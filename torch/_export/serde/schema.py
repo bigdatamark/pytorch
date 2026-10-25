@@ -1,3 +1,9 @@
+# [MODULE DOC] Schema definition for serialized exported programs: dataclasses and tagged-union classes
+# (field values carry integer ids via annotations) describing dtypes, devices, symbolic values, tensor
+# metadata, arguments, nodes, graphs, input/output specs, graph signatures, module call info and the
+# top-level exported program, plus inference containers (payload metadata, AOT model pickle data, extern
+# kernel nodes). Also holds the schema and tree-spec version numbers and mappings from serialized enum
+# values to c10 enum member names. Pure data definitions, no import-time side effects beyond class creation.
 # NOTE: This is a placeholder for iterating on export serialization schema design.
 #       Anything is subject to change and no guarantee is provided at this point.
 
@@ -21,6 +27,8 @@ TREESPEC_VERSION = 1
 # functions for oss_proxy_executor.cpp.
 # When adding new enum values, update both the enum AND the mapping.
 class ScalarType(IntEnum):
+    # [CLASS DOC] Serialized dtype enumeration with stable integer values (note the gap between 13 and 28);
+    # each value maps by name to a c10 scalar type via the mapping table below.
     UNKNOWN = 0
     BYTE = 1
     CHAR = 2
@@ -46,6 +54,7 @@ class ScalarType(IntEnum):
 
 
 class Layout(IntEnum):
+    # [CLASS DOC] Serialized tensor layout enumeration (unknown, sparse variants, mkldnn, strided).
     Unknown = 0
     SparseCoo = 1
     SparseCsr = 2
@@ -57,6 +66,7 @@ class Layout(IntEnum):
 
 
 class MemoryFormat(IntEnum):
+    # [CLASS DOC] Serialized memory format enumeration (unknown, contiguous, channels last 2d/3d, preserve).
     Unknown = 0
     ContiguousFormat = 1
     ChannelsLast = 2
@@ -108,12 +118,14 @@ MEMORY_FORMAT_TO_C10: dict[int, str] = {
 
 @dataclass
 class Device:
+    # [CLASS DOC] Serialized device: a type string and an optional index (None when unspecified).
     type: Annotated[str, 10]
     index: Annotated[int | None, 20] = None
 
 
 @_union_dataclass
 class SymExprHint(_Union):
+    # [CLASS DOC] Tagged union holding the concrete hint value (int, bool or float) of a symbolic expression.
     as_int: Annotated[int, 10]
     as_bool: Annotated[bool, 20]
     as_float: Annotated[float, 30]
@@ -125,30 +137,36 @@ class SymExprHint(_Union):
 # if we also have the hint that s0 and s1 are both 2.
 @dataclass
 class SymExpr:
+    # [CLASS DOC] A symbolic expression stored as its string form with an optional concrete hint.
     expr_str: Annotated[str, 10]
     hint: Annotated[SymExprHint | None, 20] = None
 
 
 @_union_dataclass
 class SymInt(_Union):
+    # [CLASS DOC] Tagged union: either a symbolic expression or a concrete integer.
     as_expr: Annotated[SymExpr, 10]
     as_int: Annotated[int, 20]
 
 
 @_union_dataclass
 class SymFloat(_Union):
+    # [CLASS DOC] Tagged union: either a symbolic expression or a concrete float.
     as_expr: Annotated[SymExpr, 10]
     as_float: Annotated[float, 20]
 
 
 @_union_dataclass
 class SymBool(_Union):
+    # [CLASS DOC] Tagged union: either a symbolic expression or a concrete bool.
     as_expr: Annotated[SymExpr, 10]
     as_bool: Annotated[bool, 20]
 
 
 @dataclass
 class TensorMeta:
+    # [CLASS DOC] Serialized tensor metadata: dtype, symbolic sizes and strides, requires-grad flag, device,
+    # symbolic storage offset and layout.
     dtype: Annotated[ScalarType, 10]
     sizes: Annotated[list[SymInt], 20]
     requires_grad: Annotated[bool, 30]
@@ -166,6 +184,8 @@ class TensorMeta:
 # to the "as_int" field.
 @_union_dataclass
 class SymIntArgument(_Union):
+    # [CLASS DOC] Tagged union for a symbolic-int argument: the name of a symbolic value, or a literal int (used when a
+    # list mixes symbolic and concrete ints).
     as_name: Annotated[str, 10]
     as_int: Annotated[int, 20]
 
@@ -178,6 +198,7 @@ class SymIntArgument(_Union):
 # to the "as_float" field.
 @_union_dataclass
 class SymFloatArgument(_Union):
+    # [CLASS DOC] Tagged union for a symbolic-float argument: a symbolic value name, or a literal float (for mixed lists).
     as_name: Annotated[str, 10]
     as_float: Annotated[float, 20]
 
@@ -190,17 +211,20 @@ class SymFloatArgument(_Union):
 # to the "as_bool" field.
 @_union_dataclass
 class SymBoolArgument(_Union):
+    # [CLASS DOC] Tagged union for a symbolic-bool argument: a symbolic value name, or a literal bool (for mixed lists).
     as_name: Annotated[str, 10]
     as_bool: Annotated[bool, 20]
 
 
 @dataclass
 class TensorArgument:
+    # [CLASS DOC] Reference to a tensor value in the graph by name.
     name: Annotated[str, 10]
 
 
 @dataclass
 class TokenArgument:
+    # [CLASS DOC] Reference to an effect-ordering token value in the graph by name.
     name: Annotated[str, 10]
 
 
@@ -210,24 +234,28 @@ class TokenArgument:
 # "as_tensor" field, and None values serialized to the "as_none" field.
 @_union_dataclass
 class OptionalTensorArgument(_Union):
+    # [CLASS DOC] Tagged union for an optional tensor element: a tensor reference, or a none marker.
     as_tensor: Annotated[TensorArgument, 20]
     as_none: Annotated[bool, 10]
 
 
 @dataclass
 class GraphArgument:
+    # [CLASS DOC] A named subgraph passed as an argument (for example to a higher-order op); holds the nested Graph.
     name: Annotated[str, 10]
     graph: Annotated["Graph", 20]
 
 
 @dataclass
 class CustomObjArgument:
+    # [CLASS DOC] Reference to a custom (script) object by name together with its class fully qualified name.
     name: Annotated[str, 10]
     class_fqn: Annotated[str, 20]
 
 
 @dataclass
 class ComplexValue:
+    # [CLASS DOC] A complex number literal stored as real and imaginary floats.
     real: Annotated[float, 10]
     imag: Annotated[float, 20]
 
@@ -235,6 +263,10 @@ class ComplexValue:
 # This is actually a union type
 @_union_dataclass
 class Argument(_Union):
+    # [CLASS DOC] Tagged union of every kind of value a node input/output can be: none, tensors (single, lists,
+    # nested, optional), ints, floats, bools, strings, symbolic values, dtype/layout/memory-format/device
+    # literals, subgraphs, custom objects, operator names, complex values, int/float lists of lists, and a
+    # mapping of strings to arguments. Exactly one alternative is set per instance.
     as_none: Annotated[bool, 10]
     as_tensor: Annotated[TensorArgument, 20]
     as_tensors: Annotated[list[TensorArgument], 30]
@@ -269,6 +301,7 @@ class Argument(_Union):
 
 
 class ArgumentKind(IntEnum):
+    # [CLASS DOC] Enumeration of how an argument is passed: unknown, positional or keyword.
     UNKNOWN = 0
     POSITIONAL = 1
     KEYWORD = 2
@@ -276,6 +309,7 @@ class ArgumentKind(IntEnum):
 
 @dataclass
 class NamedArgument:
+    # [CLASS DOC] An argument paired with its operator-schema parameter name and an optional passing kind.
     # Argument name from the operator schema
     name: Annotated[str, 10]
     arg: Annotated[Argument, 20]
@@ -284,6 +318,8 @@ class NamedArgument:
 
 @dataclass
 class Node:
+    # [CLASS DOC] A serialized graph node: target operator name, named inputs, outputs, string metadata, an optional
+    # flag for higher-order ops that return a single tensor, and an optional name (optional for loading older models).
     target: Annotated[str, 10]
     inputs: Annotated[list[NamedArgument], 20]
     outputs: Annotated[list[Argument], 30]
@@ -295,6 +331,9 @@ class Node:
 
 @dataclass
 class Graph:
+    # [CLASS DOC] A serialized graph: input and output arguments, ordered nodes, and tables of tensor, symbolic int, bool
+    # and float values and custom objects keyed by name. The single-tensor-return flag marks subgraphs
+    # of higher-order ops that return a bare tensor instead of a one-element list.
     inputs: Annotated[list[Argument], 10]
     outputs: Annotated[list[Argument], 20]
     nodes: Annotated[list[Node], 30]
@@ -314,12 +353,14 @@ class Graph:
 
 @dataclass
 class UserInputSpec:
+    # [CLASS DOC] Input spec for a user-supplied input; wraps an argument (only tensors and symbolic ints are expected).
     # Actually, only tensors and SymInts are allowed here
     arg: Annotated[Argument, 10]
 
 
 @_union_dataclass
 class ConstantValue(_Union):
+    # [CLASS DOC] Tagged union of a constant input value: none, int, float, string or bool.
     as_none: Annotated[bool, 10]
     as_int: Annotated[int, 20]
     as_float: Annotated[float, 30]
@@ -329,18 +370,21 @@ class ConstantValue(_Union):
 
 @dataclass
 class InputToConstantInputSpec:
+    # [CLASS DOC] Input spec binding a named graph input to a constant value.
     name: Annotated[str, 10]
     value: Annotated[ConstantValue, 20]
 
 
 @dataclass
 class InputToParameterSpec:
+    # [CLASS DOC] Input spec binding a tensor input to a module parameter by its qualified name.
     arg: Annotated[TensorArgument, 10]
     parameter_name: Annotated[str, 20]
 
 
 @dataclass
 class InputToBufferSpec:
+    # [CLASS DOC] Input spec binding a tensor input to a module buffer by name, with a flag for whether the buffer is persistent.
     arg: Annotated[TensorArgument, 10]
     buffer_name: Annotated[str, 20]
     persistent: Annotated[bool, 30]
@@ -348,23 +392,28 @@ class InputToBufferSpec:
 
 @dataclass
 class InputToTensorConstantSpec:
+    # [CLASS DOC] Input spec binding a tensor input to a lifted tensor constant by name.
     arg: Annotated[TensorArgument, 10]
     tensor_constant_name: Annotated[str, 20]
 
 
 @dataclass
 class InputToCustomObjSpec:
+    # [CLASS DOC] Input spec binding a custom-object input to a lifted custom object by name.
     arg: Annotated[CustomObjArgument, 10]
     custom_obj_name: Annotated[str, 20]
 
 
 @dataclass
 class InputTokenSpec:
+    # [CLASS DOC] Input spec for an effect-ordering token input.
     arg: Annotated[TokenArgument, 10]
 
 
 @_union_dataclass
 class InputSpec(_Union):
+    # [CLASS DOC] Tagged union describing what a graph input is: user input, parameter, buffer, tensor constant, custom
+    # object, token, or constant input.
     user_input: Annotated[UserInputSpec, 10]
     parameter: Annotated[InputToParameterSpec, 20]
     buffer: Annotated[InputToBufferSpec, 30]
@@ -376,51 +425,61 @@ class InputSpec(_Union):
 
 @dataclass
 class UserOutputSpec:
+    # [CLASS DOC] Output spec for an ordinary user-visible output argument.
     arg: Annotated[Argument, 10]
 
 
 @dataclass
 class LossOutputSpec:
+    # [CLASS DOC] Output spec marking the tensor that is the training loss.
     arg: Annotated[TensorArgument, 10]
 
 
 @dataclass
 class BufferMutationSpec:
+    # [CLASS DOC] Output spec stating that the output tensor is the new value of a named buffer.
     arg: Annotated[TensorArgument, 10]
     buffer_name: Annotated[str, 20]
 
 
 @dataclass
 class ParameterMutationSpec:
+    # [CLASS DOC] Output spec stating that the output tensor is the new value of a named parameter.
     arg: Annotated[TensorArgument, 10]
     parameter_name: Annotated[str, 20]
 
 
 @dataclass
 class GradientToParameterSpec:
+    # [CLASS DOC] Output spec stating that the output tensor is the gradient of a named parameter.
     arg: Annotated[TensorArgument, 10]
     parameter_name: Annotated[str, 20]
 
 
 @dataclass
 class GradientToUserInputSpec:
+    # [CLASS DOC] Output spec stating that the output tensor is the gradient of a named user input.
     arg: Annotated[TensorArgument, 10]
     user_input_name: Annotated[str, 20]
 
 
 @dataclass
 class UserInputMutationSpec:
+    # [CLASS DOC] Output spec stating that the output tensor is the new value of a mutated user input.
     arg: Annotated[TensorArgument, 10]
     user_input_name: Annotated[str, 20]
 
 
 @dataclass
 class OutputTokenSpec:
+    # [CLASS DOC] Output spec for an effect-ordering token output.
     arg: Annotated[TokenArgument, 10]
 
 
 @_union_dataclass
 class OutputSpec(_Union):
+    # [CLASS DOC] Tagged union describing what a graph output is: user output, loss, buffer/parameter/user-input
+    # mutation, gradient to parameter or user input, or token.
     user_output: Annotated[UserOutputSpec, 10]
     loss_output: Annotated[LossOutputSpec, 20]
     buffer_mutation: Annotated[BufferMutationSpec, 30]
@@ -433,18 +492,24 @@ class OutputSpec(_Union):
 
 @dataclass
 class GraphSignature:
+    # [CLASS DOC] The signature of a graph: ordered input specs and output specs, aligned with graph inputs and outputs.
     input_specs: Annotated[list[InputSpec], 10]
     output_specs: Annotated[list[OutputSpec], 20]
 
 
 @dataclass
 class RangeConstraint:
+    # [CLASS DOC] Value range of a symbol: optional minimum and maximum (None means unbounded).
     min_val: Annotated[int | None, 10]
     max_val: Annotated[int | None, 20]
 
 
 @dataclass
 class ModuleCallSignature:
+    # [CLASS DOC] Calling convention of a submodule: input and output arguments, input/output tree specs stored as
+    # strings, and optional original forward argument names used to name placeholders after reloading.
+    # KNOWN ISSUE: the comment above the spec fields has load/dump function names swapped relative to the
+    # usual meaning (specs are saved with the dump function and read back with the load function).
     inputs: Annotated[list[Argument], 10]
     outputs: Annotated[list[Argument], 20]
 
@@ -460,17 +525,21 @@ class ModuleCallSignature:
 
 @dataclass
 class ModuleCallEntry:
+    # [CLASS DOC] One entry of the module call graph: a module's qualified name and its optional call signature.
     fqn: Annotated[str, 10]
     signature: Annotated[ModuleCallSignature | None, 30] = None
 
 
 @dataclass
 class NamedTupleDef:
+    # [CLASS DOC] Field names of a namedtuple type, kept so tree specs can be rebuilt.
     field_names: Annotated[list[str], 10]
 
 
 @dataclass
 class GraphModule:
+    # [CLASS DOC] A serialized graph module: the graph, its signature, the module call graph (used to unflatten
+    # modules), string metadata, and a mapping from namedtuple type names to field names (kept for compatibility).
     graph: Annotated[Graph, 10]
     signature: Annotated[GraphSignature, 50]
     # This is used for unflattening, by tracking the calling structure of all of
@@ -488,6 +557,7 @@ class GraphModule:
 #            should be updated.
 @dataclass
 class SchemaVersion:
+    # [CLASS DOC] Schema version as major (bumped on breaking changes) and minor (bumped on compatible changes) numbers.
     major: Annotated[
         int, 10
     ]  # Major version number is bumped every time a breaking change is made.
@@ -498,6 +568,9 @@ class SchemaVersion:
 
 @dataclass
 class ExportedProgram:
+    # [CLASS DOC] Top-level serialized exported program: graph module, opset versions per namespace, range
+    # constraints per symbol, schema version, verifier names, the torch version that produced it
+    # (defaults to an old-version marker for legacy files) and guard code strings.
     graph_module: Annotated[GraphModule, 10]
     # Key is the opset namespace (ex. aten), and value is the version number
     opset_version: Annotated[dict[str, int], 20]
@@ -517,6 +590,8 @@ class ExportedProgram:
 # payload includes params, buffers, tensor constants, and custom objects.
 @dataclass
 class PayloadMeta:
+    # [CLASS DOC] Metadata of one payload (parameter, buffer, tensor constant or custom object) stored in an archive:
+    # archive path, parameter flag, whether it is pickled, and optional tensor metadata.
     # the path of the payload in the archive file, e.g. "weight_0"
     path_name: Annotated[str, 10]
     is_param: Annotated[bool, 20]
@@ -531,6 +606,7 @@ class PayloadMeta:
 # The mapping from payload FQN to its metadata.
 @dataclass
 class PayloadConfig:
+    # [CLASS DOC] Mapping from payload qualified name to its PayloadMeta.
     config: Annotated[dict[str, PayloadMeta], 10]
 
 
@@ -542,6 +618,9 @@ class PayloadConfig:
 #
 @dataclass
 class AOTInductorModelPickleData:
+    # [CLASS DOC] Data to pass an AOTInductor model from a publishing pipeline to a predictor: library file base name,
+    # engine input and output names, optional floating point input/output dtype overrides, and an optional CPU flag.
+    # New fields must be optional.
     # Base name of an associated .so AOTInductor library. Typically looks like:
     # "abc.so".
     library_basename: Annotated[str, 1]
@@ -564,6 +643,7 @@ class AOTInductorModelPickleData:
 
 @dataclass
 class ExternKernelNode:
+    # [CLASS DOC] A serialized external-kernel node with a (non-unique) name and the node itself.
     # name is not the unique identifier of the node
     name: Annotated[str, 10]
     node: Annotated[Node, 20]
@@ -571,4 +651,5 @@ class ExternKernelNode:
 
 @dataclass
 class ExternKernelNodes:
+    # [CLASS DOC] A list of external-kernel nodes.
     nodes: Annotated[list[ExternKernelNode], 10]

@@ -1,3 +1,7 @@
+# [MODULE DOC] Serialization and deserialization of the dynamic_shapes spec given to export. Defines two
+# dataclasses (RootDim for a root dimension's range and derived names, DynamicShapesSpec for the whole
+# spec) and the functions that dump a spec (with the example args) to a dataclass or plain mapping and
+# load it back into a structure of Dim objects, hints, ints and None. No import-time side effects.
 import dataclasses
 from typing import Any
 
@@ -17,6 +21,8 @@ from .serialize import _dataclass_to_dict
 
 @dataclasses.dataclass
 class RootDim:
+    # [CLASS DOC] Serializable description of one root Dim: its minimum, its maximum (None meaning unbounded) and the
+    # sorted names of dims derived from it by linear expressions. Plain data holder, no methods.
     """
     This represents a Dim object.
     """
@@ -28,6 +34,8 @@ class RootDim:
 
 @dataclasses.dataclass
 class DynamicShapesSpec:
+    # [CLASS DOC] Serializable container pairing a standardized dynamic_shapes tree (leaves are ints, strings naming
+    # dims or hints, or None) with a mapping from root dim name to its RootDim description. Plain data holder.
     """
     This stores a dynamic_shapes spec for de/serialization.
     """
@@ -41,6 +49,9 @@ def _postprocess_serialized_shapes(
     dims: dict[str, dict[str, int | list[str] | None]],
     to_dict: bool | None = False,
 ) -> DynamicShapesSpec | dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds a DynamicShapesSpec from the serialized shapes tree and the collected dim info. Dims are
+    # sorted by name and converted to RootDim records (an infinite max becomes None, derived names are
+    # sorted). Returns the dataclass, or its plain-mapping form when to_dict is true. Pure.
     """
     Sorts dims and dumps to dictionary format.
     """
@@ -69,6 +80,12 @@ def _dump_dynamic_shapes(
     kwargs: dict[str, Any] | None = None,
     to_dict: bool | None = False,
 ) -> DynamicShapesSpec | dict[str, Any]:
+    # [FUNCTION DOC] Serializes a dynamic_shapes spec as used by export, using the example args and kwargs to tell
+    # tensors from other inputs. Returns a spec (or plain mapping if to_dict) holding a standardized
+    # tree (one list of per-dimension entries per tensor, None for non-tensors) and a mapping of root
+    # dim names to range and derived names. If dynamic_shapes is None returns a mapping with None shapes
+    # and no dims (a plain mapping even when to_dict is false). Runs the same validity check as export and may
+    # raise its errors. Dim hints are stored as strings of class and kind; dims by name.
     """
     Utility function for dynamic shapes serialization, serializing a dynamic_shapes spec.
     Returns a DynamicShapesSpec dataclass containing 2 fields, "dynamic_shapes" and "dims".
@@ -131,6 +148,10 @@ def _dump_dynamic_shapes(
     dims: dict[str, dict[str, Any]] = {}
 
     def _standardize_shapes(path, tensor, shape):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Per-leaf mapper. Returns None for non-tensor inputs; a list of static hints (one per
+        # dimension) when the tensor has no spec; otherwise a list with one entry per dimension, taking the
+        # spec entry (from a mapping by index, or a sequence by position) or the concrete size when the
+        # entry is missing or None. Raises an assertion error if the spec is neither mapping nor sequence.
         """
         Helps standardize the dynamic_shapes tree structure we serialize,
         returning lists for each tensor shape, handling tensor-level Nones.
@@ -154,6 +175,11 @@ def _dump_dynamic_shapes(
     def _track_dim_from_dims(
         val: None | int | _DimHint | Dim,
     ) -> None | int | str:
+        # [FUNCTION DOC] HELPER: Converts one standardized leaf to its serialized form and records dims. None and ints
+        # pass through; hints become a string of class name and kind name; Dim objects become their name,
+        # and the root dim (with min, max and an empty derived set) is registered in the enclosing dims
+        # mapping, with derived dims added to their root's derived set. Raises an assertion error for
+        # other types. Mutates the enclosing dims mapping.
         """
         Tracks dims, ranges, derived dims from the standardized dynamic_shapes spec.
         """
@@ -205,6 +231,16 @@ def _load_dynamic_shapes(
     spec: DynamicShapesSpec | dict[str, Any],
     from_dict: bool | None = False,
 ) -> dict[str, Any] | tuple[Any] | list[Any] | None:
+    # [FUNCTION DOC] Inverse of the dump function. Accepts a spec dataclass, or a mapping when from_dict is true
+    # (validated: exact keys, string dim names, int min, list of string derived names), and returns the
+    # dynamic_shapes tree for export, or None if the spec's shapes are None. Rebuilds root Dim objects with
+    # their ranges, then each derived name by parsing it as a linear expression in its root symbol
+    # (rejecting non-symbol names, multi-symbol or non-linear expressions) and applying the multiplier and offset.
+    # Leaves are mapped back to ints, None, dim hints, or the cached Dim objects. Raises UserError for any
+    # invalid input or untracked dim name.
+    # KNOWN ISSUE: the mapping validation requires max to be an int and its error text claims None is
+    # allowed; a None max (unbounded, as produced by dumping) is rejected, so unbounded dims do not round trip via mappings.
+    # Also the condition checking for None after the int check is unreachable.
     """
     Utility function for dynamic shapes serialization.
     Deserializes a DynamicShapesSpec or corresponding dictionary into a dynamic_shapes input to export().
@@ -302,6 +338,9 @@ def _load_dynamic_shapes(
     def deserialize_shape(
         val: None | int | str,
     ) -> None | int | Dim | _DimHint:
+        # [FUNCTION DOC] HELPER: Maps one serialized leaf back: None and ints unchanged; the strings for the auto, dynamic and
+        # static hints to new hint objects; any other string to the cached Dim or derived dim of that name.
+        # Raises UserError for non-string leaves or names not tracked in the dims mapping.
         if val is None or isinstance(val, int):
             return val
         elif val == "_DimHint.AUTO":

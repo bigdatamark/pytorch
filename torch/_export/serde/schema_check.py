@@ -1,3 +1,10 @@
+# [MODULE DOC] Schema-evolution checker and code generator for the export serialization schema. Reads the
+# dataclasses/enums in the schema module and stages: a YAML-style description, a generated C++ header
+# (structs, tagged unions, JSON converters), a Thrift schema, and C++ converters from serialized enum
+# values to c10 enums. Compares the staged schema against the checked-in YAML, classifies changes as
+# compatible (minor version bump) or incompatible (major bump), and reports checksums. Main entry
+# points: update_schema (builds a commit description) and check (decides the next version). No
+# import-time side effects beyond defining type-mapping tables and an exception class.
 import dataclasses
 import hashlib
 import inspect
@@ -12,10 +19,13 @@ from torch._export.serde.union import _Union
 
 
 class SchemaUpdateError(Exception):
+    # [CLASS DOC] Exception raised when a schema change is not allowed or the schema bookkeeping is inconsistent
+    # (for example a changed field type, a missing checksum, or an enum value with no c10 mapping). No extra state.
     pass
 
 
 def _check(x: object, msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises SchemaUpdateError with the message when the condition is falsy; otherwise does nothing.
     if not x:
         raise SchemaUpdateError(msg)
 
@@ -36,6 +46,14 @@ _THRIFT_TYPE_MAP = {
 
 
 def _staged_schema() -> tuple[dict[str, Any], str, str]:
+    # [FUNCTION DOC] HELPER: Introspects the schema module and generates all derived artifacts. Collects every public
+    # name defined in the schema module; integer enums become enum descriptions, dataclasses become
+    # structs, and subclasses of the union base become tagged unions (each also gets C++ class text,
+    # JSON converters and Thrift definitions); version values and plain mapping tables are accepted and
+    # skipped. Returns (a mapping describing the schema plus the two version entries, the full C++ header
+    # text, the Thrift schema text). C++ and Thrift class output is ordered by each class's source position.
+    # Raises assertion errors for unsupported types, unannotated fields, duplicate field ids,
+    # optional fields without a None default, unknown module-level names, or non-positive versions.
     yaml_ret: dict[str, Any] = {}
     defs: dict[str, Any] = {}
     cpp_enum_defs: dict[str, str] = {}
@@ -48,7 +66,15 @@ def _staged_schema() -> tuple[dict[str, Any], str, str]:
     def _handle_aggregate(
         ty: type[Any],
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: For a dataclass type, walks its fields and returns three mappings keyed by field name:
+        # schema description (type text and default), C++ info (type text and default text), and Thrift
+        # info (type text and field id). The field id comes from the integer annotation on each field.
+        # Raises assertion errors for a missing/non-integer annotation or a duplicate id within the class.
         def dump_type(t: Any, level: int) -> tuple[str, str, str]:
+            # [FUNCTION DOC] HELPER: Converts a field type into three type strings (schema, C++, Thrift). Handles enums
+            # (stored as 64-bit ints in C++), basic builtins, forward references, lists, mappings, optionals
+            # (only at the top level, exactly one type plus None, rendered as optional wrappers), and
+            # annotated types (unwrapped), and plain classes. Raises assertion errors for unsupported types.
             if getattr(t, "__name__", None) in cpp_enum_defs:
                 return t.__name__, "int64_t", t.__name__
             elif t in _CPP_TYPE_MAP:
@@ -117,6 +143,9 @@ def _staged_schema() -> tuple[dict[str, Any], str, str]:
                 raise AssertionError(f"Type {t} is not supported in export schema.")
 
         def dump_cpp_value(v: object) -> str:
+            # [FUNCTION DOC] HELPER: Renders a default value as C++ text: none as the empty-optional marker, booleans as
+            # true/false, empty dict/list/tuple as empty braces, strings as quoted literals. Raises an
+            # assertion error for any other value (numbers are unsupported).
             if v is None:
                 return "std::nullopt"
             elif v is True:
@@ -139,6 +168,11 @@ def _staged_schema() -> tuple[dict[str, Any], str, str]:
         def dump_field(
             f: dataclasses.Field[Any],
         ) -> tuple[dict[str, Any], str, str | None, str, int]:
+            # [FUNCTION DOC] HELPER: Describes one dataclass field. Returns (schema description with type and optional default
+            # text, C++ type, C++ default text or None, Thrift type, Thrift id). Defaults come from the field
+            # default or its factory; empty-brace defaults are dropped for container/class types and added for
+            # primitive-like C++ types without a default. Raises assertion errors if the field lacks an
+            # integer-id annotation or is optional with a non-None default.
             t, cpp_type, thrift_type = dump_type(f.type, 0)
             ret = {"type": t}
             cpp_default: str | None = None
@@ -203,6 +237,9 @@ def _staged_schema() -> tuple[dict[str, Any], str, str]:
         return yaml_ret, cpp_ret, thrift_ret
 
     def _handle_int_enum(name: str, ty: type[IntEnum]) -> None:
+        # [FUNCTION DOC] HELPER: Registers an integer enum: records its member names and values in the schema description,
+        # and generates C++ enum text with print and parse helper functions plus a Thrift enum definition.
+        # Mutates the enclosing result containers.
         yaml_ret[name] = {"kind": "enum", "fields": {x.name: x.value for x in ty}}
         cpp_enum_defs[name] = f"""
 enum class {name} {{
@@ -231,6 +268,9 @@ enum {name} {{
         )
 
     def _handle_struct(name: str, ty: type[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Registers a dataclass as a struct: records its fields in the schema description and
+        # generates a C++ class (private members with defaults, getters/setters, friend JSON converters
+        # that fall back to defaults on load), forward declaration, and a Thrift struct. Mutates the enclosing containers.
         fields, cpp_fields, thrift_fields = _handle_aggregate(ty)
         yaml_ret[name] = {"kind": "struct", "fields": fields}
         field_decls = "\n".join(
@@ -239,6 +279,8 @@ enum {name} {{
         )
 
         def accessor(name: str, ty: str) -> str:
+            # [FUNCTION DOC] HELPER: Returns C++ getter and setter text for a struct member; enum-typed members convert
+            # to and from the stored 64-bit integer, other members use const reference getters and forwarding setters.
             type_name = fields[name]["type"]
             if type_name in cpp_enum_defs:
                 return f"""
@@ -301,10 +343,16 @@ struct {name} {{
 }}"""
 
     def _handle_union(name: str, ty: type[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Registers a tagged-union dataclass: records its alternatives in the schema description and
+        # generates a C++ class holding a variant plus a tag enum (with print/parse helpers), accessors,
+        # friend JSON converters that dispatch on the key present, a forward declaration, and a Thrift union.
+        # Mutates the enclosing containers.
         fields, cpp_fields, thrift_fields = _handle_aggregate(ty)
         yaml_ret[name] = {"kind": "union", "fields": fields}
 
         def accessor(name: str, ty: str, idx: int) -> str:
+            # [FUNCTION DOC] HELPER: Returns C++ getter and setter text for one union alternative, addressed by variant
+            # index offset by one (index zero is an empty placeholder); the setter also updates the tag.
             return f"""
   const {ty}& get_{name}() const {{
     return std::get<{idx + 1}>(variant_);
@@ -579,7 +627,13 @@ namespace cpp2 torch._export.schema
 def _diff_schema(
     dst: dict[str, Any], src: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    additions = {key: src[key] for key in src.keys() - dst.keys()}
+    # [FUNCTION DOC] HELPER: Compares a previous schema description (dst) with the new one (src) and returns
+    # (additions, subtractions) mappings. Whole types present on one side only are listed entirely; for
+    # types on both sides, added and removed fields are listed under a fields entry (defaults added or
+    # removed on struct fields count as additions or subtractions with only a default entry). The version keys are
+    # ignored. Raises SchemaUpdateError if a type changes kind, a field type changes, or an enum value
+    # changes; raises assertion errors for unknown kinds or duplicate keys.
+    additions ={key: src[key] for key in src.keys() - dst.keys()}
     subtractions = {key: dst[key] for key in dst.keys() - src.keys()}
 
     common_keys = src.keys() & dst.keys()
@@ -649,10 +703,16 @@ def _diff_schema(
 
 
 def _hash_content(s: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the hexadecimal SHA-256 digest of the whitespace-stripped string encoded as UTF-8.
     return hashlib.sha256(s.strip().encode("utf-8")).hexdigest()
 
 
 def _generate_enum_converters() -> str:
+    # [FUNCTION DOC] HELPER: Generates C++ header text with converter functions from serialized scalar type, layout and
+    # memory format values to c10 enums, based on the mapping tables in the schema module. First validates
+    # that every enum member (except the unknown member) has a mapping, raising SchemaUpdateError
+    # otherwise. Each converter uses a lookup table indexed by serialized value, with invalid slots
+    # marked, and checks range and validity at run time in the generated code. Returns the header text.
     """Generate C++ converter functions from serialized enum values to c10 enums."""
 
     def validate_mapping(
@@ -661,6 +721,8 @@ def _generate_enum_converters() -> str:
         enum_name: str,
         skip_values: set[int],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Raises SchemaUpdateError naming the first enum member (not in the skip set) whose value is
+        # absent from the mapping; returns nothing otherwise.
         """Validate that all enum values have corresponding c10 mappings."""
         for member in enum_class:
             if member.value in skip_values:
@@ -698,6 +760,9 @@ def _generate_enum_converters() -> str:
         mapping: dict[int, str],
         max_value: int,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Builds the C++ text of one converter function: a table with an entry per value from zero
+        # to the maximum mapped value (the c10 member, or an invalid marker for gaps) and a function
+        # that range-checks and looks up the serialized value. Returns the text.
         lines: list[str] = []
         for i in range(max_value + 1):
             if i in mapping:
@@ -768,6 +833,10 @@ namespace torch::aot_inductor {{
 
 @dataclasses.dataclass
 class _Commit:
+    # [CLASS DOC] HELPER: Plain record describing a proposed schema update: the newly staged schema and its checksum, the
+    # schema file path, additions and subtractions relative to the base (previous) schema, the generated C++
+    # header and enum converter header with their paths, the previous and recomputed Thrift checksums,
+    # and the Thrift schema text and path. Checksum heads are None when no previous schema file exists.
     result: dict[str, Any]
     checksum_next: str
     yaml_path: str
@@ -787,6 +856,12 @@ class _Commit:
 
 
 def update_schema() -> _Commit:
+    # [FUNCTION DOC] Builds a commit record for the current schema. Reads the existing schema YAML and Thrift files
+    # from the package resources if present (extracting and checking their embedded checksums and
+    # generated-file header lines, recomputing the Thrift checksum, and parsing the YAML), else starts from
+    # an empty base. Stages the new schema, generates the enum converters, diffs against the base, and
+    # fills in output paths under the torch directory. Returns the record. Raises SchemaUpdateError or
+    # assertion errors when checksums are missing or headers/paths are malformed. Reads files only.
     import importlib.resources
 
     dst: dict[str, Any]
@@ -871,6 +946,13 @@ def update_schema() -> _Commit:
 
 
 def check(commit: _Commit, force_unsafe: bool = False) -> tuple[list[int] | None, str]:
+    # [FUNCTION DOC] Decides the required schema version change for a commit record. Returns (next version as a
+    # major/minor list or None if no change is needed, a human-readable reason text). A struct field added without a
+    # default to an existing type, or any field removed from a surviving type, needs a major bump (minor reset
+    # to one). Otherwise any addition or removal needs a minor bump. With force_unsafe, the staged version is
+    # used and a note is appended. Pure.
+    # KNOWN ISSUE: in the removal branch the reason is assigned instead of appended, so it overwrites
+    # earlier reasons and keeps only the last removed field's message.
     next_version: list[int] | None = None
     reason = ""
     # Step 1: Detect major schema updates.

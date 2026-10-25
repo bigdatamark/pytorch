@@ -1,3 +1,10 @@
+# [MODULE DOC] Export pass converting legacy quantized ops (quantized namespace ops, prepacked ops, and
+# aten quantize/dequantize) in an FX graph module into PT2-style decomposed quantize/dequantize ops around
+# standard aten ops (conv, linear, add, mul, softmax, cat, hardswish, batch norm). Main entry point:
+# replace_quantized_ops_with_standard_ops. Weight/bias script objects are unpacked, dequantized, and
+# attached to the module as plain tensor attributes. Import-time side effects: creates a module logger
+# and three module-level globals (input quantized dtype, scale, zero point) that carry state across
+# operators during one pass run; they are mutated by the pass and never reset.
 # mypy: allow-untyped-defs
 import logging
 import operator
@@ -23,6 +30,9 @@ _ZERO_POINT: float | torch.fx.Node | None = None
 
 
 def int_to_valid_dtype(val: int) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Converts a dtype enum integer into a torch dtype (a dtype passes through unchanged),
+    # mapping the quantized unsigned/signed 8-bit dtypes to plain uint8/int8. Raises a key error for
+    # unknown enum values. Imports the converter lazily to avoid a circular import.
     from torch._export.converter import _TORCH_ENUM_TO_DTYPE  # No circular import.
 
     if isinstance(val, torch.dtype):
@@ -36,6 +46,8 @@ def int_to_valid_dtype(val: int) -> torch.dtype:
 
 
 def fx_enum_to_dtype(gm: torch.fx.GraphModule, val: int) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Appends to the graph a call node that converts the given dtype enum value (an int or a
+    # node) to a dtype at run time via the int-to-dtype helper. Returns the new node; mutates the graph.
     return gm.graph.call_function(int_to_valid_dtype, (val,))
 
 
@@ -49,6 +61,9 @@ def insert_quantized_node(
     dtype_node: torch.dtype | torch.fx.Node,
     qscheme: torch.qscheme | None,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Appends a decomposed per-tensor quantize call node taking the value, scale, zero point,
+    # qmin, qmax and dtype nodes. Returns the new node; mutates the graph.
+    # KNOWN ISSUE: the qscheme argument is accepted but ignored; only per-tensor quantization is emitted.
     return gm.graph.call_function(
         quantize_per_tensor,
         (
@@ -72,6 +87,9 @@ def get_dequantized(
     axis: int | None,
     qscheme: torch.qscheme | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Eagerly dequantizes a tensor with the decomposed dequantize ops: the per-tensor variant
+    # for the per-tensor affine scheme, the per-channel variant (using the axis) for per-channel affine.
+    # Returns the dequantized tensor. Raises a runtime error for any other scheme.
     if qscheme is torch.per_tensor_affine:
         return dequantize_per_tensor(
             val,
@@ -106,6 +124,9 @@ def insert_dequantized_node(
     axis_node: int | torch.fx.Node | None,
     qscheme: torch.qscheme | None,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Appends a graph call node for the decomposed dequantize op matching the scheme (per-tensor
+    # or per-channel, the latter also taking the axis node). Returns the new node; mutates the graph.
+    # Raises a runtime error for an unsupported scheme.
     if qscheme is torch.per_tensor_affine:
         return gm.graph.call_function(
             dequantize_per_tensor,
@@ -136,12 +157,17 @@ def insert_dequantized_node(
 
 
 def get_qmin_qmax(dtype: torch.dtype) -> tuple[int | float, int | float]:
+    # [FUNCTION DOC] HELPER: Returns the (qmin, qmax) integer range for the dtype, computed with the default
+    # (non-reduced, non-symmetric) settings. Pure.
     return calculate_qmin_qmax(None, None, False, dtype, False)  # type: ignore[arg-type]
 
 
 def insert_qmin_qmax_node(
     gm: torch.fx.GraphModule, dtype_node: torch.dtype | torch.fx.Node
 ) -> tuple[torch.fx.Node, torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Appends graph nodes that compute the quantization range at run time for a dtype node:
+    # one call to the qmin/qmax calculator and two item extractions (index 0 and 1). Returns the
+    # (qmin node, qmax node) pair; mutates the graph.
     q_min_max_node = gm.graph.call_function(
         calculate_qmin_qmax, (None, None, False, dtype_node, False)
     )
@@ -153,6 +179,9 @@ def insert_qmin_qmax_node(
 def get_script_object(
     gm: torch.nn.Module, node: torch.fx.Node
 ) -> torch._C.ScriptObject:
+    # [FUNCTION DOC] HELPER: Resolves an attribute-fetch node to the actual script object on the module, following
+    # the dotted attribute path. Returns the object. Raises assertion errors if the argument is not
+    # a node, is not an attribute fetch, has a non-string target, or the resolved value is not a script object.
     if not isinstance(node, torch.fx.Node):
         raise AssertionError(f"expected fx.Node, got {type(node).__name__}")
     if node.op != "get_attr":
@@ -173,6 +202,9 @@ def insert_weight_and_bias_get_attr_node_from_get_attr_to_scriptobject(
     gm: torch.fx.GraphModule,
     param_node: torch.fx.Node,
 ) -> tuple[torch.fx.Node, torch.fx.Node | None]:
+    # [FUNCTION DOC] HELPER: Given an attribute node holding a packed-params script object, unpacks it into quantized
+    # weight and bias, and registers dequantized weight/bias tensors as module attributes named from the
+    # node target. Returns (weight attr node, bias attr node or None). Mutates the module and graph.
     """Directly inline tensor from a get_attr fx node."""
     mod = get_script_object(gm, param_node)
     w_qtensor, b_qtensor = mod.unpack()  # type: ignore[attr-defined]
@@ -190,6 +222,9 @@ def insert_weight_and_bias_get_attr_node_from_get_attr_to_qtensor(
     get_attr_to_weight_node: torch.fx.Node,
     get_attr_to_bias_node: torch.fx.Node | None,
 ) -> tuple[torch.fx.Node, torch.fx.Node | None]:
+    # [FUNCTION DOC] HELPER: Reads quantized weight (and optional bias) tensors from the module attributes referenced
+    # by the given attribute nodes, then registers dequantized versions as new attributes and returns
+    # (weight attr node, bias attr node or None). Raises assertion errors for non-string targets.
     if not isinstance(get_attr_to_weight_node.target, str):
         raise AssertionError(
             f"expected str target, got {type(get_attr_to_weight_node.target).__name__}"
@@ -219,7 +254,10 @@ def insert_weight_and_bias_get_attr_node(
     w_attr_name: str,
     b_attr_name: str,
 ) -> tuple[torch.fx.Node, torch.fx.Node | None]:
-    w_tensor = get_tensor_from_qtensor(w_qtensor)
+    # [FUNCTION DOC] HELPER: Converts the weight to a dequantized float tensor and the bias (if present) to a plain tensor
+    # without dequantization, assigns each to the module under the given attribute names, and appends
+    # attribute-fetch nodes for them. Returns (weight node, bias node or None). Mutates module and graph.
+    w_tensor =get_tensor_from_qtensor(w_qtensor)
     _assign_attr(w_tensor, gm, w_attr_name)
     w_tensor_attr = gm.graph.get_attr(w_attr_name)
 
@@ -236,6 +274,11 @@ def insert_weight_and_bias_get_attr_node(
 def get_tensor_from_qtensor(
     qtensor: torch.Tensor, dequant: bool = True
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Turns a possibly quantized tensor into a plain tensor. Quantized 8-bit tensors are first
+    # converted to their integer representation. If dequant is true, the tensor is then dequantized using
+    # the original quantization scheme (per-channel scales, zero points and axis, or the per-tensor scale
+    # and zero point) and the qmin/qmax range of the integer dtype; otherwise (bias) the integer/plain
+    # tensor is returned as is. Pure.
     # Manual conversion because qint8 is not used anymore.
     if qtensor.dtype in [torch.qint8, torch.quint8]:
         tensor = qtensor.int_repr()
@@ -269,6 +312,8 @@ def get_tensor_from_qtensor(
 def insert_fused_activation_node(
     gm: torch.fx.GraphModule, opname: str, fx_node: torch.fx.Node
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: If the quantized op name denotes a fused relu variant (conv1d, conv2d, linear, add, mul),
+    # appends a relu call node after the given node and returns it; otherwise returns the node unchanged.
     if opname in ["conv1d_relu", "conv2d_relu", "linear_relu", "add_relu", "mul_relu"]:
         fx_node = gm.graph.call_function(torch.ops.aten.relu, (fx_node,))
     return fx_node
@@ -283,6 +328,9 @@ def _conv1d_op_with_squeeze(
     dilation: list[int],
     groups: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Emulates a one-dimensional convolution with the two-dimensional convolution op: inserts a
+    # dimension at position 2 of the input, convolves with the given weight, bias, stride, padding,
+    # dilation and groups, then removes that dimension. Returns the result tensor. Used as a graph call target.
     # In quantized version, conv1d is emulated using conv2d with squeeze and unsqueeze
     # operations before and after the conv2d operation to match the dimension of weights.
     # Reference: https://github.com/pytorch/pytorch/blob/eca0cb0fbe84bb0a34fa94afe261bceecd52c436/aten/src/ATen/native/quantized/cpu/qconv.cpp#L1827
@@ -301,6 +349,12 @@ def _conv1d_op_with_squeeze(
 
 
 def _transform_conv_with_packedparam(gm: torch.fx.GraphModule, node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Rewrites a quantized conv1d/conv2d (optionally relu-fused) node into a standard conv call
+    # node (the two-dimensional conv for 2d, the squeeze-based emulation for 1d). Weights and bias come
+    # either from a prepack call node (inlined as dequantized attributes) or from a packed-params script
+    # object (also reading stride, padding, dilation, groups from it). Returns (result node, scale node,
+    # zero point node) taken from args 2 and 3 of the original node. Raises assertion errors if the target is
+    # not an op overload or the input/param/weight/bias args are not nodes. Mutates module and graph.
     """Conv specific transformation function."""
     if not isinstance(node.target, torch._ops.OpOverload):
         raise AssertionError(f"expected OpOverload, got {type(node.target).__name__}")
@@ -361,6 +415,10 @@ def _transform_conv_with_packedparam(gm: torch.fx.GraphModule, node: torch.fx.No
 
 
 def _transform_linear_with_packedparam(gm: torch.fx.GraphModule, node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Rewrites a quantized linear (optionally relu-fused) node into the standard linear op, with
+    # weights and bias either inlined from a linear prepack call node or unpacked from a packed-params
+    # script object. Returns (result node, scale node, zero point node) from args 2 and 3 of the original
+    # node. Raises assertion errors if the input or param args are not nodes. Mutates module and graph.
     """Linear specific transformation function."""
     scale_node, zero_point_node = node.args[2], node.args[3]
 
@@ -404,6 +462,10 @@ def _transform_linear_with_packedparam(gm: torch.fx.GraphModule, node: torch.fx.
 def _transform_op_where_last_two_arguments_are_scale_and_zero_point(
     gm: torch.fx.GraphModule, node: torch.fx.Node
 ):
+    # [FUNCTION DOC] HELPER: Rewrites a quantized add, mul, softmax, cat or hardswish node (including relu-fused add/mul)
+    # into the matching standard aten op using all but the last two arguments, which are taken as the
+    # output scale and zero point. Returns (result node, scale node, zero point node). Raises assertion
+    # error if the target is not an op overload and a key error for an unmapped op name.
     """
     This transformation function can be used for function where the last two
     parameters are scale and zero point. Additionally, the function's parameters
@@ -428,6 +490,10 @@ def _transform_op_where_last_two_arguments_are_scale_and_zero_point(
 
 
 def _transform_scalar_arithmetic(gm: torch.fx.GraphModule, node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Rewrites a quantized scalar mul or add node into the scalar overload of the standard aten op
+    # with the original args. Returns (result node, global scale, global zero point): the scale and zero
+    # point are the module-level values left by a previous operator, since scalar ops carry none.
+    # Raises assertion error if the target is not an op overload.
     """Transform scalar overload for basic arithmetic."""
     to_standard_op = {
         "mul": torch.ops.aten.mul.Scalar,
@@ -441,6 +507,11 @@ def _transform_scalar_arithmetic(gm: torch.fx.GraphModule, node: torch.fx.Node):
 
 
 def _transform_prepacked_op(gm: torch.fx.GraphModule, node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Rewrites a prepacked-namespace conv2d or linear "clamp run" node into the standard conv2d or
+    # linear op. Unpacks the context script object (arg 1) to get weight and bias, and for conv also takes
+    # the remaining sizes (stride, padding, dilation, groups) from the prepacked size-unpacking op.
+    # Returns only the result node (no scale or zero point; no quantization is added). Raises a runtime
+    # error for other op names and assertion errors for a non-op-overload target or non-node arg.
     """
     Transformation for functions under prepacked namespace, where they share
     the same handling logic that [...]OpContext contains all parameters.
@@ -471,6 +542,10 @@ def _transform_prepacked_op(gm: torch.fx.GraphModule, node: torch.fx.Node):
 
 
 def _transform_batch_norm(gm: torch.fx.GraphModule, node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Rewrites a quantized batch norm node into the standard native batch norm op in inference
+    # mode (training off, momentum 0.1), using the original args minus the last three; the third-from-last
+    # arg is passed as epsilon. Takes the first output via an item extraction. Returns (result node, scale
+    # node, zero point node) from the last two original args. Mutates the graph.
     args = node.args
     scale_node, zero_point_node = args[-2], args[-1]
     op_res_node = gm.graph.call_function(
@@ -483,6 +558,12 @@ def _transform_batch_norm(gm: torch.fx.GraphModule, node: torch.fx.Node):
 def fx_transform_quantized_op_to_standard_op(
     gm: torch.fx.GraphModule, node: torch.fx.Node
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] Converts one legacy quantized-op node into standard ops plus a quantize/dequantize pair. Looks up
+    # a transform by op name and overload (raises a runtime error for unsupported ones), applies it, adds
+    # a relu if the op is a fused variant, records the resulting scale and zero point in module-level
+    # globals, then quantizes the result with the globally stored input dtype and dequantizes it again.
+    # Returns the final dequantize node. Raises an assertion error if the target is not an op overload or
+    # no input dtype was recorded earlier. Mutates the graph and module globals.
     global _SCALE, _ZERO_POINT, _INPUT_Q_DTYPE
 
     if not isinstance(node.target, torch._ops.OpOverload):
@@ -550,6 +631,14 @@ def fx_transform_quantized_op_to_standard_op(
 
 
 def replace_quantized_ops_with_standard_ops(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] Public pass entry point. Walks the graph in order; quantized-namespace ops (except prepack calls)
+    # and prepacked ops are rewritten to standard ops, aten quantize_per_tensor becomes a decomposed
+    # quantize/dequantize pair (recording the dtype node in a module global), aten dequantize is replaced by
+    # the previous quantized node, other ops just update the "last node". If anything was quantized, runs dead
+    # code elimination and removes script-object attributes and quantized buffers from all submodules.
+    # Mutates the graph module in place; returns nothing. Raises assertion errors if a dequantize appears
+    # before any quantized node. Mutates the module-level globals (not reset between runs).
+    # KNOWN ISSUE: the pass never recompiles the module after editing the graph; callers must do so.
     """
     Replace legacy quantized ops (aten.quantize_per_tensor, quantized.conv) with
     PT2 ops (quantize_decomposed.quantize_per_tensor, aten.conv).
@@ -648,6 +737,9 @@ def replace_quantized_ops_with_standard_ops(gm: torch.fx.GraphModule):
     # stored as attributes or in the buffer. This is used to clean up the GraphModule
     # to not trigger tracing errors like missing __obj_flatten__ functions.
     def _clean_attr(mod: torch.nn.Module):
+        # [FUNCTION DOC] HELPER: For the module and every submodule, deletes attributes that are script objects and removes
+        # buffers whose dtype is a quantized 8-bit dtype, so later tracing does not hit legacy objects.
+        # Mutates the modules in place.
         for submod in mod.modules():
             attr_names_to_clean = set()
             for k, v in submod.__dict__.items():

@@ -1,3 +1,8 @@
+# [MODULE DOC] Shared helpers for export passes that turn split submodule calls into higher-order op calls
+# (used by the autocast and set-grad passes). Provides: a helper that swaps one call_module node for a
+# call to a wrapping higher-order op (with metadata propagation), a helper that fixes up the
+# graph signature and applies a per-node replace/inline callback, and a recursive driver over nested
+# graph modules. No import-time side effects.
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
@@ -23,6 +28,13 @@ def _replace_with_hop_helper(
     enter_block_node: torch.fx.Node,
     wrap_hoo: HigherOrderOperator,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces a call_module node by a call to the wrap higher-order op. Inserts an attribute fetch of
+    # the submodule, then calls the op with the enter-block node's args, the submodule and the original
+    # call's args. If the submodule outputs a tuple/list, the call's users (item extractions) are renamed and
+    # given the metadata of the corresponding outputs; if it outputs a single node, the submodule output is
+    # changed to a one-element tuple and an item extraction at index zero is added. If the submodule has
+    # no output node the call node is simply erased. Raises NotImplementedError for other output types and
+    # assertion errors for a node without an owning module or non-string target. Mutates the graph.
     graph: torch.fx.Graph = node.graph
     if graph.owning_module is None:
         raise AssertionError("graph.owning_module must not be None")
@@ -32,6 +44,9 @@ def _replace_with_hop_helper(
     sub_gm = getattr(gm, node.target)
 
     def set_hoo_node_meta(call_func_node):
+        # [FUNCTION DOC] HELPER: Fills metadata on the new higher-order-op call node: copies the enter node's module
+        # stack, records the torch function name pair, and sets the value metadata to a tuple of the output
+        # values (from the enclosing output_args, tuple/list or single node). Mutates the node's meta only.
         call_func_node.meta["nn_module_stack"] = copy.copy(
             enter_block_node.meta.get("nn_module_stack", {})
         )
@@ -117,6 +132,12 @@ def _sequential_split_and_maybe_inline_subgraphs_helper(
     graph_signature: ExportGraphSignature | None,
     maybe_inline_or_replace_with_hop: Callable[[torch.fx.Node], None],
 ) -> tuple[torch.fx.GraphModule, ExportGraphSignature | None]:
+    # [FUNCTION DOC] HELPER: Takes a split graph module, an optional signature and a per-node callback. If a signature is
+    # given, makes a shallow copy, verifies the last output node's arg count equals the number of output
+    # specs (assertion error otherwise), and renames spec args to match the new output node names (None
+    # outputs must have a None spec value). Then, with a replace hook for the signature active, applies the
+    # callback to every call_module node, recompiles and lints. Returns the module and the signature copy
+    # (None when no signature was given). Mutates the module.
     """
     Helper function for replacing graph nodes with higher order nodes.
     For each subgraph in `new_gm`, decides whether to construct a HOO subgraph, or inline the calls
@@ -177,6 +198,9 @@ def _replace_with_hop_pass_helper(
         tuple[torch.fx.GraphModule, ExportGraphSignature | None],
     ],
 ) -> tuple[torch.fx.GraphModule, ExportGraphSignature | None]:
+    # [FUNCTION DOC] HELPER: Recursive driver. Applies the given split-and-replace function to the graph module, then for
+    # every attribute node that refers to a graph module, recursively processes it (with no signature) and
+    # stores the result back on the parent. Recompiles and lints, then returns the module and signature.
     """
     Split gm into sub-graph-modules using `sequential_split_and_maybe_inline_subgraphs`, and
     then recursively call itself on each of the submodules.
