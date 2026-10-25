@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Legacy private export package. Exposes the deprecated
+# aot_compile / aot_load pair (export to Torch IR, compile with Inductor to a
+# shared library, load it back as a callable) plus ExportDynamoConfig. Also
+# contains config, converter (TorchScript to export IR), db (ExportDB examples)
+# and error submodules. Importing it pulls in many torch internals but has no
+# other side effects beyond creating a module logger.
 # mypy: allow-untyped-defs
 import copy
 import dataclasses
@@ -57,6 +63,8 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ExportDynamoConfig:
+    # [CLASS DOC] Dataclass of export-specific Dynamo settings; the single field
+    # allow_rnn (default True) controls whether RNN modules are permitted.
     """
     Manage Export-specific configurations of Dynamo.
     """
@@ -67,6 +75,9 @@ class ExportDynamoConfig:
 # is called multiple times.
 @lru_cache
 def aot_compile_warning():
+    # [FUNCTION DOC] HELPER: logs a boxed deprecation warning telling users to
+    # call the inductor package APIs instead of aot_compile/aot_load. Cached, so
+    # the log lines are emitted only on the first call. Returns None.
 
     log.warning("+============================+")
     log.warning("|     !!!   WARNING   !!!    |")
@@ -123,6 +134,16 @@ def aot_compile(
     Returns:
         Path to the generated shared library
     """
+    # [FUNCTION DOC] Deprecated. Exports callable f with example args/kwargs and
+    # optional dynamic_shapes, then compiles it with Inductor under no-grad and
+    # returns the compiled artifact path (a string, or a list of paths).
+    # If the inductor predispatch config is set, uses the pre-dispatch export
+    # and takes its module; otherwise exports to Torch IR with the new tracer
+    # config patched on, honoring disable_constraint_solver and same_signature
+    # and not restoring FQNs. Emits the deprecation warning once.
+    # Raises AssertionError if the result is neither str nor list.
+    # KNOWN ISSUE: remove_runtime_assertions is accepted but never used, and the
+    # docstring omits it and same_signature.
     from torch.export._trace import _export_to_torch_ir
     from torch._inductor.decomposition import select_decomp_table
     from torch._inductor import config as inductor_config
@@ -164,6 +185,12 @@ def aot_load(so_path: str, device: str) -> Callable:
     Returns:
         A callable
     """
+    # [FUNCTION DOC] Deprecated. Loads the shared library at so_path into an AOTI
+    # model container runner chosen by the device string (cpu, cuda[:n],
+    # xpu[:n], mps[:n]) and returns a callable wrapping it. Raises RuntimeError
+    # for any other device. Emits the deprecation warning once.
+    # KNOWN ISSUE: the mps runner is created without the device index, and the
+    # docstring does not document the device argument.
     aot_compile_warning()
 
     if device == "cpu":
@@ -178,6 +205,10 @@ def aot_load(so_path: str, device: str) -> Callable:
         raise RuntimeError("Unsupported device " + device)
 
     def optimized(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: runs the loaded model. Reads the input/output
+        # tree specs from the runner call spec, flattens args plus kwargs
+        # (reordered to the input spec), keeps only tensor leaves, runs the
+        # runner, and unflattens outputs by the output spec. Returns that structure.
         call_spec = runner.get_call_spec()
         in_spec = pytree.treespec_loads(call_spec[0])
         out_spec = pytree.treespec_loads(call_spec[1])

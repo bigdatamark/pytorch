@@ -1,3 +1,7 @@
+# [MODULE DOC] ExportDB case registry: tag taxonomy, SupportLevel enum,
+# the frozen ExportCase dataclass describing one example, global registries of
+# cases/conflicts/rewrites, and decorators to register them. Import-time side
+# effect: only defines empty module-level registries.
 # mypy: allow-untyped-defs
 import inspect
 import re
@@ -33,6 +37,8 @@ _TAGS: dict[str, dict[str, Any]] = {
 
 
 class SupportLevel(Enum):
+    # [CLASS DOC] Enum marking whether an example's feature is handled by export:
+    # SUPPORTED (1) or NOT_SUPPORTED_YET (0).
     """
     Indicates at what stage the feature
     used in the example is handled in export.
@@ -46,6 +52,8 @@ ArgsType = tuple[Any, ...]
 
 
 def check_inputs_type(args, kwargs):
+    # [FUNCTION DOC] Validates example inputs: args must be a tuple, kwargs a
+    # mapping, and every kwargs key a string. Raises ValueError otherwise.
     if not isinstance(args, tuple):
         raise ValueError(
             f"Expecting args type to be a tuple, got: {type(args)}"
@@ -61,6 +69,9 @@ def check_inputs_type(args, kwargs):
             )
 
 def _validate_tag(tag: str):
+    # [FUNCTION DOC] HELPER: checks a dotted tag against the nested tag registry.
+    # Each segment must consist only of lowercase letters and hyphens (else
+    # AssertionError) and must exist at its level of the registry (else ValueError).
     parts = tag.split(".")
     t = _TAGS
     for part in parts:
@@ -74,6 +85,11 @@ def _validate_tag(tag: str):
 
 @dataclass(frozen=True)
 class ExportCase:
+    # [CLASS DOC] Immutable record describing one ExportDB example: the model,
+    # example args/kwargs, optional extra args for generalization testing, a
+    # unique name, description, tags, support level and dynamic shapes.
+    # Invariants checked on construction: input types valid, tags registered,
+    # description a non-empty string.
     example_args: ArgsType
     description: str  # A description of the use case.
     model: torch.nn.Module
@@ -86,6 +102,10 @@ class ExportCase:
     dynamic_shapes: dict[str, Any] | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates the case after construction: checks example
+        # args/kwargs (and extra_args if given) types, validates every tag, and
+        # requires a non-empty string description. Raises ValueError or
+        # AssertionError on failure; no mutation.
         check_inputs_type(self.example_args, self.example_kwargs)
         if self.extra_args is not None:
             check_inputs_type(self.extra_args, {})
@@ -107,6 +127,10 @@ def register_db_case(case: ExportCase) -> None:
     """
     Registers a user provided ExportCase into example bank.
     """
+    # [FUNCTION DOC] Adds case to the global registry keyed by name. If the name
+    # is already registered, the case is not stored there; instead it is appended
+    # to the conflict list for that name (seeded with the original case).
+    # Mutates module-level registries; returns None.
     if case.name in _EXAMPLE_CASES:
         if case.name not in _EXAMPLE_CONFLICT_CASES:
             _EXAMPLE_CONFLICT_CASES[case.name] = [_EXAMPLE_CASES[case.name]]
@@ -117,11 +141,18 @@ def register_db_case(case: ExportCase) -> None:
 
 
 def to_snake_case(name):
+    # [FUNCTION DOC] Converts a CamelCase identifier to lowercase snake_case by
+    # inserting underscores at word boundaries (before capitalized words and
+    # between a lowercase letter/digit and an uppercase letter). Returns the string.
     name = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
     return re.sub("([a-z0-9])([A-Z])", r"\1_\2", name).lower()
 
 
 def _make_export_case(m, name, configs):
+    # [FUNCTION DOC] HELPER: builds an ExportCase for module class m under the
+    # given name from the configs mapping. Raises TypeError if m is not an
+    # nn.Module; if configs has no description, falls back to m's docstring
+    # (AssertionError if that is missing). Returns the new ExportCase.
     if not isinstance(m, torch.nn.Module):
         raise TypeError("Export case class should be a torch.nn.Module.")
 
@@ -140,8 +171,16 @@ def export_case(**kwargs):
     """
     Decorator for registering a user provided case into example bank.
     """
+    # [FUNCTION DOC] Decorator factory: keyword arguments become ExportCase
+    # fields. The returned decorator registers the decorated module class as a
+    # case named after its defining module's last name component and returns
+    # the ExportCase (replacing the class).
 
     def wrapper(m):
+        # [FUNCTION DOC] HELPER: performs the registration. Raises RuntimeError
+        # if the defining module already registered a case (one per file) and
+        # AssertionError if the module cannot be determined. Records the module
+        # in the global module set and registers the case.
         configs = kwargs
         module = inspect.getmodule(m)
         if module in _MODULES:
@@ -159,7 +198,14 @@ def export_case(**kwargs):
 
 
 def export_rewrite_case(**kwargs):
+    # [FUNCTION DOC] Decorator factory for registering a rewritten (fixed)
+    # variant of an existing case. Keyword arguments must include parent, an
+    # ExportCase; the rest become ExportCase fields.
     def wrapper(m):
+        # [FUNCTION DOC] HELPER: removes parent from the options (mutating the
+        # shared kwargs mapping), asserts it is an ExportCase, copies its example
+        # args, builds a case named by the snake-case class name, appends it to
+        # the rewrite list under the parent's name and returns it.
         configs = kwargs
 
         parent = configs.pop("parent")

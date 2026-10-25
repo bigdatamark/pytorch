@@ -1,12 +1,21 @@
+# [MODULE DOC] ExportDB example: forward with positional, tuple, variadic
+# positional, keyword-only and variadic keyword parameters. Defines
+# example_args, example_kwargs, tags and model.
 # mypy: allow-untyped-defs
 import torch
 
 class FnWithKwargs(torch.nn.Module):
+    # [CLASS DOC] Stateless example module multiplying all of its inputs together.
+    # KNOWN ISSUE: the docstring says keyword arguments are unsupported, yet the
+    # case is registered with the default supported level and example kwargs.
     """
     Keyword arguments are not supported at the moment.
     """
 
     def forward(self, pos0, tuple0, *myargs, mykw0, **mykwargs):
+        # [FUNCTION DOC] Multiplies pos0 by every tensor in tuple0, every extra
+        # positional tensor, the keyword-only tensor mykw0, and the extra
+        # keyword tensors input0 and input1 (KeyError if absent). Returns the product.
         out = pos0
         for arg in tuple0:
             out = out * arg

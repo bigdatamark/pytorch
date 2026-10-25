@@ -1,3 +1,6 @@
+# [MODULE DOC] Command-line helper that scaffolds a new ExportDB example file
+# from a template. Run as a script with the case name; nothing happens at
+# import time except importing the examples package.
 import os
 import sys
 
@@ -13,6 +16,10 @@ def {case_name}(x):
 '''
 
 if __name__ == "__main__":
+    # Script entry: requires exactly one argument (the case name), else raises
+    # an AssertionError. Derives the examples directory from the package name,
+    # asserts it exists, and writes a new file named after the case containing
+    # the template with the case name substituted; prints the target path.
     if len(sys.argv) != 2:
         raise AssertionError(f"expected 2 arguments, got {len(sys.argv)}")
     root_dir = examples.__name__.replace(".", "/")

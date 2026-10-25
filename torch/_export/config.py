@@ -1,3 +1,7 @@
+# [MODULE DOC] Configuration flags for torch.export (new tracer toggle, fake
+# tensor leak detection, lifted-constant errors, auto_functionalized_v2,
+# legacy dynamo capture). Import-time side effect: install_config_module
+# replaces this module with a patchable config module (supports patch()).
 """
 Configuration module for torch.export.export.
 
@@ -39,7 +43,10 @@ use_legacy_dynamo_graph_capture = True
 if TYPE_CHECKING:
     from torch.utils._config_typing import *  # noqa: F403
 
-    def _make_closure_patcher(**changes: Any) -> Any: ...
+    def _make_closure_patcher(**changes: Any) -> Any:
+        # [FUNCTION DOC] HELPER: type-checking-only stub (body is an ellipsis);
+        # declares the patcher factory that install_config_module provides.
+        ...
 
 
 install_config_module(sys.modules[__name__])

@@ -1,3 +1,6 @@
+# [MODULE DOC] ExportDB example: passing a list of tensors as cond operands with
+# a dynamic first dimension on x. Defines example_args, tags, extra_inputs,
+# dynamic_shapes and model (module-level tensors x, y and Dim dim0_x).
 # mypy: allow-untyped-defs
 import torch
 
@@ -8,6 +11,7 @@ y = torch.randn(2)
 dim0_x = Dim("dim0_x")
 
 class CondOperands(torch.nn.Module):
+    # [CLASS DOC] Stateless example module running cond with operands x and y.
     """
     The operands passed to cond() must be:
     - a list of tensors
@@ -17,10 +21,14 @@ class CondOperands(torch.nn.Module):
     """
 
     def forward(self, x, y):
+        # [FUNCTION DOC] Runs torch.cond on whether the first dimension of x
+        # exceeds 2, with operands x and y. Returns x plus y or x minus y.
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         def false_fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x minus y.
             return x - y
 
         return torch.cond(x.shape[0] > 2, true_fn, false_fn, [x, y])

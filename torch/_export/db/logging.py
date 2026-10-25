@@ -1,5 +1,13 @@
+# [MODULE DOC] Helpers that turn export failures into ExportDB references:
+# message builder for a case name and a classifier for dynamo errors.
+# No import-time side effects.
 
 def exportdb_error_message(case_name: str) -> str:
+    # [FUNCTION DOC] Builds a user-facing message for case_name. If the name is
+    # a registered ExportDB example, returns text pointing to the docs page with
+    # underscores in the name turned into hyphens in the anchor. Otherwise logs
+    # a usage event (export.error.casenotregistered) and returns a plain
+    # "unsupported" message. Imports lazily to avoid cycles.
     from .examples import all_examples
     from torch._utils_internal import log_export_usage
 
@@ -22,6 +30,11 @@ def get_class_if_classified_error(e: Exception) -> str | None:
     Returns a string case name if the export error e is classified.
     Returns None otherwise.
     """
+    # [FUNCTION DOC] Classifies exception e. Only exact types in an allow list
+    # count: Unsupported and UserError are classified when they carry a case_name
+    # attribute (that value is returned, or None if absent); TorchRuntimeError
+    # is always classified and returns the constant string "always_classified".
+    # Any other exception type returns None. No side effects.
 
     from torch._dynamo.exc import TorchRuntimeError, Unsupported, UserError
 

@@ -1,14 +1,19 @@
+# [MODULE DOC] ExportDB example: unpacking a list input with star syntax.
+# Defines example_args, tags and model.
 # mypy: allow-untyped-defs
 
 import torch
 
 class ListUnpack(torch.nn.Module):
+    # [CLASS DOC] Stateless example module unpacking a list of tensors.
     """
     Lists are treated as static construct, therefore unpacking should be
     erased after tracing.
     """
 
     def forward(self, args: list[torch.Tensor]):
+        # [FUNCTION DOC] Splits the list into its first element and the rest and
+        # returns the first element plus the second element of the list.
         """
         Lists are treated as static construct, therefore unpacking should be
         erased after tracing.
