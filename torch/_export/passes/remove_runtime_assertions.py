@@ -1,14 +1,23 @@
+# [MODULE DOC]
+# Defines _RemoveRuntimeAssertionsPass, which deletes unused runtime assertion
+# nodes from an exported graph module. No import-time side effects.
 import torch
 from torch.fx.passes.infra.pass_base import PassBase, PassResult
 
 
 class _RemoveRuntimeAssertionsPass(PassBase):
+    # [CLASS DOC] HELPER: Stateless pass that strips runtime assertion nodes
+    # previously inserted by the inline-constraints assertion pass.
     """
     Remove runtime assertions inserted by the
     _AddRuntimeAssertionsForInlineConstraintsPass.
     """
 
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
+        # [FUNCTION DOC] Walk every GraphModule (including submodules) and erase assertion
+        # nodes (async/scalar asserts, range constraints, tensor metadata asserts)
+        # that have no users. Mutates graphs in place; no DCE or recompile is done.
+        # Returns PassResult with the same module and whether anything was erased.
         modified = False
         for module in graph_module.modules():
             if not isinstance(module, torch.fx.GraphModule):

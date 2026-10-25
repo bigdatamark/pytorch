@@ -1,3 +1,8 @@
+# [MODULE DOC] Deprecated base class for interpreter-based export passes
+# (_ExportPassBaseDeprecatedDoNotUse) plus the tracer and interpreter helpers that
+# rebuild a graph while attaching fake-tensor metadata, and type aliases Argument,
+# Value, Fn and PassType. Exports only the base class. Import-time side effects: builds
+# the set of torch symbolic function targets.
 # mypy: allow-untyped-defs
 import operator
 import traceback
@@ -51,10 +56,20 @@ _TORCH_SYM_OPS: set[Callable] = {
 
 
 class ExportPassBaseError(RuntimeError):
+    # [CLASS DOC] Error type raised for unsupported or misused operations in the export
+    # pass base class (plain RuntimeError subclass, no state).
     pass
 
 
 class _ExportPassBaseDeprecatedDoNotUse(PassBase):
+    # [CLASS DOC] HELPER: Deprecated base class for interpreter-based export passes.
+    # Subclasses override hooks such as placeholder, call_operator, call_cond, call_map,
+    # output and on_attr; the base class re-traces the graph through an interpreter plus
+    # an ExportTracer so that every new node gets fake-tensor val and tensor_meta
+    # metadata. State: interpreter (used to compute result values), tracer (builds the
+    # new graph), fake_tensor_mode, node_debug_str (text of the node being processed)
+    # and _initialized (set by __init__, checked by call). Key methods: call,
+    # call_submodule, _fx, inputs.
     """
     Interpreter-based pass class to help users maintain the IR spec while writing
     transformations.
@@ -62,12 +77,24 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
 
     @staticmethod
     def _create_dummy_node_metadata():
+        # [FUNCTION DOC] HELPER: Static method returning a NodeMetadata with a
+        # stack_trace string generated from the current call stack (one frame), for
+        # nodes that have no original metadata.
         return NodeMetadata({"stack_trace": "".join(traceback.format_stack(limit=1))})
 
     class ExportTracer(PythonKeyTracer):
+        # [CLASS DOC] HELPER: PythonKeyTracer subclass used to build the new graph
+        # during a pass. State: callback (the owning pass), root (a plain Module holding
+        # submodules and attributes), graph (the new Graph using the given codegen),
+        # tensor_attrs, fake_tensor_mode and submodules (map from module to its
+        # registered name submodule_N). Tracing from a function is unsupported; nodes
+        # are created via create_proxy by the pass.
         def __init__(
             self, callback: "_ExportPassBaseDeprecatedDoNotUse", codegen: CodeGen
         ) -> None:
+            # [FUNCTION DOC] HELPER: Create the tracer for the given pass callback, with
+            # an empty root module, a new graph using the supplied codegen, and empty
+            # attribute/submodule tables.
             super().__init__()
             self.callback = callback
             self.root = torch.nn.Module()
@@ -78,9 +105,17 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             self.submodules: dict[torch.nn.Module, str] = {}
 
         def trace(self) -> None:  # type: ignore[override]
+            # [FUNCTION DOC] HELPER: Always raises ExportPassBaseError; this tracer
+            # cannot trace a function.
             raise ExportPassBaseError("ExportTracer doesn't support trace().")
 
         def create_arg(self, a: Argument) -> torch.fx.Node:
+            # [FUNCTION DOC] HELPER: Convert a Python argument into a graph argument.
+            # Modules are registered once on the root module under a generated name.
+            # Fake tensors must carry a real fake constant, which replaces them
+            # (otherwise raises ExportPassBaseError). Tensors that become get_attr nodes
+            # get metadata set and trigger the pass on_attr callback. Returns the
+            # resulting Node or argument structure.
             if isinstance(a, torch.nn.Module):
                 if a not in self.submodules:
                     name_submodule = f"submodule_{len(self.submodules)}"
@@ -105,6 +140,14 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             node: torch.fx.Node,
             value: Argument,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Fill node meta val and tensor_meta from a (possibly
+            # nested) value. val: fake tensors are kept; real tensors are converted to
+            # fake tensors with the tracer fake mode (parameters with static shapes;
+            # quantized tensors are dequantized first); symbolic and primitive scalars
+            # are kept; anything else becomes None. Tensors that cannot be fakeified
+            # (subclasses) print a message and get None as val plus an extracted
+            # TensorMetadata entry in tensor_meta. Mutates node.meta. Raises
+            # AssertionError if the fake tensor mode is unset when needed.
             # propagate the fake tensor or sym nodes
             def make_val(
                 x: Argument,
@@ -119,6 +162,8 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
                 | str
                 | None
             ):
+                # [FUNCTION DOC] HELPER: Map one leaf to its meta val as described by
+                # set_metadata. Prints a notice on unsupported tensor subclasses.
                 if isinstance(x, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
                     return x
                 elif isinstance(x, torch.Tensor):
@@ -166,6 +211,9 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
 
             # Set the tensor_metadata for values that do not have a corresponding FakeTensor
             def make_tensor_meta(x: Argument) -> TensorMetadata | None:
+                # [FUNCTION DOC] HELPER: For real tensors that cannot be fakeified,
+                # return extracted TensorMetadata; return None for fake tensors,
+                # fakeifiable tensors and non-tensors.
                 if not is_fake_tensor(x) and isinstance(x, torch.Tensor):
                     if x.is_quantized:
                         # TODO (tmanlaibaatar) properly support Quantized FakeTensor
@@ -187,9 +235,15 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             node.meta["tensor_meta"] = pytree.tree_map(make_tensor_meta, value)
 
     class ExportInterpreter(fx.Interpreter):
+        # [CLASS DOC] HELPER: fx.Interpreter subclass that forwards each node kind to
+        # the pass callbacks. State: callback (the pass) and node (the node currently
+        # executing, used to supply original metadata). call_module and call_method are
+        # rejected.
         def __init__(
             self, callback: "_ExportPassBaseDeprecatedDoNotUse", gm: fx.GraphModule
         ) -> None:
+            # [FUNCTION DOC] HELPER: Initialize the interpreter on gm, remember the pass
+            # and start with the first node as the current node.
             super().__init__(gm)
             self.callback = callback
             self.node: torch.fx.Node = next(iter(gm.graph.nodes))
@@ -201,6 +255,9 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> ProxyValue:
+            # [FUNCTION DOC] HELPER: Run the default placeholder handling to get the
+            # input value, then call the pass placeholder hook with the current node
+            # metadata. Returns the ProxyValue.
             arg = super().placeholder(target, args, kwargs)
             return self.callback.placeholder(target, arg, NodeMetadata(self.node.meta))
 
@@ -210,6 +267,9 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> ProxyValue:
+            # [FUNCTION DOC] HELPER: Call the pass output hook with the output argument
+            # and current node metadata, and return the data field of the resulting
+            # ProxyValue.
             return self.callback.output(args[0], NodeMetadata(self.node.meta)).data  # type: ignore[return-value]
 
         def call_function(
@@ -218,6 +278,12 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> ProxyValue:
+            # [FUNCTION DOC] HELPER: Dispatch a call_function node to the matching pass
+            # hook: getitem to call_getitem; operator/builtins/math functions and torch
+            # sym ops to call_sym; OpOverload or packets to call_operator; higher-order
+            # cond to call_cond; map_impl to call_map; other HigherOrderOperators are
+            # re-emitted directly through the _fx helper. Raises ExportPassBaseError for
+            # any other target type.
             meta = NodeMetadata(self.node.meta)
 
             if target is operator.getitem:
@@ -268,6 +334,8 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> Argument:
+            # [FUNCTION DOC] HELPER: Delegate to the default interpreter get_attr
+            # behavior (no extra handling).
             return super().get_attr(target, args, kwargs)
 
         def call_module(
@@ -276,6 +344,8 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Always raises ExportPassBaseError (call_module
+            # unsupported).
             raise ExportPassBaseError("call_module is not supported.")
 
         def call_method(  # type: ignore[override]
@@ -284,14 +354,22 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
             args: tuple[Argument, ...],
             kwargs: dict[str, Argument],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Always raises ExportPassBaseError (call_method
+            # unsupported).
             raise ExportPassBaseError("call_method is not supported.")
 
         def run_node(self, n: torch.fx.Node) -> Argument:
+            # [FUNCTION DOC] HELPER: Record n as the current node and store its
+            # formatted text on the pass for debugging, then run it with the default
+            # behavior. Returns the node result.
             self.node = n
             self.callback.node_debug_str = n.format_node()
             return super().run_node(n)
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Set up the pass: a PropagateUnbackedSymInts interpreter over an
+        # empty graph module, a new ExportTracer with a default codegen, no fake tensor
+        # mode yet, the initialized flag, and no debug string.
         self.interpreter = PropagateUnbackedSymInts(
             torch.fx.GraphModule(torch.nn.Module(), torch.fx.Graph())
         )
@@ -308,6 +386,13 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         kwargs: dict[str, Argument],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] HELPER: Core node-emission helper. Runs the underlying
+        # interpreter method of the given kind on the concrete data of args to compute
+        # the result data, then creates a proxy for the node in the new graph using the
+        # proxies of the args (op overloads get a name from the overload packet). Copies
+        # meta into the node, records unbacked symbol bindings when a shape env exists,
+        # sets val/tensor_meta from the result, and returns a ProxyValue pairing data
+        # and proxy.
         args_data, kwargs_data = pytree.tree_map_only(
             ProxyValue, lambda x: x.data, (args, kwargs)
         )
@@ -331,12 +416,20 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         return ProxyValue(res_data, res_proxy)
 
     def inputs(self, graph_module: torch.fx.GraphModule) -> list[Argument]:
+        # [FUNCTION DOC] Compute example inputs for a graph module: use args stored in
+        # the module meta if present; otherwise for each placeholder use its meta val
+        # (preferring its fake constant), else build a fake tensor from tensor_meta,
+        # else None for unused placeholders. Raises ExportPassBaseError if an input
+        # cannot be constructed, AssertionError if a fake mode is required but unset.
+        # Returns a list.
         # TODO(angelayi): Update this with what we decide to do for metadata in
         # the exported graph module
         if (args := graph_module.meta.get("args", None)) is not None:
             return list(args)
 
         def extract_input(node: torch.fx.Node) -> FakeTensor | None:
+            # [FUNCTION DOC] HELPER: Produce the example value for one placeholder node
+            # as described by inputs.
             if "val" in node.meta:
                 fake = node.meta["val"]
                 if hasattr(fake, "constant") and fake.constant is not None:
@@ -369,9 +462,14 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         ]
 
     def on_attr(self, attr: ProxyValue) -> None:
+        # [FUNCTION DOC] Hook called when a tensor attribute is added to the graph;
+        # default does nothing.
         pass
 
     def placeholder(self, name: str, arg: Argument, meta: NodeMetadata) -> ProxyValue:
+        # [FUNCTION DOC] Hook creating a placeholder node named name in the new graph
+        # with the given metadata and a val derived from arg. Returns a ProxyValue of
+        # arg and the new proxy.
         arg_proxy = self.tracer.create_proxy("placeholder", name, (), {})
         arg_proxy.node.meta = meta.data
         self.tracer.set_metadata(arg_proxy.node, arg)
@@ -384,6 +482,8 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         kwargs: dict[str, Argument],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] Hook for a call to an operator overload: emit it through _fx
+        # and return the ProxyValue. Subclasses override to rewrite ops.
         return self._fx("call_function", op, args, kwargs, meta)
 
     def call_sym(
@@ -392,6 +492,8 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         args: tuple[Argument, ...],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] Hook for a symbolic or builtin function call with positional
+        # args only; emitted through _fx.
         return self._fx("call_function", target, args, {}, meta)
 
     def call_cond(
@@ -402,6 +504,10 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         inputs: list[Argument],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] Hook for the cond higher-order op: re-traces both branch
+        # submodules with the given inputs through call_submodule and emits a cond node
+        # with the new branch modules. Raises AssertionError if a branch yields nothing.
+        # Returns a ProxyValue.
         true_branch = self.call_submodule(true_fn, tuple(inputs))
         false_branch = self.call_submodule(false_fn, tuple(inputs))
         if true_branch is None:
@@ -423,6 +529,10 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         operands: list[ProxyValue],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] Hook for map_impl: unstack the mapped arguments to build
+        # example inputs, re-trace the body submodule via call_submodule with them and
+        # the operands, then emit a map_impl node with the new body. Raises
+        # AssertionError if retracing yields nothing.
         xs = _unstack_pytree([arg.data for arg in mapped_args])[0]
         f_branch = self.call_submodule(f, tuple(xs + [arg.data for arg in operands]))
         if f_branch is None:
@@ -438,14 +548,27 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
     def call_getitem(
         self, value: ProxyValue, key: int, meta: NodeMetadata
     ) -> ProxyValue:
+        # [FUNCTION DOC] Hook for indexing a value by key; emitted through _fx as a
+        # getitem call.
         return self._fx("call_function", operator.getitem, (value, key), {}, meta)
 
     def output(self, results: list[Argument], meta: NodeMetadata) -> ProxyValue:
+        # [FUNCTION DOC] Hook emitting the graph output node for the results through
+        # _fx.
         return self._fx("output", "output", (results,), {}, meta)
 
     def call_submodule(
         self, graph_module: fx.GraphModule, inputs: tuple[Argument, ...]
     ) -> PassResult:
+        # [FUNCTION DOC] Re-trace a graph module with the given inputs using the pass
+        # hooks. Temporarily swaps in a new tracer (sharing the fake tensor mode) and a
+        # plain interpreter over an empty module, runs an ExportInterpreter with the
+        # input data while preserving node meta, builds a new GraphModule from the
+        # traced graph and restores the previous tracer and interpreter. Returns
+        # PassResult with the new module and modified True.
+        # KNOWN ISSUE: the return annotation is PassResult but callers treat the result
+        # as possibly None; the previous tracer is not restored if the interpreter
+        # raises.
         prev_tracer, self.tracer = (
             self.tracer,
             self.ExportTracer(self, graph_module.graph._codegen),
@@ -473,6 +596,12 @@ class _ExportPassBaseDeprecatedDoNotUse(PassBase):
         )
 
     def call(self, graph_module: fx.GraphModule) -> PassResult:
+        # [FUNCTION DOC] Entry point of the pass. Raises ExportPassBaseError if __init__
+        # was not called. Builds example inputs, detects a single fake tensor mode among
+        # them (raises AssertionError if several), otherwise creates a fresh
+        # FakeTensorMode allowing non-fake inputs; enables the python dispatcher when a
+        # fake mode exists. Then re-traces the module under that mode via call_submodule
+        # and returns its PassResult.
         if not getattr(self, "_initialized", False):
             raise ExportPassBaseError(
                 "ExportPass is not initialized with __init__().",

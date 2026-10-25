@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Utilities used by draft_export for custom operators with generated fake kernels:
+# inserting tensor-metadata guards before their calls and collecting op profiles.
+# No import-time side effects.
 import functools
 from collections import defaultdict
 
@@ -10,6 +14,12 @@ from torch._library.fake_profile import OpProfile, TensorMetadata
 
 
 def insert_custom_op_guards(gm: torch.fx.GraphModule, ops_to_guard: set[str]) -> None:
+    # [FUNCTION DOC] For each call_function node whose target name is in ops_to_guard,
+    # insert before it an aten _assert_tensor_metadata call for every Tensor-valued
+    # Node argument (positional or keyword), asserting the dtype, device and layout
+    # recorded in that argument's meta val. New nodes get metadata via the node
+    # metadata hook (copying the guarded node's stack_trace). Mutates gm in place and
+    # recompiles it; returns None.
     """
     This is used by draft_export to insert guards in front of calls to custom
     operators which have a generated fake kernel.
@@ -47,12 +57,19 @@ def insert_custom_op_guards(gm: torch.fx.GraphModule, ops_to_guard: set[str]) ->
 def get_op_profiles(
     gm: torch.fx.GraphModule, ops_to_guard: set[str]
 ) -> dict[str, set[OpProfile]]:
+    # [FUNCTION DOC] Collect, per custom op name in ops_to_guard, the set of observed
+    # OpProfile entries (tensor metadata of the Node arguments and of the output) from
+    # call_function nodes in gm. Non-Node arguments are recorded as missing entries.
+    # Raises AssertionError if a matching node lacks meta val or its output is neither
+    # a tensor nor a list/tuple. Returns a mapping from op name to set of profiles.
     """
     This is used by draft_export to get a list of custom operator profiles so
     that we can generate fake kernels.
     """
 
     def _get_op_profile(node: torch.fx.Node) -> OpProfile:
+        # [FUNCTION DOC] HELPER: Build an OpProfile from one node: argument tensor
+        # metadata plus output tensor metadata (single or per-element for sequences).
         args_profile = tuple(
             TensorMetadata.maybe_from_tensor(arg.meta.get("val"))
             if isinstance(arg, torch.fx.Node)

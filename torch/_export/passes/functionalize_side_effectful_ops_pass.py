@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines _FunctionalizeSideEffectfulOpsPass and its op mapping table, converting
+# non-functional constraint/assert ops into token-threaded functional ones.
+# No import-time side effects beyond resolving torch.ops.aten.
 import copy
 
 import torch
@@ -20,6 +24,11 @@ _NON_FUNCTIONAL_TO_FUNCTIONAL_SIDE_EFFECTFUL_FUNCS: dict[OpOverload, OpOverload]
 
 
 class _FunctionalizeSideEffectfulOpsPass(_ExportPassBaseDeprecatedDoNotUse):
+    # [CLASS DOC] HELPER: Export pass replacing side-effectful assertion ops
+    # (sym_constrain_range, _assert_async) with functional variants that thread a
+    # dep_token value, which is appended to the graph outputs. State: _dep_token (the
+    # latest token ProxyValue, or None) and _next_dep_token_index (counter used to name
+    # tokens dep_token0, dep_token1, ...).
     """
     Functionalize ops with side effect in graph module by replacing the op with
     functional version of it. A new dependency token (`dep_token`) will be
@@ -43,11 +52,15 @@ class _FunctionalizeSideEffectfulOpsPass(_ExportPassBaseDeprecatedDoNotUse):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize the base pass and clear dep token state.
         super().__init__()
         self._dep_token: ProxyValue | None = None
         self._next_dep_token_index: int | None = None
 
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
+        # [FUNCTION DOC] Run the pass on a deep copy of graph_module. If no node targets a
+        # non-functional side-effectful op, returns the input unmodified with
+        # modified False. Otherwise resets token state and delegates to the base pass.
         # Early return if no non-functional assertions.
         if not any(
             n.target in _NON_FUNCTIONAL_TO_FUNCTIONAL_SIDE_EFFECTFUL_FUNCS
@@ -67,6 +80,11 @@ class _FunctionalizeSideEffectfulOpsPass(_ExportPassBaseDeprecatedDoNotUse):
         kwargs: dict[str, Argument],
         meta: NodeMetadata,
     ) -> ProxyValue:
+        # [FUNCTION DOC] Rewrite one operator call. Ops outside the replacement table pass
+        # through unchanged. For table ops, lazily create the initial token node
+        # (named dep_token0) with a make_dep_token call, then emit the functional
+        # variant with the current token as an extra keyword argument, name the result
+        # dep_token<N>, and make it the current token. Returns that ProxyValue.
         if op not in _NON_FUNCTIONAL_TO_FUNCTIONAL_SIDE_EFFECTFUL_FUNCS:
             return super().call_operator(op, args, kwargs, meta)
 
@@ -94,6 +112,8 @@ class _FunctionalizeSideEffectfulOpsPass(_ExportPassBaseDeprecatedDoNotUse):
         return self._dep_token
 
     def output(self, results: list[Argument], meta: NodeMetadata) -> ProxyValue:
+        # [FUNCTION DOC] Emit the graph output with the final dep token appended after
+        # the original results. Raises AssertionError if no token was ever created.
         if self._dep_token is None:
             raise AssertionError("_dep_token must not be None")
 

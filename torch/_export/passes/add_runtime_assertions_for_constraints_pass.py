@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Pass that adds runtime assertions for inline (unbacked symint) constraints to an
+# exported graph, plus helpers to convert sympy ranges and to find assertions
+# already present. Exports InputDim. No import-time side effects.
 # mypy: allow-untyped-defs
 import math
 import operator
@@ -23,11 +27,16 @@ __all__ = ["InputDim"]
 
 
 class InputDim(NamedTuple):
+    # [CLASS DOC] Named pair identifying a dimension of a named graph input:
+    # input_name (str) and dim (int index). Plain immutable record, no behavior.
     input_name: str
     dim: int
 
 
 def _convert_to_int(val):
+    # [FUNCTION DOC] HELPER: Convert a sympy bound to a Python number. Positive and
+    # negative infinity (sympy or int_oo) map to float infinities, sympy Integer maps
+    # to int. Raises RuntimeError for anything else (non-integer expressions).
     # Convert simple sympy Integers into concrete int
     if val in (sympy.oo, int_oo):
         return math.inf
@@ -39,6 +48,9 @@ def _convert_to_int(val):
 
 
 def _convert_range_to_int(range: ValueRanges):
+    # [FUNCTION DOC] HELPER: Convert a ValueRanges into a (min, max) pair of Python
+    # numbers via the scalar conversion helper. Raises AssertionError if the argument
+    # is not a ValueRanges and RuntimeError for non-integer bounds.
     if not isinstance(range, ValueRanges):
         raise AssertionError(f"expected ValueRanges, got {type(range)}")
     min_val = _convert_to_int(range.lower)
@@ -47,16 +59,28 @@ def _convert_range_to_int(range: ValueRanges):
 
 
 class _AddRuntimeAssertionsForInlineConstraintsPass(PassBase):
+    # [CLASS DOC] HELPER: Pass that inserts runtime range assertions (compare, scalar
+    # tensor, assert_async chains) for unbacked symbolic ints appearing in node meta
+    # values, either directly or as tensor shape dims. State: range_constraints
+    # (symbol to ValueRanges), _asserts_generated_unbacked_symbols (symbols already
+    # asserted, to avoid duplicates), counter (number of assert chains inserted) and
+    # existing_inline_assertions (set during call). Key method: call.
     def __init__(
         self,
         range_constraints: dict[sympy.Symbol, ValueRanges],
     ):
+        # [FUNCTION DOC] Store the symbol to range mapping and initialize the set of
+        # already-asserted symbols and the insertion counter to empty/zero.
         super().__init__()
         self.range_constraints: dict[sympy.Symbol, ValueRanges] = range_constraints
         self._asserts_generated_unbacked_symbols: set[sympy.Symbol] = set()
         self.counter = 0
 
     def _assert_range_constraint(self, node, lower, upper, assert_msg):
+        # [FUNCTION DOC] HELPER: Insert after node a lower-bound assertion (when lower is
+        # finite) and an upper-bound assertion (when upper is finite) on the value of
+        # node, each via the assert insertion helper and chained after the previous.
+        # Mutates the graph; returns nothing.
         last_node = node
         if lower > -math.inf:
             last_node = self._insert_assert_async(
@@ -69,6 +93,10 @@ class _AddRuntimeAssertionsForInlineConstraintsPass(PassBase):
             )
 
     def _insert_assert_async(self, last_node, op, lower, upper, assert_msg):
+        # [FUNCTION DOC] HELPER: After last_node, add three call_function nodes: the
+        # comparison op applied to the two operands (named lower and upper, which are
+        # really just left/right operands), a scalar_tensor of that result, and an
+        # assert_async with the message. Increments counter and returns the assert node.
         """
         Inserts assert_async call_function nodes in the graph. This function is
         called **during** the interpreter-based pass.
@@ -90,6 +118,14 @@ class _AddRuntimeAssertionsForInlineConstraintsPass(PassBase):
         return assert_async
 
     def call(self, graph_module) -> PassResult:
+        # [FUNCTION DOC] Compute existing inline assertions, then for every call_function
+        # node with a meta val in every GraphModule, find unbacked symbolic ints in the
+        # val (directly, or in tensor shape dims, recursing) not yet asserted and insert
+        # range assertions (shape dims go through a created size node). Recompiles each
+        # module. If nothing was inserted and the class is exactly this pass, returns the
+        # module unmodified. Otherwise fills missing stack_trace on non-placeholder,
+        # non-output nodes with a dummy value and returns a modified PassResult.
+        # Raises KeyError if an unbacked symbol is missing from range_constraints.
         self.existing_inline_assertions = _get_existing_inline_assertions(
             graph_module, self.range_constraints
         )
@@ -115,6 +151,12 @@ class _AddRuntimeAssertionsForInlineConstraintsPass(PassBase):
                 # need the proxy for shape, which further requires the proxy for ret[1], etc.
 
                 def add_assertions(val):
+                    # [FUNCTION DOC] HELPER: Recursively collect parallel lists of
+                    # insertion callbacks and error-message suffixes for a value. Symbolic
+                    # values that are unbacked, not already asserted, yield a range
+                    # assertion callback and message (symbol recorded as asserted); tensors
+                    # recurse on each shape dim, wrapping callbacks to first create a size
+                    # node. Other values yield empty lists.
                     call_backs: list[Callable] = []
                     messages: list[str] = []
                     if isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)):
@@ -147,6 +189,8 @@ class _AddRuntimeAssertionsForInlineConstraintsPass(PassBase):
                             for cb, msg in zip(cbs, msgs):
 
                                 def sym_size_cb(node, assert_msg, dim):
+                                    # [FUNCTION DOC] HELPER: Create a size node for dim
+                                    # after node, then run the wrapped callback on it.
                                     with node.graph.inserting_after(node):
                                         dim_node = module.graph.create_size_node(  # type: ignore[union-attr]
                                             node, dim
@@ -185,6 +229,11 @@ def _get_existing_inline_assertions(
     graph_module: torch.fx.GraphModule,
     range_constraints: dict[sympy.Symbol, ValueRanges],
 ) -> dict[sympy.Symbol, ValueRanges]:
+    # [FUNCTION DOC] HELPER: Scan all GraphModules for assert_scalar nodes whose
+    # condition is a le/ge comparison between a symbolic int and an integer constant,
+    # and return a mapping from symbol to the intersected ValueRanges those asserts
+    # already enforce (starting from unbounded). Unrecognized assert shapes are skipped.
+    # Raises RuntimeError if a matched symbol is absent from range_constraints.
     existing_inline_assertions: dict[sympy.Symbol, ValueRanges] = {}
 
     for module in graph_module.modules():
@@ -212,6 +261,8 @@ def _get_existing_inline_assertions(
             lhs, rhs = compare_arg.args
 
             def maybe_get_symint(x):
+                # [FUNCTION DOC] HELPER: Return the sympy expression of the node's
+                # SymInt meta val if x is such a node, else x unchanged.
                 if (
                     isinstance(x, torch.fx.Node)
                     and "val" in x.meta

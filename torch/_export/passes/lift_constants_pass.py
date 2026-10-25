@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Lifts constants (tensors, script objects, opaque objects) referenced via get_attr
+# in an exported graph into graph inputs, updating the graph signature. Contains
+# ConstantAttrMap (constant-keyed alias map), lift_constants_pass and helpers.
+# No import-time side effects beyond creating a logger.
 # mypy: allow-untyped-defs
 import collections
 import logging
@@ -29,6 +34,12 @@ log = logging.getLogger(__name__)
 
 
 class ConstantAttrMap(collections.abc.MutableMapping):
+    # [CLASS DOC] Mutable mapping from module constants (tensors, FakeScriptObjects,
+    # opaque objects, ScriptObjects) to a list of values (typically FQNs or placeholder
+    # nodes), supporting aliasing where one constant has several entries. State:
+    # _constant_attrs (key to list; ScriptObjects keyed by their hash) and
+    # _script_object_map (hash to the original ScriptObject, so iteration yields the
+    # objects). Direct item assignment is unsupported; use add.
     """A mapping class that understands how to use module constants (tensors,
     ScriptObjects, FakeScriptObjects, opaque objects) as keys. We store tensors,
     FakeScriptObjects, and opaque objects normally, but ScriptObjects are stored
@@ -38,6 +49,7 @@ class ConstantAttrMap(collections.abc.MutableMapping):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create empty storage and an empty ScriptObject lookup table.
         # Underlying dict that we use to implement this mapping.
         self._constant_attrs: dict[
             int | torch.Tensor | FakeScriptObject | torch.utils._pytree.TreeSpec,
@@ -49,6 +61,8 @@ class ConstantAttrMap(collections.abc.MutableMapping):
         self._script_object_map: dict[int, torch.ScriptObject] = {}
 
     def __getitem__(self, key: _ConstantAttributeType) -> Any:
+        # [FUNCTION DOC] Return the list of values for key (ScriptObjects looked up by
+        # hash). Raises AssertionError for unsupported key types and KeyError if absent.
         real_key = hash(key) if isinstance(key, torch.ScriptObject) else key
         if not isinstance(
             real_key, (int, torch.Tensor, FakeScriptObject)
@@ -59,6 +73,7 @@ class ConstantAttrMap(collections.abc.MutableMapping):
         return self._constant_attrs[real_key]
 
     def __setitem__(self, key: _ConstantAttributeType, value):
+        # [FUNCTION DOC] Always raises NotImplementedError; callers must use add.
         # we shouldn't actually call this, should go to add() instead to handle aliasing
         raise NotImplementedError(
             """Directly setting values for ConstantAttrMap is not supported, please use add(key, value) instead.
@@ -66,6 +81,10 @@ The same key can be mapped to multiple values, for handling constant aliasing.""
         )
 
     def add(self, key: _ConstantAttributeType, value: Any) -> None:
+        # [FUNCTION DOC] Append value to the list for key, creating it if needed.
+        # ScriptObject keys are stored by hash and remembered for iteration. Tensor,
+        # FakeScriptObject and opaque-class keys are stored directly. Raises TypeError
+        # for other key types. Mutates the map.
         if isinstance(key, torch.ScriptObject):
             if hash(key) not in self._constant_attrs:
                 self._constant_attrs[hash(key)] = []
@@ -83,11 +102,16 @@ The same key can be mapped to multiple values, for handling constant aliasing.""
             )
 
     def __delitem__(self, key: _ConstantAttributeType):
+        # [FUNCTION DOC] Remove the entry for key (hashing ScriptObjects); KeyError if absent.
+        # KNOWN ISSUE: the _script_object_map entry for a deleted ScriptObject is left
+        # behind, so a later iteration over keys is unaffected but the map keeps it alive.
         real_key = hash(key) if isinstance(key, torch.ScriptObject) else key
 
         del self._constant_attrs[real_key]
 
     def __iter__(self):
+        # [FUNCTION DOC] Iterate over keys, yielding the original ScriptObject for
+        # int (hash) keys and the key itself otherwise.
         for key in self._constant_attrs:
             if isinstance(key, int):
                 yield self._script_object_map[key]
@@ -95,14 +119,19 @@ The same key can be mapped to multiple values, for handling constant aliasing.""
                 yield key
 
     def __len__(self):
+        # [FUNCTION DOC] Number of distinct keys stored.
         return len(self._constant_attrs)
 
     def __contains__(self, key: object) -> bool:
+        # [FUNCTION DOC] Membership test, hashing ScriptObject keys first.
         real_key = hash(key) if isinstance(key, torch.ScriptObject) else key
         return real_key in self._constant_attrs
 
 
 def get_constant_fqn(node: torch.fx.Node, constant_name: str) -> str:
+    # [FUNCTION DOC] Compute the state-dict FQN for a constant used by node: the
+    # constant name prefixed by the FQN of the innermost module in the node's
+    # nn_module_stack, or the bare name if the stack or that FQN is empty.
     # The FQN of the constant tensor in the state dict should
     # correspond to the module where the constant tensor was
     # originally used.
@@ -119,11 +148,18 @@ def _get_first_fqn(
     const_attrs: ConstantAttrMap,
     key: _ConstantAttributeType,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Return the first value stored for key in const_attrs, or
+    # None if the key is missing or has no values.
     fqns = const_attrs.get(key)
     return fqns[0] if fqns else None
 
 
 def _unused_constant(node: torch.fx.Node) -> list[torch.fx.Node] | None:
+    # [FUNCTION DOC] HELPER: Decide whether a get_attr constant node is dead. The node
+    # must have a single user that is a lift_fresh (or lift_fresh_copy) call, which has
+    # either no users or a single detach (or detach_) user with no users. Returns the
+    # chain to erase, ordered from the last node back to the get_attr node, or None if
+    # the constant is used. Does not mutate the graph.
     """
     If there is a tensor constant created while tracing, here is how the graph
     looks like:
@@ -182,6 +218,18 @@ def lift_constants_pass(
     graph_signature: ExportGraphSignature,
     constant_attrs: ConstantAttrMap,
 ) -> dict[str, _ConstantAttributeType]:
+    # [FUNCTION DOC] Lift get_attr constants (tensors, script objects, fake script
+    # objects, opaque objects) of gm into new placeholder inputs inserted before the
+    # first user input, and update graph_signature in place. Unused constant chains are
+    # erased; GraphModule, lowered backend, AOTI runner and TreeSpec attributes are
+    # skipped; repeated constants reuse their first placeholder. Names come from
+    # constant_attrs FQNs when known, otherwise generated lifted_tensor_N or
+    # lifted_custom_N names avoiding existing targets. New placeholders copy node meta
+    # (dropping module stack and stack trace) with a fake or real tensor val, or a
+    # CustomObjArgument val; a CONSTANT_TENSOR or CUSTOM_OBJ input spec is inserted.
+    # Output spec names are renamed when nodes were replaced. Parameters used as
+    # constants are converted to plain data. Raises SpecViolationError for unsupported
+    # constant types. Returns a mapping of FQN to constant value.
     """
     Takes a graph module, graph signature, and modifies them inplace to lift any
     constants (tensors or custom classes) as inputs to the graph. Returns a
@@ -409,6 +457,10 @@ def lift_constants_pass(
 def rewrite_script_object_meta(
     gm: torch.fx.GraphModule,
 ) -> dict[str, _ConstantAttributeType]:
+    # [FUNCTION DOC] Replace meta val entries that are ScriptObjects or FakeScriptObjects
+    # with CustomObjArgument placeholders (named after the node, with the class FQN and,
+    # for fake objects, the fake value), mutating node meta in place. Returns a mapping
+    # of node name to the original object.
     """When tracing, we produce a graph with FakeScriptObject in the
     meta["val"].
 
@@ -444,6 +496,8 @@ def _materialize_and_lift_constants(
     export_graph_signature: ExportGraphSignature,
     constant_attrs: ConstantAttrMap,
 ) -> dict[str, _ConstantAttributeType]:
+    # [FUNCTION DOC] HELPER: Rewrite script object metas, then lift constants, and
+    # return the merged mapping of names to constants. Mutates gm and the signature.
     constants = rewrite_script_object_meta(gm)
     constants.update(lift_constants_pass(gm, export_graph_signature, constant_attrs))
     return constants

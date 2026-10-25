@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines CollectTracepointsPass, which turns _export_tracepoint marker nodes into
+# module call signature records and removes the markers. Exports CollectTracepointsPass.
+# No import-time side effects.
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
@@ -18,6 +22,11 @@ __all__ = ["CollectTracepointsPass"]
 
 
 class CollectTracepointsPass(PassBase):
+    # [CLASS DOC] Pass that consumes _export_tracepoint markers to record module call
+    # signatures. State: specs (mapping from module call path to ModuleCallSignature,
+    # mutated in place, new alias entries may be added) and sig (the ExportGraphSignature,
+    # updated when marker outputs are replaced). Key method: call.
+    # KNOWN ISSUE: the class docstring (constant folding) does not match the behavior.
     """
     Performs constant folding and constant propagation.
     """
@@ -26,11 +35,28 @@ class CollectTracepointsPass(PassBase):
         self, specs: dict[str, ModuleCallSignature], sig: ExportGraphSignature
     ) -> None:
         super().__init__()
+        # [FUNCTION DOC] Store the module call signature mapping and graph signature.
         self.specs = specs
         self.sig = sig
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult | None:
+        # [FUNCTION DOC] Process tracepoint marker nodes in gm and its submodules.
+        # Step 1 (forward and reverse walks per module): pop the innermost entry of
+        # nn_module_stack on nodes lying between matching input/output markers, so they
+        # no longer claim the wrapped submodule. Raises AssertionError on unknown marker
+        # kind. Step 2: for each marker, find the call fqn (adding an aliased signature
+        # copy when the module key has an alias suffix), append argument specs
+        # (tensor or constant) to the matching signature inputs or outputs when fqn equals
+        # path, rewire getitem users of the marker to the original args (also updating
+        # sig), then erase the users and the marker. Symint args raise AssertionError.
+        # Returns PassResult(gm, True) or None if there is no GraphModule.
+        # KNOWN ISSUE: the return of PassResult is inside the module loop of step 2
+        # (indented under it), so only the first GraphModule (the top-level one) is
+        # processed for marker removal; submodules are skipped.
         def get_arg_spec(arg) -> TensorArgument | ConstantArgument:
+            # [FUNCTION DOC] HELPER: Map a marker argument to a signature entry: a Node
+            # with a Tensor meta val becomes a TensorArgument by name; other Nodes raise
+            # AssertionError (symint unsupported); non-Nodes become a ConstantArgument.
             if isinstance(arg, torch.fx.Node):
                 if isinstance(arg.meta.get("val"), torch.Tensor):
                     return TensorArgument(name=arg.name)
@@ -78,6 +104,8 @@ class CollectTracepointsPass(PassBase):
                     nn_module_stack = None
 
         def copy_sig(sig) -> ModuleCallSignature:
+            # [FUNCTION DOC] HELPER: Build a fresh ModuleCallSignature with empty inputs
+            # and outputs, copying in_spec and out_spec from sig, no forward arg names.
             from torch.export.exported_program import ModuleCallSignature
 
             return ModuleCallSignature(
