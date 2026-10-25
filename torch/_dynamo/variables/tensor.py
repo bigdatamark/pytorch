@@ -1,3 +1,12 @@
+# [MODULE DOC] Dynamo variable trackers for tensors and tensor-adjacent values.
+# Defines TensorVariable (a tensor graph input or FX intermediate, with cached
+# static metadata and per-method tracing handlers), SymNodeVariable (symbolic
+# int/float/bool), NumpyNdarrayVariable, UnspecializedPythonVariable,
+# FakeItemVariable, TensorSubclassVariable, UntypedStorageVariable and
+# DataPtrVariable. Also holds the comparison-op tables and the tensor attribute
+# lookup table. Import-time side effects: builds module-level tables (reads the
+# torch tensor class dictionaries and aten ops) and tries to import numpy,
+# falling back to a None placeholder when it is missing.
 """
 This module contains variable tracker classes for handling tensors and tensor-related operations in Dynamo.
 
@@ -139,6 +148,9 @@ supported_const_comparison_op_values = dict.fromkeys(
 
 
 def is_bound_tensor_method(value: object) -> bool:
+    # [FUNCTION DOC] Returns True when value is a callable bound to a torch.Tensor
+    # instance (its self is a tensor) whose name resolves on that tensor, and whose
+    # object does not define a custom attribute-access hook. Pure check, no side effects.
     return bool(
         callable(value)
         and not torch._dynamo.utils.object_has_getattribute(value)
@@ -165,6 +177,9 @@ _VIEW_ATTR_TO_ATEN_OP = {
 
 
 def _is_sym_arith_operand(vt: VariableTracker) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether vt may be the other operand of a symbolic
+    # arithmetic op (add, sub, mul, ...). True for symnode-like trackers and for
+    # constants holding a float, int or bool; False otherwise. No side effects.
     """True if vt can be the other operand of a SymNode arithmetic op
     (add/sub). Accepts SymNode-like values plus float ConstantVariable —
     arithmetic with float promotes to SymFloat, unlike bitwise ops."""
@@ -176,6 +191,10 @@ def _is_sym_arith_operand(vt: VariableTracker) -> bool:
 
 
 def _tensor_debug_repr(value: torch.Tensor, type_name: str = "Tensor") -> str:
+    # [FUNCTION DOC] HELPER: Builds a debug string for a tensor. Functorch wrapper
+    # tensors (batched, grad-tracking, functional) are described with their level
+    # (and batch dim) and recurse into the wrapped tensor; any other tensor is shown
+    # as type_name with its shape and dtype. Read-only.
     if torch._C._functorch.is_batchedtensor(value):
         level = torch._C._functorch.maybe_get_level(value)
         bdim = torch._C._functorch.maybe_get_bdim(value)
@@ -197,6 +216,10 @@ def _tensor_debug_repr(value: torch.Tensor, type_name: str = "Tensor") -> str:
 
 
 class TensorSpecializedProps(TypedDict):
+    # [CLASS DOC] Typed dictionary of static tensor metadata (dtype, device, layout,
+    # ndim, requires_grad, flags, class type, has_grad_fn) plus optional size, stride
+    # and contiguity entries present only for fully static shapes. Keys map one to one
+    # onto TensorVariable constructor keyword arguments.
     """Static tensor metadata produced by TensorVariable.specialize; the keys
     map 1:1 to the corresponding TensorVariable.__init__ kwargs. The size,
     stride and contiguity keys are only populated for fully static shapes."""
@@ -217,6 +240,13 @@ class TensorSpecializedProps(TypedDict):
 
 
 class TensorVariable(VariableTracker):
+    # [CLASS DOC] Tracker for a tensor that is either a graph input or an FX
+    # intermediate. State: the FX proxy plus cached static metadata (dtype, device,
+    # layout, ndim, requires_grad, flags, class_type, has_grad_fn) and optional static
+    # size, stride and contiguity (None when shapes are symbolic). Invariant: the proxy
+    # node carries an example_value fake tensor that is the source of truth. Key methods:
+    # tp_getattro_impl (attribute reads), call_method (dispatch through tp_methods then a
+    # generic proxy path), number-protocol impls, and register_hook/backward tracing.
     """A torch.Tensor input or an intermediate value in the FX graph"""
 
     _nonvar_fields = {
@@ -239,6 +269,9 @@ class TensorVariable(VariableTracker):
     }
 
     def reconstruct_pycode(self, codegen) -> str:
+        # [FUNCTION DOC] Returns Python source text that rebuilds this tensor: a graph
+        # output index lookup if the proxy is a graph output, else the source's own
+        # reconstruction. Raises RuntimeError when neither is available.
         if id(self.proxy) in codegen.graph_outputs:
             return f"__graph_out[{codegen.graph_outputs[id(self.proxy)].index}]"
         elif self.source:
@@ -247,6 +280,8 @@ class TensorVariable(VariableTracker):
             raise RuntimeError(f"Python codegen for {self} failed with unknown source.")
 
     def get_real_value(self) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the real (non-fake) tensor by running the actual
+        # computation up to this proxy's node with the user's inputs. Expensive.
         """
         Get the actual value represented by this variable if computation is run
         using the user-provided inputs.
@@ -275,6 +310,9 @@ class TensorVariable(VariableTracker):
         _is_name_set: bool | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the proxy and all cached static tensor metadata as
+        # attributes. _is_name_set defaults to True only for placeholder (graph input)
+        # nodes, since inputs must not be renamed. Remaining kwargs go to the base class.
         super().__init__(**kwargs)
         self.proxy = proxy
         self.dtype = dtype
@@ -298,6 +336,10 @@ class TensorVariable(VariableTracker):
     def synchronize_attributes(
         self, tx: "InstructionTranslatorBase", target_cls: type | None = None
     ) -> None:
+        # [FUNCTION DOC] Refreshes cached metadata from the proxy's fake example value,
+        # recomputing specialized props for target_cls (default: own type). Size, stride
+        # and contiguity are reset to None when they are no longer static, then all
+        # computed props are written onto self. Mutates self.
         from .builder import get_specialized_props, infer_subclass_type
 
         if target_cls is None:
@@ -317,6 +359,7 @@ class TensorVariable(VariableTracker):
             setattr(self, k, v)
 
     def _get_fake_version(self) -> int | None:
+        # [FUNCTION DOC] HELPER: Returns the version counter of the fake example value, or None if absent.
         """Get the current version of self's fake tensor, or None if unavailable."""
         self_fake = self.proxy.node.meta.get("example_value")
         return self_fake._version if self_fake is not None else None
@@ -326,6 +369,9 @@ class TensorVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         version_before: int | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: If the fake tensor version increased since version_before
+        # (an in-place op ran), resynchronizes cached attributes and asks the output graph
+        # to check input mutation on the current stream. No-op if either version is unknown.
         """
         Sync attributes if self was mutated by an inplace operation.
 
@@ -341,11 +387,13 @@ class TensorVariable(VariableTracker):
             tx.output.check_input_mutation_on_current_stream(tx)
 
     def debug_repr(self) -> str:
+        # [FUNCTION DOC] Returns a debug string from the fake example value and Python type name.
         return _tensor_debug_repr(
             self.proxy.node.meta["example_value"], self.python_type_name()
         )
 
     def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] repr of a tensor needs real values; always triggers a graph break.
         unimplemented(
             gb_type="repr() on tensor",
             context=f"repr() on {self.python_type_name()}",
@@ -355,15 +403,21 @@ class TensorVariable(VariableTracker):
         )
 
     def as_proxy(self) -> torch.fx.Proxy:
+        # [FUNCTION DOC] Returns the FX proxy backing this tensor.
         return self.proxy
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the recorded Python class of the tensor (may be a subclass).
         return self.class_type
 
     def is_tensor(self) -> bool:
+        # [FUNCTION DOC] Always True for tensor variables.
         return True
 
     def nb_bool_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Truthiness of a tensor: calls item and tests for nonzero.
+        # Returns the item result as is if it is already a symbolic bool, a constant bool
+        # for constant items, otherwise a symbolic node comparing the item with zero.
         # THPVariable_bool calls at::Tensor::is_nonzero(), i.e. .item() != 0.
         from .constant import ConstantVariable
 
@@ -382,6 +436,9 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Emits an element-wise comparison (op name mapped to an operator
+        # function) between this tensor and a tensor, symbolic or constant operand as a graph
+        # call. Returns NotImplemented as a constant for other operand types.
         """Tensor tp_richcompare: element-wise comparison producing an FX proxy."""
         from .builder import wrap_fx_proxy_cls
 
@@ -395,6 +452,11 @@ class TensorVariable(VariableTracker):
 
     @staticmethod
     def specialize(value: torch.Tensor) -> TensorSpecializedProps:
+        # [FUNCTION DOC] Static method: reads metadata from a (fake) tensor into a props
+        # mapping. Always sets dtype, device, layout, ndim, requires_grad, flags, class type
+        # and has_grad_fn (False if reading grad_fn raises). When the shape has no free
+        # symbols, also sets integer-cast size and, for non-sparse tensors, stride and the
+        # list of memory formats it is contiguous in (None for batched tensors).
         try:
             has_grad_fn = value.grad_fn is not None
         except Exception:
@@ -448,6 +510,13 @@ class TensorVariable(VariableTracker):
     def dynamic_getattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Fallback attribute lookup. For sourceless traceable wrapper
+        # subclasses, resolves inner tensors, opaque objects, and constant metadata from
+        # the fake value. Otherwise, for sourced tensors, evaluates the source against the
+        # frame scope to get the real attribute and builds a tracker with an attribute
+        # source and a HASATTR guard (bound tensor methods become a GetAttrVariable and
+        # install no guard). Raises NotImplementedError when it cannot handle the case;
+        # raises an observed AttributeError if the real object lacks the attribute.
         fake_val = self.proxy.node.meta["example_value"]
         # For getattrs on tensors without sources,
         # we can do better than the default (creating a GetAttrVariable)
@@ -539,6 +608,8 @@ class TensorVariable(VariableTracker):
         return VariableTracker.build(tx, real_value, attr_source)
 
     def _view_attr(self, tx: "InstructionTranslatorBase", name: str) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Traces the view attribute name (T, mT, H, mH) as a call
+        # to its aten op on the current tracer and returns the resulting tracker.
         """Trace a view attribute as a call to the aten op behind the C++ getter.
 
         Going through the op keeps the node on the current tracer. Reading the
@@ -553,18 +624,23 @@ class TensorVariable(VariableTracker):
         )
 
     def method_attr_T(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute T: traced as a graph op via the view-attribute helper.
         return self._view_attr(tx, "T")
 
     def method_attr_mT(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute mT: traced as a graph op via the view-attribute helper.
         return self._view_attr(tx, "mT")
 
     def method_attr_H(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute H: traced as a graph op via the view-attribute helper.
         return self._view_attr(tx, "H")
 
     def method_attr_mH(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute mH: traced as a graph op via the view-attribute helper.
         return self._view_attr(tx, "mH")
 
     def method_attr_ndim(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute ndim: constant from cached ndim, else traced via a dim method call.
         if self.ndim is not None:
             return VariableTracker.build(tx, self.ndim)
         else:
@@ -573,6 +649,7 @@ class TensorVariable(VariableTracker):
     def method_attr_dtype(
         self, tx: "InstructionTranslatorBase"
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Attribute dtype: constant from cached dtype, or None if unknown (use default handling).
         if self.dtype is not None:
             return VariableTracker.build(tx, self.dtype)
         return None
@@ -580,6 +657,7 @@ class TensorVariable(VariableTracker):
     def method_attr_device(
         self, tx: "InstructionTranslatorBase"
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Attribute device: constant from cached device, or None if unknown.
         if self.device is not None:
             return VariableTracker.build(tx, self.device)
         return None
@@ -587,6 +665,7 @@ class TensorVariable(VariableTracker):
     def method_attr_layout(
         self, tx: "InstructionTranslatorBase"
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Attribute layout: constant from cached layout, or None if unknown.
         if self.layout is not None:
             return VariableTracker.build(tx, self.layout)
         return None
@@ -594,11 +673,14 @@ class TensorVariable(VariableTracker):
     def method_attr_is_cuda(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute is_cuda: constant boolean from the device type, or None if device unknown.
         if self.device is not None:
             return VariableTracker.build(tx, self.device.type == "cuda")
         return None
 
     def method_attr_shape(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute shape: a size tracker of constants when the size is
+        # static, otherwise the result of tracing a size method call.
         if self.valid_size():
             sizes: list[VariableTracker] = [
                 VariableTracker.build(tx, x) for x in self.size
@@ -610,6 +692,7 @@ class TensorVariable(VariableTracker):
     def method_attr_requires_grad(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute requires_grad: constant from the cached flag, or None if unknown.
         if self.requires_grad is not None:
             return VariableTracker.build(tx, self.requires_grad)
         return None
@@ -617,6 +700,7 @@ class TensorVariable(VariableTracker):
     def method_attr_is_quantized(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute is_quantized: constant from the cached flag, or None if unknown.
         if self.is_quantized is not None:
             return VariableTracker.build(tx, self.is_quantized)
         return None
@@ -624,6 +708,7 @@ class TensorVariable(VariableTracker):
     def method_attr_is_sparse(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute is_sparse: constant from the cached flag, or None if unknown.
         if self.is_sparse is not None:
             return VariableTracker.build(tx, self.is_sparse)
         return None
@@ -631,11 +716,13 @@ class TensorVariable(VariableTracker):
     def method_attr_is_nested(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute is_nested: constant from the cached flag, or None if unknown.
         if self.is_nested is not None:
             return VariableTracker.build(tx, self.is_nested)
         return None
 
     def method_attr_retain_grad(self, tx: "InstructionTranslatorBase") -> NoReturn:
+        # [FUNCTION DOC] Reading retain_grad always graph breaks (unsupported with AOTDispatcher).
         unimplemented(
             gb_type="Tensor.retain_grad() with AOTDispatcher",
             context=f"tp_getattro_impl {self} retain_grad",
@@ -646,6 +733,9 @@ class TensorVariable(VariableTracker):
     def method_attr_grad(
         self, tx: "InstructionTranslatorBase"
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Attribute grad: returns a pending side-effect value if grad was
+        # assigned during tracing; None constant for newly created tensors without a
+        # grad_fn; otherwise returns None so the caller applies default grad handling.
         if tx.output.side_effects.has_pending_mutation_of_attr(self, "grad"):
             return tx.output.side_effects.load_attr(self, "grad")
         if (
@@ -657,6 +747,7 @@ class TensorVariable(VariableTracker):
         return None
 
     def method_attr_data(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute data: traced as an in-graph call to the autograd data getter.
         return variables.TorchInGraphFunctionVariable(
             torch._C._autograd._get_data_attr  # type: ignore[attr-defined]
         ).call_function(tx, [self], {})
@@ -664,6 +755,7 @@ class TensorVariable(VariableTracker):
     def method_attr_grad_fn(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Attribute grad_fn: graph breaks if the tensor has a grad_fn, else constant None.
         if self.has_grad_fn:
             unimplemented(
                 gb_type="Tensor with grad_fn()",
@@ -675,6 +767,7 @@ class TensorVariable(VariableTracker):
             return variables.ConstantVariable.create(None)
 
     def method_attr__version(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Attribute _version: traced as an in-graph call to the tensor version op.
         from ..tensor_version_op import _tensor_version
 
         return variables.TorchInGraphFunctionVariable(_tensor_version).call_function(
@@ -684,6 +777,12 @@ class TensorVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> ConstantVariable:
+        # [FUNCTION DOC] Implements hasattr on a tensor: True immediately for names in the
+        # tensor attribute table; otherwise tries a traced getattr and reports True unless
+        # it fails or yields a generic attribute placeholder. Installs a HASATTR guard when
+        # the tensor has a source. Returns a bool constant.
+        # KNOWN ISSUE: per the in-code TODO, attribute lookup returns the placeholder for
+        # both missing and existing attributes, so the result can be wrong.
         from . import GetAttrVariable
 
         # TODO - This is not a good solution but solves an accuracy issue.
@@ -715,6 +814,13 @@ class TensorVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Resolves attribute name on the tensor. Graph breaks on sparse
+        # tensors and on banned ops in strict (backward speculation) mode, raising a
+        # special error for conditionally banned ones. Handles __class__ specially, then a
+        # per-name handler, and installs a type-match guard and attribute source on
+        # results for sourced tensors. Inplace-view method names on graph inputs return a
+        # delayed graph break tracker. Falls back to generic getset tensor attributes
+        # (new proxy node), then dynamic_getattr; raises NotImplementedError if all fail.
         fake_val = self.as_proxy().node.meta["example_value"]
         if (
             isinstance(fake_val, torch.Tensor)
@@ -803,6 +909,10 @@ class TensorVariable(VariableTracker):
         if result is None and name != "grad":
 
             def try_generic_attr_handling() -> VariableTracker | None:
+                # [FUNCTION DOC] HELPER: For names that are getset attributes on the tensor
+                # class, emits a getattr graph node on the current tracer and wraps it
+                # (with an attribute source when the tensor has a source). Returns None if
+                # the name is unknown or is not a getset descriptor (e.g. a method).
                 from .builder import wrap_fx_proxy
 
                 static_attr = all_tensor_attrs.get(name, None)
@@ -844,6 +954,11 @@ class TensorVariable(VariableTracker):
     def unpack_var_sequence(
         self, tx: "InstructionTranslatorBase", idxes: Sequence[int] | None = None
     ) -> list[VariableTracker]:
+        # [FUNCTION DOC] Unpacks the tensor along dim 0 into per-row trackers, each from an
+        # index graph node. Gets the length from static size or a traced size call
+        # (evaluating symbolic lengths, which may add a guard). idxes, if given, must match
+        # the length; default is all rows. Raises AssertionError for scalars or length
+        # mismatch. Preserves tensor-subclass override wrapping when applicable.
         from .builder import wrap_fx_proxy_cls
         from .torch_function import TensorWithTFOverrideVariable
 
@@ -914,21 +1029,26 @@ class TensorVariable(VariableTracker):
         rest: list[VariableTracker],
         tree_map_kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] tree_map on a leaf tensor: just applies map_fn to this tensor and the rest arguments.
         return map_fn.call_function(tx, [self, *rest], {})
 
     def valid_size(self) -> bool:
+        # [FUNCTION DOC] True when a static size is cached.
         return self._size is not None
 
     @property
     def size(self) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Property returning the cached static size; raises AssertionError if none is cached.
         if self._size is None:
             raise AssertionError("accessing None size in TensorVariable")
         return self._size
 
     def _strict_mode_banned_ops(self) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the configured list of ops banned in strict backward-trace mode.
         return torch._dynamo.config._autograd_backward_strict_mode_banned_ops
 
     def _strict_mode_conditional_banned_ops(self) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the configured list of ops that, in strict mode, force a retrace with a contiguous call.
         return (
             torch._dynamo.config._autograd_backward_strict_mode_conditional_banned_ops
         )
@@ -938,6 +1058,9 @@ class TensorVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         key: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements indexing. Graph breaks if the getitem op is banned in
+        # strict mode. If a torch-function override applies, dispatches the class getitem
+        # through the override machinery; otherwise traces the plain getitem handler.
         # Tensor.__getitem__ is a custom C slot, not CPython's mp_subscript.
         from .builder import SourcelessBuilder, VariableBuilder
         from .torch_function import can_dispatch_torch_function, dispatch_torch_function
@@ -974,6 +1097,14 @@ class TensorVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: "dict[str, VariableTracker]",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Central method-call tracing. Order: strict-mode ban check (graph
+        # break), deepcopy graph break, torch-function override dispatch for base tensor
+        # methods, then the named handler table (arity check, realized kwargs; a TypeError
+        # becomes a graph break; a None result falls through), then a check that the method
+        # exists on the real type (graph break otherwise), then a generic call_method graph
+        # node. Wraps the node, and resynchronizes metadata if the fake version changed
+        # (in-place op). Unbacked-symbol freshening is ignored for allow-listed methods
+        # with scalar tensor arguments.
         from .builder import SourcelessBuilder, VariableBuilder
         from .torch_function import can_dispatch_torch_function, dispatch_torch_function
 
@@ -1114,19 +1245,27 @@ class TensorVariable(VariableTracker):
     def method_size(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for size: delegates to the shared size/stride helper; None means fall through to a graph call.
         return self._method_size_stride("size", *args, **kwargs)
 
     def method_stride(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for stride: delegates to the shared size/stride helper; None means fall through to a graph call.
         return self._method_size_stride("stride", *args, **kwargs)
 
     def _method_size_stride(
         self, name: str, dim: Any | None = None
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Computes size or stride as constants when fully known.
+        # Uses cached static values (size, or stride attribute), else consults the fake
+        # tensor and accepts the result only if it has no free symbols. Returns a size
+        # tracker (size, no dim), a tuple-like constant (stride, no dim) or an int constant
+        # (with dim); returns None when symbolic. The dim argument is guarded if dynamic.
         dim = guard_if_dyn(dim)
 
         def make_const_size_variable(x: Sequence[Any], **options: Any) -> SizeVariable:
+            # [FUNCTION DOC] HELPER: Wraps each element of x as a constant tracker inside a size tracker.
             return SizeVariable(
                 [ConstantVariable.create(y, **options) for y in x], **options
             )
@@ -1166,6 +1305,8 @@ class TensorVariable(VariableTracker):
         return None
 
     def method_numel(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for numel/nelement: product of static size, else the fake
+        # tensor's numel if free of symbols; None (fall through to graph) otherwise.
         if self.valid_size():
             return VariableTracker.build(tx, product(self.size))
 
@@ -1179,6 +1320,7 @@ class TensorVariable(VariableTracker):
     method_nelement = method_numel
 
     def method_dim(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for dim/ndimension: constant from cached ndim, or None if unknown.
         if self.ndim is not None:
             return VariableTracker.build(tx, self.ndim)
         return None
@@ -1188,6 +1330,7 @@ class TensorVariable(VariableTracker):
     def method_is_floating_point(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Handler for is_floating_point: constant from the cached dtype, or None if unknown.
         if self.dtype is not None:
             return VariableTracker.build(tx, self.dtype.is_floating_point)
         return None
@@ -1195,6 +1338,9 @@ class TensorVariable(VariableTracker):
     def method_is_inference(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Handler for is_inference: graph breaks when fake-tensor inference
+        # mode is disabled in config; otherwise a constant read from the fake tensor (None
+        # if there is no example value).
         if config.fake_tensor_disable_inference_mode:
             unimplemented(
                 gb_type="Encountered tensor.is_inference() during tracing",
@@ -1212,6 +1358,7 @@ class TensorVariable(VariableTracker):
     def method_is_complex(
         self, tx: "InstructionTranslatorBase"
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Handler for is_complex: constant from the cached dtype, or None if unknown.
         if self.dtype is not None:
             return VariableTracker.build(tx, self.dtype.is_complex)
         return None
@@ -1221,6 +1368,9 @@ class TensorVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         memory_format: VariableTracker | None = None,
     ) -> ConstantVariable | None:
+        # [FUNCTION DOC] Handler for is_contiguous: checks the requested memory format
+        # (default contiguous) against the cached list of formats, else asks the fake
+        # tensor; returns a bool constant, or None if neither is available.
         memory_format_const = (
             memory_format.as_python_constant()
             if memory_format is not None
@@ -1242,6 +1392,10 @@ class TensorVariable(VariableTracker):
         non_blocking: bool = False,
         **kwargs: Any,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for type. With no dtype: returns the legacy tensor type
+        # name string (cpu or device-qualified) from the cached dtype/device. With a legacy
+        # tensor-type class argument: emits a graph type call passing the class's qualified
+        # name as a string (non_blocking forwarded). Otherwise returns None to fall through.
         if (
             dtype is None
             and self.dtype is not None
@@ -1284,6 +1438,9 @@ class TensorVariable(VariableTracker):
     def method_as_subclass(
         self, tx: "InstructionTranslatorBase", cls: VariableTracker
     ) -> "TensorWithTFOverrideVariable":
+        # [FUNCTION DOC] Handler for as_subclass: for a sourced tensor-subclass tracker,
+        # builds a torch-function-override variable from this tensor and registers it with
+        # attribute-mutation tracking (side effect). Other arguments cause a graph break.
         if isinstance(cls, TensorSubclassVariable) and cls.source:
             from .torch_function import TensorWithTFOverrideVariable
 
@@ -1309,17 +1466,23 @@ class TensorVariable(VariableTracker):
     def method_get_device(
         self, tx: "InstructionTranslatorBase"
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for get_device: device index constant (-1 for cpu), or None if device unknown.
         if isinstance(self.device, torch.device):
             index = self.device.index if self.device.type != "cpu" else -1
             return VariableTracker.build(tx, index)
         return None
 
     def method_element_size(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Handler for element_size: constant byte size of the cached dtype.
         return VariableTracker.build(tx, self.dtype.itemsize)
 
     def method_numpy(
         self, tx: "InstructionTranslatorBase", *, force: VariableTracker | bool = False
     ) -> "NumpyNdarrayVariable":
+        # [FUNCTION DOC] Handler for numpy. Graph breaks if numpy tracing is disabled or
+        # numpy is missing; raises TypeError for non-strided layouts. With force true,
+        # emits detach then cpu nodes; otherwise emits a view_as node to get a distinct
+        # proxy. Returns an ndarray-backed tracker for the new proxy.
         if not config.trace_numpy:
             unimplemented(
                 gb_type="Tensor.numpy() with trace_numpy=False",
@@ -1360,10 +1523,15 @@ class TensorVariable(VariableTracker):
         return NumpyNdarrayVariable.create(tx, proxy)
 
     def method_tolist(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Handler for tolist on integer tensors: recursively unrolls the
+        # fake tensor's shape into nested lists whose leaves are item graph nodes on indexed
+        # sub-proxies. Graph breaks for non-integer dtypes. Returns the nested list tracker.
         from .builder import wrap_fx_proxy
 
         def tolist(tensor: torch.Tensor, sub_proxy: torch.fx.Proxy) -> Any | list[Any]:
+            # [FUNCTION DOC] HELPER: Recursive unroll; dtype check (graph break), scalar -> one item node, 1-D -> list of item nodes, else recurse per row.
             def wrap(i: Any, sub_proxy: torch.fx.Proxy) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: Emits an item node for sub_proxy and wraps it; the i argument is unused.
                 return wrap_fx_proxy(
                     tx,
                     sub_proxy.item(),
@@ -1404,6 +1572,10 @@ class TensorVariable(VariableTracker):
     def _collect_backward_inputs(
         self, vars_iter: Iterable[VariableTracker], error_on_non_leaf: bool = False
     ) -> list[VariableTracker] | None:
+        # [FUNCTION DOC] HELPER: From vars_iter, gathers tensor trackers that require grad
+        # and are leaves, deduplicated by graph node. Non-leaf tensors are skipped, or cause
+        # a graph break when error_on_non_leaf is set; in that mode in-graph created
+        # (sourceless or synthetic-source) leaves also cause a graph break. Returns the list.
         """
         Collect unique leaf tensors from vars_iter for backward.
 
@@ -1470,6 +1642,12 @@ class TensorVariable(VariableTracker):
         create_graph: VariableTracker | None = None,
         inputs: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for backward: requires trace_autograd_ops config (else graph
+        # break) and raises TorchRuntimeError if the tensor needs no grad. Picks target leaves
+        # (all known leaves, or the user's inputs with non-leaf errors; empty explicit set
+        # graph breaks), calls autograd grad, then with grad mode off accumulates each
+        # result into its leaf via the inductor accumulate op. Returns constant None.
+        # Side effects: adds graph nodes; enters and exits a no-grad context tracker.
         """
         Trace tensor.backward() by rewriting as autograd.grad() + accumulate_grad.
 
@@ -1587,6 +1765,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> "DataPtrVariable":
+        # [FUNCTION DOC] Handler for data_ptr: returns a data-pointer tracker for this tensor (arguments ignored).
         return DataPtrVariable(self)
 
     def method_const_data_ptr(
@@ -1595,6 +1774,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> "DataPtrVariable":
+        # [FUNCTION DOC] Handler for const_data_ptr: like data_ptr but the tracker reconstructs via const_data_ptr.
         return DataPtrVariable(self, method_name="const_data_ptr")
 
     def method_record_stream(
@@ -1602,6 +1782,9 @@ class TensorVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         stream: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for record_stream: requires a stream tracker (raises
+        # RuntimeError otherwise), emits a record_stream graph node with the stream's
+        # user object index, and returns constant None.
         from .streams import StreamVariable
 
         if not isinstance(stream, StreamVariable):
@@ -1622,6 +1805,9 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> None:
+        # [FUNCTION DOC] Pre-check for item: when not in full-graph mode and scalar-output
+        # capture is off, logs a one-time warning and graph breaks. Otherwise returns None so
+        # the generic graph-call path emits the item node.
         # We enable capture_scalar_outputs when full_graph=True by default.
         if not tx.one_graph and not config.capture_scalar_outputs:
             self._warn_capture_scalar_outputs()
@@ -1642,6 +1828,8 @@ class TensorVariable(VariableTracker):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements operator index: for non-float, non-complex dtypes calls
+        # item and wraps a symbolic int conversion node; otherwise raises an observed TypeError.
         # CPython: only integer tensors of a single element can be converted
         # to an index. Mirrors THPVariable_index_scalar in
         # https://github.com/pytorch/pytorch/blob/7cfd054075b/tools/autograd/templates/python_variable_methods.cpp#L372-L385
@@ -1672,6 +1860,8 @@ class TensorVariable(VariableTracker):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements int conversion: observed RuntimeError for complex dtype;
+        # otherwise calls item and wraps a symbolic int conversion node.
         # CPython: THPVariable_integral_scalar handles both integer and float
         # tensors (floats are truncated to int). Complex tensors raise
         # RuntimeError at runtime.
@@ -1697,12 +1887,15 @@ class TensorVariable(VariableTracker):
         )
 
     def method___int__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of int conversion; delegates to nb_int_impl.
         return self.nb_int_impl(tx)
 
     def nb_float_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements float conversion: observed RuntimeError for complex
+        # dtype; otherwise calls item and wraps a symbolic float conversion node.
         # CPython: THPVariable_float_scalar dispatches to double.
         # Complex tensors raise RuntimeError at runtime.
         if self.dtype is not None and self.dtype.is_complex:
@@ -1725,12 +1918,14 @@ class TensorVariable(VariableTracker):
         )
 
     def method___float__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of float conversion; delegates to nb_float_impl.
         return self.nb_float_impl(tx)
 
     def nb_negative_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Unary negation: emits a negate graph node and wraps the result.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -1744,12 +1939,14 @@ class TensorVariable(VariableTracker):
         )
 
     def method___neg__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of negation; delegates to nb_negative_impl.
         return self.nb_negative_impl(tx)
 
     def nb_positive_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Unary plus: emits a positive graph node and wraps the result.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -1763,12 +1960,14 @@ class TensorVariable(VariableTracker):
         )
 
     def method___pos__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of unary plus; delegates to nb_positive_impl.
         return self.nb_positive_impl(tx)
 
     def nb_absolute_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Absolute value: emits an abs graph node and wraps the result.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -1782,12 +1981,14 @@ class TensorVariable(VariableTracker):
         )
 
     def method___abs__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of abs; delegates to nb_absolute_impl.
         return self.nb_absolute_impl(tx)
 
     def nb_invert_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise invert: emits an invert graph node and wraps the result.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -1801,6 +2002,7 @@ class TensorVariable(VariableTracker):
         )
 
     def method___invert__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of invert; delegates to nb_invert_impl.
         return self.nb_invert_impl(tx)
 
     def method___getitem__(
@@ -1809,6 +2011,9 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Indexing: emits an index graph node for self and the key. A
+        # symbolic scalar key is rewritten to a select on dim 0 to avoid specialization
+        # through the index protocol. Returns the wrapped result.
         from .builder import wrap_fx_proxy
 
         if isinstance(args[0], SymNodeVariable):
@@ -1836,6 +2041,8 @@ class TensorVariable(VariableTracker):
     @staticmethod
     @functools.cache
     def _warn_capture_scalar_outputs() -> None:
+        # [FUNCTION DOC] HELPER: Static, cached (runs once per process): logs a warning
+        # explaining the item graph break and how to enable scalar output capture, with the user stack.
         user_stack = torch._guards.TracingContext.extract_stack()
         user_stack_formatted = "".join(traceback.format_list(user_stack))
         log.warning(
@@ -1855,18 +2062,22 @@ class TensorVariable(VariableTracker):
         )
 
     def method___len__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of len; delegates to sq_length_impl.
         return self.sq_length_impl(tx)
 
     def sq_length_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Length: traced size call along dim 0 (constant when static).
         """Sequence length for tensors (size along first dimension)."""
         return self.call_method(tx, "size", [VariableTracker.build(tx, 0)], {})
 
     def tp_iter_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Iteration: unpacks the tensor into per-row trackers and returns a new list iterator over them.
         return ListIteratorVariable(
             self.unpack_var_sequence(tx), mutation_type=ValueMutationNew()
         )
 
     def method___iter__(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Method form of iter; delegates to tp_iter_impl.
         return self.tp_iter_impl(tx)
 
     def method_addcmul_(
@@ -1877,6 +2088,9 @@ class TensorVariable(VariableTracker):
         *,
         value: Any | None = None,
     ) -> Any | None:
+        # [FUNCTION DOC] Handler for addcmul_: with a value and decompositions enabled,
+        # traces multiply then fused multiply-add and copies the result into self. Otherwise
+        # returns None to use the generic path.
         if value is not None and config.enable_dynamo_decompositions:
             from torch._inductor import inductor_prims
 
@@ -1893,6 +2107,8 @@ class TensorVariable(VariableTracker):
         key: VariableTracker,
         value: VariableTracker | None,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Item assignment slot: raises an observed TypeError for deletion
+        # (value None); otherwise delegates to the setitem handler.
         if value is None:
             raise_type_error(tx, "Tensor does not support deleting items")
         return self.method___setitem__(tx, key, value)
@@ -1903,6 +2119,10 @@ class TensorVariable(VariableTracker):
         key: VariableTracker,
         value: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Item assignment: emits a setitem graph node, runs fake execution
+        # (with saved-tensor hooks disabled and unbacked-symbol freshening ignored), resyncs
+        # metadata if the version changed, and records the mutation for graph deduplication
+        # when enabled. Returns constant None.
         proxy = tx.output.create_proxy(
             "call_function",
             operator.setitem,
@@ -1936,6 +2156,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> NoReturn:
+        # [FUNCTION DOC] Handler for resize_: always graph breaks (unsupported).
         unimplemented(
             gb_type="Unsupported Tensor.resize_() call",
             context=f"call_method {self} resize_ {args} {kwargs}",
@@ -1949,6 +2170,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> NoReturn:
+        # [FUNCTION DOC] Handler for resize_as_: always graph breaks (unsupported).
         unimplemented(
             gb_type="Unsupported Tensor.resize_as_() call",
             context=f"call_method {self} resize_as_ {args} {kwargs}",
@@ -1962,6 +2184,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> NoReturn:
+        # [FUNCTION DOC] Handler for sparse_resize_: always graph breaks (unsupported).
         unimplemented(
             gb_type="Unsupported Tensor.sparse_resize_() call",
             context=f"call_method {self} sparse_resize_ {args} {kwargs}",
@@ -1975,6 +2198,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> NoReturn:
+        # [FUNCTION DOC] Handler for sparse_resize_and_clear_: always graph breaks (unsupported).
         unimplemented(
             gb_type="Unsupported Tensor.sparse_resize_and_clear_() call",
             context=f"call_method {self} sparse_resize_and_clear_ {args} {kwargs}",
@@ -1988,6 +2212,8 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> None:
+        # [FUNCTION DOC] Handler for set_: graph breaks when more than one positional
+        # argument is given (unsupported overloads); otherwise returns None so the generic path traces it.
         if len(args) > 1:
             # torch.Tensor.set_() has several overloads.
             # aten::set_.source_Tensor(Tensor) gets special handling
@@ -2011,6 +2237,9 @@ class TensorVariable(VariableTracker):
         *,
         alpha: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for add_: when alpha is a tensor tracker and decompositions
+        # are enabled, traces a fused multiply-add of other, alpha and self and copies the
+        # result into self (avoids an item graph break). Otherwise None (generic path).
         # Tensor alpha: ATen would call .item() and fma internally.
         # Use fma directly to avoid the item() graph break.
         if (
@@ -2033,6 +2262,9 @@ class TensorVariable(VariableTracker):
         *,
         value: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for addcdiv_: with a value and decompositions enabled,
+        # traces divide then fused multiply-add and copies the result into self. Otherwise
+        # returns None to use the generic path.
         if value is not None and config.enable_dynamo_decompositions:
             result = variables.TorchInGraphFunctionVariable(torch.div).call_function(
                 tx, [tensor1, tensor2], {}
@@ -2047,6 +2279,8 @@ class TensorVariable(VariableTracker):
     def sq_contains_impl(
         self, tx: "InstructionTranslatorBase", item: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Membership test: traces an elementwise equality against item, an
+        # any-reduction, then an item call, returning the resulting (possibly symbolic) bool.
         # Rewrite __contains__ here so that downstream passes can trace through
         # without dealing with unbacked symbool. Roughly the code we translate is:
         # def __contains__(self, x):
@@ -2062,6 +2296,7 @@ class TensorVariable(VariableTracker):
     def method___contains__(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of contains; delegates to sq_contains_impl.
         return self.sq_contains_impl(tx, arg)
 
     def method_register_hook(
@@ -2070,6 +2305,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for register_hook; delegates to the shared hook registration helper.
         return self._method_register_hook(tx, "register_hook", *args, **kwargs)
 
     def method_register_post_accumulate_grad_hook(
@@ -2078,6 +2314,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for register_post_accumulate_grad_hook; delegates to the shared hook registration helper.
         return self._method_register_hook(
             tx, "register_post_accumulate_grad_hook", *args, **kwargs
         )
@@ -2085,6 +2322,16 @@ class TensorVariable(VariableTracker):
     def _method_register_hook(
         self, tx: "InstructionTranslatorBase", name: str, hook: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Registers a backward hook (name selects the method).
+        # Sourceless tensors: with compiled autograd, stores the hook in backward state and
+        # emits a trampoline node that registers it at trace time; otherwise speculates the
+        # hook body as a subgraph in strict mode (stride-dependent code graph breaks),
+        # installs it as a submodule, emits a register-hook op on the tensor's tracer, and
+        # replaces self.proxy with the hooked proxy. Sourced tensors: records the hook in
+        # side effects. Returns a removable-handle tracker (or a wrapped proxy in the
+        # compiled autograd case).
+        # KNOWN ISSUE: the compiled-autograd trampoline returns None instead of a removable
+        # handle (acknowledged in an in-code TODO).
         # Note - do not arbitrarily add hooks here - make sure they match the same contract
         # see [On tensor.register_hook]
 
@@ -2099,6 +2346,9 @@ class TensorVariable(VariableTracker):
                 def _register_hook_trampoline(
                     tensor: torch.Tensor, bw_state: compiled_autograd.BackwardState
                 ) -> None:
+                    # [FUNCTION DOC] HELPER: Graph-executed function; looks up the hook
+                    # registration method on the tensor and registers a wrapper that
+                    # calls the hook stored in backward state. Returns None.
                     register_hook = getattr(tensor, name)
                     register_hook(
                         functools.partial(
@@ -2201,6 +2451,13 @@ class TensorVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         requires_grad: bool | VariableTracker = True,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for requires_grad_. If the flag would change: graph breaks
+        # for sourced tensors, or when a prior attempt found the intermediate leaked as an
+        # output. Otherwise emits graph nodes that enable the functorch in-place
+        # requires-grad permission, call requires_grad_, then restore the permission
+        # (restored at trace time too), updates the fake value and cached flag, records a
+        # new leaf, and initializes grad to None in side effects for sourceless attribute-
+        # mutation tensors. Returns self.
         if requires_grad is not True:
             requires_grad = requires_grad.as_python_constant()  # type: ignore[attr-defined]
 
@@ -2286,6 +2543,8 @@ class TensorVariable(VariableTracker):
         return self
 
     def method_detach_(self, tx: "InstructionTranslatorBase") -> "TensorVariable":
+        # [FUNCTION DOC] Handler for detach_: emits an in-place detach node, runs fake
+        # execution, resynchronizes cached metadata and returns self.
         from .builder import wrap_fx_proxy
 
         proxy = tx.output.create_proxy(
@@ -2300,6 +2559,7 @@ class TensorVariable(VariableTracker):
         return self
 
     def method_share_memory_(self, tx: "InstructionTranslatorBase") -> NoReturn:
+        # [FUNCTION DOC] Handler for share_memory_: always graph breaks (modifies storage for IPC).
         unimplemented(
             gb_type="Unsupported Tensor.share_memory_() call",
             context=f"call_method {self} share_memory_",
@@ -2316,6 +2576,8 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for new: when given one size object, or only constant
+        # integer arguments, rewrites to a new_empty call; otherwise None (generic path).
         # Convert x.new(torch.Size) into x.new_empty(torch.Size),
         # as Tensor.new acts differently with a Size input versus a tuple input.
         if (len(args) == 1 and isinstance(args[0], SizeVariable)) or (
@@ -2334,6 +2596,9 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for new_tensor: for exactly one positional data argument
+        # and a strided (or absent) constant layout, forwards to the torch tensor
+        # constructor with this tensor's dtype and device as defaults. Otherwise None.
         if len(args) != 1:
             return None
         data_arg = args[0]
@@ -2356,6 +2621,7 @@ class TensorVariable(VariableTracker):
     def method_untyped_storage(
         self, tx: "InstructionTranslatorBase"
     ) -> "UntypedStorageVariable":
+        # [FUNCTION DOC] Handler for untyped_storage: wraps the fake tensor's storage in a storage tracker tied to this tensor.
         return UntypedStorageVariable(
             self, self.as_proxy().node.meta["example_value"].untyped_storage()
         )
@@ -2366,6 +2632,8 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for wait: raises an internal Dynamo error if any argument
+        # is passed; otherwise emits a collective wait_tensor node on this tensor and wraps it.
         if args or kwargs:
             raise torch._dynamo.exc.InternalTorchDynamoError(
                 "`wait` and `wait_tensor` do not take any arguments"
@@ -2387,6 +2655,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> NoReturn:
+        # [FUNCTION DOC] Handler for random_: always graph breaks (decomposes to an invalid aten op).
         # For historical reasons, these ops decompose down to syntactically
         # invalid aten ops because they contain the python keyword `from`, see
         # discussions in #151432 for more details.
@@ -2407,6 +2676,7 @@ class TensorVariable(VariableTracker):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for uniform_: graph breaks if the from keyword is passed; otherwise None (generic path).
         if "from" in kwargs:
             unimplemented(
                 gb_type="Tensor.uniform_ op called with `from` keyword",
@@ -2480,6 +2750,7 @@ class TensorVariable(VariableTracker):
     }
 
     def set_name_hint(self, name: str) -> None:
+        # [FUNCTION DOC] Renames the proxy node to name the first time only (graph inputs are never renamed). Mutates the node.
         if not self._is_name_set:
             self.proxy.node._rename(name)
             self._is_name_set = True
@@ -2492,6 +2763,9 @@ class TensorVariable(VariableTracker):
         reverse: bool = False,
     ) -> VariableTracker:
         # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L1139 (PyNumber_Add)
+        # [FUNCTION DOC] Addition with a tensor, symbolic or scalar operand (reverse puts
+        # other on the left): emits an add graph node and wraps it as a tensor. Returns
+        # NotImplemented for unsupported operand types.
         from .builder import wrap_fx_proxy
 
         if not (isinstance(other, TensorVariable) or _is_sym_arith_operand(other)):
@@ -2510,6 +2784,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Left shift with a symbolic-like operand only (else NotImplemented); emits a shift graph node, reverse swaps sides.
         from .builder import wrap_fx_proxy
 
         if not other.is_symnode_like():
@@ -2528,6 +2803,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Right shift with a symbolic-like operand only (else NotImplemented); emits a shift graph node, reverse swaps sides.
         from .builder import wrap_fx_proxy
 
         if not other.is_symnode_like():
@@ -2546,6 +2822,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise or with a symbolic-like operand only (else NotImplemented); emits an or graph node, reverse swaps sides.
         from .builder import wrap_fx_proxy
 
         if not other.is_symnode_like():
@@ -2564,6 +2841,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise and with a symbolic-like operand only (else NotImplemented); emits an and graph node, reverse swaps sides.
         from .builder import wrap_fx_proxy
 
         if not other.is_symnode_like():
@@ -2582,6 +2860,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise xor with a symbolic-like operand only (else NotImplemented); emits an xor graph node, reverse swaps sides.
         from .builder import wrap_fx_proxy
 
         if not other.is_symnode_like():
@@ -2600,6 +2879,8 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Multiplication (reverse swaps sides): emits a multiply graph node
+        # with no operand type filtering and wraps the result as a tensor.
         # Reaches here only via direct ``tensor.__mul__(x)`` calls — the
         # ``operator.mul`` path goes through ``_handle_insert_op_in_graph``
         # in ``BuiltinVariable``.  Build the same FX proxy.
@@ -2619,6 +2900,7 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Matrix multiplication (reverse swaps sides): emits a matmul graph node and wraps the result.
         # Reaches here only via direct ``tensor.__matmul__(x)`` calls.
         from .builder import wrap_fx_proxy
 
@@ -2636,6 +2918,8 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Floor division (reverse swaps sides): NotImplemented unless other
+        # is a tensor or numeric/symbolic operand; otherwise emits a floordiv graph node.
         # Reaches here only via direct ``tensor.__floordiv__(x)`` calls — the
         # ``operator.floordiv`` path goes through ``_handle_insert_op_in_graph``
         # in ``BuiltinVariable``.  Build the same FX proxy.
@@ -2657,6 +2941,8 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] True division (reverse swaps sides): NotImplemented unless other
+        # is a tensor or numeric/symbolic operand; otherwise emits a truediv graph node.
         # Reaches here only via direct ``tensor.__truediv__(x)`` calls — the
         # ``operator.truediv`` path goes through ``_handle_insert_op_in_graph``
         # in ``BuiltinVariable``.  Build the same FX proxy.
@@ -2678,6 +2964,8 @@ class TensorVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Remainder (reverse swaps sides): NotImplemented unless other is a
+        # tensor or numeric/symbolic operand; otherwise emits a mod graph node.
         # Reaches here only via direct ``tensor.__mod__(x)`` calls — the
         # ``operator.mod`` path goes through ``_handle_insert_op_in_graph``
         # in ``BuiltinVariable``.  Build the same FX proxy.
@@ -2694,6 +2982,8 @@ class TensorVariable(VariableTracker):
         )
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash: returns the identity of the fake example value and True
+        # (identity-based, so aliases hash the same).
         # Tensor.__hash__ is `return id(self)`, so hash == id.
         # Always use the FakeTensor identity so aliased tensors
         # (e.g. y = x.add_(1)) hash consistently.
@@ -2707,6 +2997,10 @@ class TensorVariable(VariableTracker):
         reverse: bool = False,
     ) -> VariableTracker:
         # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L1135 (PyNumber_Subtract)
+        # [FUNCTION DOC] Subtraction (reverse swaps sides) only with a symbolic-like or
+        # numeric operand (else NotImplemented): emits a sub graph node.
+        # KNOWN ISSUE: the result is wrapped as a symbolic scalar tracker even though self
+        # is a tensor, unlike addition which wraps a tensor; looks suspicious.
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
         args = [other, self] if reverse else [self, other]
@@ -2725,6 +3019,8 @@ class TensorVariable(VariableTracker):
         z: VariableTracker | None,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Power (reverse swaps sides): NotImplemented for a three-argument
+        # form (z truthy) or an unsupported operand; otherwise emits a pow graph node.
         # Reaches here only via direct ``tensor.__pow__(x)`` calls — the
         # ``operator.pow`` path goes through ``_handle_insert_op_in_graph``
         # in ``BuiltinVariable``.  Build the same FX proxy.
@@ -2742,6 +3038,10 @@ class TensorVariable(VariableTracker):
 
 
 class SymNodeVariable(VariableTracker):
+    # [CLASS DOC] Tracker for a symbolic scalar (int, float or bool) backed by an FX proxy
+    # and a sym_num (SymInt, SymFloat, SymBool) value. Used for symbolic sizes, item
+    # results and unspecialized floats. Caches an optional tensor conversion. Arithmetic
+    # and bitwise number-protocol methods emit graph nodes and return new symbolic trackers.
     """
     Represents a symbolic scalar, either int, float or bool.  This is most commonly used to
     handle symbolic size computation, e.g., tensor.size(0), but it is also used to
@@ -2755,6 +3055,7 @@ class SymNodeVariable(VariableTracker):
     }
 
     def debug_repr(self) -> str:
+        # [FUNCTION DOC] Returns the repr of the symbolic number.
         return repr(self.sym_num)
 
     @classmethod
@@ -2765,6 +3066,11 @@ class SymNodeVariable(VariableTracker):
         sym_num: Any | None = None,
         **options: Any,
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Factory: derives sym_num from the fake value of the proxy node when
+        # not given, checks it equals any existing example value (AssertionError otherwise),
+        # stores it as the node's example value. Concrete int/bool/sympy integer results
+        # become plain constants; symbolic results become a new tracker, registered as
+        # proxyable with the current tracer unless the node is a placeholder.
         if sym_num is None:
             sym_num = get_fake_value(proxy.node, tx)
         if "example_value" in proxy.node.meta:
@@ -2784,6 +3090,7 @@ class SymNodeVariable(VariableTracker):
         return out
 
     def __init__(self, proxy: Any, sym_num: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the proxy and symbolic number and an empty cached tensor conversion.
         super().__init__(**kwargs)
         self.proxy = proxy
         # TODO: Should we allow non SymTypes here?  Today it is allowed
@@ -2791,21 +3098,27 @@ class SymNodeVariable(VariableTracker):
         self._tensor_var: TensorVariable | None = None
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the Python type of the symbolic value (node pytype for symbolic types, else the value's own type).
         if isinstance(self.sym_num, SymTypes):
             return self.sym_num.node.pytype
         else:
             return type(self.sym_num)
 
     def is_symnode_like(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] Returns the backing FX proxy.
         return self.proxy
 
     def nb_bool_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Truthiness: a symbolic bool returns itself; symbolic int or float
+        # emits a not-equal-to-zero node and returns a symbolic bool tracker. Raises
+        # AssertionError for other sym_num types.
         # long_bool / float_bool: non-zero check. SymBool is already boolean.
         # https://github.com/python/cpython/blob/c09ccd9c429/Objects/longobject.c#L5200
         # https://github.com/python/cpython/blob/c09ccd9c429/Objects/floatobject.c#L853
@@ -2823,6 +3136,9 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Comparison with a symbolic, constant or tensor operand: emits a
+        # comparison node and returns a symbolic bool. For other operand types, equality
+        # and inequality give a constant answer for unrelated objects; other ops return NotImplemented.
         """SymNode tp_richcompare: symbolic numeric comparison."""
         if not isinstance(other, (SymNodeVariable, ConstantVariable, TensorVariable)):
             if op in ("__eq__", "__ne__"):
@@ -2836,6 +3152,9 @@ class SymNodeVariable(VariableTracker):
         return SymNodeVariable.create(tx, proxy, sym_num=None)
 
     def as_tensor(self, tx: "InstructionTranslatorBase", dtype: Any) -> TensorVariable:
+        # [FUNCTION DOC] Converts the symbolic scalar to a scalar tensor of the given dtype
+        # by tracing the scalar_tensor call; the result is cached on first use and returned
+        # on later calls regardless of dtype.
         if self._tensor_var is None:
             self._tensor_var = VariableTracker.build(
                 tx, torch.scalar_tensor
@@ -2845,6 +3164,9 @@ class SymNodeVariable(VariableTracker):
     def evaluate_expr(
         self, output_graph: Optional["OutputGraph"] = None
     ) -> bool | int | float:
+        # [FUNCTION DOC] Specializes the symbolic value to a concrete Python scalar, adding
+        # a guard. On a data-dependent error, re-raises it if the no-data-dependent-graph-break
+        # config is set; otherwise raises a user error advising torch._check annotations.
         try:
             return guard_scalar(self.sym_num)
         except GuardOnDataDependentSymNode as e:
@@ -2864,6 +3186,7 @@ class SymNodeVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method call on a symbolic scalar: always emits a call_method graph node and wraps the result.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -2879,6 +3202,8 @@ class SymNodeVariable(VariableTracker):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Index protocol: for int or bool values, specializes to a constant
+        # via evaluate_expr (adds a guard); otherwise defers to the base class behavior.
         # SymInt / SymBool define __index__ as `self.node.int_()`, which
         # specializes the symbolic value to a concrete int (with guard).
         # SymFloat has no __index__.
@@ -2893,6 +3218,7 @@ class SymNodeVariable(VariableTracker):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] int conversion: emits a symbolic int conversion node and wraps the result.
         # SymInt.__int__: https://github.com/pytorch/pytorch/blob/ee336ca5440939b8ad65e916d47421f849e56178/torch/__init__.py#L462
         # SymFloat.__int__: https://github.com/pytorch/pytorch/blob/ee336ca5440939b8ad65e916d47421f849e56178/torch/__init__.py#L682
         # SymBool.__int__: https://github.com/pytorch/pytorch/blob/ee336ca5440939b8ad65e916d47421f849e56178/torch/__init__.py#L784
@@ -2911,6 +3237,7 @@ class SymNodeVariable(VariableTracker):
     def method___int__(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of int conversion; delegates to nb_int_impl.
         return self.nb_int_impl(tx)
 
     def nb_add_impl(
@@ -2919,6 +3246,8 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Addition (reverse swaps sides): NotImplemented for unsupported
+        # operands, else an add graph node returned as a new symbolic tracker.
         # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L1139 (PyNumber_Add)
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
@@ -2937,6 +3266,8 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise or with a symbolic-like operand (else NotImplemented): emits an or node, new symbolic tracker.
+        # KNOWN ISSUE: reverse is ignored; operand order is always self then other.
         if not other.is_symnode_like():
             return VariableTracker.build(tx, NotImplemented)
         return SymNodeVariable.create(
@@ -2953,6 +3284,8 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise and with a symbolic-like operand (else NotImplemented): emits an and node, new symbolic tracker.
+        # KNOWN ISSUE: reverse is ignored; operand order is always self then other.
         if not other.is_symnode_like():
             return VariableTracker.build(tx, NotImplemented)
         return SymNodeVariable.create(
@@ -2969,6 +3302,8 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Bitwise xor with a symbolic-like operand (else NotImplemented): emits an xor node, new symbolic tracker.
+        # KNOWN ISSUE: reverse is ignored; operand order is always self then other.
         if not other.is_symnode_like():
             return VariableTracker.build(tx, NotImplemented)
         return SymNodeVariable.create(
@@ -2985,6 +3320,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Left shift (reverse swaps sides) with a symbolic-like operand, else NotImplemented; new symbolic tracker.
         if not other.is_symnode_like():
             return VariableTracker.build(tx, NotImplemented)
         args = [other, self] if reverse else [self, other]
@@ -3002,6 +3338,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Right shift (reverse swaps sides) with a symbolic-like operand, else NotImplemented; new symbolic tracker.
         if not other.is_symnode_like():
             return VariableTracker.build(tx, NotImplemented)
         args = [other, self] if reverse else [self, other]
@@ -3020,6 +3357,7 @@ class SymNodeVariable(VariableTracker):
         reverse: bool = False,
     ) -> VariableTracker:
         # ref: https://github.com/python/cpython/blob/v3.13.0/Objects/abstract.c#L1135 (PyNumber_Subtract)
+        # [FUNCTION DOC] Subtraction (reverse swaps sides): NotImplemented for unsupported operands, else a sub node as a new symbolic tracker.
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
         args = [other, self] if reverse else [self, other]
@@ -3037,6 +3375,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Multiplication (reverse swaps sides): NotImplemented for unsupported operands, else a mul node as a new symbolic tracker.
         # sequence * sym_node must go through sq_repeat and not nb_multiply
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
@@ -3055,6 +3394,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Floor division (reverse swaps sides): NotImplemented for unsupported operands, else a floordiv node as a new symbolic tracker.
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
         lhs, rhs = (other, self) if reverse else (self, other)
@@ -3072,6 +3412,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] True division (reverse swaps sides): NotImplemented for unsupported operands, else a truediv node as a new symbolic tracker.
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
         lhs, rhs = (other, self) if reverse else (self, other)
@@ -3089,6 +3430,7 @@ class SymNodeVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Remainder (reverse swaps sides): NotImplemented for unsupported operands, else a mod node as a new symbolic tracker.
         if not _is_sym_arith_operand(other):
             return VariableTracker.build(tx, NotImplemented)
         lhs, rhs = (other, self) if reverse else (self, other)
@@ -3104,6 +3446,7 @@ class SymNodeVariable(VariableTracker):
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] float conversion: emits a symbolic float conversion node and wraps the result.
         # SymFloat.__float__: https://github.com/pytorch/pytorch/blob/ee336ca5440939b8ad65e916d47421f849e56178/torch/__init__.py#L679
         from .builder import wrap_fx_proxy
 
@@ -3120,12 +3463,14 @@ class SymNodeVariable(VariableTracker):
     def method___float__(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of float conversion; delegates to nb_float_impl.
         return self.nb_float_impl(tx)
 
     def nb_negative_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Negation: applies negation directly to the proxy (recording a graph node) and returns a new symbolic tracker.
         return SymNodeVariable.create(
             tx,
             operator.neg(self.as_proxy()),
@@ -3135,15 +3480,18 @@ class SymNodeVariable(VariableTracker):
     def method___neg__(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of negation; delegates to nb_negative_impl.
         return self.nb_negative_impl(tx)
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash: specializes the value (may add a guard) and returns its hash with False.
         return hash(self.evaluate_expr()), False
 
     def nb_positive_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Unary plus: applies it directly to the proxy and returns a new symbolic tracker.
         return SymNodeVariable.create(
             tx,
             operator.pos(self.as_proxy()),
@@ -3153,12 +3501,14 @@ class SymNodeVariable(VariableTracker):
     def method___pos__(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of unary plus; delegates to nb_positive_impl.
         return self.nb_positive_impl(tx)
 
     def nb_absolute_impl(
         self,
         tx: "InstructionTranslatorBase",
     ) -> VariableTracker:
+        # [FUNCTION DOC] Absolute value: applies abs directly to the proxy and returns a new symbolic tracker.
         return SymNodeVariable.create(
             tx,
             operator.abs(self.as_proxy()),
@@ -3172,6 +3522,8 @@ class SymNodeVariable(VariableTracker):
         z: VariableTracker | None,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Power (reverse swaps sides): NotImplemented for the three-argument
+        # form or unsupported operands, else a pow node as a new symbolic tracker.
         if z is not None:
             return VariableTracker.build(tx, NotImplemented)
         if not _is_sym_arith_operand(other):
@@ -3188,18 +3540,25 @@ class SymNodeVariable(VariableTracker):
     def method___abs__(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method form of abs; delegates to nb_absolute_impl.
         return self.nb_absolute_impl(tx)
 
     def is_python_hashable(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
     def get_python_hash(self) -> int:
+        # [FUNCTION DOC] Returns the hash of the specialized value (may add a guard); used for dict keys.
         # Essentially convert the SymNode to a constant variable whenever its
         # searched for a dict key.
         return hash(self.evaluate_expr())
 
 
 class NumpyNdarrayVariable(TensorVariable):
+    # [CLASS DOC] Tensor tracker that stands for a numpy ndarray, backed by a torch tensor
+    # through the torch numpy shim. Created from Tensor.numpy. Reuses tensor machinery
+    # but overrides attributes (tp_getset table, tp_getattro_impl), method calls (routed
+    # to numpy method wrappers), comparisons, hashing (unhashable) and Python type.
     """
     Represents a np.ndarray, but backed by torch Tensor via torch._numpy.ndarray.
     Use this for Tensor.numpy() call.
@@ -3209,6 +3568,7 @@ class NumpyNdarrayVariable(TensorVariable):
     def create(
         tx: "InstructionTranslatorBase", proxy: torch.fx.Proxy, **options: Any
     ) -> "NumpyNdarrayVariable":
+        # [FUNCTION DOC] Static factory: wraps proxy as an ndarray tracker via the generic proxy-wrapping helper; options are forwarded.
         from .builder import wrap_fx_proxy_cls
 
         return wrap_fx_proxy_cls(
@@ -3219,9 +3579,11 @@ class NumpyNdarrayVariable(TensorVariable):
         )
 
     def is_hashable(self) -> bool:
+        # [FUNCTION DOC] Always False: ndarrays are unhashable.
         return False
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Raises an observed TypeError (unhashable ndarray).
         from ..exc import raise_type_error
 
         raise_type_error(tx, "unhashable type: 'numpy.ndarray'")
@@ -3232,6 +3594,9 @@ class NumpyNdarrayVariable(TensorVariable):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Element-wise comparison with a symbolic, constant or tensor operand
+        # through the numpy operator wrapper; returns an ndarray tracker. NotImplemented
+        # constant for other operand types.
         """ndarray tp_richcompare: element-wise comparison via numpy_operator_wrapper."""
         from ..utils import numpy_operator_wrapper
 
@@ -3249,16 +3614,19 @@ class NumpyNdarrayVariable(TensorVariable):
     # NB: ndim/itemsize are ALWAYS specialized constants (numpy exposes them via
     # PyGetSetDef on ndarray), unlike size/shape which may carry free symbols.
     def _get_ndim(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Getter for ndim; constant from the fake value viewed as an ndarray.
         example_value = self.as_proxy().node.meta["example_value"]
         return VariableTracker.build(tx, tnp.ndarray(example_value).ndim)
 
     def _get_itemsize(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Getter for itemsize; constant from the fake value viewed as an ndarray.
         example_value = self.as_proxy().node.meta["example_value"]
         return VariableTracker.build(tx, tnp.ndarray(example_value).itemsize)
 
     def _get_numpy_attr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Getter for tensor-valued ndarray attributes (T, real, imag, flat): emits an attribute-wrapper graph node and returns an ndarray tracker.
         from ..utils import numpy_attr_wrapper
 
         proxy = tx.output.create_proxy(
@@ -3278,6 +3646,10 @@ class NumpyNdarrayVariable(TensorVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute lookup for ndarrays (not delegating to tensor behavior).
+        # shape, stride and size are constants when free of symbols, else traced through the
+        # numpy attribute wrapper. base, flags, dtype and __version__ graph break. Any other
+        # name raises NotImplementedError.
         # NB: This INTENTIONALLY does not call super(), because there is
         # no intrinsic reason ndarray properties are related to Tensor
         # properties.  The inheritance here is for implementation sharing.
@@ -3291,6 +3663,7 @@ class NumpyNdarrayVariable(TensorVariable):
         example_ndarray = tnp.ndarray(example_value)
 
         def insert_into_graph() -> VariableTracker:
+            # [FUNCTION DOC] HELPER: Emits an attribute-wrapper graph node for the requested name and wraps the result.
             return wrap_fx_proxy(
                 tx,
                 tx.output.create_proxy(
@@ -3339,6 +3712,8 @@ class NumpyNdarrayVariable(TensorVariable):
     def patch_args(
         name: str, args: list[VariableTracker], kwargs: dict[str, VariableTracker]
     ) -> tuple[list[VariableTracker], dict[str, VariableTracker]]:
+        # [FUNCTION DOC] Static: adapts numpy-style keyword names to torch names; for clip,
+        # renames a_min and a_max to min and max. Returns the (args, kwargs) pair.
         if name == "clip":
             kwargs_rename = {"a_min": "min", "a_max": "max"}
             kwargs = {kwargs_rename.get(k, k): v for k, v in kwargs.items()}
@@ -3351,6 +3726,10 @@ class NumpyNdarrayVariable(TensorVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method calls on ndarrays. Patches keyword names; astype to object
+        # dtype, and tostring, tobytes and __delattr__ graph break. len, size, tolist and
+        # iter delegate to the tensor implementation. Everything else emits a graph node
+        # calling the numpy method wrapper and returns an ndarray tracker.
         from ..exc import unimplemented
         from ..utils import numpy_method_wrapper
 
@@ -3397,6 +3776,7 @@ class NumpyNdarrayVariable(TensorVariable):
         return NumpyNdarrayVariable.create(tx, proxy)
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the numpy ndarray class, or the none type if numpy is not installed.
         if np is not None:
             return np.ndarray
         else:
@@ -3408,12 +3788,16 @@ class NumpyNdarrayVariable(TensorVariable):
         key: VariableTracker,
         value: VariableTracker | None,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Item assignment: observed ValueError for deletion; otherwise forwards to the setitem method call.
         if value is None:
             raise_value_error(tx, "cannot delete array elements")
         return self.call_method(tx, "__setitem__", [key, value], {})
 
 
 class UnspecializedPythonVariable(TensorVariable):
+    # [CLASS DOC] Tensor tracker for an unspecialized Python int or float held as a
+    # one-element tensor. Extra state: raw_value (the original Python number, may be
+    # None) and need_unwrap (whether the value must be unwrapped back to a scalar).
     """
     This is a 1-element tensor represents unspecialized python float/int.
     """
@@ -3432,6 +3816,7 @@ class UnspecializedPythonVariable(TensorVariable):
         need_unwrap: bool = True,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Initializes the tensor base with the proxy and keyword metadata, then stores raw_value and need_unwrap.
         super().__init__(proxy, **kwargs)
         self.raw_value = raw_value
         self.need_unwrap = need_unwrap
@@ -3443,6 +3828,7 @@ class UnspecializedPythonVariable(TensorVariable):
         raw_value: float | int | None,
         need_unwrap: bool = True,
     ) -> "UnspecializedPythonVariable":
+        # [FUNCTION DOC] Class factory: builds a new instance by copying all attributes of the given tensor tracker plus raw_value and need_unwrap.
         # Convert a `TensorVariable` instance into an `UnspecializedPythonVariable` instance.
         return UnspecializedPythonVariable(
             **dict(tensor_variable.__dict__),
@@ -3452,6 +3838,8 @@ class UnspecializedPythonVariable(TensorVariable):
 
 
 class FakeItemVariable(TensorVariable):
+    # [CLASS DOC] Tensor tracker for the result of item on a fake tensor: an unspecialized
+    # Python scalar whose raw value is not accessible. State: need_unwrap (default False).
     """An unspecialized python variable which prevents access to the underlying raw value.
     This is needed if item is called on a FakeTensor."""
 
@@ -3461,6 +3849,7 @@ class FakeItemVariable(TensorVariable):
     }
 
     def __init__(self, proxy: torch.fx.Proxy, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Removes need_unwrap (default False) from kwargs, initializes the tensor base with the rest, then stores it.
         need_unwrap = kwargs.pop("need_unwrap", False)
         super().__init__(proxy, **kwargs)
         self.need_unwrap = need_unwrap
@@ -3469,16 +3858,26 @@ class FakeItemVariable(TensorVariable):
     def from_tensor_variable(
         cls, tensor_variable: TensorVariable
     ) -> "FakeItemVariable":
+        # [FUNCTION DOC] Class factory: builds a new instance by copying all attributes of the given tensor tracker.
         return FakeItemVariable(**dict(tensor_variable.__dict__))
 
 
 class TensorSubclassVariable(UserDefinedClassVariable):
+    # [CLASS DOC] Tracker for a torch.Tensor subclass object used as a callable class
+    # (constructor). Its constructor call traces creation of subclass instances as
+    # torch-function-override tensors.
     def call_function(
         self,
         tx: "InstructionTranslatorBase",
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Traces constructing a subclass instance. With the default tensor
+        # __new__, supports only a single tensor argument and no keywords (shallow-copy
+        # semantics via an override variable); anything else graph breaks. A custom __new__
+        # is traced through. A custom __init__ is then traced on the result. Registers the
+        # new object with attribute-mutation side-effect tracking. Raises AssertionError if
+        # __new__ yields nothing; returns the new variable.
         # Handle `Subclass(existing_tensor, ...)` calls.
         from .torch_function import TensorWithTFOverrideVariable
 
@@ -3524,10 +3923,14 @@ class TensorSubclassVariable(UserDefinedClassVariable):
         return var
 
     def as_python_constant(self) -> type:
+        # [FUNCTION DOC] Returns the wrapped subclass itself as the Python constant.
         return self.value
 
 
 class UntypedStorageVariable(VariableTracker):
+    # [CLASS DOC] Tracker for a tensor's untyped storage. State: from_tensor (the owning
+    # tensor tracker) and example_value (a meta-device storage). Supports size and resize_
+    # via a method table, and reconstructs by calling untyped_storage on the tensor.
     _nonvar_fields = {
         "example_value",
         *VariableTracker._nonvar_fields,
@@ -3539,12 +3942,14 @@ class UntypedStorageVariable(VariableTracker):
         example_value: torch.UntypedStorage,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the owning tensor tracker and the meta-device example storage.
         super().__init__(**kwargs)
         self.from_tensor = from_tensor
         # Example_value will always have device="meta"
         self.example_value = example_value
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the untyped storage class.
         return torch.UntypedStorage
 
     def method_size(
@@ -3553,6 +3958,8 @@ class UntypedStorageVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for storage size: a constant if the example size has no free
+        # symbols; otherwise emits a storage-size graph node on the owning tensor.
         result = self.example_value.size()
         if not has_free_symbols(result):
             # avoid creating a node in the graph
@@ -3576,6 +3983,7 @@ class UntypedStorageVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for storage resize_: emits an inductor resize-storage-bytes node on the owning tensor with the first argument as the byte size; returns self.
         tx.output.create_proxy(
             "call_function",
             torch.ops.inductor.resize_storage_bytes_,
@@ -3590,12 +3998,16 @@ class UntypedStorageVariable(VariableTracker):
     }
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode that loads the owning tensor and calls its untyped_storage method.
         codegen(self.from_tensor)
         codegen.load_method("untyped_storage")
         codegen.call_method(0)
 
 
 class DataPtrVariable(VariableTracker):
+    # [CLASS DOC] Tracker for a tensor's data pointer integer (data_ptr or const_data_ptr).
+    # State: from_tensor, method_name, and tensor_version (fake tensor version at creation).
+    # Only equality comparison between provably identical pointers is traceable.
     _DATA_PTR_PRESERVING_TARGETS = {
         ("call_method", "detach"),
         ("call_function", torch.ops.aten.detach.default),
@@ -3607,16 +4019,19 @@ class DataPtrVariable(VariableTracker):
         method_name: str = "data_ptr",
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the tensor tracker, the pointer method name, and the current fake tensor version.
         super().__init__(**kwargs)
         self.from_tensor = from_tensor
         self.method_name = method_name
         self.tensor_version = from_tensor._get_fake_version()
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the int type.
         return int
 
     @classmethod
     def _strip_data_ptr_preserving_aliases(cls, node: torch.fx.Node) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Follows single-argument detach nodes back to their input node and returns the root node.
         while (
             isinstance(node, torch.fx.Node)
             and (node.op, node.target) in cls._DATA_PTR_PRESERVING_TARGETS
@@ -3627,6 +4042,9 @@ class DataPtrVariable(VariableTracker):
         return node
 
     def _is_same_data_ptr(self, other: "VariableTracker") -> bool:
+        # [FUNCTION DOC] HELPER: True only if other is a data-pointer tracker with the same
+        # known fake tensor version and both tensors share the same root graph node after
+        # stripping detach aliases. Conservative: False when unsure.
         if not isinstance(other, DataPtrVariable):
             return False
 
@@ -3647,6 +4065,8 @@ class DataPtrVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Supports only equality and inequality (others give NotImplemented).
+        # If both pointers are provably the same, returns a constant bool; otherwise graph breaks.
         """DataPtr tp_richcompare: identity-based eq/ne."""
         if op not in ("__eq__", "__ne__"):
             return ConstantVariable.create(NotImplemented)
@@ -3662,6 +4082,7 @@ class DataPtrVariable(VariableTracker):
         )
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode that loads the tensor and calls its pointer method (data_ptr or const_data_ptr).
         codegen(self.from_tensor)
         codegen.load_method(self.method_name)
         codegen.call_method(0)
