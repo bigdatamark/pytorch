@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Core type definitions and callback/hook protocols shared across Dynamo.
+# Contents: FrameState alias, GuardFail, GuardFilterEntry, GuardFn protocol,
+# GuardedCode, ConvertFrameReturn, wrap_guarded_code, the DynamoCallbackFn
+# protocol and DynamoCallback alias, compiler-config types, and hook protocols
+# (guard hook, guard-complete hook, profiler start/end, bytecode hook).
+# Import-time side effects: imports C-extension types from
+# torch._C._dynamo.eval_frame (re-exported under public aliases CacheEntry,
+# ExtraState, FrameAction, FrameExecStrategy, DynamoFrameType); no other state.
 """This module contains the core type definitions and protocols used throughout Dynamo.
 
 The types defined here fall into several categories:
@@ -32,6 +41,9 @@ FrameState = dict[Any, Any]
 
 
 class GuardFail(NamedTuple):
+    # [CLASS DOC] Immutable record describing a guard failure: reason is the
+    # text of the failed guard code part, orig_code is the code object whose
+    # guard failed. Passed to guard_fail_fn callbacks.
     # A string repr of the piece of failed guard code we eval-ed
     reason: str
     # A code object where we failed a guard
@@ -40,6 +52,10 @@ class GuardFail(NamedTuple):
 
 @dataclasses.dataclass(frozen=True)
 class GuardFilterEntry:
+    # [CLASS DOC] Frozen record describing one guard, handed to guard filter
+    # functions: guard name, whether it has a value and the value, the guard
+    # type and any derived guard types, whether it is a global guard, and the
+    # original Guard object it was built from.
     name: str
     has_value: bool
     value: object
@@ -50,6 +66,11 @@ class GuardFilterEntry:
 
 
 class GuardFn(Protocol):
+    # [CLASS DOC] Protocol for a compiled guard function/manager. Attributes
+    # hold the guard closure variables, argument names, code parts (plain and
+    # verbose), global scope, optional failure callback, and the owning
+    # cache entry and extra state. Calling it with the frame locals mapping
+    # returns True if all guards pass (cached code is reusable).
     closure_vars: dict[str, object]
     args: list[str]
     code_parts: list[str]
@@ -65,6 +86,9 @@ class GuardFn(Protocol):
 
 @dataclasses.dataclass
 class GuardedCode:
+    # [CLASS DOC] Compiled output for a frame: the new code object, the guard
+    # manager that must pass for it to be used, the CompileId that produced
+    # it, and a trace annotation string (defaults to "Unknown").
     code: types.CodeType
     guard_manager: GuardFn
     compile_id: CompileId
@@ -73,6 +97,11 @@ class GuardedCode:
 
 @dataclasses.dataclass
 class ConvertFrameReturn:
+    # [CLASS DOC] Result returned by a frame-conversion callback. Fields:
+    # frame_exec_strategy (default: skip this frame, default-run recursive
+    # frames), apply_to_code (apply the strategy to future frames with the same
+    # code, default True), guarded_code (compiled result or None), and
+    # skip_reason (optional text). Default instance means no compilation.
     # default return is no compiled code (i.e. `return None`):
     # strategy is to skip non-recursively, for all future intercepted frames too
 
@@ -87,6 +116,10 @@ class ConvertFrameReturn:
 
 
 def wrap_guarded_code(guarded_code: GuardedCode) -> ConvertFrameReturn:
+    # [FUNCTION DOC] Wrap a GuardedCode in a ConvertFrameReturn that runs the
+    # compiled code with the default strategy for both the frame and its
+    # recursive frames. Takes the guarded code, returns the new
+    # ConvertFrameReturn; no side effects, no exceptions raised.
     return ConvertFrameReturn(
         frame_exec_strategy=FrameExecStrategy(FrameAction.DEFAULT, FrameAction.DEFAULT),
         guarded_code=guarded_code,
@@ -94,6 +127,9 @@ def wrap_guarded_code(guarded_code: GuardedCode) -> ConvertFrameReturn:
 
 
 class DynamoCallbackFn(Protocol):
+    # [CLASS DOC] Protocol for the frame-evaluation callback: called with the
+    # intercepted frame, the matching cache entry (or None) and the per-frame
+    # state mapping; returns a ConvertFrameReturn describing what to run.
     def __call__(
         self,
         frame: DynamoFrameType,
@@ -110,10 +146,16 @@ CompilerConfig = Mapping[str, Any]
 
 @runtime_checkable
 class CompilerConfigProvider(Protocol):
+    # [CLASS DOC] Runtime-checkable protocol for objects (e.g. backends) that
+    # expose their compiler configuration via get_compiler_config, which
+    # returns a read-only mapping of options or None if there is none.
     def get_compiler_config(self) -> CompilerConfig | None: ...
 
 
 class DynamoGuardHook(Protocol):
+    # [CLASS DOC] Protocol for a hook invoked during guard evaluation with the
+    # guard manager, the code object, the frame locals, the index of the cache
+    # entry being checked, and whether it is the last entry. Returns nothing.
     def __call__(
         self,
         guard_manager: GuardFn,
@@ -125,6 +167,8 @@ class DynamoGuardHook(Protocol):
 
 
 class DynamoGuardCompleteHook(Protocol):
+    # [CLASS DOC] Protocol for a hook invoked after guard evaluation finishes,
+    # given whether a cache hit occurred; returns a bool result.
     def __call__(
         self,
         cache_hit: bool,
@@ -132,6 +176,8 @@ class DynamoGuardCompleteHook(Protocol):
 
 
 class ProfilerStartHook(Protocol):
+    # [CLASS DOC] Protocol for a hook that starts a profiler range given a
+    # name and returns an opaque record handle (to be passed to the end hook).
     def __call__(
         self,
         name: str,
@@ -140,10 +186,15 @@ class ProfilerStartHook(Protocol):
 
 
 class ProfilerEndHook(Protocol):
+    # [CLASS DOC] Protocol for a hook that ends a profiler range, given the
+    # record handle returned by the start hook; returns nothing.
     def __call__(self, record: Any) -> None: ...
 
 
 class BytecodeHook(Protocol):
+    # [CLASS DOC] Protocol for a hook called with the original and newly
+    # generated code objects; may return a replacement code object, or None
+    # to keep the new code unchanged.
     def __call__(
         self, code: types.CodeType, new_code: types.CodeType
     ) -> types.CodeType | None: ...
