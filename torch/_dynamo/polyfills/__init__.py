@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Traceable pure-Python replacements (polyfills) for builtins and library
+# functions that Dynamo cannot trace natively. This __init__ defines common
+# helpers (comparison, dict/mapping operations, match-statement support,
+# foreach and grad accumulation helpers, a no-enter torch function mode).
+# Submodules (builtins, functools, itertools, ...) are loaded by loader.py and
+# must not be imported here, to avoid circular imports.
 """
 Python polyfills for common builtins.
 """
@@ -60,7 +67,11 @@ from torch.overrides import BaseTorchFunctionMode
 # These contexts do nothing on enter, but provide the correct exit logic to ensure
 # the stack state is correct.
 class NoEnterTorchFunctionMode(BaseTorchFunctionMode):
+    # [CLASS DOC] A torch function mode whose enter does nothing (it is already
+    # on the mode stack through replayed mutations) but which keeps the normal
+    # exit logic, so resume functions after a graph break restore the stack correctly.
     def __enter__(self) -> None:
+        # [FUNCTION DOC] No-op enter; does not push the mode.
         pass
 
 
@@ -70,6 +81,9 @@ class NoEnterTorchFunctionMode(BaseTorchFunctionMode):
 # the context in the compiled fn/resume. By inlining through this polyfill, the
 # `with` statement has real bytecode that the resume function can continue from.
 def _fn_with_ctx(ctx: Any, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    # [FUNCTION DOC] HELPER: Call fn with the given args inside a with block on
+    # ctx and return its result, so the context has real bytecode that resume
+    # functions can continue from after nested graph breaks.
     with ctx:
         return fn(*args, **kwargs)
 
@@ -77,6 +91,9 @@ def _fn_with_ctx(ctx: Any, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T
 def index(
     iterator: Iterator[T], item: T, start: int = 0, end: int | None = None
 ) -> int:
+    # [FUNCTION DOC] Return the position of the first element of the iterator
+    # (within start..end) that is identical or equal to item; consumes the
+    # iterator. Raises ValueError if not found.
     from itertools import islice
 
     for i, elem in islice(enumerate(iterator), start, end):
@@ -87,25 +104,32 @@ def index(
 
 
 def repeat(item: T, count: int) -> Iterator[T]:
+    # [FUNCTION DOC] Generator yielding item count times.
     for _ in range(count):
         yield item
 
 
 def radians(x: float) -> float:
+    # [FUNCTION DOC] Convert degrees to radians.
     import math
 
     return math.pi / 180.0 * x
 
 
 def impl_IS_MAPPING(a: object) -> TypeIs[Mapping[Any, Any]]:
+    # [FUNCTION DOC] Mapping check used for the match-statement mapping opcode: True if a is a Mapping.
     return isinstance(a, Mapping)
 
 
 def impl_MATCH_SEQUENCE(a: object) -> TypeGuard[Sequence[Any]]:
+    # [FUNCTION DOC] Match-statement sequence check: True for Sequences other than str, bytes, bytearray.
     return isinstance(a, Sequence) and not isinstance(a, (str, bytes, bytearray))
 
 
 def _match_class_attr(obj: object, name: str, seen: set[str]) -> object:
+    # [FUNCTION DOC] HELPER: Fetch attribute name from obj for class patterns,
+    # recording it in the seen set. Raises TypeError if name was already seen;
+    # propagates AttributeError if missing. Mutates seen.
     if name in seen:
         raise TypeError(f"{type(obj)} got multiple sub-patterns for attribute {name}")
 
@@ -117,6 +141,12 @@ def _match_class_attr(obj: object, name: str, seen: set[str]) -> object:
 def impl_MATCH_CLASS(
     subject: object, cls: type, nargs: int, kwargs: tuple[str, ...]
 ) -> tuple[object, ...] | None:
+    # [FUNCTION DOC] Match-statement class pattern. Returns None if subject is
+    # not an instance of cls; otherwise a tuple of the matched attribute values:
+    # nargs positional ones via __match_args__ (or the subject itself when the
+    # class defines none, assuming match-self), then the keyword-named ones.
+    # Raises TypeError for non-class cls, bad __match_args__, duplicate
+    # attributes, or too many positional sub-patterns.
     if not isinstance(cls, type):
         raise TypeError("called match pattern must be a class")
 
@@ -166,6 +196,8 @@ def impl_MATCH_CLASS(
 
 
 def impl_MATCH_KEYS(obj: Mapping[T, U], keys: tuple[T, ...]) -> tuple[U, ...] | None:
+    # [FUNCTION DOC] Match-statement mapping keys: return a tuple of values for
+    # the keys if all are present, else None. Raises AssertionError if obj is not a Mapping.
     if not isinstance(obj, Mapping):
         raise AssertionError(f"Expected a Mapping, got {type(obj)}")
     if all(key in obj for key in keys):
@@ -175,6 +207,10 @@ def impl_MATCH_KEYS(obj: Mapping[T, U], keys: tuple[T, ...]) -> tuple[U, ...] | 
 
 
 def impl_CONTAINS_OP_fallback(a: T, b: Iterable[T]) -> bool:
+    # [FUNCTION DOC] Containment test fallback: iterate b if it supports
+    # iteration, else probe item access with increasing integer indices until
+    # IndexError. Returns True on first equal element. Raises TypeError if b
+    # supports neither.
     # performs fallback "a in b"
     # CPython: PySequence_Contains → _PySequence_IterSearch → PyObject_GetIter
     # PyObject_GetIter itself falls back to PySequence_GetItem when tp_iter is NULL.
@@ -200,6 +236,12 @@ def accumulate_grad(
     variable_grad: torch.Tensor | None,
     new_grad: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] Accumulate a new gradient into an existing one following
+    # the gradient layout contract. None new grad returns the existing grad. The
+    # new grad is copied into a tensor shaped like x; with no existing grad that
+    # copy is returned; sparse existing plus dense new gives an out-of-place
+    # sum; with grad mode on, an out-of-place sum; otherwise the existing grad
+    # is updated in place and returned (may alias it).
     # polyfills according to the Gradient Layout Contract
     if new_grad is None:
         return variable_grad
@@ -221,6 +263,9 @@ def accumulate_grad_no_alias(
     variable_grad: torch.Tensor | None,
     new_grad: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] Like accumulate_grad but the result never aliases an input:
+    # a None new grad returns a clone of the existing grad (or None), and the
+    # no-grad-mode case sums into a clone instead of updating in place.
     # Mirrors inductor::accumulate_grad_: same gradient layout logic as
     # accumulate_grad, but the returned grad must not alias any input.
     if new_grad is None:
@@ -246,6 +291,10 @@ def accumulate_grad_no_alias(
 def list_cmp(
     op: Callable[[Any, Any], bool], left: Sequence[T], right: Sequence[T]
 ) -> bool:
+    # [FUNCTION DOC] Lexicographic comparison of two sequences with a given
+    # comparison operator, as CPython does for lists/tuples. For equality and
+    # inequality, differing lengths decide immediately. Otherwise the operator
+    # is applied to the first differing pair, else to the lengths. Returns a bool.
     """emulate `(1,2,3) > (1,2)` etc"""
 
     # Optimization: For equality, short-circuit if lengths differ
@@ -268,6 +317,9 @@ def list_cmp(
 
 
 def dict___eq__(d: dict[T, U], other: dict[T, U]) -> bool:
+    # [FUNCTION DOC] Dict equality: same length and keys, then values compared
+    # (identity shortcut first, as in CPython). Two OrderedDicts also require
+    # the same item order. Returns a bool.
     if (len(d) != len(other)) or (d.keys() != other.keys()):
         return False
 
@@ -288,6 +340,9 @@ def dict___eq__(d: dict[T, U], other: dict[T, U]) -> bool:
 def dictview_richcompare(
     op: Callable[[Any, Any], bool], self: Iterable[T], other: Iterable[T]
 ) -> bool:
+    # [FUNCTION DOC] Rich comparison of a dict view against another set-like
+    # iterable using the given operator (eq, ne, lt, le, gt, ge), via length
+    # checks and membership tests (subset/superset semantics). Returns a bool.
     """Mirrors dictview_richcompare for dict_keys/dict_items vs set/frozenset.
 
     https://github.com/python/cpython/blob/e76aa128fe/Objects/dictobject.c#L5952-L6010
@@ -325,12 +380,14 @@ def dictview_richcompare(
 def assert_dict_equal(
     self_: Any, d1: dict[T, U], d2: dict[T, U], msg: str | None = None
 ) -> None:
+    # [FUNCTION DOC] Replacement for the unittest dict-equality assertion: asserts d1 equals d2 via the test case's truth assertion.
     self_.assertTrue(d1 == d2, msg)
 
 
 def assert_multi_line_equal(
     self_: Any, first: T, second: T, msg: str | None = None
 ) -> None:
+    # [FUNCTION DOC] Replacement for the unittest multi-line string equality assertion: simple equality check without diffing.
     return self_.assertTrue(first == second, msg)
 
 
@@ -342,10 +399,13 @@ def assert_sequence_equal(
     msg: str | None = None,
     seq_type: type[Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Replacement for the unittest sequence-equality assertion: simple equality check; seq_type is ignored.
     return self_.assertTrue(seq1 == seq2, msg)
 
 
 def getattr_and_trace(*args: Any, **kwargs: Any) -> Any:
+    # [FUNCTION DOC] Look up the attribute named by the second positional arg on
+    # the first positional arg and call it with the remaining args and keywords; returns its result.
     wrapper_obj = args[0]
     attr_name = args[1]
     fn = getattr(wrapper_obj, attr_name)
@@ -353,11 +413,14 @@ def getattr_and_trace(*args: Any, **kwargs: Any) -> Any:
 
 
 def getattr_and_trace_no_nested_graph_breaks(*args: Any, **kwargs: Any) -> Any:
+    # [FUNCTION DOC] Same as getattr_and_trace but run with nested graph breaks disabled.
     with torch._dynamo.disable_nested_graph_breaks():
         return getattr_and_trace(*args, **kwargs)
 
 
 def mapping_get(obj: Mapping[T, U], key: T, value: U | None = None, /) -> U | None:
+    # [FUNCTION DOC] Mapping get: return the item for key, or value (default
+    # None) when item access raises KeyError.
     try:
         return obj.__getitem__(key)
     except KeyError:
@@ -367,6 +430,9 @@ def mapping_get(obj: Mapping[T, U], key: T, value: U | None = None, /) -> U | No
 def instantiate_user_defined_class_object(
     cls: type[T], /, *args: Any, **kwargs: Any
 ) -> T:
+    # [FUNCTION DOC] Instantiate a user-defined class: call its new with the
+    # args, then call init only if the result's type is a true subclass of cls
+    # (without consulting metaclass instance checks). Returns the object.
     obj = cls.__new__(cls, *args, **kwargs)
 
     # Only call __init__ if the object's type is a subclass of cls.
@@ -385,6 +451,10 @@ def mutable_mapping_update(
     /,
     **kwargs: Any,
 ) -> None:
+    # [FUNCTION DOC] Mutable-mapping update: copy items from a mapping, or from
+    # an iterable of key/value pairs, into self, then apply keyword items.
+    # Raises TypeError if data is neither mapping nor iterable. Mutates self.
+    # Objects with only a keys method are intentionally unsupported.
     if isinstance(data, Mapping):
         # Merge standard mapping with PyMapping_Items
         for key, value in data.items():
@@ -425,12 +495,18 @@ def construct_dict(
     /,
     **kwargs: Any,
 ) -> T:
+    # [FUNCTION DOC] Build a dict-like instance of cls (no init call) filled
+    # from data and keyword items via mutable_mapping_update; returns it.
     self = cls.__new__(cls)
     mutable_mapping_update(self, data, **kwargs)
     return self
 
 
 def foreach_map_fn(*args: Any) -> Any:
+    # [FUNCTION DOC] Apply an op (first arg) elementwise over the remaining
+    # args; non-list/tuple args are broadcast by repetition. If none are
+    # lists, the op is applied once to the args and its result returned;
+    # otherwise returns a list of per-element results (zip truncates to the shortest).
     op = args[0]
     new_args: list[Any] = []
     at_least_one_list = False
@@ -457,6 +533,11 @@ def foreach_lerp_inplace(
     end: list[torch.Tensor] | tuple[torch.Tensor, ...],
     weight: float | int | torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC] In-place foreach lerp of the tensor list self toward end by
+    # weight (scalar or tensor), decomposed into sub and addcmul to match native
+    # CUDA rounding (low formula when |weight| < 0.5, else the high formula from
+    # end). Mutates the tensors in self and returns self.
+    # KNOWN ISSUE: annotated as returning None but returns self.
     # Decompose lerp via addcmul_ for FMA.  Uses the same dual-formula
     # approach as CUDA's native lerp to get bitwise identical results:
     #   |w| <  0.5  (low):  fma(w, diff, start)
@@ -498,10 +579,12 @@ def foreach_lerp_inplace(
 def foreach_pow_scalar(
     scalar: Any, exps: Sequence[bool | complex | float | int]
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Foreach power with a scalar base: raise scalar to each exponent, returning the foreach result.
     return torch._foreach_pow([scalar for _ in exps], exps)
 
 
 def predicate(obj: object) -> bool:
+    # [FUNCTION DOC] Truthiness of obj as a bool, written as a conditional so Dynamo handles the branch itself.
     # This will cause the rest of dynamo to handle the if statement correctly, so we don't have to rewrite it here.
     # We can't just use bool() here since we can't trace into that in general.
     if obj:
@@ -512,6 +595,11 @@ def predicate(obj: object) -> bool:
 def group_tensors_by_device_and_dtype(
     tensorlistlist: list[list[torch.Tensor | None]], with_indices: bool = False
 ) -> dict[tuple[torch.device, torch.dtype], tuple[list[list[Any]], list[int]]]:
+    # [FUNCTION DOC] Group tensors by (device, dtype) of the first non-None
+    # tensor at each index across the lists. Returns a mapping from that key to
+    # a pair: per-list grouped tensors (None where a list lacks the index) and,
+    # if with_indices, the original indices (else an empty list). Empty input
+    # gives an empty mapping.
     """Pure Python implementation of torch._C._group_tensors_by_device_and_dtype.
 
     Groups tensors by their device and dtype. This is useful before sending

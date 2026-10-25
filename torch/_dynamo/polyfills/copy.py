@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Polyfill for object.__reduce_ex__ so that copy/pickle-style reduction of
+# user-defined objects can be traced. Exports reduce_ex_user_defined_object,
+# registered via substitute_in_graph at import time.
 """
 Python polyfills for copy
 """
@@ -18,6 +22,12 @@ T = TypeVar("T")
 
 @substitute_in_graph(object.__reduce_ex__, skip_signature_check=True)  # type: ignore[arg-type]
 def reduce_ex_user_defined_object(obj: T, protocol: int, /) -> tuple:  # type: ignore[type-arg]
+    # [FUNCTION DOC] Traceable replacement for object.__reduce_ex__ (protocol
+    # is accepted but ignored). Takes the object and protocol; returns a
+    # five-tuple: constructor function (newobj, or newobj_ex when getnewargs_ex
+    # gives non-empty keyword args), its args, state, and two Nones. State is
+    # the overridden __getstate__ result, else the instance dict, else None when
+    # there is no dict. Calls user hooks; no other side effects.
     """Traceable polyfill for object.__reduce_ex__ (protocol >= 2).
 
     Mirrors CPython's reduce_newobj (Objects/typeobject.c): builds the __new__

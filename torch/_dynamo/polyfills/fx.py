@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Polyfills for the C++ fast paths torch._C._fx_map_arg and _fx_map_aggregate,
+# so Dynamo can trace fx node argument mapping. Exports map_arg and
+# map_aggregate; registered via substitute_in_graph (constant-foldable).
 from collections.abc import Callable
 from typing import Any
 
@@ -10,11 +14,17 @@ from ..decorators import substitute_in_graph
 
 @substitute_in_graph(_fx_map_arg, can_constant_fold_through=True)
 def map_arg(a: Any, fn: Callable[[Node], Any]) -> Any:
+    # [FUNCTION DOC] Apply fn to every fx Node found in the nested argument
+    # structure a, leaving non-Node leaves unchanged; returns the rebuilt structure.
     return map_aggregate(a, lambda x: fn(x) if isinstance(x, Node) else x)
 
 
 @substitute_in_graph(_fx_map_aggregate, can_constant_fold_through=True)
 def map_aggregate(a: Any, fn: Callable[[Any], Any]) -> Any:
+    # [FUNCTION DOC] Recursively rebuild a nested structure, applying fn to each
+    # leaf. Tuples (namedtuples keep their type) become tuples; lists become
+    # immutable lists; dicts become immutable dicts (values mapped, keys kept);
+    # slices have start/stop/step mapped; anything else is passed to fn.
     result: Any
     if isinstance(a, tuple):
         it = (map_aggregate(elem, fn) for elem in a)

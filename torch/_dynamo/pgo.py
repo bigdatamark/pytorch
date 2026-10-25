@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Profile-guided optimization state for Dynamo: a global per-code mapping of
+# automatic-dynamic shape/scalar profiles (FrameStateSizeEntry merged as a
+# semilattice), keyed by CodeId, with local-disk and remote persistence and
+# distributed-rank merging hooks. Holds module-global state (_CODE_STATE and
+# friends); resettable via reset_code_state. Registers PGOCacheArtifact at
+# import time. Reads/writes happen lazily on first get_code_state / put_code_state.
 """
 Profile Guided Optimization (PGO) implementation for Dynamo.
 
@@ -53,6 +60,7 @@ if TYPE_CHECKING:
 
 
 class ReservedWorkflowIdUserError(ValueError):
+    # [CLASS DOC] Error raised when a user-supplied job id uses the reserved automatically generated prefix.
     pass
 
 
@@ -114,6 +122,9 @@ LOCK_TIMEOUT = 10
 
 @functools.cache
 def _hash_containing_file(filepath: str) -> str:
+    # [FUNCTION DOC] HELPER: Return an eight-digit hex CRC32 of the file's
+    # contents, or the path itself if the file does not exist. Cached per path;
+    # reads the file.
     # if the file does not exist we consider filepath to be the hash.
     if not os.path.exists(filepath):
         return filepath
@@ -126,12 +137,14 @@ def _hash_containing_file(filepath: str) -> str:
 
 
 def _get_closure_content(content: types.CellType) -> object:
+    # [FUNCTION DOC] HELPER: For a callable with a code object return that code object, else None.
     if callable(content) and hasattr(content, "__code__"):
         return content.__code__
     return None
 
 
 def _get_cell_hash_content(content: types.CellType) -> object:
+    # [FUNCTION DOC] HELPER: Hashable stand-in for a closure cell: the code of the function in the cell, or None for non-functions or empty cells.
     # Safely extract cell contents without blowing up the entire tuple hash
     try:
         return _get_closure_content(content.cell_contents)
@@ -141,6 +154,9 @@ def _get_cell_hash_content(content: types.CellType) -> object:
 
 @dataclasses.dataclass(frozen=True)
 class CodeId:
+    # [CLASS DOC] Frozen identity of a code object for PGO keys: filename
+    # (informational), first line, name, file content hash, and optional closure
+    # hash. Equality and hashing ignore the filename so relocated copies match.
     filename: str
     firstlineno: int
     name: str
@@ -155,6 +171,7 @@ class CodeId:
 
     # Exclude file name.
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a CodeId with the same file hash, first line, name and closure hash (filename ignored).
         if not isinstance(other, CodeId):
             return False
         return (
@@ -166,15 +183,20 @@ class CodeId:
 
     # Ensure if two CodeIds are the same, then they have the same hash by excluding filename.
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash over the same fields used by equality (filename excluded).
         return hash((self.file_hash, self.name, self.firstlineno, self.closure_hash))
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Human-readable form with file hash, filename, line and name.
         return f"hash({self.file_hash}){self.filename}:{self.firstlineno}:{self.name}"
 
     @staticmethod
     def make(
         code: types.CodeType, closure: tuple[types.CellType, ...] | None = None
     ) -> CodeId:
+        # [FUNCTION DOC] Build a CodeId from a code object and optional closure
+        # cells; the closure hash combines the code objects of functions held in
+        # the cells (None when no closure). Reads the source file to hash it.
         closure_hash = None
         if closure:
             closure_hash = hash(tuple(_get_cell_hash_content(c) for c in closure))
@@ -190,6 +212,8 @@ class CodeId:
 
 @dataclasses.dataclass
 class CodeState:
+    # [CLASS DOC] PGO profile for one code object: a mapping from input source
+    # name to its FrameStateSizeEntry, created on demand.
     automatic_dynamic: defaultdict[str, FrameStateSizeEntry] = dataclasses.field(
         default_factory=lambda: defaultdict(FrameStateSizeEntry)
     )
@@ -203,6 +227,9 @@ _KNOWN_DYNAMIC_SOURCES: set[str] = set()
 
 @dataclasses.dataclass(frozen=True)
 class InferStride:
+    # [CLASS DOC] Frozen marker for a stride equal to stride times size of the
+    # given dimension (the contiguous stride for the next dimension), so merged
+    # strides keep their relationships to sizes. Attribute: dim.
     """
     Denotes the quantity stride[dim] * size[dim], which is what the stride would
     be for the next physical dimension that results in a contiguous layout.
@@ -226,6 +253,7 @@ _T = TypeVar("_T")
 
 
 class AutoUnset(enum.Enum):
+    # [CLASS DOC] Single-member enum for the unknown/identity element of the merge semilattice.
     """
     The identity element of our semilattice, a generic "don't know" element that
     is always subsumed when we get more information.
@@ -238,6 +266,7 @@ auto_unset = AutoUnset.token
 
 
 class AutoDynamic(enum.Enum):
+    # [CLASS DOC] Single-member enum for the dynamic/top element of the merge semilattice (absorbs anything).
     """
     The top element of our (bounded) semilattice, whenever you merge this with
     any other element you always get it again
@@ -251,6 +280,11 @@ auto_dynamic = AutoDynamic.token
 
 @dataclasses.dataclass
 class FrameStateSizeEntry:
+    # [CLASS DOC] Mergeable profile of one input: scalar value, tensor size
+    # tuple and stride tuple, each either concrete, unset or dynamic; plus
+    # excluded_sizes and excluded_scalar (not part of equality) recording the
+    # static values that just became dynamic so guards can exclude them. Merge
+    # in place via the in-place or operator; no symbolic ints are allowed.
     scalar: int | AutoDynamic | AutoUnset = dataclasses.field(default=auto_unset)
     # NB: We don't have cases where we have a known dimensionality but
     # we know NOTHING about the individual sizes
@@ -266,8 +300,12 @@ class FrameStateSizeEntry:
     excluded_scalar: int | None = dataclasses.field(default=None, compare=False)
 
     def render(self) -> str:
+        # [FUNCTION DOC] Human-readable description for logs: fully dynamic
+        # scalar/tensor, a static scalar, tensor sizes and strides, or an
+        # "unusual" fallback showing the repr.
         # Special cases
         def render_single(s: int | AutoDynamic | AutoUnset | InferStride) -> str:
+            # [FUNCTION DOC] HELPER: Render one element: question mark for dynamic, "auto unset", S(dim) for strides, else the number.
             if s is auto_dynamic:
                 return "?"
             elif s is auto_unset:
@@ -279,6 +317,7 @@ class FrameStateSizeEntry:
                 return str(s)
 
         def render_tuple(ss: tuple[int | AutoDynamic | InferStride, ...]) -> str:
+            # [FUNCTION DOC] HELPER: Render a tuple as a bracketed comma-separated list.
             return "[" + ", ".join(render_single(s) for s in ss) + "]"
 
         # Common cases
@@ -295,6 +334,7 @@ class FrameStateSizeEntry:
         return f"unusual {repr(self)}"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate that no scalar, size or stride element is a symbolic integer; raises AssertionError if one is.
         if isinstance(self.scalar, torch.SymInt):
             raise AssertionError(self.scalar)
         if isinstance(self.size, tuple):
@@ -307,6 +347,7 @@ class FrameStateSizeEntry:
                     raise AssertionError(s1)
 
     def is_size_dynamic(self, dim: int) -> bool:
+        # [FUNCTION DOC] True if the whole size is dynamic or the given dimension is dynamic; False if the size is unset.
         if self.size is auto_dynamic:
             return True
         if self.size is auto_unset:
@@ -314,6 +355,9 @@ class FrameStateSizeEntry:
         return self.size[dim] is auto_dynamic
 
     def is_stride_dynamic(self, dim: int) -> bool:
+        # [FUNCTION DOC] Whether the stride at dim should be dynamic. Always
+        # False unless the size is a fully static tuple of ints; otherwise True
+        # if all strides are dynamic, False if unset, else per-dimension dynamic.
         # At the moment, dynamic strides is a bit buggy.  Good test case
         # here is `PYTORCH_TEST_WITH_DYNAMO=1 python test/test_autograd.py
         # TestAutograd.test_gradcheck_jacobian_mismatch`
@@ -341,16 +385,19 @@ class FrameStateSizeEntry:
 
     @staticmethod
     def _munge_symint(xs: tuple[int, ...]) -> tuple[AutoDynamic | int, ...]:
+        # [FUNCTION DOC] HELPER: Replace symbolic integers in a tuple with the dynamic marker, keeping concrete values.
         return tuple(auto_dynamic if isinstance(x, torch.SymInt) else x for x in xs)
 
     @classmethod
     def make_scalar(cls, x: int) -> FrameStateSizeEntry:
+        # [FUNCTION DOC] Entry for a scalar value: given scalar, dynamic size and stride.
         return FrameStateSizeEntry(scalar=x, size=auto_dynamic, stride=auto_dynamic)
 
     @classmethod
     def make_tensor(
         cls, size: tuple[int, ...], stride: tuple[int, ...]
     ) -> FrameStateSizeEntry:
+        # [FUNCTION DOC] Entry for a tensor: dynamic scalar, with size and stride tuples (symbolic ints become dynamic).
         return FrameStateSizeEntry(
             scalar=auto_dynamic,
             size=cls._munge_symint(size),
@@ -359,6 +406,7 @@ class FrameStateSizeEntry:
 
     @classmethod
     def make_size(cls, size: tuple[int, ...]) -> FrameStateSizeEntry:
+        # [FUNCTION DOC] Entry for a size-only value: unset scalar and stride, size tuple (symbolic ints become dynamic).
         return FrameStateSizeEntry(
             scalar=auto_unset,
             size=cls._munge_symint(size),
@@ -367,6 +415,8 @@ class FrameStateSizeEntry:
 
     @staticmethod
     def _merge_atom(x: _T, y: _T) -> AutoDynamic | _T:
+        # [FUNCTION DOC] HELPER: Semilattice join of two elements: unset yields
+        # the other; dynamic or unequal values yield dynamic; equal values stay.
         if x is auto_unset:
             return y
         if y is auto_unset:
@@ -381,6 +431,9 @@ class FrameStateSizeEntry:
         xs: AutoDynamic | AutoUnset | tuple[_T, ...],
         ys: AutoDynamic | AutoUnset | tuple[_T, ...],
     ) -> AutoDynamic | AutoUnset | tuple[AutoDynamic | _T, ...]:
+        # [FUNCTION DOC] HELPER: Join of two tuple-valued entries: unset yields
+        # the other; dynamic or different lengths yield dynamic; otherwise the
+        # elementwise join.
         if xs is auto_unset:
             return ys
         if ys is auto_unset:
@@ -392,6 +445,11 @@ class FrameStateSizeEntry:
         return tuple(cls._merge_atom(x, y) for x, y in zip(xs, ys))
 
     def __ior__(self, other: Self) -> Self:
+        # [FUNCTION DOC] Merge other into self in place (join of scalar, size,
+        # stride). Also maintains exclusion info: when a static size tuple
+        # changes, records its static dims (others None); clears it when no
+        # transition occurs; records the old scalar when two different ints
+        # merge and clears it once the scalar is dynamic. Returns self.
         # Record current static sizes before merge. For dims that become
         # dynamic, the exclusion guard will reject these values so inputs
         # fall through to the earlier, more specialized cache entry.
@@ -430,6 +488,11 @@ def update_automatic_dynamic(
     *,
     is_unspecialized_nn_module: bool = False,
 ) -> FrameStateSizeEntry:
+    # [FUNCTION DOC] Merge a newly observed entry for the named input into the
+    # global code state of the translator's frame. With automatic dynamic
+    # shapes on: merges in place, logs and emits compile events for scalar,
+    # size and stride changes, and returns the merged entry. Otherwise
+    # overwrites the stored entry and returns the new one. Mutates global state.
     code_id = CodeId.make(tx.f_code, tx.closure)
     frame_state = get_code_state()[code_id]
     if torch._dynamo.config.automatic_dynamic_shapes:
@@ -472,6 +535,9 @@ def update_automatic_dynamic(
         def log_tup(
             tup_name: str, short_reason: str, long_reason: str, i: int | None = None
         ) -> None:
+            # [FUNCTION DOC] HELPER: Log (info, debug and a compile event) that
+            # the input became dynamic, comparing the new and old size or stride
+            # tuple (whole tuple, or element i when given).
             entry_tup = (
                 getattr(entry, tup_name) if i is None else getattr(entry, tup_name)[i]
             )
@@ -546,6 +612,12 @@ def process_automatic_dynamic(
     *,
     is_unspecialized_nn_module: bool = False,
 ) -> FrameStateSizeEntry:
+    # [FUNCTION DOC] Entry point for automatic-dynamic updates, aware of
+    # compiler collectives. No distributed state: plain update. During the
+    # preflight (no gathered states yet): stores the entry as local state and
+    # returns it unmerged (static). After the collective: applies the update
+    # from every rank's state and returns the last result; raises
+    # AssertionError if no rank has the name.
     if (st := tx.distributed_state) is None:
         return update_automatic_dynamic(
             tx,
@@ -589,6 +661,8 @@ def process_automatic_dynamic(
 
 
 def format_cache_key(key: str) -> str:
+    # [FUNCTION DOC] Append the global rank (None if distributed is not
+    # initialized) and the configured cache key tag to a base key, colon separated.
     # NB: We always use global rank for keys, even though they are overkill
     # for local only cache
     rank = None
@@ -600,6 +674,10 @@ def format_cache_key(key: str) -> str:
 
 
 def get_cache_key() -> str | None:
+    # [FUNCTION DOC] Compute the PGO cache key: None if caches are force
+    # disabled (warns once) or no job id is known. A user job id gives a
+    # formatted key (raises ReservedWorkflowIdUserError if it starts with the
+    # reserved prefix); otherwise an automatic MAST job name and version key if available.
     # TODO: info versions of these logs that log only once
     if torch.compiler.config.force_disable_caches:
         warn_once(
@@ -626,6 +704,7 @@ def get_cache_key() -> str | None:
 
 
 def get_extra_cache_key(sticky_key: str) -> str | None:
+    # [FUNCTION DOC] Formatted cache key for an extra (sticky) profile key; None if caches are force disabled (warns once).
     if torch.compiler.config.force_disable_caches:
         warn_once(
             "dynamo_pgo force disabled by torch.compiler.config.force_disable_caches"
@@ -637,6 +716,8 @@ def get_extra_cache_key(sticky_key: str) -> str | None:
 
 # This solely controls local PGO
 def code_state_path(cache_key: str) -> str | None:
+    # [FUNCTION DOC] Local file path for a cache key (file name sanitized,
+    # under the dynamo subdirectory of the cache directory); None if local PGO is disabled by config.
     if not torch._dynamo.config.automatic_dynamic_local_pgo:
         log.debug("automatic_dynamic_local_pgo not enabled")
         return None
@@ -648,6 +729,10 @@ def code_state_path(cache_key: str) -> str | None:
 
 
 def should_use_remote_dynamo_pgo_cache() -> bool:
+    # [FUNCTION DOC] Decide whether to use the remote PGO cache: never when
+    # caches are force disabled; the explicit config setting if set; otherwise
+    # only in the internal build, outside unit tests, when the remote cache
+    # module exists and its version meets a rollout knob.
     if torch.compiler.config.force_disable_caches:
         return False
 
@@ -671,6 +756,7 @@ def should_use_remote_dynamo_pgo_cache() -> bool:
 
 
 def get_remote_cache() -> RemoteCache[JsonDataTy] | None:
+    # [FUNCTION DOC] Create the remote PGO cache client, or None if remote use is disabled.
     from torch._inductor.remote_cache import create_cache
 
     if not should_use_remote_dynamo_pgo_cache():
@@ -685,6 +771,8 @@ def get_remote_cache() -> RemoteCache[JsonDataTy] | None:
 
 
 def _collect_dynamic_sources(code_state: CodeState) -> OrderedSet[str]:
+    # [FUNCTION DOC] HELPER: Ordered set of source names in a code state that
+    # have a dynamic size dimension (for tensors) or a dynamic scalar.
     dynamic_sources: OrderedSet[str] = OrderedSet()
     for src, fs in code_state.automatic_dynamic.items():
         dynamic = False
@@ -698,6 +786,9 @@ def _collect_dynamic_sources(code_state: CodeState) -> OrderedSet[str]:
 
 
 def _collect_missing_sources(all_sources: OrderedSet[str]) -> OrderedSet[str]:
+    # [FUNCTION DOC] HELPER: Return the sources not yet covered by the
+    # dynamic-source configuration. Sources already known to be dynamic are
+    # skipped; newly found dynamic ones are added to the global known set.
     from torch._dynamo.variables.builder import is_dynamic_source
 
     global _KNOWN_DYNAMIC_SOURCES
@@ -713,6 +804,9 @@ def _collect_missing_sources(all_sources: OrderedSet[str]) -> OrderedSet[str]:
 
 
 def log_frame_dynamic_whitelist(f_code: types.CodeType) -> None:
+    # [FUNCTION DOC] For a frame's code, compute the comma-joined dynamic
+    # sources and the subset missing from configuration; if any dynamic
+    # sources exist, record them in a timed compile event. Mutates the global known-source set.
     global _KNOWN_DYNAMIC_SOURCES
     code_id = CodeId.make(f_code, None)
     frame_state = get_code_state()[code_id]
@@ -729,6 +823,7 @@ def log_frame_dynamic_whitelist(f_code: types.CodeType) -> None:
 
 
 def _log_size_mismatch_recompile() -> None:
+    # [FUNCTION DOC] HELPER: Once per process, record an internal insight that a dynamic-shape recompile was detected (sets a global flag).
     global _LOGGED_DYNAMIC_ALLOWLIST
     if not _LOGGED_DYNAMIC_ALLOWLIST:
         torch._utils_internal.add_mlhub_insight(
@@ -743,6 +838,9 @@ def _log_size_mismatch_recompile() -> None:
 
 
 def render_code_state(cs: defaultdict[CodeId, CodeState]) -> str:
+    # [FUNCTION DOC] Render the whole code state as text: each code id followed
+    # by its per-source rendered entries, plus, if any sources are dynamic, a
+    # hint to set the dynamic-sources environment variable listing them.
     code_state_str = "\n".join(
         f"{k}:\n"
         + "\n".join(
@@ -764,8 +862,12 @@ def render_code_state(cs: defaultdict[CodeId, CodeState]) -> str:
 
 @CacheArtifactFactory.register
 class PGOCacheArtifact(CacheArtifact):
+    # [CLASS DOC] Cache artifact kind for PGO profiles (type name pgo); content
+    # is the pickled code state, key the PGO cache key. Registered with the factory.
     @override
     def populate_cache(self) -> None:
+        # [FUNCTION DOC] Write the artifact content to the local PGO file for
+        # its (possibly rewritten) key. Raises AssertionError if local PGO is disabled.
         meta = write_local_impl(
             self._rewrite_cache_key_for_mega_cache(self.key), self.content
         )
@@ -777,10 +879,14 @@ class PGOCacheArtifact(CacheArtifact):
     @override
     @staticmethod
     def type() -> str:
+        # [FUNCTION DOC] Return the artifact type name.
         return "pgo"
 
     @staticmethod
     def _rewrite_cache_key_for_mega_cache(original_key: str) -> str:
+        # [FUNCTION DOC] HELPER: If the key was an automatic job key (reserved
+        # prefix), return the current process's key when available; otherwise
+        # return the original key unchanged.
         """
         The PGO cache artifact key for a MAST job contains the job name and the version.
         When we want to use the cache artifact on a different MAST job, we need to
@@ -795,6 +901,10 @@ class PGOCacheArtifact(CacheArtifact):
 
 
 def hit(key: str, ty: str) -> defaultdict[CodeId, CodeState]:
+    # [FUNCTION DOC] HELPER: Bookkeeping after a successful load: logs,
+    # emits a structured trace artifact, marks the PGO feature used, snapshots
+    # a deep copy as the initial state (to detect changes later) and returns
+    # the current code state. Raises AssertionError if the state is not a defaultdict.
     global _INIT_CODE_STATE
     if not isinstance(_CODE_STATE, defaultdict):
         raise AssertionError(
@@ -812,6 +922,10 @@ def hit(key: str, ty: str) -> defaultdict[CodeId, CodeState]:
 
 
 def get_local_code_state(cache_key: str) -> defaultdict[CodeId, CodeState] | None:
+    # [FUNCTION DOC] Try to load the code state from the local file for the
+    # key. On success sets the global state, records a cache artifact and
+    # returns the state; if the file is missing, local PGO is off, or unpickling
+    # fails (logged as a warning), returns None. Reads the file; mutates globals.
     global _CODE_STATE
     path = code_state_path(cache_key)
     if path is not None and os.path.exists(path):
@@ -843,6 +957,10 @@ def lookup_remote_cache_entry(
     cache_key: str,
     event_name: str | None = None,
 ) -> defaultdict[CodeId, CodeState] | None:
+    # [FUNCTION DOC] Fetch and decode a code state from the remote cache: read
+    # the key, expect a mapping with a base64 string payload, decode and
+    # unpickle it, log the size if an event name is given, and record a cache
+    # artifact. Returns the state, or None on a miss or any read/parse failure (logged).
     code_state = None
     try:
         cache_data = remote_cache.get(cache_key)
@@ -882,6 +1000,7 @@ def lookup_remote_cache_entry(
 
 
 def get_remote_code_state(cache_key: str) -> defaultdict[CodeId, CodeState] | None:
+    # [FUNCTION DOC] If a remote cache is available, load the code state for the key (timed); on success sets the global state and returns it via hit, else returns None.
     global _CODE_STATE
     remote_cache = get_remote_cache()
     if remote_cache is not None:
@@ -899,6 +1018,11 @@ def get_remote_code_state(cache_key: str) -> defaultdict[CodeId, CodeState] | No
 
 
 def get_extra_remote_code_state(cache_key: str) -> None:
+    # [FUNCTION DOC] Load an extra remote profile for the key and install it
+    # as the global code state, tracing it. Requires the global state to be
+    # initialized and (when something is found) still empty; raises
+    # AssertionError otherwise. No-op without a remote cache or a hit.
+    # KNOWN ISSUE: despite the docstring saying merge, the loaded state replaces the (empty) global state and the initial snapshot is not updated.
     """
     Reads an additional PGO profile from the given cache key, and merges it with the default PGO profile.
     """
@@ -937,6 +1061,10 @@ def get_extra_remote_code_state(cache_key: str) -> None:
 
 
 def get_code_state() -> defaultdict[CodeId, CodeState]:
+    # [FUNCTION DOC] Return the global code state, initializing it on first
+    # use: an empty mapping, then if a cache key exists try local file, then
+    # remote, then (if still empty) the extra remote read key. Subsequent calls
+    # return the same object. Mutates and reads module globals and caches.
     global _CODE_STATE, _INIT_CODE_STATE
     if _CODE_STATE is not None:
         return _CODE_STATE
@@ -972,6 +1100,10 @@ def get_code_state() -> defaultdict[CodeId, CodeState]:
 
 
 def put_code_state() -> None:
+    # [FUNCTION DOC] Persist the code state if it was initialized, changed
+    # since load, and a cache key exists: writes locally and remotely, and also
+    # to the extra write key when configured. Otherwise logs and returns.
+    # KNOWN ISSUE: the extra-key write does not pass the extra flag, so it logs under the regular remote event name.
     if _CODE_STATE is None:
         log.info("put_code_state: never initialized, will not write")
         return
@@ -994,6 +1126,10 @@ def put_code_state() -> None:
 
 
 def write_local_impl(cache_key: str, pickled_code: bytes) -> tuple[str, int] | None:
+    # [FUNCTION DOC] Atomically write pickled bytes to the local PGO file for
+    # the key: create the directory, take a file lock (bounded timeout), write
+    # a temp file and replace the target. Returns the path and byte size, or
+    # None if local PGO is disabled. File I/O side effects.
     path = code_state_path(cache_key)
 
     if path is None:
@@ -1019,6 +1155,9 @@ def write_local_impl(cache_key: str, pickled_code: bytes) -> tuple[str, int] | N
 
 
 def put_local_code_state(cache_key: str) -> None:
+    # [FUNCTION DOC] Pickle the global code state (AssertionError if
+    # uninitialized), record it as a cache artifact, and write it locally;
+    # logs, emits compile events and a structured trace. Skips quietly when local caching is disabled.
     with dynamo_timed(name := "pgo.put_local_code_state", log_pt2_compile_event=True):
         CompileEventLogger.pt2_compile(name, cache_key=cache_key)
         if _CODE_STATE is None:
@@ -1046,6 +1185,10 @@ def put_local_code_state(cache_key: str) -> None:
 
 
 def put_remote_code_state(cache_key: str, extra_code_state: bool = False) -> None:
+    # [FUNCTION DOC] Upload the pickled global code state, base64 encoded in a
+    # mapping, to the remote cache under the key (timed; event name depends on
+    # the extra flag). AssertionError if the state is uninitialized; returns
+    # quietly when no remote cache is available. Emits a structured trace.
     event_name = (
         "put_remote_code_state"
         if not extra_code_state
@@ -1087,6 +1230,7 @@ def put_remote_code_state(cache_key: str, extra_code_state: bool = False) -> Non
 
 # NB: this does NOT reset the cached code state on disk
 def reset_code_state() -> None:
+    # [FUNCTION DOC] Clear the in-memory code state, its initial snapshot and the logged-insight flag (the on-disk cache is untouched).
     global _CODE_STATE, _INIT_CODE_STATE, _LOGGED_DYNAMIC_ALLOWLIST
     _CODE_STATE = None
     _INIT_CODE_STATE = None

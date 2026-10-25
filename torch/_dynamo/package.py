@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Compile package infrastructure for precompile: CompilePackage records the
+# code objects, guards, resume functions and backend ids produced by Dynamo,
+# serializes them (SerializedCode, _DynamoCacheEntry, PrecompileCacheEntry),
+# and reinstalls them (globals, precompile cache entries) in a new process.
+# Also defines DynamoStore implementations (in-memory, disk) and the global
+# DynamoCache disk store. Import-time side effects: registers
+# PrecompileCacheArtifact with the cache artifact factory, creates the global
+# code cache and the DynamoCache object (which resolves the cache directory).
 """
 This module provides the infrastructure for creating and managing compile package
 for torch.compile. We mainly have two abstractions here:
@@ -54,9 +63,14 @@ _CODE_CACHE = WeakIdKeyDictionary()
 
 
 def _code_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Decorator for code conversion class methods that
+    # memoizes results in the global weak-keyed code cache, keyed by the input
+    # code object. Returns the wrapping function.
     def _(
         cls: type[Any], code: Union["SerializedCode", types.CodeType]
     ) -> Union["SerializedCode", types.CodeType]:
+        # [FUNCTION DOC] HELPER: Return the cached conversion for code, else
+        # compute via the wrapped function, store in the global cache and return it.
         if code in _CODE_CACHE:
             return _CODE_CACHE[code]
         res = fn(cls, code)
@@ -68,6 +82,10 @@ def _code_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 @dataclasses.dataclass(frozen=True)
 class SerializedCode:
+    # [CLASS DOC] Frozen, picklable mirror of a code object: one field per code
+    # attribute returned by get_code_keys (bytes, names, constants, line tables).
+    # Nested code constants are themselves SerializedCode. Converted both ways
+    # by from_code_object and to_code_object.
     co_argcount: int
     co_posonlyargcount: int
     co_kwonlyargcount: int
@@ -91,6 +109,8 @@ class SerializedCode:
     @classmethod
     @_code_cache
     def from_code_object(cls, code: types.CodeType) -> "SerializedCode":
+        # [FUNCTION DOC] Convert a code object into a SerializedCode by copying
+        # each attribute, recursively converting nested code constants. Memoized per code object.
         kwargs = {key: getattr(code, key) for key in get_code_keys()}
         kwargs["co_consts"] = tuple(
             cls.from_code_object(c) if isinstance(c, types.CodeType) else c
@@ -101,6 +121,8 @@ class SerializedCode:
     @classmethod
     @_code_cache
     def to_code_object(cls, serialized_code: "SerializedCode") -> types.CodeType:
+        # [FUNCTION DOC] Rebuild a real code object from a SerializedCode,
+        # recursively converting nested serialized constants. Memoized per input.
         kwargs = {key: getattr(serialized_code, key) for key in get_code_keys()}
         kwargs["co_consts"] = tuple(
             cls.to_code_object(c) if isinstance(c, SerializedCode) else c
@@ -113,6 +135,8 @@ class SerializedCode:
 
 @dataclasses.dataclass
 class _GuardedCodeCacheEntry:
+    # [CLASS DOC] HELPER: Serializable record of one Dynamo compilation: pickled
+    # guards state bytes plus the generated Dynamo bytecode as SerializedCode.
     """
     Contains the serializable information associated with a single compilation in dynamo.
     To restore an execution of compiled code, we will need to serialize the following data:
@@ -125,6 +149,9 @@ class _GuardedCodeCacheEntry:
 
 
 def load_guards_state(guards_state: bytes) -> Any:
+    # [FUNCTION DOC] Unpickle serialized guards state. If the FSDP fully-shard
+    # module is importable, unpickling runs with its module-new-init override
+    # disabled; otherwise with no special context. Returns the guards state object.
     try:
         import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard
 
@@ -140,6 +167,10 @@ def load_guard_manager(
     target_code: types.CodeType,
     runtime_global_scope: Any,
 ) -> "GuardManagerWrapper":
+    # [FUNCTION DOC] Rebuild the runtime guard manager from a deserialized
+    # guards state: constructs a check function manager for the target code
+    # using the saved output graph, shape code parts and local state, bound to
+    # the runtime global scope. Returns its guard manager.
     from .output_graph import OutputGraphCommon
 
     return torch._dynamo.guards.CheckFunctionManager(
@@ -156,6 +187,8 @@ _FunctionId = NewType("_FunctionId", str)  # __resume_at
 
 
 def _backend_ids_from_code(code: types.CodeType) -> Iterator[_BackendId]:
+    # [FUNCTION DOC] HELPER: Generator yielding every global name in the code's
+    # names that looks like a compiled function name, recursing into nested code constants.
     for name in code.co_names:
         if is_compiled_fn_name(name):
             yield _BackendId(name)
@@ -166,6 +199,9 @@ def _backend_ids_from_code(code: types.CodeType) -> Iterator[_BackendId]:
 
 @dataclasses.dataclass(frozen=True)
 class InlinedSource:
+    # [CLASS DOC] HELPER: Frozen record of source code inlined during tracing:
+    # module name, line range, a checksum of that range, and the full module
+    # text. Used to detect source changes when loading a package.
     module: str
     firstlineno: int
     lastlineno: int
@@ -175,14 +211,21 @@ class InlinedSource:
 
 @functools.cache
 def _get_module_content(module: types.ModuleType) -> str:
+    # [FUNCTION DOC] HELPER: Return the full source text of a module (cached per module).
     return inspect.getsource(module)
 
 
 @dataclasses.dataclass
 class SourceInfo:
+    # [CLASS DOC] Set of InlinedSource records for all user code inlined by
+    # Dynamo into a package; extended by add_code.
     inlined_sources: set[InlinedSource]
 
     def add_code(self, code: types.CodeType) -> None:
+        # [FUNCTION DOC] Record the source of a code object as an InlinedSource
+        # (module, line range, checksum, module text). Silently ignores code with
+        # no module. Raises AssertionError if the code's source lines differ from
+        # the module text at that range. Mutates inlined_sources.
         module = inspect.getmodule(code)
         if module is None:
             return
@@ -207,6 +250,9 @@ class SourceInfo:
 
 @dataclasses.dataclass
 class _DynamoCodeCacheEntry:
+    # [CLASS DOC] HELPER: Serializable per-code-object record (original code,
+    # module, function names, guarded codes, import sources, backend ids,
+    # access path, install flags, compile-id and bypass flags); see fields below.
     """
     Contains the serializable information associated with a single code object
     in dynamo. To restore an execution of compiled code, we will need the following
@@ -240,6 +286,12 @@ class _DynamoCodeCacheEntry:
 
 
 def _lookup_code(entry: _DynamoCodeCacheEntry) -> types.CodeType:
+    # [FUNCTION DOC] HELPER: Resolve the live code object for an entry by
+    # walking attributes from the entry's module along its function name and
+    # then its code source path (attribute names and bracketed literal indexes).
+    # Raises AssertionError unless exactly one function name and the result is
+    # a code object; raises PackageError if the source path is missing/unresolvable.
+    # KNOWN ISSUE: the integer check on the result of rfind is always true.
     if len(entry.function_names) != 1:
         raise AssertionError(
             f"Expected exactly one function name, got {len(entry.function_names)}"
@@ -277,12 +329,18 @@ def _lookup_code(entry: _DynamoCodeCacheEntry) -> types.CodeType:
 
 
 def _raise_resolution_error(code: types.CodeType, scope: Any) -> Never:
+    # [FUNCTION DOC] HELPER: Always raises PackageError saying the code's qualified name could not be resolved within the given scope.
     raise PackageError(
         f"Cannot resolve a fully qualified name for {code}. Lookup scope: {scope}"
     )
 
 
 def _get_code_source(code: types.CodeType) -> tuple[str, str]:
+    # [FUNCTION DOC] Compute a serialized handle for a code object: returns the
+    # qualified name of the top-level function/object found and a dotted path
+    # (code constants, function code, closure cells) from it to the code. Handles
+    # decorated and nested functions; on older Pythons searches module/class
+    # members. Raises PackageError if the module or path cannot be found.
     """
     Given a code object, return a fully qualified name which will be used as
     a serialized handle to access the code object from the new process.
@@ -311,6 +369,10 @@ def _get_code_source(code: types.CodeType) -> tuple[str, str]:
     seen = set()
 
     def _find_code_source(obj: Any) -> str | None:
+        # [FUNCTION DOC] HELPER: Depth-first search from obj for the target
+        # code, tracking visited objects. Returns the attribute path suffix
+        # (empty if obj is the code itself) or None if not reachable. Updates
+        # the enclosing toplevel to the function/method through which the code was found.
         nonlocal toplevel
         nonlocal seen
         if obj in seen:
@@ -389,6 +451,9 @@ def _get_code_source(code: types.CodeType) -> tuple[str, str]:
 
 @dataclasses.dataclass(frozen=True)
 class SystemInfo:
+    # [CLASS DOC] Frozen snapshot of Python, torch, toolkit, Triton and GPU
+    # identity, stored in cache entries so loads can be rejected on incompatible
+    # systems. CHECK_GPUS lists device types checked (cuda, xpu).
     """
     System information including Python, PyTorch, and GPU details.
     This information is used to ensure compiled artifacts can only be loaded
@@ -404,6 +469,9 @@ class SystemInfo:
 
     @classmethod
     def current(cls) -> "SystemInfo":
+        # [FUNCTION DOC] Build a SystemInfo for this process: Python and torch
+        # versions, Triton version (zero pair if absent) and, for the first
+        # available GPU backend, its device name and toolkit version (errors reading them are ignored).
         """Create a SystemInfo instance with current system information."""
         # Get GPU name if CUDA or XPU is available
         gpu_name = None
@@ -430,6 +498,11 @@ class SystemInfo:
     def check_compatibility(
         self, other: "SystemInfo", device_type: str = "cpu"
     ) -> None:
+        # [FUNCTION DOC] Compare this (saved) info against other (the current
+        # system). Raises RuntimeError on Python or torch version mismatch; for
+        # GPU device types also if the device is unavailable or toolkit, Triton
+        # (when the current one is not the zero pair) or GPU name differ.
+        # KNOWN ISSUE: the GPU-name error message labels cached/current with swapped attribute sources (self is cached, other is current, matches); the Triton check only skips when other is the zero pair.
         """
         Check if this SystemInfo is compatible with another SystemInfo.
         Raises RuntimeError if incompatible.
@@ -470,6 +543,9 @@ class SystemInfo:
 
 @dataclasses.dataclass
 class _DynamoCacheEntry:
+    # [CLASS DOC] HELPER: Serializable Dynamo half of a package: per-code
+    # entries (first is the entry function), inlined source info, device type,
+    # system info (defaults to the current system) and function name/line for debugging.
     codes: list[_DynamoCodeCacheEntry]
     source_info: SourceInfo
     device_type: str
@@ -479,14 +555,19 @@ class _DynamoCacheEntry:
 
     @property
     def backend_ids(self) -> set[_BackendId]:
+        # [FUNCTION DOC] Union of backend ids across all code entries.
         return {backend_id for code in self.codes for backend_id in code.backend_ids}
 
     def check_versions(self) -> None:
+        # [FUNCTION DOC] Raise RuntimeError if the current system is incompatible with the saved system info.
         """Check if the current system is compatible with the system used to create this cache entry."""
         current_system_info = SystemInfo.current()
         self.system_info.check_compatibility(current_system_info, self.device_type)
 
     def debug_info(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a small summary mapping (code count, function
+        # name and line, device type, backend ids) for logging. Raises
+        # AssertionError if there are no code entries.
         if len(self.codes) == 0:
             raise AssertionError("Expected at least one code entry")
         return {
@@ -507,16 +588,22 @@ from torch.compiler._cache import (
 
 @CacheArtifactFactory.register
 class PrecompileCacheArtifact(CacheArtifact):
+    # [CLASS DOC] Cache artifact kind for precompile packages; registered with
+    # the artifact factory. Content is the pickled PrecompileCacheEntry, key the package id.
     def populate_cache(self) -> None:
+        # [FUNCTION DOC] Write this artifact's pickled content to the local Dynamo disk cache under its key.
         DynamoCache._write_to_local_cache(self.content, self.key)
 
     @staticmethod
     def type() -> str:
+        # [FUNCTION DOC] Return the artifact type name.
         return "precompile"
 
 
 @dataclasses.dataclass
 class PrecompileCacheEntry:
+    # [CLASS DOC] Full serializable precompile record: the Dynamo cache entry
+    # plus a mapping from backend id to backend artifact content.
     """
     A full cache entry for caching precompile, for a toplevel torch.compile.
     Consists of a _DynamoCacheEntry, which contains all the dynamo related contents,
@@ -531,6 +618,11 @@ class PrecompileCacheEntry:
     def from_cache_entry(
         cache_entry: _DynamoCacheEntry, backends: dict[_BackendId, Any]
     ) -> Optional["PrecompileCacheEntry"]:
+        # [FUNCTION DOC] Combine a Dynamo cache entry with available backends.
+        # For each code entry, collects the backends it needs; if one is
+        # missing, logs a warning, emits a structured trace artifact, marks that
+        # code entry bypassed and stops scanning that entry. Returns a new
+        # entry (never None despite the annotation). Mutates code entries' bypassed flag.
         backend_content: dict[_BackendId, Any] = {}
 
         for code in cache_entry.codes:
@@ -561,6 +653,7 @@ class PrecompileCacheEntry:
 
 
 def _hash_source(source: str) -> str:
+    # [FUNCTION DOC] HELPER: Hex SHA-256 digest of the source text.
     sha256_hash = hashlib.sha256()
     sha256_hash.update(source.encode())
     return sha256_hash.hexdigest()
@@ -569,16 +662,22 @@ def _hash_source(source: str) -> str:
 def _get_sourcelines(
     m: types.ModuleType, firstlineno: int, lastlineno: int
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Source lines of a module from one-based first line up to (excluding) last line.
     return inspect.getsourcelines(m)[0][firstlineno - 1 : lastlineno - 1]
 
 
 def _hash_sourcelines(m: types.ModuleType, firstlineno: int, lastlineno: int) -> str:
+    # [FUNCTION DOC] HELPER: Checksum of a module's source line range.
     return _hash_source("".join(_get_sourcelines(m, firstlineno, lastlineno)))
 
 
 def _compile_frame_context(
     code: types.CodeType,
 ) -> contextlib.AbstractContextManager[None]:
+    # [FUNCTION DOC] HELPER: Return a context manager that, when entered,
+    # simulates a compile frame for the code: bumps the frame counter, makes a
+    # compile id, sets up compile context and compile timing with code
+    # metadata, and logs the Dynamo start.
     from torch._dynamo.convert_frame import get_compile_id, log_dynamo_start
     from torch._guards import compile_context, CompileContext
 
@@ -590,6 +689,7 @@ def _compile_frame_context(
     # pyrefly: ignore [deprecated]
     @contextlib.contextmanager
     def _ctx() -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: Generator context body; mutates global frame counter state and logs.
         increment_frame()
         compile_id = get_compile_id(frame_state={})
         with (
@@ -614,6 +714,12 @@ def _compile_frame_context(
 
 
 class CompilePackage:
+    # [CLASS DOC] Mutable recorder/installer for one top-level compiled
+    # function. State: the innermost user function, mapping code object to
+    # _DynamoCodeCacheEntry (first is the entry function), current entry
+    # during compilation, globals installed per module, device type, cached
+    # backends, source info, resume codes, initialized flag. Key methods:
+    # initialize, code_context, add_* recorders, validate, install/uninstall, cache_entry.
     """
     CompilePackage is considered a low level component and should not be directly exposed to
     end users. It has the following interface:
@@ -632,6 +738,10 @@ class CompilePackage:
         dynamo: _DynamoCacheEntry | None = None,
         ignore_inlined_sources: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Create a package. With a function, immediately
+        # initializes (fresh, or from a saved Dynamo entry), uninstalls any
+        # installed state and validates. With no function, leaves it
+        # uninitialized for a later initialize call.
         self._innermost_fn = None
         self._codes: dict[types.CodeType, _DynamoCodeCacheEntry] = {}
 
@@ -651,6 +761,7 @@ class CompilePackage:
             self.validate()
 
     def is_initialized(self) -> bool:
+        # [FUNCTION DOC] Whether initialize has completed.
         return self._initialized
 
     def initialize(
@@ -659,6 +770,13 @@ class CompilePackage:
         dynamo: _DynamoCacheEntry | None = None,
         ignore_inlined_sources: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Bind the package to fn (unwrapped to its innermost
+        # function). With a saved entry: checks system compatibility, and
+        # unless ignoring sources verifies inlined-source checksums (raises
+        # RuntimeError on change) and adopts its source info; then maps code
+        # objects to saved entries (first entry is the function itself).
+        # Without one, registers the function's code. Raises AssertionError if
+        # already initialized or arguments are wrong type.
         from .eval_frame import innermost_fn
 
         if self._initialized:
@@ -700,6 +818,10 @@ class CompilePackage:
         code_source: str | None = None,
         install_to_global: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Register a code object, creating an empty
+        # entry if new, or checking an existing entry agrees on module,
+        # install-to-global flag and code source (AssertionError otherwise).
+        # Appends function_name to the entry's names when given.
         if python_code not in self._codes:
             code = _DynamoCodeCacheEntry(
                 python_code=SerializedCode.from_code_object(python_code),
@@ -732,15 +854,20 @@ class CompilePackage:
 
     @property
     def cached_backends(self) -> dict[_BackendId, Any]:
+        # [FUNCTION DOC] Mapping of backend id to backend object recorded in this process (debug/testing).
         return self._cached_backends
 
     @functools.cached_property
     def source_id(self) -> str:
+        # [FUNCTION DOC] Stable id (hash of qualified name and first line) of the package's function; cached. Raises AssertionError if uninitialized.
         if self._innermost_fn is None:
             raise AssertionError("_innermost_fn is not set")
         return CompilePackage.source_id_from_fn(self._innermost_fn)
 
     def _add_user_function(self, code: types.CodeType) -> None:
+        # [FUNCTION DOC] HELPER: Register user code encountered during compile,
+        # computing its qualified name and code source path. Raises PackageError
+        # if the module or path cannot be found.
         function_name, code_source = _get_code_source(code)
         module = inspect.getmodule(code)
         if module is None:
@@ -754,6 +881,10 @@ class CompilePackage:
 
     @contextlib.contextmanager
     def code_context(self, code: types.CodeType) -> Generator[None, None, None]:
+        # [FUNCTION DOC] Context manager marking code as the entry currently
+        # being compiled (registering it first if unknown). Not reentrant
+        # (AssertionError). On exit marks the entry as having a compile id and
+        # clears the current entry.
         if self._current_entry is not None:
             raise AssertionError("_current_entry is already set in code_context")
 
@@ -775,6 +906,9 @@ class CompilePackage:
         guards_state: bytes,
         dynamo_code: types.CodeType,
     ) -> None:
+        # [FUNCTION DOC] Record a compiled variant (pickled guards and Dynamo
+        # bytecode) on the current entry, plus backend ids referenced by the
+        # bytecode. No-op if the entry is bypassed; AssertionError outside code_context.
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in add_guarded_code")
         if self._current_entry.bypassed:
@@ -788,6 +922,9 @@ class CompilePackage:
             self._add_backend_id(backend_id)
 
     def add_inlined_source(self, sources: list[types.CodeType]) -> None:
+        # [FUNCTION DOC] Record source info for each inlined code object,
+        # skipping resume functions. No-op if bypassed; AssertionError outside
+        # code_context. Mutates source info.
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in add_inlined_source")
         if self._current_entry.bypassed:
@@ -798,9 +935,11 @@ class CompilePackage:
             self._source_info.add_code(code)
 
     def update_device_type(self, graph: torch.fx.Graph | None) -> None:
+        # [FUNCTION DOC] Set the package device type from the graph's devices (overwrites the previous value).
         self._device_type = _graph_device_type(graph)
 
     def bypass_current_entry(self) -> None:
+        # [FUNCTION DOC] Mark the current entry bypassed so nothing further is recorded or installed for it. AssertionError outside code_context.
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in bypass_current_entry")
         self._current_entry.bypassed = True
@@ -811,6 +950,9 @@ class CompilePackage:
         python_module: str,
         function_name: str,
     ) -> None:
+        # [FUNCTION DOC] Register a generated resume function's code to be
+        # installed into its module globals under function_name, and remember it
+        # as a resume code (excluded from inlined sources).
         self._add_function(
             python_code,
             python_module,
@@ -820,6 +962,7 @@ class CompilePackage:
         self._resume_codes.add(python_code)
 
     def add_import_source(self, alias: str, module_name: str) -> None:
+        # [FUNCTION DOC] Record that global alias should be bound to the imported module module_name on install. AssertionError outside code_context.
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in add_import_source")
         self._current_entry.import_sources[alias] = module_name
@@ -827,6 +970,7 @@ class CompilePackage:
     def _add_backend_id(
         self, backend_id: _BackendId, backend: Any | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Add a backend id to the current entry if not present; optionally cache the backend object. AssertionError outside code_context.
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in add_backend_id")
         if backend_id not in self._current_entry.backend_ids:
@@ -835,6 +979,7 @@ class CompilePackage:
             self._cached_backends[backend_id] = backend
 
     def add_backend_id(self, backend_id: str, backend: Any | None = None) -> None:
+        # [FUNCTION DOC] Public wrapper to record a backend id, which must start with the compiled-function prefix and underscore (AssertionError otherwise).
         if not backend_id.startswith(f"{COMPILED_FN_PREFIX}_"):
             raise AssertionError(
                 f"backend_id must start with '{COMPILED_FN_PREFIX}_', got '{backend_id}'"
@@ -842,6 +987,8 @@ class CompilePackage:
         self._add_backend_id(_BackendId(backend_id), backend)
 
     def validate(self) -> None:
+        # [FUNCTION DOC] Check invariants: no current entry, initialized, and the
+        # first code entry is the innermost function's code. Raises AssertionError.
         if self._current_entry is not None:
             raise AssertionError("_current_entry should be None during validate")
         if self._innermost_fn is None:
@@ -854,6 +1001,9 @@ class CompilePackage:
             )
 
     def _install_global(self, module: types.ModuleType, name: str, value: Any) -> None:
+        # [FUNCTION DOC] HELPER: Bind name to value in the module globals,
+        # first disowning any pending cleanup hook for that name, and record it
+        # for later uninstall. Mutates module globals.
         # A pre-reset compile in this process may still own `name` via a
         # CleanupHook that hasn't fired yet. We're taking over the binding now,
         # so that hook must not delete it once its code object is collected.
@@ -862,6 +1012,9 @@ class CompilePackage:
         self._installed_globals.setdefault(module, []).append(name)
 
     def uninstall(self) -> None:
+        # [FUNCTION DOC] Remove every global this package installed and reset
+        # precompile cache entries on the function's code. Mutates module
+        # globals and eval-frame state. AssertionError if uninitialized.
         from torch._C._dynamo.eval_frame import _reset_precompile_entries
 
         if self._innermost_fn is None:
@@ -875,6 +1028,15 @@ class CompilePackage:
         _reset_precompile_entries(self._innermost_fn.__code__)
 
     def install(self, backends: dict[_BackendId, Any]) -> None:
+        # [FUNCTION DOC] Activate the package: uninstall old state, then for
+        # each code entry (inside a simulated compile frame when it had a compile
+        # id) install import aliases, resume functions (factories when they have
+        # free variables), deserialized disabled backends under their ids,
+        # populate the builtins dict if needed, rebuild guard managers from saved
+        # guards and load precompile entries into eval-frame. Bypassed entries
+        # only get imports and resume functions; entries without guarded code
+        # make the code skipped. Raises RuntimeError for a missing backend and
+        # AssertionError on inconsistent guards state. Mutates module globals.
         """
         Sync the package states to the compiled function. This includes the following actions:
           1. Clean up the previously installed states.
@@ -915,6 +1077,7 @@ class CompilePackage:
                                 _globals: dict[str, Any] = f_globals,
                                 _name: str = fn_name,
                             ) -> types.FunctionType:
+                                # [FUNCTION DOC] HELPER: Factory building the resume function from the captured code and globals with the given closure cells.
                                 return types.FunctionType(
                                     _code, _globals, _name, None, closure
                                 )
@@ -995,6 +1158,8 @@ class CompilePackage:
                     )
 
     def cache_entry(self) -> _DynamoCacheEntry:
+        # [FUNCTION DOC] Validate, then snapshot the package as a serializable
+        # Dynamo cache entry (codes, source info, device type, function name and line).
         self.validate()
         if self._innermost_fn is None:
             raise AssertionError("_innermost_fn is not set in cache_entry")
@@ -1008,6 +1173,7 @@ class CompilePackage:
 
     @staticmethod
     def source_id_from_fn(fn: Callable[..., Any]) -> str:
+        # [FUNCTION DOC] Hex SHA-256 over the qualified name and first line number of fn's innermost function; used as the package key.
         from .eval_frame import innermost_fn
 
         innermost_fn_ = innermost_fn(fn)
@@ -1022,6 +1188,9 @@ _Backends = dict[_BackendId, Any]
 
 
 class DynamoStore(abc.ABC):
+    # [CLASS DOC] Abstract storage for packages. Subclasses implement clear,
+    # write and read; concrete methods record packages to PrecompileContext and
+    # save/load entries by key, attaching backend artifacts.
     """
     A DynamoStore tracks active CompilePackages, and provides methods to store and retrieve them.
 
@@ -1029,6 +1198,7 @@ class DynamoStore(abc.ABC):
     """
 
     def record_package(self, package: CompilePackage) -> None:
+        # [FUNCTION DOC] Register the package's cache entry with PrecompileContext under its source id.
         """
         Records a package to PrecompileContext, so that it can be serialized later.
         """
@@ -1040,6 +1210,7 @@ class DynamoStore(abc.ABC):
         )
 
     def record_eager_backend(self, backend_id: _BackendId, backend: Any) -> None:
+        # [FUNCTION DOC] Wrap an eager backend object in an artifact and record it in PrecompileContext (testing aid).
         """
         Records eager fx graphs to PrecompileContext for testing purposes.
         """
@@ -1052,7 +1223,9 @@ class DynamoStore(abc.ABC):
         PrecompileContext.record_artifact(result)
 
     @abc.abstractmethod
-    def clear(self) -> None: ...
+    def clear(self) -> None:
+        # [FUNCTION DOC] Abstract: remove all stored packages.
+        ...
 
     @abc.abstractmethod
     def write(
@@ -1060,6 +1233,7 @@ class DynamoStore(abc.ABC):
         cache_entry: PrecompileCacheEntry,
         path: str,
     ) -> None:
+        # [FUNCTION DOC] Abstract: persist a precompile entry under the given path or key.
         """
         Abstract method to write dynamo cache entry and backends to storage.
 
@@ -1071,6 +1245,9 @@ class DynamoStore(abc.ABC):
         ...
 
     def save_cache_entry(self, cache_entry: _DynamoCacheEntry, key: str) -> None:
+        # [FUNCTION DOC] Gather serialized backend artifacts for each backend id
+        # from PrecompileContext (RuntimeError if missing, AssertionError if wrong
+        # type), build a precompile entry and write it under key.
         """
         Saves a package to a given path. Grabs backends from PrecompileContext.
         """
@@ -1097,6 +1274,7 @@ class DynamoStore(abc.ABC):
         self.write(entry, key)
 
     def save_package(self, package: CompilePackage, key: str) -> None:
+        # [FUNCTION DOC] Record the package then save its cache entry under key.
         """
         Saves a package to a given path. Grabs backends from PrecompileContext.
         """
@@ -1106,6 +1284,7 @@ class DynamoStore(abc.ABC):
 
     @abc.abstractmethod
     def read(self, path: str) -> PrecompileCacheEntry:
+        # [FUNCTION DOC] Abstract: load the precompile entry stored under path.
         """
         Abstract method to read dynamo cache entry and backends from storage.
 
@@ -1118,6 +1297,8 @@ class DynamoStore(abc.ABC):
         ...
 
     def load_cache_entry(self, key: str) -> PrecompileCacheEntry:
+        # [FUNCTION DOC] Read the entry for key and register each backend
+        # artifact with PrecompileContext (AssertionError if a backend has the wrong type). Returns the entry.
         from torch._dynamo.precompile_context import (
             BackendCacheArtifact,
             PrecompileContext,
@@ -1136,6 +1317,7 @@ class DynamoStore(abc.ABC):
     def load_package(
         self, fn: Any, key: str
     ) -> tuple[CompilePackage, dict[_BackendId, Any]]:
+        # [FUNCTION DOC] Load the entry for key and build a CompilePackage for fn from it; returns the package and the backends mapping (not yet installed).
         """
         Loads a package from a given path and returns it plus a list of deserialized backends
         """
@@ -1145,14 +1327,17 @@ class DynamoStore(abc.ABC):
 
 
 class InMemoryDynamoStore(DynamoStore):
+    # [CLASS DOC] DynamoStore keeping entries in a dict (packages) keyed by path.
     """
     A DynamoStore implementation that keeps state about CompilePackages in memory.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Start with an empty mapping of stored packages.
         self.packages: dict[str, PrecompileCacheEntry] = {}
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Remove all stored packages.
         self.packages.clear()
 
     def write(
@@ -1160,12 +1345,14 @@ class InMemoryDynamoStore(DynamoStore):
         cache_entry: PrecompileCacheEntry,
         path: str,
     ) -> None:
+        # [FUNCTION DOC] Store the entry in the dict under path (overwrites).
         """
         Store the dynamo cache entry and backends in memory instead of writing to disk.
         """
         self.packages[path] = cache_entry
 
     def read(self, path: str) -> PrecompileCacheEntry:
+        # [FUNCTION DOC] Return the stored entry for path; RuntimeError if absent.
         """
         Read dynamo cache entry and backends from memory.
         """
@@ -1176,11 +1363,14 @@ class InMemoryDynamoStore(DynamoStore):
 
 
 class DiskDynamoStore(DynamoStore):
+    # [CLASS DOC] DynamoStore persisting each entry as a pickled file named
+    # "entry" inside a directory per key, under an optional path prefix.
     """
     A DynamoStore implementation that keeps state about CompilePackages on disk.
     """
 
     def __init__(self, path_prefix: str = "") -> None:
+        # [FUNCTION DOC] Remember the directory prefix under which packages are stored.
         """
         Initialize a DiskDynamoStore with a path prefix.
 
@@ -1190,9 +1380,11 @@ class DiskDynamoStore(DynamoStore):
         self._path_prefix = path_prefix
 
     def path_prefix(self) -> str:
+        # [FUNCTION DOC] Return the configured directory prefix.
         return self._path_prefix
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Recursively delete the prefix directory (errors ignored); does nothing if the prefix is empty.
         """
         Clear all CompilePackages from disk.
         """
@@ -1204,6 +1396,8 @@ class DiskDynamoStore(DynamoStore):
         cache_entry: PrecompileCacheEntry,
         path: str,
     ) -> None:
+        # [FUNCTION DOC] Pickle the entry, record it as a cache artifact, and
+        # write it to the local cache directory for path. Any failure is wrapped in RuntimeError.
         """
         Write dynamo cache entry and backends to disk.
         """
@@ -1217,6 +1411,9 @@ class DiskDynamoStore(DynamoStore):
             raise RuntimeError(f"Failed to save package to {path}: {e}") from e
 
     def _write_to_local_cache(self, pickled_content: bytes, path: str) -> None:
+        # [FUNCTION DOC] HELPER: Create the directory (under the prefix) and
+        # atomically write the pickled bytes to a file named entry inside it.
+        # Failures are wrapped in RuntimeError. File I/O side effect.
         from torch._inductor.codecache import write_atomic
 
         path = os.path.join(self.path_prefix(), path) if self.path_prefix() else path
@@ -1227,6 +1424,8 @@ class DiskDynamoStore(DynamoStore):
             raise RuntimeError(f"Failed to save package to {path}: {e}") from e
 
     def read(self, path: str) -> PrecompileCacheEntry:
+        # [FUNCTION DOC] Read and unpickle the entry file for path (under the
+        # prefix). Failures are wrapped in RuntimeError.
         """
         Read dynamo cache entry and backends from disk.
         """
@@ -1241,12 +1440,16 @@ class DiskDynamoStore(DynamoStore):
 
 
 class DiskDynamoCache(DiskDynamoStore):
+    # [CLASS DOC] Disk store at the Inductor cache directory's dynamo subfolder
+    # with convenience save/load keyed automatically by function source id, and
+    # hit/miss/error counters.
     """
     Special DiskDynamoStore which adds some helper functions for automatically
     tracking paths of packages
     """
 
     def save(self, package: CompilePackage) -> None:
+        # [FUNCTION DOC] Save the package under its source id and log it.
         """
         Saves a package to a given path. Grabs backends from PrecompileContext.
         """
@@ -1255,6 +1458,10 @@ class DiskDynamoCache(DiskDynamoStore):
         super().save_package(package, key)
 
     def load(self, fn: Callable[..., Any]) -> PrecompileCacheEntry | None:
+        # [FUNCTION DOC] Look up the entry for fn by source id. Returns it and
+        # bumps the hit counter; returns None with an error counter bump if
+        # loading fails, or a miss counter bump if the directory does not exist.
+        # KNOWN ISSUE: the failure warning has a format placeholder but no argument is supplied.
         """
         Loads a package from a given path and returns it plus a list of deserialized backends
         """
@@ -1275,6 +1482,8 @@ class DiskDynamoCache(DiskDynamoStore):
         return None
 
     def load_and_install_package(self, fn: Callable[..., Any]) -> CompilePackage | None:
+        # [FUNCTION DOC] Load fn's entry; if none, return None; else build a
+        # package, install its backends (mutating globals) and return it.
         """
         Load directly into a package and install backends
         """
@@ -1287,10 +1496,12 @@ class DiskDynamoCache(DiskDynamoStore):
             return package
 
     def path_prefix(self) -> str:
+        # [FUNCTION DOC] Directory prefix computed freshly from the current cache directory (the constructor argument is ignored).
         return os.path.join(cache_dir(), "dynamo")
 
 
 def cache_dir() -> str:
+    # [FUNCTION DOC] HELPER: Return the Inductor cache directory (lazy import).
     from torch._inductor.runtime.cache_dir_utils import cache_dir
 
     return cache_dir()
