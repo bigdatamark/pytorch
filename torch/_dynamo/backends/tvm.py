@@ -1,3 +1,6 @@
+# [MODULE DOC] TVM backend for Dynamo: registers the "tvm" backend, which compiles graphs
+# through TVM's relax frontend, plus a cheap availability check. Import-time side effect:
+# registers the backend in the registry (TVM itself is imported only when the backend runs).
 """
 This module provides TVM backend integration for TorchDynamo.
 
@@ -33,6 +36,10 @@ def tvm(
     *,
     options: MappingProxyType[str, Any] | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend callable (not usable with fake tensors, via the decorator). Imports
+    # the TVM relax torch frontend (raises ImportError with install hint if missing), reads an
+    # optional pipeline from the options mapping, and returns the callable produced by compiling
+    # the graph module with the example inputs through relax_dynamo.
     try:
         from tvm.relax.frontend.torch import relax_dynamo  # type: ignore[import]
     except ImportError as e:
@@ -46,5 +53,6 @@ def tvm(
 
 
 def has_tvm() -> bool:
+    # [FUNCTION DOC] Returns True if a module named tvm can be found, without importing it.
     # avoid the heavy tvm import just to check availability
     return importlib.util.find_spec("tvm") is not None

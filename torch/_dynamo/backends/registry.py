@@ -1,3 +1,8 @@
+# [MODULE DOC] Registry of Dynamo compiler backends. Holds module-level mappings of backend name
+# to entry point, name to compiler function, and name to tags, plus a default backend setting.
+# Provides registration (decorators, debug and experimental variants), name lookup with lazy
+# import and entry-point loading, listing, a registered-backend check, and default get/set.
+# Import-time side effects: creates a logger and the global registries (no backends registered).
 """
 This module implements TorchDynamo's backend registry system for managing compiler backends.
 
@@ -73,6 +78,8 @@ log = logging.getLogger(__name__)
 
 
 class CompiledFn(Protocol):
+    # [CLASS DOC] Typing protocol for a compiled graph: a callable taking tensors and returning a
+    # tuple of tensors.
     def __call__(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]: ...
 
 
@@ -89,6 +96,10 @@ def register_backend(
     name: str | None = None,
     tags: Sequence[str] = (),
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Registers a compiler under a name (default: its function name) with tags.
+    # If no compiler is given, returns a partial for decorator-with-arguments use. Raises an
+    # error if the compiler is not callable or the name is already in the compiler registry.
+    # Side effects: updates the three global registries. Returns the compiler unchanged.
     """
     Decorator to add a given compiler to the registry to allow calling
     `torch.compile` with string shorthand.  Note: for projects not
@@ -122,6 +133,10 @@ register_experimental_backend = functools.partial(
 
 
 def lookup_backend(compiler_fn: str | CompilerFn) -> CompilerFn:
+    # [FUNCTION DOC] Resolves a backend name to a compiler function; callables pass through
+    # unchanged. For unknown names, triggers lazy import of backends and entry-point discovery;
+    # if still unknown, raises InvalidBackend with close-match suggestions. If the name is known
+    # only as an entry point, loads and registers it. Side effects: imports, registry updates.
     """Expand backend strings to functions"""
     if isinstance(compiler_fn, str):
         if compiler_fn not in _BACKENDS:
@@ -144,6 +159,9 @@ def lookup_backend(compiler_fn: str | CompilerFn) -> CompilerFn:
 
 # NOTE: can't type this due to public api mismatch; follow up with dev team
 def list_backends(exclude_tags=("debug", "experimental")) -> list[str]:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Ensures backends are lazily imported, then returns the sorted names of
+    # registered backends that carry none of the excluded tags (default excludes debug and
+    # experimental). Side effect: may import backend modules.
     """
     Return valid strings that can be passed to:
 
@@ -162,6 +180,9 @@ def list_backends(exclude_tags=("debug", "experimental")) -> list[str]:  # type:
 
 @functools.cache
 def _lazy_import() -> None:
+    # [FUNCTION DOC] HELPER: Cached (runs once). Imports every submodule of the backends package
+    # (triggering their registrations), checks the dynamo minifier backend loaded (raises an
+    # error otherwise), and discovers entry-point backends.
     from .. import backends
     from ..utils import import_submodule
 
@@ -177,6 +198,8 @@ def _lazy_import() -> None:
 
 @functools.cache
 def _discover_entrypoint_backends() -> None:
+    # [FUNCTION DOC] HELPER: Cached. Reads setuptools entry points in the torch_dynamo_backends
+    # group and records each name in the backend registry with its (unloaded) entry point.
     # importing here so it will pick up the mocked version in test_backends.py
     from importlib.metadata import entry_points
 
@@ -189,6 +212,9 @@ def _discover_entrypoint_backends() -> None:
 
 
 def _is_registered_backend(compiler_fn: CompilerFn) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True for a compiler that is in the registry, an inductor
+    # compile wrapper, or a generic compile wrapper around a registered compiler; False for
+    # custom callables. Loads backends lazily first.
     """
     Check if the given compiler function is a registered backend.
     Custom backends (user-provided callables not in the registry) return False.
@@ -211,6 +237,8 @@ def _is_registered_backend(compiler_fn: CompilerFn) -> bool:
 
 
 def set_default_backend(backend: str | CompilerFn | None) -> None:
+    # [FUNCTION DOC] Sets the global default backend used by torch.compile. None resets to
+    # inductor. Raises TypeError if the value is neither a string nor callable. Mutates global.
     """Set the default backend used by torch.compile when no backend is explicitly specified.
 
     Pass None to reset to the default ("inductor").
@@ -225,5 +253,6 @@ def set_default_backend(backend: str | CompilerFn | None) -> None:
 
 
 def get_default_backend() -> str | CompilerFn:
+    # [FUNCTION DOC] Returns the current global default backend (name or callable).
     """Return the current default backend for torch.compile."""
     return _default_backend

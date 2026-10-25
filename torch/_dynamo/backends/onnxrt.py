@@ -1,3 +1,6 @@
+# [MODULE DOC] Placeholder for the onnxruntime Dynamo backend. All real code is commented out
+# (registration of an "onnxrt" backend or an informational error backend); importing this module
+# defines nothing and has no side effects.
 # This backend is maintained by ONNX team. To direct issues
 # to the right people, please tag related GitHub issues with `module: onnx`.
 #

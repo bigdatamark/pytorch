@@ -1,3 +1,7 @@
+# [MODULE DOC] Bytecode analysis helpers for Dynamo: dead code removal, pointless jump removal,
+# line number propagation and cleanup, live-variable analysis, and stack-size analysis, working
+# on lists of Instruction objects. Import-time side effects: builds version-dependent module
+# constants (terminal opcodes, jump opcodes and names, local and free opcode sets).
 """
 This module provides utilities for analyzing and optimizing Python bytecode.
 Key functionality includes:
@@ -51,6 +55,8 @@ stack_effect = dis.stack_effect
 
 
 def get_indexof(insts: list["Instruction"]) -> dict["Instruction", int]:
+    # [FUNCTION DOC] Maps each instruction object (by identity) to its list index. Raises an
+    # error if the same instruction object appears twice. Pure otherwise.
     """
     Get a mapping from instruction memory address to index in instruction list.
     Additionally checks that each instruction only appears once in the list.
@@ -67,11 +73,18 @@ def get_indexof(insts: list["Instruction"]) -> dict["Instruction", int]:
 
 
 def remove_dead_code(instructions: list["Instruction"]) -> list["Instruction"]:
+    # [FUNCTION DOC] Returns the instructions reachable from the first one, following fall-through,
+    # jump targets and exception handler targets, stopping at terminal opcodes. On Python 3.11+
+    # also shrinks each live instruction's exception table entry so its start and end are live
+    # instructions (mutating the entries). Raises an error on jumps without targets or
+    # inconsistent entries.
     """Dead code elimination"""
     indexof = get_indexof(instructions)
     live_code = set()
 
     def find_live_code(start: int) -> None:
+        # [FUNCTION DOC] HELPER: Marks instructions live from index start onward, recursing into
+        # jump and exception targets; stops at an already-live index or a terminal opcode.
         for i in range(start, len(instructions)):
             if i in live_code:
                 return
@@ -126,6 +139,10 @@ def remove_dead_code(instructions: list["Instruction"]) -> list["Instruction"]:
 
 
 def remove_pointless_jumps(instructions: list["Instruction"]) -> list["Instruction"]:
+    # [FUNCTION DOC] Returns a new list without absolute jumps whose target is the immediately
+    # following instruction.
+    # KNOWN ISSUE: only matches JUMP_ABSOLUTE, which does not exist in Python 3.11+, so it is a
+    # no-op on newer versions.
     """Eliminate jumps to the next instruction"""
     pointless_jumps = {
         id(a)
@@ -136,10 +153,14 @@ def remove_pointless_jumps(instructions: list["Instruction"]) -> list["Instructi
 
 
 def propagate_line_nums(instructions: list["Instruction"]) -> None:
+    # [FUNCTION DOC] Mutates instructions so each has starts_line set to the most recent line
+    # number seen (carrying forward; stays None before any line is seen).
     """Ensure every instruction has line number set in case some are removed"""
     cur_line_no = None
 
     def populate_line_num(inst: "Instruction") -> None:
+        # [FUNCTION DOC] HELPER: Updates the running line number from the instruction if it
+        # starts a line, then stores the running value on the instruction.
         nonlocal cur_line_no
         if inst.starts_line:
             cur_line_no = inst.starts_line
@@ -151,11 +172,15 @@ def propagate_line_nums(instructions: list["Instruction"]) -> None:
 
 
 def remove_extra_line_nums(instructions: list["Instruction"]) -> None:
+    # [FUNCTION DOC] Mutates instructions, clearing starts_line when it repeats the previous
+    # recorded line number, so only line changes remain.
     """Remove extra starts line properties before packing bytecode"""
 
     cur_line_no = None
 
     def remove_line_num(inst: "Instruction") -> None:
+        # [FUNCTION DOC] HELPER: Clears the instruction's starts_line if equal to the running
+        # line number; otherwise records it as the running value; None is left alone.
         nonlocal cur_line_no
         if inst.starts_line is None:
             return
@@ -170,6 +195,8 @@ def remove_extra_line_nums(instructions: list["Instruction"]) -> None:
 
 @dataclasses.dataclass
 class ReadsWrites:
+    # [CLASS DOC] HELPER: Accumulator for liveness analysis holding sets of variable names read,
+    # written, and visited instruction start indices.
     reads: set[Any]
     writes: set[Any]
     visited: set[Any]
@@ -178,11 +205,20 @@ class ReadsWrites:
 def livevars_analysis(
     instructions: list["Instruction"], instruction: "Instruction"
 ) -> set[Any]:
+    # [FUNCTION DOC] Returns the set of local or free variable names that may be read starting
+    # from the given instruction. Walks forward along the straight-line path (the "must" state,
+    # where earlier writes kill later reads) and explores jump and exception targets in a "may"
+    # state; stops at terminal opcodes. Raises an error for unhandled local/free opcodes or
+    # jumps lacking a target. Pure.
+    # KNOWN ISSUE: after a jump, the rest of the current walk continues in the may state, but
+    # writes are checked only against the must state.
     indexof = get_indexof(instructions)
     must = ReadsWrites(set(), set(), set())
     may = ReadsWrites(set(), set(), set())
 
     def walk(state: ReadsWrites, start: int) -> None:
+        # [FUNCTION DOC] HELPER: Scans from start (once per start per state) recording reads
+        # and writes of local/free variables in the given state, recursing into targets.
         if start in state.visited:
             return
         state.visited.add(start)
@@ -217,21 +253,28 @@ def livevars_analysis(
 
 @dataclasses.dataclass
 class FixedPointBox:
+    # [CLASS DOC] HELPER: Shared mutable flag; true while the stack-size analysis has not changed
+    # any bound in the current pass.
     value: bool = True
 
 
 @dataclasses.dataclass
 class StackSize:
+    # [CLASS DOC] HELPER: Lower and upper bound of the stack depth at one instruction, plus the
+    # shared fixed-point flag that is cleared whenever a bound changes.
     low: int | float
     high: int | float
     fixed_point: FixedPointBox
 
     def zero(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets both bounds to zero (entry point) and clears the flag.
         self.low = 0
         self.high = 0
         self.fixed_point.value = False
 
     def offset_of(self, other: "StackSize", n: int) -> None:
+        # [FUNCTION DOC] HELPER: Widens these bounds to include the other's bounds shifted by n;
+        # clears the fixed-point flag if anything changed.
         prior = (self.low, self.high)
         self.low = min(self.low, other.low + n)
         self.high = max(self.high, other.high + n)
@@ -239,6 +282,8 @@ class StackSize:
             self.fixed_point.value = False
 
     def exn_tab_jump(self, depth: int) -> None:
+        # [FUNCTION DOC] HELPER: Widens the bounds to include an exception handler entry depth;
+        # clears the fixed-point flag if anything changed.
         prior = (self.low, self.high)
         self.low = min(self.low, depth)
         self.high = max(self.high, depth)
@@ -247,6 +292,11 @@ class StackSize:
 
 
 def stacksize_analysis(instructions: list["Instruction"]) -> int | float:
+    # [FUNCTION DOC] Computes the maximum stack depth needed by the instruction list. Iterates
+    # (at most 100 passes) propagating depth bounds across fall-through, jump and exception
+    # handler edges until a fixed point. Returns the highest upper bound. Raises an error for an
+    # empty list, a missing next instruction or jump target, failure to converge, or a negative
+    # lower bound. Pure.
     if not instructions:
         raise AssertionError("instructions list must not be empty")
     fixed_point = FixedPointBox()
