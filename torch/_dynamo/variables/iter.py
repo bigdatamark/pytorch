@@ -1,3 +1,12 @@
+# [MODULE DOC] Iterator-related VariableTrackers for Dynamo. Defines trackers for
+# itertools callables (ItertoolsVariable, which eagerly or lazily builds iterator
+# trackers when called) and iterator objects: chain, repeat, count, zip, zip_longest,
+# map, filter and dict/set view iterators. Each iterator tracker implements the
+# next-step protocol on symbolic values, records mutation through the side-effects
+# tracker, and can reconstruct itself as real Python bytecode. Also defines the
+# iterator size limit constant and an exhaustion-probe helper. Import-time side
+# effects: captures the chain.from_iterable method object and builds the repeat
+# call signature used for argument binding.
 """
 This module provides iterator-related variable tracking functionality for Dynamo.
 It implements variable classes for handling Python iterators and itertools functions
@@ -69,6 +78,9 @@ MAX_ITERATOR_LIMIT = 100 * 1024  # 100k
 def is_iterator_exhausted(
     tx: "InstructionTranslatorBase", iterator: VariableTracker
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Probes an iterator tracker by advancing it once. Returns
+    # False if an item was produced (that item is consumed and discarded), or True
+    # if it raised the observed stop-iteration (which is cleared from the translator).
     try:
         pyiter_next(tx, iterator)
         return False
@@ -78,29 +90,42 @@ def is_iterator_exhausted(
 
 
 class ItertoolsVariable(VariableTracker):
+    # [CLASS DOC] Tracker for an itertools callable (chain, zip_longest, product,
+    # groupby, repeat, count, chain.from_iterable). State: value, the real callable.
+    # Calling it produces iterator trackers or, for product and groupby, eagerly
+    # materialized list iterators; unsupported callables fall back to generic calls.
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the wrapped itertools callable in the value attribute.
         super().__init__(**kwargs)
         self.value = value
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: VariableTracker, op: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Rich comparison: delegates to the constant-based comparison,
+        # treating the wrapped callable as a python constant. Returns a tracker.
         from .object_protocol import python_constant_richcompare_impl
 
         return python_constant_richcompare_impl(self, tx, other, op)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string naming the wrapped callable.
         return f"ItertoolsVariable({self.value})"
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped itertools callable as the python constant.
         return self.value
 
     def get_real_python_backed_value(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped callable as the real python-backed value.
         return self.value
 
     def _get_from_iterable(
         self, tx: "InstructionTranslatorBase"
     ) -> "VariableTracker | None":
+        # [FUNCTION DOC] HELPER: Getter for the from_iterable attribute. Returns a tracker
+        # for the saved chain.from_iterable method when the wrapped callable is chain,
+        # otherwise None so generic attribute handling proceeds.
         # Only itertools.chain has from_iterable; declining (None) falls
         # through to the generic protocol for other itertools callables.
         if self.value is itertools.chain:
@@ -117,6 +142,16 @@ class ItertoolsVariable(VariableTracker):
         args: list["VariableTracker"],
         kwargs: "dict[str, VariableTracker]",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Symbolically calls the itertools callable. chain and
+        # chain.from_iterable build a lazy ChainVariable; zip_longest builds a
+        # ZipLongestVariable (optional fillvalue kwarg); product eagerly unpacks all
+        # inputs and returns a list iterator of tuples (optional repeat kwarg);
+        # groupby eagerly groups by constant keys (optional key function) into a list
+        # iterator of key and sub-iterator pairs; repeat binds object and optional times
+        # (negative clamped to 0, non-constant count uses a polyfill) and returns a
+        # RepeatIteratorVariable; count returns a CountIteratorVariable. Unsupported
+        # kwargs, key types or argument counts cause a graph break; a type error is
+        # raised for a non-integer repeat count; other callables use the generic path.
         # See also: module `torch._dynamo.polyfills.itertools`
 
         if self.value is itertools.chain and not kwargs:
@@ -181,6 +216,9 @@ class ItertoolsVariable(VariableTracker):
                 )
 
             def retrieve_const_key(key: VariableTracker) -> Any:
+                # [FUNCTION DOC] HELPER: Converts a grouping key tracker to a real python
+                # value (evaluating symbolic ints, or using a python constant).
+                # Graph-breaks for non-constant keys.
                 from ..utils import specialize_symnode
 
                 # Unwrap LazyVariableTracker to get the underlying variable
@@ -217,6 +255,8 @@ class ItertoolsVariable(VariableTracker):
             if "key" in kwargs:
 
                 def keyfunc(x: VariableTracker) -> Any:
+                    # [FUNCTION DOC] HELPER: Applies the user key function to an element
+                    # symbolically and returns the resulting constant key value.
                     return retrieve_const_key(
                         kwargs.get("key").call_function(tx, [x], {})  # type: ignore[union-attr]
                     )
@@ -224,6 +264,7 @@ class ItertoolsVariable(VariableTracker):
             else:
 
                 def keyfunc(x: VariableTracker) -> Any:
+                    # [FUNCTION DOC] HELPER: Identity key: the element itself as constant key.
                     return retrieve_const_key(x)
 
             result = []
@@ -289,6 +330,8 @@ class ItertoolsVariable(VariableTracker):
             # kwargs) falls through to a graph break so eager raises the
             # CPython TypeError.
             def count_sig(start: Any = 0, step: Any = 1) -> tuple[Any, Any]:
+                # [FUNCTION DOC] HELPER: Signature stand-in used only to bind and validate
+                # count arguments; returns (start, step) with defaults 0 and 1.
                 return start, step
 
             try:
@@ -303,17 +346,24 @@ class ItertoolsVariable(VariableTracker):
 
 
 class IteratorVariable(VariableTracker):
+    # [CLASS DOC] Abstract base for all iterator trackers. Iterators are their own
+    # iterator, report __iter__ and __next__ as present, and compare by object
+    # identity semantics. Subclasses must override the next-item hook.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Forwards keyword options to the base tracker; adds no state.
         super().__init__(**kwargs)
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: VariableTracker, op: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Rich comparison using the generic object comparison protocol.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Abstract next-item hook; the base version always graph-breaks
+        # (marked as a Dynamo bug) because subclasses are expected to override it.
         unimplemented(
             gb_type="Unimplemented next() call",
             context=f"next({self})",
@@ -324,16 +374,23 @@ class IteratorVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> "ConstantVariable":
+        # [FUNCTION DOC] Answers hasattr queries: True for __iter__ and __next__,
+        # otherwise defers to the base implementation.
         if name == "__iter__" or name == "__next__":
             return variables.ConstantVariable.create(True)
         return super().call_obj_hasattr(tx, name)
 
     def tp_iter_impl(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # [FUNCTION DOC] Returns the iterator itself (iter of an iterator is identity).
         """Iterators are their own iterator."""
         return self
 
 
 class ChainVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for itertools.chain. State: source_iterator (iterator over raw
+    # sub-iterables) and current (the active sub-iterator or None). Sub-iterables are
+    # converted to iterators lazily at next time. Mutable; mutations are recorded in
+    # side effects; reconstructs as chain of current plus chain.from_iterable of source.
     """
     Represents itertools.chain(*iterables) — yields one item per tp_iternext_impl call.
 
@@ -351,6 +408,8 @@ class ChainVariable(IteratorVariable):
         current: "VariableTracker | None" = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the source iterator of raw sub-iterables and the optional
+        # current sub-iterator.
         super().__init__(**kwargs)
         # source_iterator yields raw sub-iterables; converted lazily per tp_iternext_impl
         self.source_iterator = source_iterator
@@ -358,9 +417,12 @@ class ChainVariable(IteratorVariable):
         self.current = current
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the python type itertools.chain.
         return itertools.chain
 
     def _get_from_iterable(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # [FUNCTION DOC] HELPER: Getter for from_iterable; always returns a tracker for
+        # the saved chain.from_iterable method.
         return ItertoolsVariable(_CHAIN_FROM_ITERABLE)
 
     tp_getset = {
@@ -368,6 +430,11 @@ class ChainVariable(IteratorVariable):
     }
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # [FUNCTION DOC] Returns the next item. Loops: if no current sub-iterator, pulls
+        # the next sub-iterable from the source (end of source raises observed
+        # stop-iteration) and converts it to an iterator (non-iterables raise a type
+        # error); then takes the next item from it, clearing current when exhausted.
+        # Records mutation of this tracker; raises AssertionError if immutable.
         if not self.is_mutable():
             raise AssertionError("ChainVariable must be mutable for next()")
         while True:
@@ -390,6 +457,8 @@ class ChainVariable(IteratorVariable):
                 self.current = None
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode creating a real chain object from the current
+        # sub-iterator (if any) followed by chain.from_iterable over the source iterator.
         # Reconstruct as itertools.chain(current, itertools.chain.from_iterable(source))
         codegen.add_push_null(
             lambda: codegen.extend_output(
@@ -418,6 +487,10 @@ class ChainVariable(IteratorVariable):
 
 
 class RepeatIteratorVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for itertools.repeat. State: item (value yielded), times
+    # (total count, None for unbounded), remaining (count left, None if unbounded).
+    # Bounded instances are mutable and decrement on each next; reconstructs as repeat
+    # with the remaining count.
     # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c
     # repeat carries a `cnt` count: -1 means unbounded; CPython's repeat_new
     # clamps a user-supplied negative `times` to 0. We model that with `times`
@@ -435,15 +508,21 @@ class RepeatIteratorVariable(IteratorVariable):
         remaining: int | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores item, times and remaining; remaining defaults to times.
         super().__init__(**kwargs)
         self.item = item
         self.times = times
         self.remaining = times if remaining is None else remaining
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the python type itertools.repeat.
         return itertools.repeat
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns the repeated item. Unbounded: always the item, no state
+        # change. Bounded: raises observed stop-iteration when the remaining count is
+        # zero, otherwise records mutation, decrements remaining and returns the item.
+        # Raises AssertionError if a bounded instance is immutable.
         # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c repeat_next
         if self.remaining is None:
             return self.item
@@ -461,6 +540,9 @@ class RepeatIteratorVariable(IteratorVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements the length-hint method: returns a constant with the
+        # remaining count; raises a type error for the unbounded form. The args and
+        # kwargs are ignored.
         # ref: repeat_len in itertoolsmodule.c (exposed as __length_hint__);
         # raises TypeError for the unbounded form ("len() of unsized object").
         # Not a C-level slot, so it lives in tp_methods rather than call_method.
@@ -473,12 +555,16 @@ class RepeatIteratorVariable(IteratorVariable):
     }
 
     def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns a constant string repr: repeat of the item's repr, with
+        # the remaining count appended for bounded iterators.
         item_repr = tracked_repr(tx, self.item)
         if self.times is None:
             return ConstantVariable.create(f"repeat({item_repr})")
         return ConstantVariable.create(f"repeat({item_repr}, {self.remaining})")
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode creating a real repeat object with the item and,
+        # if bounded, the remaining count.
         codegen.add_push_null(
             lambda: codegen.extend_output(
                 [
@@ -496,6 +582,9 @@ class RepeatIteratorVariable(IteratorVariable):
 
 
 class CountIteratorVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for itertools.count. State: item (next value), step, and
+    # advance_count (number of next calls during tracing, replayed on the real
+    # iterator by side-effect handling). Mutable; reconstructs as count(item, step).
     # advance_count tracks how many next() calls were made during tracing,
     # used by side_effects.py to replay them on the real iterator post-execution.
     _nonvar_fields = {
@@ -504,6 +593,7 @@ class CountIteratorVariable(IteratorVariable):
     }
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the python type itertools.count.
         return itertools.count
 
     def __init__(
@@ -513,6 +603,8 @@ class CountIteratorVariable(IteratorVariable):
         advance_count: int = 0,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores item and step (plain numbers are wrapped as constant
+        # trackers) and the advance count.
         super().__init__(**kwargs)
         if not isinstance(item, VariableTracker):
             item = ConstantVariable.create(item)
@@ -523,6 +615,9 @@ class CountIteratorVariable(IteratorVariable):
         self.advance_count = advance_count
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns the current value, then records mutation, advances the
+        # value by adding step symbolically, and increments advance_count. Never
+        # exhausts. Raises AssertionError if immutable.
         # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c#L4189-L4216
         if not self.is_mutable():
             raise AssertionError("CountIteratorVariable must be mutable for next()")
@@ -533,6 +628,9 @@ class CountIteratorVariable(IteratorVariable):
         return old_item
 
     def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns a constant string repr like count(start) or
+        # count(start, step) (step omitted when it is the integer one). Falls back to the
+        # base repr if value or step is not a python constant.
         # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c#L4218-L4243
         if not (self.item.is_python_constant() and self.step.is_python_constant()):
             return super().tp_repr_impl(tx)
@@ -546,6 +644,8 @@ class CountIteratorVariable(IteratorVariable):
         return ConstantVariable.create(result)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode creating a real count object from the current
+        # item and step.
         codegen.add_push_null(
             lambda: codegen.extend_output(
                 [
@@ -560,6 +660,9 @@ class CountIteratorVariable(IteratorVariable):
 
 
 class ZipVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for builtin zip. State: iterable (tuple tracker of the
+    # underlying iterators) and strict flag. Each next pulls one item from every
+    # iterator into a tuple. Mutable; reconstructs as zip with a strict keyword.
     """
     Represents zip(*iterables)
     """
@@ -578,6 +681,8 @@ class ZipVariable(IteratorVariable):
         strict: bool = False,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the tuple tracker of iterators and the strict flag.
+        # Raises AssertionError if the iterable is not a tuple tracker.
         super().__init__(**kwargs)
         if not isinstance(iterable, variables.TupleVariable):
             raise AssertionError(f"Expected a tuple of iterables, got {type(iterable)}")
@@ -586,9 +691,18 @@ class ZipVariable(IteratorVariable):
         self.strict = strict
 
     def python_type(self) -> type[zip]:  # type: ignore[type-arg]
+        # [FUNCTION DOC] Returns the builtin zip type.
         return zip
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns a tuple tracker with the next item of each iterator. No
+        # iterators: observed stop-iteration. A non-strict exhaustion propagates the
+        # stop-iteration. Strict mode raises a value error if a later iterator is
+        # shorter, or if the first is exhausted while another still yields; if all
+        # are exhausted the stop-iteration propagates. Raises AssertionError if immutable.
+        # KNOWN ISSUE: in strict mode, the shorter-than-previous value error is raised
+        # without first clearing the pending observed stop-iteration, unlike the map
+        # tracker which handles it first.
         # ref: https://github.com/python/cpython/blob/v3.13.3/Python/bltinmodule.c#L2906-L2994
         if not self.is_mutable():
             raise AssertionError("ZipVariable must be mutable for next()")
@@ -629,6 +743,8 @@ class ZipVariable(IteratorVariable):
         return variables.TupleVariable(items)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode calling builtin zip with the iterator tuple
+        # unpacked and the strict keyword set to the stored flag.
         codegen.add_push_null(
             lambda: codegen.load_import_from("builtins", "zip"), call_function_ex=True
         )
@@ -644,6 +760,10 @@ class ZipVariable(IteratorVariable):
 
 
 class ZipLongestVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for itertools.zip_longest. State: iterables (list of
+    # iterators), fillvalue tracker, and exhausted (per-iterator flags). Exhausted
+    # iterators contribute the fill value until all are exhausted. Mutable;
+    # reconstructs with empty iterators substituted for exhausted ones.
     """
     Represents itertools.zip_longest(*iterables, fillvalue=None)
     """
@@ -663,6 +783,8 @@ class ZipLongestVariable(IteratorVariable):
         exhausted: "list[bool] | None" = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores iterators and fill value; exhausted flags default to all
+        # False, one per iterator.
         super().__init__(**kwargs)
         self.iterables = iterables
         self.fillvalue = fillvalue
@@ -671,9 +793,15 @@ class ZipLongestVariable(IteratorVariable):
         )
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the python type itertools.zip_longest.
         return itertools.zip_longest
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # [FUNCTION DOC] Returns a tuple tracker with one item per iterator, using the fill
+        # value for exhausted ones. An iterator that raises stop-iteration is marked
+        # exhausted (recording mutation) and replaced by the fill value. If all were
+        # already exhausted, or none produced a real item this round, raises observed
+        # stop-iteration. Raises AssertionError if immutable.
         # ref: https://github.com/python/cpython/blob/3.13/Modules/itertoolsmodule.c#L2737-L2808
         if not self.is_mutable():
             raise AssertionError("ZipLongestVariable must be mutable for next()")
@@ -699,6 +827,8 @@ class ZipLongestVariable(IteratorVariable):
         return variables.TupleVariable(values)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode calling zip_longest with the live iterators (an
+        # empty iterator stands in for each exhausted one) and the fillvalue keyword.
         codegen.add_push_null(
             lambda: codegen.extend_output(
                 [
@@ -737,6 +867,9 @@ class ZipLongestVariable(IteratorVariable):
 
 
 class MapVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for builtin map. State: fn (callable tracker), iterable (tuple
+    # tracker of iterators) and strict flag (only reconstructible on Python 3.14+).
+    # Each next pulls one item from every iterator and calls fn on them. Mutable.
     """
     Represents map(fn, *iterables)
     """
@@ -756,6 +889,8 @@ class MapVariable(IteratorVariable):
         strict: bool = False,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores fn, the tuple tracker of iterators and the strict flag.
+        # Raises AssertionError if iterables is not a tuple tracker.
         super().__init__(**kwargs)
         self.fn = fn
         if not isinstance(iterables, variables.TupleVariable):
@@ -766,9 +901,15 @@ class MapVariable(IteratorVariable):
         self.strict = strict
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the builtin map type.
         return map
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Pulls the next item from each iterator and returns the result of
+        # calling fn on them symbolically. Non-strict exhaustion propagates the
+        # stop-iteration. Strict mode raises a value error if a later iterator is
+        # shorter or a later one still has items after the first ended; otherwise
+        # raises observed stop-iteration. Raises AssertionError if immutable.
         # ref: https://github.com/python/cpython/blob/v3.13.3/Python/bltinmodule.c#L1409-L1450
         if not self.is_mutable():
             raise AssertionError("MapVariable must be mutable for next()")
@@ -806,6 +947,9 @@ class MapVariable(IteratorVariable):
         return self.fn.call_function(tx, items, {})
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode calling builtin map with fn and the iterators. If
+        # strict is set, adds the strict keyword (raises AssertionError before Python
+        # 3.14, where map has no strict option).
         codegen.add_push_null(
             lambda: codegen.load_import_from("builtins", "map"), call_function_ex=True
         )
@@ -828,6 +972,9 @@ class MapVariable(IteratorVariable):
 
 
 class FilterVariable(IteratorVariable):
+    # [CLASS DOC] Tracker for builtin filter. State: fn (predicate tracker, or None
+    # constant for identity) and iterable (single iterator). Reconstructs as filter
+    # of fn over the iterable.
     """
     Represents filter(fn, iterable)
     """
@@ -841,14 +988,20 @@ class FilterVariable(IteratorVariable):
         iterable: VariableTracker,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the predicate and the iterable tracker.
         super().__init__(**kwargs)
         self.fn = fn
         self.iterable = iterable
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the builtin filter type.
         return filter
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Loops pulling items from the iterable until one is truthy. The
+        # test value is the item itself when fn is None, else fn called on the item;
+        # truthiness is evaluated through a polyfill and must be a python constant.
+        # Iterator exhaustion propagates as stop-iteration. Does not record mutation.
         # ref: https://github.com/python/cpython/blob/v3.13.3/Python/bltinmodule.c#L573-L606
         # A do-while loop to find elements that make fn return true
         while True:
@@ -864,6 +1017,7 @@ class FilterVariable(IteratorVariable):
                 return item
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode calling builtin filter with fn and the iterable.
         codegen.add_push_null(lambda: codegen.load_import_from("builtins", "filter"))
         codegen(self.fn)
         codegen(self.iterable)
@@ -871,6 +1025,10 @@ class FilterVariable(IteratorVariable):
 
 
 class DictViewIterator(IteratorVariable):
+    # [CLASS DOC] Base for iterators over a dict or set snapshot. The view_type class
+    # attribute (keys, values or items) selects what is yielded. State: _iter, a real
+    # Python iterator over the captured tracker items, so consumption during tracing
+    # is reflected in length hints. Subclasses only set the CPython type and view_type.
     """Base class for dict view iterators (keys, values, or items)."""
 
     _nonvar_fields = {
@@ -885,6 +1043,9 @@ class DictViewIterator(IteratorVariable):
         items: dict[HashableTracker, VariableTracker],
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Creates the underlying real iterator over the mapping's keys,
+        # values or key-value pairs depending on view_type. Raises AssertionError for an
+        # unknown view_type.
         super().__init__(**kwargs)
         if self.view_type == "keys":
             self._iter = iter(items)
@@ -898,6 +1059,10 @@ class DictViewIterator(IteratorVariable):
             self._iter = iter(items.items())  # type: ignore[bad-assignment]
 
     def tp_iternext_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Advances the real iterator and returns the key tracker, value
+        # tracker, or a tuple tracker of both. A real StopIteration or RuntimeError
+        # (for example dict changed size) is converted into the same observed
+        # exception in the traced program.
         # dictiter_iternextitem: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5538-L5578
         # dictiter_iternextkey: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5125-L5144
         # dictiter_iternextvalue: https://github.com/python/cpython/blob/v3.13.3/Objects/dictobject.c#L5248-L5267
@@ -924,6 +1089,8 @@ class DictViewIterator(IteratorVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Length-hint method: returns a constant with the number of
+        # not-yet-consumed elements computed from the real iterator. Args are ignored.
         # dictiter_len/setiter_len: __length_hint__ returns the number of
         # not-yet-consumed elements. self._iter is a live Python iterator over
         # the captured items, so its own length hint already reflects any
@@ -936,6 +1103,9 @@ class DictViewIterator(IteratorVariable):
     }
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the real iterator type matching view_type: dict key,
+        # value or item iterator type. Set iterators (view_type keys) report the dict
+        # key iterator type.
         if self.view_type == "keys":
             return type(iter({}))
         elif self.view_type == "values":
@@ -945,25 +1115,32 @@ class DictViewIterator(IteratorVariable):
 
 
 class DictIterator(DictViewIterator):
+    # [CLASS DOC] Iterator over a dict directly (yields keys).
     _cpython_type = type(iter({}))
     view_type = "keys"
 
 
 class DictKeysIterator(DictViewIterator):
+    # [CLASS DOC] Iterator over a dict keys view (yields keys).
     _cpython_type = type(iter({}.keys()))
     view_type = "keys"
 
 
 class DictValuesIterator(DictViewIterator):
+    # [CLASS DOC] Iterator over a dict values view (yields values).
     _cpython_type = type(iter({}.values()))
     view_type = "values"
 
 
 class DictItemsIterator(DictViewIterator):
+    # [CLASS DOC] Iterator over a dict items view (yields key-value tuples).
     _cpython_type = type(iter({}.items()))
     view_type = "items"
 
 
 class SetIterator(DictViewIterator):
+    # [CLASS DOC] Iterator over a set snapshot (yields the elements as keys).
+    # KNOWN ISSUE: python_type inherited from the base reports the dict key iterator
+    # type rather than the real set iterator type.
     _cpython_type = type(iter(set()))
     view_type = "keys"

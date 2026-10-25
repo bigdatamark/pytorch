@@ -1,3 +1,12 @@
+# [MODULE DOC] Dynamo support for the invoke_subgraph higher-order operator. Defines
+# InvokeSubgraphHigherOrderVariable plus the auto-cache machinery that lets a
+# repeatedly called nested compile region (for example identical transformer
+# layers) be traced once and then "stamped out" again on later calls. Main pieces:
+# input fingerprinting (pytree flatten of args), reuse eligibility checks, reuse
+# conditions (tensor metadata plus re-evaluated guards on remapped sources), the
+# cache entry save/lookup helpers, and the stamp-out routine that emits a new
+# invoke_subgraph call. Import-time side effects: creates module loggers only,
+# including the hierarchical_compile artifact logger.
 """
 This module contains the InvokeSubgraphHigherOrderVariable class and its
 supporting helpers for subgraph reuse (auto-cache) in Dynamo's invoke_subgraph
@@ -172,6 +181,9 @@ hc_log = torch._logging.getArtifactLogger(__name__, "hierarchical_compile")
 
 
 class InputTag(enum.Enum):
+    # [CLASS DOC] Enumeration of the kinds of leaf inputs supported for subgraph
+    # reuse: tensor, symnode, constant (including enum members) and sourceful
+    # user-defined object. The tag decides how a leaf is compared across calls.
     TENSOR = "tensor"
     SYMNODE = "symnode"
     CONSTANT = "constant"
@@ -179,6 +191,10 @@ class InputTag(enum.Enum):
 
 
 class InputFingerprint(NamedTuple):
+    # [CLASS DOC] Immutable summary of one call's arguments used for cache lookup and
+    # saving: tagged leaf trackers, a positionally aligned list of leaf sources
+    # (None when sourceless), a flag for unsupported leaves, and the pytree
+    # treespec of the (args, kwargs) structure (None on the fast flat path).
     # (InputTag, VariableTracker) pairs for each leaf input.
     flat_vts: list[tuple[InputTag, VariableTracker]]
     # 1-1 mapping to flat_vts: source for each leaf, or None if the VT has no source.
@@ -192,6 +208,9 @@ class InputFingerprint(NamedTuple):
 def is_constant_like(
     vt: Any,
 ) -> TypeGuard[ConstantVariable | UserDefinedObjectVariable]:
+    # [FUNCTION DOC] HELPER: Returns True if the tracker is a constant variable or a
+    # user-defined object wrapping an enum member (immutable singleton), i.e. a
+    # leaf that can be compared by its value. No side effects, never raises.
     """Whether a leaf VT is compared by value, via ``vt.value``.
 
     Enum members are UserDefinedObjectVariable (not ConstantVariable) in
@@ -204,6 +223,9 @@ def is_constant_like(
 
 
 def classify_vt(vt: Any) -> InputTag | None:
+    # [FUNCTION DOC] HELPER: Maps a leaf tracker to its InputTag: tensor, symnode,
+    # constant-like, or object (a user-defined object that has a source). Returns
+    # None for anything else (including sourceless objects), meaning unsupported.
     """Return the tag for a leaf VT, or None if unsupported."""
     if isinstance(vt, TensorVariable):
         return InputTag.TENSOR
@@ -226,6 +248,11 @@ def build_input_fingerprint(
     fn_args_vt: Any,
     kwargs: dict[str, Any],
 ) -> InputFingerprint:
+    # [FUNCTION DOC] Builds the InputFingerprint for a call. If there are no kwargs and
+    # every positional arg is already a supported leaf, uses the fast flat path;
+    # otherwise flattens (args, kwargs) with the traced pytree helper. Args: the
+    # translator, the list of argument trackers, and the kwargs mapping. Returns
+    # the fingerprint; may trace inlined functions (side effects on the tracer).
     """Build an InputFingerprint by flattening (args, kwargs) via pytree.
 
     Flattens the argument structure into leaf VTs, classifying each leaf as
@@ -249,6 +276,9 @@ def build_input_fingerprint(
 
 
 def build_fingerprint_fast(fn_args_vt: Any) -> InputFingerprint:
+    # [FUNCTION DOC] Fingerprint for flat leaf-only args without kwargs: tags each arg
+    # and records its source (None kept for alignment); no treespec. Raises
+    # AssertionError if an arg is unclassifiable (caller must pre-check).
     """Build fingerprint for the common case of flat leaf args, no kwargs."""
     flat_vts: list[tuple[InputTag, VariableTracker]] = []
     arg_sources: list[Source | None] = []
@@ -270,6 +300,12 @@ def build_fingerprint_with_pytree(
     fn_args_vt: Any,
     kwargs: dict[str, Any],
 ) -> InputFingerprint:
+    # [FUNCTION DOC] Fingerprint for nested or kwarg arguments. Wraps (args list,
+    # kwargs) in a sourceless tracker, then recursively walks the pytree node
+    # types, inlining each container's registered flatten function (or falling
+    # back to the full traced tree_flatten for non-plain-function flatteners).
+    # Produces tagged leaves, aligned sources, a has_unknown flag when a leaf
+    # or node type is unsupported, and the reconstructed treespec.
     """Build fingerprint via pytree flatten for nested/kwargs cases.
 
     Recurses over the pytree structure natively (untraced), inlining/tracing
@@ -295,6 +331,8 @@ def build_fingerprint_with_pytree(
     has_unknown = False
 
     def add_leaf(vt: VariableTracker) -> None:
+        # [FUNCTION DOC] HELPER: Classifies a leaf and appends it and its source to the
+        # enclosing lists, or sets the has_unknown flag if unsupported.
         nonlocal has_unknown
         tag = classify_vt(vt)
         if tag is None:
@@ -305,6 +343,10 @@ def build_fingerprint_with_pytree(
             arg_sources.append(getattr(vt, "source", None))
 
     def flatten(node_vt: VariableTracker) -> pytree.TreeSpec:
+        # [FUNCTION DOC] HELPER: Recursively flattens one node. Unknown python type sets
+        # has_unknown and yields a leaf spec; unregistered node types become leaves;
+        # registered ones are flattened into children and context and rebuilt into
+        # a TreeSpec. Returns the node's TreeSpec; appends leaves as a side effect.
         nonlocal has_unknown
         try:
             node_type = node_vt.python_type()
@@ -348,6 +390,8 @@ def build_fingerprint_with_pytree(
 
 
 def sym_num_key(sym_num: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns the symbolic expression of a SymInt/SymFloat (with
+    # ShapeEnv replacements applied), used as the comparison key for symnode inputs.
     """Key for matching a symbolic input against a cached one.
 
     Compares the symbolic expression rather than the SymInt object. Each tensor
@@ -364,6 +408,9 @@ def sym_num_key(sym_num: Any) -> Any:
 
 
 def get_flat_proxies(fingerprint: InputFingerprint) -> list[Proxy]:
+    # [FUNCTION DOC] HELPER: Returns the FX proxies of the tensor and symnode leaves in
+    # order, dropping duplicates that share the same graph node. This order defines
+    # the index used by LiftedUserArg.
     """Collect deduplicated proxies from tensor/symnode leaves."""
     seen: set[torch.fx.Node] = set()
     flat_proxies: list[Proxy] = []
@@ -378,6 +425,9 @@ def get_flat_proxies(fingerprint: InputFingerprint) -> list[Proxy]:
 
 @dataclass
 class LiftedUserArg:
+    # [CLASS DOC] HELPER: Record describing a lifted subgraph input that is one of the
+    # call's own tensor/symnode arguments, identified by its index in the
+    # deduplicated flat proxy list.
     """Lifted arg that came from a user argument (intermediate activation or explicit input)."""
 
     index: int
@@ -385,6 +435,8 @@ class LiftedUserArg:
 
 @dataclass
 class LiftedCapturedSource:
+    # [CLASS DOC] HELPER: Record for a lifted input that is a captured variable with a
+    # known Source; on reuse the source is remapped and re-resolved to a value.
     """Lifted arg that is a captured variable (e.g. a weight or parameter) with a Source."""
 
     source: Any  # Source
@@ -392,6 +444,9 @@ class LiftedCapturedSource:
 
 @dataclass
 class LiftedSyntheticObject:
+    # [CLASS DOC] HELPER: Record for a lifted synthetic (opaque) object: stores the
+    # constructor function, its args and optional arg sources so the object can be
+    # rebuilt as a synthetic graph input on reuse.
     """Lifted arg that is a TorchScriptObject with a SyntheticLocalSource."""
 
     ctor_fn: Any  # Callable
@@ -401,6 +456,8 @@ class LiftedSyntheticObject:
 
 @dataclass
 class LiftedBoundSymbol:
+    # [CLASS DOC] HELPER: Record for a lifted SymInt that is already bound as a graph
+    # input; stores its sympy expression, used to look up the existing proxy.
     """Lifted arg that is a SymInt already bound as a graph input.
 
     SymInt graph inputs are created during tensor wrapping (not through
@@ -419,6 +476,9 @@ LiftedArgOrigin = (
 
 
 def get_fn_code(fn_var: Any) -> types.CodeType | None:
+    # [FUNCTION DOC] HELPER: Returns the code object used as the cache key for the
+    # region function: the function's code for user functions, or the forward
+    # method's code for unspecialized nn modules; None for other trackers.
     if isinstance(fn_var, UserFunctionVariable):
         return fn_var.get_function().__code__
     elif isinstance(fn_var, UnspecializedNNModuleVariable):
@@ -432,6 +492,8 @@ def has_mutated_vars(
     tx: "InstructionTranslatorBase",
     traced_sources: OrderedSet[Source],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any source in traced_sources appears in the
+    # outer SideEffects mutated-source set; logs the overlap at debug level.
     """Check if any source accessed by the subgraph has been mutated.
 
     SideEffects.mutated_sources records the exact AttrSource for every
@@ -456,6 +518,11 @@ def is_reuse_eligible(
     traced_sources: OrderedSet[Source] | None = None,
     has_reuse_hash_fn: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a freshly traced subgraph may be cached. Unless a
+    # user hash function is used, rejects subgraphs with recorded side effects or
+    # whose traced sources were mutated. Always requires the result to be a tensor
+    # or a tuple/list of tensors and the fingerprint to have no unsupported leaf.
+    # Returns a bool; logs the reason for rejection; no mutation.
     """Best-effort check for whether a traced subgraph result can be reused.
 
     It is possible that a subgraph is morally reusable but does not fall
@@ -525,6 +592,12 @@ def build_reuse_condition(
     fingerprint: InputFingerprint,
     traced_sources: OrderedSet[Source],
 ) -> InvokeSubgraphReuseCondition | None:
+    # [FUNCTION DOC] Builds the reuse condition for a traced call: per-leaf input checks
+    # (tensor metadata, symnode key, type plus value for constants, nothing for
+    # objects) and a list of guard tuples (source, handler, expected value, guard)
+    # for all guards installed on traced and argument sources, skipping guards
+    # marked skippable. Returns None if a tensor has no example value. Raises
+    # RuntimeError for an unsupported guard type or an unresolvable source.
     """Build an InvokeSubgraphReuseCondition from a traced subgraph.
 
     A reuse condition is a mix of two kinds of checks:
@@ -636,6 +709,8 @@ def build_source_replacement(
     old_arg_sources: list[Source | None],
     new_arg_sources: list[Source | None],
 ) -> dict[Source, Source]:
+    # [FUNCTION DOC] HELPER: Pairs old and new argument sources positionally and returns
+    # a mapping old -> new, omitting pairs where either is None or both are equal.
     """Map old arg sources to new arg sources for remapping captured variable sources."""
     return {
         old: new
@@ -650,6 +725,14 @@ def is_reusable(
     fingerprint: InputFingerprint,
     cached_entry: InvokeSubgraphReuseEntry,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a cached entry matches the current call. Checks, in
+    # order: treespec equality, input count, then per leaf the tag and tensor
+    # metadata / symnode key / constant type and value (a differing constant is
+    # tolerated only if both calls have sources). Then remaps traced sources and
+    # rejects if any was mutated; finally re-evaluates each guard on its remapped
+    # source against live frame locals and globals. Returns a bool; logs failures;
+    # no state change except resolution caches. Raises AssertionError on tag/type
+    # inconsistencies.
     """Check if a cached subgraph can be reused for the current call.
 
     Three-phase check:
@@ -776,6 +859,8 @@ def is_reusable(
     # parameterization is central in getting the new sources and then running
     # guards on them.
     def replacement_fn(s: Source) -> Source:
+        # [FUNCTION DOC] HELPER: Returns the replacement for a source, or the source
+        # itself if it has no mapping.
         return source_replacement.get(s, s)
 
     # Check for mutations on remapped traced_sources.
@@ -852,6 +937,9 @@ def has_reuse_entries(
     tx: "InstructionTranslatorBase",
     fn_var: Any,
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the invoke_subgraph cache has any guard-based reuse
+    # entry for the region function's code object. False when the cache is absent
+    # or the function has no code. Read-only.
     """Cheap check: does the cache have any entries for this function?"""
     from torch._guards import InvokeSubgraphCache
 
@@ -869,6 +957,9 @@ def find_reuse_match(
     fn_var: Any,
     fingerprint: InputFingerprint,
 ) -> InvokeSubgraphReuseEntry | None:
+    # [FUNCTION DOC] Searches the guard-based cache for an entry whose reuse condition
+    # accepts the current fingerprint (via is_reusable). Returns the first matching
+    # entry, or None if no cache, no function code, or no match.
     from torch._guards import InvokeSubgraphCache
 
     invoke_subgraph_cache = tx.output.tracing_context.hop_dispatch_set_cache.get_cache(
@@ -886,6 +977,8 @@ def find_reuse_match(
     def evaluator(
         cond: "InvokeSubgraphReuseCondition", entry: InvokeSubgraphReuseEntry
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Adapter passed to the cache; returns whether the given
+        # condition and entry are reusable for the current fingerprint.
         return is_reusable(tx, cond, fingerprint, entry)
 
     return invoke_subgraph_cache.find_reuse_entry(fn_code, evaluator)
@@ -905,6 +998,12 @@ def save_reuse_entry(
     condition: "InvokeSubgraphReuseCondition | None" = None,
     hash_key: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] Stores a traced subgraph in the invoke_subgraph cache. Builds the
+    # input mapping, counts user-visible outputs, records output tensor metadata
+    # (shape, stride, dtype, device, requires_grad) and creates a reuse entry, added
+    # either under a guard condition or under a hash key (exactly one must be
+    # given, else AssertionError). Mutates the cache; silently returns if there is
+    # no cache or no function code. May raise when max_reuse_entries is exceeded.
     """Save a traced subgraph into the reuse cache for future cache hits.
 
     Builds an InvokeSubgraphReuseEntry with the freevar mapping (how each
@@ -991,6 +1090,9 @@ def trace_reuse_hash_fn(
     fn_args_vt: "list[VariableTracker]",
     kwargs: dict[str, VariableTracker],
 ) -> int:
+    # [FUNCTION DOC] Inlines the user-supplied hash function on the call arguments with
+    # guard installation suppressed and returns the resulting constant integer.
+    # Raises RuntimeError if tracing graph-breaks or the result is not a constant int.
     """Trace the user's reuse_hash_fn to get a constant integer hash key.
 
     Guards installed during the hash function tracing are skipped — the hash
@@ -1019,6 +1121,8 @@ def find_reuse_entry_by_key(
     fn_var: Any,
     hash_key: int,
 ) -> InvokeSubgraphReuseEntry | None:
+    # [FUNCTION DOC] Looks up a reuse entry by user hash key for the region function.
+    # Returns the entry, or None when no cache, no function code, or no such key.
     from torch._guards import InvokeSubgraphCache
 
     invoke_subgraph_cache = tx.output.tracing_context.hop_dispatch_set_cache.get_cache(
@@ -1037,6 +1141,13 @@ def stamp_out_subgraph(
     fingerprint: InputFingerprint,
     cached: InvokeSubgraphReuseEntry,
 ) -> VariableTracker:
+    # [FUNCTION DOC] Emits a new invoke_subgraph call in the current graph from a cached
+    # entry without retracing. Rebuilds the lifted argument list from the saved
+    # mapping (user arg proxies, bound symbols, synthetic objects, or captured
+    # sources remapped and resolved via VariableBuilder), creates fake output
+    # tensors from the cached metadata, adds the call node, and returns only the
+    # user-visible outputs (single tensor, truncated tuple, or full result).
+    # Side effects: adds graph nodes, graph inputs and possibly lazy proxies.
     """Emit a new invoke_subgraph call by stamping out a cached subgraph.
 
     Sources in the cached entry are parameterized: they refer to the original
@@ -1157,6 +1268,11 @@ def build_subgraph_input_mapping(
     p_args: tuple[Any, ...],
     flat_vts: list[tuple[InputTag, VariableTracker]],
 ) -> list[LiftedArgOrigin]:
+    # [FUNCTION DOC] For each lifted argument of the call (after body node and name),
+    # records its origin: a user arg index if its graph node matches a flat
+    # tensor/symnode leaf, a bound SymInt expression, a synthetic object
+    # constructor record, or a captured source. Raises AssertionError if a free
+    # variable has no source. Read-only on the graph.
     """Build a mapping that records the origin of each lifted arg for a subgraph.
 
     On a cache hit, we stamp out a new invoke_subgraph call and need to
@@ -1223,6 +1339,12 @@ def build_subgraph_input_mapping(
 
 
 class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
+    # [CLASS DOC] Tracker for the invoke_subgraph higher-order op. Traces the wrapped
+    # function into a subgraph, installs it as a named submodule (deduplicating
+    # structurally identical graphs), and adds an invoke_subgraph call node.
+    # Class flags: input mutation and side effects allowed, aliasing not supported,
+    # aliased intermediates filtered, no eager fallback. Implements subgraph reuse
+    # (guard-based or user hash-key based) except under export.
     _HOP_NAME = "torch.ops.higher_order.invoke_subgraph"
     _ALLOW_FALLBACK_TO_EAGER = False
     supports_input_mutation = True
@@ -1243,6 +1365,12 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
         body_gmod: GraphModule,
         attr_name: str,
     ) -> str:
+        # [FUNCTION DOC] Installs the traced body graph module and returns its attribute
+        # name. Graph-breaks unless the function is a user function or unspecialized
+        # module. Compares the body with previously installed submodules of the same
+        # function code (newest first) and returns the existing name on a structural
+        # match; otherwise installs it via the parent class and records the new name.
+        # Raises AssertionError if a recorded submodule is missing or fake mode is unset.
         # Check if the subgraph from speculate_subgraph (body_gmod) and the fake
         # inputs have already been seen before. If yes, the subgraph is already
         # installed in the output graph and we can just access the subgraph
@@ -1321,6 +1449,14 @@ class InvokeSubgraphHigherOrderVariable(WrapHigherOrderVariable):
         args: "list[VariableTracker]",
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handles a call to invoke_subgraph with the region function as
+        # first arg. Reads compile-region config, max reuse entries and optional hash
+        # function from the function attributes. Unless exporting, tries reuse (hash
+        # key path or guard-based path) and stamps out a cached subgraph on a hit.
+        # Otherwise traces the body, stores its config in graph module metadata, and
+        # if eligible saves a reuse entry (a user hash function with an ineligible
+        # subgraph raises RuntimeError). Returns the flattened call result.
+        # Graph-breaks if unexpected kwargs remain. Side effects: graph and cache mutation.
         from torch._dynamo.utils import dynamo_timed
         from torch._dynamo.variables.higher_order_ops import (
             _call_function_with_auto_output_flattening,
