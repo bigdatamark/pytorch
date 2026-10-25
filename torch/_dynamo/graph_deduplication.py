@@ -1,3 +1,9 @@
+# [MODULE DOC] Graph deduplication pass: takes groups of structurally identical regions found by
+# the region tracker, extracts one representative per group into a subgraph, and replaces every
+# region with a call to the invoke_subgraph higher-order op. Also contains the stable
+# topological sort honoring extra dependencies (mutation ordering, autocast enter/exit),
+# aliasing checks, and tuple-output flattening helpers. Module-level state:
+# last_node_to_additional_deps (exposed for tests) and a logger. No other import-time effects.
 """
 This module implements graph deduplication functionality for TorchDynamo's optimization pipeline.
 Graph deduplication identifies identical subgraphs in the computational graph and merges them
@@ -34,6 +40,15 @@ last_node_to_additional_deps: dict[Node, OrderedSet[Node]] | None = None
 
 
 def apply_graph_deduplication(output_graph) -> dict[str, torch.fx.GraphModule]:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Entry point of the pass. Gets identical region groups from the output
+    # graph's region tracker, computes extra ordering dependencies, and for each group builds a
+    # subgraph from the first region (skipping groups with no external inputs), installs it on
+    # the output graph, adds an attribute-fetch node, and replaces each region by an
+    # invoke_subgraph call. Finally records the dependency map in a module global and stably
+    # re-sorts the graph. Mutates output_graph in place. Returns a mapping from installed
+    # subgraph name to its GraphModule. Raises AssertionError if the final sort fails.
+    # KNOWN ISSUE: the docstring says it returns a node-to-replacement mapping, but the code
+    # returns the dict of subgraph graph modules.
     """
     This is the main entry point for applying the graph deduplication pass. \
 Deduplication occurs in two phases:
@@ -132,6 +147,14 @@ def _replace_region_with_subgraph(
     node_to_additional_deps: dict[Node, OrderedSet[Node]],
     node_to_mutated_arg_positions: dict[Node, OrderedSet[int]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces one region of the graph with an invoke_subgraph call. Builds
+    # the call arguments from the external usages (expanding tuple inputs into their flattened
+    # getitem nodes). Aborts silently (returns without change, logging at debug level) if any
+    # external argument is mutated inside the region or if input/output aliasing is detected.
+    # Otherwise creates the call node, rewires external users to getitem nodes of its result
+    # (tuple outputs via the tuple helper), erases the region's nodes in reverse order, and
+    # updates the additional-dependency map to point at the new call node. With the lint config
+    # on, prints cycle info, re-sorts and lints the graph. Mutates graph and dependency map.
     sub_args = []
     flattened_getitem_nodes: OrderedSet[Node] = OrderedSet()
     for usages in external_node_usages:
@@ -220,6 +243,9 @@ def _replace_region_with_subgraph(
 def _get_external_inputs(
     region: Region,
 ) -> dict[Node, OrderedSet[UsageIndex]]:
+    # [FUNCTION DOC] HELPER: Finds nodes outside the region used as arguments by region nodes.
+    # Returns an insertion-ordered mapping from each external node to the set of (index of the
+    # using node in the region, index in that node's flattened args) pairs.
     external_node_to_usages = defaultdict[Node, OrderedSet[UsageIndex]](OrderedSet)
     region_unique = set(region)
     for node_ind, node in enumerate(region):
@@ -236,6 +262,8 @@ def _get_external_inputs(
 
 
 def _get_all_output_indices(regions: list[Region]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns the sorted union, over all given regions, of positions of
+    # nodes that have at least one user outside their region.
     # Scan all regions to get the set of all possible output nodes indices in the region
     # perhaps we can record this information during region creation for more efficiency?
     inds_with_external_users: set[int] = set()
@@ -246,6 +274,8 @@ def _get_all_output_indices(regions: list[Region]) -> list[int]:
 
 
 def _get_inds_with_external_users(region: Region, inds_unique: set[int]) -> None:
+    # [FUNCTION DOC] HELPER: Adds to inds_unique (mutated in place) the positions of region nodes
+    # having any user not in the region. Returns nothing.
     for ind, node in enumerate(region):
         for user in node.users:
             if user not in region:
@@ -262,6 +292,13 @@ def _create_subgraph(
     dict[UsageIndex, OrderedSet[int]],
     dict[int, dict[tuple[int, ...], int]],
 ]:
+    # [FUNCTION DOC] HELPER: Builds a new FX graph from a representative region. Creates one
+    # placeholder per external input node (tuple inputs get placeholders for their flattened
+    # element nodes that are in the region instead), copies the remaining region nodes with
+    # arguments remapped, and emits an output node returning a tuple of all nodes at
+    # inds_with_external_users (tuple-valued ones flattened into getitem nodes). Returns
+    # (subgraph, list of usage sets per input, mapping from usage to flattened tuple element
+    # indices, mapping from output index to tuple path-to-output spec).
     subgraph: torch.fx.Graph = torch.fx.Graph()
     external_input_to_usages = _get_external_inputs(region)
     external_node_usages = list[OrderedSet[UsageIndex]]()
@@ -293,12 +330,16 @@ def _create_subgraph(
         external_node_usages.append(usage_indices)
 
     def map_arg(node: Node) -> Node:
+        # [FUNCTION DOC] HELPER: Returns the subgraph node mapped to the given original node, or
+        # the node itself if unmapped.
         if node in region_to_subgraph_node:
             return region_to_subgraph_node[node]
         else:
             return node
 
     def copy_to_subgraph(node: Node) -> Node:
+        # [FUNCTION DOC] HELPER: Copies node into the subgraph with remapped arguments, records the
+        # mapping, and returns the new node.
         subgraph_node = subgraph.node_copy(node, lambda old: map_arg(old))
         region_to_subgraph_node[node] = subgraph_node
         return subgraph_node
@@ -329,6 +370,13 @@ def _stable_topological_sort_impl(
     do_sort: bool = True,
     region: OrderedSet[Node] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Core of the stable topological sort. Processes nodes in current
+    # order, treating inputs plus extra dependencies as prerequisites; a node with unready
+    # prerequisites waits until its last unready one is processed. When do_sort is true, nodes
+    # are moved (mutating the graph) so every node follows its prerequisites while otherwise
+    # preserving order. If region is given, only nodes in it are considered and others count as
+    # ready. Output nodes are skipped. Raises AssertionError if an output node has users.
+    # Returns True if all nodes were placed (no cycle), else False.
     # Nodes are in exactly one of these four collections:
 
     # - Nodes in `pending` are waiting to be processed (in reverse order):
@@ -393,6 +441,8 @@ def _stable_topological_sort(
     graph: torch.fx.Graph,
     node_to_additional_deps: dict[Node, OrderedSet[Node]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Stably topologically sorts the whole graph in place honoring extra
+    # dependencies; raises AssertionError if sorting fails (cycle).
     if not _stable_topological_sort_impl(graph, node_to_additional_deps):
         raise AssertionError("stable topological sort failed")
 
@@ -401,6 +451,8 @@ def _stable_topological_sort_region(
     graph: torch.fx.Graph,
     region: OrderedSet[Node],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Stably topologically sorts only the given set of nodes in place, with
+    # no extra dependencies; raises AssertionError if sorting fails.
     if not _stable_topological_sort_impl(graph, {}, region=region):
         raise AssertionError("stable topological sort of region failed")
 
@@ -409,6 +461,8 @@ def _has_cycle(
     graph: torch.fx.Graph,
     node_to_additional_deps: dict[Node, OrderedSet[Node]],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the graph plus extra dependencies contains a cycle.
+    # Runs the sort in check-only mode (graph not modified).
     return not _stable_topological_sort_impl(
         graph, node_to_additional_deps, do_sort=False
     )
@@ -417,6 +471,8 @@ def _has_cycle(
 def _populate_additional_deps(
     graph: torch.fx.Graph, node_to_mutated_arg_positions: dict[Node, OrderedSet[int]]
 ) -> dict[Node, OrderedSet[Node]]:
+    # [FUNCTION DOC] HELPER: Builds the mapping from node to the nodes it must be ordered after,
+    # combining mutation-ordering dependencies and global-state (autocast) dependencies.
     node_to_additional_deps: dict[Node, OrderedSet[Node]] = defaultdict(OrderedSet)
     _add_mutation_dependencies(node_to_mutated_arg_positions, node_to_additional_deps)
     _add_global_state_dependencies(graph, node_to_additional_deps)
@@ -426,6 +482,9 @@ def _populate_additional_deps(
 def _add_global_state_dependencies(
     graph: torch.fx.Graph, node_to_additional_deps: dict[Node, OrderedSet[Node]]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Adds dependencies that pin autocast enter/exit nodes in place. Each
+    # such node depends on all earlier nodes (except its own args), and every later node depends
+    # on every earlier autocast enter/exit node (except its own args). Mutates the given map.
     import torch.amp
 
     all_nodes = list(graph.nodes)
@@ -437,6 +496,8 @@ def _add_global_state_dependencies(
     def prev_cur_nodes(
         all_nodes: list[Node],
     ) -> Generator[tuple[list[Node], Node], None, None]:
+        # [FUNCTION DOC] HELPER: Generator yielding each node in order paired with the list of all
+        # nodes before it (the same list object, grown after each yield).
         prev_nodes: list[Node] = []
         next_nodes = list(reversed(all_nodes))
 
@@ -463,6 +524,9 @@ def _add_mutation_dependencies(
     node_to_mutated_arg_positions: dict[Node, OrderedSet[int]],
     node_to_additional_deps: dict[Node, OrderedSet[Node]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each mutating node and each mutated argument position, orders the
+    # mutation after earlier users of that argument and before later users, by adding entries to
+    # the additional-dependency map (mutated in place). Order is judged by node position.
     for node, indices in node_to_mutated_arg_positions.items():
         flat_args_kwargs = _get_flat_args(node, {})
 
@@ -490,6 +554,11 @@ def _has_aliasing(
     inds_with_external_users: list[int],
     flattened_getitem_nodes: OrderedSet[Node],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Checks whether replacing the region by a subgraph call would involve
+    # tensor storage aliasing, which invoke_subgraph does not support. Using example values from
+    # node metadata, detects input-input, output-output and input-output sharing of storage
+    # (skipping flattened getitem nodes). Logs the finding at debug level and returns True if
+    # aliasing exists, else False. Raises AssertionError if an output example value is a list.
     input_storages: dict[StorageWeakRef, Node] = dict()
     for node in inputs:
         if node in flattened_getitem_nodes:
@@ -545,16 +614,22 @@ def _has_aliasing(
 
 
 def _is_tuple_node(node: Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node's recorded example value is a tuple.
     return isinstance(node.meta["example_value"], tuple)
 
 
 def _get_children_getitems(node: Node) -> Generator[Node, None, None]:
+    # [FUNCTION DOC] HELPER: Generator yielding users of node that are item-access calls with an
+    # integer index.
     for user in node.users:
         if user.target is operator.getitem and isinstance(user.args[1], int):
             yield user
 
 
 def _get_flattened_node_indices(node: Node, region: Region) -> OrderedSet[int]:
+    # [FUNCTION DOC] HELPER: Walks the tree of integer-index item-access users of a tuple node
+    # breadth first and returns, in visit order, the region positions of those that have at
+    # least one user inside the region. Raises KeyError if such a node is not in the region.
     """Returns an ordered set of indices, each representing a node in the region which will be flattened"""
     flattened_node_to_ind = {n: i for i, n in enumerate(region)}
     node_indices: OrderedSet[int] = OrderedSet()
@@ -571,7 +646,12 @@ def _get_flattened_node_indices(node: Node, region: Region) -> OrderedSet[int]:
 def _create_getitem_nodes(
     node: Node, subgraph_tuple_node: Node, subgraph: torch.fx.Graph
 ) -> tuple[list[Node], dict[tuple[int, ...], int]]:
-    tup = node.meta["example_value"]
+    # [FUNCTION DOC] HELPER: Flattens a tuple-valued node in the subgraph by creating, breadth
+    # first, an item-access node for every element (recursing into nested tuples), each with its
+    # example value recorded. Returns (list of created nodes in creation order, mapping from the
+    # index path of each element to its position in that list). Raises AssertionError if the
+    # node's example value is not a tuple.
+    tup =node.meta["example_value"]
     if not isinstance(tup, tuple):
         raise AssertionError("_get_getitem_children expects tuple")
 
@@ -606,6 +686,11 @@ def _replace_tuple_outputs(
     invoke_subgraph_node: Node,
     graph: torch.fx.Graph,
 ) -> OrderedSet[Node]:
+    # [FUNCTION DOC] HELPER: In the outer graph, replaces every nested item-access user of a
+    # tuple node with an item access on the invoke_subgraph result at the position
+    # output_index plus the spec offset for its index path, then erases the old item-access
+    # nodes and the tuple node itself. Returns the set of erased nodes. Raises AssertionError if
+    # node is not tuple valued; mutates graph.
     if not _is_tuple_node(node):
         raise AssertionError("_replace_tuple_outputs expects a tuple node")
 

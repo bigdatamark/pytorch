@@ -1,3 +1,6 @@
+# [MODULE DOC] Maps (source file, line number) to the dotted qualified name of the enclosing
+# function/class, computed lazily by tokenizing the file and memoized in a module-level cache.
+# Main contents: cache, clearcache, get_funcname. No import-time side effects.
 """
 This module provides functionality for caching and looking up fully qualified function
 and class names from Python source files by line number.
@@ -23,10 +26,18 @@ cache: dict[str, dict[int, str]] = {}
 
 
 def clearcache() -> None:
+    # [FUNCTION DOC] Empties the module-level filename-to-line-names cache so files are re-parsed
+    # on next lookup. Takes no arguments, returns nothing; mutates global state.
     cache.clear()
 
 
 def _add_file(filename: str) -> None:
+    # [FUNCTION DOC] HELPER: Tokenizes the file and stores in the cache a mapping from each
+    # token start line to the dotted name of the innermost enclosing class/def (empty string at
+    # top level). Tracks nesting through indent/dedent tokens. On OSError or TokenError the
+    # file gets an empty mapping. Mutates the global cache; returns nothing.
+    # KNOWN ISSUE: only the first token's line is recorded per token, so a line gets the name
+    # in effect at its last token; behavior is undefined for invalid Python source.
     try:
         with tokenize.open(filename) as f:
             tokens = list(tokenize.generate_tokens(f.readline))
@@ -69,6 +80,10 @@ def _add_file(filename: str) -> None:
 
 
 def get_funcname(filename: str, lineno: int) -> str | None:
+    # [FUNCTION DOC] Returns the dotted qualified function/class name enclosing the given line
+    # of the given file, or None if the line has no recorded token (e.g. blank or beyond EOF).
+    # Parses and caches the file on first access (file I/O, mutates the global cache). An
+    # empty string means the line is at module level or the file was unreadable.
     if filename not in cache:
         _add_file(filename)
     return cache[filename].get(lineno, None)

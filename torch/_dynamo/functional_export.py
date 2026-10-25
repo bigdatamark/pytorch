@@ -1,3 +1,10 @@
+# [MODULE DOC] Graph capture for export built on Dynamo's full-graph capture. Provides the
+# entry points that trace a callable/module into an FX GraphModule whose forward replays
+# Dynamo bytecode for flattening/unflattening (dynamo_graph_capture_for_export), or a cleaner
+# variant rebuilt by an FX transformer with pytree codegen (_dynamo_graph_capture_for_export).
+# Also holds helpers that strip export-root naming artifacts, constraint-violation reporting,
+# and the bytecode flatten/unflatten callables and custom code generator. Import-time side
+# effects: creates a module logger only.
 from __future__ import annotations
 
 import inspect
@@ -59,6 +66,10 @@ def post_process_error_msg(
     args: Any,
     kwargs: Any,
 ) -> ConstraintViolationError:
+    # [FUNCTION DOC] Rewrites the message of a constraint violation error so that source names
+    # refer to the user's original callable inputs (instead of the internal traced wrapper):
+    # computes flat input paths for the call arguments from the callable signature and replaces
+    # sources in the first error argument. Mutates and returns the same error object.
     """
     Because we trace a different callable, the sources are all messed up.
     Manually patch them so the error message looks correct.
@@ -82,6 +93,8 @@ EXPORT_ROOT_REPLACEMENTS = [
 
 
 def clean_export_root_string(text: str) -> str:
+    # [FUNCTION DOC] Returns text with the export-root naming artifacts removed or replaced,
+    # applying each replacement rule in order. Pure.
     """Generic utility to clean export_root patterns from strings."""
     result = text
     for pattern, replacement in EXPORT_ROOT_REPLACEMENTS:
@@ -92,6 +105,10 @@ def clean_export_root_string(text: str) -> str:
 def clean_nn_module_stack_and_source_fn(
     graph_module: torch.fx.GraphModule, is_inline_builtin: bool = False
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Mutates every node's module-stack and source-function-stack metadata, and the
+    # graph module's flat-name-to-original-name metadata, to remove export-root artifacts.
+    # Module stack: drops the root export entry, cleans keys and names, and (if
+    # is_inline_builtin) drops entries that refer to self. Returns the same graph module.
     """
     Clean up nn_module_stack metadata by removing export_root references.
 
@@ -120,6 +137,9 @@ def clean_nn_module_stack_and_source_fn(
     def _process_nn_module_stack(
         nn_module_stack: dict[str, tuple[str, T]],
     ) -> dict[str, tuple[str, T]]:
+        # [FUNCTION DOC] HELPER: Given a mapping key -> (name, class), removes the root export
+        # entry (mutating the input), cleans keys and names, skips self references when
+        # inline-builtin mode is set, and returns a new mapping.
         if "L__self____export_root" in nn_module_stack:
             del nn_module_stack["L__self____export_root"]
 
@@ -140,6 +160,8 @@ def clean_nn_module_stack_and_source_fn(
         return cleaned_stack
 
     def _process_source_fn(source_fn_stack: Iterable[T]) -> Iterable[T]:
+        # [FUNCTION DOC] HELPER: Returns a list where each (string name, class) pair has its name
+        # cleaned; all other items are kept unchanged.
         cleaned_stack = []
         for item in source_fn_stack:
             if isinstance(item, tuple) and len(item) == 2:
@@ -182,6 +204,11 @@ def clean_nn_module_stack_and_source_fn(
 
 
 def clean_export_root(graph_module: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] Renames, in place, attribute-fetch targets and called-submodule targets (and
+    # node names of module calls) that contain export-root artifacts; the underlying
+    # parameters or submodules are moved to the new names. A module called multiple times is
+    # renamed once and all its call nodes updated. Raises AssertionError if an attribute to
+    # move is missing or a target is not a string.
     """Remove export_root artifacts from FX graph in-place"""
 
     # Unlike getattr node, call_module can be invoked multiple times
@@ -233,12 +260,19 @@ def clean_export_root(graph_module: torch.fx.GraphModule) -> None:
 
 
 class ModuleToTrace(torch.nn.Module):
+    # [CLASS DOC] Wrapper module traced instead of the user callable so inputs arrive flat.
+    # State: _export_root (the wrapped user callable/module) and in_spec (pytree spec used to
+    # rebuild the original args and kwargs from flat arguments).
     def __init__(self, foo: Any, in_spec: Any) -> None:
+        # [FUNCTION DOC] Stores the wrapped callable under the export-root attribute and the
+        # input pytree spec.
         super().__init__()
         self._export_root = foo
         self.in_spec = in_spec
 
     def forward(self, *flat_args: Any) -> ExportTracerOutput:
+        # [FUNCTION DOC] Unflattens flat_args into the original args/kwargs, calls the wrapped
+        # callable, flattens its result, and returns a named pair of (flat outputs, output spec).
         args, kwargs = pytree.tree_unflatten(flat_args, self.in_spec)
         res = self._export_root(*args, **kwargs)
         out_flat, out_spec = pytree.tree_flatten(res)
@@ -252,6 +286,13 @@ ExportTracerOutput = namedtuple("ExportTracerOutput", ["flat_args", "out_spec"])
 class DynamoGraphTransformer(torch.fx.Transformer):
     """Graph transformer for dynamo export that flattens inputs/outputs without complex matching."""
 
+    # [CLASS DOC] FX transformer that rebuilds a Dynamo-captured graph so that its placeholders
+    # are one per flattened user input (named arg_N) and its outputs follow the output map.
+    # State: flat_inputs, per-input dynamic dims, graph_input_order (user input index to graph
+    # placeholder index), graph_output_map (output index to kind and value), optional fake mode,
+    # graph_inputs (graph placeholder index to source), the original placeholders and output
+    # node, new_input_nodes (user index to new placeholder) and old_to_new_mapping. Inputs not
+    # matched are turned into get_attr nodes when they are captured objects.
     def __init__(
         self,
         module: torch.fx.GraphModule,
@@ -262,6 +303,12 @@ class DynamoGraphTransformer(torch.fx.Transformer):
         fake_mode: FakeTensorMode | None = None,
         graph_inputs: dict[int, Source | None] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the transformer over module and stores the inputs, dynamic
+        # dims, order and output maps, fake mode and graph inputs (empty if None). Collects the
+        # original placeholders and output node, creates the new flattened placeholders, and
+        # builds the old-to-new placeholder mapping. Raises AssertionError if the dynamic dims
+        # list length differs from the number of flat inputs, or StopIteration if the module
+        # has no output node.
         super().__init__(module)
 
         if len(flat_args_dynamic_dims) != len(flat_inputs):
@@ -290,6 +337,10 @@ class DynamoGraphTransformer(torch.fx.Transformer):
         self._create_placeholder_mapping()
 
     def _create_flattened_inputs(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates one new placeholder per flat input, recording it in
+        # new_input_nodes. Copies non-value metadata from the matching original placeholder, and
+        # sets the value metadata: a fake tensor with dynamic/static dims for tensors (when a
+        # fake mode exists), the wrapped value for integer wrapper objects, else the raw input.
         """Create new placeholder nodes for flattened inputs with proper fake tensors."""
         for i in range(len(self.flat_inputs)):
             placeholder = super().placeholder(f"arg_{i}", (), {})
@@ -332,6 +383,8 @@ class DynamoGraphTransformer(torch.fx.Transformer):
             self.new_input_nodes[i] = placeholder
 
     def _create_placeholder_mapping(self) -> None:
+        # [FUNCTION DOC] HELPER: Fills old_to_new_mapping from each original graph placeholder to
+        # the new placeholder of the user input mapped to it, for in-range placeholder indices.
         """Create mapping from old placeholders to new ones."""
         # graph_input_order maps: user_input_index -> graph_placeholder_index
         # We need to create: old_graph_placeholder -> new_user_input_placeholder
@@ -344,6 +397,13 @@ class DynamoGraphTransformer(torch.fx.Transformer):
     def placeholder(
         self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Transformer hook for placeholder nodes. If the current node was mapped,
+        # returns its new placeholder after copying extra metadata (tensor dict, example value,
+        # unbacked bindings, and the value metadata only if missing). Otherwise, if the
+        # placeholder's source is a captured (non item-access) object with an example value,
+        # registers it as a buffer (tensors) or plain attribute on the module and returns an
+        # attribute-fetch proxy carrying copied metadata. Else falls back to the default
+        # placeholder behavior.
         """Replace old placeholders with new flattened ones."""
         # Return the corresponding new placeholder
         if self.current_node in self.old_to_new_mapping:
@@ -384,6 +444,10 @@ class DynamoGraphTransformer(torch.fx.Transformer):
     def output(
         self, target: Target, args: Sequence[Any], kwargs: dict[str, Any]
     ) -> Any:
+        # [FUNCTION DOC] Transformer hook for the output node. Builds the new output tuple by
+        # visiting graph_output_map in sorted key order: graph outputs are taken from the
+        # original outputs by index, input passthroughs from the new input placeholders, and
+        # constants are inserted as is. Returns the output proxy for that tuple.
         """Transform output according to graph_output_map."""
         original_outputs = args[0]
 
@@ -403,6 +467,10 @@ class DynamoGraphTransformer(torch.fx.Transformer):
         return super().output(target, (tuple(new_outputs),), {})
 
     def run_node(self, n: Node) -> Any:
+        # [FUNCTION DOC] Records n as the current node, runs the default transformation, and if
+        # the result is a different node, copies value, example value and unbacked binding
+        # metadata from n and renames the result to n's name (except for output nodes).
+        # Returns the result.
         """Run node transformation and preserve metadata."""
         self.current_node = n
         result = super().run_node(n)
@@ -420,6 +488,9 @@ class DynamoGraphTransformer(torch.fx.Transformer):
         return result
 
     def transform(self) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Runs the base transformation and copies the flat-name-to-original-name
+        # and compile id entries from the source module's metadata (if present) to the result
+        # module. Returns the new graph module.
         """Perform the graph transformation and copy module metadata."""
         result_gm = super().transform()
 
@@ -452,6 +523,13 @@ def _suggest_or_raise_constraint_violation(
     kwargs: Any,
     dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: After capture, builds guards to detect constraint violations, then
+    # (if a shape environment exists and the traced forward is not an operator) solves dimension
+    # constraints and produces a suggestion message. If there is a violation, appends the
+    # message to it; if forced specializations exist, creates a violation error; otherwise logs
+    # an info summary. Also creates an error if any shape variable range is for a static
+    # integer. Raises the (post-processed) ConstraintViolationError when one exists; returns
+    # nothing otherwise. Mutates shape environment state via solving.
     constraint_violation_error = None
     try:
         # Check if we have any constraint violations
@@ -512,6 +590,8 @@ def _suggest_or_raise_constraint_violation(
 
 
 def _normalize_shuffle_graph(shuffle_gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Eliminates dead code from the graph, recompiles it, and re-registers
+    # every buffer by deleting and re-setting its attribute. Mutates in place.
     shuffle_gm.graph.eliminate_dead_code()
     shuffle_gm.recompile()
     for name, buffer in list(shuffle_gm.named_buffers()):
@@ -520,18 +600,24 @@ def _normalize_shuffle_graph(shuffle_gm: torch.fx.GraphModule) -> None:
 
 
 def normalize_graph_module(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] For each placeholder node, sets its value metadata to its example value
+    # metadata (KeyError if absent). Mutates in place.
     for node in gm.graph.nodes:
         if node.op == "placeholder":
             node.meta["val"] = node.meta["example_value"]
 
 
 class InputProcessor:
+    # [CLASS DOC] Callable that turns a flat inputs tuple back into (args, kwargs) for the
+    # original call. State: root (module or callable prepended as first argument, or None),
+    # num_args (count of positional args) and kwarg_names (names for trailing values).
     def __init__(
         self,
         root: object,
         num_args: int,
         kwarg_names: list[str],
     ) -> None:
+        # [FUNCTION DOC] Stores root, number of positional args and keyword names.
         self.root = root
         self.num_args = num_args
         self.kwarg_names = kwarg_names
@@ -539,6 +625,11 @@ class InputProcessor:
     def __call__(
         self, inputs: tuple[object, ...]
     ) -> tuple[tuple[object, ...], dict[str, object]]:
+        # [FUNCTION DOC] Splits inputs into positional args (first num_args) and keyword args
+        # (remaining values zipped with kwarg_names). If a root exists it is prepended to the
+        # positional args; when root is a graph module, first checks that its codegen is the
+        # bytecode codegen whose flatten object refers back to this processor, raising
+        # AssertionError otherwise. Returns (args, kwargs).
         args = inputs
         # pyrefly: ignore [implicit-any]
         kwargs = {}
@@ -569,16 +660,22 @@ class InputProcessor:
 
 
 class Yield(Exception):
+    # [CLASS DOC] HELPER: Sentinel exception raised by the dummy backend to abort the replayed
+    # compiled call once the graph inputs have been captured.
     pass
 
 
 class DynamoBytecodeFlatten:
+    # [CLASS DOC] Callable that, given the user's inputs, replays the captured Dynamo bytecode up
+    # to the graph call and returns the flat list of graph inputs. State: input_processor, the
+    # capture output, globals for the replay, and gm_inputs (last captured graph inputs).
     def __init__(
         self,
         input_processor: InputProcessor,
         out: CaptureOutput,
         f_globals: dict[str, object],
     ) -> None:
+        # [FUNCTION DOC] Stores the processor, capture output and globals; gm_inputs starts None.
         self.input_processor = input_processor
         self.out = out
         self.f_globals = f_globals
@@ -586,7 +683,13 @@ class DynamoBytecodeFlatten:
 
     @dynamo_disable(reason="do not trace internal dynamo graph capture")  # type: ignore[misc]
     def __call__(self, *inputs: object) -> object:
+        # [FUNCTION DOC] Rebuilds args/kwargs from inputs and runs the captured forward with a
+        # dummy backend that records the graph inputs and aborts via the sentinel exception.
+        # Returns the recorded graph inputs. Raises RuntimeError if the call finishes without
+        # reaching the backend, AssertionError if nothing was recorded. Not traced by Dynamo.
         def backend_dummy(*example_inputs: object) -> None:
+            # [FUNCTION DOC] HELPER: Records the example inputs on the flatten object and raises
+            # the sentinel to stop execution.
             self.gm_inputs = example_inputs
             raise Yield
 
@@ -603,12 +706,16 @@ class DynamoBytecodeFlatten:
 
 
 class DynamoBytecodeUnflatten:
+    # [CLASS DOC] Callable that, given the flat graph outputs and the original user inputs,
+    # replays the captured Dynamo bytecode with a backend that returns those outputs, producing
+    # the user-visible result structure. State: input_processor, capture output, globals.
     def __init__(
         self,
         input_processor: InputProcessor,
         out: CaptureOutput,
         f_globals: dict[str, object],
     ) -> None:
+        # [FUNCTION DOC] Stores the processor, capture output and globals.
         self.input_processor = input_processor
         self.out = out
         self.f_globals = f_globals
@@ -617,7 +724,11 @@ class DynamoBytecodeUnflatten:
     def __call__(
         self, flat_outs: Sequence[object], inputs: tuple[object, ...]
     ) -> object:
+        # [FUNCTION DOC] Rebuilds args/kwargs from inputs, then runs the captured forward with
+        # torch dispatch disabled and a dummy backend that returns flat_outs; returns the
+        # resulting user-level output. Not traced by Dynamo.
         def backend_dummy(*example_inputs: object) -> Sequence[object]:
+            # [FUNCTION DOC] HELPER: Ignores its inputs and returns the supplied flat outputs.
             return flat_outs
 
         args, kwargs = self.input_processor(inputs)
@@ -631,6 +742,15 @@ class DynamoBytecodeUnflatten:
 def create_fx_graph_from_captured_output(
     out: CaptureOutput, mod: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Turns a capture output into the final export graph module whose forward
+    # replays bytecode. Validates the flat user inputs, takes the captured graph module, and if
+    # the traced root is an nn.Module copies its parameters, buffers, submodules, non-persistent
+    # buffer set, extra instance attributes and hooks onto the graph module (with a custom
+    # wrapped call that disables the hooks while preserving their state). Installs the bytecode
+    # code generator plus flatten/unflatten objects as attributes, normalizes placeholder
+    # values, removes the parameter-name-to-source attribute, recompiles, and stores module
+    # call specs, fake mode (allowing non-fake inputs) and a tracing context in metadata.
+    # Raises AssertionError if backend input is missing or attribute conflicts exist.
     if out.backend_input is None:
         raise AssertionError("out.backend_input must not be None")
     backend_input = out.backend_input
@@ -683,6 +803,12 @@ def create_fx_graph_from_captured_output(
                 raise AssertionError("graph_module._wrapped_call.cls_call must be None")
 
             def dynamo_wrapped_call(self, *args: object, **kwargs: object) -> object:
+                # [FUNCTION DOC] HELPER: Replacement class-level call. Temporarily installs an
+                # instance forward that restores the forward hooks only for the inner forward,
+                # clears the hook dicts so the outer call machinery does not run them (they were
+                # already traced), calls the parent call, and in a finally block removes the
+                # instance forward and restores the hooks. Raises AssertionError if an instance
+                # forward already exists.
                 if "forward" in self.__dict__:
                     raise AssertionError("'forward' should not be in self.__dict__")
 
@@ -691,6 +817,8 @@ def create_fx_graph_from_captured_output(
                 original_forward = type(self).forward
 
                 def patched_forward(self, *args: object, **kwargs: object) -> object:
+                    # [FUNCTION DOC] HELPER: Restores the saved hooks on self, then calls the
+                    # original class forward and returns its result.
                     self._forward_hooks = fwd_hooks
                     self._forward_pre_hooks = fwd_pre_hooks
                     return original_forward(self, *args, **kwargs)
@@ -750,12 +878,18 @@ def create_fx_graph_from_captured_output(
 
 
 class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
+    # [CLASS DOC] HELPER: FX code generator for graphs whose generated forward takes the user's
+    # original arguments, flattens them by replaying Dynamo bytecode, and unflattens the
+    # outputs the same way. State: orig_arg_names, the flatten and unflatten callables,
+    # wrap_tuple flag (default False) and _inputs (inputs of the in-progress call).
     def __init__(
         self,
         orig_arg_names: list[str],
         dynamo_bytecode_flatten: DynamoBytecodeFlatten,
         dynamo_bytecode_unflatten: DynamoBytecodeUnflatten,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the argument names and the two callables; wrap_tuple is
+        # False and no inputs are pending.
         super().__init__()
         self.orig_arg_names = orig_arg_names
         self.dynamo_bytecode_flatten = dynamo_bytecode_flatten
@@ -764,6 +898,10 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
         self._inputs: tuple[Any, ...] | None = None
 
     def process_inputs(self, *inputs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Remembers the inputs for the later output step, flattens them via
+        # the bytecode flatten callable, and returns the flat graph inputs. If a fake mode is
+        # active and any resulting tensor is not fake, enables non-fake inputs on that mode
+        # (mutation) so recovered module-attribute tensors can be used.
         self._inputs = inputs
         results = self.dynamo_bytecode_flatten(*inputs)
         fake_mode = detect_fake_mode()
@@ -781,6 +919,10 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
         return results
 
     def process_outputs(self, outputs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Unflattens the graph outputs using the inputs saved by the
+        # preceding input step, wraps the result in a one-element tuple if wrap_tuple is set,
+        # clears the saved inputs and returns the result. Raises AssertionError if called before
+        # inputs were processed.
         if self._inputs is None:
             raise AssertionError("process_outputs called before process_inputs")
         results = self.dynamo_bytecode_unflatten(outputs, self._inputs)
@@ -796,6 +938,12 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
         *,
         expanded_def: bool = False,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Generates the source text of the forward definition using the
+        # original argument names. If the first name is self it is treated as the receiver and
+        # the free variable list gets self inserted first (mutating free_vars); any other
+        # argument named self is renamed to a unique name to avoid duplicate parameters. Calls
+        # the base generator with the adjusted names and, if free variables exist, appends the
+        # variable-binding text. Returns the definition text.
         fn_args = self.orig_arg_names
         has_orig_self = (fn_args[0] == "self") if len(fn_args) > 0 else False
         if has_orig_self:
@@ -828,7 +976,10 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
     def gen_var_bindings(
         self, fn_args: list[str], free_vars: list[str], expanded_def: bool
     ) -> str:
-        without_annotation = [x.split(":")[0].split("#")[0] for x in free_vars]
+        # [FUNCTION DOC] HELPER: Returns source text that packs the function arguments into a
+        # tuple and unpacks the result of calling the module's flatten attribute on it into the
+        # free variables (annotations and comments stripped from their names).
+        without_annotation =[x.split(":")[0].split("#")[0] for x in free_vars]
         if len(fn_args) == 0:
             fn_signature = ""
         elif len(fn_args) == 1:
@@ -846,6 +997,10 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
         descs: object | None = None,
         repr_fn: Any | None = None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the source text of the return statement: it calls the
+        # module's unflatten attribute with the tuple of output values (rendered with repr_fn,
+        # default repr) and the saved argument tuple, optionally wrapped in a one-element tuple
+        # when wrap_tuple is set. The descs argument is unused.
         if repr_fn is None:
             repr_fn = repr
         # pyrefly: ignore [not-iterable]
@@ -859,9 +1014,19 @@ def dynamo_graph_capture_for_export(
     fn: Callable[..., Any],
     constraints: list[Constraint] | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Returns a callable that, when invoked with example args and kwargs, captures
+    # fn with full-graph Dynamo capture and returns an export-style graph module (see
+    # create_fx_graph_from_captured_output). If fn is an operator overload, it is first wrapped
+    # in a generated Python function with the operator's argument names and defaults
+    # (executed from generated source). The returned callable runs under the compiling-state
+    # context with side-effect replay disabled (warn policy), metrics and timing contexts, and
+    # raises AssertionError if the config to install free tensors is enabled. The constraints
+    # list is passed through to capture.
     if isinstance(fn, torch._ops.OpOverload):
 
         def default_annotation(arg: torch.Argument) -> str:
+            # [FUNCTION DOC] HELPER: Returns the default-value suffix for an argument in
+            # generated source text (equals sign plus repr of the default), or empty text.
             if arg.has_default_value():
                 return f"={arg.default_value!r}"
             return ""
@@ -882,6 +1047,8 @@ def op_overload_wrapper({", ".join(arg_list)}):
         fn = out["op_overload_wrapper"]  # type: ignore[assignment]
 
     def inner(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Captures fn on the given example inputs and returns the export
+        # graph module. Raises AssertionError if install-free-tensors config is on.
         if torch._dynamo.config.install_free_tensors:
             raise AssertionError("install_free_tensors must be False")
         with (
@@ -910,6 +1077,13 @@ def _dynamo_graph_capture_for_export(
     constraints: list[Constraint] | None = None,
     dynamic_shapes: _DynamicShapesInput = None,
 ) -> Callable[..., torch.fx.GraphModule]:
+    # [FUNCTION DOC] Returns a callable that captures mod (module or function) on example args
+    # and kwargs into an export-ready graph module with one placeholder per flattened input,
+    # pytree-based input/output codegen and cleaned export-root names. Optional constraints
+    # and dynamic_shapes control dynamic dimensions (spec objects use the newer spec API).
+    # See the docstring for the overall steps. The returned callable resets Dynamo state,
+    # patches Dynamo config (specialization, scalar/dynamic-output capture, free tensors) and
+    # may raise a constraint violation error.
     """
     Improved dynamo graph capture using transformer approach with proper fake tensor handling.
 
@@ -934,6 +1108,14 @@ def _dynamo_graph_capture_for_export(
     _constraints = constraints
 
     def inner(*args: Any, **kwargs: Any) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Performs the capture for the given example inputs: flattens them
+        # (honoring a user shapes spec), wraps mod in the flat-input module, resets Dynamo,
+        # runs full-graph capture under the patched config, checks constraint violations
+        # (unless a shapes spec is used), derives dynamic dims per input and the graph input
+        # order from export metadata, rebuilds the graph with the transformer, installs pytree
+        # codegen, recompiles, cleans export-root artifacts and stores module call specs and
+        # fake mode in metadata. Returns the graph module. Side effects: resets global Dynamo
+        # state and temporarily patches config.
         # This sets the is_exporting flag when building guards.
         with _compiling_state_context():
             # Only a ShapesSpec/ParamsSpec object opts into the new spec API.

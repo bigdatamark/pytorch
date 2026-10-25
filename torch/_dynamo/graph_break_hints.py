@@ -1,3 +1,7 @@
+# [MODULE DOC] Constants holding standard hint messages (each a list of one string) that are
+# passed as the hints argument of the graph-break reporting call. Categories: USER_ERROR,
+# DYNAMO_BUG, DIFFICULT, FUNDAMENTAL, SUPPORTABLE, CAUSED_BY_EARLIER_GRAPH_BREAK,
+# INFERENCE_MODE, SPARSE_TENSOR. No import-time side effects; plain module-level data.
 USER_ERROR = [
     "Your code may result in an error when running in eager. "
     "Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. "
