@@ -1,3 +1,9 @@
+# [MODULE DOC] Dynamo VariableTracker for torch.optim.Optimizer instances (OptimizerVariable).
+# Instead of tracing the slow optimizer state initialization (_init_group), it runs it eagerly
+# on the real optimizer, then builds sources/guards for params, grads and state tensors, marks
+# state as static addresses for CUDA graphs, and registers a finalizer that drops static
+# tensor references from the graph module when the optimizer dies. Also defines two private
+# control-flow exceptions and a perf-hint logger. No import-time side effects beyond the logger.
 """
 This module implements variable tracking for PyTorch optimizers during Dynamo tracing.
 
@@ -55,10 +61,14 @@ if TYPE_CHECKING:
 
 
 class ArgMappingException(Exception):
+    # [CLASS DOC] HELPER: Raised when _init_group arguments cannot be mapped to real python
+    # values; caught in OptimizerVariable.call_method to fall back to normal tracing.
     pass
 
 
 class GuardInstallException(Exception):
+    # [CLASS DOC] HELPER: Signals that guards could not be installed for the optimizer;
+    # caught in OptimizerVariable.call_method to fall back to normal tracing.
     pass
 
 
@@ -66,6 +76,11 @@ perf_hint_log = getArtifactLogger(__name__, "perf_hints")
 
 
 def _is_static_for_cudagraphs(x: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: True if tensor x has a stable address for CUDA graphs. Non-CUDA
+    # tensors always count as static. For CUDA tensors: if a cudagraph-trees manager exists for
+    # the device, static means marked static address or recorded by the manager's current node
+    # (AssertionError if the manager has no current node); without a manager, only the marked
+    # static address counts.
     from torch._inductor.cudagraph_trees import get_manager
 
     if x.is_cuda:
@@ -86,6 +101,12 @@ def _is_static_for_cudagraphs(x: torch.Tensor) -> bool:
 
 
 class OptimizerVariable(UserDefinedObjectVariable):
+    # [CLASS DOC] Tracks a torch.optim.Optimizer. State: value (the real optimizer),
+    # grad_to_source and tensor_to_source (maps from real grad/state tensors to their Sources,
+    # filled by map_sources_and_install_guards), static_tensor_names (graph attribute names of
+    # tensors to drop on finalization). Intercepts the _init_group method to run it eagerly,
+    # and exposes _init_group/param_groups through the getset table. Key methods: call_method,
+    # map_sources_and_install_guards, wrap_tensor, update_list_args, create_finalizer.
     _nonvar_fields = {
         "grad_to_source",
         "tensor_to_source",
@@ -101,6 +122,8 @@ class OptimizerVariable(UserDefinedObjectVariable):
         tensor_to_source: dict[torch.Tensor, Source] | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Store the real optimizer and the optional source/name maps (each
+        # defaulting to a fresh empty mapping or set) on top of the base object variable.
         super().__init__(value, **kwargs)
         # pyrefly: ignore [bad-override]
         self.value: torch.optim.Optimizer = value
@@ -115,6 +138,13 @@ class OptimizerVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Method-call hook. For _init_group (when the optimizer defines it):
+        # graph-break on pending parameter mutations, move CPU step tensors to the param device,
+        # map args to real python values, run _init_group on the real optimizer, register sources
+        # and guards, append resulting state tensors into the traced list args, stash a global
+        # weakref to the optimizer and create a finalizer. Returns a constant of its result.
+        # If argument mapping or guard installation fails, or for any other method, falls back
+        # to normal tracing. Side effects: mutates the real optimizer and trace-time side effects.
         """This is an optimization to avoid tracing the very slow initialization of the optimizer"""
         if name == "_init_group":
             if not hasattr(self.value, "_init_group"):
@@ -147,6 +177,9 @@ class OptimizerVariable(UserDefinedObjectVariable):
     # _init_group resolves to a GetAttrVariable so the call is intercepted in
     # call_method (in the typical case, a UserMethodVariable would inline it).
     def _get_init_group(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] HELPER: getset getter for _init_group. Requires a source (AssertionError
+        # otherwise) and returns a GetAttrVariable on the optimizer so the later call is
+        # handled by call_method instead of being inlined.
         if not self.source:
             raise AssertionError("OptimizerVariable requires a source for _init_group")
         name = "_init_group"
@@ -158,6 +191,9 @@ class OptimizerVariable(UserDefinedObjectVariable):
     # param_groups only runs setup side effects (static addresses, capturable
     # guards) and declines, falling through to the generic protocol.
     def _get_param_groups(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] HELPER: getset getter for param_groups that only performs side effects:
+        # marks every parameter as a guarded static address and sets capturable flags (see
+        # _set_capturable). Always returns None so generic attribute lookup proceeds.
         from ..decorators import mark_static_address
 
         for group in self.value.param_groups:
@@ -173,6 +209,9 @@ class OptimizerVariable(UserDefinedObjectVariable):
     }
 
     def graph_break_if_pending_mutation(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Walk all optimizer params; if any param's tracked variable has a pending
+        # side-effect mutation, trigger a graph break so the real parameter is up to date before
+        # running _init_group. Returns nothing otherwise.
         # If there are pending mutations on a parameter (due to using closure)
         # then we need to graph break to allow the python version of the parameter
         # to update, so that running _init_group will initialize the states with
@@ -192,11 +231,17 @@ class OptimizerVariable(UserDefinedObjectVariable):
                     )
 
     def _set_capturable(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] HELPER: For each param group whose params are all CUDA/XPU with no
+        # optimizer state yet and which has a capturable key, set capturable to True on the
+        # real group. Then realize the traced param_groups and set the capturable entry to
+        # constant True in each traced group. Mutates the real optimizer.
         from . import LazyVariableTracker
 
         # We only set capturable if params are on cuda
         # and the state is not initialized
         def safe_to_set_capturable(group: dict[str, Any]) -> bool:
+            # [FUNCTION DOC] HELPER: True if the group has a capturable key, all its params
+            # are on CUDA or XPU, and none of them has optimizer state yet.
             all_uninitialized = True
             all_gpu = True
 
@@ -224,9 +269,15 @@ class OptimizerVariable(UserDefinedObjectVariable):
     def get_python_args(
         self, *args: Any, **kwargs: Any
     ) -> tuple[list[Any], dict[str, Any]]:
+        # [FUNCTION DOC] Convert traced args/kwargs into real python values for calling
+        # _init_group. Returns (list of args, dict of kwargs). Supported: python constants,
+        # empty ListVariable (-> new empty list), and a param_group dict VT sourced from indexing
+        # the optimizer's param_groups (-> the real group). Raises ArgMappingException otherwise.
         """Get python values equivalent to the variable tracker args"""
 
         def map_arg(arg: Any) -> Any:
+            # [FUNCTION DOC] HELPER: map one traced argument to its real value (see
+            # get_python_args); raises ArgMappingException when unsupported.
             if isinstance(arg, VariableTracker) and arg.is_python_constant():
                 return arg.as_python_constant()
             elif isinstance(arg, ListVariable) and not arg.items:
@@ -253,11 +304,24 @@ class OptimizerVariable(UserDefinedObjectVariable):
     # corresponding to the parameter
     # in most cases this is a no-op because the state is empty
     def move_step_if_cpu(self) -> None:
+        # [FUNCTION DOC] For every param with optimizer state, if the "step" tensor is on CPU,
+        # replace it with a copy on the param's device. Mutates the real optimizer state; usually
+        # a no-op because state is empty.
         for p, state in self.value.state.items():
             if "step" in state and state["step"].is_cpu:
                 state["step"] = state["step"].to(p.device)
 
     def map_sources_and_install_guards(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Reset and rebuild grad_to_source and tensor_to_source. Marks all state
+        # tensors as guarded static addresses; realizes traced param_groups and state (which
+        # installs guards), records key-order guards on the state dict, maps each param to its
+        # source and each existing grad to a GradSource (installing a constant-match guard for
+        # params with no grad), and maps remaining state tensors to dict-item sources. May log a
+        # perf hint when grads are not static for CUDA graphs. Raises AssertionError if a param
+        # has no source.
+        # KNOWN ISSUE: the perf hint passes a one-element tuple (stray trailing comma) as the
+        # log format message. Also the loop that realizes per-param state skips index 0 because
+        # it tests key_index for truthiness.
         from ..decorators import mark_static_address
         from .lazy import LazyVariableTracker
 
@@ -265,6 +329,7 @@ class OptimizerVariable(UserDefinedObjectVariable):
         self.tensor_to_source = {}
 
         def mark_static(x: Any) -> None:
+            # [FUNCTION DOC] HELPER: mark one tensor as a guarded static address.
             mark_static_address(x, guard=True)
 
         tree_map_only(torch.Tensor, mark_static, self.value.state)
@@ -366,6 +431,10 @@ class OptimizerVariable(UserDefinedObjectVariable):
     def wrap_tensor(
         self, tx: "InstructionTranslatorBase", tensor_value: torch.Tensor
     ) -> TensorVariable:
+        # [FUNCTION DOC] Build a TensorVariable for a real state or grad tensor. Known state
+        # tensors use their recorded source (marked static, name recorded); known grads use their
+        # grad source; unknown tensors are marked static and given a global weakref source.
+        # Side effects: updates static_tensor_names, may store a global weakref in tx.
         """Wrap state tensor in a TensorVariable"""
         from ..decorators import mark_static_address
 
@@ -399,6 +468,10 @@ class OptimizerVariable(UserDefinedObjectVariable):
         py_args: Iterable[Any],
         py_kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] After the real _init_group ran, mirror list mutations into the traced
+        # list arguments: for each ListVariable arg, record a mutation and append a VT for each
+        # element of the matching real list (tensors via wrap_tensor, others built with an item
+        # source). Raises AssertionError if the real counterpart is not a list. kwargs are unused.
         """Update the args and kwargs to the traced optimizer call"""
         for arg, py_arg in zip(args, py_args):
             if isinstance(arg, ListVariable):
@@ -415,12 +488,20 @@ class OptimizerVariable(UserDefinedObjectVariable):
                         arg.items.append(VariableTracker.build(tx, val, source))
 
     def create_finalizer(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Register a graph finalizer so that, once the compiled graph module
+        # exists, a weakref finalizer on the optimizer removes its static tensors from the graph
+        # module's buffers/parameters and clears the tracing context's flat param lists when
+        # the optimizer is garbage collected.
         names_to_delete = self.static_tensor_names
         value = self.value
         tc = tx.output.tracing_context
 
         def init_finalizer(gm: torch.fx.GraphModule) -> None:
+            # [FUNCTION DOC] HELPER: given the graph module, attach a weakref finalizer on the
+            # optimizer that runs clear_static_tensor_refs.
             def clear_static_tensor_refs() -> None:
+                # [FUNCTION DOC] HELPER: pop each recorded name from the module's buffers and
+                # parameters and clear the flat param lists in the tracing context.
                 for name in names_to_delete:
                     gm._buffers.pop(name, None)
                     gm._parameters.pop(name, None)

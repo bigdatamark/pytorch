@@ -1,3 +1,11 @@
+# [MODULE DOC] Dynamo VariableTrackers for TorchScript / torchbind / opaque custom-class objects.
+# CustomClassVariable represents the class itself (constructing it yields an object VT, rejecting
+# reference-type opaque classes inside the compiled region). CustomClassObjectVariable represents
+# an instance: it holds an FX proxy plus a real or fake value, dispatches registered members
+# either by calling the real object (USE_REAL), by emitting graph call_method nodes (INLINED),
+# or via the call_torchbind higher-order op, and graph-breaks on unregistered members. A
+# decorator turns graph breaks in these paths into hard UnsafeScriptObjectError errors.
+# No import-time side effects.
 """
 This module implements variable tracking for TorchScript objects during Dynamo tracing.
 
@@ -68,9 +76,16 @@ _T = TypeVar("_T")
 def _raise_hard_error_if_graph_break(
     reason: str,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] HELPER: Decorator factory. The returned decorator wraps a function so that
+    # an Unsupported (graph break) raised inside becomes an UnsafeScriptObjectError carrying the
+    # original message. KNOWN ISSUE: the reason argument is accepted but never used.
     def deco(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: wrap fn (preserving its metadata) with the conversion described
+        # on the enclosing factory.
         @functools.wraps(fn)
         def graph_break_as_hard_error(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            # [FUNCTION DOC] HELPER: call fn; convert Unsupported into UnsafeScriptObjectError
+            # (chained from the original); any other exception propagates.
             try:
                 return fn(*args, **kwargs)
             except Unsupported as e:
@@ -82,6 +97,11 @@ def _raise_hard_error_if_graph_break(
 
 
 class CustomClassVariable(UserDefinedVariable):
+    # [CLASS DOC] VT for an opaque/custom class object (the class, not an instance). State:
+    # value is the real class. Not treated as a python constant so attribute access goes
+    # through tp_getattro_impl validation. Calling it constructs the real object (outside
+    # tracing) and wraps it in a CustomClassObjectVariable. Key methods: call_function,
+    # tp_getattro_impl, nb_or_impl.
     """
     A variable that represents an opaque object class (not instance).
     Since UserDefinedClassVariable has some special handling for side effects,
@@ -90,6 +110,8 @@ class CustomClassVariable(UserDefinedVariable):
     """
 
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Store the wrapped class. Raises AssertionError if value is an Enum class
+        # (those must use UserDefinedClassVariable).
         if isinstance(value, type) and issubclass(value, enum.Enum):
             raise AssertionError(
                 f"Enum class {value} should use UserDefinedClassVariable, "
@@ -99,15 +121,20 @@ class CustomClassVariable(UserDefinedVariable):
         self.value = value
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Return the wrapped real class.
         return self.value
 
     def is_python_constant(self) -> bool:
+        # [FUNCTION DOC] Always False, to block constant folding of attribute accesses on opaque
+        # classes so tp_getattro_impl validation runs.
         # prevents constant folding of attribute accesses on
         # opaque classes. this ensures tp_getattro_impl is called,
         # allowing for proper validation and error handling
         return False
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the wrapped class; returns (hash, False) since classes are
+        # always hashable and the hash is real.
         # CustomClassVariable wraps the CLASS, not an instance.
         # Classes are always hashable in CPython (type.__hash__ = object.__hash__).
         return hash(self.value), False
@@ -118,6 +145,9 @@ class CustomClassVariable(UserDefinedVariable):
         other: "VariableTracker",
         reverse: bool = False,
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Class | other (type union). If other is not a python constant, returns
+        # NotImplemented; otherwise calls the metaclass or-operator on the real values and wraps
+        # the result (or NotImplemented) in a VT. The reverse flag is ignored.
         try:
             other_val = other.as_python_constant()
         except NotImplementedError:
@@ -129,14 +159,20 @@ class CustomClassVariable(UserDefinedVariable):
         return VariableTracker.build(tx, result)
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] The class itself serves as its own graph argument.
         return self.value
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Debug string: VT class name with the wrapped class.
         return f"{self.__class__.__name__}({self.value})"
 
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Class attribute access. Looks the name up statically (graph break if
+        # missing). staticmethod and property are resolved; other descriptors are resolved
+        # dynamically only if implemented in C, otherwise graph break. Literal results become
+        # constants; others are built with an attribute source when this VT has a source.
         obj = None
         try:
             obj = inspect.getattr_static(self.value, name)
@@ -182,6 +218,11 @@ class CustomClassVariable(UserDefinedVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Construct an opaque object at trace time. Reference-type (symbolic)
+        # opaque classes graph-break (and their __init__ code is marked skipped). Otherwise the
+        # args are converted to python constants (guard install skipped for hoisted types),
+        # the real object is built, wrapped as a fake object unless it is a constant type, and
+        # returned as a CustomClassObjectVariable carrying the constructor args and their sources.
         # disallow creating reference-type opaque objects in the middle of the
         # program
         if is_opaque_symbolic_type(self.value):
@@ -240,10 +281,18 @@ class CustomClassVariable(UserDefinedVariable):
 
 
 class CustomClassObjectVariable(UserDefinedObjectVariable):
+    # [CLASS DOC] VT for an instance of a TorchScript/torchbind/opaque custom class. State: proxy
+    # (FX proxy, or the real object for lazily hoisted constant types), value (real or fake
+    # script object), source, ctor_args_kwargs (constant constructor args when sourceless) and
+    # ctor_arg_sources. Member access is controlled by each member's registered MemberType;
+    # unregistered members graph-break, and graph breaks inside the traced paths become hard
+    # errors. Key methods: create, as_proxy, tp_getattro_impl, call_method.
     _fake_script_object_cache: dict[int, "CustomClassObjectVariable"] = {}
 
     @classmethod
     def is_matching_cls(cls, user_cls: type) -> bool:
+        # [FUNCTION DOC] True if user_cls is a ScriptObject subclass, a registered custom class,
+        # or a FakeScriptObject subclass.
         return (
             issubclass(user_cls, torch.ScriptObject)
             or is_custom_class(user_cls)
@@ -260,6 +309,9 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         tx: "InstructionTranslatorBase | None" = None,
         **options: Any,
     ) -> "CustomClassObjectVariable":
+        # [FUNCTION DOC] Factory. Raises AssertionError for Enum values. Builds the VT; if proxy is
+        # a real FX Proxy that is not a graph input placeholder, requires tx (AssertionError if
+        # missing) and records the VT as proxyable in the current tracer. Returns the VT.
         if isinstance(value, enum.Enum):
             raise AssertionError(
                 f"Enum {type(value)} should use UserDefinedObjectVariable, not CustomClassObjectVariable"
@@ -285,6 +337,8 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         ctor_arg_sources: tuple[Source | None, ...] | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Store proxy, source and constructor info; if proxy is an FX Proxy, record
+        # the value as the node's example_value metadata (mutates the node).
         super().__init__(value, **kwargs)
         self.proxy = proxy
         if isinstance(self.proxy, torch.fx.Proxy):
@@ -298,6 +352,11 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         self.ctor_arg_sources = ctor_arg_sources
 
     def as_proxy(self) -> Proxy:
+        # [FUNCTION DOC] Return the FX proxy. If proxy is still a raw constant-type object, lazily
+        # lift it to a synthetic graph input when its type is hoisted (using the current
+        # translator; RuntimeError if constructed with kwargs), caching the new proxy. Raises
+        # AssertionError if the raw object is not an opaque constant type. Mutates self.proxy
+        # and the graph inputs.
         if not isinstance(self.proxy, torch.fx.Proxy):
             # If we have a hoisted value type, then lazily lift it to be a graph
             # input when as_proxy() is called.
@@ -326,6 +385,7 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         return self.proxy
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Debug string: VT class name with the real object (unwrapping a fake).
         value = (
             self.value.real_obj
             if isinstance(self.value, FakeScriptObject)
@@ -341,6 +401,10 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         other: "VariableTracker",
         op: str,
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Rich comparison by value. If self is not a python constant, use identity
+        # based object_richcompare. If other is not constant, return NotImplemented. Otherwise
+        # apply the named comparison dunder of self's real type to the real values; any
+        # exception yields NotImplemented. Returns a constant VT.
         from .constant import ConstantVariable
         from .object_protocol import object_richcompare
 
@@ -369,6 +433,13 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute access on the object (graph breaks become hard errors). For
+        # registered custom classes by MemberType: USE_REAL and INLINED methods become a lambda VT
+        # that routes to call_method (INLINED only when sourceless), other values go through the
+        # generic lookup; opaque constant types use generic lookup; missing __bool__/__len__
+        # raise AttributeError; unregistered members graph-break. For non-custom script objects
+        # the attribute must be a callable method, returned as a call_torchbind higher-order op
+        # VT (requires a source, AssertionError otherwise); missing or non-callable graph-breaks.
         from torch._higher_order_ops.torchbind import call_torchbind
 
         from .higher_order_ops import TorchHigherOrderOperatorVariable
@@ -460,6 +531,7 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         tx: "InstructionTranslatorBase",
         key: "VariableTracker",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] obj[key]: delegates to this class's call_method for the item-get dunder.
         # Call call_method directly on this class to avoid the __getitem__ →
         # mp_subscript_impl loop in VariableTracker.call_method.
         return CustomClassObjectVariable.call_method(self, tx, "__getitem__", [key], {})
@@ -478,6 +550,12 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         args: Iterable[Any],
         kwargs: dict[str, Any],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method call on the object (graph breaks become hard errors). For custom
+        # classes by MemberType: USE_REAL calls the real method on constant args (graph break for
+        # custom __getattr__ or if it returns reference-type opaque objects; the set-attribute
+        # dunder returns the real object), result built as a VT; INLINED or opaque constant
+        # types emit a call_method graph node on the proxy and wrap the output; unregistered
+        # members graph-break. Non-custom objects graph-break ("weird method call").
         from .builder import wrap_fx_proxy
 
         real_obj = self.as_python_constant()
@@ -566,6 +644,8 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         )
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Return the real object: unwrap a fake script object, return opaque
+        # constant types and torch script objects as is, else defer to the base class.
         if isinstance(self.value, FakeScriptObject):
             return self.value.real_obj
         elif is_opaque_constant_type(type(self.value)):
@@ -575,6 +655,8 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
         return super().as_python_constant()
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the real object as (hash, False); raises an observed TypeError
+        # if it is unhashable.
         from ..exc import raise_type_error
 
         real_obj = self.as_python_constant()
@@ -584,4 +666,5 @@ class CustomClassObjectVariable(UserDefinedObjectVariable):
             raise_type_error(tx, f"unhashable type: '{type(real_obj).__name__}'")
 
     def get_real_value(self) -> Any:
+        # [FUNCTION DOC] Same as as_python_constant: the underlying real object.
         return self.as_python_constant()

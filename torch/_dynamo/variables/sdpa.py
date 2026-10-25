@@ -1,3 +1,7 @@
+# [MODULE DOC] Dynamo VariableTracker for the C++ scaled-dot-product-attention params struct
+# (SDPAParams): SDPAParamsVariable is a read-only container holding an FX proxy and the VTs of
+# its seven fields (PARAM_NAMES). Supports attribute access via graph getattr nodes and
+# reconstruction by calling the torch._C params constructor. No import-time side effects.
 from inspect import getattr_static
 from typing import Any, TYPE_CHECKING, TypeGuard
 
@@ -27,6 +31,9 @@ PARAM_NAMES = [
 
 
 class SDPAParamsVariable(VariableTracker):
+    # [CLASS DOC] Read-only VT for an SDPAParams struct. State: proxy (FX proxy of the struct)
+    # and param_vars (list of VTs for query, key, value, attn_mask, dropout, is_causal,
+    # enable_gqa). Attribute reads become graph getattr nodes; python_type is SDPAParams.
     """Represents the c++ params struct for scaled dot product attention.
     This is a read-only container."""
 
@@ -34,6 +41,9 @@ class SDPAParamsVariable(VariableTracker):
     def create(
         tx: "InstructionTranslatorBase", value: Any, source: Source
     ) -> VariableTracker:
+        # [FUNCTION DOC] Factory from a real SDPAParams value: build a VT (with attribute source)
+        # for each field in PARAM_NAMES and call the SDPAParams constructor as an in-graph
+        # function, returning the resulting VT (an SDPAParamsVariable).
         from .torch import TorchInGraphFunctionVariable
 
         params = [
@@ -45,14 +55,20 @@ class SDPAParamsVariable(VariableTracker):
     def __init__(
         self, proxy: Proxy, param_vars: list[VariableTracker], **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] Store the struct's FX proxy and the VTs of its fields, then initialize
+        # the base VT with remaining keyword options.
         self.proxy = proxy
         self.param_vars = param_vars
         super().__init__(**kwargs)
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] The python type represented: SDPAParams.
         return SDPAParams
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emit bytecode that rebuilds the struct by calling the torch._C params
+        # constructor with the field VTs in order. Raises AssertionError if the VT has a source
+        # or param_vars is None.
         if self.source is not None:
             raise AssertionError(
                 "SDPAParamsVariable should not have a source during reconstruct"
@@ -66,11 +82,15 @@ class SDPAParamsVariable(VariableTracker):
         codegen.extend_output(create_call_function(len(self.param_vars), False))
 
     def as_proxy(self) -> Proxy:
+        # [FUNCTION DOC] Return the stored FX proxy.
         return self.proxy
 
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute read: the name must exist statically on the C params class
+        # (else graph break). Emits a getattr proxy on the struct proxy and wraps it, adding an
+        # attribute source when this VT has a source. Returns the wrapped VT.
         import torch._C
 
         from .builder import wrap_fx_proxy
@@ -100,4 +120,6 @@ class SDPAParamsVariable(VariableTracker):
 
     @staticmethod
     def is_sdpa_params(value: Any) -> TypeGuard["SDPAParams"]:
+        # [FUNCTION DOC] True if value is the SDPAParams class itself (identity check, not an
+        # instance check).
         return value is SDPAParams
