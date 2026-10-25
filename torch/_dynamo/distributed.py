@@ -1,3 +1,8 @@
+# [MODULE DOC] Lazily creates and caches the two process groups Dynamo uses for
+# cross-rank coordination: a compile group (compiler collectives) and a guard
+# group (guard collectives). Module globals _COMPILE_PG and _GUARD_PG hold the
+# cached groups. No import-time side effects beyond importing distributed and
+# config.
 """
 Manages process groups for distributed compilation in TorchDynamo.
 
@@ -24,6 +29,12 @@ _GUARD_PG: dist.ProcessGroup | None = None
 
 
 def get_compile_pg() -> dist.ProcessGroup | None:
+    # [FUNCTION DOC] Return the process group for compiler collectives, or None.
+    # Returns None unless config.enable_compiler_collectives is set and
+    # torch.distributed is available and initialized. On first eligible call it
+    # creates a new group tagged for the compiler (a collective call all ranks
+    # must make) and caches it in a module global. Raises AssertionError if the
+    # created group does not include this rank.
     if (
         config.enable_compiler_collectives
         and dist.is_available()
@@ -46,6 +57,11 @@ def get_compile_pg() -> dist.ProcessGroup | None:
 # NB: Unlike get_compile_pg, this is only called when guard collectives were
 # explicitly requested
 def get_guard_pg() -> dist.ProcessGroup | None:
+    # [FUNCTION DOC] Return the process group for guard collectives, or None if
+    # torch.distributed is unavailable or uninitialized. Does not check any
+    # config flag; callers request it explicitly. On first call creates a tagged
+    # group (collective across ranks) and caches it in a module global. Raises
+    # AssertionError if the group does not include this rank.
     if dist.is_available() and dist.is_initialized():
         global _GUARD_PG
         if _GUARD_PG is None:

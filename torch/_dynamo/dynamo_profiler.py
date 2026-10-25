@@ -1,3 +1,8 @@
+# [MODULE DOC] Profiler data model for Dynamo tracing time. Defines records for
+# per-inlined-function timings and stack entries, and DynamoProfilerState which
+# collects timings and converts them into a cProfile-compatible pstats object,
+# an optional SVG call graph (via external gprof2dot and graphviz), and printed
+# reports. No import-time side effects.
 """
 Dynamo Profiler - tracks where Dynamo spends time during compilation.
 
@@ -26,6 +31,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class FunctionTraceTiming:
+    # [CLASS DOC] Dataclass record of one traced (inlined) function call:
+    # identity (name, file, first line), inclusive and exclusive time in
+    # nanoseconds, bytecode count, inline depth, optional caller identity,
+    # whether the call is non-recursive (primitive), and the full call stack as
+    # a tuple of (name, file, line) entries. Properties give millisecond views
+    # and pstats-style keys.
     """
     Timing data for a single inlined function trace.
 
@@ -60,22 +71,30 @@ class FunctionTraceTiming:
     # Backwards compatibility alias
     @property
     def trace_time_ns(self) -> int:
+        # [FUNCTION DOC] Backwards-compatible alias returning the inclusive
+        # time in nanoseconds.
         return self.cumtime_ns
 
     @property
     def trace_time_ms(self) -> float:
+        # [FUNCTION DOC] Inclusive time converted to milliseconds.
         return self.cumtime_ns / 1e6
 
     @property
     def cumtime_ms(self) -> float:
+        # [FUNCTION DOC] Inclusive time (including subcalls) in milliseconds.
         return self.cumtime_ns / 1e6
 
     @property
     def tottime_ms(self) -> float:
+        # [FUNCTION DOC] Exclusive time (excluding subcalls) in milliseconds.
         return self.tottime_ns / 1e6
 
     @property
     def caller_key(self) -> tuple[str, int, str] | None:
+        # [FUNCTION DOC] Return the caller as a (filename, line, name) tuple,
+        # substituting empty text / zero for missing file or line, or None if
+        # there is no caller name.
         """Return caller as a pstats-compatible key tuple."""
         if self.caller_func_name is not None:
             return (
@@ -87,10 +106,13 @@ class FunctionTraceTiming:
 
     @property
     def func_key(self) -> tuple[str, int, str]:
+        # [FUNCTION DOC] Return this function as a (filename, line, name) tuple.
         """Return this function as a pstats-compatible key tuple."""
         return (self.filename, self.firstlineno, self.func_name)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Human-readable summary with name, location, cumulative
+        # and total times in milliseconds, bytecode count and depth.
         return (
             f"FunctionTraceTiming({self.func_name} at {self.filename}:{self.firstlineno}, "
             f"cumtime={self.cumtime_ms:.2f}ms, tottime={self.tottime_ms:.2f}ms, "
@@ -100,6 +122,9 @@ class FunctionTraceTiming:
 
 @dataclass
 class ProfilerStackEntry:
+    # [CLASS DOC] Dataclass for one live frame on the profiler stack: function
+    # identity, start time (ns), accumulated time of traced children (ns), and
+    # whether the call is primitive (not already on the stack).
     """Stack entry for tracking function timing in the Dynamo profiler."""
 
     func_name: str
@@ -111,23 +136,34 @@ class ProfilerStackEntry:
 
 
 class DynamoProfilerState:
+    # [CLASS DOC] Mutable profiler state: timings (list of finished
+    # FunctionTraceTiming records) and stack (list of ProfilerStackEntry for
+    # in-progress traces). Methods maintain the stack, record results, and
+    # export them as pstats, SVG, or printed output.
     """State for Dynamo profiler tracking function trace timings."""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create empty timings and stack lists.
         self.timings: list[FunctionTraceTiming] = []
         self.stack: list[ProfilerStackEntry] = []
 
     def record_timing(self, timing: FunctionTraceTiming) -> None:
+        # [FUNCTION DOC] Append a finished timing record to the timings list.
         """Record timing data for a traced function."""
         self.timings.append(timing)
 
     def get_timings(self) -> list[FunctionTraceTiming]:
+        # [FUNCTION DOC] Return the internal timings list itself (not a copy).
         """Get all recorded timings."""
         return self.timings
 
     def push(
         self, func_name: str, filename: str, firstlineno: int, start_time_ns: int
     ) -> None:
+        # [FUNCTION DOC] Push a stack entry for a function starting at the given
+        # time. The entry is marked primitive only if no entry with the same
+        # name, file and first line is already on the stack; child time starts
+        # at zero. Mutates the stack.
         """Push a new entry onto the timing stack."""
         # Check if this function already exists in the stack (indirect recursion)
         is_primitive = not any(
@@ -148,17 +184,23 @@ class DynamoProfilerState:
         )
 
     def pop(self) -> ProfilerStackEntry | None:
+        # [FUNCTION DOC] Remove and return the top stack entry, or None if the
+        # stack is empty.
         """Pop the top entry from the timing stack."""
         if self.stack:
             return self.stack.pop()
         return None
 
     def add_child_time(self, child_cumtime_ns: int) -> None:
+        # [FUNCTION DOC] Add a finished child's inclusive time (ns) to the top
+        # stack entry's child-time accumulator; no-op on an empty stack.
         """Add the child's cumulative time to the parent's child_time accumulator."""
         if self.stack:
             self.stack[-1].child_time_ns += child_cumtime_ns
 
     def get_current_caller(self) -> tuple[str, str, int] | None:
+        # [FUNCTION DOC] Return (name, file, first line) of the top stack entry,
+        # or None if the stack is empty.
         """Get the current caller (top of stack) as (func_name, filename, firstlineno)."""
         if self.stack:
             entry = self.stack[-1]
@@ -166,6 +208,8 @@ class DynamoProfilerState:
         return None
 
     def get_call_stack(self) -> tuple[tuple[str, str, int], ...]:
+        # [FUNCTION DOC] Return the whole stack, bottom to top, as a tuple of
+        # (name, file, first line) tuples.
         """Get the full current call stack as tuple of (func_name, filename, firstlineno)."""
         return tuple(
             (entry.func_name, entry.filename, entry.firstlineno) for entry in self.stack
@@ -174,6 +218,14 @@ class DynamoProfilerState:
     def generate_pstats(
         self, output_file: str | None = None, print_raw: bool = False
     ) -> pstats.Stats:
+        # [FUNCTION DOC] Aggregate recorded timings per function (call count,
+        # primitive-call count, total time, cumulative time counted only for
+        # primitive calls) and per caller edge (edge cumulative time counts all
+        # calls, for call-graph tools). Caller-only functions get zeroed
+        # top-level entries. Builds a pstats.Stats from a dummy profile and
+        # overwrites its stats and totals. Side effects: optionally prints a
+        # raw aggregate table (print_raw), writes the stats file when
+        # output_file is given and logs a message. Returns the Stats object.
         """Generate pstats.Stats object from recorded timings.
 
         Args:
@@ -329,6 +381,12 @@ class DynamoProfilerState:
     def generate_svg(
         self, profile_file: str, svg_file: str | None = None
     ) -> str | None:
+        # [FUNCTION DOC] Render a call-graph SVG from a pstats file by piping
+        # gprof2dot output into graphviz dot via subprocesses. The output path
+        # defaults to the profile path with an svg extension. Prints a message
+        # and returns None if either tool is missing, a process fails, or the
+        # file is not created, or on any exception; otherwise prints and returns
+        # the SVG path.
         """Generate an SVG call graph from a profile file using gprof2dot and graphviz.
 
         Args:
@@ -401,6 +459,10 @@ class DynamoProfilerState:
     def dump_stats(
         self, output_file: str | None = None, generate_svg: bool = True
     ) -> None:
+        # [FUNCTION DOC] Print profiler results to stdout: does nothing if no
+        # timings were recorded; otherwise builds pstats (with raw table), prints
+        # it sorted by cumulative time, and if output_file is given saves it,
+        # prints visualization hints, and optionally generates an SVG.
         """Print profiler stats to stdout and optionally save to file.
 
         Args:
