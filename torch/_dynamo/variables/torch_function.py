@@ -1,3 +1,8 @@
+# [MODULE DOC] Dynamo support for __torch_function__: tensor subclasses with overrides
+# (TensorWithTFOverrideVariable), torch function mode variables and the symbolic mode stack,
+# and the dispatch logic that emulates eager ordering of subclass/mode __torch_function__ calls.
+# Import-time side effects: builds the operator lists (bin_ops etc.) and computes banned_attrs
+# from torch.overrides; creates the module-level torch_function_mode_stack_state_mgr singleton.
 """TorchDynamo support for __torch_function__ tensor subclasses.
 
 This module implements support for tensor subclasses with __torch_function__ overrides.
@@ -131,8 +136,16 @@ banned_attrs = [
 
 
 class TorchFunctionModeVariable(GenericContextWrappingVariable):
+    # [CLASS DOC] Variable wrapping a TorchFunctionMode instance (or a placeholder with no value
+    # for a device context inserted during tracing). Holds value, cm_obj (same object, for
+    # context-manager compatibility) and source. Enter/exit push/pop the real mode stack via
+    # in-graph calls; the mode is dispatched to through call_torch_function.
     @staticmethod
     def is_supported_torch_function_mode(ty: type[TorchFunctionMode]) -> bool:
+        # [FUNCTION DOC] Returns True if graph breaks under a mode of type ty are supported:
+        # the type is a NoEnterTorchFunctionMode or DeviceContext subclass, or it has no custom
+        # attribute-lookup hook and keeps the default TorchFunctionMode enter and exit methods.
+        # Args: ty, the mode class. Pure; no side effects.
         # Supported in this sense means we can support graph breaks under the
         # context.
         # We are able to trace custom modes but if there are graph breaks under them
@@ -153,6 +166,9 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         source: Source | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the mode value (may be None for a device-context placeholder),
+        # its source, and aliases cm_obj to the value. Only calls the parent initializer when
+        # value is not None; extra kwargs are forwarded to it.
         if value is not None:
             super().__init__(value, **kwargs)
         self.value = value
@@ -161,6 +177,8 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         self.source = source  # type: ignore[assignment]
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode that reloads the mode from its source.
+        # Raises an AssertionError if the variable has no source.
         # This shouldn't be called unless we have a source
         if not self.source:
             raise AssertionError(
@@ -169,12 +187,15 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         self.source.reconstruct(codegen)
 
     def module_name(self) -> str:
+        # [FUNCTION DOC] Returns the module name of the wrapped mode object.
         return self.value.__module__
 
     def fn_name(self) -> str:
+        # [FUNCTION DOC] Returns the class name of the wrapped mode object.
         return type(self.value).__name__
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the class of the wrapped mode object.
         return type(self.value)
 
     def call_torch_function(
@@ -185,6 +206,9 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         args: Iterable[Any],
         kwargs: dict[str, Any],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Invokes this mode's __torch_function__ symbolically with the given
+        # function, types tuple, args and kwargs, via the module-level call_torch_function.
+        # Returns the resulting VariableTracker.
         return call_torch_function(
             tx,
             get_torch_function_fn(tx, self),  # type: ignore[arg-type]
@@ -195,6 +219,8 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         )
 
     def enter(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Symbolically enters the mode: pushes it onto the torch function stack
+        # via an in-graph call (no-op for NoEnterTorchFunctionMode). Returns a None constant.
         from .torch import TorchInGraphFunctionVariable
 
         if isinstance(self.value, NoEnterTorchFunctionMode):
@@ -206,6 +232,9 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         return ConstantVariable.create(None)
 
     def exit(self, tx: "InstructionTranslatorBase", *args: Any) -> VariableTracker:
+        # [FUNCTION DOC] Symbolically exits the mode by popping the torch function stack via an
+        # in-graph call. Extra args (exception info) are ignored. Returns a None constant.
+        # KNOWN ISSUE: pops unconditionally, even when enter was a no-op for NoEnterTorchFunctionMode.
         from .torch import TorchInGraphFunctionVariable
 
         TorchInGraphFunctionVariable(torch._C._pop_torch_function_stack).call_function(
@@ -214,6 +243,8 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         return ConstantVariable.create(None)
 
     def reconstruct_type(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode loading the NoEnterTorchFunctionMode class (looked up by
+        # module import and attribute), regardless of the wrapped mode's actual type.
         ty = NoEnterTorchFunctionMode
         codegen(
             AttrSource(
@@ -223,18 +254,26 @@ class TorchFunctionModeVariable(GenericContextWrappingVariable):
         )
 
     def supports_graph_breaks(self) -> bool:
+        # [FUNCTION DOC] Always True: graph breaks under this context are supported.
         return True
 
     def exit_on_graph_break(self) -> bool:
+        # [FUNCTION DOC] Always False: the mode is not exited when a graph break occurs.
         return False
 
 
 # Used to clear/restore the python torch function mode stack and temporarily restore it as needed
 class TorchFunctionModeStackStateManager:
+    # [CLASS DOC] Context manager that saves the current python torch function mode stack in
+    # self.stack and clears the real stack on entry, restoring it on exit. Also offers
+    # temp_restore_stack to temporarily reinstall the saved stack.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes with an empty saved stack.
         self.stack: list[Any] = []
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Saves the current mode stack and clears the global mode stack (global
+        # side effect). Returns nothing.
         self.stack = torch.overrides._get_current_function_mode_stack()
         clear_torch_function_mode_stack()
 
@@ -244,11 +283,15 @@ class TorchFunctionModeStackStateManager:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Restores the saved mode stack as the global stack and forgets it.
+        # Exception arguments are ignored; exceptions are not suppressed.
         set_torch_function_mode_stack(self.stack)
         self.stack = []
 
     @contextlib.contextmanager
     def temp_restore_stack(self) -> Generator[None, None, None]:
+        # [FUNCTION DOC] Context manager: installs the saved stack as the global mode stack for
+        # the duration of the block, then reinstalls the previous stack even if an error occurs.
         prev = torch.overrides._get_current_function_mode_stack()
         set_torch_function_mode_stack(self.stack)
         try:
@@ -261,7 +304,13 @@ torch_function_mode_stack_state_mgr = TorchFunctionModeStackStateManager()
 
 
 class SymbolicTorchFunctionState:
+    # [CLASS DOC] Dynamo's symbolic view of torch function state during tracing: whether
+    # subclass dispatch and mode dispatch are enabled, the skip_next flag, the current mode
+    # being inlined (cur_mode), and mode_stack, a deque of TorchFunctionModeVariable.
     def __init__(self, py_stack: Iterable[Any], skip_next: bool) -> None:
+        # [FUNCTION DOC] Snapshots the C-level enablement flags, records skip_next, resets the
+        # TorchFunctionModeStackVariable offset (global class state), and builds mode_stack from
+        # py_stack as lazy variables each sourced by its stack index.
         # This is annoyingly complicated because of how the torch function subclass + mode C API was designed
         # There are two exposed C knobs here as contexts: torch._C.DisableTorchFunction and torch._C.DisableTorchFunctionSubclass
         # These are their definitions:
@@ -306,12 +355,16 @@ class SymbolicTorchFunctionState:
             )
 
     def in_torch_function_mode(self) -> bool:
+        # [FUNCTION DOC] True if the symbolic mode stack is non-empty.
         return len(self.mode_stack) > 0
 
     def pop_torch_function_mode(self) -> TorchFunctionModeVariable:
+        # [FUNCTION DOC] Removes and returns the top mode of the symbolic stack.
+        # Raises an error if the stack is empty.
         return self.mode_stack.pop()
 
     def push_torch_function_mode(self, mode_var: TorchFunctionModeVariable) -> None:
+        # [FUNCTION DOC] Pushes mode_var onto the top of the symbolic stack.
         self.mode_stack.append(mode_var)
 
     def call_torch_function_mode(
@@ -322,6 +375,9 @@ class SymbolicTorchFunctionState:
         args: Iterable[Any],
         kwargs: dict[str, Any],
     ) -> Any:
+        # [FUNCTION DOC] Dispatches to the top mode: temporarily pops it (so nested torch calls
+        # see only the modes below it), calls its __torch_function__ symbolically, and returns
+        # the result. The mode is pushed back afterwards, even on error.
         with self._pop_mode_for_inlining() as cur_mode:
             return cur_mode.call_torch_function(tx, fn, types, args, kwargs)
 
@@ -329,6 +385,8 @@ class SymbolicTorchFunctionState:
     def _pop_mode_for_inlining(
         self,
     ) -> Generator[TorchFunctionModeVariable, None, None]:
+        # [FUNCTION DOC] HELPER: context manager that pops the top mode, records it as cur_mode
+        # (saving the previous cur_mode), yields it, then restores cur_mode and re-pushes the mode.
         old_mode = self.cur_mode
         self.cur_mode = self.pop_torch_function_mode()  # type: ignore[assignment]
         try:
@@ -340,6 +398,10 @@ class SymbolicTorchFunctionState:
 
 
 class TorchFunctionModeStackVariable(VariableTracker):
+    # [CLASS DOC] Dummy variable standing for the global torch function mode stack in the side
+    # effect tracker, so stack mutations get replayed. Holds a source and the symbolic stack.
+    # Class-level state: stack_value_singleton (tracking key) and offset (index shift caused by
+    # inserting or removing a device context at the stack bottom).
     """Fake VT to use as a dummy object, indicating the presence of torch function mode stack mutation"""
 
     # singleton value representing the global torch function mode stack
@@ -361,15 +423,21 @@ class TorchFunctionModeStackVariable(VariableTracker):
         source: Source,
         symbolic_stack: collections.deque[TorchFunctionModeVariable],
     ) -> None:
+        # [FUNCTION DOC] Stores the source and the symbolic stack reference. Does not call the
+        # parent initializer.
         self.source = source
         self.symbolic_stack = symbolic_stack
 
     @classmethod
     def reset(cls) -> None:
+        # [FUNCTION DOC] Resets the class-level device-context index offset to zero.
         cls.offset = 0
 
     @classmethod
     def register_mutation(cls, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Ensures the mode stack is tracked as mutated in the output graph's side
+        # effects: on first call creates the dummy variable, tracks it and marks it mutated;
+        # later calls do nothing.
         if cls.stack_value_singleton not in tx.output.side_effects:
             var = cls(
                 source=Source(),
@@ -380,6 +448,9 @@ class TorchFunctionModeStackVariable(VariableTracker):
 
     @classmethod
     def register_device_context_insertion(cls, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Records a default-device context being inserted: unless the bottom of
+        # the symbolic stack is already a device context, increments offset and inserts a
+        # placeholder mode variable (no value) at the bottom, sourced by the negative offset.
         stack = tx.symbolic_torch_function_state.mode_stack
         if stack and cls.is_device_context(stack[0]):
             return
@@ -394,6 +465,8 @@ class TorchFunctionModeStackVariable(VariableTracker):
 
     @classmethod
     def clear_default_device(cls, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] If the bottom of the symbolic stack is a device context, removes it and
+        # decrements offset; otherwise does nothing.
         stack = tx.symbolic_torch_function_state.mode_stack
         if stack and cls.is_device_context(stack[0]):
             stack.popleft()
@@ -401,20 +474,29 @@ class TorchFunctionModeStackVariable(VariableTracker):
 
     @staticmethod
     def is_device_context(var: TorchFunctionModeVariable) -> bool:
+        # [FUNCTION DOC] True if the mode variable wraps a DeviceContext or is a valueless
+        # placeholder (which stands for an inserted device context).
         return isinstance(var.value, DeviceContext) or var.value is None
 
     @classmethod
     def get_mode_index(cls, ind: int) -> int:
+        # [FUNCTION DOC] Returns the stack index ind shifted by the current device-context offset.
         return ind + cls.offset
 
 
 def _get_all_args(
     args: Iterable[Any], kwargs: dict[str, Any]
 ) -> Iterable[VariableTracker]:
+    # [FUNCTION DOC] HELPER: collects all leaf arguments from args and kwargs using a pytree
+    # flatten, then expands list and dict variables via _flatten_vts. Returns a list of variables.
     return _flatten_vts(pytree.arg_tree_leaves(*args, **kwargs))
 
 
 def _flatten_vts(vts: Iterable[VariableTracker]) -> list[VariableTracker]:
+    # [FUNCTION DOC] HELPER: breadth-first flattening of variables. Lazy variables whose type is
+    # a dict, list or tuple are realized first; realized list variables contribute their items
+    # and constant-dict variables their values (recursively); everything else is output as is.
+    # Returns the flat list; realizing lazy variables is a side effect.
     from collections import deque
 
     from .dicts import ConstDictVariable
@@ -443,6 +525,8 @@ def _flatten_vts(vts: Iterable[VariableTracker]) -> list[VariableTracker]:
 
 
 def _get_subclass_type(var: VariableTracker) -> type:
+    # [FUNCTION DOC] HELPER: returns the Python type of a tensor-with-override or user-defined
+    # object variable. Raises an AssertionError for any other variable kind.
     if not isinstance(var, (TensorWithTFOverrideVariable, UserDefinedObjectVariable)):
         raise AssertionError(f"Unexpected type {type(var)}")
     return var.python_type()
@@ -451,6 +535,9 @@ def _get_subclass_type(var: VariableTracker) -> type:
 def _get_subclass_type_var(
     tx: "InstructionTranslatorBase", var: VariableTracker
 ) -> VariableTracker:
+    # [FUNCTION DOC] HELPER: returns a variable representing the class of var. For tensor
+    # subclass variables uses class_type_var; for user-defined objects builds a variable for
+    # the type (with a type source when the object has a source). Raises AssertionError otherwise.
     if isinstance(var, TensorWithTFOverrideVariable):
         return var.class_type_var(tx)
     elif isinstance(var, UserDefinedObjectVariable):
@@ -463,6 +550,11 @@ def _get_subclass_type_var(
 def _is_attr_overridden(
     tx: "InstructionTranslatorBase", var: VariableTracker, name: str
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the variable's class defines attribute name differently
+    # from torch.Tensor (static lookup on the class compared to the Tensor attribute). Returns
+    # False for other variable kinds or if the class lacks the attribute.
+    # KNOWN ISSUE: if torch.Tensor itself lacks the attribute, the Tensor lookup raises an
+    # AttributeError that is swallowed, yielding False even for a class-defined attribute.
     if not isinstance(var, (TensorWithTFOverrideVariable, UserDefinedObjectVariable)):
         return False
     import torch
@@ -487,6 +579,11 @@ def call_torch_function(
     *,
     is_subclass_dispatch: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Symbolically calls a __torch_function__ implementation (torch_function_var)
+    # with the function, types tuple, and args/kwargs packed as tuple and dict variables.
+    # For subclass dispatch (is_subclass_dispatch), temporarily disables subclass dispatch in the
+    # symbolic state during the call to prevent re-entrant dispatch; the flag is restored after,
+    # even on error. Returns the variable produced by the call.
     # This emulates calling __torch_function__, which has a signature
     #   def __torch_function__(cls, func, types, args=(), kwargs=None):
     #
@@ -519,6 +616,8 @@ def call_torch_function(
 def get_torch_function_fn(
     tx: "InstructionTranslatorBase", vt: VariableTracker
 ) -> VariableTracker:
+    # [FUNCTION DOC] Returns a variable for the __torch_function__ attribute of vt, obtained by
+    # symbolically calling the builtin attribute getter.
     # The underlying function could be a classmethod, staticmethod, regular
     # function or a function with C-implementation. It doesn't matter as long as
     # they satisfy the calling convention in `call_torch_function`.
@@ -531,6 +630,9 @@ def get_torch_function_fn(
 def can_dispatch_torch_function(
     tx: "InstructionTranslatorBase", args: Iterable[Any], kwargs: dict[str, Any]
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a torch API call needs __torch_function__ dispatch: True if
+    # any flattened argument has an override and subclass dispatch is enabled, or if mode dispatch
+    # is enabled and the symbolic mode stack is non-empty. Pure query.
     has_overridden_args = any(
         has_torch_function(arg) for arg in _get_all_args(args, kwargs)
     )
@@ -546,6 +648,11 @@ def dispatch_torch_function(
     args: Iterable[Any],
     kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] Emulates eager __torch_function__ dispatch for fn. Finds args with overrides,
+    # orders them with the eager overload-ordering helper, and builds the types tuple. First tries
+    # the top mode (if any); then each overloaded arg in order; the first result that is not
+    # NotImplemented is returned (marking torch_function_subclass_inlined on the output graph for
+    # subclass results). If all return NotImplemented, triggers a graph break via unimplemented.
     """Gathers all args that are TensorWithTFOverrideVariable and dispatches based on the ordering in _get_overloaded_args"""
 
     all_args = _get_all_args(args, kwargs)
@@ -587,6 +694,9 @@ def dispatch_torch_function(
 
 
 class TensorWithTFOverrideVariable(TensorVariable):
+    # [CLASS DOC] TensorVariable for an instance of a tensor subclass with a __torch_function__
+    # override. class_type is the subclass; attribute access and method calls dispatch through
+    # __torch_function__, and the subclass is installed as a global for output rewrapping.
     """
     Represents a tensor subclass instance with a __torch_function__ override.
     """
@@ -599,6 +709,10 @@ class TensorWithTFOverrideVariable(TensorVariable):
         class_type: type,
         cls_source: Source | None,
     ) -> "TensorWithTFOverrideVariable":
+        # [FUNCTION DOC] Converts a tensor variable into an override variable of class_type, by
+        # realizing it, shallow-copying its fields (minus its class_type) into a new instance, and
+        # installing the subclass as a global. Raises AssertionError if the original class is not a
+        # tensor type. cls_source is unused.
         # [Note: __torch_function__] coerce `tensor_var` into a
         # TensorWithTFOverrideVariable. In eager, this is just a type change.
         import torch
@@ -619,6 +733,8 @@ class TensorWithTFOverrideVariable(TensorVariable):
         return var
 
     def install_global(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Ensures the subclass is available in the output graph's global scope
+        # under its mangled name (installing it if absent), so compiled code can rewrap outputs.
         # stash the subclass type to rewrap an output tensor if needed
         # this is needed because the actual type needs to be available
         # each time the compiled artifact is run and outputs a wrapped tensor.
@@ -629,14 +745,18 @@ class TensorWithTFOverrideVariable(TensorVariable):
             )
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the tensor subclass.
         return self.class_type
 
     def class_type_var(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Returns a subclass variable for class_type, sourced from its installed global.
         return TensorSubclassVariable(
             self.class_type, source=GlobalSource(self.global_mangled_class_name(tx))
         )
 
     def global_mangled_class_name(self, tx: "InstructionTranslatorBase") -> str:
+        # [FUNCTION DOC] Returns the safe global name used to store class_type in the output
+        # graph's globals, derived from a prefix plus the class name.
         return get_safe_global_name(
             tx, f"__subclass_{self.class_type.__name__}", self.class_type
         )
@@ -644,6 +764,12 @@ class TensorWithTFOverrideVariable(TensorVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute lookup on the subclass instance. Graph breaks for banned
+        # attributes (tensor base attribute getters) and for overridden attributes that are not a
+        # function, property or classmethod. Non-overridden plain Tensor attributes dispatch via
+        # __torch_function__ when dispatch is active. Overridden functions become bound user
+        # methods (with a closure guard), properties inline the getter, classmethods bind the class.
+        # Otherwise falls back to the TensorVariable implementation.
         # [Note: __torch_function__] We currently only support attributes that are defined on
         # base tensors, custom attribute accesses will graph break.
         import torch
@@ -734,6 +860,9 @@ class TensorWithTFOverrideVariable(TensorVariable):
         args: Iterable[Any],
         kwargs: dict[str, Any],
     ) -> Any:
+        # [FUNCTION DOC] Calls this instance's __torch_function__ symbolically as subclass
+        # dispatch. Caches the resolved __torch_function__ variable on the instance on first use
+        # (assuming it is not modified during tracing). Returns the call result.
         # NOTE this assumes `__torch_function__` isn't modified during tracing.
         if not hasattr(self, "torch_function_fn"):
             self.torch_function_fn = get_torch_function_fn(tx, self)
@@ -755,6 +884,11 @@ class TensorWithTFOverrideVariable(TensorVariable):
         args: list[VariableTracker],
         kwargs: "dict[str, VariableTracker]",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Method call on the instance. If torch function dispatch applies, graph
+        # breaks when the method is overridden by the subclass; otherwise resolves the Tensor
+        # implementation (class attribute guarded via source when available) and dispatches it
+        # through dispatch_torch_function with self prepended to args. If dispatch does not apply,
+        # defers to the parent implementation.
         # This code block implements inlining the __torch_function__ override
         # of `call_method`.
         tf_args = [self] + list(args)
