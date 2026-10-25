@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# [MODULE DOC] Vendored copy of the third-party appdirs utility (version 1.4.4).
+# Computes platform-specific per-user and site-wide directories (data, config,
+# cache, state, log) for an application, following Windows known-folder, macOS
+# and XDG conventions. Main contents: user_data_dir, site_data_dir,
+# user_config_dir, site_config_dir, user_cache_dir, user_state_dir,
+# user_log_dir, and the AppDirs convenience wrapper class.
+# Import-time side effects: detects the platform into a module-level name and,
+# on Windows only, selects a folder-lookup backend (pywin32, ctypes, JNA, or
+# registry fallback) by trying imports in that order. Has a self-test main block.
 # Copyright (c) 2005-2010 ActiveState Software Inc.
 # Copyright (c) 2013 Eddy Petrișor
 
@@ -73,6 +82,11 @@ else:
 
 
 def user_data_dir(appname=None, appauthor=None, version=None, roaming=False):
+    # [FUNCTION DOC] Returns the per-user data directory path for an app.
+    # Windows: local or roaming app-data folder joined with author (defaults to
+    # appname unless False) and appname. macOS: Application Support. Other: the
+    # XDG data home variable or a default under the home dir. Appends version
+    # only when appname is given. Pure path computation; no directories created.
     r"""Return full path to the user-specific data dir for this application.
 
         "appname" is the name of application.
@@ -128,6 +142,13 @@ def user_data_dir(appname=None, appauthor=None, version=None, roaming=False):
 
 
 def site_data_dir(appname=None, appauthor=None, version=None, multipath=False):
+    # [FUNCTION DOC] Returns the shared (all-users) data directory for an app.
+    # Windows: common app-data folder; macOS: system Application Support; other:
+    # entries of the XDG data dirs variable (default two usr share dirs), with
+    # appname/version appended; returns only the first entry unless multipath is
+    # true, in which case entries are joined with the path separator.
+    # KNOWN ISSUE: on the non-Windows, non-macOS branch it returns early, so
+    # that branch's behavior differs structurally from the others (harmless).
     r"""Return full path to the user-shared data dir for this application.
 
         "appname" is the name of application.
@@ -197,6 +218,10 @@ def site_data_dir(appname=None, appauthor=None, version=None, multipath=False):
 
 
 def user_config_dir(appname=None, appauthor=None, version=None, roaming=False):
+    # [FUNCTION DOC] Returns the per-user config directory for an app.
+    # Windows: same as the user data dir; macOS: Preferences folder; other: XDG
+    # config home variable or a default dot-config dir. Appends appname and
+    # version (version only when appname is given). Pure path computation.
     r"""Return full path to the user-specific config dir for this application.
 
         "appname" is the name of application.
@@ -241,6 +266,11 @@ def user_config_dir(appname=None, appauthor=None, version=None, roaming=False):
 
 
 def site_config_dir(appname=None, appauthor=None, version=None, multipath=False):
+    # [FUNCTION DOC] Returns the shared (all-users) config directory for an app.
+    # Windows: delegates to the site data dir; macOS: system Preferences folder;
+    # other: entries of the XDG config dirs variable (default etc xdg) with
+    # appname/version appended; first entry only unless multipath is true.
+    # KNOWN ISSUE: on macOS the version argument is ignored.
     r"""Return full path to the user-shared data dir for this application.
 
         "appname" is the name of application.
@@ -298,6 +328,10 @@ def site_config_dir(appname=None, appauthor=None, version=None, multipath=False)
 
 
 def user_cache_dir(appname=None, appauthor=None, version=None, opinion=True):
+    # [FUNCTION DOC] Returns the per-user cache directory for an app.
+    # Windows: local app-data folder with author/appname and, if opinion is true,
+    # a trailing Cache folder; macOS: Library Caches; other: XDG cache home or a
+    # default dot-cache dir. Appends version when appname is given. No I/O.
     r"""Return full path to the user-specific cache dir for this application.
 
         "appname" is the name of application.
@@ -355,6 +389,10 @@ def user_cache_dir(appname=None, appauthor=None, version=None, opinion=True):
 
 
 def user_state_dir(appname=None, appauthor=None, version=None, roaming=False):
+    # [FUNCTION DOC] Returns the per-user state directory for an app.
+    # Windows and macOS: same as the user data dir (without version, which is
+    # then appended here); other: XDG state home variable or a default under the
+    # local state folder. Appends appname and version. Pure path computation.
     r"""Return full path to the user-specific state dir for this application.
 
         "appname" is the name of application.
@@ -397,6 +435,13 @@ def user_state_dir(appname=None, appauthor=None, version=None, roaming=False):
 
 
 def user_log_dir(appname=None, appauthor=None, version=None, opinion=True):
+    # [FUNCTION DOC] Returns the per-user log directory for an app.
+    # macOS: Library Logs joined with appname; Windows: user data dir plus an
+    # optional Logs folder; other: user cache dir plus an optional log folder
+    # (opinion controls the suffix). Version is applied inside the delegated
+    # calls on Windows/Unix, so it is not appended again.
+    # KNOWN ISSUE: on macOS appname is required (joining with None raises a
+    # TypeError) and version is appended only if truthy after the join.
     r"""Return full path to the user-specific log dir for this application.
 
         "appname" is the name of application.
@@ -446,11 +491,16 @@ def user_log_dir(appname=None, appauthor=None, version=None, opinion=True):
 
 
 class AppDirs:
+    # [CLASS DOC] Convenience holder for app identity (appname, appauthor,
+    # version, roaming, multipath) exposing each directory kind as a read-only
+    # property that calls the matching module-level function with those values.
     """Convenience wrapper for getting application dirs."""
 
     def __init__(
         self, appname=None, appauthor=None, version=None, roaming=False, multipath=False
     ):
+        # [FUNCTION DOC] Stores the app name, author, version and the roaming and
+        # multipath flags as attributes. No validation or side effects.
         self.appname = appname
         self.appauthor = appauthor
         self.version = version
@@ -459,38 +509,45 @@ class AppDirs:
 
     @property
     def user_data_dir(self):
+        # [FUNCTION DOC] Property: user data dir for the stored app settings.
         return user_data_dir(
             self.appname, self.appauthor, version=self.version, roaming=self.roaming
         )
 
     @property
     def site_data_dir(self):
+        # [FUNCTION DOC] Property: shared data dir, honoring the multipath flag.
         return site_data_dir(
             self.appname, self.appauthor, version=self.version, multipath=self.multipath
         )
 
     @property
     def user_config_dir(self):
+        # [FUNCTION DOC] Property: user config dir for the stored app settings.
         return user_config_dir(
             self.appname, self.appauthor, version=self.version, roaming=self.roaming
         )
 
     @property
     def site_config_dir(self):
+        # [FUNCTION DOC] Property: shared config dir, honoring the multipath flag.
         return site_config_dir(
             self.appname, self.appauthor, version=self.version, multipath=self.multipath
         )
 
     @property
     def user_cache_dir(self):
+        # [FUNCTION DOC] Property: user cache dir (default opinion behavior).
         return user_cache_dir(self.appname, self.appauthor, version=self.version)
 
     @property
     def user_state_dir(self):
+        # [FUNCTION DOC] Property: user state dir for the stored app settings.
         return user_state_dir(self.appname, self.appauthor, version=self.version)
 
     @property
     def user_log_dir(self):
+        # [FUNCTION DOC] Property: user log dir (default opinion behavior).
         return user_log_dir(self.appname, self.appauthor, version=self.version)
 
 
@@ -498,6 +555,10 @@ class AppDirs:
 
 
 def _get_win_folder_from_registry(csidl_name):
+    # [FUNCTION DOC] HELPER: Windows-only fallback that maps a CSIDL name (app
+    # data, common app data, local app data) to a registry value name and reads
+    # it from the current-user Shell Folders key. Returns the directory string;
+    # raises KeyError for unknown names or OS errors if the key is missing.
     """This is a fallback technique at best. I'm not sure if using the
     registry for this guarantees us the correct answer for all CSIDL_*
     names.
@@ -519,6 +580,9 @@ def _get_win_folder_from_registry(csidl_name):
 
 
 def _get_win_folder_with_pywin32(csidl_name):
+    # [FUNCTION DOC] HELPER: Windows folder lookup via pywin32 shell API. Returns
+    # the path as text; if it has characters above 255 it tries to convert to the
+    # short (8.3) path via win32api, silently keeping the long path if missing.
     from win32com.shell import shell, shellcon
 
     dir = shell.SHGetFolderPath(0, getattr(shellcon, csidl_name), 0, 0)
@@ -548,6 +612,10 @@ def _get_win_folder_with_pywin32(csidl_name):
 
 
 def _get_win_folder_with_ctypes(csidl_name):
+    # [FUNCTION DOC] HELPER: Windows folder lookup via ctypes and the shell32
+    # SHGetFolderPathW call into a 1024-char buffer. Maps CSIDL name to a numeric
+    # id (KeyError if unknown). Converts to the short path if any character is
+    # above 255 and the conversion succeeds. Returns the path string.
     import ctypes
 
     csidl_const = {
@@ -575,6 +643,10 @@ def _get_win_folder_with_ctypes(csidl_name):
 
 
 def _get_win_folder_with_jna(csidl_name):
+    # [FUNCTION DOC] HELPER: Windows folder lookup for Jython using the JNA
+    # bindings to the shell API; strips trailing nul characters and converts to
+    # the short path when high characters are present. Returns the path string.
+    # Only usable under a Java-hosted Python.
     import array
 
     from com.sun import jna

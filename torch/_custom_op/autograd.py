@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Autograd support for the deprecated CustomOp API. Builds the
+# autograd kernel for a custom op from user-supplied save-for-backward and
+# backward functions by generating a torch.autograd.Function subclass, validates
+# the backward results, and packs/unpacks arbitrary nested data on the ctx.
+# Main contents: autograd_kernel_indirection, autograd_not_implemented,
+# construct_autograd_kernel, gen_autograd_function, namedtuple_args helpers,
+# validate_grad_inputs_dict, grad_inputs_dict_to_flat_tuple,
+# save_pytree_for_backward, unpack_saved. No import-time side effects.
 import functools
 from collections import namedtuple
 
@@ -17,9 +25,17 @@ import torch.utils._pytree as pytree
 # the `autograd_not_implemented` behavior, but then the user may come
 # and register something that is actually a backward formula
 def autograd_kernel_indirection(custom_op):
+    # [FUNCTION DOC] Builds the swappable autograd kernel registered for a
+    # custom op. Takes the custom op object; returns a callable that, at call
+    # time, uses the user's generated autograd impl if present, raises a
+    # RuntimeError if only one of backward/save_for_backward was registered, and
+    # otherwise falls back to the not-implemented kernel.
     autograd_fallback = autograd_not_implemented(custom_op)
 
     def inner(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: The dispatching kernel described above; forwards
+        # all args and returns the chosen kernel's result. Raises RuntimeError
+        # naming the missing registration and the location of the found one.
         if custom_op._has_impl("autograd"):
             kernel = custom_op._get_impl("autograd").func
             return kernel(*args, **kwargs)
@@ -49,7 +65,12 @@ def autograd_kernel_indirection(custom_op):
 # TODO(#101191): Use the actual C++ autograd not implemented fallback,
 # or change the default autograd fallback to the autograd not implemented fallback.
 def autograd_not_implemented(custom_op):
+    # [FUNCTION DOC] Returns a default autograd kernel for a custom op: it raises
+    # a RuntimeError if grad mode is on and any tensor input requires grad,
+    # otherwise calls the op with autograd dispatch excluded.
     def kernel(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: The kernel described above; returns the op's
+        # result or raises RuntimeError when autograd would be needed.
         if torch.is_grad_enabled() and pytree.tree_any(
             lambda x: isinstance(x, torch.Tensor) and x.requires_grad, (args, kwargs)
         ):
@@ -61,6 +82,11 @@ def autograd_not_implemented(custom_op):
 
 
 def mark_non_differentiable(ctx, output, output_differentiability):
+    # [FUNCTION DOC] Marks outputs as non-differentiable on the autograd ctx
+    # according to a per-output list of booleans (None means do nothing). Wraps a
+    # single output into a tuple; tensors and lists of tensors flagged false are
+    # collected and marked (mutates ctx). Raises AssertionError on a length
+    # mismatch and RuntimeError if a non-tensor, non-list output is flagged true.
     # Output types are restricted to be:
     # - Tensor
     # - Tensor[]
@@ -107,11 +133,26 @@ def construct_autograd_kernel(
     save_for_backward_fn,
     backward_fn,
 ):
+    # [FUNCTION DOC] Creates the autograd kernel for a custom op from the schema,
+    # output differentiability list, the op and its overload, and the user's
+    # save-for-backward and backward functions. Returns an apply function that
+    # flattens inputs, runs a freshly generated autograd Function (forward calls
+    # the op below autograd and saves data; backward calls the user's function
+    # and validates its gradient mapping), and returns outputs in the original
+    # structure.
     def apply(*args):
+        # [FUNCTION DOC] HELPER: Runs the generated autograd Function on the
+        # flattened args and rebuilds the original output structure. Raises
+        # AssertionError if the output spec was not recorded by forward.
         flat_args, spec = pytree.tree_flatten(args)
         out_spec = None
 
         def forward(ctx, *flat_args):
+            # [FUNCTION DOC] HELPER: Autograd forward. Enables grad
+            # materialization, rebuilds args, calls the op below autograd, runs
+            # the save-for-backward function on named inputs and output, stores
+            # results and arg type info on ctx, marks non-differentiable outputs,
+            # records the output spec (via a nonlocal), and returns flat outputs.
             ctx.set_materialize_grads(True)
             args = pytree.tree_unflatten(list(flat_args), spec)
             with torch._C._AutoDispatchBelowAutograd():
@@ -131,6 +172,12 @@ def construct_autograd_kernel(
             return tuple(flat_output)
 
         def backward(ctx, *flat_grad_output):
+            # [FUNCTION DOC] HELPER: Autograd backward. Rebuilds the output
+            # gradients structure, unpacks saved data, calls the user's backward
+            # with a placeholder ctx, validates the returned mapping of input
+            # name to gradient, and returns a flat tuple of input gradients.
+            # Raises AssertionError if forward never ran; RuntimeError on bad
+            # user results.
             if out_spec is None:
                 raise AssertionError("out_spec is unexpectedly None")
             grads = pytree.tree_unflatten(list(flat_grad_output), out_spec)
@@ -160,6 +207,9 @@ def construct_autograd_kernel(
 
 
 def gen_autograd_function(name, forward, backward):
+    # [FUNCTION DOC] HELPER: Dynamically creates and returns a new
+    # torch.autograd.Function subclass with the given class name, using the given
+    # forward and backward callables as static methods.
     generated_cls = type(
         name,
         (torch.autograd.Function,),
@@ -173,6 +223,9 @@ def gen_autograd_function(name, forward, backward):
 
 @functools.lru_cache
 def namedtuple_args_cls(schema):
+    # [FUNCTION DOC] HELPER: Cached (per schema) factory returning a named tuple
+    # class whose fields are the schema's argument names and whose class name is
+    # the schema name plus an args suffix.
     attribs = [arg.name for arg in schema.arguments.flat_all]
     name = str(schema.name) + "_args"
     # mypy doesn't support dynamic namedtuple name
@@ -181,6 +234,9 @@ def namedtuple_args_cls(schema):
 
 
 def namedtuple_args(schema, args):
+    # [FUNCTION DOC] HELPER: Wraps a tuple of positional args into the schema's
+    # named tuple class. Raises AssertionError if args is not a tuple; a length
+    # mismatch raises a TypeError from the tuple constructor.
     if not isinstance(args, tuple):
         raise AssertionError(f"expected tuple, got {type(args)}")
     tuple_cls = namedtuple_args_cls(schema)
@@ -188,7 +244,15 @@ def namedtuple_args(schema, args):
 
 
 def validate_grad_inputs_dict(grad_inputs_dict, forward_op, args_info):
+    # [FUNCTION DOC] Checks the user's backward result: it must be a mapping whose
+    # keys are exactly the tensor-like argument names of the op; each value must
+    # be None or a tensor (or, for list-typed args, a same-length list/tuple of
+    # None or tensors), and a tensor gradient is only allowed where the original
+    # argument was a tensor. Raises RuntimeError with the backward location on
+    # any violation; returns nothing.
     def error(what):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError with the given detail,
+        # prefixed by the op and backward registration location.
         backward = forward_op._get_impl("backward")
         raise RuntimeError(
             f"In the backward function defined for {forward_op} at "
@@ -268,6 +332,9 @@ def validate_grad_inputs_dict(grad_inputs_dict, forward_op, args_info):
 
 
 def grad_inputs_dict_to_flat_tuple(grad_inputs_dict, args_info):
+    # [FUNCTION DOC] Converts the name-to-gradient mapping into the flat tuple of
+    # leaves that autograd expects, one per forward input. Arguments absent from
+    # the mapping get None in the same nested structure as their type info.
     result = []
     for name, arg_info in args_info._asdict().items():
         if name not in grad_inputs_dict:
@@ -282,6 +349,10 @@ def grad_inputs_dict_to_flat_tuple(grad_inputs_dict, args_info):
 # save Tensors (to avoid reference cycles) and for non-Tensors to go onto the
 # ctx object.
 def save_pytree_for_backward(ctx, stuff):
+    # [FUNCTION DOC] Saves a nested structure on the autograd ctx: flattens it,
+    # stores tensors through the ctx save mechanism and non-tensors as plain
+    # attributes, plus the structure spec, count and index lists needed by
+    # unpack_saved (mutates ctx with several attributes).
     flat_stuff, spec = pytree.tree_flatten(stuff)
     num_elts = len(flat_stuff)
     tensor_idxs = [
@@ -305,6 +376,9 @@ def save_pytree_for_backward(ctx, stuff):
 
 # Inverse operation to save_pytree_for_backward
 def unpack_saved(ctx):
+    # [FUNCTION DOC] Inverse of save_pytree_for_backward: merges saved tensors and
+    # saved non-tensors back into their original positions and rebuilds and
+    # returns the original nested structure. Reads ctx only.
     flat_stuff = [None] * ctx.num_elts
     for tensor, idx in zip(ctx.saved_tensors, ctx.tensor_idxs):
         flat_stuff[idx] = tensor

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Legacy public-ish facade for defining custom operators:
+# custom_op to declare an operator, then impl, impl_abstract,
+# impl_save_for_backward and impl_backward to register behaviors; get_ctx is
+# re-exported. Thin wrappers over torch._custom_op.impl and torch.library.
+# Includes a testing-only _destroy. No import-time side effects.
 import inspect
 
 from torch._custom_op.impl import (
@@ -22,6 +27,14 @@ __all__ = [
 
 
 def custom_op(qualname, func_or_schema=None):
+    # [FUNCTION DOC] Declares a new custom operator named by a namespace-qualified
+    # string. Validates the name and namespace up front. With no second argument
+    # returns a decorator; the decorated function must be a plain function whose
+    # name matches the operator name, and its schema is inferred from annotations
+    # (no mutated args). With a schema string, defines the op immediately and
+    # returns None; with a function, applies the decorator directly and returns
+    # the function. Raises ValueError on bad function or name mismatch. Side
+    # effect: defines the operator in the dispatcher and global registry.
     r"""Register a new custom operator
 
     In PyTorch, defining an op (short for "operator") is a two step-process:
@@ -92,6 +105,9 @@ def custom_op(qualname, func_or_schema=None):
     validate_namespace(ns)
 
     def inner(func):
+        # [FUNCTION DOC] HELPER: Checks the function is a plain function named as
+        # the operator (ValueError otherwise), infers its schema, defines the
+        # operator, and returns the original function unchanged.
         if not inspect.isfunction(func):
             raise ValueError(
                 f"custom_op(...)(func): Expected `func` to be a Python "
@@ -119,6 +135,11 @@ def custom_op(qualname, func_or_schema=None):
 
 
 def impl(qualname, *, device_types=("cpu", "cuda"), func=None):
+    # [FUNCTION DOC] Registers a device implementation (cpu and/or cuda, default
+    # both) for an existing custom operator, found in the custom op registry or
+    # in the torch.library. Usable as a decorator (func omitted) or called with
+    # func. Returns the function unchanged. Errors (unknown op, duplicate or
+    # conflicting registration, unsupported device type) propagate.
     r"""Register an implementation for a device type for this custom op.
 
     If the op is passed multiple Tensor inputs with different device
@@ -173,6 +194,8 @@ def impl(qualname, *, device_types=("cpu", "cuda"), func=None):
     """
 
     def inner(func):
+        # [FUNCTION DOC] HELPER: Looks up the operator, registers func as the
+        # device implementation, and returns func.
         custom_op = _find_custom_op(qualname, also_check_torch_library=True)
         custom_op.impl(device_types, _stacklevel=3)(func)
         return func
@@ -183,6 +206,12 @@ def impl(qualname, *, device_types=("cpu", "cuda"), func=None):
 
 
 def impl_abstract(qualname, *, func=None):
+    # [FUNCTION DOC] Registers a fake/meta (shape-only) implementation for the
+    # operator by delegating to the torch.library fake registration, with the
+    # stack level adjusted for error locations. Decorator-friendly; returns
+    # whatever the library registration returns.
+    # KNOWN ISSUE: the docstring's first example has an abstract function that
+    # omits the bias parameter yet uses it, so it would not match the op.
     r"""Register an abstract implementation for this operator.
 
     An "abstract implementation" specifies the behavior of this operator on
@@ -258,12 +287,18 @@ def impl_abstract(qualname, *, func=None):
 
 
 def impl_save_for_backward(qualname, *, func=None):
+    # [FUNCTION DOC] Registers the function that selects what to save for the
+    # backward pass of a custom operator. Decorator-friendly; returns func
+    # unchanged. If a backward function was already registered, the autograd
+    # kernel is generated. Registration errors propagate.
     r"""Register a function that tells us what to save for backward.
 
     Please see :func:`impl_backward` for more details.
     """
 
     def inner(func):
+        # [FUNCTION DOC] HELPER: Looks up the operator, registers func as the
+        # save-for-backward function, and returns func.
         custom_op = _find_custom_op(qualname, also_check_torch_library=True)
         custom_op.impl_save_for_backward(_stacklevel=3)(func)
         return func
@@ -274,6 +309,11 @@ def impl_save_for_backward(qualname, *, func=None):
 
 
 def impl_backward(qualname, output_differentiability=None, *, func=None):
+    # [FUNCTION DOC] Registers the backward formula for a custom operator, with an
+    # optional per-output list of booleans saying which outputs are
+    # differentiable. Decorator-friendly; returns func unchanged. Once both
+    # backward and save-for-backward exist the autograd kernel is built. Errors
+    # for non-functional ops or bad differentiability lists propagate.
     r"""Registers a backward formula for an operator.
 
     In order for an operator to work with autograd, you need to register
@@ -311,6 +351,8 @@ def impl_backward(qualname, output_differentiability=None, *, func=None):
     """
 
     def inner(func):
+        # [FUNCTION DOC] HELPER: Looks up the operator, registers func as the
+        # backward function, and returns func.
         custom_op = _find_custom_op(qualname, also_check_torch_library=True)
         custom_op.impl_backward(output_differentiability, _stacklevel=3)(func)
         return func
@@ -321,6 +363,9 @@ def impl_backward(qualname, output_differentiability=None, *, func=None):
 
 
 def _destroy(qualname):
+    # [FUNCTION DOC] HELPER: Testing only. Finds the registered custom op (raises
+    # RuntimeError if unknown) and de-registers it, removing it from torch.ops
+    # and the global registry.
     """De-registers a custom op. For testing purposes only"""
     custom_op = _find_custom_op(qualname)
     custom_op._destroy()

@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Python decomposition registry. Holds three global tables mapping
+# operators to Python decomposition functions (post_autograd, pre_autograd,
+# meta) and the API to register, query and prune them. Exports: decomposition_table,
+# pre_autograd_decomposition_table, meta_table, register_decomposition,
+# get_decompositions, core_aten_decompositions, and the private
+# _should_decompose_because_unsafe_op. Import-time side effects: imports
+# torch._decomp.decompositions and torch._refs, which populate the tables via
+# register_decomposition, and mirrors registrations into native fake-dispatch
+# tables.
 import inspect
 import typing
 from collections import defaultdict
@@ -45,6 +54,11 @@ meta_table = global_decomposition_table["meta"]
 
 
 def _should_decompose_because_unsafe_op(op: torch._ops.OperatorBase) -> bool:
+    # [FUNCTION DOC] Returns True if an op must always be decomposed during
+    # export/compile tracing: only for op overloads that carry the
+    # maybe-aliasing-or-mutating tag, or the default overload of native batch
+    # norm (a temporary workaround for its incorrect schema). Non-overloads give
+    # False. No side effects.
     """
     Returns True if the op must always decompose in export/compile tracing system
 
@@ -63,6 +77,14 @@ def _should_decompose_because_unsafe_op(op: torch._ops.OperatorBase) -> bool:
 
 
 def _add_op_to_registry(registry, op, fn):
+    # [FUNCTION DOC] HELPER: Adds fn to the registry mapping for an op. A higher
+    # order operator is stored directly. An overload packet expands to all its
+    # overloads. Raises RuntimeError on duplicate registration of an overload;
+    # overloads without a dispatcher kernel are skipped. For registered ones,
+    # also tells the native fake dispatch about the decomposition (post_autograd
+    # table) or meta (meta table); pre_autograd needs nothing. Raises
+    # AssertionError if the packet type is unexpected or if the registry is an
+    # unknown global table not mirrored natively.
     """
     This is an internal API for adding an op to the decomposition table.
 
@@ -107,6 +129,14 @@ def _add_op_to_registry(registry, op, fn):
 
 
 def _convert_out_params(f):
+    # [FUNCTION DOC] HELPER: Adapts a decomposition that takes an out parameter to
+    # the calling convention of native function declarations. No out annotation:
+    # returns f unchanged. Tuple-typed out: returns a wrapper that pops each named
+    # out keyword (all or none must be given, AssertionError otherwise) and passes
+    # them as one tuple, with signature and annotations rewritten to the separate
+    # keyword-only names. Custom-named single out (flagged by an annotation which
+    # is removed from f): wrapper renames that keyword to out. Wrappers keep the
+    # out-wrapper marker attribute in the tuple case.
     out_annotation = f.__annotations__.get("out")
 
     # If there are no out params, do not wrap the function.
@@ -122,6 +152,9 @@ def _convert_out_params(f):
 
         @wraps(f)
         def _fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Collects the separate out keywords into one
+            # tuple (or None if none given) and calls f; AssertionError if only
+            # some are provided.
             out_kwargs = tuple(kwargs.pop(o, None) for o in out_names)
             # Either all of the out kwargs are set or none of them
             is_none = out_kwargs[0] is None
@@ -164,6 +197,8 @@ def _convert_out_params(f):
 
         @wraps(f)
         def _fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Pops the custom-named out keyword and passes
+            # its value to f as out (None if absent).
             out_kwarg = kwargs.pop(custom_out_param_name, None)
             return f(*args, **kwargs, out=out_kwarg)
 
@@ -196,6 +231,13 @@ def _convert_out_params(f):
 def register_decomposition(
     aten_op, registry=None, *, type="post_autograd", unsafe=False
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Returns a decorator that registers a function as the
+    # decomposition of one or more ops (any nested structure of ops accepted) in
+    # a registry: the given one, or the global table for the type (post_autograd,
+    # pre_autograd or meta; AssertionError otherwise). Unless unsafe is set, the
+    # function is first adapted for out parameters. Mutates the registry (and
+    # native fake dispatch tables); duplicate registration raises RuntimeError.
+    # The decorator returns the original, unwrapped function.
     """
     A decorator to register a function as a decomposition to the Python
     decomposition table.  Use it like this::
@@ -225,6 +267,8 @@ def register_decomposition(
         )
 
     def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: Applies the registration described above to fn
+        # for every op in aten_op and returns fn as originally given.
         orig_fn = fn
         if not unsafe:
             fn = _convert_out_params(fn)
@@ -234,6 +278,7 @@ def register_decomposition(
             registry = global_decomposition_table[type]
 
         def register(op):
+            # [FUNCTION DOC] HELPER: Adds one op's mapping to the chosen registry.
             _add_op_to_registry(registry, op, fn)
 
         # To handle allowing multiple aten_ops at once
@@ -247,6 +292,11 @@ def get_decompositions(
     aten_ops: Sequence[torch._ops.OperatorBase | OpOverloadPacket],
     type: str = "post_autograd",
 ) -> dict[torch._ops.OperatorBase, Callable]:
+    # [FUNCTION DOC] Returns a new mapping from operator overloads to their
+    # decomposition functions for the requested ops, from the global table of the
+    # given type (AssertionError for an unknown type). Packets expand to all
+    # their registered overloads; ops without a decomposition are ignored.
+    # Read-only on the registry.
     """
     Retrieve a dictionary of decompositions corresponding to the list of
     operator overloads and overload packets passed as input.  Overload
@@ -283,6 +333,9 @@ def remove_decompositions(
     decompositions: dict[torch._ops.OperatorBase, Callable],
     aten_ops: Sequence[OpOverload | OpOverloadPacket],
 ) -> None:
+    # [FUNCTION DOC] Removes entries from the given decomposition mapping
+    # (mutating it in place) for each listed overload, or for every overload of
+    # each listed packet. Missing entries are ignored. Returns nothing.
     """
     Given a dictionary of decompositions obtained from get_decompositions(), removes
     operators associated with a list of operator overloads and overload packets passed
@@ -303,6 +356,9 @@ import torch._refs
 
 
 def core_aten_decompositions() -> "CustomDecompTable":
+    # [FUNCTION DOC] Returns the default export decomposition table (the set that
+    # lowers to core ATen ops) by lazily importing and calling the export
+    # package's default_decompositions helper.
     from torch.export.exported_program import default_decompositions
 
     return default_decompositions()
@@ -316,6 +372,10 @@ def core_aten_decompositions() -> "CustomDecompTable":
 def _core_aten_decompositions_post_autograd() -> dict[
     torch._ops.OperatorBase, Callable
 ]:
+    # [FUNCTION DOC] HELPER: Returns the post-autograd decompositions for a fixed
+    # list of ATen ops chosen to yield core ATen (copied from the inductor
+    # decomposition list, excluding ones that produce prims). Ops absent from the
+    # table are silently skipped; the list also repeats one op, which is harmless.
     aten = torch.ops.aten
     return get_decompositions(
         [

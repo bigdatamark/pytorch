@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Deprecated CustomOp implementation. Defines the CustomOp class
+# (a Python handle on a dispatcher operator that records Python-registered
+# impls for devices, fake/abstract, factory, save-for-backward, backward and
+# autograd), the custom_op decorator, schema/name/device validation helpers,
+# error-report callbacks for missing kernels, and lookup helpers. Import-time
+# side effects: creates the global_registry mapping of qualified name to CustomOp
+# (which keeps ops alive) and constants for supported devices and reserved
+# namespaces.
 import dataclasses
 import functools
 import inspect
@@ -51,6 +59,9 @@ RESERVED_NS = {
 
 
 def warn_deprecated():
+    # [FUNCTION DOC] HELPER: Emits a DeprecationWarning saying torch._custom_op is
+    # deprecated in favor of torch.library. KNOWN ISSUE: the message promises
+    # removal in 2.6, which has long passed.
     warnings.warn(
         "torch._custom_op is deprecated and will be removed in PyTorch 2.6, please "
         "use the equivalent torch.library API instead.",
@@ -60,12 +71,23 @@ def warn_deprecated():
 
 
 def custom_op(qualname: str, manual_schema: str | None = None) -> typing.Callable:
+    # [FUNCTION DOC] Deprecated decorator factory for defining a custom op from a
+    # qualified name and optional manual schema string. Warns of deprecation and
+    # returns a decorator that validates the function (plain function, name
+    # matches), infers or validates the schema (functional, no self arg; a manual
+    # schema requires an unannotated, default-free matching signature), defines
+    # the op in a fragment library, builds a CustomOp, copies name/module/doc,
+    # registers the autograd indirection kernel and the missing-kernel error
+    # callback. The decorator returns the CustomOp. Raises ValueError on invalid
+    # input.
     r"""
     This API is deprecated, please use torch.library.custom_op instead
     """
     warn_deprecated()
 
     def inner(func):
+        # [FUNCTION DOC] HELPER: The decorator body described above; takes the
+        # prototype function and returns the new CustomOp.
         if not inspect.isfunction(func):
             raise ValueError(
                 f"custom_op(...)(func): Expected `func` to be a Python "
@@ -127,6 +149,14 @@ global_registry: dict[str, "CustomOp"] = {}
 
 
 class CustomOp:
+    # [CLASS DOC] Deprecated handle for a custom dispatcher operator. State: the
+    # parsed schema, namespace, owning Library, dispatcher handle, short and
+    # qualified names, a mapping from impl kind (device type, factory, abstract,
+    # backward, save_for_backward, autograd) to the function and its registration
+    # location, and a flag for the autograd indirection kernel. Each instance is
+    # recorded in the global registry. Calling it dispatches directly through the
+    # dispatcher. Key methods: impl, impl_factory, impl_abstract,
+    # impl_save_for_backward, impl_backward.
     r"""
     This API is deprecated, please use torch.library.custom_op instead
     """
@@ -134,6 +164,10 @@ class CustomOp:
     def __init__(
         self, lib, cpp_ns, schema, operator_name, ophandle, *, _private_access=False
     ):
+        # [FUNCTION DOC] Constructs the handle and registers it in the global
+        # registry under namespace::name (global mutation). Warns of deprecation.
+        # Raises RuntimeError unless the private access flag is set, since users
+        # must construct through the custom_op decorator.
         super().__init__()
         warn_deprecated()
         if not _private_access:
@@ -160,6 +194,9 @@ class CustomOp:
         global_registry[self._qualname] = self
 
     def _register_autograd_kernel_indirection(self):
+        # [FUNCTION DOC] HELPER: Registers the swappable autograd indirection
+        # kernel (holding only a weak reference to this op) on the Autograd key
+        # and sets the flag. Raises AssertionError if already registered.
         if self._registered_autograd_kernel_indirection:
             raise AssertionError("autograd kernel indirection already registered")
         self._lib.impl(
@@ -171,6 +208,10 @@ class CustomOp:
     # Note that this doesn't cause torch.library to use the impl, that
     # needs to be done in a separate self._lib.impl call.
     def _register_impl(self, kind, func, stacklevel=2):
+        # [FUNCTION DOC] HELPER: Records func and the caller source location (found
+        # via the given stack depth) under the impl kind. Raises RuntimeError
+        # naming the earlier location if that kind is already registered. Does not
+        # itself register a dispatcher kernel.
         if self._has_impl(kind):
             func_and_location = self._impls[kind]
             if func_and_location is None:
@@ -186,12 +227,18 @@ class CustomOp:
         self._impls[kind] = FuncAndLocation(func, location)
 
     def _get_impl(self, kind):
+        # [FUNCTION DOC] HELPER: Returns the recorded function-and-location entry
+        # for the impl kind; raises KeyError if absent.
         return self._impls[kind]
 
     def _has_impl(self, kind):
+        # [FUNCTION DOC] HELPER: Returns whether an impl of this kind is recorded.
         return kind in self._impls
 
     def _destroy(self):
+        # [FUNCTION DOC] HELPER: Testing aid. Deletes the library (dropping its
+        # registrations), removes the op from the torch.ops namespace if present,
+        # and removes it from the global registry. Leaves the object unusable.
         # NOTE: [CustomOp lifetime]
         # A CustomOp, once created, lives forever. The mechanism is that the
         # global registry holds a reference to it. However, to make testing
@@ -207,9 +254,12 @@ class CustomOp:
         del global_registry[self._qualname]
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns a string showing the qualified op name.
         return f'<CustomOp(op="{self._qualname}")>'
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Invokes the operator through the dispatcher handle
+        # directly, bypassing torch.ops, and returns its result.
         # Bypass torch.ops.* and directly do OperatorHandle::callBoxed.
         # Using torch.ops.* is a bit of a pain (it can be slow and it has lifetime
         # issues from caching operators that make testing CustomOp difficult).
@@ -221,6 +271,10 @@ class CustomOp:
         device_types: str | typing.Iterable[str],
         _stacklevel=2,
     ) -> typing.Callable:
+        # [FUNCTION DOC] Deprecated. Takes one or more device type names (cpu,
+        # cuda); raises ValueError for unsupported ones. Returns a decorator that,
+        # per distinct device type, checks no pre-existing library kernel exists,
+        # records the impl, and registers it on the matching dispatch key.
         r"""
         This API is deprecated, please use torch.library.custom_op instead
         """
@@ -230,6 +284,8 @@ class CustomOp:
             validate_device_type(device_type)
 
         def inner(f):
+            # [FUNCTION DOC] HELPER: Registers f for each device type and returns
+            # f; raises RuntimeError on conflicts or duplicate registration.
             for device_type in set(device_types):
                 self._check_doesnt_have_library_impl(device_type)
                 self._register_impl(device_type, f, stacklevel=_stacklevel)
@@ -240,6 +296,10 @@ class CustomOp:
         return inner
 
     def _check_doesnt_have_library_impl(self, device_type):
+        # [FUNCTION DOC] HELPER: Returns quietly if a Python impl for the device is
+        # already recorded; otherwise raises RuntimeError if the dispatcher
+        # already has a computed kernel for that device key from some other
+        # registration.
         if self._has_impl(device_type):
             return
         key = SUPPORTED_DEVICE_TYPE_TO_KEY[device_type]
@@ -251,9 +311,14 @@ class CustomOp:
             )
 
     def impl_factory(self) -> typing.Callable:
+        # [FUNCTION DOC] Returns a decorator that registers a function as the
+        # implementation of a factory op (no tensor inputs) on the BackendSelect
+        # key, recording it under the factory kind. Raises RuntimeError if one
+        # exists already.
         r"""Register an implementation for a factory function."""
 
         def inner(f):
+            # [FUNCTION DOC] HELPER: Records and registers f, then returns f.
             self._register_impl("factory", f)
             library.impl(self._lib, self._opname, "BackendSelect")(f)
             return f
@@ -261,11 +326,19 @@ class CustomOp:
         return inner
 
     def impl_abstract(self, _stacklevel=2) -> typing.Callable:
+        # [FUNCTION DOC] Deprecated. Returns a decorator registering a
+        # shape-only (abstract) implementation, recorded under the abstract kind
+        # and also installed on the Meta key wrapped so that asking for the
+        # fake-mode context inside it raises an informative RuntimeError (ops with
+        # data-dependent shapes cannot have a Meta kernel). Raises RuntimeError
+        # if a conflicting Meta or composite kernel already exists.
         r"""
         This API is deprecated, please use torch.library.custom_op instead
         """
 
         def inner(f):
+            # [FUNCTION DOC] HELPER: Performs the checks, records f, installs the
+            # wrapped Meta kernel, and returns f.
             self._check_doesnt_have_library_meta_impl()
             self._register_impl("abstract", f, stacklevel=_stacklevel)
             location = self._get_impl("abstract").location
@@ -275,7 +348,11 @@ class CustomOp:
             # Handle DispatchKey.Meta registration
             @functools.wraps(f)
             def f_with_ctx(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Runs f with the context getter replaced
+                # by one that raises, and returns f's result.
                 def error_on_ctx():
+                    # [FUNCTION DOC] HELPER: Always raises RuntimeError explaining
+                    # that the context is unavailable in a Meta kernel.
                     raise RuntimeError(
                         f"Attempted to call get_ctx() for the meta implementation "
                         f"for {qualname}."
@@ -296,7 +373,13 @@ class CustomOp:
         return inner
 
     def _check_can_register_backward(self):
+        # [FUNCTION DOC] HELPER: Validates the schema permits a backward formula:
+        # it must be functional, have returns, return no non-mutating views, and
+        # every return must be int, SymInt, bool, float, Tensor or a list of
+        # Tensor. Raises RuntimeError otherwise; returns nothing.
         def error(detail):
+            # [FUNCTION DOC] HELPER: Raises RuntimeError naming the op, its schema
+            # and the unsupported detail.
             raise RuntimeError(
                 f"Cannot use torch._custom_ops APIs to register backward "
                 f"formula for {detail}. Got operator "
@@ -336,6 +419,10 @@ class CustomOp:
             )
 
     def _check_doesnt_have_library_autograd_impl(self):
+        # [FUNCTION DOC] HELPER: If the autograd indirection is already registered
+        # returns quietly; otherwise raises RuntimeError if the op already has a
+        # CompositeImplicitAutograd kernel or an Autograd, AutogradCPU or
+        # AutogradCUDA kernel registered elsewhere.
         if self._registered_autograd_kernel_indirection:
             return
 
@@ -364,6 +451,11 @@ class CustomOp:
                 )
 
     def _check_doesnt_have_library_meta_impl(self):
+        # [FUNCTION DOC] HELPER: Decides whether an abstract impl may be added.
+        # Allowed if one is already recorded, or if the op has a
+        # CompositeExplicitAutograd kernel but no Meta kernel (escape hatch).
+        # Otherwise raises RuntimeError if the op has a CompositeImplicitAutograd
+        # kernel or an existing Meta kernel.
         if self._has_impl("abstract"):
             return
 
@@ -408,6 +500,10 @@ class CustomOp:
     # When both of these have been provided, then we automatically
     # construct the "autograd" kernel.
     def _register_autograd_kernel(self):
+        # [FUNCTION DOC] HELPER: Once both backward and save_for_backward are
+        # recorded, builds the autograd kernel from them and records it under the
+        # autograd kind (picked up by the indirection kernel). Raises
+        # AssertionError if either is missing.
         if not self._has_impl("backward"):
             raise AssertionError("backward impl must be registered first")
         if not self._has_impl("save_for_backward"):
@@ -423,12 +519,19 @@ class CustomOp:
         self._register_impl("autograd", kernel)
 
     def impl_save_for_backward(self, _stacklevel=2):
+        # [FUNCTION DOC] Returns a decorator registering the function that chooses
+        # what to save for backward. The decorator checks backward is allowed,
+        # ensures the autograd indirection is registered, records the function,
+        # and builds the autograd kernel if backward is also registered.
         r"""Register a function that tells us what to save for backward.
 
         Please see impl_backward for more details.
         """
 
         def inner(f):
+            # [FUNCTION DOC] HELPER: Performs the registration steps above.
+            # KNOWN ISSUE: returns None instead of f, so a decorated function
+            # name becomes None.
             self._check_can_register_backward()
             self._check_doesnt_have_library_autograd_impl()
             if not self._registered_autograd_kernel_indirection:
@@ -440,12 +543,20 @@ class CustomOp:
         return inner
 
     def impl_backward(self, output_differentiability=None, _stacklevel=2):
+        # [FUNCTION DOC] Deprecated. Validates the optional output
+        # differentiability (must be a list of bools whose length equals the
+        # number of op returns, else RuntimeError) and returns a decorator that
+        # registers the backward function: checks allowed, ensures the autograd
+        # indirection, records the function and the differentiability list, and
+        # builds the autograd kernel if save_for_backward exists.
         r"""
         This API is deprecated, please use torch.library.custom_op instead
         """
         if output_differentiability is not None:
 
             def yell():
+                # [FUNCTION DOC] HELPER: Raises RuntimeError describing the
+                # expected output_differentiability format.
                 raise RuntimeError(
                     f"impl_backward(output_differentiability): expected "
                     f"output_differentiability to be a list of bools with "
@@ -462,6 +573,9 @@ class CustomOp:
                 yell()
 
         def inner(f):
+            # [FUNCTION DOC] HELPER: Performs the registration steps above.
+            # KNOWN ISSUE: returns None instead of f, so a decorated function
+            # name becomes None.
             self._check_can_register_backward()
             self._check_doesnt_have_library_autograd_impl()
             if not self._registered_autograd_kernel_indirection:
@@ -476,11 +590,16 @@ class CustomOp:
 
 @dataclasses.dataclass
 class FuncAndLocation:
+    # [CLASS DOC] HELPER: Plain record pairing a registered callable with a string
+    # describing where it was registered (file and line).
     func: typing.Callable
     location: str
 
 
 def find_ophandle_or_throw(cpp_ns: str, operator_name: OperatorName):
+    # [FUNCTION DOC] HELPER: Looks up the dispatcher handle for namespace plus
+    # operator name (empty overload name if none) and returns it; the native
+    # lookup raises if the schema is not defined.
     overload_name = (
         "" if operator_name.overload_name is None else operator_name.overload_name
     )
@@ -490,6 +609,8 @@ def find_ophandle_or_throw(cpp_ns: str, operator_name: OperatorName):
 
 
 def validate_namespace(ns: str) -> None:
+    # [FUNCTION DOC] Raises ValueError if the namespace contains a dot or is one of
+    # the reserved internal namespaces; returns nothing otherwise.
     if "." in ns:
         raise ValueError(
             f'custom_op(..., ns="{ns}"): expected ns to not contain any . (and be a '
@@ -503,6 +624,9 @@ def validate_namespace(ns: str) -> None:
 
 
 def validate_schema(schema: FunctionSchema) -> None:
+    # [FUNCTION DOC] Raises ValueError unless the schema is functional (no
+    # mutation, no view returns, at least one return) and has no argument named
+    # self; returns nothing otherwise.
     if not torch._library.utils.is_functional_schema(schema):
         raise ValueError(
             f"custom_op only supports functional operators "
@@ -520,6 +644,9 @@ def validate_schema(schema: FunctionSchema) -> None:
 
 
 def parse_qualname(qualname: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits a namespace-qualified op name on the first double
+    # colon into (namespace, name). Raises ValueError if there is no namespace or
+    # the name part contains a dot (overloads unsupported).
     names = qualname.split("::", 1)
     if len(names) != 2:
         raise ValueError(
@@ -537,6 +664,8 @@ def parse_qualname(qualname: str) -> tuple[str, str]:
 
 
 def validate_device_type(device_type: str) -> None:
+    # [FUNCTION DOC] Raises ValueError if the device type is not one of the
+    # supported device types (cpu, cuda); returns nothing otherwise.
     if device_type not in SUPPORTED_DEVICE_TYPE_TO_KEY:
         raise ValueError(
             f"CustomOp.impl(device_types=[{device_type}, ...]): we only support device_type "
@@ -545,6 +674,8 @@ def validate_device_type(device_type: str) -> None:
 
 
 def supported_param(param: inspect.Parameter) -> bool:
+    # [FUNCTION DOC] HELPER: True if the parameter is positional-or-keyword or
+    # keyword-only (not positional-only, varargs or varkwargs).
     return param.kind in (
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
@@ -554,6 +685,10 @@ def supported_param(param: inspect.Parameter) -> bool:
 def validate_function_matches_schema(
     schema: FunctionSchema, func: typing.Callable
 ) -> None:
+    # [FUNCTION DOC] Checks that a function used with a manual schema matches it:
+    # only positional-or-keyword and keyword-only params, no annotations at all,
+    # no defaults on either side, and the same names in the same order for the
+    # positional and keyword-only groups. Raises ValueError otherwise.
     sig = inspect.signature(func)
 
     if not all(supported_param(p) for p in sig.parameters.values()):
@@ -587,6 +722,7 @@ def validate_function_matches_schema(
     ]
 
     def error():
+        # [FUNCTION DOC] HELPER: Raises ValueError for a signature/schema mismatch.
         raise ValueError(
             f"custom_op(..., manual_schema)(func): When passing in a manual "
             f"schema, we expect `func`'s signature to match `manual_schema` "
@@ -595,6 +731,7 @@ def validate_function_matches_schema(
         )
 
     def error_default_args():
+        # [FUNCTION DOC] HELPER: Raises ValueError because defaults are disallowed.
         raise ValueError(
             f"custom_op(..., manual_schema)(func): "
             f"neither func nor manual_schema should have default "
@@ -603,6 +740,8 @@ def validate_function_matches_schema(
         )
 
     def compare(sig_args, schema_args):
+        # [FUNCTION DOC] HELPER: Compares function params with schema args by
+        # count, name and absence of defaults; raises ValueError on difference.
         if len(sig_args) != len(schema_args):
             error()
         for (name, param), arg in zip(sig_args, schema_args):
@@ -616,6 +755,10 @@ def validate_function_matches_schema(
 
 
 def report_error_callback(custom_op: typing.Any, key: str) -> None:
+    # [FUNCTION DOC] HELPER: Dispatcher callback invoked when no kernel exists for
+    # a dispatch key. Always raises NotImplementedError with a key-specific hint:
+    # Undefined (no tensor inputs, suggests factory impl), Meta (no abstract
+    # impl), CPU or CUDA (no device impl), or a generic message otherwise.
     if key == "Undefined":
         raise NotImplementedError(
             f"{custom_op}: There were no Tensor inputs to this operator "
@@ -646,6 +789,10 @@ def report_error_callback(custom_op: typing.Any, key: str) -> None:
 
 
 def custom_op_from_existing(op):
+    # [FUNCTION DOC] HELPER: Wraps an already-defined op overload (e.g. from
+    # torch.library) in a new CustomOp, using a fresh fragment library for its
+    # namespace and parsing its schema without the namespace prefix. Returns the
+    # CustomOp, which is also added to the global registry.
     ns = op.namespace
     lib = torch.library.Library(ns, "FRAGMENT")
     name = op.name().split("::")[-1]
@@ -657,7 +804,11 @@ def custom_op_from_existing(op):
 
 
 def get_op(qualname):
+    # [FUNCTION DOC] Resolves a qualified op name to its default overload object
+    # in torch.ops. Raises ValueError if the namespace, op or default overload is
+    # not found (e.g. not registered or library not loaded).
     def error_not_found():
+        # [FUNCTION DOC] HELPER: Raises ValueError saying the op was not found.
         raise ValueError(
             f"Could not find the operator {qualname}. Please make sure you have "
             f"already registered the operator and (if registered from C++) "
@@ -677,6 +828,9 @@ def get_op(qualname):
 
 
 def _find_custom_op(qualname, also_check_torch_library=False):
+    # [FUNCTION DOC] HELPER: Returns the CustomOp for a qualified name from the
+    # global registry. If missing: raises RuntimeError unless the flag is set, in
+    # which case it wraps the existing torch.ops operator in a new CustomOp.
     if qualname in global_registry:
         return global_registry[qualname]
     if not also_check_torch_library:
@@ -690,6 +844,9 @@ def _find_custom_op(qualname, also_check_torch_library=False):
 
 
 def get_abstract_impl(qualname):
+    # [FUNCTION DOC] Returns the abstract (fake) implementation function recorded
+    # for the qualified op name, or None if the op is not in the registry or has
+    # no abstract impl. Used by fake tensor machinery.
     if qualname not in torch._custom_op.impl.global_registry:
         return None
     custom_op = torch._custom_op.impl.global_registry[qualname]
@@ -701,6 +858,11 @@ def get_abstract_impl(qualname):
 
 
 def _custom_op_with_schema(qualname, schema, needs_fixed_stride_order=True):
+    # [FUNCTION DOC] HELPER: Defines an op from a qualified name and a schema
+    # suffix string (validated as functional), optionally tagging it as needing a
+    # fixed stride order, creates its CustomOp, registers the autograd
+    # indirection and the missing-kernel error callback. Returns the default
+    # overload object from torch.ops. Raises ValueError on invalid schema.
     ns, name = qualname.split("::")
     schema_str = f"{name}{schema}"
     function_schema = FunctionSchema.parse(schema_str)

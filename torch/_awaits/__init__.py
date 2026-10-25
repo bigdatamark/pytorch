@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Python-side definition of the Await type, a generic wrapper
+# around the native torch._C._Await that represents delayed execution of a
+# callable (used by the JIT awaitable primitives). Exports: Await (listed in the
+# export list; note the class actually defined here is named _Await).
+# KNOWN ISSUE: the export list names Await but no such name is defined in this
+# module, so a star import would fail; only _Await exists.
 from __future__ import annotations
 
 from typing import Generic, TypeVar
@@ -10,9 +16,17 @@ __all__ = ['Await']
 W = TypeVar("W")
 
 class _PyAwaitMeta(type(torch._C._Await), type(Generic)):  # type: ignore[misc, no-redef]
+    # [CLASS DOC] HELPER: Metaclass combining the native Await metaclass with the
+    # Generic metaclass so that the Python Await class can be both a subclass of
+    # the native type and subscriptable. No state or methods of its own.
     pass
 
 class _Await(torch._C._Await, Generic[W], metaclass=_PyAwaitMeta):
+    # [CLASS DOC] Generic Python wrapper over the native Await object, holding a
+    # callable plus its args for deferred execution, with result type W. All
+    # behavior (fn, args, is_nowait, waiting) comes from the native base class;
+    # in eager mode attribute access is forwarded to the awaited result. This
+    # class adds only typing support and defines no methods itself.
     r"""
     Wrapper around a ``torch._C.Await`` which encapsulates delayed execution
     of a callable. All manipulations happen with functions ``torch.jit._awaitable``,
