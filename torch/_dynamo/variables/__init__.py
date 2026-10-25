@@ -1,3 +1,18 @@
+# [PACKAGE DOC] Package of Dynamo VariableTracker classes. Each variable class wraps one kind of
+# Python value seen during symbolic bytecode tracing (tensors, constants, lists, dicts, sets,
+# functions, context managers, nn modules, iterators, user-defined objects, higher-order ops,
+# streams, etc.) and implements how operations on it are traced into the FX graph.
+# Contents: submodules base, builtin, constant, ctx_manager, dicts, distributed, functions,
+# higher_order_ops, iter, lazy, lists, memory, misc, nn_module, optimizer, sdpa, sets, streams,
+# tensor, torch, user_defined.
+# Exports: re-exports the commonly used variable classes plus the device context manager
+# helpers (get_device_context_manager, register_device_context_manager) via the explicit export
+# list. Importing the package imports all submodules (import-time side effects are those of
+# those submodules).
+# KNOWN ISSUE: the export list is not complete; many classes imported here (for example
+# ConstDictVariable-adjacent ones like DictItemsVariable, and most of the ctx_manager,
+# functions, iter, sets and user_defined classes) are imported but not listed, and it is not
+# strictly sorted.
 """
 This package implements variable tracking and symbolic execution capabilities for Dynamo,
 which are essential for converting Python code into FX graphs. It provides a comprehensive
