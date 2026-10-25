@@ -1,3 +1,13 @@
+# [MODULE DOC] Repro generation, minification and accuracy analysis for graphs
+# after AOT Autograd (the Inductor-facing stage). Main pieces: a compiler
+# wrapper (wrap_compiler_debug) that dumps repro/minifier scripts on failure or
+# bad accuracy; generators that serialize an FX graph, its inputs, config, env
+# vars and user Triton kernels into a standalone script; minifier predicates
+# (inductor_fails, inductor_accuracy_fails); and the command-line driver
+# run_repro (run / minify / analyze / get_args / minifier-query) embedded in
+# generated scripts. Import-time side effects: imports Triton if present (else
+# defines placeholder classes), loads the inductor config module, and sets the
+# module flag use_buck from the fbcode check.
 """
 Utilities for reproducing and debugging issues in PyTorch's Dynamo AOT compilation.
 
@@ -50,15 +60,23 @@ try:
 except ImportError:
 
     class Autotuner:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Empty placeholder used when Triton is not installed
+        # so isinstance checks against Triton autotuner kernels are always false.
         pass
 
     class JITFunction:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Empty placeholder used when Triton is not installed
+        # so isinstance checks against Triton JIT kernels are always false.
         pass
 
     class Heuristics:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Empty placeholder used when Triton is not installed
+        # so isinstance checks against Triton heuristics wrappers are always false.
         pass
 
     class TritonConstexpr:  # type: ignore[no-redef]
+        # [CLASS DOC] HELPER: Empty placeholder used when Triton is not installed
+        # so isinstance checks against Triton constexpr values are always false.
         pass
 
 
@@ -103,6 +121,10 @@ from .. import config
 def _find_repeat_interleave_constraints(
     gm: torch.fx.GraphModule,
 ) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Scans the graph for repeat_interleave calls whose
+    # first argument and output_size keyword are both graph placeholders. Returns
+    # a list of (repeats placeholder name, output_size placeholder name) pairs.
+    # Pure; no side effects. Nodes missing either placeholder form are skipped.
     """
     Find repeat_interleave operations with output_size constraints.
 
@@ -150,6 +172,8 @@ inductor_config = import_module("torch._inductor.config")
 
 
 class GroupInfo(TypedDict):
+    # [CLASS DOC] HELPER: Typed mapping describing one process group: its
+    # world size and the rank of the current process within it.
     size: int
     rank: int
 
@@ -157,6 +181,12 @@ class GroupInfo(TypedDict):
 def _extract_distributed_info(
     gm: torch.fx.GraphModule,
 ) -> dict[str, GroupInfo]:
+    # [FUNCTION DOC] HELPER: Walks graph nodes that call c10d functional
+    # collective op overloads, normalizes their arguments to keywords, and for each
+    # distinct string group_name resolves the live process group to record its size
+    # and this process's rank. Returns a mapping from group name to GroupInfo.
+    # Nodes that are not such ops, cannot be normalized, or lack a string group name
+    # are skipped. Requires the named groups to exist in the current process.
     """
     Extract process group information from distributed ops in the graph.
 
@@ -210,6 +240,13 @@ def _extract_distributed_info(
 def setup_fake_process_groups(
     group_info: dict[str, GroupInfo],
 ) -> None:
+    # [FUNCTION DOC] Recreates fake (single-process) distributed state for a repro
+    # run. Does nothing for an empty mapping. Otherwise initializes a default fake
+    # process group with the largest group size as world size (rank taken from the
+    # first group of that size), clears all registered process groups, then
+    # registers the default group under every full-size group name and creates and
+    # registers new groups (ranks 0..size-1) for smaller ones. Side effects: mutates
+    # global distributed state.
     """
     Set up fake process groups for repro execution.
 
@@ -259,6 +296,10 @@ def generate_standalone_repro(
     *,
     save_path: str | None = None,
 ) -> str:
+    # [FUNCTION DOC] Builds the text of a standalone inductor repro script for the
+    # graph and example args by writing it to an in-memory buffer (no save dir, so
+    # inputs are not stored on disk). If save_path is given, also writes the script
+    # to that file and logs it. Returns the script text.
     """
     Generate a self-contained repro script from an FX graph.
     """
@@ -285,6 +326,11 @@ def wrap_compiler_debug(
     unconfigured_compiler_fn: _CompileFxCallable,
     compiler_name: str,
 ) -> _CompileFxCallable:
+    # [FUNCTION DOC] Wraps a compile_fx-style compiler so failures or accuracy
+    # problems are turned into repro/minifier scripts, according to the
+    # repro_after and repro_level config. Returns the wrapper (debug_wrapper), which
+    # preserves the wrapped function's metadata. compiler_name is used in dump
+    # names and must be inductor for accuracy mode.
     """
     Minifier for Fx Graph modules after Aot Autograd has finished. We wrap both
     forward and backward call separately with the backend compiler_fn - like
@@ -300,6 +346,13 @@ def wrap_compiler_debug(
         compile_region_name: str | None = None,
         **kwargs: Unpack[_CompileFxKwargs],
     ) -> OutputCode:
+        # [FUNCTION DOC] HELPER: Compiles the graph with the wrapped compiler
+        # (extra kwargs and region name bound). Raises if repro_after is not
+        # dynamo, aot or unset. If compilation raises and repro_after is aot, dumps
+        # graph state (level 1) or a minifier launcher (level 2) from a pre-compile
+        # copy of the graph, logs, and re-raises. When repro_after is aot returns a
+        # boxed callable that defers to inner_debug_fn on real inputs; otherwise
+        # returns the compiled function unchanged.
         from torch._subclasses import FakeTensorMode
 
         compiler_fn = functools.partial(
@@ -347,6 +400,11 @@ def wrap_compiler_debug(
         def deferred_for_real_inputs(
             real_inputs: Sequence[InputType], **_kwargs: object
         ) -> Any:
+            # [FUNCTION DOC] HELPER: Boxed-call entry that runs the compiled
+            # function on real inputs. Raises if unexpected kwargs are passed. If
+            # repro_after is not aot, calls the compiled function directly (error if
+            # it is a string); otherwise runs inner_debug_fn with repro_after
+            # temporarily disabled to avoid recursive minification.
             # This is a bit obscure: if we recursively try to accuracy minify
             # the SAME function, this would trigger.  But most of the time
             # we should never hit this branch
@@ -360,6 +418,14 @@ def wrap_compiler_debug(
                 return inner_debug_fn(real_inputs)
 
         def inner_debug_fn(real_inputs: Sequence[InputType]) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the compiled function on real inputs with
+            # debugging by repro_level. Level 3 always dumps a minifier launcher
+            # first. Level 4 (inductor only, else NotImplementedError) compares
+            # against eager for accuracy; on failure dumps graph state and minifier
+            # script and raises AccuracyError. Otherwise runs the compiled function,
+            # synchronizes the accelerator for non-CPU inputs to surface faults, and
+            # on exception dumps state (level 1) or minifier script (level 2) from
+            # fake copies of the inputs before re-raising. Returns the outputs.
             """
             Aot Autograd fw_compiler and bw_compiler can have fake tensors. So,
             example_inputs can be fake tensors. We can call compiler_fn (which is
@@ -457,6 +523,9 @@ def wrap_compiler_debug(
 
 
 def maybe_fbcode_instructions() -> str:
+    # [FUNCTION DOC] HELPER: Returns a quoted instruction block (how to run the
+    # repro under buck, including a TARGETS template with extra deps) when running
+    # in fbcode, otherwise an empty string.
     if is_fbcode():
         extra_deps_formatted = "\n".join([f'        "{dep}",' for dep in extra_deps])
         if len(extra_deps_formatted) > 0:
@@ -489,6 +558,11 @@ python_binary(
 
 
 def generate_custom_triton_kernel(kernel: Any) -> str:
+    # [FUNCTION DOC] Returns source text recreating a user Triton kernel. For an
+    # autotuner, emits an autotune decorator listing each config (kwargs, warps,
+    # stages) with an empty key; a heuristics-wrapped kernel yields only an error
+    # message string. Then appends a jit decorator and the kernel source (taken from
+    # the kernel or its wrapped function). Pure.
     res = ""
     if isinstance(kernel, Autotuner):
         # pyrefly: ignore [missing-attribute]
@@ -534,6 +608,15 @@ def generate_compiler_repro_string(
     stable_hash: bool = False,
     has_distributed_ops: bool = False,
 ) -> str:
+    # [FUNCTION DOC] Builds the full text of a repro script body (everything before
+    # the main block): env var and config setup, imports (distributed and Triton
+    # ones as needed), optional version/system comments, re-registration of user
+    # Triton kernels (with referenced constants, imports and nested kernels), the
+    # module source for the graph, input-loading code (tensors, symints, None,
+    # opaque objects, generators, unsupported), symbol hint definitions prepended at
+    # the top, repeat_interleave fixup lines, and creation of the Repro module.
+    # Reads the global kernel side table. Returns the script string. Kernels that
+    # fail with an attribute error produce an ERROR line in the output instead.
     if save_dir is not None:
         save_dir = normalize_path_separator(save_dir)
     # Add distributed imports if needed
@@ -605,10 +688,16 @@ if "__compile_source__" in globals():
     )
 
     def get_fn_name(kernel: Any) -> str:
+        # [FUNCTION DOC] HELPER: Returns the unqualified function name of a Triton
+        # kernel, unwrapping autotuner wrappers.
         fn: Any = kernel if isinstance(kernel, JITFunction) else kernel.fn
         return fn.__name__.split(".")[-1]
 
     def get_triton_import_line(name: str, val: Any) -> str | None:
+        # [FUNCTION DOC] HELPER: Given a global name and value referenced by kernel
+        # source, returns an import statement line recreating it if it is a Triton
+        # module or object (module alias or from-import, with rename when needed);
+        # returns None for the names triton and tl or non-Triton values.
         # User-defined Triton kernels are serialized from their source, not from
         # their original Python module.  If the source references a global
         # imported from Triton, such as `from triton.language.extra import
@@ -641,6 +730,12 @@ if "__compile_source__" in globals():
         written_nested_kernels: set[str],
         written_triton_imports: set[str],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Parses the kernel source to find referenced and
+        # called names, then returns text defining needed Triton import lines,
+        # simple constants (constexpr, int, float, str, bool globals) and nested
+        # JIT kernels (recursively, with dependencies first). Mutates the three
+        # passed sets to avoid duplicates and cycles. Returns empty text if the
+        # kernel lacks function or source.
         """Write out global triton imports, tl.constexpr vars, and nested kernels."""
         result = ""
         jit_fn = kernel if isinstance(kernel, JITFunction) else kernel.fn
@@ -856,8 +951,14 @@ def save_graph_repro(
     check_str: str | None = None,
     stable_hash: bool = False,
 ) -> None:
-    if any(
-        isinstance(arg, torch.fx.experimental._backward_state.BackwardState)
+    # [FUNCTION DOC] Writes a complete runnable repro script to the file object.
+    # If any arg is a BackwardState, writes only an explanatory message and returns.
+    # Otherwise writes the generated body, then a main block calling run_repro with
+    # accuracy (defaulting to whether compiler_name contains accuracy), tracing mode
+    # (symbolic if any arg has free symbols, else real), command, save_dir and
+    # check_str; adds fake process group setup and teardown when the graph has
+    # distributed ops. Side effect: writes to fd.
+
         for arg in args
     ):
         fd.write(
@@ -922,6 +1023,10 @@ def dump_compiler_graph_state(
     *,
     accuracy: str | bool | None = None,
 ) -> None:
+    # [FUNCTION DOC] Saves a repro checkpoint named by node count into the
+    # minifier checkpoints directory (created if needed), logs it, and copies it to
+    # repro.py in the current directory for convenience (plus a buck target in
+    # fbcode). A failed copy due to permissions is only logged as a warning.
     subdir = os.path.join(minifier_dir(), "checkpoints")
     if not os.path.exists(subdir):
         os.makedirs(subdir, exist_ok=True)
@@ -952,6 +1057,10 @@ def dump_compiler_graph_state(
 def dump_to_minify(
     gm: torch.fx.GraphModule, args: Sequence[Any], compiler_name: str
 ) -> None:
+    # [FUNCTION DOC] Renders a repro script with the minify command into memory
+    # (inputs saved in the checkpoints directory, created if needed) and hands it
+    # to the shared minifier-launcher helper, which writes the launcher file.
+    # KNOWN ISSUE: annotated as returning None but returns the helper's result.
     out = io.StringIO()
     # TODO: factor this out
     subdir = os.path.join(minifier_dir(), "checkpoints")
@@ -971,6 +1080,11 @@ def isolate_fails(
     tracing_mode: str | None = None,
     check_str: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Minifier predicate that tests a graph in a separate process.
+    # Writes a minifier-query repro script to a random file in an isolate
+    # subdirectory of the current directory, runs it with the current environment
+    # overlaid by env (via buck in fbcode, else the current interpreter), echoes its
+    # indented stdout and stderr, and returns True when the process exits nonzero.
     if env is None:
         env = {}
     subdir = os.path.join(os.getcwd(), "isolate")
@@ -1032,11 +1146,18 @@ def isolate_fails(
 def inductor_fails(
     fx_g: torch.fx.GraphModule, args: Sequence[Any], check_str: str | None = None
 ) -> bool:
+    # [FUNCTION DOC] Minifier predicate: True if compiling and running the graph
+    # with Inductor raises an error (matching check_str when given, and printing
+    # it). First runs the graph eagerly; if eager fails or returns something other
+    # than a flat tuple/list, returns False (not a valid candidate). Syncs the
+    # accelerator when inputs are on a non-CPU device so faults surface.
     has_gpu = any(
         isinstance(arg, torch.Tensor) and arg.device.type != "cpu" for arg in args
     )
 
     def sync() -> None:
+        # [FUNCTION DOC] HELPER: Synchronizes the accelerator if inputs were on a
+        # non-CPU device and an accelerator is available.
         if has_gpu and torch.accelerator.is_available():
             # Ensures that segfaults are surfaced
             torch.accelerator.synchronize()
@@ -1079,11 +1200,18 @@ def inductor_accuracy_fails(
     require_fp64: bool = False,
     ignore_non_fp: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Minifier predicate for accuracy: returns True if the Inductor
+    # compiled graph diverges from eager (versus fp64 reference when require_fp64),
+    # optionally ignoring non-floating outputs. Delegates to the forward-only
+    # accuracy checker with a compile function that derives compile args from the
+    # graph. The check_str argument is accepted but unused.
     from torch._inductor.compile_fx import compile_fx_inner
 
     def _compile_with_symbolic_args(
         gm: torch.fx.GraphModule, inputs: list[Any]
     ) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Compiles gm with Inductor using compile args
+        # extracted from placeholder metadata when traced symbolically.
         return compile_fx_inner(gm, _get_compile_args(gm, inputs))  # type: ignore[return-value]
 
     return backend_aot_accuracy_fails(
@@ -1108,6 +1236,14 @@ def _build_symbolic_wrapper(
     args: list[Any],
     symint_exprs: dict[int, str],
 ) -> tuple[nn.Module, list[Any]] | None:
+    # [FUNCTION DOC] HELPER: Builds a wrapper module and argument list preserving
+    # symbolic relationships among integer args. Splits symint expression strings
+    # (by arg index) into free symbols (names like s followed by digits) and derived
+    # expressions. Returns None when there are no free symbols. Otherwise returns a
+    # wrapper that takes carrier int8 tensors (one per free symbol, sized by the
+    # hint, on the first CUDA tensor's device else CPU) followed by non-symint args,
+    # reads sizes from carriers, evaluates derived expressions, and calls the inner
+    # module. Currently unused by repro_common.
     """Build a wrapper module that preserves symbolic relationships.
 
     Returns (wrapper_module, wrapper_args) where wrapper_args has carrier
@@ -1146,11 +1282,22 @@ def _build_symbolic_wrapper(
     n_args = len(args)
 
     class _SymIntWrapper(nn.Module):
+        # [CLASS DOC] HELPER: Module that rebuilds the original integer arguments
+        # from carrier tensor sizes and derived expressions, then calls the wrapped
+        # inner module. State: inner (the wrapped module).
         def __init__(self, inner: nn.Module) -> None:
+            # [FUNCTION DOC] HELPER: Stores the wrapped module.
             super().__init__()
             self.inner = inner
 
         def forward(self, *flat_args: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Takes carrier tensors then other args; maps
+            # each free symbol name to its carrier's first-dimension size,
+            # evaluates derived expressions (with no builtins) over those symbols,
+            # reassembles the original argument order, and returns the inner
+            # module's result.
+            # KNOWN ISSUE: a statement that indexes derived_positions has no
+            # effect (leftover "keep reference" line).
             carriers = flat_args[: len(free_order)]
             other = flat_args[len(free_order) :]
 
@@ -1195,6 +1342,13 @@ def _build_symbolic_wrapper(
 def repro_common(
     options: ReproOptions, mod: nn.Module, load_args: Any
 ) -> tuple[torch.fx.GraphModule, list[Any]]:
+    # [FUNCTION DOC] Shared setup for repro commands. Verifies the module has no
+    # parameters (raises AssertionError otherwise), warns about large unserialized
+    # buffers and about a missing or newer load_args version, runs load_args once
+    # with a no-op reader to count inputs and again with a real reader (progress
+    # bar) to materialize args, traces the module to a GraphModule with the
+    # requested tracing mode, and turns on the inductor intermediate-hooks config
+    # (global side effect). Returns the graph module and args.
     # Invariant for graphs we generate with the repro script
     if any(mod.named_parameters()):
         raise AssertionError("Repro graph should not have any parameters")
@@ -1245,6 +1399,10 @@ def repro_common(
 
 
 def _get_compile_args(mod: torch.fx.GraphModule, args: Sequence[Any]) -> Sequence[Any]:
+    # [FUNCTION DOC] HELPER: Chooses what to pass to the Inductor compile entry.
+    # Returns the given args unchanged unless the graph has placeholders carrying
+    # symbolic integer metadata (symbolic tracing); in that case returns per
+    # placeholder the fake metadata value, falling back to the matching arg.
     """Extract FakeTensor/SymInt args from the traced graph for compilation.
 
     When repro_common traces with tracing_mode='symbolic', the resulting
@@ -1285,6 +1443,9 @@ ACCURACY_FAILS: dict[str, Callable[[torch.fx.GraphModule, Any], bool]] = {
 
 
 def repro_minifier_query(options: ReproOptions, mod: nn.Module, load_args: Any) -> None:
+    # [FUNCTION DOC] Loads the repro, picks the failure predicate by the accuracy
+    # option, and exits the process with status 1 if the predicate says the graph
+    # fails, else status 0. Used by isolated minifier subprocesses.
     mod, args = repro_common(options, mod, load_args)
     fail_fn = functools.partial(
         ACCURACY_FAILS[options.accuracy],
@@ -1297,6 +1458,11 @@ def repro_minifier_query(options: ReproOptions, mod: nn.Module, load_args: Any) 
 
 
 def repro_minify(options: ReproOptions, mod: nn.Module, load_args: Any) -> None:
+    # [FUNCTION DOC] Runs the delta-debugging minifier on the loaded repro graph.
+    # The failure predicate is either an isolated-subprocess check (pinned to GPU 1
+    # if two or more GPUs, else 0, via an environment variable) or the in-process
+    # predicate chosen by accuracy mode. Runs with repro_after disabled; state dumps
+    # go to the checkpoint writer. Side effects: files on disk, subprocesses.
     from functorch.compile import minifier
 
     mod, args = repro_common(options, mod, load_args)
@@ -1335,6 +1501,15 @@ def repro_minify(options: ReproOptions, mod: nn.Module, load_args: Any) -> None:
 
 
 def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None:
+    # [FUNCTION DOC] Accuracy analyzer. Compiles the graph with Inductor, runs it
+    # while saving every intermediate tensor to a content store under save_dir
+    # (raises RuntimeError if save_dir is unset), optionally re-runs to check
+    # Inductor determinism, runs an fp64 copy through an interpreter to save and
+    # check fp64 intermediates, and finally interprets the eager graph comparing
+    # each saved node against Inductor and fp64 values using the repro tolerance,
+    # printing NONDETERMINISTIC or DIVERGED messages. Various skip options disable
+    # steps. Raises AssertionError if arg lists are not consumed or a divergence
+    # is not logged.
     from torch._inductor.compile_fx import compile_fx_inner
     from torch._inductor.hooks import intermediate_hook
 
@@ -1355,6 +1530,9 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
     known_names = set()
 
     def save_hook(name: str, val: Any) -> None:
+        # [FUNCTION DOC] HELPER: Intermediate hook that records the node name and,
+        # unless skipped, writes the tensor to the content store under the inductor
+        # subpath; advances the progress bar.
         known_names.add(name)
         if not options.skip_saving_inductor_intermediates:
             writer.write_tensor(os.path.join("inductor", name), val)
@@ -1382,6 +1560,8 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
             raise AssertionError("new_args should be empty after compiled() call")
 
     def compare_tuples(tuple1: tuple[Any], tuple2: tuple[Any]) -> str | None:
+        # [FUNCTION DOC] HELPER: Compares two metadata tuples elementwise; returns
+        # None if equal, else a text listing each differing pair joined with and.
         diff_indices = [i for i in range(len(tuple1)) if tuple1[i] != tuple2[i]]
         diff_values = [(tuple1[i], tuple2[i]) for i in diff_indices]
 
@@ -1391,6 +1571,9 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
             return " and ".join(f"{a} != {b}" for a, b in diff_values)
 
     def check_hook(name: str, val: Any) -> None:
+        # [FUNCTION DOC] HELPER: Intermediate hook that compares the tensor's
+        # metadata to the one saved earlier under the inductor subpath and prints a
+        # nondeterminism message on mismatch; advances the progress bar.
         meta = writer.compute_tensor_metadata(val)
         meta2 = reader.read_tensor_metadata(os.path.join("inductor", name))
         reason = compare_tuples(meta, meta2)
@@ -1409,11 +1592,18 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
                 raise AssertionError("new_args should be empty after compiled() call")
 
     class WriterInterp(fx.Interpreter):
+        # [CLASS DOC] HELPER: Graph interpreter that saves the result of every node
+        # whose name was seen during the Inductor run into the content store under
+        # a given subdirectory. State: subdir.
         def __init__(self, mod: torch.nn.Module, subdir: str) -> None:
+            # [FUNCTION DOC] HELPER: Initializes the interpreter and stores subdir.
             super().__init__(mod)
             self.subdir = subdir
 
         def run_node(self, n: torch.fx.Node) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the node; if its name is a known
+            # intermediate, writes the result to the store and advances progress.
+            # Returns the result.
             r = super().run_node(n)
             name = n.name
             if name in known_names:
@@ -1431,7 +1621,12 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
             raise AssertionError("new_args should be empty after boxed_run() call")
 
     class ExactReaderInterp(fx.Interpreter):
+        # [CLASS DOC] HELPER: Graph interpreter that checks fp64 determinism by
+        # comparing each known node's result metadata to the saved fp64 metadata.
         def run_node(self, n: torch.fx.Node) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the node and, for known intermediates,
+            # prints a nondeterminism message when metadata differs from the saved
+            # fp64 value; returns the result.
             r = super().run_node(n)
             name = n.name
             if name in known_names:
@@ -1455,7 +1650,14 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
     # Now that we've saved everything, interp through the eager graph
     # and do comparisons
     class ReaderInterp(fx.Interpreter):
+        # [CLASS DOC] HELPER: Graph interpreter that runs the eager graph and, for
+        # each known node, compares the eager value to the saved Inductor and fp64
+        # values, printing DIVERGED messages.
         def run_node(self, n: torch.fx.Node) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the node; for known intermediates reads
+            # the saved Inductor and fp64 tensors and checks closeness within the
+            # configured tolerance (NaNs equal). Raises AssertionError if the check
+            # fails without having logged a reason. Returns the eager result.
             r = super().run_node(n)
             name = n.name
             if name in known_names:
@@ -1464,6 +1666,8 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
                 logged = False
 
                 def log_error(msg: str, *args: Any) -> None:
+                    # [FUNCTION DOC] HELPER: Error callback that marks a divergence
+                    # as logged and prints a formatted DIVERGED message.
                     nonlocal logged
                     logged = True
                     pbar.write(f"DIVERGED at {name}: {msg % args}")
@@ -1490,11 +1694,17 @@ def repro_analyze(options: ReproOptions, mod: nn.Module, load_args: Any) -> None
 def repro_get_args(
     options: ReproOptions, mod: nn.Module, load_args: Any
 ) -> tuple[torch.fx.GraphModule, list[Any]]:
+    # [FUNCTION DOC] Loads the repro and returns the traced graph module and its
+    # input args without running anything.
     mod, args = repro_common(options, mod, load_args)
     return mod, args
 
 
 def repro_run(options: ReproOptions, mod: nn.Module, load_args: Any) -> None:
+    # [FUNCTION DOC] Compiles a copy of the loaded graph with Inductor and runs it.
+    # With an accuracy mode set, compares against eager and raises AccuracyError
+    # on divergence. Otherwise just executes it and synchronizes the accelerator
+    # for non-CPU inputs. Raises AssertionError if compilation returns a string.
     from torch._inductor.compile_fx import compile_fx_inner
 
     mod, args = repro_common(options, mod, load_args)
@@ -1541,6 +1751,13 @@ def run_repro(
     check_str: str | None = None,
     **kwargs: Any,
 ) -> Any:
+    # [FUNCTION DOC] Command-line entry point embedded in generated repro scripts.
+    # Warns about unknown keyword args, normalizes boolean accuracy to the mode
+    # strings, builds an argument parser with run, minify, get_args, analyze and
+    # minifier-query subcommands (shared accuracy/save-dir/tracing-mode flags plus
+    # per-command flags), defaults to the given command when no CLI args exist,
+    # and dispatches to the matching repro_* function, returning its result.
+    # The patch_code argument is accepted but ignored with a warning.
     for k in kwargs:
         log.warning(
             "Unrecognized kwarg %s; perhaps this repro was made on a newer version of PyTorch",
@@ -1574,6 +1791,10 @@ default settings on this script:
     )
 
     def common_flags(parser: argparse.ArgumentParser) -> None:
+        # [FUNCTION DOC] HELPER: Adds the flags shared by all subcommands to a
+        # parser: mutually exclusive no-accuracy, accuracy, strict-accuracy; save
+        # directory and its negation; and tracing mode, with defaults taken from
+        # the enclosing run_repro arguments.
         accuracy_group = parser.add_mutually_exclusive_group()
         accuracy_group.add_argument(
             "--no-accuracy",
