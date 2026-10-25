@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Bytecode-level symbolic executor at the heart of Dynamo. Defines the instruction
+# translators (base, root, and inlining variants) that step through a code object's
+# bytecode, maintaining a symbolic stack and locals of VariableTrackers, recording
+# operations into the OutputGraph, and handling graph breaks, speculation/restart,
+# block stacks (with/try), generators, and exception handling. Also defines
+# SpeculationLog (restart bookkeeping), state holders, and helper functions for
+# jumps/asserts. Import-time side effects: creates module loggers, a thread-local
+# `tls`, and the comparison-operator handler table (compare_op_handlers).
 """
 Core module responsible for converting Python bytecode into TorchDynamo's symbolic execution format.
 
@@ -255,6 +264,9 @@ ExceptionTypes: TypeAlias = (
 
 @functools.cache
 def _import_module(name: str) -> types.ModuleType:
+    # [FUNCTION DOC] HELPER: Import and return the module with the given name; results are
+    # cached (functools.cache) so repeated imports skip importlib filesystem checks.
+    # Raises whatever importlib raises (e.g. ImportError) for unknown modules.
     """
     Import the named module and cache the result. importlib.import_module()
     seems to do some filesystem checking to validate the name so not caching
@@ -266,6 +278,10 @@ def _import_module(name: str) -> types.ModuleType:
 def _registered_module_for_globals(
     module_name: object, f_globals: dict[str, Any]
 ) -> tuple[str, types.ModuleType] | None:
+    # [FUNCTION DOC] HELPER: Given a module name and a globals dict, return (name, module)
+    # if the name refers to a real registered module (sys.modules, or the torch.package
+    # importer for torch_package names) whose namespace dict is exactly f_globals; else
+    # None. Names that are not strings or start with "namedtuple_" yield None.
     if not isinstance(module_name, str) or module_name.startswith("namedtuple_"):
         return None
 
@@ -284,6 +300,10 @@ def _registered_module_for_globals(
 
 @dataclasses.dataclass
 class SpeculationEntry:
+    # [CLASS DOC] One speculation checkpoint: records the source location and instruction
+    # pointer (plus the instruction, for debugging) where a graph-break-capable speculation
+    # happened, a failed flag, the error_on_graph_break setting at failure time, and an
+    # optional GraphCompileReason. Entries persist across analysis restarts via SpeculationLog.
     filename: str
     lineno: int
     instruction_pointer: int
@@ -294,6 +314,9 @@ class SpeculationEntry:
     reason: GraphCompileReason | None = None
 
     def fail_and_restart_analysis(self, error_on_graph_break: bool) -> None:
+        # [FUNCTION DOC] Mark this entry failed, remember the error_on_graph_break setting,
+        # and raise SpeculationRestartAnalysis (with the stored reason text, or a default)
+        # so the frame is retraced and a graph break is taken here on the next pass.
         """
         Start tracing of the current frame over again, and don't take this branch.
         """
@@ -306,6 +329,9 @@ class SpeculationEntry:
         raise exc.SpeculationRestartAnalysis(restart_reason=restart_reason)
 
     def failed(self, tx: InstructionTranslatorBase) -> bool:
+        # [FUNCTION DOC] Return whether this entry was marked failed. If so, also restore the
+        # recorded error_on_graph_break value onto the translator tx. Raises AssertionError
+        # if the entry failed but no error_on_graph_break value was recorded.
         if self._failed:
             if self.error_on_graph_break is None:
                 raise AssertionError(
@@ -318,6 +344,10 @@ class SpeculationEntry:
 
 @dataclasses.dataclass
 class SpeculationLog:
+    # [CLASS DOC] Ordered list of SpeculationEntry shared across analysis restarts, with a
+    # cursor (index) that is reset on restart. Also carries flags/lists telling the retrace
+    # to graph break at autograd.grad or requires_grad_ on source-less intermediates, and
+    # the names of output tensors whose grad_fns were consumed. Methods: restart, clear, next.
     """
     SpeculationLog replaces the prior copy_graphstate/restore_graphstate
     checkpointing.  Rather than saving/restoring state, we restart the
@@ -339,15 +369,21 @@ class SpeculationLog:
     graph_break_on_requires_grad_: bool = False
 
     def restart(self) -> None:
+        # [FUNCTION DOC] Rewind the cursor to the first entry, keeping all entries.
         self.index = 0
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Drop all entries and rewind the cursor (used when divergence is intended).
         self.entries.clear()
         self.index = 0
 
     def next(
         self, filename: str, lineno: int, instruction_pointer: int, inst: Instruction
     ) -> SpeculationEntry:
+        # [FUNCTION DOC] Return the entry at the cursor (creating and appending one if the log
+        # is exhausted) and advance the cursor. Verifies the entry's filename, line number and
+        # instruction pointer match the arguments; raises SpeculationLogDivergence with a
+        # detailed message (including the previous entry) if the retrace diverged.
         """
         Lookup or create a SpeculationEntry() that is shared across
         RestartAnalysis calls.  Args are used only for debug checks.
@@ -395,11 +431,15 @@ Otherwise, please submit a bug report, ideally including the contents of TORCH_L
 
 @dataclasses.dataclass
 class LocalState:
+    # [CLASS DOC] Per-rank record of automatic-dynamic-shape state: a mapping from input
+    # name to FrameStateSizeEntry. Used for cross-rank dynamic shape coordination.
     automatic_dynamic: dict[str, FrameStateSizeEntry] = dataclasses.field(
         default_factory=dict
     )
 
     def render(self) -> str:
+        # [FUNCTION DOC] Return a newline-joined "name: rendered entry" string for every
+        # automatic-dynamic entry.
         return "\n".join(
             f"{k}: {v.render()}" for k, v in self.automatic_dynamic.items()
         )
@@ -408,12 +448,17 @@ class LocalState:
 # Mutable box that is shared across restarts
 @dataclasses.dataclass
 class DistributedState:
+    # [CLASS DOC] Mutable box shared across restarts holding the compile process group,
+    # this rank's LocalState, and (once gathered) the list of all ranks' LocalStates.
     compile_pg: Any
     local_state: LocalState
     all_states: list[LocalState] | None = None
 
 
 class TensorifyState:
+    # [CLASS DOC] Process-global (class-level) set of symfloat names that the tensorify
+    # python scalars pass asked to specialize on the next analysis restart. Only
+    # classmethods are used; there are no instances.
     # These are the set of string symfloats names (eg. "zf0") that we collect
     # from the tensorify_python_scalars.py joint fx pass to inform us about
     # which float inputs we should specialize when we restart analysis.
@@ -421,23 +466,28 @@ class TensorifyState:
 
     @classmethod
     def specialize(cls, index: str) -> None:
+        # [FUNCTION DOC] Add the symfloat name to the global force-specialization set.
         cls.force_specializations.add(index)
 
     @classmethod
     def should_specialize(cls, index: str) -> bool:
+        # [FUNCTION DOC] Return True if the named symfloat is marked for specialization.
         return index in cls.force_specializations
 
     @classmethod
     def clear(cls) -> None:
+        # [FUNCTION DOC] Empty the global force-specialization set.
         cls.force_specializations.clear()
 
     @classmethod
     def empty(cls) -> bool:
+        # [FUNCTION DOC] Return True if no symfloat is marked for specialization.
         return len(cls.force_specializations) == 0
 
 
 @functools.cache
 def _step_logger() -> Callable[..., None]:
+    # [FUNCTION DOC] HELPER: Return (cached) the dynamo step logger function for this module's logger.
     return torchdynamo_logging.get_step_logger(log)
 
 
@@ -445,6 +495,9 @@ def _step_logger() -> Callable[..., None]:
 def save_and_restart_speculation_log(
     tx: InstructionTranslatorBase,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager: temporarily replace tx's speculation log entries with an
+    # empty list and cursor 0, then restore the original entries and index on exit (even on
+    # error). Avoids divergence errors when generators are exhausted during reconstruction.
     # When reconstructing a generator after a graph break, we advance it until
     # it is fully exhausted. This process adds new entries to the speculation
     # log that were not previously observed. Without temporarily clearing the
@@ -465,6 +518,10 @@ def save_and_restart_speculation_log(
 def temporarely_allow_writes_to_output_graph(
     tx: InstructionTranslatorBase,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager: set the output graph's should_exit flag to False for the
+    # duration of the block, then restore its previous value on exit.
+    # KNOWN ISSUE: the saved value is read inside the try block, so an error reading it would
+    # make the finally clause reference an unset variable.
     try:
         tmp = tx.output.should_exit
         tx.output.should_exit = False
@@ -475,6 +532,10 @@ def temporarely_allow_writes_to_output_graph(
 
 @dataclasses.dataclass
 class BlockStackEntry:
+    # [CLASS DOC] One entry of the symbolic block stack (with/try blocks): the pushing
+    # instruction, its jump target, the value-stack depth at push time, and an optional
+    # context-manager variable. Only entries with a context manager can be restored in a
+    # resume function. Methods: can_restore, resume_fn, exit.
     # Current instruction that pushes something to block_stack
     inst: Instruction
     target: Instruction | None
@@ -482,9 +543,13 @@ class BlockStackEntry:
     with_context: ContextWrappingVariable | GenericContextWrappingVariable | None = None
 
     def can_restore(self) -> bool:
+        # [FUNCTION DOC] Return True if this block has a context manager and so can be re-entered.
         return self.with_context is not None
 
     def resume_fn(self) -> ReenterWith:
+        # [FUNCTION DOC] Build the ReenterWith descriptor used to re-enter this block in a resume
+        # function: stack depth minus one, plus the context manager's target_values when present.
+        # Raises AssertionError if stack_index is None.
         if self.stack_index is None:
             raise AssertionError("expected self.stack_index is not None to be true")
         if (
@@ -501,6 +566,10 @@ class BlockStackEntry:
     def exit(
         self, tx: InstructionTranslatorBase, is_graph_break: bool
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Exit this block's context manager by symbolically calling its exit.
+        # During a graph break the exit is only performed if the context manager says it must
+        # exit on graph break; otherwise returns None. Returns the exit result variable.
+        # Raises AssertionError if there is no context manager.
         if self.with_context is None:
             raise AssertionError("expected self.with_context is not None to be true")
         if (
@@ -511,14 +580,17 @@ class BlockStackEntry:
 
 
 class SpeculationLogDivergence(AssertionError):
+    # [CLASS DOC] Raised when a restarted analysis deviates from the recorded SpeculationLog.
     pass
 
 
 class ReturnValueOp(Exception):
+    # [CLASS DOC] Control-flow signal raised by a return instruction to stop the step loop.
     pass
 
 
 class YieldValueOp(Exception):
+    # [CLASS DOC] Control-flow signal raised on a yield to return control to the caller.
     """
     Signal to the symbolic tracer to stop and return control flow to the
     caller
@@ -526,17 +598,23 @@ class YieldValueOp(Exception):
 
 
 def stack_op(fn: Callable[..., object]) -> Callable[..., Any]:
+    # [FUNCTION DOC] Build an opcode handler from a plain Python callable: the handler pops as
+    # many stack values as fn has parameters, calls fn symbolically via a BuiltinVariable, and
+    # pushes the result. Returns the handler (wrapped to look like fn).
     nargs = len(inspect.signature(fn).parameters)
     fn_var = BuiltinVariable(fn)
 
     @functools.wraps(fn)
     def impl(self: InstructionTranslator, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: Opcode handler produced by stack_op; pops args, calls, pushes result.
         self.push(fn_var.call_function(self, self.popn(nargs), {}))
 
     return impl
 
 
 def is_stdlib(mod: object) -> bool:
+    # [FUNCTION DOC] Return True if mod is a module object whose top-level package name is in
+    # sys.stdlib_module_names; False for non-modules.
     if not isinstance(mod, types.ModuleType):
         return False
     return mod.__name__.split(".")[0] in sys.stdlib_module_names
@@ -544,13 +622,18 @@ def is_stdlib(mod: object) -> bool:
 
 @functools.cache
 def get_assert_bytecode_sequence(with_msg: bool) -> list[str]:
+    # [FUNCTION DOC] HELPER: Compile a tiny function containing an assert (with or without a
+    # message) and return the opcode names that follow its conditional jump through the
+    # raise instruction. Used to pattern-match assert statements in user bytecode. Cached.
     if with_msg:
 
         def fn(x: Any) -> None:
+            # [FUNCTION DOC] HELPER: Template function containing an assert with a message.
             assert x, "msg"  # noqa: S101  # function is to recognize assert statements in user code
     else:
 
         def fn(x: Any) -> None:
+            # [FUNCTION DOC] HELPER: Template function containing a bare assert.
             assert x  # noqa: S101  # function is to recognize assert statements in user code
 
     insts = [inst.opname for inst in dis.get_instructions(fn)]
@@ -567,6 +650,11 @@ def _detect_and_normalize_assert_statement(
     truth_fn: Callable[[object], bool],
     push: bool,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether the current conditional jump begins an assert
+    # statement. Only applies when truth_fn is the plain truth test and push is False.
+    # Compares the upcoming opcodes to the known assert sequences (without and with message);
+    # on a match pushes the message (the constant or "assertion error") onto the stack and
+    # returns True, else False. Raises AssertionError if the instruction pointer is not an int.
     # Detect if this jump instruction is assert and normalize the assert
     # by pushing dummy error message when nothing is given.
     #
@@ -641,6 +729,8 @@ explain = False
 
 
 def get_node_source_info(n: torch.fx.Node) -> str:
+    # [FUNCTION DOC] Return a string with the innermost "File ..." line (and the following
+    # code line, if any) from the node's stack trace, or an empty string if there is none.
     """Extract the innermost user source location from an FX node's stack trace."""
     st = n.meta.get("stack_trace", "") or getattr(n, "stack_trace", "")
     if not st:
@@ -660,6 +750,10 @@ def get_node_source_info(n: torch.fx.Node) -> str:
 
 
 def format_tensor_computation_trace(value: VariableTracker, max_lines: int = 20) -> str:
+    # [FUNCTION DOC] Build a human-readable explanation of how a TensorVariable was computed:
+    # walks the FX graph backwards from its node, listing graph inputs first and then up to
+    # max_lines call_function ops in dataflow order with user source locations. Returns an
+    # empty string for non-tensors, empty graphs, or any internal failure (logged at debug).
     """Walk the FX graph backwards from a TensorVariable to show how it was
     computed, with user source locations. Graph inputs (placeholders) are always
     shown first, followed by operations in dataflow order ending at the branch
@@ -676,9 +770,13 @@ def format_tensor_computation_trace(value: VariableTracker, max_lines: int = 20)
         visited: set[str] = set()
 
         def fmt_arg(a: object) -> str:
+            # [FUNCTION DOC] HELPER: Format an FX argument: node name for nodes, repr otherwise.
             return a.name if isinstance(a, torch.fx.Node) else repr(a)
 
         def walk(n: torch.fx.Node) -> None:
+            # [FUNCTION DOC] HELPER: Depth-first visit of a node and its node arguments, recording
+            # formatted blocks for placeholders and call_function ops (ops capped at max_lines);
+            # skips already-visited nodes. Mutates visited, op_blocks and placeholder_blocks.
             if n.name in visited:
                 return
             visited.add(n.name)
@@ -729,7 +827,15 @@ def format_tensor_computation_trace(value: VariableTracker, max_lines: int = 20)
 def generic_jump(
     truth_fn: Callable[[object], bool], push: bool
 ) -> Callable[[InstructionTranslatorBase, Instruction], None]:
+    # [FUNCTION DOC] Build the handler for a conditional jump opcode. truth_fn is the predicate
+    # (truth or negation) deciding whether to jump; push says whether the tested value stays
+    # on the stack when the jump is taken. The handler handles constants, modules, user
+    # objects, symbolic ints/bools (guarding), asserts (rewritten to torch._assert_async),
+    # and data-dependent tensor conditions (graph break with partial graph + resume).
     def raise_jump_graph_break(value: VariableTracker) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Raise a "Data-dependent branching" graph break for value,
+        # including a tensor computation trace and hints tailored to scalar int/bool tensors
+        # and any/all reductions. Always raises (Unsupported via unimplemented).
         trace_info = format_tensor_computation_trace(value)
         hints: list[str] = []
         if isinstance(value, TensorVariable):
@@ -796,6 +902,11 @@ def generic_jump(
         value: VariableTracker,
         extra_msg: str = "",
     ) -> None:
+        # [FUNCTION DOC] HELPER: Perform a data-dependent jump graph break: compute the break
+        # exception, raise a loop graph break if a backedge may exist, otherwise log the break,
+        # compile the partial subgraph (value on stack), and emit a conditional jump to two
+        # resume-function calls (fallthrough and jump target). Mutates output instructions.
+        # Raises AssertionError if partial compilation is not allowed or inst.target is None.
         if not self.should_compile_partial_graph():
             raise AssertionError(
                 "expected self.should_compile_partial_graph() to be true"
@@ -858,6 +969,10 @@ def generic_jump(
         self.output.add_output_instructions([jump_inst] + if_next + if_jump)
 
     def inner(self: InstructionTranslatorBase, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: The jump opcode handler. Pops the tested value, handles assert
+        # patterns, then evaluates truthiness for constants, nn modules, user-defined objects
+        # and symbolic values (installing guards) and jumps if truth_fn says so; tensors cause a
+        # graph break via jump_graph_break; otherwise raises an unsupported-branching error.
         value: VariableTracker = self.pop()
         if (
             config.rewrite_assert_with_torch_assert
@@ -1025,6 +1140,11 @@ def generic_jump(
 def _reconstruct_block_stack(
     tx: InstructionTranslatorBase, cg: PyCodegen, cleanup: list[Instruction]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emit codegen output that rebuilds the active with-blocks (from tx and
+    # all parent translators, outermost first) before re-running an unsupported instruction.
+    # Torch function mode blocks get a try/except that pops the mode on error; other blocks must
+    # have a ContextWrappingVariable, whose type is reconstructed and wrapped in try/finally.
+    # Appends cleanup instructions to the cleanup list. Raises AssertionError on bad blocks.
     """Generates bytecode to restore the block stack for running the unsupported instruction
     in the compiled bytecode."""
     # Reconstruct the context variable CLASS in the block stack
@@ -1056,6 +1176,9 @@ def _reconstruct_block_stack(
 
 
 def _make_warnings_warn_wrapper(filename: str, lineno: int) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Return a function forwarding to warnings.warn whose code object
+    # reports the given filename and first line number, so warnings issued from inlined frames
+    # are attributed to (and deduplicated by) the original source location.
     """Create a wrapper for warnings.warn that reports the given source location.
 
     When warnings.warn (stacklevel=1) inspects its caller frame, it sees the
@@ -1086,11 +1209,24 @@ def break_graph_if_unsupported(
 ) -> Callable[
     [Callable[..., None]], Callable[[InstructionTranslatorBase, Instruction], None]
 ]:
+    # [FUNCTION DOC] Decorator factory for opcode handlers that may graph break (calls, subscripts,
+    # attribute stores...). push says whether the instruction pushes one result (0 or 1 outputs
+    # only); msg_prefix is prepended to the logged graph break reason. The decorated handler
+    # records a speculation; on Unsupported/UserError it logs the break, stores the reason, and
+    # restarts analysis so the next pass compiles the partial graph and resumes after the
+    # instruction. See the NOTE above about the 0/1 output limitation.
     def decorator(
         inner_fn: Callable[..., None],
     ) -> Callable[[InstructionTranslatorBase, Instruction], None]:
+        # [FUNCTION DOC] HELPER: Wrap inner_fn with the speculation and graph-break handling logic.
         @functools.wraps(inner_fn)
         def wrapper(self: InstructionTranslatorBase, inst: Instruction) -> None:
+            # [FUNCTION DOC] HELPER: Run the handler under a speculation. If the speculation already
+            # failed (second pass) perform the graph break now. Otherwise run inner_fn; on
+            # Unsupported/UserError either re-raise (generic context managers with fullgraph,
+            # skip_frame, no partial graph) or log, record the reason, and restart analysis.
+            # Temporarily sets current_instruction_push; raises a graph break under active generic
+            # context managers; loop graph break if a backedge may exist.
             prev_push = self.current_instruction_push
             self.current_instruction_push = push
             speculation = self.speculate()
@@ -1155,6 +1291,11 @@ def break_graph_if_unsupported(
             inst: Instruction,
             reason: GraphCompileReason,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Perform the actual graph break for inst: compile the partial
+            # subgraph, rebuild the block stack, emit the unsupported instruction itself (a CALL with
+            # keyword names handled for 3.11/3.12) into the output bytecode, pop its inputs, push an
+            # UnknownVariable placeholder if it produces a value, and add a call to the resume
+            # function for the next instruction. Mutates output instructions and the stack.
             if (
                 sys.version_info >= (3, 11)
                 and sys.version_info < (3, 12)
@@ -1240,12 +1381,19 @@ def break_graph_if_unsupported(
 
 
 class BytecodeDispatchTableMeta(type):
+    # [CLASS DOC] Metaclass that gives each class a dispatch_table: a 256-entry list indexed by
+    # opcode, holding the class's method named after the opcode, or a handler raising a
+    # "Missing bytecode handler" graph break when the class has none.
     """Installs a `cls.dispatch_table` on every subclass to speed up calls to self.OPCODE()"""
 
     def __init__(cls: type, name: str, bases: Any, dct: Any) -> None:
+        # [FUNCTION DOC] Initialize the class and build its dispatch_table from dis.opmap
+        # (entries for unused opcode numbers are None). Sets the class attribute dispatch_table.
         super().__init__(name, bases, dct)  # type: ignore[misc]
 
         def _missing(opname: str, *args: Any) -> None:
+            # [FUNCTION DOC] HELPER: Default handler for opcodes without a method; always raises a
+            # graph break (Unsupported) of type "Missing bytecode handler".
             unimplemented(
                 gb_type="Missing bytecode handler",
                 context=f"{opname} with args {args}",
@@ -1265,6 +1413,8 @@ class BytecodeDispatchTableMeta(type):
 
 
 def pyexception_class_check(val: VariableTracker) -> TypeIs[ExceptionTypes]:
+    # [FUNCTION DOC] HELPER: True if val is an exception class: a builtin variable wrapping a
+    # BaseException subclass, or a user-defined exception class variable. Mirrors CPython's check.
     # Mirror's CPython PyExceptionClass_Check
     # https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Include/pyerrors.h#L60-L62
     if isinstance(val, variables.BuiltinVariable):
@@ -1273,6 +1423,7 @@ def pyexception_class_check(val: VariableTracker) -> TypeIs[ExceptionTypes]:
 
 
 def pyexception_instance_check(val: VariableTracker) -> TypeIs[ExceptionVals]:
+    # [FUNCTION DOC] HELPER: True if val is an exception instance variable (builtin or user-defined).
     # Mirror's CPython PyExceptionInstance_Check
     # https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Include/pyerrors.h#L64-L65
     return isinstance(
@@ -1281,6 +1432,8 @@ def pyexception_instance_check(val: VariableTracker) -> TypeIs[ExceptionVals]:
 
 
 def pyerr_given_exception_match(err: VariableTracker, exc: type[BaseException]) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if err (an exception class or instance variable) is a
+    # subclass/instance of the real exception type exc; False for anything else.
     # Mirror's PyErr_GivenExceptionMatch
     if pyexception_class_check(err):
         return issubclass(err.fn, exc)
@@ -1290,6 +1443,8 @@ def pyerr_given_exception_match(err: VariableTracker, exc: type[BaseException]) 
 
 
 def pygen_fetch_stopiteration_value(val: ExceptionVals) -> VariableTracker:
+    # [FUNCTION DOC] HELPER: For a StopIteration exception variable return its first argument
+    # (the generator return value) if any, otherwise a None constant; non-StopIteration gives None.
     # Mirror's CPython PyGen_FetchStopIterationValue
     if issubclass(val.exc_type, StopIteration):
         return val.args[0] if val.args else ConstantVariable.create(None)
@@ -1298,6 +1453,8 @@ def pygen_fetch_stopiteration_value(val: ExceptionVals) -> VariableTracker:
 
 @dataclasses.dataclass
 class Segment:
+    # [CLASS DOC] HELPER: One frame's slice of the exception stack: a list of exception values
+    # plus a link to the previous (lower) segment, emulating a chain of CPython exc-state items.
     """
     One frame's slice of the exception stack, mirroring CPython's
     `_PyErr_StackItem` (`gi_exc_state`).
@@ -1314,6 +1471,10 @@ class Segment:
 
 @dataclasses.dataclass
 class ExceptionStack:
+    # [CLASS DOC] Symbolic exception state shared by all translators: a linked chain of Segments
+    # (stack of handled exceptions, indexable globally across segments) and the single
+    # "current exception" being raised. Supports push/pop of segments (generator resume/suspend),
+    # moving the current exception onto the stack, and setting __context__ chains without cycles.
     """
     Exception stack that it is shared among all InstructionTranslator instances
     """
@@ -1333,11 +1494,14 @@ class ExceptionStack:
     _current_exception: ExceptionVals | None = dataclasses.field(default=None)
 
     def push_segment(self, segment: Segment) -> None:
+        # [FUNCTION DOC] Make the given segment the head of the chain, linking it above the old head.
         """Make `segment` the head, linking it to the current head (resume)."""
         segment.prev = self._exc_stack
         self._exc_stack = segment
 
     def pop_segment(self) -> Segment:
+        # [FUNCTION DOC] Detach and return the head segment, making the one below the new head.
+        # Raises AssertionError if only the base segment remains.
         """Restore the head to the segment below (suspend)."""
         segment = self._exc_stack
         if segment.prev is None:
@@ -1347,18 +1511,24 @@ class ExceptionStack:
         return segment
 
     def clear_current_exception(self) -> None:
+        # [FUNCTION DOC] Forget the current (in-flight) exception.
         self._current_exception = None
 
     def set_raised_exception(self, val: ExceptionVals) -> None:
+        # [FUNCTION DOC] Record val as the current in-flight exception (like PyErr_SetRaisedException).
         # Mirrors CPython's PyErr_SetRaisedException
         self._current_exception = val
 
     def get_topmost_exception(self) -> ExceptionVals:
+        # [FUNCTION DOC] Return the top handled exception across all segments. Raises AssertionError
+        # if the whole stack is empty.
         if not len(self):
             raise AssertionError("expected len(self.exn_vt_stack) to be true")
         return self.__getitem__(-1)
 
     def move_current_exception_to_stack(self) -> None:
+        # [FUNCTION DOC] Push the current exception onto the handled-exception stack and clear it
+        # (like PUSH_EXC_INFO). Raises AssertionError if there is no current exception.
         if self._current_exception is None:
             raise AssertionError(
                 "expected self._current_exception is not None to be true"
@@ -1367,6 +1537,7 @@ class ExceptionStack:
         self.clear_current_exception()
 
     def get_raised_exception(self) -> ExceptionVals:
+        # [FUNCTION DOC] Return the current in-flight exception; raises AssertionError if none.
         # Mirrors CPython's PyErr_GetRaisedException()
         if self._current_exception is None:
             raise AssertionError(
@@ -1377,6 +1548,10 @@ class ExceptionStack:
     def _set_context_recursive(
         self, val: ExceptionVals, prev_idx: int
     ) -> ExceptionVals:
+        # [FUNCTION DOC] HELPER: Recursively set the __context__ of val (and of the earlier stack
+        # entries it chains to) from the exception stack entry at prev_idx (negative index from
+        # the top), unless val already has a non-None context. Mutates exception variables and
+        # returns val.
         if (ctx := val.__context__) and not ctx.is_constant_none():  # type: ignore[union-attr]
             return val
         if len(self) + prev_idx > 0:
@@ -1387,6 +1562,9 @@ class ExceptionStack:
         return val
 
     def _break_context_reference_cycle(self, val: ExceptionVals) -> None:
+        # [FUNCTION DOC] HELPER: Walk val's __context__ chain with a cycle detector (tortoise and
+        # hare); if the chain leads back to val, clear that link's context to break the cycle.
+        # Stops at None contexts or pre-existing cycles. Mutates exception variables.
         # See test_exceptions::test_raise_does_not_create_context_chain_cycle
         # Based on https://github.com/python/cpython/blob/e635bf2e49797ecb976ce45a67fce2201a25ca68/Python/errors.c#L207-L228
         # As noted on CPython, this is O(chain length) but the context chains
@@ -1416,17 +1594,22 @@ class ExceptionStack:
     def _set_context_and_break_context_reference_cycle(
         self, val: ExceptionVals
     ) -> None:
+        # [FUNCTION DOC] HELPER: Set val's implicit __context__ from the handled-exception stack,
+        # then break any resulting context reference cycle.
         # set Exception.__context__
         self._set_context_recursive(val, len(self) - 1)
         self._break_context_reference_cycle(val)
 
     def pop(self) -> ExceptionVals:
+        # [FUNCTION DOC] Pop and return the top item of the head segment only (raises IndexError if empty).
         return self._exc_stack.items.pop()
 
     def append(self, val: ExceptionVals) -> None:
+        # [FUNCTION DOC] Push val onto the head segment.
         self._exc_stack.items.append(val)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Total number of handled exceptions across all segments in the chain.
         n = 0
         segment: Segment | None = self._exc_stack
         while segment is not None:
@@ -1435,6 +1618,8 @@ class ExceptionStack:
         return n
 
     def __getitem__(self, index: int) -> ExceptionVals:
+        # [FUNCTION DOC] Index across the whole segment chain (lower segments first, negative
+        # indices from the top). Raises IndexError if out of range.
         # Global indexing over the segment chain: `prev` segments (lower)
         # concatenated with the head segment (upper), so `[-1]` falls through
         # to the caller when the head segment is empty.
@@ -1453,6 +1638,7 @@ class ExceptionStack:
         return segment.items[index - base]
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string showing the stack and current exception (also used as repr).
         return f"{self._exc_stack=} - {self._current_exception=}"
 
     __repr__ = __str__
@@ -1461,6 +1647,13 @@ class ExceptionStack:
 class InstructionTranslatorBase(
     metaclass=BytecodeDispatchTableMeta,
 ):
+    # [CLASS DOC] Base symbolic bytecode interpreter. Holds the symbolic value stack, symbolic
+    # locals/cells/globals, block stack, exception stack, instruction pointer, the shared
+    # OutputGraph, speculation state, and parent link for inlined frames. Subclasses
+    # (InstructionTranslator for root frames, InliningInstructionTranslator for inlined calls)
+    # supply frame setup/return handling. Each opcode is a method dispatched through
+    # dispatch_table; step() executes one instruction and converts unsupported behavior into
+    # graph breaks via speculation/restart.
     output: OutputGraph
     symbolic_locals: dict[str, VariableTracker]
     # Registry of this frame's cells (cellvars + freevars), recorded at frame
@@ -1505,6 +1698,8 @@ class InstructionTranslatorBase(
     # Store the latest bytecode before graph_break() call by user
 
     def mark_inconsistent_side_effects(self) -> None:
+        # [FUNCTION DOC] Flag that tracing met instructions where Dynamo's view of history may differ
+        # from eager execution (sets inconsistent_side_effects to True).
         """
         InstructionTranslator has encountered instructions which may cause
         dynamo to see a different version of history from eager
@@ -1513,6 +1708,10 @@ class InstructionTranslatorBase(
         self.inconsistent_side_effects = True
 
     def maybe_has_backedge(self) -> bool:
+        # [FUNCTION DOC] Heuristically report whether a loop backedge may follow the current
+        # instruction in this frame or any parent frame: scans remaining instructions (stopping at
+        # the first return) for a jump whose target offset precedes the current offset. May give
+        # false positives/negatives. Raises AssertionError if a frame has no instruction pointer.
         # This function employs a heuristic. It does not reliably detect a backedge.
         # The heuristic is straightforward: starting from the current instruction and
         # continuing to the end, if any jump instruction targets an instruction before
@@ -1551,30 +1750,40 @@ class InstructionTranslatorBase(
         return False
 
     def cellvars(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Return the code object's cell variable names.
         return self.code_options["co_cellvars"]
 
     def freevars(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Return the code object's free variable names.
         return self.code_options["co_freevars"]
 
     def new_pycode_varname(self, prefix: str) -> str:
+        # [FUNCTION DOC] Return a fresh unique local variable name for the prefix (double underscore,
+        # prefix, then a per-prefix counter) and remember it as the latest name for that prefix.
         """Generate a fresh, unique pycode-local variable name for the given prefix."""
         name = f"__{prefix}{next(self._pycode_varname_counter[prefix])}"
         self._pycode_last_varname[prefix] = name
         return name
 
     def reset_pycode_varname_counter(self, prefix: str) -> None:
+        # [FUNCTION DOC] Restart the numbering of generated names for the prefix at zero.
         self._pycode_varname_counter[prefix] = itertools.count(0)
 
     def get_pycode_last_varname(self, prefix: str) -> str:
+        # [FUNCTION DOC] Return the most recent name generated for the prefix (KeyError if none yet).
         """Return the most recently generated pycode varname for the given prefix."""
         return self._pycode_last_varname[prefix]
 
     def cell_and_freevars(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Return cellvars followed by freevars, computed once and cached on the instance.
         if not hasattr(self, "_cell_and_freevars"):
             self._cell_and_freevars = self.cellvars() + self.freevars()
         return self._cell_and_freevars
 
     def _register_cells(self) -> None:
+        # [FUNCTION DOC] HELPER: Fill symbolic_cellvars with the symbolic locals that are cells or
+        # freevars, and remove freevars that collide with a fast local name from symbolic_locals.
+        # Idempotent. Mutates symbolic_cellvars and symbolic_locals.
         # Record this frame's cells in the symbolic_cellvars registry. A free
         # var that shares its name with a fast local occupies a second,
         # distinct localsplus slot in CPython (e.g. an inlined comprehension
@@ -1592,6 +1801,9 @@ class InstructionTranslatorBase(
                 self.symbolic_locals.pop(name, None)
 
     def prune_dead_locals(self) -> None:
+        # [FUNCTION DOC] Snapshot all cell and free variables into post_prune_cell_and_freevars, then
+        # drop from symbolic_locals every local not read later (liveness analysis from the current
+        # instruction; dotted comprehension names are normalized). Mutates symbolic_locals.
         # keep cell and freevar references alive
         self.post_prune_cell_and_freevars = {
             name: self._cellvar(name) for name in self.cell_and_freevars()
@@ -1614,6 +1826,9 @@ class InstructionTranslatorBase(
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> None:
+        # [FUNCTION DOC] Symbolically call fn with args (list) and kwargs (dict), pushing the result
+        # onto the stack. Raises AssertionError on wrongly typed arguments or when the underlying
+        # callable is forbidden for tracing.
         if not isinstance(fn, VariableTracker):
             raise AssertionError("expected isinstance(fn, VariableTracker) to be true")
         if not isinstance(args, list):
@@ -1642,6 +1857,9 @@ class InstructionTranslatorBase(
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to a generator function by wrapping fn as a
+        # LocalGeneratorFunctionVariable (if needed) and returning the result of calling it
+        # (a generator object variable).
         """
         Redirect the call to the generator "call_function"
         """
@@ -1656,6 +1874,10 @@ class InstructionTranslatorBase(
         kwargs: dict[str, VariableTracker],
         allow_nested_graph_breaks: bool = False,
     ) -> Any:
+        # [FUNCTION DOC] Inline a user function call: generator functions produce a generator
+        # variable; other functions are traced by InliningInstructionTranslator.inline_call and
+        # the returned variable is the function's result. allow_nested_graph_breaks permits graph
+        # breaks inside the inlined frame.
         """
         A call to some user defined function by inlining it.
         """
@@ -1671,6 +1893,9 @@ class InstructionTranslatorBase(
             )
 
     def get_line_of_code_header(self, lineno: int | None = None) -> str:
+        # [FUNCTION DOC] Format "file:line in function (source function name) (inline depth: N)" for
+        # the given line number (default: current line); the inline depth part appears only when
+        # inlined.
         if lineno is None:
             lineno = self.lineno
         inline_depth_str = (
@@ -1681,12 +1906,17 @@ class InstructionTranslatorBase(
         return f"{self.f_code.co_filename}:{lineno} in {self.f_code.co_name}{funcname_str}{inline_depth_str}"
 
     def get_log_starts_line_log_str(self) -> str:
+        # [FUNCTION DOC] Build the "TRACE starts_line" log message: location header plus the source
+        # text of the current line (read through linecache).
         log_str = f"TRACE starts_line {self.get_line_of_code_header()}\n"
         line = linecache.getline(self.f_code.co_filename, self.lineno).rstrip()
         log_str += f"    {line}"
         return log_str
 
     def starts_line(self, lineno: int) -> None:
+        # [FUNCTION DOC] Called when an instruction begins a new source line: if the line changed,
+        # update self.lineno and the TracingContext current location, and emit a trace-source log
+        # line lazily when that log is enabled.
         if self.lineno == lineno:
             return
         self.lineno = lineno
@@ -1698,6 +1928,13 @@ class InstructionTranslatorBase(
             trace_source_log.debug("%s", LazyString(self.get_log_starts_line_log_str))
 
     def step(self) -> bool:
+        # [FUNCTION DOC] Execute the instruction at the instruction pointer via the dispatch table.
+        # Returns True to continue tracing, False to stop (end of code, return/yield signal, or
+        # output should_exit). Records a speculation when the stack is empty and a graph exists
+        # (taking a step graph break if that speculation failed earlier). Observed exceptions go to
+        # exception_handler. On Unsupported/UserError/StepUnsupported it re-raises under fullgraph /
+        # error_on_graph_break / resume-prologue / skip_frame, marks skip_frame when no checkpoint
+        # exists, or else logs and fails the last speculation to restart analysis.
         """Process exactly one instruction, return False we should exit"""
         self.error_on_graph_break = _get_error_on_graph_break()
 
@@ -1816,6 +2053,10 @@ class InstructionTranslatorBase(
     if sys.version_info >= (3, 11):
 
         def update_block_stack(self, inst: Instruction) -> None:
+            # [FUNCTION DOC] Python 3.11+: pop the top symbolic with-block when the instruction's
+            # exception table entry shows we left it into the enclosing block, or when no entry
+            # covers it (except NOP/JUMP_BACKWARD/NOT_TAKEN). Raises AssertionError if leaving a
+            # block with more than one nested block on the stack.
             # 3.11+ no longer uses a block stack, but we still keep track of one
             # so that we know which contexts are currently active.
             # For our purposes, all exception table entries with the same target
@@ -1865,10 +2106,13 @@ class InstructionTranslatorBase(
     else:
 
         def update_block_stack(self, inst: Instruction) -> None:
+            # [FUNCTION DOC] Pre-3.11: no-op (block stack is managed by explicit block opcodes).
             pass
 
     @property
     def next_instruction(self) -> Instruction:
+        # [FUNCTION DOC] Return the instruction at the instruction pointer (the one executed next).
+        # Raises AssertionError if the pointer is None.
         if self.instruction_pointer is None:
             raise AssertionError(
                 "expected self.instruction_pointer is not None to be true"
@@ -1876,6 +2120,11 @@ class InstructionTranslatorBase(
         return self.instructions[self.instruction_pointer]
 
     def step_graph_break(self, continue_inst: Instruction) -> None:
+        # [FUNCTION DOC] Graph break at a failed step-speculation (stack must be empty): compile the
+        # partial subgraph and then emit code resuming at continue_inst (for nested/inlined frames,
+        # also skip/handle the parent chain when nested graph breaks are enabled). Raises
+        # AssertionError if output instructions already exist, there is no current speculation, or
+        # the stack is non-empty.
         # generate code from checkpoint
         if self.output.output_instructions:
             raise AssertionError(
@@ -2079,12 +2328,21 @@ class InstructionTranslatorBase(
             )
 
     def run_ctx_mgr(self) -> Any:
+        # [FUNCTION DOC] Return the context manager wrapped around run(): a TracingContext frame
+        # context with no pushed frame summary, so real_stack gets attached to exceptions.
         # NB: Don't push the top level frame summary; set_current_loc will
         # take care of it.  However, DO make sure we attach real_stack to
         # exceptions
         return TracingContext.current_frame(None)
 
     def run(self) -> None:
+        # [FUNCTION DOC] Trace the whole frame: register this translator with the output graph and
+        # call step() until it returns False. Errors while tracing a resume prologue are wrapped
+        # in ResumePrologueTracingError; graph breaks the root translator cannot handle are logged
+        # (unless fullgraph) and data-dependent ones get the partial FX graph attached; other
+        # errors get the execution record attached and side effects summarized. Always pops the
+        # translator from the output graph and, for the root translator, cleans up the output
+        # graph and stops bytecode tracing.
         with self.run_ctx_mgr():
             dump_file(self.f_code.co_filename)
             try:
@@ -2164,6 +2422,9 @@ class InstructionTranslatorBase(
                     self.output.mark_bytecode_tracing_stop()
 
     def push(self, val: VariableTracker) -> None:
+        # [FUNCTION DOC] Push a VariableTracker onto the symbolic stack, first tagging it with a
+        # source location (from the current instruction's position data or line) if it has none.
+        # Raises AssertionError if val is not a VariableTracker.
         if not isinstance(val, VariableTracker):
             raise AssertionError(f"push expects VariableTracker, got {typestr(val)}")
         if val.source_location is None:
@@ -2188,16 +2449,23 @@ class InstructionTranslatorBase(
         self.stack.append(val)
 
     def push_many(self, vals: list[VariableTracker]) -> None:
+        # [FUNCTION DOC] Push each value in order (last element ends on top).
         for val in vals:
             self.push(val)
 
     def pop(self) -> VariableTracker:
+        # [FUNCTION DOC] Pop and return the top of the symbolic stack.
         return self.stack.pop()
 
     def popn(self, n: int) -> list[VariableTracker]:
+        # [FUNCTION DOC] Pop n values and return them in stack order (deepest first).
         return [*reversed([self.pop() for _ in range(n)])]
 
     def LOAD_FAST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the (unwrapped) symbolic local named by the instruction. Falls
+        # back to the "implicit" name for dotted comprehension variables; graph breaks if the local
+        # is undefined. Locals named with the __stack prefix (continuation args) are removed after
+        # loading. Records the local with the execution recorder if active.
         name = inst.argval
         if self.exec_recorder and name in self.f_locals:
             self.exec_recorder.add_local_var(name, self.f_locals[name])
@@ -2233,6 +2501,9 @@ class InstructionTranslatorBase(
             self.symbolic_locals.pop(name)
 
     def _cellvar(self, name: str) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Resolve the cell variable for a name: the symbolic local if it
+        # currently holds a CellVariable, else the entry in the symbolic_cellvars registry
+        # (KeyError if absent).
         # The localsplus slot is authoritative while it holds a cell (a
         # mid-function MAKE_CELL from an inlined comprehension can replace a
         # merged cell slot's cell with a fresh one). Fall back to the registry
@@ -2246,6 +2517,8 @@ class InstructionTranslatorBase(
         return self.symbolic_cellvars[name]
 
     def LOAD_DEREF(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the current contents of the named cell/free variable, read
+        # through the side-effect tracker. Raises AssertionError if the name is not a cell/freevar.
         if inst.argval not in self.cell_and_freevars():
             raise AssertionError(
                 "expected inst.argval in self.cell_and_freevars() to be true"
@@ -2258,6 +2531,9 @@ class InstructionTranslatorBase(
             self.exec_recorder.add_local_var(inst.argval, self.f_locals[inst.argval])
 
     def STORE_FAST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop a value, give it the local's name as a hint, and bind it in
+        # symbolic_locals. Storing to the resume-prologue marker variable updates
+        # is_tracing_resume_prologue (the value must be a bool constant).
         name = inst.argval
         loaded_vt = self.pop()
         loaded_vt.set_name_hint(name)
@@ -2269,12 +2545,18 @@ class InstructionTranslatorBase(
             self.is_tracing_resume_prologue = val
 
     def DELETE_FAST(self, inst: Instruction) -> None:
-        var = self.symbolic_locals.get(inst.argval)
+        # [FUNCTION DOC] Opcode: delete a symbolic local; tensors may first get a stream
+        # sync-dealloc emitted. Raises KeyError if the local is not bound.
+        var =self.symbolic_locals.get(inst.argval)
         if isinstance(var, TensorVariable):
             self._maybe_emit_sync_dealloc(var)
         del self.symbolic_locals[inst.argval]
 
     def _maybe_emit_sync_dealloc(self, var: TensorVariable) -> None:
+        # [FUNCTION DOC] HELPER: For a CUDA/XPU tensor whose last use in the graph ran on a different
+        # stream than its allocation, add graph calls that record an event on the last-use stream
+        # and a sync_dealloc op tied to the allocation stream. No-op for other devices, unused
+        # tensors, or when the streams match. Adds nodes to the output graph.
         from .variables.streams import get_current_stream, new_event
 
         device = var.device
@@ -2318,6 +2600,9 @@ class InstructionTranslatorBase(
         )
 
     def STORE_DEREF(self, inst: Instruction) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] Opcode: pop a value and store it into the named cell/free variable via the
+        # side-effect tracker, hinting the value's name from the cell. Raises AssertionError for
+        # unknown names or a non-cell variable.
         if inst.argval not in self.cell_and_freevars():
             raise AssertionError(
                 "expected inst.argval in self.cell_and_freevars() to be true"
@@ -2334,10 +2619,13 @@ class InstructionTranslatorBase(
             val.set_name_hint(cell.local_name)  # type: ignore[attr-defined]
 
     def LOAD_CLOSURE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the cell object itself (not its contents) for the named variable.
         # LOAD_CLOSURE pushes the cell object itself.
         self.push(self._cellvar(inst.argval))
 
     def _load_const(self, inst: Instruction) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Return the ConstantVariable for the instruction's constant, using a
+        # per-translator cache indexed by the instruction argument (built on first use).
         i = inst.arg
         if i is None:
             return ConstantVariable.create(value=inst.argval)  # type: ignore[return-value]
@@ -2350,9 +2638,14 @@ class InstructionTranslatorBase(
         return val
 
     def LOAD_CONST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the instruction's constant as a ConstantVariable.
         self.push(self._load_const(inst))
 
     def _load_global(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: Push the named global: names missing from globals are loaded as
+        # builtins; globals modified during tracing come from the side-effect tracker; otherwise a
+        # variable is built with a GlobalSource (installing guards). Records globals/builtins with
+        # the execution recorder if active.
         name = inst.argval
 
         if self.exec_recorder:
@@ -2376,12 +2669,17 @@ class InstructionTranslatorBase(
 
     @functools.cached_property
     def nn_modules_globals_vt(self) -> VariableTracker:
+        # [FUNCTION DOC] Cached property: a variable wrapping the torch.nn.modules.module module,
+        # built with an import source so it can be guarded and reconstructed.
         module_name = "torch.nn.modules.module"
         module_source = self.import_source(module_name)
         fglobals_value = _import_module(module_name)
         return VariableTracker.build(self, fglobals_value, module_source)
 
     def LOAD_GLOBAL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: load a global/builtin; when the low bit of the argument is set also
+        # push a NULL (before the value on 3.11-3.12, after it on 3.13+). Raises AssertionError if
+        # the argument is missing.
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
         if sys.version_info >= (3, 11) and sys.version_info < (3, 13) and inst.arg % 2:
@@ -2391,6 +2689,8 @@ class InstructionTranslatorBase(
             self.PUSH_NULL(inst)
 
     def STORE_GLOBAL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop a value and record a global store in the side-effect tracker
+        # (replayed after the graph runs). Graph breaks if the value is a tensor hook handle.
         value = self.pop()
         name = inst.argval
         source = GlobalSource(name)
@@ -2412,6 +2712,10 @@ class InstructionTranslatorBase(
     # InstructionTranslator - so it should be safe to do.
     @cache_method
     def import_source(self, module_name: str) -> GlobalSource:
+        # [FUNCTION DOC] Register an alias global for the named module (handling torch_package
+        # modules) in the output graph's global scope, import sources, co_names and the package,
+        # and return a GlobalSource for the alias. Cached per translator. Raises AssertionError if
+        # the alias is already bound to something else.
         """Create an alias to a module for use in guards"""
         if "torch_package" in module_name:
             value = torch.package.package_importer._package_imported_modules[
@@ -2437,6 +2741,9 @@ class InstructionTranslatorBase(
         return GlobalSource(alias)
 
     def resolve_name(self, name: str, package: str, level: int) -> str:
+        # [FUNCTION DOC] Resolve a relative import name to an absolute module name given the
+        # package and relative level (copied from CPython). Raises ImportError if the level goes
+        # beyond the top-level package.
         """
         Copied from the Cpython implementation of __import__
         Resolve a relative module name to an absolute one.
@@ -2449,6 +2756,9 @@ class InstructionTranslatorBase(
         return f"{base}.{name}" if name else base
 
     def calc_package(self) -> str:
+        # [FUNCTION DOC] Determine the package of the executing module from f_globals (__package__,
+        # else __spec__.parent, else derived from __name__/__path__), logging warnings on
+        # inconsistencies (copied from CPython).
         """
         Copied from the Cpython implementation of __import__
         https://github.com/python/cpython/blob/5a094f0255eea1db58fb2cf14c200971e64ec36e/Lib/importlib/_bootstrap.py#L1090
@@ -2478,6 +2788,10 @@ class InstructionTranslatorBase(
         return package
 
     def IMPORT_NAME(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop level and fromlist constants, perform a real import (or load the
+        # module recorded for replay), resolve relative names, and push a PythonModuleVariable
+        # with an import source. Graph breaks on ImportError or when the result is not a module.
+        # Side effect: real module import and execution recorder update.
         level, fromlist = self.popn(2)
         level = level.as_python_constant()
         fromlist = fromlist.as_python_constant()
@@ -2542,6 +2856,7 @@ class InstructionTranslatorBase(
     EAGER_IMPORT_NAME = IMPORT_NAME
 
     def IMPORT_FROM(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: duplicate the module on top of the stack and load the named attribute from it.
         self.DUP_TOP(inst)
         self._load_attr(inst.argval)
 
@@ -2549,6 +2864,9 @@ class InstructionTranslatorBase(
     # InstructionTranslator - so it should be safe to do.
     @cache_method
     def load_builtin_from_argval(self, argval: Any) -> VariableTracker:
+        # [FUNCTION DOC] Return a variable for the named builtin (cached): callables are built with a
+        # source into the builtins dict (guarded), builtin constants without one. A missing name
+        # raises an observed NameError; a non-callable non-constant raises AssertionError.
         if argval not in self.f_builtins:
             # Name is neither a global nor a builtin: matches CPython raising
             # NameError with `name` set to the missing identifier.
@@ -2572,9 +2890,13 @@ class InstructionTranslatorBase(
             return VariableTracker.build(self, val)
 
     def load_builtin(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Push the builtin named by the instruction's argument.
         self.push(self.load_builtin_from_argval(inst.argval))
 
     def jump(self, inst: Instruction | BlockStackEntry) -> None:
+        # [FUNCTION DOC] Move the instruction pointer to the index of inst.target and reset
+        # start_point, adding the number of instructions executed since the last jump to the
+        # ir_count metric. Raises AssertionError if the pointer, start point, or target is None.
         if self.instruction_pointer is None:
             raise AssertionError(
                 "expected self.instruction_pointer is not None to be true"
@@ -2598,29 +2920,40 @@ class InstructionTranslatorBase(
     JUMP_IF_TRUE_OR_POP = generic_jump(operator.truth, True)
 
     def SETUP_LOOP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy Python <= 3.7): push a block stack entry for the loop. Raises
+        # AssertionError if the instruction has no target.
         # only exists in python<=3.7
         if inst.target is None:
             raise AssertionError("expected inst.target is not None to be true")
         self.block_stack.append(BlockStackEntry(inst, inst.target, len(self.stack)))
 
     def SETUP_EXCEPT(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy Python <= 3.7): push a block stack entry for the try block.
         # only exists in python<=3.7
         if inst.target is None:
             raise AssertionError("expected inst.target is not None to be true")
         self.block_stack.append(BlockStackEntry(inst, inst.target, len(self.stack)))
 
     def POP_BLOCK(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop the top block stack entry.
         self.block_stack.pop()
 
     def SETUP_WITH(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (older Pythons): delegate to setup_or_before_with.
         self.setup_or_before_with(inst)
 
     def SETUP_FINALLY(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push a block stack entry (target and current stack depth) for a
+        # try/finally block. Raises AssertionError if the instruction has no target.
         if inst.target is None:
             raise AssertionError("expected inst.target is not None to be true")
         self.block_stack.append(BlockStackEntry(inst, inst.target, len(self.stack)))
 
     def FOR_ITER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: advance the iterator on top of the stack and push the next value.
+        # On exhaustion (StopIteration or observed user StopIteration/IndexError, which is handled)
+        # push a None (3.12+) or pop the iterator (older) and jump past the loop. On 3.15+ a NULL
+        # stays on top of the iterator.
         # in 3.15+, make sure TOS remains a null
         if sys.version_info >= (3, 15):
             null = self.pop()
@@ -2653,6 +2986,9 @@ class InstructionTranslatorBase(
     def _create_exception_instance(
         self, val: ExceptionTypes | ExceptionVals
     ) -> ExceptionVals:
+        # [FUNCTION DOC] HELPER: Normalize a raise operand into an exception instance variable: an
+        # exception class is instantiated with no arguments (error if the result is not a
+        # BaseException); an instance is returned as is. Raises an observed TypeError otherwise.
         if pyexception_class_check(val):
             # Create the instance of the exception type
             # https://github.com/python/cpython/blob/3.11/Python/ceval.c#L6547-L6549
@@ -2674,6 +3010,10 @@ class InstructionTranslatorBase(
     def set_exception_obj(
         self, exception: ExceptionTypes, value: VariableTracker | None
     ) -> ExceptionVals:
+        # [FUNCTION DOC] Build the exception instance for a type and optional value (reusing value
+        # if it is already an instance of the type, else calling the type with it), attach a
+        # traceback entry, set its implicit __context__ chain, and record it as the current raised
+        # exception. Returns the instance. Raises AssertionError if the result is not an exception variable.
         # Mirrors CPython PyErr_SetObject
         # Note: This function is here rather than in ExceptionStack because we
         # need an InstructionTranslator instance to create the exception instance
@@ -2703,6 +3043,8 @@ class InstructionTranslatorBase(
         return instance
 
     def _attach_traceback_to_exception(self, exc: ExceptionVals) -> None:
+        # [FUNCTION DOC] HELPER: Prepend a traceback entry for the current frame to the exception's
+        # __traceback__ attribute (like PyTraceBack_Here). Mutates the exception variable.
         # based on CPython's PyTraceBack_Here impl
         frame_summary = self.frame_summary()
         tb = exc.tp_getattro_impl(
@@ -2723,6 +3065,9 @@ class InstructionTranslatorBase(
         )
 
     def _raise_observed_exception(self, exc_: ExceptionVals) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Raise the Dynamo ObservedException subclass matching the exception
+        # variable's type, carrying the exception's recorded python stack, to unwind the tracer to
+        # the handler. Always raises.
         # Propagate `exc_` as an ObservedException to unwind the tracer to the
         # handler, preserving the original raise location via python_stack.
         observed_exception_type = get_dynamo_observed_exception(exc_.exc_type)  # type: ignore[attr-defined, union-attr]
@@ -2736,6 +3081,11 @@ class InstructionTranslatorBase(
         val: VariableTracker | None,
         cause: VariableTracker | None,
     ) -> NoReturn:
+        # [FUNCTION DOC] Implement a Python raise statement symbolically. val None re-raises the top
+        # handled exception (observed RuntimeError if none). Otherwise normalizes val to an
+        # instance, validates and sets __cause__ from cause, records the raise-site stack once,
+        # registers it as the current exception and raises the matching observed exception.
+        # Raises observed TypeError for non-exception values/causes. Never returns.
         # Mirrors CPython's `do_raise`
         # https://github.com/python/cpython/blob/704c4c79e8485c20fb59cea1acec005f365a4fca/Python/ceval.c#L1900
 
@@ -2796,6 +3146,9 @@ class InstructionTranslatorBase(
         self._raise_observed_exception(exc_instance)
 
     def RAISE_VARARGS(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: argument 0 re-raises; 1 raises the top of stack (left on the stack);
+        # otherwise pops a cause and an exception and raises the exception from the cause.
+        # Always ends by raising an observed exception.
         if inst.arg == 0:
             # bare raise; do_raise reraises the exception on top of the stack,
             # or reports "No active exception to reraise" if the stack is empty
@@ -2811,6 +3164,9 @@ class InstructionTranslatorBase(
             self.do_raise(val, cause)
 
     def CLEANUP_THROW(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): if the exception on top is a StopIteration, pop three values
+        # and push None and the exception's first argument (or None) as a normal generator return;
+        # otherwise re-raise via RERAISE. Raises AssertionError if the top is not an exception.
         # https://github.com/python/cpython/pull/96010
         tos = self.stack[-1]
         if not isinstance(tos, ExceptionVals):
@@ -2823,6 +3179,10 @@ class InstructionTranslatorBase(
             self.RERAISE(inst)
 
     def RERAISE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: re-raise the exception on top of the stack as the current raised
+        # exception (3.11+: pops an extra lasti value if the argument is nonzero, otherwise leaves
+        # the exception on the stack; older: pops type, value, traceback). Always raises an
+        # observed exception; AssertionError if the value is not an exception instance.
         # https://docs.python.org/3/library/dis.html#opcode-RERAISE
         #   Re-raises the exception currently on top of the stack. If oparg is
         #   non-zero, pops an additional value from the stack which is used to
@@ -2856,6 +3216,9 @@ class InstructionTranslatorBase(
             self._raise_observed_exception(val)
 
     def WITH_EXCEPT_START(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: call the with-statement's __exit__ (located at a version-dependent
+        # stack depth) with the exception type, value and traceback of the active exception, and
+        # push the result. Raises AssertionError on a too-shallow stack or a non-exception value.
         args: list[VariableTracker] = []
         if sys.version_info >= (3, 11):
             fn_loc = 4 if sys.version_info < (3, 14) else 5
@@ -2902,12 +3265,21 @@ class InstructionTranslatorBase(
         self.call_function(fn, args, {})
 
     def exception_handler(self, raised_exception: ObservedException) -> None:
+        # [FUNCTION DOC] Route an observed exception to a handler in this frame. On 3.11+, uses the
+        # current instruction's exception table entry: unwinds the stack to the handler depth,
+        # optionally pushes the lasti offset, pushes the raised exception, and jumps to the handler.
+        # With no entry, clears the stack, attaches a traceback and either graph breaks (root
+        # translator: exception escapes the compiled region) or re-raises to the parent. On older
+        # Pythons, pops the block stack looking for a handler.
         observed_exn_gb_explanation = (
             "Dynamo found no exception handler at the top-level compiled function "
             "when encountering an exception. Exception will propagate outside the compiled region."
         )
 
         def bubble_exception_to_interpreter() -> None:
+            # [FUNCTION DOC] HELPER: Let an unhandled exception leave the compiled region: fake tensor
+            # errors become a TorchRuntimeError; other exceptions cause an "Observed exception"
+            # graph break. Always raises.
             # Bubble the exception to the interpreter
             if isinstance(raised_exception, FakeTensorObservedException):
                 from .exc import format_graph_break_message
@@ -3042,6 +3414,9 @@ class InstructionTranslatorBase(
                 raise raised_exception
 
     def PUSH_EXC_INFO(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): pop the top value, push the previously handled exception (or
+        # None) and then the popped value back, and move the current exception onto the handled
+        # exception stack.
         # https://docs.python.org/3/library/dis.html#opcode-PUSH_EXC_INFO
         #   Pops a value from the stack. Pushes the current exception to the top
         #   of the stack. Pushes the value originally popped back to the stack.
@@ -3071,6 +3446,9 @@ class InstructionTranslatorBase(
         self.exn_vt_stack.move_current_exception_to_stack()
 
     def POP_EXCEPT(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: end of an except handler. 3.11+: pop one stack value; older: pop the
+        # EXCEPT_HANDLER block and three values. Either way pops the handled exception stack.
+        # Raises AssertionError if the exception stack is empty or the block entry is wrong.
         if sys.version_info >= (3, 11):
             _ = self.pop()
             # This exception is handled and therefore we can clear the error indicator
@@ -3095,6 +3473,11 @@ class InstructionTranslatorBase(
             self.exn_vt_stack.pop()
 
     def check_if_exc_matches(self) -> bool:
+        # [FUNCTION DOC] Evaluate an except clause match: pop the expected type(s) (a builtin or user
+        # exception class, or a tuple of them) and test the active exception below it (popped only
+        # before 3.11) for being an instance/subclass of any. Returns the boolean result. Graph
+        # breaks for unsupported expected types or non-exception values. Raises AssertionError if
+        # the stack has fewer than two values.
         if not (len(self.stack) >= 2):
             raise AssertionError("expected len(self.stack) >= 2 to be true")
         expected_exc_types = self.pop()
@@ -3179,9 +3562,11 @@ class InstructionTranslatorBase(
         return False
 
     def CHECK_EXC_MATCH(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the boolean result of the except-clause match test.
         self.push(VariableTracker.build(self, self.check_if_exc_matches()))
 
     def JUMP_IF_NOT_EXC_MATCH(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (pre-3.11): jump to the instruction's target if the exception does not match.
         if not self.check_if_exc_matches():
             self.jump(inst)
 
@@ -3190,12 +3575,17 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace COMPARE_OP: a comparison operation, e.g. a == b",
     )
     def COMPARE_OP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (graph-break capable): the old "exception match" form does an except
+        # match test; otherwise pops two operands and pushes the result of the matching comparison
+        # handler (including "in" and "not in").
         if inst.argval == "exception match":
             self.CHECK_EXC_MATCH(inst)
         else:
             self.push(compare_op_handlers[inst.argval](self, self.popn(2), {}))
 
     def GET_ITER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: replace the iterable on top of the stack with its iterator (always a
+        # real iterator, unlike CPython 3.15 virtual iterators), pushing a NULL after it on 3.15+.
         # This is intentionally different from cpython 3.15+.  Cpython creates virtual iterators for certain types
         # (i.e. lists/tuples), represented on the stack by the iterable + an integer index.  Other types call the
         # builtin iter and are represented by iterator + null.  We could mimic this in dynamo, but it becomes
@@ -3211,7 +3601,9 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace CALL_FUNCTION: a call to a regular function, e.g. f(x, y)",
     )
     def CALL_FUNCTION(self, inst: Instruction) -> None:
-        args = self.popn(inst.argval)
+        # [FUNCTION DOC] Opcode (graph-break capable): pop the positional arguments and the callee and
+        # push the call result.
+        args =self.popn(inst.argval)
         fn = self.pop()
         self.call_function(fn, args, {})
 
@@ -3220,6 +3612,10 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace CALL_FUNCTION_EX: a variadic function call, e.g. f(*args)",
     )
     def CALL_FUNCTION_EX(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (graph-break capable): variadic call. Pops the keyword mapping (when
+        # present), the positional sequence, the callee and any NULL (position depends on Python
+        # version). Non-list positionals are unpacked into a tuple; user-defined mappings are
+        # converted to dicts. Graph breaks on bad flags or non-list/dict types. Pushes the result.
         kwargsvars: VariableTracker
         if inst.argval == 0:
             kwargsvars = ConstDictVariable({})
@@ -3291,6 +3687,12 @@ class InstructionTranslatorBase(
         "a function call with keyword arguments, e.g. f(x=True)",
     )
     def CALL_FUNCTION_KW(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (graph-break capable, pre-3.11 style): pops a constant tuple of keyword
+        # names, the arguments and the callee; the last len(names) arguments become keyword
+        # arguments. Pushes the call result. Raises AssertionError for a non-constant name tuple
+        # or duplicate names.
+        # KNOWN ISSUE: with an empty names tuple the negative slice by zero would treat all
+        # arguments as keywords, but such a call is not normally emitted.
         argnames = self.pop()
         args = self.popn(inst.argval)
         fn = self.pop()
@@ -3308,6 +3710,8 @@ class InstructionTranslatorBase(
         self.call_function(fn, args, kwargs)
 
     def LOAD_METHOD_SUPER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): perform the super() call with two stack arguments, then load
+        # the named method from the resulting super object (as an attribute before 3.11, else via LOAD_METHOD).
         self.CALL_FUNCTION(dataclasses.replace(inst, argval=2))
         arg = inst.argval[0]
         argval = self.code_options["co_names"][arg]
@@ -3317,12 +3721,17 @@ class InstructionTranslatorBase(
             self.LOAD_METHOD(dataclasses.replace(inst, argval=argval))
 
     def LOAD_ATTR_SUPER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): perform the super() call with two stack arguments, then load
+        # the named attribute from the resulting super object.
         self.CALL_FUNCTION(dataclasses.replace(inst, argval=2))
         arg = inst.argval[0]
         argval = self.code_options["co_names"][arg]
         self._load_attr(argval)
 
     def LOAD_METHOD(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): load the attribute and push it together with a NULL (NULL
+        # first on 3.11-3.12, after on 3.13+). Raises AssertionError on Python < 3.11, where it is
+        # rewritten before reaching here.
         self._load_attr(inst.argval)
         obj = self.pop()
         if sys.version_info >= (3, 13):
@@ -3340,11 +3749,16 @@ class InstructionTranslatorBase(
             )
 
     def CALL_METHOD(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode placeholder: always raises AssertionError, since CALL_METHOD is
+        # rewritten to CALL_FUNCTION before tracing.
         raise AssertionError(
             "CALL_METHOD should have been rewritten to CALL_FUNCTION. This function should never be called."
         )
 
     def _load_attr(self, attr: Any) -> None:
+        # [FUNCTION DOC] HELPER: Pop an object, realize it, and push its attribute using the generic
+        # getattr protocol. If that is unsupported but the object is a Python constant, fall back to
+        # the real getattr with an attribute source. Re-raises otherwise.
         obj = self.pop().realize()
         try:
             result = generic_getattr(self, obj, attr)
@@ -3358,6 +3772,8 @@ class InstructionTranslatorBase(
         self.push(result)
 
     def LOAD_ATTR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: replace the object on top with its named attribute. On 3.12+ the
+        # method-variant argument bit must already be normalized away (AssertionError otherwise).
         if sys.version_info >= (3, 12):
             if inst.arg is None or inst.arg % 2 != 0:
                 raise AssertionError(
@@ -3371,6 +3787,8 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace STORE_ATTR: storing an object's attribute, e.g. x.attr = y",
     )
     def STORE_ATTR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (graph-break capable): pop the object and value and perform a
+        # symbolic setattr of the named attribute (recording side effects). Pushes nothing.
         val, obj = self.popn(2)
         VariableTracker.build(self, setattr).call_function(
             self,  # type: ignore[arg-type]
@@ -3379,6 +3797,8 @@ class InstructionTranslatorBase(
         )
 
     def DELETE_ATTR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop an object and symbolically delete the named attribute, first
+        # emitting a stream sync-dealloc if the attribute holds a tensor with a pending mutation.
         obj = self.pop()
         self._maybe_sync_dealloc_attr(obj, inst.argval)
         VariableTracker.build(self, delattr).call_function(
@@ -3388,6 +3808,9 @@ class InstructionTranslatorBase(
         )
 
     def _maybe_sync_dealloc_attr(self, obj: VariableTracker, name: str) -> None:
+        # [FUNCTION DOC] HELPER: If the side-effect tracker holds a pending mutation of obj.name that
+        # is a tensor, emit a sync-dealloc for it. Uses only the tracker (no getattr, so no
+        # graph nodes or graph breaks are triggered by the lookup).
         # Only check side_effects — a pure dict lookup with no observable
         # side effects. We intentionally avoid tp_getattro_impl here because it
         # can trigger __getattr__, add graph nodes, or cause graph breaks.
@@ -3400,6 +3823,10 @@ class InstructionTranslatorBase(
     def codegen_return_with_pops(
         inst: Instruction, num_stack: int
     ) -> list[Instruction]:
+        # [FUNCTION DOC] Static method: build instructions that return from a stack laid out as cells,
+        # frame values, then 0 or 1 current-frame values: swap the value down if present, pop the
+        # two bookkeeping entries, and return (RETURN_VALUE or RETURN_CONST copying inst's constant).
+        # Raises AssertionError if num_stack is greater than 1.
         """
         Debug CPython expects the stack to be empty after the return.
         Calling compile_subgraph will push cells and frame values to TOS.
@@ -3439,6 +3866,14 @@ class InstructionTranslatorBase(
         is_leaf: bool,
         handle_inactive_ctx: bool,
     ) -> tuple[types.CodeType, str]:
+        # [FUNCTION DOC] Create the resume function for this frame, resuming at resume_inst (a jump
+        # is followed to its target). Emits codegen (into cg) that replaces inactive context
+        # manager values by their classes (when handle_inactive_ctx) and, for the leaf frame,
+        # filters frame locals to the live ones. Looks up or builds the continuation code via
+        # ContinueExecutionCache with block-stack, stack-length and argument-name info, copies
+        # any original-GraphModule context, installs the resume function as a global (and in the
+        # package), and bumps the resumes counter. Returns (code object, global name). Stack
+        # state is unchanged. Raises AssertionError on inconsistent state.
         """
         Creates the resume function for the frame corresponding to `self`.
 
@@ -3636,6 +4071,10 @@ class InstructionTranslatorBase(
         return new_code, resume_name
 
     def _maybe_replace_warnings_warn_on_stack(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: If the callee of the call instruction on the symbolic stack is the
+        # skipped warnings.warn function, replace it in place with a wrapper reporting the leaf
+        # frame's source location (installed as an output global). Silently returns when the
+        # instruction has no argument, the callee depth cannot be found, or no line is known.
         """Replace warnings.warn on the symbolic stack with a wrapper that
         preserves the leaf frame's source location for warning dedup.
 
@@ -3677,6 +4116,13 @@ class InstructionTranslatorBase(
         inst: Instruction,
         all_stack_locals_metadata: list[StackLocalsMetadata],
     ) -> list[Instruction]:
+        # [FUNCTION DOC] Generate bytecode that creates and calls the resume function(s) for this
+        # frame and its parents, then returns their result. Sets instruction_pointer to None.
+        # Frames whose resume instruction is a return are skipped (if all are, it just returns
+        # the top of stack). Rearranges the packed frame values so the deepest non-returning
+        # frame receives the leaf stack values, filters cells and frame values to the kept frames,
+        # calls create_resume for each kept frame, then codegen_call_resume. Returns the
+        # instruction list. May update num_stack in the metadata and push an UnknownVariable.
         """
         Codegen all resume function(s) from the frame stack starting at `self`, call them,
         and return the result.
@@ -3846,6 +4292,11 @@ class InstructionTranslatorBase(
     def codegen_call_resume(
         resume_codes: list[types.CodeType], resume_names: list[str], cg: PyCodegen
     ) -> None:
+        # [FUNCTION DOC] Static method: emit bytecode that calls the chain of resume functions. Loads
+        # each resume function (through its factory with the matching cells when it has free
+        # variables), arranges the stack as first resume function, a list of the remaining
+        # resumes and frame values, and the root frame's values, then emits the call. Pops cells
+        # and frame values, leaving the call result on top. Appends to cg.
         """
         Calls the provided resume functions.
 
@@ -3975,6 +4426,12 @@ class InstructionTranslatorBase(
         cg.extend_output(create_call_function_ex(False, True))
 
     def should_compile_partial_graph(self) -> bool:
+        # [FUNCTION DOC] Return whether a graph break may compile a partial graph now. False if (3.11+)
+        # the current instruction is in a block other than the top with-block; otherwise true only
+        # if every block on the block stack is restorable, not fullgraph, error-on-graph-break
+        # is not set for the leaf tracer, not tracing a resume prologue, no generic context
+        # manager is active, no one-hop torch function skip is active, and the current tracer
+        # is not nested in a higher-order operator.
         if sys.version_info >= (3, 11):
             # Do not compile if current instruction's block is not the top with block
             entry = self.current_instruction.exn_tab_entry
@@ -3999,10 +4456,14 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace STORE_SUBSCR: trying to store subscript, e.g. x[key] = y",
     )
     def STORE_SUBSCR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (graph-break capable): pop value, object and key and perform a
+        # symbolic item assignment. Pushes nothing.
         val, obj, key = self.popn(3)
         generic_setitem(self, obj, key, val)
 
     def DELETE_SUBSCR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop object and key, emit a stream sync-dealloc if the removed item
+        # is a tensor (found without side effects), then symbolically delete the item.
         obj, key = self.popn(2)
         # Check for tensor items using side-effect-free internal lookups
         # only. We avoid call_method("__getitem__") because it can execute
@@ -4013,6 +4474,8 @@ class InstructionTranslatorBase(
     def _maybe_sync_dealloc_subscr(
         self, obj: VariableTracker, key: VariableTracker
     ) -> None:
+        # [FUNCTION DOC] HELPER: Look up obj[key] for list-like or constant-dict variables using
+        # side-effect-free accessors (errors ignored); if the item is a tensor, emit a sync-dealloc.
         from .variables.dicts import ConstDictVariable
         from .variables.lists import BaseListVariable
 
@@ -4033,14 +4496,18 @@ class InstructionTranslatorBase(
             self._maybe_emit_sync_dealloc(item_var)
 
     def BUILD_TUPLE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop argval items and push a TupleVariable of them.
         items = self.popn(inst.argval)
         self.push(TupleVariable(items))
 
     def BUILD_SLICE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop argval items and push a SliceVariable built from them.
         items = self.popn(inst.argval)
         self.push(SliceVariable(items, tx=self))  # type: ignore[arg-type]
 
     def _can_speculate_comprehension_nested(self) -> bool:
+        # [FUNCTION DOC] HELPER: Whether comprehension speculation is allowed in a nested context;
+        # always False for the base class (overridden for inlined translators).
         """Check if comprehension speculation is allowed in nested context.
 
         For the base class (non-inlined), this always returns False.
@@ -4048,6 +4515,8 @@ class InstructionTranslatorBase(
         return False
 
     def BUILD_LIST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: first lets comprehension speculation set itself up (and returns if it
+        # handled the instruction); otherwise pops argval items and pushes a new list variable.
         if maybe_setup_comprehension_speculation(self, inst):
             return
 
@@ -4055,6 +4524,8 @@ class InstructionTranslatorBase(
         self.push(VariableTracker.build(self, items))
 
     def BUILD_SET(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop argval items and push a new mutable SetVariable. Graph breaks if
+        # the testing-only config flag requests a missing handler.
         if config.inject_BUILD_SET_unimplemented_TESTING_ONLY:
             unimplemented(
                 gb_type="missing BUILD_SET handler",
@@ -4067,7 +4538,9 @@ class InstructionTranslatorBase(
         self.push(new_set)
 
     def BUILD_LIST_UNPACK(self, inst: Instruction, cls: type = ListVariable) -> None:
-        seqs = self.popn(inst.argval)
+        # [FUNCTION DOC] Opcode (legacy): pop argval iterables, concatenate their unpacked items and
+        # push a new container of type cls (list by default). Graph breaks if an item cannot be unpacked.
+        seqs =self.popn(inst.argval)
         items = []
         for seq in seqs:
             try:
@@ -4083,11 +4556,14 @@ class InstructionTranslatorBase(
         self.push(cls(items, mutation_type=ValueMutationNew()))
 
     def BUILD_TUPLE_UNPACK(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): like BUILD_LIST_UNPACK but produces a tuple variable.
         self.BUILD_LIST_UNPACK(inst, cls=TupleVariable)
 
     BUILD_TUPLE_UNPACK_WITH_CALL = BUILD_TUPLE_UNPACK
 
     def BUILD_MAP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: first lets comprehension speculation set itself up; otherwise pops
+        # argval key/value pairs and pushes a dict variable built from them.
         if maybe_setup_comprehension_speculation(self, inst):
             return
 
@@ -4096,7 +4572,10 @@ class InstructionTranslatorBase(
         self.push(VariableTracker.build(self, d))
 
     def BUILD_MAP_UNPACK(self, inst: Instruction) -> None:
-        items = self.popn(inst.argval)
+        # [FUNCTION DOC] Opcode (legacy): pop argval mappings, convert each to a dict, merge them in
+        # order (later keys win) and push the merged dict variable. Raises AssertionError if a
+        # conversion does not yield a constant dict variable.
+        items =self.popn(inst.argval)
         # ensure everything is a dict
         items = [
             VariableTracker.build(self, dict).call_function(self, [x], {})
@@ -4119,6 +4598,9 @@ class InstructionTranslatorBase(
     BUILD_MAP_UNPACK_WITH_CALL = BUILD_MAP_UNPACK
 
     def BUILD_CONST_KEY_MAP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop a constant tuple of keys and argval values and push a dict
+        # variable mapping keys to values. Raises AssertionError on a non-constant key tuple or a
+        # length mismatch.
         keys = self.pop()
         values = self.popn(inst.argval)
         if not isinstance(keys, TupleVariable):
@@ -4138,6 +4620,8 @@ class InstructionTranslatorBase(
         )
 
     def MAP_ADD(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (dict comprehension): pop key and value and store them into the dict
+        # variable located argval positions down the stack. Raises AssertionError if that is not a dict variable.
         k, v = self.popn(2)
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4151,6 +4635,8 @@ class InstructionTranslatorBase(
         generic_setitem(self, obj, k, v)
 
     def SET_ADD(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (set comprehension): pop a value and add it to the mutable set
+        # variable argval positions down the stack. Raises AssertionError for a wrong target.
         v = self.pop()
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4164,6 +4650,8 @@ class InstructionTranslatorBase(
         obj.call_method(self, "add", [v], {})  # type: ignore[arg-type]
 
     def SET_UPDATE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop an iterable and update the mutable set variable argval positions
+        # down the stack with it. Raises AssertionError for a wrong target.
         v = self.pop()
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4177,6 +4665,9 @@ class InstructionTranslatorBase(
         obj.call_method(self, "update", [v], {})  # type: ignore[arg-type]
 
     def LIST_APPEND(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (list comprehension): pop a value and append it to the mutable list
+        # variable argval positions down the stack, recording the mutation in side effects.
+        # Raises AssertionError for a wrong or immutable target.
         v = self.pop()
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4191,6 +4682,10 @@ class InstructionTranslatorBase(
         obj.items.append(v)
 
     def MAKE_FUNCTION(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop the code object (and, before 3.11, the name), then (before 3.13)
+        # the optional closure, annotations, keyword defaults and defaults selected by the flag
+        # bits, and push a NestedUserFunctionVariable; annotations become a dict attribute.
+        # Raises AssertionError if the code object lacks a qualified name or annotations are not a tuple.
         flags = inst.arg
         if sys.version_info < (3, 11):
             fn_name = self.pop()
@@ -4244,6 +4739,8 @@ class InstructionTranslatorBase(
         self.push(fn)
 
     def UNPACK_SEQUENCE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop an iterable, unpack it fully and push its items so the first item
+        # ends on top. Raises an observed ValueError if the count differs from argval.
         seq = self.pop()
         val = unpack_iterable(self, seq)
         if len(val) < inst.argval:
@@ -4260,6 +4757,10 @@ class InstructionTranslatorBase(
             self.push(i)
 
     def UNPACK_EX(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (starred unpacking): the argument packs a prefix count (low byte) and
+        # suffix count (high byte). Pops an iterable, unpacks it, and pushes the suffix items, a
+        # new list of the middle items, then the prefix items. Raises an observed ValueError if
+        # too few values; graph breaks if the object is not iterable.
         if not (0 <= inst.argval <= 0xFFFF):
             raise AssertionError("expected 0 <= inst.argval <= 0xFFFF to be true")
         prefix = inst.argval & 0xFF  # low byte
@@ -4292,6 +4793,8 @@ class InstructionTranslatorBase(
         push=False, msg_prefix="Encountered intentional debugging graph break"
     )
     def graph_break_on_leaf_function(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: Testing aid (graph-break capable): forces a graph break when this
+        # function made no inlined calls, to exercise nested graph breaks.
         if self.has_no_inlined_calls:
             unimplemented(
                 gb_type="Forced graph break on leaf function",
@@ -4304,20 +4807,25 @@ class InstructionTranslatorBase(
             )
 
     def NOP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: does nothing, except that a NOP marked GRAPH_BREAK_IF_LEAF triggers
+        # the testing graph break helper.
         # Dynamo-specific testing behavior
         if inst.argval == "GRAPH_BREAK_IF_LEAF":
             self.graph_break_on_leaf_function(inst)
 
     def POP_TOP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: discard the top of the stack.
         self.pop()
 
     def ROT_TWO(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): swap the top two stack items.
         a = self.pop()
         b = self.pop()
         self.push(a)
         self.push(b)
 
     def ROT_THREE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): move the top item down to third position.
         a = self.pop()
         b = self.pop()
         c = self.pop()
@@ -4326,6 +4834,7 @@ class InstructionTranslatorBase(
         self.push(b)
 
     def ROT_FOUR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): move the top item down to fourth position.
         a = self.pop()
         b = self.pop()
         c = self.pop()
@@ -4336,11 +4845,13 @@ class InstructionTranslatorBase(
         self.push(b)
 
     def DUP_TOP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): duplicate the top stack item (same object pushed twice).
         a = self.pop()
         self.push(a)
         self.push(a)
 
     def DUP_TOP_TWO(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (legacy): duplicate the top two stack items, preserving order.
         a = self.pop()
         b = self.pop()
         self.push(b)
@@ -4349,6 +4860,8 @@ class InstructionTranslatorBase(
         self.push(a)
 
     def _convert_value(self, value: VariableTracker, flag: int) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Apply an f-string conversion: 1 = str, 2 = repr, 3 = ascii (symbolic
+        # calls); any other flag returns the value unchanged.
         if flag == 1:
             return VariableTracker.build(self, str).call_function(self, [value], {})  # type: ignore[arg-type]
         elif flag == 2:
@@ -4358,6 +4871,10 @@ class InstructionTranslatorBase(
         return value
 
     def _format_value(self, fmt_spec: VariableTracker, flags: int) -> None:
+        # [FUNCTION DOC] HELPER: Pop a value and push its formatted form. Symbolic numbers become a
+        # lazy format-string variable. Otherwise applies the conversion in the low two flag bits;
+        # with no conversion, an empty spec and the default object formatting it eagerly evaluates
+        # str. Else calls str.format with a constructed "{:spec}" string (which must be constant).
         value = self.pop()
         if isinstance(value, SymNodeVariable):
             from torch._dynamo.variables.lazy import (
@@ -4408,6 +4925,9 @@ class InstructionTranslatorBase(
         self.call_function(BuiltinVariable(str.format), [fmt_var, value], {})
 
     def FORMAT_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop an optional format spec (when flag bit 4 is set, else use an
+        # empty string) and format the value below it via _format_value. Raises AssertionError
+        # if the argument is missing.
         flags = inst.arg
         if flags is None:
             raise AssertionError("expected flags is not None to be true")
@@ -4418,6 +4938,9 @@ class InstructionTranslatorBase(
         return self._format_value(fmt_spec, flags)
 
     def BUILD_STRING(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop arg parts (constants or format-string variables), merge them into
+        # one StringFormatVariable with a combined format string, argument list and keyword
+        # mapping, and push it. Graph breaks on key conflicts or other part types.
         format_string_parts: list[str] = []
         args: list[VariableTracker] = []
         kwargs: dict[str, VariableTracker] = {}
@@ -4452,6 +4975,8 @@ class InstructionTranslatorBase(
         )
 
     def IS_OP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop two operands and push the result of "is" (argument 0) or
+        # "is not" (argument 1). Raises AssertionError for other argument values.
         if not (inst.argval == 0 or inst.argval == 1):
             raise AssertionError(
                 "expected inst.argval == 0 or inst.argval == 1 to be true"
@@ -4460,6 +4985,8 @@ class InstructionTranslatorBase(
         self.push(compare_op_handlers[argval](self, self.popn(2), {}))
 
     def CONTAINS_OP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop left and right operands and push whether left is in right
+        # (argument 0) or the negation (argument 1). Raises AssertionError for other arguments.
         if not (inst.argval == 0 or inst.argval == 1):
             raise AssertionError(
                 "expected inst.argval == 0 or inst.argval == 1 to be true"
@@ -4471,6 +4998,8 @@ class InstructionTranslatorBase(
             self.UNARY_NOT(inst)
 
     def LIST_EXTEND(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop an iterable and extend the mutable list variable argval positions
+        # down the stack with it. Raises AssertionError for a wrong or immutable target.
         v = self.pop()
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4484,11 +5013,16 @@ class InstructionTranslatorBase(
         obj.call_method(self, "extend", [v], {})  # type: ignore[arg-type]
 
     def LIST_TO_TUPLE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: replace the list on top with a tuple of its items (symbolic tuple call).
         self.push(
             VariableTracker.build(self, tuple).call_function(self, [self.pop()], {})
         )  # type: ignore[arg-type]
 
     def STOPITERATION_ERROR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode helper (PEP 479): if the exception on top of the stack is a
+        # StopIteration, replace it with a RuntimeError whose context and cause are the original
+        # exception. Other exceptions are left alone. Raises AssertionError if the top is not an
+        # exception instance.
         # wrap the generator body in a try: ... except StopIteration: ... which
         # converts the StopIteration into a RuntimeError
         # https://peps.python.org/pep-0479/
@@ -4517,6 +5051,9 @@ class InstructionTranslatorBase(
             self.stack[-1] = new_val
 
     def DICT_MERGE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (also used for DICT_UPDATE): pop a mapping and update the mutable dict
+        # variable argval positions down the stack with it. Raises AssertionError for a wrong or
+        # immutable target.
         v = self.pop()
         if not (inst.argval > 0):
             raise AssertionError("expected inst.argval > 0 to be true")
@@ -4534,9 +5071,12 @@ class InstructionTranslatorBase(
     DICT_UPDATE = DICT_MERGE
 
     def GEN_START(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: discard the top of the stack (the initial sent value of a generator).
         self.pop()
 
     def GET_LEN(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the length of the top item without popping it: a constant's
+        # real length, otherwise the result of its symbolic length method.
         tos = self.stack[-1]
         if tos.is_python_constant():
             self.push(VariableTracker.build(self, len(tos.as_python_constant())))
@@ -4544,6 +5084,8 @@ class InstructionTranslatorBase(
             self.push(tos.call_method(self, "__len__", [], {}))
 
     def MATCH_MAPPING(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (match statement): push whether the top item is a mapping, computed by
+        # inlining the impl_IS_MAPPING polyfill. The item stays on the stack.
         """
         If STACK[-1] is an instance of collections.abc.Mapping, push True.
         Otherwise, push False
@@ -4558,7 +5100,9 @@ class InstructionTranslatorBase(
         )
 
     def MATCH_SEQUENCE(self, inst: Instruction) -> None:
-        tos = self.stack[-1]
+        # [FUNCTION DOC] Opcode (match statement): push whether the top item is a sequence, via the
+        # inlined impl_MATCH_SEQUENCE polyfill. The item stays on the stack.
+        tos =self.stack[-1]
         self.push(
             self.inline_user_function_return(
                 VariableTracker.build(self, impl_MATCH_SEQUENCE),
@@ -4568,6 +5112,9 @@ class InstructionTranslatorBase(
         )
 
     def MATCH_CLASS(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (match statement): pop subject, class and attribute names, run the
+        # inlined impl_MATCH_CLASS polyfill with the argument as positional count, and push the
+        # result; before 3.11 also push a boolean telling whether the match succeeded.
         subject, cls, names = self.popn(3)
         arg = VariableTracker.build(self, inst.arg)
         self.push(
@@ -4584,6 +5131,9 @@ class InstructionTranslatorBase(
             self.push(VariableTracker.build(self, not istype(tos, ConstantVariable)))
 
     def MATCH_KEYS(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (match statement): using the key tuple on top and the mapping below it
+        # (neither popped), push the result of the inlined impl_MATCH_KEYS polyfill; before 3.11
+        # also push a success boolean. Raises AssertionError if the keys are not a tuple.
         keys = self.stack[-1]
         obj = self.stack[-2]
 
@@ -4602,9 +5152,11 @@ class InstructionTranslatorBase(
             self.push(VariableTracker.build(self, not istype(tos, ConstantVariable)))
 
     def LOAD_ASSERTION_ERROR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the AssertionError builtin.
         self.push(self.load_builtin_from_argval("AssertionError"))
 
     def LOAD_BUILD_CLASS(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push the __build_class__ builtin.
         self.push(self.load_builtin_from_argval("__build_class__"))
 
     UNARY_POSITIVE = stack_op(operator.pos)
@@ -4649,6 +5201,9 @@ class InstructionTranslatorBase(
 
     # 3.11 opcodes
     def RESUME(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): a RESUME with argument 0 (function start) is saved as a prefix
+        # instruction and ends the prefix region; on 3.15+ argument 4 is also saved as prefix.
+        # Any other RESUME must occur after the prefix region (AssertionError otherwise).
         if inst.arg == 0:
             self.append_prefix_inst(inst)
             self.accept_prefix_inst = False
@@ -4662,14 +5217,21 @@ class InstructionTranslatorBase(
     if sys.version_info >= (3, 11):
 
         def BINARY_OP(self, inst: Instruction) -> None:
+            # [FUNCTION DOC] Opcode (3.11+): dispatch through the _binary_op_lookup table using the
+            # instruction argument to the specific binary or in-place operator handler.
+            # Raises AssertionError if the argument is missing.
             if inst.arg is None:
                 raise AssertionError("expected inst.arg is not None to be true")
             return _binary_op_lookup[inst.arg](self, inst)
 
     def PRECALL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11): no-op; the work happens in CALL.
         pass
 
     def KW_NAMES(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11-3.12): fetch the constant tuple of keyword names selected by the
+        # argument and store it as kw_names for the next CALL. Raises AssertionError if the
+        # constant is not a tuple of strings or kw_names is already set.
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
         kw_names = self.code_options["co_consts"][inst.arg]
@@ -4683,9 +5245,15 @@ class InstructionTranslatorBase(
         self.kw_names = ConstantVariable.create(value=kw_names)  # type: ignore[assignment]
 
     def PUSH_NULL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: push a NullVariable placeholder.
         self.push(NullVariable())
 
     def _call(self, inst: Instruction, call_kw: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: Shared implementation of CALL and CALL_KW (3.11+). Pops the keyword
+        # name tuple when call_kw (3.13+ only), then argument-count plus two stack values, works out
+        # the callee and optional bound self from the NULL placement for the Python version,
+        # splits the trailing keyword values into a mapping, and calls the callee, always
+        # resetting kw_names afterwards. Raises AssertionError on malformed names/arguments.
         # see https://docs.python.org/3.11/library/dis.html#opcode-CALL
         # for convention
         if call_kw:
@@ -4747,14 +5315,17 @@ class InstructionTranslatorBase(
         msg_prefix="Encountered graph break when attempting to trace CALL: a function call, e.g. f(x, y)",
     )
     def CALL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+, graph-break capable): perform a call via _call.
         self._call(inst)
 
     def COPY(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): push a reference to the stack item arg positions from the top.
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
         self.push(self.stack[-inst.arg])
 
     def SWAP(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): swap the top of the stack with the item arg positions down.
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
         self.stack[-1], self.stack[-inst.arg] = self.stack[-inst.arg], self.stack[-1]
@@ -4768,9 +5339,11 @@ class InstructionTranslatorBase(
     POP_JUMP_BACKWARD_IF_FALSE = generic_jump(operator.not_, False)
 
     def CACHE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): inline cache placeholder; does nothing.
         pass
 
     def BEFORE_WITH(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): begin a with statement via setup_or_before_with.
         self.setup_or_before_with(inst)
 
     def enter_ctx(
@@ -4778,6 +5351,12 @@ class InstructionTranslatorBase(
         ctx: ContextWrappingVariable | GenericContextWrappingVariable,
         inst: Instruction,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Enter a context manager variable: registers generic managers that cannot
+        # graph break in active_generic_context_managers, pushes a BlockStackEntry for restorable
+        # with-blocks (not those nested in try blocks; the entry holds the manager only for the
+        # root translator or when nested graph breaks are enabled), and returns the result of
+        # symbolically entering the manager. Raises AssertionError if the next instruction has no
+        # exception table entry on 3.11+.
         if (
             isinstance(ctx, GenericContextWrappingVariable)
             and not ctx.supports_graph_breaks()
@@ -4815,6 +5394,7 @@ class InstructionTranslatorBase(
 
     @staticmethod
     def unsupported_ctx_graph_break(ctx: VariableTracker) -> NoReturn:
+        # [FUNCTION DOC] Static method: always raises an "Unsupported context manager" graph break for ctx.
         unimplemented(
             gb_type="Unsupported context manager",
             context=f"Attempted SETUP_WITH/BEFORE_WITH/LOAD_SPECIAL on {ctx}",
@@ -4831,6 +5411,9 @@ class InstructionTranslatorBase(
         )
 
     def setup_or_before_with(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Implement SETUP_WITH/BEFORE_WITH: pop a context manager (graph break if not a
+        # supported context wrapping variable), push a WithExitFunctionVariable for its exit, then
+        # push the result of entering it (via enter_ctx).
         ctx = self.pop()
         if not isinstance(
             ctx, (ContextWrappingVariable, GenericContextWrappingVariable)
@@ -4849,11 +5432,16 @@ class InstructionTranslatorBase(
         self.push(self.enter_ctx(ctx, inst))
 
     def append_prefix_inst(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Record inst in prefix_insts (instructions copied verbatim into generated
+        # code). Raises AssertionError once the prefix region has ended.
         if not self.accept_prefix_inst:
             raise AssertionError("expected self.accept_prefix_inst to be true")
         self.prefix_insts.append(inst)
 
     def MAKE_CELL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): in the prefix region just record it. On 3.12+ mid-function
+        # (inlined comprehension), replace the slot with a fresh tracked cell (the slot must hold a
+        # NULL after LOAD_FAST_AND_CLEAR); graph breaks if the name is also a free variable.
         if sys.version_info >= (3, 12) and not self.accept_prefix_inst:
             # In 3.12+, MAKE_CELL is no longer necessarily a prefix instruction.
             # It can be generated by inlined comprehensions.
@@ -4887,9 +5475,11 @@ class InstructionTranslatorBase(
             self.append_prefix_inst(inst)
 
     def COPY_FREE_VARS(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): record as a prefix instruction.
         self.append_prefix_inst(inst)
 
     def RETURN_GENERATOR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): record as a prefix instruction.
         self.append_prefix_inst(inst)
 
     # 3.12 opcodes
@@ -4897,6 +5487,8 @@ class InstructionTranslatorBase(
     # BUILD_SLICE 2 and BINARY/STORE_SUBSCR
 
     def END_FOR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): pop one (3.13+) or two stack items ending a for loop, and on
+        # 3.12+ decrement the comprehension depth if this END_FOR closes a tracked comprehension layer.
         if sys.version_info >= (3, 13):
             self.pop()
         else:
@@ -4910,6 +5502,7 @@ class InstructionTranslatorBase(
                 self._comprehension_depth -= 1
 
     def LOAD_FAST_CHECK(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): like LOAD_FAST but graph breaks if the local is an uninitialized (NULL) value.
         if istype(self.symbolic_locals.get(inst.argval, None), NullVariable):
             unimplemented(
                 gb_type="LOAD_FAST_CHECK on uninitialized variable",
@@ -4920,6 +5513,7 @@ class InstructionTranslatorBase(
         self.LOAD_FAST(inst)
 
     def LOAD_FAST_AND_CLEAR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): push the local (or a NULL if unbound), then set the local to NULL.
         if inst.argval not in self.symbolic_locals:
             self.push(NullVariable())
         else:
@@ -4927,6 +5521,9 @@ class InstructionTranslatorBase(
         self.symbolic_locals[inst.argval] = NullVariable()
 
     def LOAD_SUPER_ATTR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): run the super() call with two stack arguments, then load the
+        # named attribute, or a method (with NULL) when the low argument bit is set.
+        # Raises AssertionError if the argument is missing.
         self.CALL_FUNCTION(dataclasses.replace(inst, argval=2))
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
@@ -4936,6 +5533,8 @@ class InstructionTranslatorBase(
             self._load_attr(inst.argval)
 
     def CALL_INTRINSIC_1(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): dispatch one-argument intrinsics by code: 3 = StopIteration to
+        # RuntimeError conversion, 5 = unary plus, 6 = list to tuple, and others handled below.
         if inst.argval == 3:
             # INTRINSIC_STOPITERATION_ERROR
             self.STOPITERATION_ERROR(inst)
@@ -4960,6 +5559,9 @@ class InstructionTranslatorBase(
             )
 
     def CALL_INTRINSIC_2(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): pop two arguments; only code 4 (set function type params) is
+        # supported: sets the function's type-params attribute and pushes the function back.
+        # Other codes graph break. Raises AssertionError if the first argument is not a user function.
         arg2 = self.pop()
         arg1 = self.pop()
         if inst.argval == 4:
@@ -4985,6 +5587,8 @@ class InstructionTranslatorBase(
             )
 
     def END_SEND(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): keep the top value, drop the item below it (and one more on
+        # 3.15+), ending a send/await sequence.
         tos = self.pop()
         self.pop()
         if sys.version_info >= (3, 15):
@@ -5000,9 +5604,13 @@ class InstructionTranslatorBase(
         "a function call with keyword arguments, e.g. f(x=True)",
     )
     def CALL_KW(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+, graph-break capable): call with keyword names taken from the stack.
         self._call(inst, call_kw=True)
 
     def TO_BOOL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+): no-op; the conversion is implied by the following conditional
+        # jump or unary not, which regenerate it in output code. Raises AssertionError if the next
+        # instruction is not one of those.
         # TO_BOOL only precedes a conditional jump or UNARY_NOT (see compile.c in CPython)
         # So we can skip this instruction as long as we remember to codegen a TO_BOOL
         # before conditional jumps/UNARY_NOT.
@@ -5016,6 +5624,11 @@ class InstructionTranslatorBase(
             )
 
     def SET_FUNCTION_ATTRIBUTE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+): pop a function and an attribute value and set one attribute
+        # on the function variable chosen by the flag (annotate-function on 3.14+, closure,
+        # annotations tuple converted to a dict, keyword defaults, or defaults), then push the
+        # function back. Raises AssertionError if the target is not a nested user function or
+        # an annotations value has the wrong type.
         flags = inst.arg
         if flags is None:
             raise AssertionError("expected flags is not None to be true")
@@ -5057,14 +5670,18 @@ class InstructionTranslatorBase(
         self.push(fn)
 
     def CONVERT_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+): replace the top value with its str/repr/ascii conversion
+        # selected by the argument.
         if inst.arg is None:
             raise AssertionError("expected inst.arg is not None to be true")
         self.push(self._convert_value(self.pop(), inst.arg))
 
     def FORMAT_SIMPLE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+): format the top value with an empty format spec.
         self._format_value(VariableTracker.build(self, ""), 0)
 
     def FORMAT_WITH_SPEC(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.13+): pop a format spec and format the value below it.
         self._format_value(self.pop(), 0)
 
     # 3.14 opcodes
@@ -5072,6 +5689,7 @@ class InstructionTranslatorBase(
     NOT_TAKEN = NOP
 
     def POP_ITER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.14+): discard the iterator on the stack (and one more value on 3.15+).
         self.pop()
         if sys.version_info >= (3, 15):
             self.pop()
@@ -5087,6 +5705,10 @@ class InstructionTranslatorBase(
     )
 
     def LOAD_SPECIAL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.14+): load a special method by index into the table of enter/exit
+        # names. For a context manager variable, pushes an enter or exit function variable plus
+        # a NULL (graph breaks on unsupported managers); other names are loaded as attributes
+        # followed by a NULL. Raises AssertionError if the argument is not an int.
         if not isinstance(inst.arg, int):
             raise AssertionError("expected LOAD_SPECIAL arg to be set to int")
         attr = self._load_special_names[inst.arg]
@@ -5119,6 +5741,7 @@ class InstructionTranslatorBase(
             self.PUSH_NULL(inst)
 
     def LOAD_SMALL_INT(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.14+): push the small integer given by the instruction as a constant variable.
         self.push(VariableTracker.build(self, inst.argval))
 
     # See
@@ -5140,11 +5763,16 @@ class InstructionTranslatorBase(
     )
 
     def LOAD_COMMON_CONSTANT(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.14+/3.15): push the interpreter's common constant selected by the
+        # integer argument from a fixed table. Raises AssertionError if the argument is not an int.
         if not isinstance(inst.arg, int):
             raise AssertionError("expected LOAD_COMMON_CONSTANT arg to be set to int")
         self.push(VariableTracker.build(self, self._common_constants[inst.arg]))
 
     def is_non_empty_graph(self) -> bool:
+        # [FUNCTION DOC] Return True once the output graph holds more than one call (enough to be a
+        # resumable checkpoint). After the first True, the method replaces itself on the instance
+        # with a function that always returns True (performance shortcut).
         if self.output.count_calls() > 1:
             # perf optimization only
             self.is_non_empty_graph = lambda: True  # type: ignore[method-assign]
@@ -5154,6 +5782,8 @@ class InstructionTranslatorBase(
     def format_frame_summary(
         self, additional_stack_frames: list[Any] | None = None
     ) -> str:
+        # [FUNCTION DOC] Format the current frame summary plus any additional frames (reversed order)
+        # as a traceback-style string.
         if additional_stack_frames is None:
             additional_stack_frames = []
         return "".join(
@@ -5163,7 +5793,9 @@ class InstructionTranslatorBase(
         )
 
     def frame_summary(self) -> traceback.FrameSummary:
-        positions = self.current_instruction.positions
+        # [FUNCTION DOC] Build a FrameSummary for the current location (file, current line, function
+        # name; column info from instruction positions on 3.11+) without looking up source text.
+        positions =self.current_instruction.positions
         # colno/end_colno kwargs were added to FrameSummary in 3.11
         kwargs: dict[str, Any] = {}
         if sys.version_info >= (3, 11) and positions is not None:
@@ -5178,12 +5810,17 @@ class InstructionTranslatorBase(
         )
 
     def is_co_filename_from_nn_modules(self) -> bool:
-        filename = getattr(self.f_code, "co_filename", "<unknown>")
+        # [FUNCTION DOC] Return True if the current code's filename matches the pattern for files
+        # under the torch nn modules directory.
+        filename =getattr(self.f_code, "co_filename", "<unknown>")
         nn_modules_pattern = re.compile(r".*torch/nn/modules.*")
         return nn_modules_pattern.match(filename) is not None
 
     def store_global_weakref_by_id(self, prefix: str, value: Any) -> str:
-        global_name = self.output.install_global_by_id(prefix, weakref.ref(value))
+        # [FUNCTION DOC] Install a weak reference to value as an output-graph global (name derived from
+        # prefix and the object's id), install a guard that the referent is still alive, and
+        # return the global's name.
+        global_name =self.output.install_global_by_id(prefix, weakref.ref(value))
         install_guard(
             GlobalWeakRefSource(global_name).make_guard(GuardBuilder.WEAKREF_ALIVE)
         )
@@ -5191,12 +5828,15 @@ class InstructionTranslatorBase(
 
     @property
     def fake_mode(self) -> FakeTensorMode | None:
+        # [FUNCTION DOC] Property: the fake tensor mode of the output graph's tracing context (may be None).
         return self.output.tracing_context.fake_mode
 
     @contextlib.contextmanager
     def strict_translation_mode(
         self, check_fn: Callable[[VariableTracker], bool]
     ) -> Any:
+        # [FUNCTION DOC] Context manager: temporarily set strict_checks_fn to check_fn (a predicate
+        # over variables enabling strict mode per variable), restoring the previous value on exit.
         """
         Strict mode is enabled on a per-VariableTracker level depending on the return value of check_fn(node).
         """
@@ -5208,6 +5848,9 @@ class InstructionTranslatorBase(
             self.strict_checks_fn = prior
 
     def speculate(self) -> SpeculationEntry:
+        # [FUNCTION DOC] Get the speculation log entry for the instruction just fetched (the one
+        # before the instruction pointer), creating or validating it against the log. Raises
+        # AssertionError if the pointer is None or zero; may raise SpeculationLogDivergence.
         if self.instruction_pointer is None:
             raise AssertionError(
                 "expected self.instruction_pointer is not None to be true"
@@ -5224,6 +5867,7 @@ class InstructionTranslatorBase(
     def _make_frame_loc(
         self, filename: str, lineno: int | None, fallback_lineno: int
     ) -> tuple[str, int]:
+        # [FUNCTION DOC] HELPER: Return (filename, lineno), substituting fallback_lineno when lineno is None or negative.
         if lineno is None or lineno < 0:
             return (filename, fallback_lineno)
         return (filename, lineno)
@@ -5231,6 +5875,8 @@ class InstructionTranslatorBase(
     def _get_frame_loc_chain(
         self, frame_loc: tuple[str, int]
     ) -> tuple[tuple[str, int], ...]:
+        # [FUNCTION DOC] HELPER: Return the chain of (file, line) locations from the outermost parent
+        # frame (only when nested graph breaks are enabled) down to the given current location.
         frame_loc_chain_list: list[tuple[str, int]] = []
 
         if config.nested_graph_breaks:
@@ -5249,6 +5895,8 @@ class InstructionTranslatorBase(
         return tuple(frame_loc_chain_list)
 
     def _format_stack_source_attribution(self) -> str:
+        # [FUNCTION DOC] HELPER: Describe where each distinct symbolic stack value originated (by its
+        # source location); returns an empty string when none has a location.
         """Format bytecode source locations for stack values involved in a graph break."""
         seen: set[SourceLocation] = set()
         parts: list[str] = []
@@ -5273,6 +5921,11 @@ class InstructionTranslatorBase(
         reason: str,
         exc: Unsupported | UserError | StepUnsupported,
     ) -> None:
+        # [FUNCTION DOC] Log a graph break once per exception (skips if exc.logged). Builds the user
+        # code stack and location (nested-frame aware), a message with the reason, stack source
+        # attribution and traceback (extended when config.verbose), emits a structured trace
+        # artifact, and writes it to the graph_breaks logger unless it is a duplicate (same type and
+        # location chain), in which case a short message is logged. Marks exc.logged = True.
         if exc.logged:
             return
 
@@ -5385,6 +6038,8 @@ class InstructionTranslatorBase(
     def raise_loop_graph_break(
         code: types.CodeType, exc: Unsupported | UserError
     ) -> NoReturn:
+        # [FUNCTION DOC] Static method: always raises a skip-frame graph break because a graph break
+        # happened in a for/while loop; chains the original exception.
         unimplemented(
             gb_type="graph break in loop",
             context=f"frame skipped: {format_frame_info(code)}",
@@ -5419,6 +6074,13 @@ class InstructionTranslatorBase(
         # Pre-computed indexof for cache reuse
         indexof: dict[Instruction, int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initialize translator state for one frame: the output graph, instructions
+        # (plus a precomputed or fresh instruction index), frame locals/globals/builtins, code
+        # options, symbolic locals/globals/torch-function/stream state, speculation log,
+        # exception stack, distributed state, optional closure and package. Creates the empty
+        # symbolic stack, block stack, counters and flags, an execution recorder when replay
+        # recording is enabled, and pushes a None placeholder for coroutine/async-generator
+        # (and pre-3.11 generator) frames. Registers cells and primes linecache for the file.
         super().__init__()
         self.speculation_log = speculation_log
         self.distributed_state = distributed_state
@@ -5545,13 +6207,21 @@ class InstructionTranslatorBase(
 
 
 class InstructionTranslator(InstructionTranslatorBase):
+    # [CLASS DOC] Translator for the root (outermost) frame being compiled. Creates the OutputGraph,
+    # populates symbolic locals/cells from the live frame (lazily, with local sources for
+    # guards), and handles return instructions by compiling the final subgraph. Tracks itself
+    # as the thread-local current translator while active.
     @staticmethod
     def current_tx() -> InstructionTranslator:
+        # [FUNCTION DOC] Static method: return the thread-local current root translator
+        # (AttributeError if none is active).
         return tls.current_tx
 
     @contextlib.contextmanager
     def set_current_tx(self) -> Any:
-        prior = getattr(tls, "current_tx", None)
+        # [FUNCTION DOC] Context manager: make self the thread-local current translator, restoring the
+        # prior one (or removing the attribute) on exit.
+        prior =getattr(tls, "current_tx", None)
         tls.current_tx = self
         try:
             yield
@@ -5581,6 +6251,14 @@ class InstructionTranslator(InstructionTranslatorBase):
         distributed_state: DistributedState | None,
         package: CompilePackage | None,
     ) -> None:
+        # [FUNCTION DOC] Initialize the root translator: logs the start of tracing, builds the
+        # OutputGraph and base state, rejects tracing inside unsupported functorch transforms,
+        # then under the tracing context fills symbolic_locals from the frame's locals (skipping
+        # never-read inputs unless exporting, as lazy variables with local sources), creates
+        # cell variables for cellvars and freevars (from the closure; unassigned cells become
+        # deleted variables), registers cells, sets up torch-function and stream state, and
+        # realizes everything in export mode. Raises AssertionError if export is requested
+        # without fullgraph or the closure is missing.
         _step_logger()(
             logging.INFO,
             f"torchdynamo start tracing {f_code.co_name} {code_options['co_filename']}:{code_options['co_firstlineno']}",
@@ -5772,6 +6450,9 @@ class InstructionTranslator(InstructionTranslatorBase):
                 )
 
     def _throw_if_in_functorch(self) -> None:
+        # [FUNCTION DOC] HELPER: If tracing happens under a functorch vmap, grad or jvp interpreter
+        # with a non-eager backend, raise a graph break "Unsupported functorch tracing attempt"
+        # so the frame falls back to eager.
         # Fallback to eager in case of a graph break inside vmap
         eager = torch._dynamo.lookup_backend("eager")
         compiler_fn = inspect.getattr_static(
@@ -5803,6 +6484,8 @@ class InstructionTranslator(InstructionTranslatorBase):
             )
 
     def get_example_value(self, source: Source) -> Any:
+        # [FUNCTION DOC] Return the real runtime value for a local or global source from the frame's
+        # locals/globals. Raises KeyError for a missing name or any other source type.
         if isinstance(source, LocalSource):
             return self.f_locals[source.local_name]
         if isinstance(source, GlobalSource):
@@ -5810,6 +6493,7 @@ class InstructionTranslator(InstructionTranslatorBase):
         raise KeyError
 
     def symbolic_locals_contain_module_class(self) -> bool:
+        # [FUNCTION DOC] Return True if any symbolic local is a user-defined class that subclasses torch.nn.Module.
         for v in self.symbolic_locals.values():
             if isinstance(v, UserDefinedClassVariable) and issubclass(
                 v.as_python_constant(), torch.nn.Module
@@ -5818,6 +6502,8 @@ class InstructionTranslator(InstructionTranslatorBase):
         return False
 
     def replace_tos_if_return_is_generator(self) -> None:
+        # [FUNCTION DOC] If the top of the stack is a local generator object, replace it with a list
+        # iterator over its fully unpacked items (so a returned generator can be reconstructed).
         if (
             len(self.stack)
             and (tos := self.stack[-1])
@@ -5829,6 +6515,11 @@ class InstructionTranslator(InstructionTranslatorBase):
             )
 
     def _return(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: Finish tracing the root frame on a return instruction. Converts a
+        # returned generator, updates the ir_count metric, raises SkipFrame if no ops were traced
+        # (unless empty graphs are allowed or other conditions hold), clears the instruction pointer,
+        # compiles the final subgraph (popping the return value for RETURN_VALUE), emits the
+        # return bytecode, and raises ReturnValueOp to stop the step loop.
         self.replace_tos_if_return_is_generator()
         if self.instruction_pointer is None:
             raise AssertionError(
@@ -5888,9 +6579,11 @@ class InstructionTranslator(InstructionTranslatorBase):
         raise ReturnValueOp
 
     def RETURN_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: return the top of stack from the root frame (see _return).
         self._return(inst)
 
     def RETURN_CONST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): return a constant from the root frame (see _return).
         self._return(inst)
 
 
@@ -5910,6 +6603,10 @@ def profile_inline_call(
     code: types.CodeType,
     get_inline_depth: Callable[[], int],
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager wrapping the inlining of one call for the Dynamo profiler. When
+    # the profiler config is off it just yields. Otherwise it lazily creates the profiler state
+    # on the output graph, pushes the callee (name, file, first line, start time), and (after
+    # the body) records timing for the call keyed by caller info and call stack.
     """
     Context manager for profiling inline calls.
 
@@ -5967,6 +6664,10 @@ def profile_inline_call(
 
 
 class InliningInstructionTranslator(InstructionTranslatorBase):
+    # [CLASS DOC] Translator that traces a called user function in the context of a parent
+    # translator, sharing its output graph, speculation log and exception stack. Holds the
+    # function variable, the parent link and the symbolic result (set by return opcodes).
+    # Key entry points: inline_call (classmethod), build_inline_tracer, check_inlineable, inline_call_.
     """Trace and inline a called method"""
 
     symbolic_result: VariableTracker | None
@@ -5982,6 +6683,9 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         kwargs: dict[str, VariableTracker],
         allow_nested_graph_breaks: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Class method: inline func into parent. Builds the inlining translator for
+        # the call (build_inline_tracer) and runs it (inline_call_) under the profiling context,
+        # returning the inlined call's result variable. Exceptions from the callee propagate.
         tracer = None
         with profile_inline_call(
             parent.output, func.get_code(), lambda: parent.inline_depth + 1
@@ -5999,6 +6703,10 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
     def check_inlineable(
         func: BaseUserFunctionVariable,
     ) -> trace_rules.SkipResult:
+        # [FUNCTION DOC] Static method: decide whether a user function may be inlined. Graph breaks if
+        # the function has a bound self, was wrapped by torch.compiler.disable, or the trace
+        # rules mark it skipped (except the known-safe autograd trampoline, which is allowed).
+        # Returns the trace_rules SkipResult for an inlineable function.
         if func.has_self():
             unimplemented(
                 gb_type="Inline attempt with __self__",
@@ -6069,6 +6777,13 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         kwargs: dict[str, VariableTracker],
         allow_nested_graph_breaks: bool = False,
     ) -> InliningInstructionTranslator:
+        # [FUNCTION DOC] Static method: construct the translator that will inline func into parent.
+        # Checks (and caches per code object in the tracing context) that the function is
+        # inlineable, binds the arguments to symbolic locals (raising an observed TypeError on bind
+        # failure), graph breaks on unconverted arguments and on set/delete item/attr dunder
+        # methods whose self is not a user-defined object, logs the inlining, records original
+        # GraphModule context for module calls, and returns a generator or regular inlining
+        # translator. Raises AssertionError for unsupported function variable types.
         if not isinstance(
             func,
             (
@@ -6151,6 +6866,8 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
             parent_code = parent.f_code
 
             def get_trace_call_log_str() -> str:
+                # [FUNCTION DOC] HELPER: Lazily build the "TRACE inlined call" log message with the
+                # call-site header and source line.
                 header = parent.get_line_of_code_header(
                     lineno=cur_inst.positions.lineno
                 )
@@ -6217,6 +6934,15 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         return tracer
 
     def inline_call_(self) -> VariableTracker:
+        # [FUNCTION DOC] Run this inlined frame to completion and return its result variable. Marks
+        # the parent as having inlined calls and as having an active child tracer; runs under
+        # strict mode if the parent uses it; on exceptions logs and re-raises (graph-break
+        # exceptions get skip_frame cleared since it referred to this frame). Always propagates the
+        # child's error_on_graph_break to the parent. If the output asked to exit, returns a None
+        # constant. Otherwise merges globals (same namespace) and side-effect consistency flags
+        # into the parent, records the code as traced, and returns the result, or for a finished
+        # generator raises an observed StopIteration carrying the return value.
+        # Raises AssertionError if no result was produced.
         parent = self.parent
         parent.has_no_inlined_calls = False
         parent.is_child_tracer_active = True
@@ -6290,6 +7016,12 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         funcvar: BaseUserFunctionVariable | LocalGeneratorObjectVariable,
         allow_nested_graph_breaks: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize an inlining translator for code called from parent: takes globals
+        # and builtins from the function variable, reuses or builds (and caches in the tracing
+        # context) the cleaned instructions, instruction index and code options, calls the base
+        # initializer sharing the parent's output graph, speculation log, exception stack,
+        # distributed state and package at inline depth + 1, then records funcvar, parent,
+        # call counters, a copy of the nn module stack, fullgraph flag and nested-graph-break permission.
         f_globals = funcvar.get_globals()
         f_builtins = f_globals["__builtins__"]
         if not isinstance(f_builtins, dict):
@@ -6348,12 +7080,17 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
 
     @property
     def fake_mode(self) -> FakeTensorMode | None:
+        # [FUNCTION DOC] Property: the parent translator's fake tensor mode (may be None).
         return self.parent.fake_mode
 
     def run_ctx_mgr(self) -> Any:
+        # [FUNCTION DOC] Return a TracingContext frame context pushing the parent's current frame summary.
         return TracingContext.current_frame(self.parent.frame_summary())
 
     def _can_speculate_comprehension_nested(self) -> bool:
+        # [FUNCTION DOC] HELPER: True only if nested graph breaks are enabled and allowed for this
+        # call and function, and the parent could compile a partial graph (skips the exception
+        # table entry check done by should_compile_partial_graph).
         """Check if comprehension speculation is allowed in this inlined context.
 
         Unlike should_compile_partial_graph(), this skips the exception table entry check.
@@ -6369,6 +7106,9 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         return True
 
     def should_compile_partial_graph(self) -> bool:
+        # [FUNCTION DOC] For inlined frames, partial graphs are only possible with nested graph breaks
+        # enabled, allowed for this call and function, and possible in the parent; then defers to
+        # the base rules. Otherwise False (inlining is all or nothing).
         if config.nested_graph_breaks:
             if not self._allow_nested_graph_breaks:
                 return False
@@ -6384,6 +7124,8 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         inst: Instruction,
         all_stack_locals_metadata: list[StackLocalsMetadata],
     ) -> list[Instruction]:
+        # [FUNCTION DOC] With nested graph breaks enabled, defer to the base implementation;
+        # otherwise graph break with "Graph break in inlined function".
         if config.nested_graph_breaks:
             return super().create_call_resume_at(inst, all_stack_locals_metadata)
         unimplemented(
@@ -6394,11 +7136,15 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         )
 
     def RETURN_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: store the popped value as the inlined call's symbolic result, clear
+        # the instruction pointer and raise ReturnValueOp to stop tracing the frame.
         self.symbolic_result = self.pop()
         self.instruction_pointer = None
         raise ReturnValueOp
 
     def RETURN_CONST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.12+): store the instruction's constant as the symbolic result,
+        # clear the instruction pointer and raise ReturnValueOp.
         self.symbolic_result = self._load_const(inst)
         self.instruction_pointer = None
         raise ReturnValueOp
@@ -6406,7 +7152,12 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
     def get_globals_source_and_value(
         self, name: str
     ) -> tuple[Any, VariableTracker, Source]:
-        registered_module = _registered_module_for_globals(
+        # [FUNCTION DOC] For the inlined function's globals namespace, return (globals value, variable
+        # for it, source of the named global). If the namespace is a registered module, uses an
+        # import source and attribute source; otherwise installs the globals dict as an unnamed
+        # scope global and uses a dict item source. Sources inside stdlib modules are wrapped to
+        # skip guards. Variables are built eagerly (not lazily) since a setattr may follow.
+        registered_module =_registered_module_for_globals(
             self.f_globals.get("__name__"), self.f_globals
         )
         if registered_module is not None:
@@ -6436,6 +7187,10 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         return fglobals_value, fglobals_vt, global_source
 
     def _load_global(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] HELPER: Load a global in an inlined frame. Missing names load as builtins. If
+        # the function shares the root frame's globals, use the base implementation; otherwise
+        # use a pending side-effect mutation of the module attribute if any, else build a variable
+        # for the current value with the globals source.
         name = inst.argval
         if name not in self.f_globals:
             return self.load_builtin(inst)
@@ -6453,6 +7208,9 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
                 self.push(VariableTracker.build(self, value, global_source))
 
     def STORE_GLOBAL(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: with shared root globals use the base implementation. Otherwise pop
+        # the value (graph break for tensor hook handles or when the globals are not a registered
+        # module dict) and record an attribute store on the module variable in side effects.
         if self.output.global_scope is self.f_globals:
             # If the global scope matches that of the root frame, use handler in
             # root frame instruction translator, to enforce consistency.
@@ -6485,9 +7243,15 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
 
 
 class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
+    # [CLASS DOC] Inlining translator for generator functions. Keeps the list of values yielded so
+    # far (generated_items), the generator frame state (created, suspended, cleared...) and its
+    # own exception-state segment (gi_exc_state). Yields stop tracing via YieldValueOp, and graph
+    # breaks are never resumable.
     generated_items: list[VariableTracker]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Initialize like the inlining translator, then start with no generated items,
+        # frame state FRAME_CREATED, and an empty exception segment.
         super().__init__(*args, **kwargs)
         self.generated_items = []
         self.frame_state = FrameState.FRAME_CREATED
@@ -6495,6 +7259,8 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
 
     @contextlib.contextmanager
     def link_gi_exc_state(self):
+        # [FUNCTION DOC] Context manager: link the generator's exception segment onto the shared
+        # exception stack for the duration, and always unlink (pop) it afterwards.
         try:
             self.exn_vt_stack.push_segment(self.gi_exc_state)
             yield
@@ -6503,6 +7269,8 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
 
     @contextlib.contextmanager
     def temporarily_set_frame_state(self, state: FrameState):
+        # [FUNCTION DOC] Context manager: set the generator frame state for the duration and restore
+        # the previous state on exit (even on error).
         saved_frame_state = self.frame_state
         try:
             self.frame_state = state
@@ -6511,14 +7279,19 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
             self.frame_state = saved_frame_state
 
     def inline_call_(self) -> VariableTracker:
+        # [FUNCTION DOC] Run the inlined generator body (base behavior) under the inline-call profiler context.
         with profile_inline_call(self.output, self.f_code, lambda: self.inline_depth):
             return super().inline_call_()
 
     def should_compile_partial_graph(self) -> bool:
+        # [FUNCTION DOC] Always False: resuming after a graph break inside an inlined generator is not supported.
         # resuming on graph break on inlined generator not supported
         return False
 
     def YIELD_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: pop the yielded value, append it to generated_items, mark the frame
+        # suspended (yield-from state for YIELD_FROM or after SEND), make it the symbolic result,
+        # and raise YieldValueOp to stop tracing. Raises InfiniteGeneratorError past the iterator limit.
         top = self.pop()
         self.generated_items.append(top)
         prev = self.instructions[self.indexof[inst] - 1].opname
@@ -6533,6 +7306,7 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
         raise YieldValueOp
 
     def GET_YIELD_FROM_ITER(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: leave a list iterator on top as is; otherwise replace the top value by iter() of it.
         tos = self.stack[-1]
         if not isinstance(tos, ListIteratorVariable):
             self.pop()
@@ -6540,18 +7314,26 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
             self.push(res)
 
     def RETURN_GENERATOR(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: the result of the generator call is the generator function variable
+        # itself; raises ReturnValueOp.
         self.symbolic_result = self.funcvar
         raise ReturnValueOp
 
     def RETURN_VALUE(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: mark the generator frame cleared (exhausted), then do the base return.
         self.frame_state = FrameState.FRAME_CLEARED
         return super().RETURN_VALUE(inst)
 
     def RETURN_CONST(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode: mark the generator frame cleared, then do the base constant return.
         self.frame_state = FrameState.FRAME_CLEARED
         return super().RETURN_CONST(inst)
 
     def YIELD_FROM(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (Python 3.10 only): send the popped value to the sub-iterator below it.
+        # If the sub-iterator finished, replace it with its return value; otherwise rewind the
+        # instruction pointer to repeat this instruction and yield the produced value. Observed
+        # errors from the sub-iterator propagate. Raises AssertionError on other Python versions.
         # https://github.com/python/cpython/blob/1790e584142b5db070b74bc64777ad14e26608c2/Python/ceval.c#L2581
         if not sys.version_info[:2] == (3, 10):
             raise AssertionError("Python 3.10 specific")
@@ -6598,6 +7380,10 @@ class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):
             self.YIELD_VALUE(inst)
 
     def SEND(self, inst: Instruction) -> None:
+        # [FUNCTION DOC] Opcode (3.11+): send the popped value to the receiver on the stack and push the
+        # reply. If the receiver finishes (observed StopIteration), push its return value, clear the
+        # current exception, pop the receiver on 3.11, and jump past the loop.
+        # Raises AssertionError if the stack has fewer than two items.
         if not (len(self.stack) >= 2):
             raise AssertionError("expected len(self.stack) >= 2 to be true")
 
