@@ -1,4 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Serialization and deserialization of torch.export ExportedProgram objects.
+# Converts an ExportedProgram (FX graph, signature, range constraints, module call graph,
+# state dict, constants, example inputs) into a SerializedArtifact: a JSON byte string for
+# the program structure (using the dataclasses in the schema module) plus torch.save blobs
+# for tensors/custom objects; and back again. Main contents: dtype/layout/memory-format
+# mapping tables, GraphModuleSerializer / ExportedProgramSerializer (export side),
+# GraphModuleDeserializer / ExportedProgramDeserializer (import side), canonicalize (stable
+# normal form of a serialized program), JSON helpers, the public serialize/deserialize
+# functions, and an extension registry (ExtensionHandler, register_extension) for custom
+# operator types.
+# Import-time side effects: creates module-level registries (empty dicts), a logger, and
+# raises an error if the symbolic-op set accidentally contains an OpOverload.
 import base64
 import copy
 import copyreg
@@ -112,10 +124,14 @@ log = logging.getLogger(__name__)
 
 
 class SerializeError(RuntimeError):
+    # [CLASS DOC] Error type raised for any failure while serializing or deserializing an
+    # exported program (unsupported argument/target types, malformed serialized data).
     pass
 
 
 def _reverse_map(d: dict[Any, Enum]):
+    # [FUNCTION DOC] HELPER: Invert a mapping from torch objects to schema enums, returning a
+    # mapping from each enum's underlying value to the torch object.
     return {v.value: k for k, v in d.items()}
 
 
@@ -223,6 +239,9 @@ if any(isinstance(op, torch._ops.OpOverload) for op in _SYM_OPS):
 
 @dataclass
 class SerializedArtifact:
+    # [CLASS DOC] Final on-disk form of an exported program: four byte strings holding the
+    # JSON-encoded program, the pickled state dict, the pickled constants/custom objects, and
+    # the pickled example inputs. Empty bytes mean the part was not serialized.
     exported_program: bytes
     state_dict: bytes
     constants: bytes
@@ -231,6 +250,9 @@ class SerializedArtifact:
 
 @dataclass
 class _SerializedProgram:
+    # [CLASS DOC] HELPER: Intermediate result of ExportedProgramSerializer: the schema-level
+    # ExportedProgram dataclass (not yet JSON encoded) plus the pickled state dict, constants
+    # and example inputs as bytes.
     exported_program: ExportedProgram
     state_dict: bytes
     constants: bytes
@@ -238,19 +260,30 @@ class _SerializedProgram:
 
 
 class LazyMap(dict):
+    # [CLASS DOC] Mapping from name to a lazily evaluated value. Values are stored as
+    # zero-argument callables; the first lookup of a key calls the stored callable, caches
+    # the result in place, and returns it. State lives in an internal map and a set of
+    # already-evaluated keys, NOT in the underlying dict storage.
+    # KNOWN ISSUE: subclasses dict but overrides only set/get/repr, so len, iteration, items,
+    # contains, and get on the dict base see an empty dict.
     """
     Dictionary class for deferred instantiation of node metadata values.
     Purpose is to avoid creation of symbolic-shape tensors before relevant shape guards are parsed.
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Create empty internal map and empty set of evaluated keys.
         self.map = {}
         self.evaluated = set()
 
     def __setitem__(self, k, v):
+        # [FUNCTION DOC] Store the (callable) value v under key k without evaluating it.
         self.map[k] = v
 
     def __getitem__(self, k):
+        # [FUNCTION DOC] Return the evaluated value for key k. On first access, call the stored
+        # callable, cache its result, and mark the key evaluated. Raises a key error for
+        # unknown keys. A stored value must be callable the first time it is read.
         out = self.map[k]
         if k in self.evaluated:
             return out
@@ -259,16 +292,21 @@ class LazyMap(dict):
         return self.map[k]
 
     def __repr__(self):
+        # [FUNCTION DOC] Return the repr of the internal map (unevaluated callables included).
         return self.map.__repr__()
 
 
 def deserialize_device(d: Device) -> torch.device:
+    # [FUNCTION DOC] Convert a schema Device (type string, optional index) to a torch.device;
+    # the index is omitted when it is None.
     if d.index is None:
         return torch.device(type=d.type)  # type: ignore[call-overload]
     return torch.device(type=d.type, index=d.index)
 
 
 def deserialize_size(sizes: Sequence[SymInt]) -> tuple[int, ...]:
+    # [FUNCTION DOC] Convert a sequence of schema SymInt values into a tuple of plain ints.
+    # Only the concrete (as_int) variant is supported; anything else raises an AssertionError.
     for sym_int_size in sizes:
         if sym_int_size.type != "as_int":
             raise AssertionError(f"Only as_int is supported, got {sym_int_size.type}")
@@ -276,6 +314,8 @@ def deserialize_size(sizes: Sequence[SymInt]) -> tuple[int, ...]:
 
 
 def deserialize_stride(strides: Sequence[SymInt]) -> tuple[int, ...]:
+    # [FUNCTION DOC] Same as deserialize_size but for strides: returns a tuple of ints, raising
+    # an AssertionError if any entry is not a concrete (as_int) value.
     for sym_int_stride in strides:
         if sym_int_stride.type != "as_int":
             raise AssertionError(f"Only as_int is supported, got {sym_int_stride.type}")
@@ -283,22 +323,31 @@ def deserialize_stride(strides: Sequence[SymInt]) -> tuple[int, ...]:
 
 
 def deserialize_scalar_type(st: ScalarType) -> torch.dtype:
+    # [FUNCTION DOC] Map a schema ScalarType enum to the torch dtype via the reverse dtype
+    # table; raises a key error for unknown values.
     return _SERIALIZE_TO_TORCH_DTYPE[st]
 
 
 def deserialize_storage_offset(offset: SymInt) -> int:
+    # [FUNCTION DOC] Return the concrete int stored in a schema SymInt storage offset; raises
+    # an AssertionError if the offset is symbolic (not as_int).
     if offset.type != "as_int":
         raise AssertionError(f"Only as_int is supported, got {offset.type}")
     return offset.as_int
 
 
 def _print_sympy(s: torch.SymInt | torch.SymBool | torch.SymFloat | sympy.Expr):
+    # [FUNCTION DOC] HELPER: Return the sympy srepr string of an expression. Symbolic torch
+    # scalars are first unwrapped to their underlying sympy expression.
     if isinstance(s, (torch.SymInt, torch.SymBool, torch.SymFloat)):
         s = s.node.expr
     return sympy.printing.repr.srepr(s)
 
 
 def serialize_sym_int(s: int | torch.SymInt) -> SymInt:
+    # [FUNCTION DOC] Convert an int, SymInt or sympy symbol to a schema SymInt. Concrete values
+    # become the as_int variant; symbolic ones become an as_expr variant holding the srepr
+    # string and, when the node has a hint, an int hint. Raises SerializeError for other types.
     if isinstance(s, (torch.SymInt, sympy.Symbol, int)):
         if symbolic_shapes.is_concrete_int(s):
             return SymInt.create(as_int=int(s))
@@ -323,6 +372,9 @@ def serialize_sym_int(s: int | torch.SymInt) -> SymInt:
 
 
 def serialize_sym_float(s: float | torch.SymFloat) -> SymFloat:
+    # [FUNCTION DOC] Float analogue of serialize_sym_int: concrete floats become as_float,
+    # symbolic ones become an as_expr with srepr string and optional float hint. Raises
+    # SerializeError for unsupported types.
     if isinstance(s, (torch.SymFloat, sympy.Symbol, float)):
         if symbolic_shapes.is_concrete_float(s):
             return SymFloat.create(as_float=float(s))
@@ -347,6 +399,9 @@ def serialize_sym_float(s: float | torch.SymFloat) -> SymFloat:
 
 
 def serialize_sym_bool(s: bool | torch.SymBool) -> SymBool:
+    # [FUNCTION DOC] Convert a bool or SymBool to a schema SymBool: as_bool when concrete,
+    # otherwise as_expr with the srepr string (no hint is recorded). Raises SerializeError for
+    # other types.
     if isinstance(s, (torch.SymBool, bool)):
         if symbolic_shapes.is_concrete_bool(s):
             return SymBool.create(as_bool=bool(s))
@@ -359,6 +414,9 @@ def serialize_sym_bool(s: bool | torch.SymBool) -> SymBool:
 
 
 def serialize_tensor_meta(t: torch.Tensor) -> TensorMeta:
+    # [FUNCTION DOC] Build a schema TensorMeta (dtype, sizes, strides, storage offset, layout,
+    # device, requires_grad) from a tensor (typically fake). Sizes, strides and offset go through
+    # serialize_sym_int so they may be symbolic. Unsupported dtype or layout raises a key error.
     """
     Extract a TensorMeta describing `t`.
     """
@@ -377,6 +435,9 @@ _CURRENT_DESERIALIZER: Optional["GraphModuleDeserializer"] = None
 
 
 def _reduce_fake_tensor(fake_tensor: FakeTensor):
+    # [FUNCTION DOC] HELPER: Pickle reducer for FakeTensor, installed temporarily in the copyreg
+    # dispatch table. Returns (reconstruct function, (JSON bytes of the TensorMeta, whether the
+    # tensor is a Parameter)) so fake tensors survive torch.save without real data.
     is_parameter = isinstance(fake_tensor, torch.nn.Parameter)
     tensor_meta = serialize_tensor_meta(fake_tensor)
     tensor_meta_bytes = json.dumps(
@@ -388,6 +449,10 @@ def _reduce_fake_tensor(fake_tensor: FakeTensor):
 def _reconstruct_fake_tensor(
     serialized_tensor_meta: bytes, is_parameter: bool
 ) -> FakeTensor:
+    # [FUNCTION DOC] HELPER: Unpickle counterpart of _reduce_fake_tensor. Decodes the JSON bytes
+    # into a TensorMeta and asks the module-global current deserializer to build a FakeTensor
+    # (wrapped in a Parameter if requested). Raises an AssertionError if no deserializer is
+    # active, i.e. if loading happens outside GraphModuleDeserializer.deserialize.
     # Deserialize the bytes into a TensorMeta
     json_tensor_meta = json.loads(serialized_tensor_meta.decode("utf-8"))
     tensor_meta = _dict_to_dataclass(TensorMeta, json_tensor_meta)
@@ -404,6 +469,12 @@ def _reconstruct_fake_tensor(
 def serialize_torch_artifact(
     artifact: Any | None, pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL
 ) -> bytes:
+    # [FUNCTION DOC] Pickle an arbitrary artifact (state dict, constants, example inputs) to
+    # bytes with torch.save using the given pickle protocol. None yields empty bytes. While
+    # saving, a custom reducer for FakeTensor is registered globally (copyreg) and always removed
+    # afterwards; raises an AssertionError if a FakeTensor reducer is already registered.
+    # KNOWN ISSUE: a comment inside says tensors are moved to cpu before saving, but no such
+    # move is done here.
     if artifact is None:
         return b""
 
@@ -427,6 +498,10 @@ def serialize_torch_artifact(
 def deserialize_torch_artifact(
     serialized: dict[str, Any] | tuple[Any, ...] | bytes,
 ):
+    # [FUNCTION DOC] Load an artifact produced by serialize_torch_artifact. A dict or tuple is
+    # returned unchanged, empty bytes give an empty dict, otherwise the bytes are loaded with
+    # torch.load in weights-only mode, falling back (with a logged warning) to full unpickling
+    # if that fails. Raises an AssertionError if the result is not a tuple or dict.
     if isinstance(serialized, (dict, tuple)):
         return serialized
     if len(serialized) == 0:
@@ -451,6 +526,9 @@ def deserialize_torch_artifact(
 
 
 def _sympy_int_to_int(val: sympy.Expr, adjust: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Convert a bound expression to a plain int. Infinite values give
+    # None, sympy Integers give an int; any other expression logs a warning and is rounded with
+    # floor or ceil per the adjust argument (any other adjust value raises a RuntimeError).
     # Convert simple sympy Integers into concrete int
     if val in (sympy.oo, int_oo):
         return None
@@ -478,6 +556,8 @@ def _sympy_int_to_int(val: sympy.Expr, adjust: str) -> int | None:
 
 
 def _int_to_sympy_int(val: int | None, default) -> sympy.Expr:
+    # [FUNCTION DOC] HELPER: Inverse of _sympy_int_to_int. None gives the supplied default,
+    # infinities (python or int_oo) map to int_oo / -int_oo, other ints become sympy Integers.
     # Convert concrete int into simple sympy Integers
     if val is None:
         return default
@@ -491,12 +571,17 @@ def _int_to_sympy_int(val: int | None, default) -> sympy.Expr:
 
 
 def _symbol_index(sym: sympy.Symbol, sym_type: SymT):
+    # [FUNCTION DOC] HELPER: Return the numeric suffix of a symbol's name after stripping the
+    # prefix for the given symbol type. Raises a value error if the suffix is not an integer.
     return int(str(sym)[len(prefix_str[sym_type]) :])
 
 
 def serialize_range_constraints(
     range_constraints: dict[sympy.Symbol, ValueRanges],
 ) -> dict[str, RangeConstraint]:
+    # [FUNCTION DOC] Convert a mapping of sympy symbols to ValueRanges into a mapping of symbol
+    # name to schema RangeConstraint with integer bounds (lower rounded up, upper rounded down;
+    # unbounded sides become None).
     return {
         str(k): RangeConstraint(
             _sympy_int_to_int(v.lower, "ceil"),  # type: ignore[arg-type]
@@ -507,6 +592,9 @@ def serialize_range_constraints(
 
 
 def _get_schema_from_target(target):
+    # [FUNCTION DOC] HELPER: Return the FunctionSchema of an operator target: the schema of an
+    # OpOverload, or the registered extension handler's schema for custom registered types.
+    # Raises a RuntimeError if no schema can be found.
     if isinstance(target, torch._ops.OpOverload):
         return target._schema
     elif type(target) in _serialization_registry:
@@ -516,6 +604,10 @@ def _get_schema_from_target(target):
 
 @dataclass
 class GraphState:
+    # [CLASS DOC] HELPER: Mutable accumulator used by GraphModuleSerializer for one graph being
+    # serialized: input and output arguments, serialized nodes, and per-name tables of tensor
+    # metadata, symbolic int/bool/float values and custom-object arguments, plus a flag for
+    # whether the graph returns a single bare tensor.
     inputs: list[Argument] = field(default_factory=list)
     outputs: list[Argument] = field(default_factory=list)
     nodes: list[Node] = field(default_factory=list)
@@ -528,7 +620,12 @@ class GraphState:
 
 
 class Final(type):
+    # [CLASS DOC] HELPER: Metaclass that forbids subclassing: creating a class whose base was
+    # itself built by this metaclass raises a TypeError. Used with the final decorator on the
+    # serializer and deserializer classes.
     def __new__(metacls, name, bases, classdict):
+        # [FUNCTION DOC] HELPER: Create the class, raising a TypeError if any base class is
+        # already a Final class.
         for b in bases:
             if isinstance(b, Final):
                 raise TypeError(f"type '{b.__name__}' is not an acceptable base type")
@@ -536,6 +633,9 @@ class Final(type):
 
 
 def is_metadata_matched(config, entry_metadata):
+    # [FUNCTION DOC] Return whether an autotuner config and a compiled-kernel metadata object
+    # agree on the launch attributes cpu threads, warps, stages and ctas. Attributes missing
+    # from either object are ignored; any present on both with different values gives False.
     metadata_attrs = ["num_cpu_threads", "num_warps", "num_stages", "num_ctas"]
     for attr in metadata_attrs:
         if hasattr(config, attr) and hasattr(entry_metadata, attr):
@@ -545,6 +645,12 @@ def is_metadata_matched(config, entry_metadata):
 
 
 def get_triton_kernel_and_cache_entry(node: torch.fx.Node):
+    # [FUNCTION DOC] For a triton_kernel_wrapper_functional FX node, look up the kernel in the
+    # kernel side table (unwrapping an Autotuner to its underlying JIT function) and return the
+    # pair (kernel function, compiled cache entry). Requires triton and exactly one device cache.
+    # With several cache entries it disambiguates first by constexpr values taken from the node's
+    # kwargs, then (autotuner only) by matching config launch metadata. Raises AssertionError when
+    # preconditions fail, no entry matches, or the match stays ambiguous.
     if (
         node.target
         is not torch._higher_order_ops.triton_kernel_wrap.triton_kernel_wrapper_functional
@@ -699,11 +805,19 @@ def get_triton_kernel_and_cache_entry(node: torch.fx.Node):
 
 @final
 class GraphModuleSerializer(metaclass=Final):
+    # [CLASS DOC] Converts one FX GraphModule (plus the export graph signature and module call
+    # graph) into the schema GraphModule dataclass. State: the current GraphState accumulator,
+    # the signature and call graph, a mapping of custom object names to the real objects found
+    # (later pickled as constants), a mapping of duplicate getitem node names to the canonical
+    # one, and namedtuple field names seen in treespecs. Entry point is serialize; nodes are
+    # dispatched by op kind through handle_<op> methods. Cannot be subclassed.
     def __init__(
         self,
         graph_signature: ep.ExportGraphSignature,
         module_call_graph: list[ep.ModuleCallEntry],
     ):
+        # [FUNCTION DOC] Store the signature and module call graph and initialize empty graph
+        # state, custom object table, duplicate-getitem table and namedtuple field table.
         self.graph_state = GraphState()
         self.graph_signature = graph_signature
         self.module_call_graph = module_call_graph
@@ -713,6 +827,9 @@ class GraphModuleSerializer(metaclass=Final):
 
     @contextmanager
     def save_graph_state(self):
+        # [FUNCTION DOC] Context manager: temporarily replaces the graph state with a fresh empty
+        # one (used when serializing a nested subgraph) and restores the previous state on exit,
+        # even on error.
         saved = self.graph_state
         self.graph_state = GraphState()
         try:
@@ -721,6 +838,10 @@ class GraphModuleSerializer(metaclass=Final):
             self.graph_state = saved
 
     def handle_placeholder(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Serialize a placeholder node as a graph input, based on its meta value:
+        # tensors and SymInts get registered output entries; plain python scalars/None/str are
+        # serialized as constants; custom-object arguments also record their metadata. SymFloat
+        # inputs raise an AssertionError (not implemented), as do unknown types. Appends to inputs.
         if node.op != "placeholder":
             raise AssertionError(f"expected placeholder op, got {node.op}")
         val = node.meta["val"]
@@ -750,6 +871,9 @@ class GraphModuleSerializer(metaclass=Final):
         self.graph_state.inputs.append(graph_input)
 
     def handle_output(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Serialize the output node: a single Node argument marks a single-tensor
+        # return, otherwise the tuple/list of arguments is serialized element by element. Sets the
+        # outputs and single-return flag in graph state. Raises AssertionError on bad structure.
         if node.op != "output":
             raise AssertionError(f"expected output op, got {node.op}")
         if len(node.args) != 1:
@@ -768,6 +892,9 @@ class GraphModuleSerializer(metaclass=Final):
             self.graph_state.outputs = [self.serialize_input(arg) for arg in node_args]
 
     def serialize_operator(self, target) -> str:
+        # [FUNCTION DOC] Return the string name of an operator target: strings pass through;
+        # torch ops modules are renamed from torch._ops to torch.ops; everything else becomes
+        # module dot name.
         if isinstance(target, str):
             return target
         elif target.__module__.startswith("torch._ops"):
@@ -779,6 +906,14 @@ class GraphModuleSerializer(metaclass=Final):
             return f"{target.__module__}.{target.__name__}"
 
     def handle_call_function(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Serialize a call_function node into a schema Node appended to graph state.
+        # getitem nodes are skipped (their producer's multi-output handling covers them). Branches:
+        # symbolic operators or nodes with symbolic meta values; OpOverloads (schema-driven inputs
+        # and outputs); higher order operators (special cases for aoti_call_delegate, which swaps
+        # the lowered module for its path, and the functional triton kernel wrapper, which drops
+        # constexpr args and adds launch parameters from the compiled cache entry); registered
+        # extension types (target encoded as a hash, namespace, colon, op name string); other callables.
+        # Raises SerializeError for unsupported targets and AssertionError for broken invariants.
         if node.op != "call_function":
             raise AssertionError(f"expected call_function op, got {node.op}")
         meta_val = node.meta.get("val")
@@ -822,6 +957,8 @@ class GraphModuleSerializer(metaclass=Final):
         elif isinstance(node.target, torch._ops.HigherOrderOperator):
 
             def _is_hop_single_tensor_return(node) -> bool:
+                # [FUNCTION DOC] HELPER: True if the higher order op node's meta value is a single
+                # tensor (HOP schemas are not always available, so the meta value is inspected).
                 if not isinstance(node.target, torch._ops.HigherOrderOperator):
                     raise AssertionError(
                         f"expected HigherOrderOperator, got {type(node.target).__name__}"
@@ -863,6 +1000,8 @@ class GraphModuleSerializer(metaclass=Final):
                     serializable_args[2] = serializable_weight_nodes
 
                 def serialize_tensor_list_output(node):
+                    # [FUNCTION DOC] HELPER: Serialize a node whose meta value is a list of tensors
+                    # as one tensor-list argument, naming each element after its getitem user.
                     meta_val = node.meta.get("val", None)
                     tensor_args = []
                     for idx, meta in enumerate(meta_val):
@@ -1052,9 +1191,14 @@ class GraphModuleSerializer(metaclass=Final):
         self.graph_state.nodes.append(ex_node)
 
     def handle_get_attr(self, node):
+        # [FUNCTION DOC] No-op beyond debug logging: get_attr nodes are serialized lazily where
+        # they are used as arguments (see serialize_input).
         log.debug("[handle_get_attr] %s", node.name)
 
     def _output_node_at_index(self, node, index) -> torch.fx.Node | None:
+        # [FUNCTION DOC] HELPER: Find the getitem user of a multi-output node that selects the given
+        # index, or None. All users must be getitem nodes (else AssertionError). If several users
+        # select the same index, later ones are recorded as duplicates of the first.
         user_node = None
         for user in node.users:
             if user.target is not operator.getitem:
@@ -1069,6 +1213,8 @@ class GraphModuleSerializer(metaclass=Final):
         return user_node
 
     def _output_node_name_at_index(self, node, index) -> str:
+        # [FUNCTION DOC] HELPER: Name for output number index of a multi-output node: the name of
+        # its getitem user, or a synthesized unused-name when no user selects that index.
         user_node = self._output_node_at_index(node, index)
         if user_node is None:
             return f"{node.name}_unused_{index}"
@@ -1076,6 +1222,11 @@ class GraphModuleSerializer(metaclass=Final):
             return user_node.name
 
     def serialize_metadata(self, node: torch.fx.Node) -> dict[str, str]:
+        # [FUNCTION DOC] Flatten an FX node's meta dict into a string-to-string mapping. Handled keys:
+        # stack_trace (copied), nn_module_stack (entries as key, path, type joined with commas, then
+        # entries joined by the delimiter), source_fn_stack, torch_fn, custom (JSON), from_node
+        # (JSON of node sources). Raises SerializeError if custom metadata is not JSON-encodable and
+        # AssertionError for a malformed nn_module_stack entry.
         ret = {}
 
         if stack_trace := node.meta.get("stack_trace"):
@@ -1084,6 +1235,8 @@ class GraphModuleSerializer(metaclass=Final):
         if nn_module_stack := node.meta.get("nn_module_stack"):
 
             def export_nn_module_stack(val):
+                # [FUNCTION DOC] HELPER: Encode one nn_module_stack value (a path string and a type
+                # string) as path, comma, type; raises AssertionError if it is not such a pair.
                 if not isinstance(val, tuple) or len(val) != 2:
                     val_len = len(val) if isinstance(val, tuple) else "N/A"
                     raise AssertionError(
@@ -1136,6 +1289,8 @@ class GraphModuleSerializer(metaclass=Final):
     def _serialize_from_node(
         self, from_node: list[NodeSource] | None
     ) -> list[dict[str, Any]] | None:
+        # [FUNCTION DOC] HELPER: Convert a list of NodeSource objects to a list of dictionaries,
+        # silently dropping entries of other types; None stays None.
         """
         Serialize from_node metadata from a list of NodeSource objects to a list of dictionaries.
         """
@@ -1151,6 +1306,8 @@ class GraphModuleSerializer(metaclass=Final):
     def serialize_script_obj_meta(
         self, script_obj_meta: ep.CustomObjArgument
     ) -> CustomObjArgument:
+        # [FUNCTION DOC] Convert the export-level custom object descriptor (name, class name) into a
+        # schema CustomObjArgument.
         log.debug("[serialize_script_obj_meta] %s", script_obj_meta)
         return CustomObjArgument(
             name=script_obj_meta.name,
@@ -1158,6 +1315,10 @@ class GraphModuleSerializer(metaclass=Final):
         )
 
     def serialize_sym_op_inputs(self, op, args) -> list[NamedArgument]:
+        # [FUNCTION DOC] Serialize positional args of a symbolic operator as named positional
+        # arguments, with names taken from the OpOverload schema or from the python signature of the
+        # operator (which must be in the symbolic op set, else AssertionError). Extra args or names
+        # beyond the shorter of the two are dropped.
         if isinstance(op, torch._ops.OpOverload):
             args_names = [arg.name for arg in op._schema.arguments]
         else:
@@ -1181,6 +1342,11 @@ class GraphModuleSerializer(metaclass=Final):
         args,
         kwargs=None,
     ) -> list[NamedArgument]:
+        # [FUNCTION DOC] Serialize call arguments for an operator that has a schema (OpOverload,
+        # torchbind call, or registered extension type). Walks the schema arguments in order: a name
+        # in kwargs is emitted as a keyword argument, otherwise a non-kwarg-only position inside args
+        # is emitted positionally; arguments that were not passed (defaults) are intentionally not
+        # serialized. Each value is converted by serialize_input using the schema type.
         schema = None
         serialized_args = []
 
@@ -1227,6 +1393,8 @@ class GraphModuleSerializer(metaclass=Final):
         return serialized_args
 
     def serialize_hoo_inputs(self, args, kwargs) -> list[NamedArgument]:
+        # [FUNCTION DOC] Serialize schema-less inputs: positional args get an empty name and kind
+        # positional, kwargs keep their names with kind keyword.
         """
         For serializing HOO inputs since HOOs do not have a schema.
         """
@@ -1249,6 +1417,8 @@ class GraphModuleSerializer(metaclass=Final):
         return inputs
 
     def is_inductor_sym_int_arg(self, arg) -> bool:
+        # [FUNCTION DOC] HELPER: True for a plain int or SymInt value (used for inductor external
+        # fallback nodes, where symbolic ints are not FX nodes).
         # This is a special branch for handling SymInt args in inductor's
         # ExternalFallbackNode.
         # For regular FX graph, SymInt arg should be a fx.Node and should be
@@ -1256,18 +1426,22 @@ class GraphModuleSerializer(metaclass=Final):
         return type(arg) is int or isinstance(arg, torch.SymInt)
 
     def is_sym_int_arg(self, arg) -> bool:
+        # [FUNCTION DOC] HELPER: True for a plain int, or an FX node already registered as a
+        # symbolic int value in the current graph state.
         return type(arg) is int or (
             isinstance(arg, torch.fx.Node)
             and arg.name in self.graph_state.sym_int_values
         )
 
     def is_sym_float_arg(self, arg) -> bool:
+        # [FUNCTION DOC] HELPER: True for a float, or an FX node registered as a symbolic float.
         return isinstance(arg, float) or (
             isinstance(arg, torch.fx.Node)
             and arg.name in self.graph_state.sym_float_values
         )
 
     def is_sym_bool_arg(self, arg) -> bool:
+        # [FUNCTION DOC] HELPER: True for a bool, or an FX node registered as a symbolic bool.
         return isinstance(arg, bool) or (
             isinstance(arg, torch.fx.Node)
             and arg.name in self.graph_state.sym_bool_values
@@ -1275,6 +1449,15 @@ class GraphModuleSerializer(metaclass=Final):
 
     # should be torch._C.JitType but that annotation is busted
     def serialize_input(self, arg, arg_type: Any | None = None) -> Argument:
+        # [FUNCTION DOC] Convert one call argument into a schema Argument union. Handles: FX nodes
+        # (get_attr of a graph module becomes a nested serialized graph, lowered backend modules
+        # become a name-backend string, symbolic values/custom objects/deduplicated getitems/tensors
+        # become named references); inductor buffers and torchbind objects; SymInt/SymFloat; python
+        # bool, str, int, float, complex, None; dicts with string keys (recursive); lists/tuples of
+        # a homogeneous kind (empty lists use arg_type to pick the kind, defaulting to a tensor
+        # list with a warning); dtype, device, memory format, layout; script objects and opaque
+        # custom class objects (recorded in the custom object table under a generated name);
+        # operators. Raises SerializeError for unsupported values.
         import torch._inductor.ir as inductor_ir
 
         inductor_tensor_buffers = (
@@ -1518,6 +1701,8 @@ class GraphModuleSerializer(metaclass=Final):
             elif all(isinstance(a, (torch.fx.Node, type(None))) for a in arg):
                 # list of optional tensors
                 def serialize_optional_tensor_args(a):
+                    # [FUNCTION DOC] HELPER: Convert one list element (None or FX node) into an
+                    # optional tensor argument; raises SerializeError for other element types.
                     if a is None:
                         return OptionalTensorArgument.create(as_none=True)
                     elif isinstance(a, torch.fx.Node):
@@ -1540,6 +1725,8 @@ class GraphModuleSerializer(metaclass=Final):
             ):
                 # list of inductor buffers as optional tensors
                 def serialize_optional_tensor_args(a):
+                    # [FUNCTION DOC] HELPER: Convert one list element (None or inductor buffer)
+                    # into an optional tensor argument; raises SerializeError otherwise.
                     if a is None:
                         return OptionalTensorArgument.create(as_none=True)
                     elif isinstance(a, inductor_tensor_buffers):
@@ -1612,30 +1799,43 @@ class GraphModuleSerializer(metaclass=Final):
             )
 
     def serialize_tensor_output(self, name, meta_val) -> TensorArgument:
+        # [FUNCTION DOC] Register tensor metadata for a new value name in graph state and return a
+        # TensorArgument referring to it. Raises AssertionError if the name is already registered.
         if name in self.graph_state.tensor_values:
             raise AssertionError(f"name {name!r} already in tensor_values")
         self.graph_state.tensor_values[name] = serialize_tensor_meta(meta_val)
         return TensorArgument(name=name)
 
     def serialize_sym_int_output(self, name, meta_val) -> SymIntArgument:
+        # [FUNCTION DOC] Register a symbolic int value under a new name in graph state and return a
+        # by-name SymIntArgument. Raises AssertionError on a duplicate name.
         if name in self.graph_state.sym_int_values:
             raise AssertionError(f"name {name!r} already in sym_int_values")
         self.graph_state.sym_int_values[name] = serialize_sym_int(meta_val)
         return SymIntArgument.create(as_name=name)
 
     def serialize_sym_float_output(self, name, meta_val) -> SymFloatArgument:
+        # [FUNCTION DOC] Register a symbolic float value under a new name and return a by-name
+        # SymFloatArgument. Raises AssertionError on a duplicate name.
         if name in self.graph_state.sym_float_values:
             raise AssertionError(f"name {name!r} already in sym_float_values")
         self.graph_state.sym_float_values[name] = serialize_sym_float(meta_val)
         return SymFloatArgument.create(as_name=name)
 
     def serialize_sym_bool_output(self, name, meta_val) -> SymBoolArgument:
+        # [FUNCTION DOC] Register a symbolic bool value under a new name and return a by-name
+        # SymBoolArgument. Raises AssertionError on a duplicate name.
         if name in self.graph_state.sym_bool_values:
             raise AssertionError(f"name {name!r} already in sym_bool_values")
         self.graph_state.sym_bool_values[name] = serialize_sym_bool(meta_val)
         return SymBoolArgument.create(as_name=name)
 
     def serialize_input_spec(self, spec: ep.InputSpec) -> InputSpec:
+        # [FUNCTION DOC] Convert an export InputSpec into the schema InputSpec union by kind: user
+        # input (constants of int, bool, str, float or None become constant inputs; others go through
+        # serialize_argument_spec), parameter, buffer (with persistence flag), constant tensor, custom
+        # object, or token. Asserts that target and argument types match the kind; raises
+        # SerializeError for unsupported constant values and AssertionError for unknown kinds.
         log.debug("[serialize_input_spec] %s", spec)
         if spec.kind == ep.InputKind.USER_INPUT:
             if isinstance(spec.arg, ep.ConstantArgument):
@@ -1735,6 +1935,10 @@ class GraphModuleSerializer(metaclass=Final):
             raise AssertionError(f"Unknown argument kind: {spec}")
 
     def serialize_output_spec(self, spec: ep.OutputSpec) -> OutputSpec:
+        # [FUNCTION DOC] Convert an export OutputSpec into the schema OutputSpec union by kind: user
+        # output, loss output, buffer/parameter/user-input mutation, gradient to parameter/user input,
+        # or token. Non-user kinds require a tensor (or token) argument and a target name where
+        # applicable; violations or unknown kinds raise AssertionError.
         log.debug("[serialize_output_spec] %s", spec)
         if spec.kind == ep.OutputKind.USER_OUTPUT:
             return OutputSpec.create(
@@ -1837,6 +2041,8 @@ class GraphModuleSerializer(metaclass=Final):
             raise AssertionError(f"Unknown argument kind: {spec}")
 
     def serialize_signature(self, sig: ep.ExportGraphSignature) -> GraphSignature:
+        # [FUNCTION DOC] Serialize all input and output specs of a graph signature into a schema
+        # GraphSignature, preserving order.
         log.debug("\n[serialize_signature]")
         return GraphSignature(
             input_specs=[self.serialize_input_spec(s) for s in sig.input_specs],
@@ -1844,6 +2050,10 @@ class GraphModuleSerializer(metaclass=Final):
         )
 
     def serialize_argument_spec(self, x: ep.ArgumentSpec) -> Argument:
+        # [FUNCTION DOC] Convert an export argument descriptor into a schema Argument: tensors,
+        # symbolic ints/floats and custom objects by name; constants via serialize_input.
+        # KNOWN ISSUE: symbolic bool and token arguments fall through to an AssertionError with the
+        # placeholder message "TODO".
         if isinstance(x, ep.TensorArgument):
             return Argument.create(as_tensor=TensorArgument(name=x.name))
         elif isinstance(x, ep.SymIntArgument):
@@ -1860,9 +2070,14 @@ class GraphModuleSerializer(metaclass=Final):
             raise AssertionError("TODO")
 
     def serialize_treespec(self, treespec: pytree.TreeSpec) -> str:
+        # [FUNCTION DOC] Dump a pytree TreeSpec to its versioned string form, and as a side effect
+        # record the field names of every namedtuple type inside it in the namedtuple field table.
+        # Raises SerializeError if the same namedtuple type is seen with differing field names.
         # We want to additionally save all the field names of the namedtuples in
         # case users want to check that the treespec types are equivalent
         def store_namedtuple_fields(ts: pytree.TreeSpec) -> None:
+            # [FUNCTION DOC] HELPER: Recursively walk a treespec and record field names of
+            # namedtuple nodes under their serialized type name, checking consistency.
             if ts.type is None:
                 return
             if ts.type is namedtuple or pytree.is_namedtuple_class(ts.type):
@@ -1894,6 +2109,8 @@ class GraphModuleSerializer(metaclass=Final):
     def serialize_module_call_signature(
         self, module_call_signature: ep.ModuleCallSignature
     ) -> ModuleCallSignature:
+        # [FUNCTION DOC] Serialize a module call signature: input and output argument specs, input
+        # and output pytree specs as strings, and forward argument names (None when empty).
         log.debug("[serialize_module_call_signature] %s", module_call_signature)
         return ModuleCallSignature(
             inputs=[
@@ -1912,6 +2129,8 @@ class GraphModuleSerializer(metaclass=Final):
     def serialize_module_call_graph(
         self, module_call_graph: list[ep.ModuleCallEntry]
     ) -> list[ModuleCallEntry]:
+        # [FUNCTION DOC] Serialize each module call graph entry (fully qualified name plus optional
+        # signature, None when absent), preserving order.
         log.debug("\n[serialize_module_call_graph]")
         return [
             ModuleCallEntry(
@@ -1926,6 +2145,12 @@ class GraphModuleSerializer(metaclass=Final):
         ]
 
     def serialize_outputs(self, node: torch.fx.Node) -> list[Argument]:
+        # [FUNCTION DOC] Serialize the outputs of an OpOverload/extension call node using its schema
+        # returns and meta value. No returns: empty list. A single tensor-list return: one tensor-list
+        # argument. A single other return: one output. Multiple returns: per-return handling of None
+        # (undefined tensor), tensors, tensor lists and scalars, naming each after the getitem user
+        # that consumes it (or a synthesized unused-name). Registers tensor/symbolic values in graph
+        # state. Raises ValueError for unhandled output types and AssertionError on schema mismatch.
         """For a given node, return the dataclass representing its output values.
 
         [NOTE: Multiple outputs] We handle aggregates differently than FX. For
@@ -1946,6 +2171,8 @@ class GraphModuleSerializer(metaclass=Final):
         """
 
         def _is_single_tensor_list_return(target: Any) -> bool:
+            # [FUNCTION DOC] HELPER: True if the target schema has exactly one return and it is a
+            # list of tensors.
             schema = _get_schema_from_target(target)
             returns = schema.returns
 
@@ -2048,6 +2275,10 @@ class GraphModuleSerializer(metaclass=Final):
         return output_arguments
 
     def serialize_hoo_outputs(self, node: torch.fx.Node) -> list[Argument]:
+        # [FUNCTION DOC] Serialize outputs of a schema-less node from its meta value. A tuple gives
+        # one argument per element (tensor lists become tensor-list arguments); a dict of tensors
+        # gives one tensor-list argument (dict keys used as output indices); anything else is a single
+        # output named after the node. Raises SerializeError for non-tensor list/dict elements.
         """
         For serializing HOO outputs since HOOs do not have a schema.
         """
@@ -2098,6 +2329,9 @@ class GraphModuleSerializer(metaclass=Final):
             return [self.serialize_output(node.name, meta_val)]
 
     def serialize_output(self, name: str, meta_val: Any) -> Argument:
+        # [FUNCTION DOC] Serialize one output value under the given name: None as a none argument;
+        # tensors, symbolic/concrete bool, int and float as registered named values. Lists are not
+        # handled here (callers handle them earlier); anything else raises SerializeError.
         # Check single value return
         if meta_val is None:
             return Argument.create(as_none=True)
@@ -2130,6 +2364,9 @@ class GraphModuleSerializer(metaclass=Final):
         raise SerializeError(f"Unable to serialize output {meta_val}")
 
     def _handle_getitem_users(self, node: torch.fx.Node) -> list[TensorArgument]:
+        # [FUNCTION DOC] HELPER: Serialize every element of a multi-output node's meta value as a
+        # tensor output named after its getitem user (dummy names for unused indices) and return the
+        # list of tensor arguments. Appears unused within this module.
         meta_val = node.meta["val"]
 
         idx_to_name = {}
@@ -2157,6 +2394,11 @@ class GraphModuleSerializer(metaclass=Final):
         return arg_list
 
     def serialize_graph(self, graph_module: torch.fx.GraphModule) -> Graph:
+        # [FUNCTION DOC] Serialize a GraphModule's graph: visit nodes in order, dispatching each to the
+        # handler named for its op kind, and wrap any failure in a SerializeError naming the node.
+        # Returns a schema Graph built from the accumulated graph state. Raises AssertionError if
+        # given something other than a GraphModule. Mutates graph state (use save_graph_state for
+        # nested graphs).
         if not isinstance(graph_module, torch.fx.GraphModule):
             raise AssertionError(
                 f"expected GraphModule, got {type(graph_module).__name__}"
@@ -2186,6 +2428,8 @@ class GraphModuleSerializer(metaclass=Final):
         )
 
     def serialize_graph_module_metadata(self, meta: dict[str, Any]):
+        # [FUNCTION DOC] Serialize graph-level metadata: only the custom entry is kept, JSON encoded
+        # into a string mapping. Raises SerializeError if it is not JSON-encodable.
         ret = {}
         if custom := meta.get("custom"):
             log.debug("\n[serialize_graph_module_metadata] %s", custom)
@@ -2199,6 +2443,8 @@ class GraphModuleSerializer(metaclass=Final):
         return ret
 
     def serialize(self, graph_module: torch.fx.GraphModule) -> GraphModule:
+        # [FUNCTION DOC] Main entry point: serialize the graph, signature, module call graph, graph
+        # metadata and namedtuple field table into one schema GraphModule.
         log.debug("\n[serialize]")
         graph = self.serialize_graph(graph_module)
 
@@ -2213,11 +2459,17 @@ class GraphModuleSerializer(metaclass=Final):
 
 @final
 class ExportedProgramSerializer(metaclass=Final):
+    # [CLASS DOC] Top-level serializer: turns an ExportedProgram into a _SerializedProgram (schema
+    # ExportedProgram plus pickled state dict, constants and example inputs). State: operator set
+    # versions (always including aten, defaulting to the runtime max operator version) and the pickle
+    # protocol. Cannot be subclassed.
     def __init__(
         self,
         opset_version: dict[str, int] | None = None,
         pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
     ):
+        # [FUNCTION DOC] Copy the given opset versions, fill in the aten version from the runtime if
+        # missing, and store the pickle protocol.
         self.opset_version: dict[str, int] = {}
         if opset_version:
             self.opset_version.update(opset_version)
@@ -2234,6 +2486,11 @@ class ExportedProgramSerializer(metaclass=Final):
         serialize_constants: bool = True,
         serialize_example_inputs: bool = True,
     ) -> _SerializedProgram:
+        # [FUNCTION DOC] Validate the program, serialize its graph module and range constraints, merge
+        # custom objects found in the graph with the program constants (name clash raises an
+        # AssertionError), build the schema ExportedProgram (schema and torch versions, verifier
+        # dialects, guards code), check that canonicalization succeeds, and pickle the proxy-free
+        # state dict, constants and example inputs (each optional via flags, else empty bytes).
         """
         Args:
             exported_program: Exported Program to serialize
@@ -2305,8 +2562,17 @@ class ExportedProgramSerializer(metaclass=Final):
 
 @final
 class GraphModuleDeserializer(metaclass=Final):
+    # [CLASS DOC] Rebuilds an FX GraphModule, export graph signature, module call graph, state dict,
+    # constants and example inputs from the schema GraphModule. State: the FX graph and root module
+    # under construction, a map from serialized names to FX nodes, a lazy map from names to meta values
+    # (fake tensors and symbolic scalars built on demand), plus per-run state created in deserialize
+    # (shape env, fake tensor mode, symbol caches, range constraints, unbacked symbol set, constants,
+    # signature). Entry point is deserialize, which registers itself as the module-global current
+    # deserializer so unpickled fake tensors can find it. Cannot be subclassed.
     @dataclasses.dataclass
     class Result:
+        # [CLASS DOC] Bundle returned by deserialize: graph module, signature, module call graph, map
+        # of symbol names to sympy symbols, state dict, constants, and optional example inputs.
         graph_module: torch.fx.GraphModule
         signature: ep.ExportGraphSignature
         module_call_graph: list[ep.ModuleCallEntry]
@@ -2316,6 +2582,8 @@ class GraphModuleDeserializer(metaclass=Final):
         example_inputs: tuple[tuple[torch.Tensor, ...], dict[str, Any]] | None
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize an empty name-to-node map, empty lazy name-to-meta map, a fresh FX
+        # graph and an empty root module.
         self.serialized_name_to_node: dict[str, torch.fx.Node] = {}
         self.serialized_name_to_meta: LazyMap = LazyMap()  # str -> MetaType
         self.graph = torch.fx.Graph()
@@ -2323,6 +2591,10 @@ class GraphModuleDeserializer(metaclass=Final):
 
     @contextmanager
     def save_graph_module(self) -> Iterator[None]:
+        # [FUNCTION DOC] Context manager used to deserialize a nested subgraph: saves the current graph,
+        # root module, name maps and unbacked symbol set, installs fresh empty ones, and restores the
+        # saved ones on exit even on error. Requires unbacked_symbols to already exist (set in
+        # deserialize).
         saved = (
             self.graph,
             self.module,
@@ -2347,12 +2619,18 @@ class GraphModuleDeserializer(metaclass=Final):
             ) = saved
 
     def deserialize_extension_operator(self, serialized_target: str):
+        # [FUNCTION DOC] Resolve a target of the form hash, namespace, colon, op name by looking up the
+        # registered handler for the namespace and asking it to rebuild the operator. Raises a key
+        # error for an unregistered namespace.
         namespace, op_name = serialized_target.split(":")
         namespace = namespace[1:]  # starting with #
         handler = _deserialization_registry[namespace]
         return handler.from_op_name(op_name)
 
     def deserialize_operator(self, serialized_target: str):
+        # [FUNCTION DOC] Turn a serialized operator name into a python object: names under the operator,
+        # torch or math modules are resolved by attribute walking; names starting with a hash go to
+        # extension handlers. Any unresolvable or unrecognized name is returned unchanged as a string.
         if serialized_target.startswith(
             "_operator"
         ):  # TODO(zhxchen17) Follow up on this.
@@ -2380,6 +2658,11 @@ class GraphModuleDeserializer(metaclass=Final):
     def _parse_sym_expr(
         self, expr_str: str, hint: int | bool | float | None = None
     ) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Parse an expression string with the known sympy function table and
+        # cached symbols, then process it bottom-up: cache each distinct sub-expression/symbol by its
+        # string, track unbacked symbols, record hints in the shape env, apply any saved value range,
+        # and record a traceback for symbols. Returns the parsed expression. Mutates shape env and
+        # symbol caches.
         """
         Parses and does bottom-up processing of sympy.Expr nodes,
         populating ShapeEnv & caching symbols as needed.
@@ -2388,6 +2671,9 @@ class GraphModuleDeserializer(metaclass=Final):
         def _process_sym_expr(
             sym: sympy.Expr, hint: int | bool | float | None = None
         ) -> sympy.Expr:
+            # [FUNCTION DOC] HELPER: Recursive step: numbers and booleans are returned as is;
+            # otherwise process arguments first, reuse or cache the symbol by its string, then add
+            # hint, range constraint and stack information to the shape env.
             if sym.is_Integer or sym.is_Float or sym.is_Boolean:  # base case
                 return sym
             else:  # recursive case
@@ -2427,6 +2713,9 @@ class GraphModuleDeserializer(metaclass=Final):
         return _process_sym_expr(expr, hint)
 
     def deserialize_sym_int(self, s: SymInt) -> int | torch.SymInt:
+        # [FUNCTION DOC] Convert a schema SymInt: an as_expr value is parsed into a symbolic int node
+        # in the shape env (with its optional int hint); an as_int value is returned as a python int.
+        # Raises AssertionError on a bad hint/value type and SerializeError for unknown variants.
         val = s.value
         if s.type == "as_expr":
             if val.hint is None:
@@ -2450,6 +2739,9 @@ class GraphModuleDeserializer(metaclass=Final):
             )
 
     def deserialize_sym_float(self, s: SymFloat) -> float | torch.SymFloat:
+        # [FUNCTION DOC] Float analogue of deserialize_sym_int: as_expr becomes a symbolic float node
+        # (hint taken from the float hint if present), as_float is returned as is; unknown variants
+        # raise SerializeError.
         val = s.value
         if s.type == "as_expr":
             hint = val.hint.as_float if val.hint else None
@@ -2465,6 +2757,8 @@ class GraphModuleDeserializer(metaclass=Final):
             )
 
     def deserialize_sym_bool(self, s: SymBool) -> bool | torch.SymBool:
+        # [FUNCTION DOC] Convert a schema SymBool: as_expr becomes a symbolic bool node (no hint),
+        # as_bool is returned as is; unknown variants raise SerializeError.
         val = s.value
         if s.type == "as_expr":
             expr = self._parse_sym_expr(val.expr_str)
@@ -2482,6 +2776,9 @@ class GraphModuleDeserializer(metaclass=Final):
         self,
         tensor_meta: TensorMeta,
     ) -> FakeTensor:
+        # [FUNCTION DOC] Build a fake tensor with the described sizes, strides (possibly symbolic),
+        # device, dtype and requires_grad inside this deserializer's fake tensor mode. Does not
+        # restore layout or storage offset.
         with self.fake_tensor_mode:
             return cast(
                 FakeTensor,
@@ -2497,12 +2794,17 @@ class GraphModuleDeserializer(metaclass=Final):
     def deserialize_script_obj_meta(
         self, script_obj_meta: CustomObjArgument
     ) -> ep.CustomObjArgument:
+        # [FUNCTION DOC] Convert a schema custom object descriptor into the export-level one (same
+        # name and class name).
         return ep.CustomObjArgument(
             name=script_obj_meta.name,
             class_fqn=script_obj_meta.class_fqn,
         )
 
     def deserialize_graph_output(self, output) -> torch.fx.Node | int | None:
+        # [FUNCTION DOC] Convert one serialized graph output: tensors and symbolic values map to their
+        # FX nodes by name; int, float, bool are returned as constants; none gives None. Raises
+        # SerializeError for other kinds.
         if output.type == "as_tensor":
             return self.serialized_name_to_node[output.as_tensor.name]
         elif output.type == "as_sym_int":
@@ -2523,6 +2825,13 @@ class GraphModuleDeserializer(metaclass=Final):
             raise SerializeError(f"Unable to deserialize output node {output}")
 
     def deserialize_graph(self, serialized_graph: Graph) -> torch.fx.Graph:
+        # [FUNCTION DOC] Rebuild the FX graph held in self.graph from a schema Graph. Steps: register
+        # lazy meta-value constructors for all named tensors, symbolic values and custom objects;
+        # create placeholders for inputs (tensors, custom objects, named SymInts keep their names;
+        # constant inputs get a name from the signature and a meta value); deserialize each node;
+        # create the output node (single bare value or tuple) with its meta value; recompute unbacked
+        # bindings on nodes. Raises SerializeError for bad inputs/nodes and AssertionError if
+        # unbacked symbols remain unbound. Returns the graph. Symbolic float inputs are not handled.
         log.debug("\n[deserialize_graph]")
 
         # Handle the tensor metas.
@@ -2658,7 +2967,17 @@ class GraphModuleDeserializer(metaclass=Final):
         return self.graph
 
     def deserialize_node(self, serialized_node: Node, target: Callable) -> None:
+        # [FUNCTION DOC] Create FX call_function node(s) for one serialized node given its resolved
+        # target. Branches: symbolic ops (and item); higher order ops (inputs, metadata propagation to
+        # graph-argument get_attr nodes, name chosen from node name or single tensor output); triton
+        # kernel wrapper (not implemented, raises SerializeError); OpOverloads/extension types
+        # (schema-driven inputs); plain callables; otherwise SerializeError with a hint about
+        # unregistered custom ops. Then attaches outputs and metadata, registers shape env asserts
+        # for assert_scalar and size constraints for sym_constrain_range_for_size, and gives
+        # non-placeholder/output nodes an empty nn_module_stack if missing.
         def _is_single_tensor_return(target) -> bool:
+            # [FUNCTION DOC] HELPER: True if the target schema has exactly one return and it is a
+            # tensor.
             schema = _get_schema_from_target(target)
             returns = schema.returns
             return len(returns) == 1 and isinstance(
@@ -2798,6 +3117,10 @@ class GraphModuleDeserializer(metaclass=Final):
             fx_node.meta["nn_module_stack"] = {}
 
     def deserialize_input_spec(self, i: InputSpec) -> ep.InputSpec:
+        # [FUNCTION DOC] Convert a schema InputSpec union into the export InputSpec with matching kind
+        # (user input, parameter, buffer with persistence, constant tensor, custom object, token,
+        # constant input as a user input with a constant argument). Raises AssertionError for unknown
+        # variants.
         log.debug("[deserialize_input_spec] %s", i)
         if i.type == "user_input":
             return ep.InputSpec(
@@ -2851,6 +3174,8 @@ class GraphModuleDeserializer(metaclass=Final):
             raise AssertionError(f"Unknown input spec {i}")
 
     def deserialize_output_spec(self, o: OutputSpec) -> ep.OutputSpec:
+        # [FUNCTION DOC] Convert a schema OutputSpec union into the export OutputSpec with matching
+        # kind and target name where applicable. Raises AssertionError for unknown variants.
         log.debug("[deserialize_output_spec] %s", o)
         if o.type == "user_output":
             return ep.OutputSpec(
@@ -2904,6 +3229,8 @@ class GraphModuleDeserializer(metaclass=Final):
             raise AssertionError(f"Unknown output spec {o}")
 
     def deserialize_signature(self, sig: GraphSignature) -> ep.ExportGraphSignature:
+        # [FUNCTION DOC] Deserialize every input and output spec into an export graph signature,
+        # preserving order.
         log.debug("\n[deserialize_signature]")
         return ep.ExportGraphSignature(
             input_specs=[self.deserialize_input_spec(i) for i in sig.input_specs],
@@ -2920,6 +3247,14 @@ class GraphModuleDeserializer(metaclass=Final):
         | None = None,
         symbol_name_to_range: dict[str, symbolic_shapes.ValueRanges] | None = None,
     ) -> Result:
+        # [FUNCTION DOC] Main entry point. Registers this instance as the module-global current
+        # deserializer (AssertionError if one is already active; always cleared in a finally block),
+        # creates a fresh shape env and fake tensor mode, loads constants, deserializes the signature,
+        # prepares value ranges (with placeholder lower bounds during analysis) and bumps the shape
+        # env counters for unbacked symbols seen in the ranges, loads example inputs, deserializes
+        # the graph and module call graph (within the nn.Module graph-input context), builds the
+        # graph module, and restores custom/namedtuple field metadata. Returns a Result bundle; the
+        # state dict is loaded last.
         global _CURRENT_DESERIALIZER
         if _CURRENT_DESERIALIZER is not None:
             raise AssertionError("_CURRENT_DESERIALIZER is already set")
@@ -3031,6 +3366,10 @@ class GraphModuleDeserializer(metaclass=Final):
             _CURRENT_DESERIALIZER = None
 
     def sync_fx_node(self, name: str, fx_node: torch.fx.Node):
+        # [FUNCTION DOC] Bind a serialized value name to an FX node: renames the node, records it in
+        # the name-to-node map, and sets its meta value to the lazily evaluated entry for that name.
+        # Raises SerializeError if the name was already bound and AssertionError if the node already
+        # has a meta value.
         if name in self.serialized_name_to_node:
             raise SerializeError(f"Node {name} has already been deserialized before.")
         # overwrite name
@@ -3041,9 +3380,19 @@ class GraphModuleDeserializer(metaclass=Final):
         fx_node.meta["val"] = self.serialized_name_to_meta[name]
 
     def deserialize_sym_op_inputs(self, inputs):
+        # [FUNCTION DOC] Deserialize the argument of each named input into a tuple of positional args
+        # (names are ignored).
         return tuple(self.deserialize_input(input.arg) for input in inputs)
 
     def deserialize_inputs(self, target, serialized_node: Node):
+        # [FUNCTION DOC] Rebuild (args tuple, kwargs ordered mapping) for a schema-driven call by
+        # walking the target schema arguments. Serialized kind decides positional vs keyword; for
+        # older data without usable kind, arguments without defaults that are not keyword-only are
+        # positional, and the rest are keywords if present. Arguments named like python keywords
+        # are forced positional. Missing defaulted arguments are omitted.
+        # KNOWN ISSUE: in the python-keyword fallback branch, kwargs is reset to an empty mapping
+        # before its values are appended to args, so the intended move of earlier keyword args into
+        # positionals never happens and those kwargs are dropped.
         schema_args = _get_schema_from_target(target).arguments
         argument_kinds = {input.name: input.kind for input in serialized_node.inputs}
         actual_args = {
@@ -3086,6 +3435,8 @@ class GraphModuleDeserializer(metaclass=Final):
         return tuple(args), kwargs
 
     def deserialize_hoo_inputs(self, inputs: list[NamedArgument]):
+        # [FUNCTION DOC] Split schema-less inputs into (args tuple, kwargs mapping): positional kind or
+        # empty name go to args, others to kwargs by name.
         """
         For deserializing HOO inputs since HOOs do not have a schema.
         """
@@ -3099,6 +3450,12 @@ class GraphModuleDeserializer(metaclass=Final):
         return (tuple(args), kwargs)
 
     def deserialize_input(self, inp: Argument) -> Any:
+        # [FUNCTION DOC] Convert a schema Argument union to a python/FX value: none, dtype, memory
+        # format, layout, device, scalars, complex; tensors and symbolic values as FX nodes (via name
+        # lookup); a nested graph is deserialized into a submodule registered on the root module and
+        # referenced by a get_attr node; dict of arguments (recursive); lists of every supported
+        # kind (int lists become lists of tuples, optional tensors allow None); custom objects from
+        # lifted inputs or constants; operators. Raises SerializeError for unhandled kinds.
         value = inp.value
         typ_ = inp.type
         if typ_ == "as_none":
@@ -3176,6 +3533,8 @@ class GraphModuleDeserializer(metaclass=Final):
             elif typ_ == "as_optional_tensors":
 
                 def deserialize_optional_tensor_args(a):
+                    # [FUNCTION DOC] HELPER: Map an optional tensor argument to None or its FX
+                    # node; raises SerializeError for other variants.
                     if a.type == "as_none":
                         return None
                     elif a.type == "as_tensor":
@@ -3197,6 +3556,8 @@ class GraphModuleDeserializer(metaclass=Final):
             raise SerializeError(f"Unhandled argument {inp}")
 
     def deserialize_constant_input(self, inp: ConstantValue) -> Any:
+        # [FUNCTION DOC] Convert a schema ConstantValue (int, float, string, bool, none) to the
+        # matching python value; raises SerializeError for other variants.
         if inp.type == "as_int":
             return int(inp.as_int)
         elif inp.type == "as_float":
@@ -3211,6 +3572,8 @@ class GraphModuleDeserializer(metaclass=Final):
             raise SerializeError(f"Unhandled constant argument {inp} to deserialize")
 
     def deserialize_sym_argument(self, sym_arg):
+        # [FUNCTION DOC] Convert a SymInt/SymFloat/SymBool argument: a literal value is returned as is,
+        # a by-name reference is resolved to its FX node. Raises SerializeError for unknown shapes.
         if isinstance(sym_arg, SymIntArgument):
             if sym_arg.type == "as_int":
                 return sym_arg.as_int
@@ -3229,9 +3592,15 @@ class GraphModuleDeserializer(metaclass=Final):
         raise SerializeError(f"Unknown symbolic argument type: {sym_arg}")
 
     def deserialize_sym_op_outputs(self, serialized_node: Node, fx_node: torch.fx.Node):
+        # [FUNCTION DOC] Bind the FX node of a symbolic op to the name of its single serialized output.
         self.sync_fx_node(serialized_node.outputs[0].value.as_name, fx_node)
 
     def deserialize_outputs(self, serialized_node: Node, fx_node: torch.fx.Node):
+        # [FUNCTION DOC] Attach serialized outputs to the FX node. No outputs: nothing. A higher order
+        # op flagged as not returning a bare tensor with a single output: wrapped as a one-element
+        # tuple via a generated getitem. A single tensor or symbolic output: bind the node to that
+        # name. A single none output: meta value None and rename the node to an unused name.
+        # Otherwise: delegate to deserialize_multiple_outputs.
         # Check single value return
         if len(serialized_node.outputs) == 0:
             return
@@ -3244,6 +3613,9 @@ class GraphModuleDeserializer(metaclass=Final):
         ):
 
             def _deserialize_hop_with_single_return(serialized_node, fx_node):
+                # [FUNCTION DOC] HELPER: Handle a higher order op whose only output is a tensor or
+                # symbolic value inside a tuple: emit one getitem node for index zero, set the op's
+                # meta value to a one-element tuple and register the op node by its own name.
                 meta_val: list[Any] = []
                 arg = None
                 if serialized_node.outputs[0].type == "as_tensor":
@@ -3297,6 +3669,9 @@ class GraphModuleDeserializer(metaclass=Final):
         idx: int,
         deserialized_metadata: dict[str, Any],
     ):
+        # [FUNCTION DOC] Create a getitem node selecting index idx from fx_node, named after the
+        # tensor or symbolic argument, bind it, append its meta value to meta_val, and copy the given
+        # metadata onto it. Raises AssertionError for unsupported argument types.
         if isinstance(arg, TensorArgument):
             name = arg.name
         elif isinstance(arg, SymIntArgument):
@@ -3326,6 +3701,11 @@ class GraphModuleDeserializer(metaclass=Final):
         args,
         deserialized_metadata: dict[str, Any],
     ):
+        # [FUNCTION DOC] Emit getitem nodes for each output in args and collect meta values into
+        # meta_val. Single tensor/symbolic outputs get one named getitem; list-like outputs get an
+        # unnamed getitem whose children are generated recursively and whose meta value is the list;
+        # none outputs get a getitem named as_none with meta value None. Raises
+        # NotImplementedError for other output kinds and AssertionError for non-Argument entries.
         for idx, arg in enumerate(args):
             if isinstance(arg, (TensorArgument, SymIntArgument, SymFloatArgument)):
                 self.generate_getitem(
@@ -3376,6 +3756,10 @@ class GraphModuleDeserializer(metaclass=Final):
     def deserialize_multiple_outputs(
         self, serialized_node: Node, fx_node: torch.fx.Node
     ) -> None:
+        # [FUNCTION DOC] Represent several serialized outputs on one FX node (inverse of
+        # serialize_outputs): emit a getitem node per output, then set the node's meta value to the
+        # tuple of collected meta values and register it by name. A single output must be a tensor
+        # list (AssertionError otherwise).
         deserialized_metadata = self.deserialize_metadata(serialized_node.metadata)
 
         # Convert multiple return types to FX format.
@@ -3410,11 +3794,18 @@ class GraphModuleDeserializer(metaclass=Final):
         self.serialized_name_to_node[fx_node.name] = fx_node
 
     def deserialize_metadata(self, metadata: dict[str, str]) -> dict[str, Any]:
+        # [FUNCTION DOC] Inverse of serialize_metadata: rebuild an FX meta dict from the string mapping.
+        # stack_trace is copied; nn_module_stack is split into key, path, type triples (commas inside
+        # brackets/parentheses do not split); source_fn_stack entries have their operator resolved;
+        # torch_fn becomes a tuple; custom is JSON decoded; from_node is decoded into node sources.
         ret: dict[str, Any] = {}
         if stack_trace := metadata.get("stack_trace"):
             ret["stack_trace"] = stack_trace
 
         def deserialize_meta_func(serialized_target: str):
+            # [FUNCTION DOC] HELPER: Resolve a dotted name under torch.nn or torch by attribute
+            # walking (returning the original string if some attribute is missing); other names go to
+            # deserialize_operator.
             module = None
             if serialized_target.startswith("torch.nn"):
                 module = torch.nn
@@ -3436,10 +3827,13 @@ class GraphModuleDeserializer(metaclass=Final):
         if nn_module_stack_str := metadata.get("nn_module_stack"):
             # Originally serialized to "key,orig_path,type_str"
             def import_nn_module_stack(key, path, ty):
+                # [FUNCTION DOC] HELPER: Return the (key, (path, type)) pair for one stack entry.
                 return key, (path, ty)
 
             # Helper function to split string by commas, accounting for nested parentheses/brackets
             def metadata_split(metadata):
+                # [FUNCTION DOC] HELPER: Split a string on top-level commas (ignoring commas nested
+                # in brackets or parentheses) and require exactly three parts, else AssertionError.
                 out = []
                 start, n = 0, 0
                 a, b = "[(", ")]"
@@ -3486,6 +3880,8 @@ class GraphModuleDeserializer(metaclass=Final):
     def _deserialize_from_node(
         self, from_node_data: list[dict[str, Any]] | None
     ) -> list[NodeSource] | None:
+        # [FUNCTION DOC] HELPER: Rebuild NodeSource objects from their dictionary form, dropping
+        # entries that cannot be reconstructed; None stays None; a non-list raises AssertionError.
         """
         Deserialize from_node metadata from JSON data.
         """
@@ -3502,6 +3898,9 @@ class GraphModuleDeserializer(metaclass=Final):
         ]
 
     def deserialize_argument_spec(self, x: Argument) -> ep.ArgumentSpec:
+        # [FUNCTION DOC] Convert a schema Argument to an export argument descriptor: tensors and
+        # symbolic int/float by name; custom objects and all other values become constant arguments
+        # (custom object keeps its name, others get an empty name) holding the deserialized value.
         log.debug("[deserialize_argument_spec] %s", x)
         if x.type == "as_tensor":
             return ep.TensorArgument(name=x.as_tensor.name)
@@ -3519,6 +3918,8 @@ class GraphModuleDeserializer(metaclass=Final):
     def deserialize_module_call_signature(
         self, module_call_signature: ModuleCallSignature
     ) -> ep.ModuleCallSignature:
+        # [FUNCTION DOC] Convert a schema module call signature: argument specs for inputs/outputs,
+        # pytree specs loaded from their string forms, and forward argument names (None when empty).
         return ep.ModuleCallSignature(
             inputs=[
                 self.deserialize_argument_spec(x) for x in module_call_signature.inputs
@@ -3536,6 +3937,8 @@ class GraphModuleDeserializer(metaclass=Final):
     def deserialize_module_call_graph(
         self, module_call_graph: list[ModuleCallEntry]
     ) -> list[ep.ModuleCallEntry]:
+        # [FUNCTION DOC] Convert each schema module call entry (name plus optional signature) to the
+        # export-level entry, preserving order.
         log.debug("\n[deserialize_module_call_graph]")
         return [
             ep.ModuleCallEntry(
@@ -3552,7 +3955,12 @@ class GraphModuleDeserializer(metaclass=Final):
 
 @final
 class ExportedProgramDeserializer(metaclass=Final):
+    # [CLASS DOC] Top-level deserializer: turns a schema ExportedProgram plus pickled state dict,
+    # constants and example inputs back into an export ExportedProgram. State: expected opset
+    # versions (aten defaulted from the runtime). Cannot be subclassed.
     def __init__(self, expected_opset_version: dict[str, int] | None = None):
+        # [FUNCTION DOC] Copy the expected opset versions and default the aten version to the runtime
+        # maximum operator version when absent.
         self.expected_opset_version: dict[str, int] = {}
         if expected_opset_version:
             self.expected_opset_version.update(expected_opset_version)
@@ -3564,6 +3972,9 @@ class ExportedProgramDeserializer(metaclass=Final):
         symbol_name_to_range: dict[str, symbolic_shapes.ValueRanges],
         symbol_name_to_symbol: dict[str, sympy.Symbol],
     ) -> dict[sympy.Symbol, ValueRanges]:
+        # [FUNCTION DOC] Re-key range constraints from symbol names to sympy symbols using the symbols
+        # discovered while deserializing the graph; names with no matching symbol are dropped with a
+        # logged warning.
         log.debug("\n[deserialize_range_constraints]")
         range_constraints = {}
         for k, v in symbol_name_to_range.items():
@@ -3587,6 +3998,11 @@ class ExportedProgramDeserializer(metaclass=Final):
         *,
         _unsafe_skip_version_check=False,
     ) -> ep.ExportedProgram:
+        # [FUNCTION DOC] Rebuild an export ExportedProgram. Checks the schema major version against
+        # the current one (version 0.0 allowed; mismatch raises SerializeError unless the unsafe skip
+        # flag is set), converts serialized range constraints to value ranges, deserializes the graph
+        # module with GraphModuleDeserializer, remaps range constraints to symbols, loads verifiers,
+        # and restores guards code. Note the expected opset version is stored but not checked here.
         if not isinstance(exported_program, ExportedProgram):
             raise AssertionError(
                 f"expected ExportedProgram, got {type(exported_program).__name__}"
@@ -3639,7 +4055,10 @@ class ExportedProgramDeserializer(metaclass=Final):
 
 
 class EnumEncoder(json.JSONEncoder):
+    # [CLASS DOC] HELPER: JSON encoder that writes enums as their values and bytes as base64 text.
     def default(self, obj):
+        # [FUNCTION DOC] HELPER: Encode an Enum as its value and bytes as a base64 string; anything
+        # else defers to the base encoder (which raises a type error).
         if isinstance(obj, Enum):
             return obj.value
         if isinstance(obj, bytes):
@@ -3648,6 +4067,10 @@ class EnumEncoder(json.JSONEncoder):
 
 
 def _dataclass_to_dict(obj):
+    # [FUNCTION DOC] HELPER: Recursively convert schema dataclasses and unions into JSON-ready plain
+    # structures: a union becomes a one-key mapping of variant name to value; dataclasses become
+    # field mappings; lists, tuples and dicts are converted element-wise; infinite and NaN floats
+    # become the strings Infinity, -Infinity, NaN; other values pass through.
     if isinstance(obj, _Union):
         return {obj.type: _dataclass_to_dict(obj.value)}
     elif dataclasses.is_dataclass(obj):
@@ -3675,6 +4098,8 @@ def _dataclass_to_dict(obj):
 
 
 def _to_json_bytes(obj: Any) -> bytes:
+    # [FUNCTION DOC] HELPER: Encode a schema object as UTF-8 JSON bytes via _dataclass_to_dict and the
+    # enum encoder, with NaN/infinity literals disallowed.
     return json.dumps(_dataclass_to_dict(obj), cls=EnumEncoder, allow_nan=False).encode(
         "utf-8"
     )
@@ -3689,6 +4114,10 @@ def serialize(
     serialize_constants: bool = True,
     serialize_example_inputs: bool = True,
 ) -> SerializedArtifact:
+    # [FUNCTION DOC] Public export entry point: serialize an ExportedProgram (inside the nn.Module
+    # graph-input context for its example inputs) with the given opset versions and pickle protocol,
+    # JSON encode the schema program, and return a SerializedArtifact of four byte strings. The three
+    # flags skip pickling the state dict, constants or example inputs (leaving empty bytes).
     with _enable_graph_inputs_of_type_nn_module(exported_program.example_inputs):
         serialized_program = ExportedProgramSerializer(
             opset_version, pickle_protocol
@@ -3714,6 +4143,8 @@ def serialize(
 
 
 def _resolve_schema_cls(cls):
+    # [FUNCTION DOC] HELPER: Resolve a string or forward-reference type annotation to the class of
+    # that name in the schema module; unresolvable inputs are returned unchanged.
     if isinstance(cls, str):
         resolved = getattr(schema, cls, None)
         if resolved is not None:
@@ -3724,6 +4155,11 @@ def _resolve_schema_cls(cls):
 
 
 def _dict_to_dataclass(cls, data):
+    # [FUNCTION DOC] HELPER: Rebuild a schema object of type cls from decoded JSON data, guided by type
+    # hints. Handles annotated types, optionals (None passes through), union classes (one-key mapping
+    # of variant to value), dataclasses (unknown keys ignored for forward compatibility, missing keys
+    # left to defaults), lists and dicts (element types from the annotation), and floats. Raises
+    # AssertionError for unresolved class names or malformed union data.
     cls = _resolve_schema_cls(cls)
     if isinstance(cls, str):
         raise AssertionError(f"Unresolved class type: '{cls}'.")
@@ -3777,6 +4213,8 @@ def _dict_to_dataclass(cls, data):
 
 
 def _bytes_to_dataclass(cls: Any, artifact_bytes: bytes) -> Any:
+    # [FUNCTION DOC] HELPER: Decode UTF-8 JSON bytes and convert the result into an instance of the
+    # given schema class.
     artifact_str = artifact_bytes.decode("utf-8")
     artifact_dict = json.loads(artifact_str)
     artifact_dataclass = _dict_to_dataclass(cls, artifact_dict)
@@ -3789,6 +4227,10 @@ def deserialize(
     *,
     _unsafe_skip_version_check=False,
 ) -> ep.ExportedProgram:
+    # [FUNCTION DOC] Public import entry point: decode the JSON program bytes of a SerializedArtifact
+    # into the schema ExportedProgram and rebuild an export ExportedProgram with the pickled state
+    # dict, constants and example inputs. The keyword flag skips the schema version check. Raises
+    # AssertionError if the program part is not bytes, and SerializeError on version mismatch.
     if not isinstance(artifact.exported_program, bytes):
         raise AssertionError(
             f"expected bytes, got {type(artifact.exported_program).__name__}"
@@ -3808,7 +4250,17 @@ def deserialize(
 def _canonicalize_graph(
     sorted_inputs, sorted_outputs, graph, constants
 ) -> tuple[Graph, dict[str, str]]:
+    # [FUNCTION DOC] HELPER: Canonicalize one schema graph in place (the caller passes an already
+    # copied program) and return (new Graph, mapping from old value names to new names). Stages:
+    # (1) topologically sort nodes with a deterministic tie-break (target name, then ranks of the
+    # argument names), (2) rename every defined value to underscore plus a running index, rewriting
+    # uses, (3) clear node metadata, (4) sort value tables by name, (5) recurse into nested graphs,
+    # renaming them to generated names. Raises AssertionError on unknown argument kinds or undefined
+    # symbols.
     def _get_argument(a: Argument):
+        # [FUNCTION DOC] HELPER: Return the part of an Argument that carries value names (tensors,
+        # symbolic values, optional/nested tensors, custom objects) or None for kinds that carry
+        # none. Raises AssertionError for unknown kinds.
         if a.type == "as_none":
             return None
         elif a.type == "as_tensor":
@@ -3874,13 +4326,23 @@ def _canonicalize_graph(
 
     # Stage 1: Reorder named items.
     def for_args(f, a):
+        # [FUNCTION DOC] HELPER: Apply f to every name-carrying leaf inside an Argument (mapping over
+        # the pytree of its name-bearing part). Raises AssertionError if a is not an Argument.
         if not isinstance(a, Argument):
             raise AssertionError(f"expected Argument, got {type(a).__name__}")
         pytree.tree_map(f, _get_argument(a))
 
     def sort_nodes(nodes):
+        # [FUNCTION DOC] HELPER: Deterministic topological sort of nodes. Builds a definition table
+        # from node outputs, dependency edges from node inputs (graph inputs and constants create no
+        # edge), and ranks for names in graph-input order; then repeatedly pops the ready node with
+        # the smallest (target, argument ranks, index) key from a heap, assigning ranks to its outputs
+        # as it goes. Returns the sorted list. Raises AssertionError on duplicate definitions or
+        # undefined symbols.
         @dataclass
         class Edges:
+            # [CLASS DOC] HELPER: Per-node dependency record: indices of consumer nodes and the count
+            # of not-yet-emitted producers.
             outs: list[int]
             ins: int
 
@@ -3892,6 +4354,8 @@ def _canonicalize_graph(
         ret: list[Node] = []
 
         def get_name(a) -> str | None:
+            # [FUNCTION DOC] HELPER: Return the value name referenced by a leaf argument, or None for
+            # None and literal (non-named) variants; raises AssertionError for unknown types.
             if a is None:
                 return None
             if isinstance(a, TensorArgument):
@@ -3918,6 +4382,7 @@ def _canonicalize_graph(
         for i in sorted_inputs:
 
             def add_input(a):
+                # [FUNCTION DOC] HELPER: Record the leaf's name as a graph input.
                 if s := get_name(a):
                     graph_inputs.add(s)
 
@@ -3926,6 +4391,8 @@ def _canonicalize_graph(
         for idx, node in enumerate(nodes):
 
             def add_def(a):
+                # [FUNCTION DOC] HELPER: Record that the leaf's name is defined by the current node;
+                # raises AssertionError if already defined.
                 if s := get_name(a):
                     if s in def_table:
                         raise AssertionError(f"symbol {s!r} already in def_table")
@@ -3939,6 +4406,9 @@ def _canonicalize_graph(
         for idx, user in enumerate(nodes):
 
             def add_edge(a):
+                # [FUNCTION DOC] HELPER: Add a dependency edge from the node defining the leaf's name
+                # to the current user node; constants and graph inputs add none; an undefined name
+                # raises AssertionError.
                 if s := get_name(a):
                     if s in constants:
                         return
@@ -3956,12 +4426,16 @@ def _canonicalize_graph(
                 for_args(add_edge, i.arg)
 
         def add_rank(a):
+            # [FUNCTION DOC] HELPER: Assign the next sequential rank to the leaf's name (error if it
+            # already has one).
             if s := get_name(a):
                 if s in rank:
                     raise AssertionError(f"symbol {s!r} already in rank")
                 rank[s] = len(rank)
 
         def get_rank(a):
+            # [FUNCTION DOC] HELPER: Rank of the leaf's name, or minus one for unnamed leaves and
+            # constants.
             s = get_name(a)
             if s and s not in constants:
                 return rank[s]
@@ -3972,7 +4446,10 @@ def _canonicalize_graph(
             for_args(add_rank, i)
 
         def add_candidate(idx: int):
+            # [FUNCTION DOC] HELPER: Push a ready node onto the heap keyed by target name, per-input
+            # (name, ranks) list, and node index.
             def get_ranks(i):
+                # [FUNCTION DOC] HELPER: List of ranks of all leaves of an input argument.
                 ranks = []
                 for_args(lambda x: ranks.append(get_rank(x)), i)
                 return ranks
@@ -4014,7 +4491,12 @@ def _canonicalize_graph(
     name_table: dict[str, str] = {}
 
     def rename_def(a):
+        # [FUNCTION DOC] HELPER: Rename a defined leaf in place to the next generated name and re-key
+        # the matching value table of the graph; records old-to-new in the name table. Unnamed
+        # (literal) variants are left alone; unknown types raise AssertionError.
         def _rename(arg_name, values):
+            # [FUNCTION DOC] HELPER: Generate the next new name, record the mapping, and move the
+            # value table entry from the old key to the new key; asserts no duplicates/missing keys.
             new_name = f"_{len(name_table)}"
             if arg_name in name_table:
                 raise AssertionError(f"arg_name {arg_name!r} already in name_table")
@@ -4043,6 +4525,8 @@ def _canonicalize_graph(
             raise AssertionError(f"Unknown argument type: {a}")
 
     def replace_use(a):
+        # [FUNCTION DOC] HELPER: Rewrite a used leaf's name in place using the old-to-new name table
+        # (names not in the table, e.g. constants, are kept). Unknown types raise AssertionError.
         if a is None:
             return
         if isinstance(a, TensorArgument):
@@ -4133,6 +4617,14 @@ def _canonicalize_graph(
 def canonicalize(
     ep: ExportedProgram, constants: set[str] | None = None
 ) -> ExportedProgram:
+    # [FUNCTION DOC] Return a canonical copy of a serialized program (the input is deep copied, not
+    # mutated): sorts opset versions, range constraints, guards code and module call graph; orders
+    # inputs and outputs by spec kind rank then name then original position; canonicalizes the graph
+    # via _canonicalize_graph; and rewrites all value names in input/output specs with the resulting
+    # rename table. Names listed in constants are not renamed. Raises AssertionError if graph and
+    # signature lengths disagree or on unknown spec kinds.
+    # KNOWN ISSUE: the inner output-spec rewriting function reads the loop variable of the enclosing
+    # scope instead of its own parameter; it works only because it is called from that loop.
     """
     Normalize a serialized ExportedProgram, so that different eager program which
     shares the same semantics can get a single representation on disk.
@@ -4175,6 +4667,9 @@ def canonicalize(
         )
 
     def rank_input(inp) -> tuple[int, str | None, int]:
+        # [FUNCTION DOC] HELPER: Sort key for (index, (argument, input spec)): kind rank (token first,
+        # then parameter, buffer, constant tensor, custom object, user input, constant input), the
+        # target name where one exists, then the original index. Raises AssertionError for unknown kinds.
         idx, (_arg, spec) = inp
         if not isinstance(spec, InputSpec):
             raise AssertionError(f"expected InputSpec, got {type(spec).__name__}")
@@ -4196,6 +4691,9 @@ def canonicalize(
             raise AssertionError(f"Unknown input type: {spec}")
 
     def rank_output(out) -> tuple[int, str | None, int]:
+        # [FUNCTION DOC] HELPER: Sort key for (index, (argument, output spec)): kind rank (token,
+        # parameter mutation, buffer mutation, user input mutation, user/loss output, gradient to
+        # parameter, gradient to user input), target name where one exists, then original index.
         idx, (_arg, spec) = out
         if not isinstance(spec, OutputSpec):
             raise AssertionError(f"expected OutputSpec, got {type(spec).__name__}")
@@ -4238,6 +4736,9 @@ def canonicalize(
     )
 
     def replace_input(spec):
+        # [FUNCTION DOC] HELPER: Rewrite the value names inside an input spec in place using the
+        # graph's old-to-new name table. Constant and literal inputs are left unchanged. Raises
+        # AssertionError for unknown kinds.
         if not isinstance(spec, InputSpec):
             raise AssertionError(f"expected InputSpec, got {type(spec).__name__}")
         if spec.type == "user_input":
@@ -4294,6 +4795,10 @@ def canonicalize(
             raise AssertionError(f"Unknown input type: {spec}")
 
     def replace_output(out):
+        # [FUNCTION DOC] HELPER: Rewrite the value names inside an output spec in place using the
+        # old-to-new name table (including target input names for gradient/mutation kinds).
+        # KNOWN ISSUE: ignores its parameter and reads the variable named spec from the enclosing
+        # function's loop, so it only works when called inside that loop.
         if not isinstance(spec, OutputSpec):
             raise AssertionError(f"expected OutputSpec, got {type(spec).__name__}")
         if spec.type == "user_output":
@@ -4372,24 +4877,35 @@ def canonicalize(
 
 
 class ExtensionHandler:
+    # [CLASS DOC] Interface for plugging custom operator types into export serialization. Subclasses
+    # supply a unique namespace string, conversion between an operator object and its name, and the
+    # operator's function schema. All methods are class methods that raise NotImplementedError here.
     """
     Base class for handling extension operators.
     """
 
     @classmethod
     def namespace(cls) -> str:
+        # [FUNCTION DOC] Return the unique namespace under which this handler's operators are
+        # serialized. Must be overridden; the base raises NotImplementedError.
         raise NotImplementedError(f"{cls.__class__} namespace() must be implemented")
 
     @classmethod
     def to_op_name(cls, op) -> str:
+        # [FUNCTION DOC] Return the string name of an operator object (no colon allowed). Must be
+        # overridden; the base raises NotImplementedError.
         raise NotImplementedError(f"{cls.__class__} op_name() must be implemented")
 
     @classmethod
     def from_op_name(cls, name: str):
+        # [FUNCTION DOC] Rebuild the operator object from its serialized name. Must be overridden;
+        # the base raises NotImplementedError (message names the metaclass, not the handler).
         raise NotImplementedError(f"{cls.__class__} op_name() must be implemented")
 
     @classmethod
     def op_schema(cls, op) -> torch.FunctionSchema:
+        # [FUNCTION DOC] Return the FunctionSchema describing the operator's arguments and returns.
+        # Must be overridden; the base raises NotImplementedError.
         raise NotImplementedError(f"{cls.__class__} op_schema() must be implemented")
 
 
@@ -4397,6 +4913,11 @@ def register_extension(
     op_type: type[Any],
     extension_handler: type[ExtensionHandler],
 ):
+    # [FUNCTION DOC] Register a handler class for a custom operator type, filling both module-level
+    # registries (type to handler for serialization, namespace to handler for deserialization).
+    # Raises AssertionError if the handler is not an ExtensionHandler subclass, the type or the
+    # namespace is already registered, the type is not a class, or its module starts with torch or
+    # builtins. Mutates global registries.
     """Register custom de/serialization method for a node with non-standard type."""
     if not issubclass(extension_handler, ExtensionHandler):
         raise AssertionError(f"Expected ExtensionHandler, got {extension_handler}.")
@@ -4419,6 +4940,8 @@ def register_extension(
 
 
 def _registered_extension_types():
+    # [FUNCTION DOC] HELPER: Tuple of all operator types currently registered for extension
+    # serialization.
     return tuple(_serialization_registry.keys())
 
 
