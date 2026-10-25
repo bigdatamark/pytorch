@@ -1,3 +1,9 @@
+# [MODULE DOC] Support for graph breaks inside inlined list/dict comprehensions (Python 3.12+,
+# where comprehensions are inlined into the enclosing function bytecode). Detects the start of a
+# comprehension, analyzes its bytecode (iterator vars, walrus vars, captured vars, how the result
+# is consumed), and on speculation failure compiles the graph up to it, runs the comprehension in
+# a synthetic skipped function, and chains into a resume function. Entry point:
+# maybe_setup_comprehension_speculation. Import time effects: creates a module logger only.
 from __future__ import annotations
 
 import copy
@@ -35,6 +41,9 @@ log = logging.getLogger(__name__)
 
 @functools.cache
 def _get_comprehension_bytecode_prefix() -> list[str]:
+    # [FUNCTION DOC] HELPER: Cached. Compile a tiny list comprehension function, disassemble it,
+    # and return the opcode names from the last LOAD_FAST_AND_CLEAR up to (excluding) BUILD_LIST:
+    # the prefix pattern marking a comprehension start. Raises AssertionError below Python 3.12.
     """Get the bytecode instructions that precede BUILD_LIST in a list comprehension."""
 
     if sys.version_info < (3, 12):
@@ -43,6 +52,7 @@ def _get_comprehension_bytecode_prefix() -> list[str]:
         )
 
     def fn() -> list[int]:
+        # [FUNCTION DOC] HELPER: Sample function whose bytecode is inspected; returns a list comprehension.
         return [i for i in range(1)]  # noqa: C416
 
     insts = [inst.opname for inst in dis.get_instructions(fn)]
@@ -55,6 +65,10 @@ def _get_comprehension_bytecode_prefix() -> list[str]:
 
 @dataclasses.dataclass
 class ComprehensionAnalysis:
+    # [CLASS DOC] Plain dataclass result of bytecode analysis of one inlined comprehension: the
+    # instruction index after its epilogue, where the result goes (named variable, or left on the
+    # stack when returned/consumed, or neither when discarded), and lists of variable names
+    # (iterator, walrus-assigned, captured from the outer scope).
     """Metadata about a comprehension's bytecode structure.
 
     Attributes:
@@ -75,6 +89,9 @@ class ComprehensionAnalysis:
 
 
 def _is_comprehension_start(tx: InstructionTranslatorBase) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether the instructions just before the current build
+    # instruction (instruction pointer minus one) have exactly the opcode names of the cached
+    # comprehension prefix. Raises AssertionError on Python < 3.12 or when no instruction pointer.
     """Detect if we're at the start of a list/dict comprehension in 3.12+.
 
     In Python 3.12+, comprehensions are inlined with a bytecode pattern that
@@ -96,6 +113,9 @@ def _is_comprehension_start(tx: InstructionTranslatorBase) -> bool:
 
 
 def _find_comprehension_end_for_ip(tx: InstructionTranslatorBase) -> int:
+    # [FUNCTION DOC] HELPER: Scan forward from the current instruction pointer counting nested
+    # loop-start and loop-end opcodes; return the index of the loop-end matching the outermost
+    # loop, or -1 if none is found. Raises AssertionError on Python < 3.12 or no instruction pointer.
     """Find the instruction pointer of the outermost END_FOR for current comprehension."""
     if sys.version_info < (3, 12):
         raise AssertionError(
@@ -117,6 +137,13 @@ def _find_comprehension_end_for_ip(tx: InstructionTranslatorBase) -> int:
 
 
 def _analyze_comprehension(tx: InstructionTranslatorBase) -> ComprehensionAnalysis:
+    # [FUNCTION DOC] HELPER: Inspect the bytecode of the comprehension starting at the current
+    # build instruction. Collects iterator vars (saved before the build), walrus vars (copy then
+    # store in the loop body), captured outer vars (fast loads not defined inside), then examines
+    # the epilogue after the loop end to classify the result as discarded, stored to one variable,
+    # or left on the stack. Returns a ComprehensionAnalysis. Raises AssertionError on old Python or
+    # no instruction pointer; triggers a graph break (unimplemented) if the loop end is missing,
+    # the stored result is ambiguous, or the pattern is unknown.
     """Analyze comprehension bytecode to determine result handling pattern."""
     if sys.version_info < (3, 12):
         raise AssertionError(
@@ -268,6 +295,15 @@ def _analyze_comprehension(tx: InstructionTranslatorBase) -> ComprehensionAnalys
 def _handle_comprehension_graph_break(
     tx: InstructionTranslatorBase, inst: Instruction
 ) -> None:
+    # [FUNCTION DOC] HELPER: Perform the graph break at a comprehension. Compiles the partial graph
+    # popping the iterator and saved-var stack items, appends the non-NULL popped items to the
+    # frame values list in the generated output code, builds the synthetic comprehension function,
+    # calls it, removes the temporary items, writes walrus values and the result into the frame
+    # values list (or leaves the result on the stack, or discards it), then emits a call to the
+    # resume function at the instruction after the comprehension. Side effects: mutates the
+    # symbolic stack/locals, adds output instructions, installs a global function, and sets the
+    # instruction pointer to None to end tracing. Raises AssertionError on old Python or no
+    # instruction pointer. Argument inst is unused.
     """Handle list/dict comprehension graph break.
 
     Builds a synthetic function wrapping the comprehension bytecode,
@@ -505,6 +541,13 @@ def _build_comprehension_fn(
     nonnull_count: int,
     meta: StackLocalsMetadata,
 ) -> tuple[types.CodeType, str]:
+    # [FUNCTION DOC] HELPER: Create a code object from the current frame's code whose body is the
+    # copied comprehension bytecode. Its arguments are the two nested resume placeholders, the live
+    # locals (non-cell), then the non-NULL stack items. The body pushes the stack items back
+    # (NULL placeholders where needed), runs the comprehension, and returns the result (or None
+    # if discarded), packed in a tuple with walrus values when present. Marks the code skipped by
+    # Dynamo and installs it as a global under a unique name. Returns the code and its name.
+    # Imports lazily to avoid cycles.
     """Build a synthetic function wrapping comprehension bytecode.
 
     Uses the same calling convention as resume functions created by
@@ -543,6 +586,9 @@ def _build_comprehension_fn(
     )
 
     def update(instructions: list[Instruction], code_options: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Code transform callback. Rewrites code_options in place (name,
+        # line number, free vars, argument counts, variable names, clears varargs flags) and
+        # replaces the instruction list with prefix, copied comprehension body and epilogue.
         code_options["co_name"] = fn_name
         if sys.version_info >= (3, 11):
             code_options["co_qualname"] = fn_name
@@ -615,6 +661,9 @@ def _build_comprehension_fn(
 def _copy_comprehension_bytecode(
     tx: InstructionTranslatorBase, start_ip: int, end_ip: int
 ) -> list[Instruction]:
+    # [FUNCTION DOC] HELPER: Shallow-copy the instructions in the half-open index range, clear
+    # their exception table entries, and redirect jump targets that point inside the range to the
+    # copies. Returns the new list; originals are untouched.
     """Copy comprehension bytecode instructions, updating jump targets."""
     inst_map: dict[Instruction, Instruction] = {}
     copied_insts: list[Instruction] = []
@@ -636,6 +685,14 @@ def _copy_comprehension_bytecode(
 def maybe_setup_comprehension_speculation(
     tx: InstructionTranslatorBase, inst: Instruction
 ) -> bool:
+    # [FUNCTION DOC] Called by the translator on an empty list/map build. Returns False unless on
+    # Python 3.12+ at a real comprehension start. Decides whether speculation is allowed (all
+    # blocks restorable, not fullgraph or error-on-break, not in a resume prologue, no generic
+    # context managers, root tracer, and nested-comprehension check for inlined frames). At the
+    # outermost comprehension it starts a speculation; if a previous speculation already failed it
+    # performs the comprehension graph break and returns True. Otherwise records the loop end
+    # index and increments the comprehension depth, returning False. Raises AssertionError if the
+    # loop end cannot be found.
     """
     Handle comprehension start for Python 3.12+ BUILD_LIST/BUILD_MAP with argval 0.
     Returns True if a graph break was triggered and the caller should return early.
