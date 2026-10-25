@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Central inline/skip/in-graph rule tables for Dynamo. Holds big name->VariableTracker
+# rule maps (manual rules, torch C-binding and non-C-binding in-graph functions), module
+# inline/skip lists, lazily built id sets (allowed, disallowed, builtin, polyfilled, numpy),
+# and the lookup/check entry points deciding whether a callable or file is inlined, skipped,
+# or treated as an in-graph torch function.
+# Import-time side effects: validates MOD_SKIPLIST is sorted/unique, builds SKIP_DIRS and
+# BUILTIN_INLINE_WHEN_CALLED, registers third-party libs into SKIP_DIRS (via add), and
+# compiles the SKIP_DIRS regex. Mutable module globals: SKIP_DIRS, SKIP_DIRS_RE, _force_inline_flag.
 """
 Tracing rules and policies for TorchDynamo compilation decisions.
 
@@ -3064,6 +3073,12 @@ Generate the torch object - Dynamo tracing rule (the wrapping variable) map.
 
 @functools.cache
 def get_torch_obj_rule_map() -> dict[Any, type["VariableTracker"]]:
+    # [FUNCTION DOC]
+    # Cached. Builds a mapping from live objects (or torch file paths for entries of the form
+    # file-path-hash-name) to the VariableTracker class that handles them, by loading every
+    # name in torch_name_rule_map. Unloadable names are skipped; lru-wrapped functions are
+    # unwrapped. Returns the mapping.
+    # Raises AssertionError if one object maps to two different rules.
     d: dict[Any, type[VariableTracker]] = {}
     for m in torch_name_rule_map:
         for k, v in m.items():  # type: ignore[attr-defined]
@@ -3087,6 +3102,8 @@ def get_torch_obj_rule_map() -> dict[Any, type["VariableTracker"]]:
 
 
 def _load_obj_from_str(fully_qualified_name: str) -> Any:
+    # [FUNCTION DOC] HELPER: Imports the module part of a dotted name and returns the final
+    # attribute. Raises ImportError or AttributeError if missing.
     module, obj_name = fully_qualified_name.rsplit(".", maxsplit=1)
     return getattr(importlib.import_module(module), obj_name)
 
@@ -3097,6 +3114,11 @@ Load string represented torch objects.
 
 
 def load_object(name: str) -> Any:
+    # [FUNCTION DOC]
+    # Resolves a string name to an object. A name may be a dotted path, or a dotted path to a
+    # class/module plus a hash separator and an attribute name. The result is passed through
+    # unwrap_if_wrapper. Returns None if the module or attribute cannot be found.
+    # Raises AssertionError if the name has more than one hash separator.
     try:
         x = name.split("#")
         if len(x) == 2:
@@ -3119,6 +3141,10 @@ Get all torch.Tensor methods which are allowed to be in graph functions.
 
 @functools.cache
 def get_tensor_method() -> frozenset[Any]:
+    # [FUNCTION DOC]
+    # Cached. Returns the frozen set of torch.Tensor method descriptors/builtins (from
+    # torch.Tensor and torch._C.TensorBase) allowed in graphs, excluding constructors such as
+    # new and subclass makers, and adding contains and register_hook (specially handled).
     disallowed_tensor_methods = {"__new__", "_make_wrapper_subclass", "_make_subclass"}
     s = set()
     for name in dir(torch.Tensor):
@@ -3161,6 +3187,8 @@ Return if a torch object is ATen op or torch.Tensor method.
 
 
 def is_aten_op_or_tensor_method(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is an allowed Tensor method or an OpOverload/OpOverloadPacket instance.
     return obj in get_tensor_method() or isinstance(
         obj,
         (torch._ops.OpOverloadPacket, torch._ops.OpOverload),
@@ -3168,6 +3196,11 @@ def is_aten_op_or_tensor_method(obj: object) -> bool:
 
 
 class FunctionIdSet:
+    # [CLASS DOC]
+    # Lazily initialized set of object ids, optionally with an id->name mapping. The
+    # initializer callable runs on first use; if it returns a mapping, ids and names are both
+    # kept, if a set, only ids. Mutable via add/remove. Used as a decorator on initializers
+    # to create module-level id sets.
     """
     Track a set of `id()`s of objects which are either allowed or not
     allowed to go into the generated FX graph.  Use to test for torch.*,
@@ -3183,9 +3216,15 @@ class FunctionIdSet:
     def __init__(
         self, lazy_initializer: Callable[[], dict[int, str] | set[int]]
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores the lazy initializer; nothing is computed yet.
         self.lazy_initializer = lazy_initializer
 
     def __call__(self) -> set[int]:
+        # [FUNCTION DOC]
+        # Returns the id set, running the initializer on first call and caching ids (and names
+        # if a mapping was returned). Raises AssertionError if the initializer returns neither
+        # a mapping nor a set.
         if self.function_ids is None:
             value = self.lazy_initializer()
             if isinstance(value, dict):
@@ -3200,6 +3239,9 @@ class FunctionIdSet:
         return self.function_ids
 
     def get_name(self, idx: int, default: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the recorded name for an id, or the default if absent. Triggers lazy init.
+        # Raises AssertionError if the initializer produced a set (no names).
         self()  # lazy init
         if self.function_names is None:
             raise AssertionError(
@@ -3208,44 +3250,58 @@ class FunctionIdSet:
         return self.function_names.get(idx, default)
 
     def add(self, idx: int) -> None:
+        # [FUNCTION DOC]
+        # Adds an id to the set (after lazy init). Mutates shared state; no name is recorded.
         function_ids = self()  # lazy init
         function_ids.add(idx)
 
     def remove(self, idx: int) -> None:
+        # [FUNCTION DOC]
+        # Removes an id if present (after lazy init); silently ignores missing ids.
         function_ids = self()
         if idx in function_ids:
             function_ids.remove(idx)
 
     def __contains__(self, idx: int) -> bool:
+        # [FUNCTION DOC]
+        # Membership test of an id, triggering lazy init.
         return idx in self()
 
 
 @FunctionIdSet
 def _allowed_callable_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer for the allowed-in-graph id set; starts empty and is
+    # filled by registration elsewhere.
     rv: dict[int, str] = {}
     return rv
 
 
 @FunctionIdSet
 def _leaf_function_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer for the leaf-function id set; starts empty.
     rv: dict[int, str] = {}
     return rv
 
 
 @FunctionIdSet
 def _disallowed_callable_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer for the disallowed-in-graph id set; starts empty.
     rv: dict[int, str] = {}
     return rv
 
 
 @FunctionIdSet
 def _nonstrict_trace_callable_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer for the nonstrict-trace id set; starts empty.
     rv: dict[int, str] = {}
     return rv
 
 
 @FunctionIdSet
 def _builtin_function_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer mapping ids of public callables in builtins and
+    # operator to qualified names, plus the class-building builtin. Polyfill loader may later
+    # remove entries.
     # See also torch/_dynamo/polyfills/loader.py, which removes items in _builtin_function_ids
     rv = {
         id(v): f"builtins.{k}"
@@ -3265,12 +3321,16 @@ def _builtin_function_ids() -> dict[int, str]:
 
 @FunctionIdSet
 def _polyfilled_function_ids() -> set[int]:
+    # [FUNCTION DOC] HELPER: Initializer for the polyfilled id set; starts empty and is filled
+    # by the substitute_in_graph decorator.
     # See also @torch._dynamo.decorators.substitute_in_graph(...), which adds items in _polyfilled_function_ids
     return set()
 
 
 @FunctionIdSet
 def _numpy_function_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer mapping ids of supported numpy callables (from the
+    # NP_SUPPORTED_MODULES list) to qualified names, excluding unsupported random functions.
     unsupported_funcs = {
         "seed",
         "ranf",
@@ -3281,6 +3341,9 @@ def _numpy_function_ids() -> dict[int, str]:
     }
 
     def is_supported(k: str, v: Any, mod: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if the attribute is callable and either has no module,
+        # is defined in the module itself, or is a non-excluded mtrand function re-exported by
+        # numpy.random.
         if not callable(v):
             return False
         if not getattr(v, "__module__", None):
@@ -3305,6 +3368,8 @@ def _numpy_function_ids() -> dict[int, str]:
 
 @FunctionIdSet
 def _builtin_constant_ids() -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Initializer mapping ids of non-callable public builtins (constants)
+    # to qualified names.
     """
     Collects constant builtins by eliminating callable items.
     """
@@ -3320,6 +3385,11 @@ _lazy_module_init: dict[str, list[Callable[[], None]]] = defaultdict(list)
 
 
 def add_module_init_func(name: str, init_func: Callable[[], None]) -> None:
+    # [FUNCTION DOC]
+    # Registers an init callback to run when an object from the given root module is first
+    # checked, avoiding eager import. Mutates the lazy-init registry.
+    # Raises AssertionError if name is dotted or a callback is already registered for it.
+    # KNOWN ISSUE: comment says it eagerly inits if already imported, but no such code exists.
     """Register a module without eagerly importing it"""
     # If the module is already imported, eagerly run init
     if "." in name:
@@ -3330,6 +3400,8 @@ def add_module_init_func(name: str, init_func: Callable[[], None]) -> None:
 
 
 def _maybe_init_lazy_module(obj: object) -> None:
+    # [FUNCTION DOC] HELPER: Finds the root module of obj and, if init callbacks are registered
+    # for it, removes them from the registry and runs them once. No-op without a module.
     module = getattr(obj, "__module__", None)
     if module is None:
         return
@@ -3342,57 +3414,81 @@ def _maybe_init_lazy_module(obj: object) -> None:
 
 
 def is_callable_allowed(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj's id is in the allowed-in-graph set; runs lazy module init first.
     _maybe_init_lazy_module(obj)
     return id(obj) in _allowed_callable_ids
 
 
 def is_nonstrict_trace_callable(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is registered for nonstrict tracing; runs lazy module init first.
     _maybe_init_lazy_module(obj)
     return id(obj) in _nonstrict_trace_callable_ids
 
 
 def is_leaf_function(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is registered as a leaf function; runs lazy module init first.
     _maybe_init_lazy_module(obj)
     return id(obj) in _leaf_function_ids
 
 
 def is_callable_disallowed(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is registered as disallowed in graph; runs lazy module init first.
     _maybe_init_lazy_module(obj)
     return id(obj) in _disallowed_callable_ids
 
 
 def is_forbidden(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # Returns the statically looked-up forbidden marker attribute of obj (false by default),
+    # without triggering descriptors; runs lazy module init first.
     _maybe_init_lazy_module(obj)
     return inspect.getattr_static(obj, "_dynamo_forbidden", False)
 
 
 def is_builtin_callable(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is a known builtin or operator callable (by id).
     # See also torch/_dynamo/polyfills/loader.py, which removes items in _builtin_function_ids
     return id(obj) in _builtin_function_ids
 
 
 def is_builtin_constant(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is one of the public non-callable builtins (by id).
     return id(obj) in _builtin_constant_ids
 
 
 def is_polyfilled_callable(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj has a registered polyfill (by id).
     # See also @torch._dynamo.decorators.substitute_in_graph(...), which adds items in _polyfilled_function_ids
     return id(obj) in _polyfilled_function_ids
 
 
 def is_numpy(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is a numpy array or scalar, or a supported numpy function. False if numpy
+    # is unavailable.
     if np is None:
         return False
     return isinstance(obj, (np.ndarray, np.generic)) or id(obj) in _numpy_function_ids
 
 
 def is_numpy_dtype(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is a numpy dtype instance; False if numpy is unavailable.
     if np is None:
         return False
     return isinstance(obj, np.dtype)
 
 
 def is_numpy_type_info(obj: object) -> bool:
+    # [FUNCTION DOC]
+    # True if obj is a numpy finfo or iinfo instance; False if numpy is unavailable.
     if np is None:
         return False
     return isinstance(obj, (np.finfo, np.iinfo))
@@ -3438,6 +3534,8 @@ THIRDPARTY_SKIPLIST = (
 
 
 def _as_posix_path(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Normalizes a path and converts to forward slashes, preserving a
+    # trailing separator if the input had one.
     posix_path = Path(os.path.normpath(path)).as_posix()
     # os.path.normpath and pathlib.Path remove trailing slash, so we need to add it back
     if path.endswith((os.path.sep, "/")):
@@ -3446,12 +3544,16 @@ def _as_posix_path(path: str) -> str:
 
 
 def _strip_init_py(s: str) -> str:
+    # [FUNCTION DOC] HELPER: Removes a trailing package-init filename from a path and returns
+    # the posix-normalized result (a directory path with trailing slash for packages).
     suffix = "__init__.py"
     s = s.removesuffix(suffix)
     return _as_posix_path(s)
 
 
 def _module_dir(m: types.ModuleType) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the normalized file/directory path of a module, or a
+    # falsy value (None) if it has no file attribute (e.g. frozen modules).
     # Protect against a module not exporting __file__ - this can happen for
     # frozen modules, for example.
     file = getattr(m, "__file__", None)
@@ -3694,6 +3796,9 @@ MOD_SKIPLIST = set(MOD_SKIPLIST)
 
 @functools.cache
 def get_legacy_mod_inlinelist() -> set[str]:
+    # [FUNCTION DOC]
+    # Cached. Converts LEGACY_MOD_INLINELIST module names to absolute posix path prefixes under
+    # the torch install directory. Returns an empty set if torch has no file location.
     torch_dir = _module_dir(torch)
     if torch_dir is None:
         return set()
@@ -3706,6 +3811,9 @@ def get_legacy_mod_inlinelist() -> set[str]:
 
 @functools.cache
 def get_mod_inlinelist() -> set[str]:
+    # [FUNCTION DOC]
+    # Cached. Converts MOD_INLINELIST module names to absolute posix path prefixes under the
+    # torch install directory. Returns an empty set if torch has no file location.
     torch_dir = _module_dir(torch)
     if torch_dir is None:
         return set()
@@ -3718,6 +3826,9 @@ def get_mod_inlinelist() -> set[str]:
 
 @functools.cache
 def get_mod_skiplist() -> set[str]:
+    # [FUNCTION DOC]
+    # Cached (not cleared by clear_lru_cache). Converts MOD_SKIPLIST module names to absolute
+    # posix path prefixes under the torch install directory; empty set if no torch location.
     torch_dir = _module_dir(torch)
     if torch_dir is None:
         return set()
@@ -3784,6 +3895,8 @@ FORCE_SKIP_FILES = {f"{_module_dir(torch)}optim/lr_scheduler.py"}
 
 
 def _recompile_re() -> None:
+    # [FUNCTION DOC] HELPER: Rebuilds the global skip-directory regex from SKIP_DIRS (anchored
+    # prefix match on paths without whitespace or angle brackets). Mutates SKIP_DIRS_RE.
     global SKIP_DIRS_RE
     SKIP_DIRS_RE = re.compile(
         rf"^[^\s<]*({'|'.join(re.escape(_as_posix_path(d)) for d in SKIP_DIRS)})"
@@ -3791,6 +3904,11 @@ def _recompile_re() -> None:
 
 
 def add(import_name: str) -> None:
+    # [FUNCTION DOC]
+    # Adds a module (given by name or module object) to the skip directories so Dynamo does
+    # not trace into it, then rebuilds the skip regex. Silently returns if the module cannot
+    # be found or has no origin file. Mutates SKIP_DIRS and SKIP_DIRS_RE.
+    # Raises AssertionError if the argument is neither a string nor a module.
     if isinstance(import_name, types.ModuleType):
         return add(import_name.__name__)
     if not isinstance(import_name, str):
@@ -3811,11 +3929,19 @@ def add(import_name: str) -> None:
 
 @dataclasses.dataclass
 class SkipResult:
+    # [CLASS DOC]
+    # Result record of a skip decision: skipped flag and optional human-readable reason.
     skipped: bool
     reason: str | None
 
 
 def check_file(filename: str | None, is_inlined_call: bool = False) -> SkipResult:
+    # [FUNCTION DOC]
+    # Decides whether a source file should be skipped. Returns a SkipResult. Precedence: no
+    # filename (skip), force-skip files, legacy inline list (inline), then for inlined calls
+    # the mod inline list and inline-when-called builtins (inline), fbcode skip dirs and
+    # torchrec dirs (skip, fbcode only), unittest dir unless tracing unittest enabled (skip),
+    # the skip-dir regex (skip), the mod skip list (skip), else inline by default.
     """Should skip this file?"""
     if filename is None:
         return SkipResult(
@@ -3873,6 +3999,9 @@ def check_file(filename: str | None, is_inlined_call: bool = False) -> SkipResul
 
 @dataclasses.dataclass
 class FunctionInfo:
+    # [CLASS DOC]
+    # Record bundling what check_verbose knows about a callable: the python object (maybe
+    # None), name, source filename, and code object (maybe None).
     py_obj: object | None
     name: str | None
     filename: str
@@ -3918,6 +4047,9 @@ _force_inline_flag = False
 # pyrefly: ignore [deprecated]
 @contextlib.contextmanager
 def _force_inline() -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that sets the global force-inline flag for its
+    # duration and restores the previous value on exit (even on error). While set,
+    # check_verbose never skips.
     """
     A context manager used within the dynamo codebase that forces a function
     and nested function calls to be inlined during dynamo tracing.
@@ -3940,6 +4072,13 @@ def _force_inline() -> Iterator[None]:
 def check_verbose(
     obj: object, is_inlined_call: bool = False, frame: Any | None = None
 ) -> SkipResult:
+    # [FUNCTION DOC]
+    # Main inline/skip decision for a callable, code object, or variable tracker. Returns a
+    # SkipResult. Never skips under force-inline; allows nn.Module forward frames of built-in
+    # modules that have hooks at top level; skips typing.cast at top level; otherwise
+    # normalizes the object into FunctionInfo and consults lookup_inner, mapping user-function,
+    # polyfill, and in-graph rules to not-skipped and the skip rule to skipped.
+    # Raises AssertionError if the filename cannot be determined or the rule is unexpected.
     if _force_inline_flag:
         return SkipResult(
             False,
@@ -4035,10 +4174,16 @@ def check_verbose(
 
 
 def check(obj: object, is_inlined_call: bool = False, frame: Any | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Boolean wrapper over check_verbose: True if the object should be skipped.
     return check_verbose(obj, is_inlined_call, frame).skipped
 
 
 def get_skip_reason(obj: object) -> str:
+    # [FUNCTION DOC]
+    # Builds a descriptive skip reason string for a callable (used on graph breaks): the
+    # disallowed name if disallowed, else the file-check reason, else a generic message
+    # about an undeterminable source file.
     """Compute a descriptive skip reason for a callable. Only called on graph break."""
     if is_callable_disallowed(obj):
         return _disallowed_callable_ids.get_name(id(obj), repr(obj))
@@ -4063,11 +4208,16 @@ _recompile_re()
 
 
 def is_torch_inline_allowed(filename: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the filename starts with any MOD_INLINELIST path prefix.
     return any(filename.startswith(d) for d in get_mod_inlinelist())
 
 
 @functools.cache
 def get_ngb_suppress_inlinelist() -> set[str]:
+    # [FUNCTION DOC]
+    # Cached. Converts NGB_SUPPRESS_INLINELIST module names to absolute posix path prefixes
+    # under the torch install directory; empty set if torch has no file location.
     torch_dir = _module_dir(torch)
     if torch_dir is None:
         return set()
@@ -4078,17 +4228,23 @@ def get_ngb_suppress_inlinelist() -> set[str]:
 
 
 def is_ngb_suppressed_inline(filename: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the filename starts with any path prefix in the graph-break-suppress inline list.
     return any(filename.startswith(d) for d in get_ngb_suppress_inlinelist())
 
 
 @functools.cache
 def dynamo_dir() -> str | None:
+    # [FUNCTION DOC]
+    # Cached. Returns the directory path of the torch._dynamo package, or None if unknown.
     import torch._dynamo
 
     return _module_dir(torch._dynamo)
 
 
 def is_torch(filename: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the file is under the torch directory but not under torch._dynamo.
     dynamo_path = dynamo_dir()
     if dynamo_path is not None and filename.startswith(dynamo_path):
         return False
@@ -4111,6 +4267,10 @@ BUILTIN_CALLABLES = {
 
 
 def lookup_callable(obj: Callable[..., Any]) -> type[VariableTracker] | None:
+    # [FUNCTION DOC]
+    # Returns the VariableTracker class for a callable from the id-based sets, in order:
+    # disallowed (skip), allowed (in-graph), polyfilled, special builtin table, generic
+    # builtin. Returns None if unhashable or no rule matches.
     if not hashable(obj):
         return None
     # Custom allow/disallow in graph takes precedence over the general lookup.
@@ -4134,6 +4294,9 @@ E.g, the lookup result of `torch.sin` is `TorchInGraphFunctionVariable`.
 
 
 def lookup(obj: object) -> type[VariableTracker] | None:
+    # [FUNCTION DOC]
+    # Returns the trace-rule VariableTracker class for an object using default lookup_inner
+    # arguments (treated as a direct call).
     return lookup_inner(obj)
 
 
@@ -4145,6 +4308,12 @@ def lookup_inner(
     is_direct_call: bool = True,
     reasons: None | set[str] = None,
 ) -> type[VariableTracker] | None:
+    # [FUNCTION DOC]
+    # Wraps the core lookup and applies the dont_skip_tracing config: a skip result becomes
+    # a user-function rule (with a reason recorded) unless the file is inside torch._dynamo
+    # (other than the dont-skip test file), which stays skipped. Args mirror _lookup_inner;
+    # the reasons set, if given, is appended to. Raises AssertionError if no filename can be
+    # determined in that path.
     result = _lookup_inner(
         obj,
         name=name,
@@ -4186,6 +4355,12 @@ def _lookup_inner(
     is_direct_call: bool = True,
     reasons: set[str] | None = None,
 ) -> type[VariableTracker] | None:
+    # [FUNCTION DOC] HELPER: Core rule lookup. Returns None for unhashable objects. Steps: (1)
+    # in-graph for aten ops/tensor methods, then the torch object rule map (by object, or by
+    # file and name for code without an object when not a direct call, with resume functions
+    # matched by prefix); list comprehension frames are inlined; (2) for direct calls, patched
+    # init is skipped and torch function handlers are inlined; for top-level non-direct
+    # getattr frames, skipped; (3) otherwise decided by check_file. Adds reasons if given.
     # Step 1: lookup obj's tracing rule in `torch_name_rule_map`.
     # The rules defined in `torch_name_rule_map` mainly includes two parts:
     # - Manually defined rules for any functions.
@@ -4268,6 +4443,9 @@ def _lookup_inner(
 
 
 def clear_lru_cache() -> None:
+    # [FUNCTION DOC]
+    # Clears the cached rule map, tensor-method set, legacy and regular inline lists,
+    # graph-break-suppress list, and dynamo dir. Side effect: later calls recompute them.
     torch._dynamo.trace_rules.get_torch_obj_rule_map.cache_clear()
     torch._dynamo.trace_rules.get_tensor_method.cache_clear()
     torch._dynamo.trace_rules.get_legacy_mod_inlinelist.cache_clear()
