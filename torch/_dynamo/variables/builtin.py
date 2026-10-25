@@ -1,3 +1,10 @@
+# [MODULE DOC] Variable trackers that let Dynamo symbolically execute Python builtins
+# (len, isinstance, getattr, min/max, arithmetic operators, etc.). Main contents:
+# BaseBuiltinVariable, BuiltinVariable (generic builtin/operator dispatcher), and
+# specialized trackers for dict, iter, getattr, hasattr, setattr and list, plus operator
+# tables used to map operators to Tensor methods and a few helpers. Import-time side
+# effects: only builds module-level constant tables; the tensor-method map is filled lazily
+# on first use, and an extra foldable entry is added for complex on Python 3.14+.
 """
 Built-in function and type variable tracking for TorchDynamo's symbolic execution.
 
@@ -285,6 +292,10 @@ _COMPUTED_LAZY_CONSTANT_OPS: frozenset[Callable[..., Any]] = frozenset(
 def _try_computed_lazy_constant(
     fn: Callable[..., Any], args: list[VariableTracker]
 ) -> VariableTracker | None:
+    # [FUNCTION DOC] HELPER: Given an operator and its argument trackers, build a computed
+    # lazy constant tracker when the operator is add/sub/mul (in-place forms desugared first),
+    # there are exactly two args, all are constants or lazy constants, and at least one lazy
+    # constant is still unrealized. Returns None in every other case so the caller falls back.
     """Build a ComputedLazyConstantVariable for fn(*args), or None to fall back."""
     from .lazy import ComputedLazyConstantVariable, LazyConstantVariable
 
@@ -306,6 +317,12 @@ def _try_computed_lazy_constant(
 
 
 def populate_builtin_to_tensor_fn_map() -> None:
+    # [FUNCTION DOC] Fill the module-level maps from builtin operators to the Tensor
+    # methods they dispatch to (forward map) and to the reflected Tensor methods (reverse
+    # map, only when it differs from the forward one). It runs each operator on small
+    # sample tensors under a torch-function mode that records the function invoked. Does
+    # nothing if the forward map is already populated. Mutates global state; raises an
+    # error if no function was recorded for an operator.
     global BUILTIN_TO_TENSOR_FN_MAP
     if len(BUILTIN_TO_TENSOR_FN_MAP) > 0:
         # Only populate once; after there are elements present no need to
@@ -314,6 +331,8 @@ def populate_builtin_to_tensor_fn_map() -> None:
     most_recent_func: Callable[..., Any] | None = None
 
     class GetMethodMode(BaseTorchFunctionMode):
+        # [CLASS DOC] HELPER: Torch-function mode that remembers the most recent function
+        # intercepted (stored in the enclosing closure variable) and then runs it normally.
         """
         Mode to extract the correct methods from torch function invocations
         (Used to get the correct torch.Tensor methods from builtins)
@@ -326,6 +345,9 @@ def populate_builtin_to_tensor_fn_map() -> None:
             args: Sequence[Any] = (),
             kwargs: dict[str, Any] | None = None,
         ) -> Any:
+            # [FUNCTION DOC] HELPER: Record func as the most recent function seen, then call
+            # it with the given args and kwargs (missing kwargs treated as empty) and return
+            # its result. Side effect: overwrites the enclosing recorded-function variable.
             kwargs = kwargs or {}
             nonlocal most_recent_func
             most_recent_func = func
@@ -377,6 +399,12 @@ def populate_builtin_to_tensor_fn_map() -> None:
 
 
 class BaseBuiltinVariable(VariableTracker):
+    # [CLASS DOC] Common base for trackers of builtin callables. Subclasses expose the
+    # wrapped callable through the class attribute _fn (BuiltinVariable overrides this with
+    # an instance attribute). Provides type-attribute readers (__bases__, __base__,
+    # __flags__) registered in tp_getset/tp_members, a guard-installing factory, constant
+    # conversion, reconstruction as a global load, hasattr, hashing, rich comparison, and
+    # special handling of str/repr methods called on object or type.
     """
     Common base class for all builtin variable trackers (BuiltinVariable,
     DictBuiltinVariable, IterBuiltinVariable, and future specialized builtins).
@@ -401,6 +429,10 @@ class BaseBuiltinVariable(VariableTracker):
     def _type_get_bases(
         self: "BaseBuiltinVariable", tx: "InstructionTranslatorBase"
     ) -> "VariableTracker | None":
+        # [FUNCTION DOC] HELPER: Getter for the __bases__ attribute. If the wrapped callable
+        # is a class, returns a tuple tracker of trackers for each base class (sourced via
+        # attribute and index when this tracker has a source); otherwise returns None so the
+        # caller falls through to dynamic attribute handling.
         fn = self.as_python_constant()
         if not isinstance(fn, type):
             return None
@@ -414,6 +446,8 @@ class BaseBuiltinVariable(VariableTracker):
     def _type_get_base(
         self: "BaseBuiltinVariable", tx: "InstructionTranslatorBase"
     ) -> "VariableTracker | None":
+        # [FUNCTION DOC] HELPER: Getter for the __base__ attribute. Returns a tracker for the
+        # wrapped class's primary base class, or None if the wrapped callable is not a class.
         fn = self.as_python_constant()
         if not isinstance(fn, type):
             return None
@@ -423,6 +457,8 @@ class BaseBuiltinVariable(VariableTracker):
     def _type_get_flags(
         self: "BaseBuiltinVariable", tx: "InstructionTranslatorBase"
     ) -> "VariableTracker | None":
+        # [FUNCTION DOC] HELPER: Getter for the __flags__ attribute. Returns a tracker for the
+        # wrapped class's type flags, or None if the wrapped callable is not a class.
         fn = self.as_python_constant()
         if not isinstance(fn, type):
             return None
@@ -437,13 +473,20 @@ class BaseBuiltinVariable(VariableTracker):
 
     @classmethod
     def create_with_source(cls, value: Any, source: Source) -> "BaseBuiltinVariable":
+        # [FUNCTION DOC] Build an instance of the calling class for a builtin found at the
+        # given source. Installs a builtin-match guard on that source (side effect on the
+        # guard set) and returns a new tracker carrying the source; value is ignored.
         install_guard(source.make_guard(GuardBuilder.BUILTIN_MATCH))
         return cls(source=source)
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Return the wrapped builtin callable stored in the class attribute.
         return self._fn
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emit bytecode that loads the builtin by its name as a global.
+        # Raises an assertion error if the frame's globals already define that name
+        # (shadowing). Side effect: appends instructions to the codegen output.
         name = self.as_python_constant().__name__
         if name in codegen.tx.f_globals:
             raise AssertionError("shadowed global")
@@ -452,6 +495,10 @@ class BaseBuiltinVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute lookup on the wrapped builtin. Returns a generic
+        # attribute-access tracker for the named attribute (with its Python type when the
+        # real attribute exists on the wrapped callable and a source-derived source), never
+        # evaluating the attribute itself.
         # Declarative type-attribute dispatch, mirroring the consultation at the
         # top of VariableTracker.getattro_impl. Inlined here because this
         # override keeps its own GetAttrVariable fallback instead of delegating
@@ -466,9 +513,13 @@ class BaseBuiltinVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> ConstantVariable:
+        # [FUNCTION DOC] Answer hasattr on the wrapped builtin by checking the real callable
+        # directly; returns a constant boolean tracker.
         return VariableTracker.build(tx, hasattr(self.as_python_constant(), name))  # type: ignore[return-value]
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the tracker: the hash of the wrapped callable, paired with
+        # a false flag (meaning no user code was run to compute it).
         # CPython meth_hash: https://github.com/python/cpython/blob/e76aa128fe/Objects/methodobject.c#L319
         return hash(self.as_python_constant()), False
 
@@ -478,6 +529,8 @@ class BaseBuiltinVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Rich comparison of the wrapped callable with another tracker,
+        # delegating to the shared constant-comparison helper for the given operator name.
         return python_constant_richcompare_impl(self, tx, other, op)
 
     def call_method(
@@ -487,6 +540,11 @@ class BaseBuiltinVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method call on the wrapped builtin. Special-cases the unbound
+        # string and repr methods with one argument and no keywords when the wrapped
+        # callable is object or type (using the real type-level formatting for user-defined
+        # classes and constant types), and otherwise uses the generic string/repr helpers.
+        # All other methods defer to the parent implementation.
         if name == "__str__" and len(args) == 1 and not kwargs:
             arg = args[0]
             if self.as_python_constant() is object:
@@ -526,6 +584,12 @@ def _uses_custom_classinfo_check(
     use_instancecheck: bool = True,
     use_subclasscheck: bool = True,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether an isinstance/issubclass class-info argument
+    # relies on a user-customized instance or subclass check hook that Dynamo cannot trace
+    # soundly. Recurses through tuples and unions (for typing unions, instance checks only
+    # count on Python 3.12+). Plain classes, tensor dtype pseudo-types, and known parameter
+    # metaclasses return false; classes whose metaclass overrides the hooks (other than
+    # the default type/ABC versions) return true. Non-class inputs return false.
     if isinstance(type_info, tuple):
         return any(_uses_custom_classinfo_check(item) for item in type_info)
     if isinstance(type_info, types.UnionType):
@@ -578,6 +642,16 @@ def _uses_custom_classinfo_check(
 
 
 class BuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for a builtin function, type or operator function (for example
+    # len, int, or the arithmetic and comparison functions from the operator module). The
+    # wrapped callable lives in the instance attribute fn (not a tracked variable field).
+    # call_function builds, caches by (callable, argument tracker types, kwargs flag), and
+    # runs a handler chain: insert a graph op for tensor args, binary-op handlers, a
+    # dedicated call_<name> method, constant folding, and finally a graph break. Also
+    # implements many call_<name> handlers following CPython semantics, comparison helpers
+    # for tensors and symbolic nodes, and special unbound-method handling in call_method.
+    # Must not wrap builtins listed in MUST_USE_SPECIALIZED (dict, getattr, hasattr, iter,
+    # list, setattr), which have their own tracker classes.
     """
     A VariableTracker that represents a built-in value (functions and operators).
     A lot of the code here assumes it will be a function object.
@@ -600,6 +674,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _builtin_type_get_name(
         self: "BuiltinVariable", tx: "InstructionTranslatorBase"
     ) -> "VariableTracker | None":
+        # [FUNCTION DOC] HELPER: Getter for the __name__ attribute. Always returns a string
+        # constant tracker holding the wrapped callable's name (never declines).
         source = self.source and AttrSource(self.source, "__name__")
         return VariableTracker.build(tx, self.fn.__name__, source)
 
@@ -609,12 +685,20 @@ class BuiltinVariable(BaseBuiltinVariable):
 
     @classmethod
     def create_with_source(cls, value: Any, source: Source) -> "BuiltinVariable":
+        # [FUNCTION DOC] Build a tracker wrapping the given builtin value found at the given
+        # source. Installs a builtin-match guard on the source (side effect on the guard
+        # set) and returns the new tracker carrying that source.
         install_guard(source.make_guard(GuardBuilder.BUILTIN_MATCH))
         return cls(value, source=source)
 
     @staticmethod
     @functools.cache
     def _constant_fold_functions() -> set[Callable[..., Any]]:
+        # [FUNCTION DOC] HELPER: Cached set of callables that may be evaluated at compile
+        # time when all arguments are constants: pure builtins (abs, len, min, max, str,
+        # round, ...), most operator-module functions, the supported comparison operators,
+        # and all plain functions in the math module. Takes no arguments; the result is
+        # computed once and shared.
         fns: set[Callable[..., Any]] = {
             abs,
             all,
@@ -686,11 +770,15 @@ class BuiltinVariable(BaseBuiltinVariable):
         return fns
 
     def can_constant_fold_through(self) -> bool:
+        # [FUNCTION DOC] Return whether the wrapped callable is in the constant-foldable set.
         return self.fn in self._constant_fold_functions()
 
     @staticmethod
     @functools.cache
     def _fx_graph_functions() -> set[Callable[..., Any]]:
+        # [FUNCTION DOC] HELPER: Cached set of operator-module callables (arithmetic,
+        # bitwise, comparison, in-place and getitem forms) that can be recorded directly as
+        # call nodes in the FX graph when tensor arguments are involved.
         fns = {
             operator.abs,
             operator.pos,
@@ -739,6 +827,10 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _binops() -> dict[
         Callable[..., object], tuple[list[str], Callable[..., object]]
     ]:
+        # [FUNCTION DOC] HELPER: Cached table meant to map a binary operator function to its
+        # forward, reverse and in-place magic method names plus its in-place operator.
+        # KNOWN ISSUE: the table is always empty (all entries are commented out), so the
+        # user-defined and symbolic-node handlers built from it in _binop_handlers are dead.
         # function -> ([forward name, reverse name, in-place name], in-place op)
         fns: dict[Callable[..., object], tuple[list[str], Callable[..., object]]] = {
             # NB: The follow binary operators are not supported for now, since the
@@ -764,6 +856,17 @@ class BuiltinVariable(BaseBuiltinVariable):
             ]
         ],
     ]:
+        # [FUNCTION DOC] HELPER: Cached builder of the multiple-dispatch table mapping an
+        # operator function to an ordered list of (pair of tracker type constraints,
+        # handler) entries. Handlers take the translator and two trackers. Contents: for
+        # each entry of the binops table, user-defined-object handlers (call forward or
+        # reflected magic methods), and symbolic-node handlers that record a graph call
+        # (in-place ops are desugared to their out-of-place form); for every supported
+        # comparison operator, constant-by-value comparison, symbolic-node and tensor
+        # comparison handlers, generic rich comparison, never-None shortcuts and identity
+        # comparison for the is/is-not operators. Raises an error if a comparison operator
+        # is not callable or already has handlers.
+        # KNOWN ISSUE: the binops table is empty, so the first group of handlers is never created.
         # Multiple dispatch mechanism defining custom binop behavior for certain type
         # combinations. Handlers are attempted in order, and will be used if the type checks
         # match. They are expected to have the signature:
@@ -793,6 +896,10 @@ class BuiltinVariable(BaseBuiltinVariable):
                 forward_name: str = forward_name,
                 reverse_name: str = reverse_name,
             ) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: Dispatch a binary operation involving a
+                # user-defined object: if the left operand is user-defined, call its forward
+                # magic method with the right operand; otherwise call the right operand's
+                # reflected method with the left. Returns the resulting tracker.
                 # Manually handle reversing logic if needed (e.g. call __radd__)
 
                 # TODO: If we expand this to handle tensor args, we need to manually
@@ -826,6 +933,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                 *,
                 forward_name: str = inplace_name,
             ) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: In-place binary operation on a user-defined
+                # operand: call the left operand's in-place magic method with the right one.
                 return a.call_method(tx, forward_name, [b], {})
 
             op_handlers[in_place_op].append(
@@ -843,6 +952,9 @@ class BuiltinVariable(BaseBuiltinVariable):
                 *,
                 fn: Callable[..., Any] = op,
             ) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: Record the operator as a graph call on the two
+                # operands (at least one symbolic) and wrap the resulting proxy in a tracker.
+                # Side effect: adds a node to the output graph.
                 from .builder import wrap_fx_proxy
 
                 return wrap_fx_proxy(
@@ -872,9 +984,18 @@ class BuiltinVariable(BaseBuiltinVariable):
         def create_cmp_op_handlers(
             op: Callable[..., Any],
         ) -> list[tuple[tuple[_TrackersType, _TrackersType], _HandlerCallback]]:
+            # [FUNCTION DOC] HELPER: Build the ordered handler list for one comparison
+            # operator. Always starts with a constant-vs-constant handler. For the six rich
+            # comparisons it adds symbolic-node handlers and a generic rich-comparison
+            # fallback and returns. For other operators (identity tests) it adds shortcuts
+            # for types never equal to None, tensor and symbolic-node handlers, and, for
+            # is/is-not, an identity-comparison handler.
             def compare_by_value(
                 tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
             ) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: Apply the comparison operator to the two constants'
+                # underlying values and return a constant tracker. A TypeError from the
+                # comparison is re-raised as an observed exception inside the traced program.
                 try:
                     return VariableTracker.build(tx, op(a.value, b.value))  # type: ignore[attr-defined]
                 except TypeError as exc:
@@ -927,6 +1048,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                     a: VariableTracker,
                     b: VariableTracker,
                 ) -> VariableTracker:
+                    # [FUNCTION DOC] HELPER: Compare two trackers through the generic rich
+                    # comparison protocol using the captured magic method name.
                     return generic_richcompare(tx, a, b, dunder)
 
                 result.append(((VariableTracker, VariableTracker), handler))
@@ -945,6 +1068,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                     a: VariableTracker,
                     b: VariableTracker,
                 ) -> VariableTracker:
+                    # [FUNCTION DOC] HELPER: Return the precomputed constant result of
+                    # comparing an arbitrary object with None for this identity operator.
                     return VariableTracker.build(tx, none_result)
 
                 obj_op_none = never
@@ -1000,6 +1125,9 @@ class BuiltinVariable(BaseBuiltinVariable):
                     left: VariableTracker,
                     right: VariableTracker,
                 ) -> VariableTracker | None:
+                    # [FUNCTION DOC] HELPER: Handle is / is-not. Asks the identity-compare
+                    # helper whether the trackers are the same object; returns None when it
+                    # cannot decide, else a constant boolean (negated for is-not).
                     result = vt_identity_compare(left, right)
                     if result is None:
                         return None
@@ -1025,6 +1153,10 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _find_binop_handler(
         op: Callable[..., Any], a_type: type[VariableTracker], b_type: type
     ) -> list[_HandlerCallback] | None:
+        # [FUNCTION DOC] HELPER: Look up handlers for an operator and a pair of tracker
+        # classes. Returns None if the operator has no table entry, otherwise the list of
+        # handlers (possibly empty) whose type constraints both operand classes subclass,
+        # in registration order.
         handlers = BuiltinVariable._binop_handlers().get(op)
         if handlers is None:
             return None
@@ -1036,6 +1168,8 @@ class BuiltinVariable(BaseBuiltinVariable):
         return matches
 
     def can_insert_in_graph(self) -> bool:
+        # [FUNCTION DOC] Return whether the wrapped callable can be recorded directly as an
+        # FX graph call (is in the graph-capable operator set).
         return self.fn in self._fx_graph_functions()
 
     # Builtins that have been promoted to their own VT classes. Creating a
@@ -1045,6 +1179,9 @@ class BuiltinVariable(BaseBuiltinVariable):
     )
 
     def __init__(self, fn: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Store the wrapped callable fn; other keyword arguments (source,
+        # mutation type, etc.) go to the base tracker. Raises an assertion error if fn is
+        # one of the builtins that must use a specialized tracker class.
         if fn in self.MUST_USE_SPECIALIZED:
             raise AssertionError(
                 f"Use the specialized VT class for {fn!r}, not BuiltinVariable. "
@@ -1054,6 +1191,7 @@ class BuiltinVariable(BaseBuiltinVariable):
         self.fn = fn
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Debug string showing the class name and the wrapped callable's name.
         if self.fn is None:
             name = "None"
         else:
@@ -1062,9 +1200,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         return f"{self.__class__.__name__}({name})"
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Return the wrapped callable stored on the instance.
         return self.fn
 
     def get_real_python_backed_value(self) -> Any:
+        # [FUNCTION DOC] Return the real Python object backing this tracker: the wrapped callable.
         return self.fn
 
     def nb_or_impl(
@@ -1073,6 +1213,12 @@ class BuiltinVariable(BaseBuiltinVariable):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implement the bitwise-or slot for the wrapped callable, used for
+        # type unions such as one class or another. If the wrapped callable is a class and
+        # the other operand is a compile-time constant, performs the real type union and
+        # returns it as a constant tracker; otherwise (or if the real operation reports
+        # not-implemented) returns a tracker for the not-implemented singleton. The reverse
+        # flag is accepted but unused.
         # BuiltinVariable wraps built-in types like list, tuple, dict.
         # type(self.fn).__or__(self.fn, other_val) delegates to CPython's
         # _Py_union_type_or for type unions (e.g. list | tuple).
@@ -1091,6 +1237,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         return VariableTracker.build(tx, result)
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] For the wrapped builtin types bool, int and float, return the
+        # matching torch dtype (bool, int64, float64) so they can be used as dtype arguments
+        # in graph calls; any other callable defers to the parent implementation.
         DTYPE = {
             bool: torch.bool,
             int: torch.int64,
@@ -1101,6 +1250,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         return super().as_proxy()
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emit bytecode loading the builtin by name as a global. Raises an
+        # assertion error if the callable is not from the builtins module or if the frame's
+        # globals shadow its name. Side effect: appends instructions to the codegen output.
         name = self.fn.__name__
         if self.fn.__module__ != "builtins":
             raise AssertionError(f"Expected builtins module, got {self.fn.__module__}")
@@ -1109,9 +1261,12 @@ class BuiltinVariable(BaseBuiltinVariable):
         codegen.append_output(codegen.create_load_global(name, add=True))
 
     def constant_args(self, *args: VariableTracker, **kwargs: VariableTracker) -> bool:
+        # [FUNCTION DOC] Return whether every positional and keyword argument is a constant.
         return check_constant_args(args, kwargs)
 
     def tensor_args(self, *args: VariableTracker) -> bool:
+        # [FUNCTION DOC] Return whether at least one argument is a tensor tracker. Returns
+        # false immediately if any argument is a generic attribute-access tracker.
         any_tensor = False
         for arg in args:
             if isinstance(arg, variables.GetAttrVariable):
@@ -1120,6 +1275,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         return any_tensor
 
     def tensor_args_type(self, arg_types: list[type]) -> bool:
+        # [FUNCTION DOC] Type-level version of the tensor-argument check: true if any
+        # tracker class is a tensor tracker class; false immediately if any is a generic
+        # attribute-access tracker class.
         any_tensor = False
         for arg_type in arg_types:
             if issubclass(arg_type, variables.GetAttrVariable):
@@ -1130,6 +1288,9 @@ class BuiltinVariable(BaseBuiltinVariable):
     def python_and_tensor_constant_only(
         self, *args: VariableTracker, **kwargs: VariableTracker
     ) -> bool:
+        # [FUNCTION DOC] Return true when every tensor argument comes from a constant source
+        # (a tensor that is effectively a compile-time constant; a tensor without a source
+        # counts as non-constant) and all non-tensor arguments are constants.
         tensor_args = []
         non_tensor_args = []
         for i in itertools.chain(args, kwargs.values()):
@@ -1146,6 +1307,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def unwrap_unspec_args_kwargs(
         args: list[VariableTracker], kwargs: dict[str, VariableTracker]
     ) -> tuple[list[Any], dict[str, Any]]:
+        # [FUNCTION DOC] Convert positional and keyword argument trackers to their raw Python
+        # values; returns a list and a mapping. May raise if a tracker has no constant value.
         return [x.as_python_constant() for x in args], {
             k: v.as_python_constant() for k, v in kwargs.items()
         }
@@ -1153,6 +1316,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def has_constant_handler(
         self, args: list[VariableTracker], kwargs: dict[str, VariableTracker]
     ) -> bool:
+        # [FUNCTION DOC] Return whether the wrapped callable is foldable and all arguments
+        # are constants or unspecialized Python scalars, i.e. constant folding would work.
         return self.can_constant_fold_through() and check_unspec_or_constant_args(
             args, kwargs
         )
@@ -1168,6 +1333,15 @@ class BuiltinVariable(BaseBuiltinVariable):
         ],
         VariableTracker | None,
     ]:
+        # [FUNCTION DOC] HELPER: Build the handler used by call_function for a given builtin
+        # callable, a list of argument tracker classes and a flag saying whether keyword
+        # arguments were passed. The returned handler takes (translator, args, kwargs) and
+        # returns a tracker or None. Lazy non-constant args are realized and re-dispatched;
+        # lazy constants are resolved by delegating to a handler built for constants. Exception
+        # classes build exception trackers. Otherwise an ordered chain is assembled: graph
+        # insertion for tensor args, binary-op handlers, the matching call_<name> method,
+        # and constant folding; the first handler returning a truthy result wins, and if none
+        # does a graph break "Failed to trace builtin operator" is raised.
         from .lazy import (
             ComputedLazyConstantVariable,
             LazyConstantVariable,
@@ -1216,6 +1390,11 @@ class BuiltinVariable(BaseBuiltinVariable):
                 args: list[VariableTracker],
                 kwargs: dict[str, VariableTracker],
             ) -> VariableTracker | None:
+                # [FUNCTION DOC] HELPER: Handle calls whose args include lazy constants.
+                # Without kwargs, first try to build a computed lazy constant. If any lazy
+                # constant resolves to a non-constant tracker type (for example a symbolic
+                # int), realize all lazy constants and redo the call; otherwise run the handler
+                # built for plain constants.
                 if not kwargs:
                     result = _try_computed_lazy_constant(fn, args)
                     if result is not None:
@@ -1250,6 +1429,10 @@ class BuiltinVariable(BaseBuiltinVariable):
                 args: list[VariableTracker],
                 kwargs: dict[str, VariableTracker],
             ) -> VariableTracker:
+                # [FUNCTION DOC] HELPER: Instantiate an exception class in the traced
+                # program. Graph-breaks if constructing AssertionError with any non-string
+                # argument. Returns the matching specialized exception tracker for
+                # StopIteration, AttributeError and NameError, or a generic exception tracker.
                 if fn is AssertionError and not all(
                     x.is_python_constant() and isinstance(x.as_python_constant(), str)
                     for x in args
@@ -1299,6 +1482,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                 def call_binop_handlers(
                     tx: "InstructionTranslatorBase", args: Any, _: Any
                 ) -> Any:
+                    # [FUNCTION DOC] HELPER: Try each matching binary-op handler in order and
+                    # return the first truthy result, or None if none produced one.
                     # pyrefly: ignore [not-iterable]
                     for fn in binop_handlers:
                         rv = fn(tx, *args)
@@ -1316,6 +1501,13 @@ class BuiltinVariable(BaseBuiltinVariable):
                 args: list[VariableTracker],
                 kwargs: dict[str, VariableTracker],
             ) -> VariableTracker | None:
+                # [FUNCTION DOC] HELPER: Run the dedicated call_<name> method with the args.
+                # On a TypeError, check whether the arguments fail to bind to the method; if so
+                # and no constant-fold alternative exists, log a warning and graph-break with
+                # "invalid call to builtin op handler"; if binding was fine, re-raise. If the
+                # method itself graph-breaks but constant folding is possible, discard that
+                # break (removing it from stats). Falls through returning None so later
+                # handlers can try.
                 try:
                     # pyrefly: ignore [not-callable]
                     return self_handler(tx, *args, **kwargs)
@@ -1362,6 +1554,14 @@ class BuiltinVariable(BaseBuiltinVariable):
                     args: list[VariableTracker],
                     kwargs: dict[str, VariableTracker],
                 ) -> VariableTracker | None:
+                    # [FUNCTION DOC] HELPER: Constant folding when all args are constant
+                    # trackers and there are no kwargs. Calls the real function on the raw
+                    # values and wraps the result. Exceptions raised by the function are
+                    # re-raised as observed exceptions in the traced program; failure to get a
+                    # raw value causes a "constant fold exception" graph break.
+                    # KNOWN ISSUE: the clause for the constant-conversion error comes after the
+                    # generic exception clause; if that error is an Exception subclass it is
+                    # converted to an observed exception rather than a graph break.
                     # fast path
                     try:
                         res = fn(
@@ -1390,6 +1590,10 @@ class BuiltinVariable(BaseBuiltinVariable):
                     args: list[VariableTracker],
                     kwargs: dict[str, VariableTracker],
                 ) -> VariableTracker | None:
+                    # [FUNCTION DOC] HELPER: Constant folding with a runtime check: if every
+                    # arg and kwarg is a constant or unspecialized scalar, call the real function
+                    # on raw values and wrap the result (errors become observed exceptions, or a
+                    # graph break if no raw value is available). Otherwise returns None.
                     # path with a runtime check
                     if check_unspec_or_constant_args(args, kwargs):
                         try:
@@ -1419,6 +1623,8 @@ class BuiltinVariable(BaseBuiltinVariable):
             handlers.append(constant_fold_handler)
 
         def call_unimplemented(args: list[VariableTracker]) -> None:
+            # [FUNCTION DOC] HELPER: Always graph-breaks with "Failed to trace builtin
+            # operator", reporting the builtin name, argument tracker types and hints.
             real_arg_types = [arg.python_type_name() for arg in args]
             unimplemented(
                 gb_type="Failed to trace builtin operator",
@@ -1444,6 +1650,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                 args: list[VariableTracker],
                 kwargs: dict[str, VariableTracker],
             ) -> VariableTracker | None:
+                # [FUNCTION DOC] HELPER: Dispatch with a single handler; return its result if
+                # truthy, otherwise graph-break as an unsupported builtin call.
                 rv = handler(tx, args, kwargs)
                 if rv:
                     return rv
@@ -1457,6 +1665,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                 args: list[VariableTracker],
                 kwargs: dict[str, VariableTracker],
             ) -> VariableTracker | None:
+                # [FUNCTION DOC] HELPER: Dispatch with several handlers; return the first truthy
+                # result, otherwise graph-break as an unsupported builtin call.
                 rv = None
                 for fn in handlers:
                     rv = fn(tx, args, kwargs)
@@ -1469,6 +1679,9 @@ class BuiltinVariable(BaseBuiltinVariable):
 
     @staticmethod
     def _constant_eval_numeric_expr(node: ast.AST) -> bool:
+        # [FUNCTION DOC] HELPER: Return whether a parsed expression tree consists only of
+        # numeric constants (bool, int, float, complex) combined with unary plus/minus/invert
+        # and the arithmetic and bitwise binary operators, so it is safe to evaluate.
         allowed_nodes = (
             ast.Expression,
             ast.Constant,
@@ -1500,6 +1713,10 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _constant_eval_result(
         tx: "InstructionTranslatorBase", tree: ast.Expression, filename: str
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Evaluate a parsed expression at compile time. Returns None
+        # if it contains any call. Tries literal evaluation first; if that fails, evaluates
+        # purely numeric expressions with empty builtins (errors become observed exceptions),
+        # else returns None. On success returns a constant tracker.
         if any(isinstance(child, ast.Call) for child in ast.walk(tree)):
             return None
         ast.fix_missing_locations(tree)
@@ -1525,6 +1742,10 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the eval builtin. Only supports a single constant string
+        # argument (no extra args or kwargs, else returns None). Parses it as an expression
+        # (a syntax error becomes an observed SyntaxError) and constant-evaluates it when it
+        # is a literal or simple numeric expression; returns None otherwise.
         if args or kwargs:
             return None
         if not source.is_python_constant():
@@ -1546,6 +1767,10 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for vars. No arguments gives a snapshot of the current
+        # frame's locals; one argument gives that object's attribute dictionary (a missing
+        # one becomes an observed TypeError). Keyword arguments or more than one argument
+        # raise an observed TypeError.
         if kwargs:
             raise_type_error(tx, "vars() takes no keyword arguments")
         if len(args) == 0:
@@ -1561,12 +1786,20 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_locals(
         self, tx: "InstructionTranslatorBase", *args: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for locals. Takes no arguments (otherwise an observed
+        # TypeError) and returns a snapshot dictionary of the current frame's locals.
         if len(args) != 0:
             raise_observed_exception(TypeError, tx)
         return self._call_frame_locals_snapshot(tx)
 
     @staticmethod
     def _call_frame_locals_snapshot(tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Build a new dictionary tracker (fresh mutable value) mapping
+        # name constants to the current frame's local, cell and free variable trackers.
+        # Cell contents are loaded through side effects; empty or deleted slots are skipped;
+        # ordering of cells vs fast locals depends on Python version so that fast locals
+        # shadow cells (reversed on 3.12). Locals pruned from the symbolic state but present
+        # at runtime are rebuilt from their local source, installing guards as a side effect.
         from .builder import VariableBuilder
 
         frame_local_names = set(tx.f_code.co_varnames) | set(tx.cell_and_freevars())
@@ -1614,6 +1847,17 @@ class BuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Record the wrapped operator on tensor/symbolic arguments.
+        # Returns None if kwargs are given without tensor args. Tries torch-function
+        # dispatch first (remapping to Tensor methods, swapping operands to use the reflected
+        # method when the first arg is not a tensor, unless exporting). Otherwise: constants
+        # fold into stored constants; in-place ops on constant left operands are desugared;
+        # getitem with a symbolic index becomes a select call; numpy-array args use a numpy
+        # wrapper; non-tensor comparisons use generic rich comparison; else a graph call is
+        # created and wrapped as a fake-item, unspecialized scalar, symbolic or tensor
+        # tracker. A NotImplementedError becomes a graph break. Mutates the output graph.
+        # KNOWN ISSUE: the in-place desugaring map sends the in-place matmul to itself instead of
+        # to the plain matmul; also the truediv special case rebinds args after the graph call.
         from .builder import wrap_fx_proxy, wrap_fx_proxy_cls
 
         if kwargs and not self.tensor_args(*args, *kwargs.values()):
@@ -1786,6 +2030,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Call the wrapped builtin with the given argument trackers. Calling
+        # object with no arguments builds a fresh opaque object tracker. Otherwise looks up
+        # (or creates and caches in a class-level mapping) a handler keyed by the callable
+        # and the argument tracker classes (plus a kwargs marker; kwargs are realized first)
+        # and runs it. Raises an assertion error if no handler is available.
         if self.fn is object and not args and not kwargs:
             # object() -> a fresh opaque instance, wrapped as ObjectVariable to
             # match how SourcelessBuilder wraps bare `object` instances. Falling
@@ -1819,6 +2068,14 @@ class BuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Call an attribute of the wrapped builtin as an unbound method.
+        # Handles: object.__setattr__ on a tracked user object; __new__ for object and tuple
+        # (tracking new user-defined objects); constant-foldable class methods on constant
+        # args; object.__init__ (no-op); methods of set/frozenset/list/tuple forwarded to the
+        # first argument; unbound rich comparisons on constants of the wrapped type;
+        # str/float methods on constants; and unbound length, iteration, negation, positive,
+        # absolute, invert and hash dunder methods mapped to the generic protocol helpers.
+        # Anything else goes to the parent implementation.
         if self.fn is object and name == "__setattr__":
             if len(args) != 3:
                 raise AssertionError(
@@ -1982,6 +2239,8 @@ class BuiltinVariable(BaseBuiltinVariable):
         arg: VariableTracker,
         base: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for int: convert arg to an integer, using the numeric
+        # conversion protocol, or parse with the given base when a base is supplied.
         if base is None:
             return pynumber_int(tx, arg)
         return pylong_from_base(tx, arg, base)
@@ -1989,46 +2248,60 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_float(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for float: convert arg using the numeric float protocol.
         return pynumber_float(tx, arg)
 
     def call_bin(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for bin: format arg as a binary string via the base-conversion helper.
         return pynumber_tobase(tx, arg, 2)
 
     def call_oct(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for oct: format arg as an octal string via the base-conversion helper.
         return pynumber_tobase(tx, arg, 8)
 
     def call_hex(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for hex: format arg as a hexadecimal string via the base-conversion helper.
         return pynumber_tobase(tx, arg, 16)
 
     def call_bool(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for bool: truth value of arg via the generic truthiness protocol.
         # Emulate PyBool_Type.tp_vectorcall which boils down to PyObject_IsTrue.
         return generic_is_true(tx, arg)
 
     def call_hash(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for hash: hash of arg via the generic hash protocol.
         return generic_hash(tx, arg)
 
     def call_repr(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for repr: representation string of arg via the generic repr protocol.
         return generic_repr(tx, arg)
 
     def call_str(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for str: string conversion of arg via the generic str protocol.
         return generic_str(tx, arg)
 
     def call___build_class__(self, tx, *args, **kwargs):
+        # [FUNCTION DOC] Handler for the class-definition builtin. Requires the config flag
+        # enabling class-build tracing; the first argument must be a user function (class
+        # body) whose real function can be obtained, and all remaining args and kwargs must be
+        # constants. Then really builds the class and returns it as a tracker. Every other
+        # case graph-breaks "Invalid call to __build_class__".
         def fail(args, kwargs) -> NoReturn:
+            # [FUNCTION DOC] HELPER: Always graph-breaks with "Invalid call to __build_class__".
             unimplemented(
                 gb_type="Invalid call to __build_class__",
                 context=f"Non-constant args to __build_class__: {args} {kwargs}",
@@ -2063,6 +2336,12 @@ class BuiltinVariable(BaseBuiltinVariable):
         key: VariableTracker | None = None,
         default: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Shared handler for min and max (assigned to both call_min
+        # and call_max). Accepts either several positional values or one iterable, plus
+        # optional key (None means no key) and default (only valid for a single iterable).
+        # Raises observed type errors for zero args or a default with several positionals, and
+        # an observed value error for an empty iterable without default (which is returned if
+        # given). Delegates to the plain or key-based reduction.
         name = self.fn.__name__
         if len(args) == 0:
             raise_type_error(tx, f"{name} expected at least 1 argument, got 0")
@@ -2092,6 +2371,9 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _call_min_max_seq(
         self, tx: "InstructionTranslatorBase", items: list[VariableTracker]
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Reduce a non-empty list of trackers to the min or max by
+        # pairwise binary comparison; a single item is returned unchanged. Raises an
+        # assertion error on an empty list.
         if len(items) <= 0:
             raise AssertionError("_call_min_max_seq requires at least one item")
         if len(items) == 1:
@@ -2105,6 +2387,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         items: list[VariableTracker],
         key: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: min/max with a key function. Applies the key to every item,
+        # then scans keeping the first extremal item (replacing only on strictly better
+        # key), comparing keys with the less-than operator. The comparison result must be a
+        # compile-time constant, otherwise graph-breaks "min/max with non-constant key".
+        # Returns the original item, not the key.
         # Mirror CPython builtin_min_max: compare on key(item) but return the
         # original element, keeping the first extremal element on ties (only
         # replace on a strict comparison). Like list.sort, comparisons are done
@@ -2139,6 +2426,14 @@ class BuiltinVariable(BaseBuiltinVariable):
         a: VariableTracker | None,
         b: VariableTracker | None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Binary min or max of two trackers. Returns None if either is
+        # None. With tensor args: scalar-item results are converted to tensors; symbolic
+        # operands become a graph call of the builtin; a constant second operand becomes a
+        # clamp (or numpy clip); otherwise elementwise maximum/minimum. If both operands are
+        # unspecialized scalars or constants the result is an unspecialized-scalar (or
+        # fake-item) tracker carrying the raw computed value. Symbolic operands without
+        # tensors use symbolic max/min; two constants are computed directly; any other
+        # combination returns None.
         if a is None or b is None:
             # a or b could be none if we reduce and _call_min_max_binary failed
             # to return something
@@ -2250,16 +2545,20 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_abs(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for abs: absolute value via the numeric protocol helper.
         return pynumber_absolute(tx, arg)
 
     def call_pos(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the unary-plus operator function via the numeric protocol helper.
         return pynumber_positive(tx, arg)
 
     def call_index(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the index operator function: convert arg to an exact
+        # integer via the index protocol (symbolic values are specialized to constants).
         # Specialize SymNodeVariable to a constant first, matching CPython's
         # PyNumber_Index which forces a concrete int.
         return pynumber_index(tx, arg)
@@ -2271,6 +2570,8 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for round: looks up the rounding method on arg and calls it
+        # with the remaining positional and keyword arguments; returns its result.
         from .builder import SourcelessBuilder
 
         # Call arg.__round__()
@@ -2285,6 +2586,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for range. Raises an observed type error for keyword
+        # arguments or an argument count outside one to three; converts each argument with
+        # the index protocol and returns a range tracker.
         if kwargs:
             raise_type_error(tx, "range() takes no keyword arguments")
         if len(args) == 0:
@@ -2295,6 +2599,7 @@ class BuiltinVariable(BaseBuiltinVariable):
         return variables.RangeVariable(list(args))
 
     def _dynamic_args(self, *args: VariableTracker, **kwargs: VariableTracker) -> bool:
+        # [FUNCTION DOC] HELPER: Return whether any positional or keyword argument is a symbolic node tracker.
         return any(isinstance(x, SymNodeVariable) for x in args) or any(
             isinstance(x, SymNodeVariable) for x in kwargs.values()
         )
@@ -2302,6 +2607,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_slice(
         self, tx: "InstructionTranslatorBase", *args: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for slice: requires one to three arguments (otherwise an
+        # observed type error) and returns a slice tracker built from them.
         if not 1 <= len(args) < 4:
             raise_type_error(tx, f"slice expected at least 1 argument, got {len(args)}")
         return variables.SliceVariable(list(args), tx)
@@ -2309,6 +2616,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def _dyn_proxy(
         self, tx: "InstructionTranslatorBase", *args: Any, **kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Record the wrapped callable as a graph call on the given
+        # arguments and wrap the proxy in a tracker. Side effect: adds a node to the graph.
         from .builder import wrap_fx_proxy
 
         return wrap_fx_proxy(
@@ -2324,6 +2633,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for tuple. Keyword arguments or more than one argument raise
+        # an observed type error. No argument gives a new empty tuple tracker; an existing
+        # exact tuple tracker is returned as is; anything else is unpacked into a new tuple tracker.
         # ref: https://github.com/python/cpython/blob/main/Objects/abstract.c#L2004-L2078
         if kwargs:
             raise_type_error(
@@ -2348,6 +2660,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_callable(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for callable: constant boolean telling whether the argument's
+        # Python type defines a call slot (graph-breaks if the type cannot be determined).
         # PyCallable_Check: callable(x) is type(x)->tp_call != NULL. Dispatch on
         # the arg's Python type slot rather than enumerating callable VTs.
         # callable() is the only handler for this builtin, so always return a
@@ -2360,6 +2674,8 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_cast(
         self, _: Any, *args: VariableTracker, **kwargs: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for typing.cast: with exactly two arguments returns the
+        # second (the value) unchanged; otherwise graph-breaks "bad args to builtin cast()".
         if len(args) == 2:
             return args[1]
 
@@ -2373,6 +2689,9 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_dir(
         self, tx: "InstructionTranslatorBase", arg: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for dir. Supports user-defined classes, wrapped builtins and
+        # compile-time constants by computing the real name list and wrapping it; returns
+        # None for any other tracker so other handlers can try.
         if isinstance(arg, variables.UserDefinedClassVariable):
             return VariableTracker.build(tx, dir(arg.value))
         if isinstance(arg, BuiltinVariable):
@@ -2388,6 +2707,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for set. Any keyword argument or more than one positional
+        # raises an observed type error. No argument gives a new empty set tracker; one
+        # argument gives a new set tracker filled by calling its update method with it.
         # ref: https://github.com/python/cpython/blob/main/Objects/setobject.c#L2708-L2735
         # CPython set_init rejects keywords before unpacking positional args, so
         # set(a=1) and set().__init__(a=1) both raise regardless of arg count.
@@ -2414,6 +2736,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for frozenset. Keywords or more than one positional raise an
+        # observed type error. No argument gives an empty frozenset tracker; an existing exact
+        # frozenset tracker is returned as is; a set or dict tracker reuses its existing
+        # hashable keys; otherwise the argument is unpacked into items. Returns a new
+        # frozenset tracker.
         if kwargs:
             raise_type_error(
                 tx,
@@ -2447,6 +2774,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for zip. Only the strict keyword is allowed (other kwargs
+        # raise an argument-mismatch error). Gets an iterator for each argument and returns
+        # a zip tracker over them, with the strictness flag taken from the keyword.
         # ref: https://github.com/python/cpython/blob/v3.13.3/Python/bltinmodule.c#L2822-L2887
         if kwargs:
             if not (len(kwargs) == 1 and "strict" in kwargs):
@@ -2473,6 +2803,8 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for len: needs exactly one positional argument and no
+        # keywords (else an observed type error); returns its length via the generic size protocol.
         if kwargs:
             raise_type_error(tx, "len() takes no keyword arguments")
         if len(args) != 1:
@@ -2487,6 +2819,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the length-hint operator function. Takes one object and
+        # an optional default (zero if omitted); wrong arity or keywords raise an observed
+        # type error. Uses the real length if the type has one; else uses the default when
+        # the type lacks a length-hint method; else calls that method, returning the default
+        # if it raises a type error.
         # ref: PyObject_LengthHint (Objects/abstract.c): try __len__, then
         # __length_hint__, falling back to the supplied default for either a
         # missing slot or a TypeError raised by the slot.
@@ -2516,6 +2853,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the getitem operator function: exactly two positional
+        # arguments (container, key), no keywords, else an observed type error; delegates
+        # to the generic subscript protocol.
         if kwargs:
             raise_type_error(tx, "_operator.getitem() takes no keyword arguments")
         if len(args) != 2:
@@ -2528,6 +2868,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the setitem operator function: exactly three positional
+        # arguments (container, key, value), no keywords, else an observed type error;
+        # delegates to the generic item-assignment protocol.
         if kwargs:
             raise_type_error(tx, "_operator.setitem() takes no keyword arguments")
         if len(args) != 3:
@@ -2540,6 +2883,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the delitem operator function: exactly two positional
+        # arguments (container, key), no keywords, else an observed type error; delegates
+        # to the generic item-deletion protocol.
         if kwargs:
             raise_type_error(tx, "_operator.delitem() takes no keyword arguments")
         if len(args) != 2:
@@ -2552,6 +2898,18 @@ class BuiltinVariable(BaseBuiltinVariable):
         arg: VariableTracker,
         isinstance_type_var: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for isinstance, always producing a constant boolean (or a
+        # graph break / observed error). Graph-breaks if the argument's Python type is
+        # unknown. For sourced async-collective tensors, reinstalls a type guard when the
+        # checked classes distinguish them from plain tensors. For tensors with a dtype:
+        # graph-breaks on custom instance/subclass check hooks, otherwise answers using
+        # dtype pseudo-types, the parameter metaclass hook for wrapper subclasses, or a
+        # subclass test on the tensor's type. Graph-breaks for user-defined objects wrapping
+        # C-extension member descriptors; honors a user-class instance-check hook;
+        # handles user exception classes; normalizes the class-info (class, union, tuple,
+        # or object with an instance-check hook) or raises an observed TypeError; finally
+        # answers with a subclass test of the argument's type against the class-info tuple,
+        # falling back to membership when that test raises a TypeError.
         try:
             arg_type = arg.python_type()
         except NotImplementedError:
@@ -2602,7 +2960,15 @@ class BuiltinVariable(BaseBuiltinVariable):
             def _tensor_isinstance(
                 tensor_var: VariableTracker, tensor_type: Any
             ) -> bool:
+                # [FUNCTION DOC] HELPER: Evaluate whether the tensor matches a class or tuple
+                # of classes (true if any matches), using the enclosing argument tracker.
+                # KNOWN ISSUE: the tensor_var parameter is unused; the enclosing arg is read instead.
                 def check_type(ty: Any) -> bool:
+                    # [FUNCTION DOC] HELPER: Check one class against the tensor. Legacy
+                    # tensor type names match on the tensor's dtype; the parameter class is
+                    # checked directly on the example value for traceable wrapper
+                    # subclasses (to run its metaclass hook); other classes use a subclass
+                    # test on the tracker's Python type.
                     if ty not in tensortype_to_dtype:
                         example_val = arg.as_proxy().node.meta["example_value"]
                         if (
@@ -2693,12 +3059,14 @@ class BuiltinVariable(BaseBuiltinVariable):
         left_ty: VariableTracker,
         right_ty: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for issubclass: delegates to the generic subclass-check protocol helper.
         """Checks if first arg is subclass of right arg"""
         return generic_issubclass(tx, left_ty, right_ty)
 
     def call_super(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for two-argument super: returns a super tracker built from the class and instance trackers.
         return variables.SuperVariable(a, b)
 
     def call_next(
@@ -2707,6 +3075,10 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for next. Needs one or two positional args and no keywords
+        # (else an observed type error); the first must be an iterator type (else an observed
+        # type error). Returns the iterator's next item; when it is exhausted, returns the
+        # optional default if given, otherwise re-raises the observed stop-iteration.
         if kwargs:
             raise_type_error(tx, "next() takes no keyword arguments")
         if len(args) == 0:
@@ -2732,6 +3104,10 @@ class BuiltinVariable(BaseBuiltinVariable):
         *seqs: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for map: needs a function and at least one iterable (else an
+        # observed type error). The strict keyword is accepted only on Python 3.14+; any
+        # other keyword raises an argument-mismatch error. Returns a map tracker over
+        # iterators of the inputs.
         if len(seqs) == 0:
             raise_observed_exception(
                 TypeError,
@@ -2770,6 +3146,7 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_filter(
         self, tx: "InstructionTranslatorBase", fn: VariableTracker, seq: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for filter: returns a filter tracker over the function and an iterator of the sequence.
         return variables.FilterVariable(
             fn,
             generic_getiter(tx, seq),
@@ -2779,6 +3156,11 @@ class BuiltinVariable(BaseBuiltinVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute lookup on the wrapped builtin. When the wrapped callable
+        # is object, reads the real attribute (a missing one raises an observed
+        # AttributeError) and returns non-callable values as constants. Otherwise (and for
+        # callables) returns a generic attribute-access tracker carrying the attribute's
+        # Python type when known and an attribute source.
         # Declarative type-attribute dispatch (__name__, __bases__, __base__,
         # __flags__), mirroring the consultation at the top of
         # VariableTracker.getattro_impl. Inlined because this override keeps its
@@ -2803,11 +3185,17 @@ class BuiltinVariable(BaseBuiltinVariable):
         obj: VariableTracker,
         name_var: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for delattr: forwards to the object's attribute-deletion method with the name.
         return obj.call_method(tx, "__delattr__", [name_var], {})
 
     def call_type(
         self, tx: "InstructionTranslatorBase", obj: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for single-argument type. Gets the object's Python type (an
+        # unknown type raises a user error of kind invalid input) and returns a tracker for
+        # that class. The source is a type source derived from the object's source, or the
+        # user-object class source; for plain tensors it is the torch module's Tensor
+        # attribute, installing the torch module as a global (side effect).
         try:
             py_type = obj.python_type()
         except NotImplementedError as error:
@@ -2834,6 +3222,10 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_reversed(
         self, tx: "InstructionTranslatorBase", obj: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for reversed. If the object's type defines the reversed
+        # hook as None, raises an observed type error; if it defines the hook, calls it. Else
+        # requires the sequence protocol (otherwise an observed type error) and returns the
+        # result of a polyfill reverse sequence iterator.
         # Mirrors CPython's builtin_reversed_impl (Python/enumobject.c)
         # https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/enumobject.c#L353-L395
         # 1. Look up __reversed__ via _PyObject_LookupSpecial. If found, call it.
@@ -2867,6 +3259,10 @@ class BuiltinVariable(BaseBuiltinVariable):
         obj: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for sorted. For non-tensor input, unpacks it into a new
+        # list tracker and sorts it with the list sort method using the keyword arguments
+        # (key, reverse); returns the list. Returns None for tensor input so other handlers
+        # may handle it.
         if not isinstance(obj, variables.TensorVariable):
             list_var = variables.ListVariable(
                 unpack_iterable(tx, obj),
@@ -2879,11 +3275,13 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_neg(
         self, tx: "InstructionTranslatorBase", a: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the negation operator function via the numeric protocol helper.
         return pynumber_negative(tx, a)
 
     def call_invert(
         self, tx: "InstructionTranslatorBase", a: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the bitwise-invert operator function via the numeric protocol helper.
         return pynumber_invert(tx, a)
 
     def call_format(
@@ -2893,6 +3291,9 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the string format method used as a function: converts the
+        # first argument (must be a compile-time constant) to a string and returns a lazy
+        # string-format tracker holding the remaining positional and keyword trackers.
         format_string = _format_string.as_python_constant()
         format_string = str(format_string)
         return StringFormatVariable.create(format_string, list(args), kwargs)
@@ -2900,6 +3301,10 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_id(
         self, tx: "InstructionTranslatorBase", *args: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for id. Needs exactly one argument (else an observed type
+        # error). If the tracker knows its real id, installs the id-appropriate guard on its
+        # source (when it has one) and returns that id as a constant; otherwise returns a
+        # fake-id tracker built from the tracker object's own identity.
         if len(args) != 1:
             raise_observed_exception(
                 TypeError,
@@ -2921,6 +3326,7 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_deepcopy(
         self, tx: "InstructionTranslatorBase", x: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for deepcopy: always graph-breaks with "copy.deepcopy()" (unsupported).
         unimplemented(
             gb_type="copy.deepcopy()",
             context=f"copy.deepcopy({x})",
@@ -2937,6 +3343,12 @@ class BuiltinVariable(BaseBuiltinVariable):
         left: VariableTracker,
         right: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Comparison where at least one operand is a tensor. For
+        # is / is-not, compares the identity of the underlying fake example values and returns
+        # a constant. Other operators must be supported tensor comparisons (else graph break);
+        # when both tensors have known, different sizes they must be broadcastable (else graph
+        # break). Records a graph call and wraps it with the tensor tracker class of the
+        # tensor operand (tensor or ndarray).
         from .builder import wrap_fx_proxy_cls
         from .tensor import supported_tensor_comparison_op_values
 
@@ -2995,6 +3407,11 @@ class BuiltinVariable(BaseBuiltinVariable):
         left: VariableTracker,
         right: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Comparison where at least one operand is a symbolic node.
+        # Graph-breaks for unsupported operators. If the other operand is not symbolic,
+        # constant or tensor, the answer is known at compile time and returned as a constant
+        # from comparing two unrelated objects. Otherwise records a graph call and returns a
+        # new symbolic node tracker.
         from .tensor import supported_tensor_comparison_op_values
 
         op = self.fn
@@ -3031,126 +3448,151 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_xor(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the bitwise-xor operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_xor", "^")
 
     def call_ixor(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place xor operator function via the in-place protocol helper (falls back to xor).
         return binary_iop(tx, a, b, "nb_inplace_xor", "nb_xor", "^=")
 
     def call_mul(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the multiplication operator function via the numeric multiply helper.
         return pynumber_multiply(tx, a, b)
 
     def call_imul(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place multiplication operator function via the in-place multiply helper.
         return pynumber_inplace_multiply(tx, a, b)
 
     def call_matmul(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the matrix-multiplication operator function via the matrix multiply helper.
         return pynumber_matrix_multiply(tx, a, b)
 
     def call_imatmul(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place matrix-multiplication operator function via the in-place helper.
         return pynumber_inplace_matrix_multiply(tx, a, b)
 
     def call_sub(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the subtraction operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_subtract", "-")
 
     def call_isub(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place subtraction operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_subtract", "nb_subtract", "-=")
 
     def call_add(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the addition operator function via the numeric add helper.
         return pynumber_add(tx, a, b)
 
     def call_iadd(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place addition operator function via the in-place add helper.
         return pynumber_inplace_add(tx, a, b)
 
     def call_and_(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the bitwise-and operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_and", "&")
 
     def call_iand(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place bitwise-and operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_and", "nb_and", "&=")
 
     def call_or_(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the bitwise-or operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_or", "|")
 
     def call_ior(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place bitwise-or operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_or", "nb_or", "|=")
 
     def call_lshift(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the left-shift operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_lshift", "<<")
 
     def call_ilshift(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place left-shift operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_lshift", "nb_lshift", "<<=")
 
     def call_rshift(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the right-shift operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_rshift", ">>")
 
     def call_irshift(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place right-shift operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_rshift", "nb_rshift", ">>=")
 
     def call_floordiv(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the floor-division operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_floor_divide", "//")
 
     def call_ifloordiv(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place floor-division operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_floor_divide", "nb_floor_divide", "//=")
 
     def call_truediv(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the true-division operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_true_divide", "/")
 
     def call_itruediv(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place true-division operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_true_divide", "nb_true_divide", "/=")
 
     def call_mod(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the modulo operator function via the binary-operation protocol helper.
         return binary_op(tx, a, b, "nb_remainder", "%")
 
     def call_imod(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place modulo operator function via the in-place protocol helper.
         return binary_iop(tx, a, b, "nb_inplace_remainder", "nb_remainder", "%=")
 
     def call_divmod(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for divmod via the binary-operation protocol helper (divmod slot, no in-place form).
         # PyNumber_Divmod dispatches through the nb_divmod slot with no
         # in-place form. https://github.com/python/cpython/blob/3.13/Objects/abstract.c#L1056
         return binary_op(tx, a, b, "nb_divmod", "divmod()")
@@ -3162,6 +3604,7 @@ class BuiltinVariable(BaseBuiltinVariable):
         b: VariableTracker,
         c: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for pow: power of a by b with optional modulus c, via the ternary-operation protocol helper.
         return ternary_op(tx, a, b, c, "nb_power", "** or pow()")
 
     def call_ipow(
@@ -3171,11 +3614,16 @@ class BuiltinVariable(BaseBuiltinVariable):
         b: VariableTracker,
         c: VariableTracker | None = None,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the in-place power operator function via the ternary in-place protocol helper.
         return ternary_iop(tx, a, b, c, "nb_inplace_power", "nb_power", "**=")
 
     def call_not_(
         self, tx: "InstructionTranslatorBase", a: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] Handler for the logical-not operator function. A symbolic node
+        # records a graph call and returns a symbolic result; dictionary views are unwrapped
+        # to their dictionary; list, dict and set trackers give a constant (true if empty);
+        # user-defined objects use their truth value; anything else returns None.
         if isinstance(a, SymNodeVariable):
             return SymNodeVariable.create(
                 tx,
@@ -3199,20 +3647,28 @@ class BuiltinVariable(BaseBuiltinVariable):
     def call_contains(
         self, tx: "InstructionTranslatorBase", a: VariableTracker, b: VariableTracker
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handler for the contains operator function: membership test via the sequence-contains helper.
         return pysequence_contains(tx, a, b)
 
 
 class DictBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the dict type itself. Calling it builds a dict by inlining the
+    # construct-dict polyfill; its methods (__new__, fromkeys, and unbound dict methods
+    # applied to a dict tracker) are forwarded to the underlying dictionary trackers.
+    # Exposes static helpers for building dicts of a given dict-like class and for fromkeys.
     """Variable tracker for the `dict` builtin constructor."""
 
     _fn = dict
 
     def __init__(self, value: type = dict, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is dict;
+        # remaining keyword arguments go to the base tracker.
         if value is not dict:
             raise AssertionError(f"DictBuiltinVariable value must be dict, got {value}")
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "DictBuiltinVariable()"
 
     def call_function(
@@ -3221,6 +3677,7 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to dict: builds the dictionary through the custom-dict helper with the plain dict class.
         return DictBuiltinVariable.call_custom_dict(tx, dict, *args, **kwargs)
 
     def call_method(
@@ -3230,6 +3687,12 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Unbound method call on dict. For the allocation method with args:
+        # returns a fresh empty dict tracker when the class argument is dict itself, else
+        # tracks a new user-defined object of that subclass. The fromkeys method uses the
+        # fromkeys helper. Other known dict methods are forwarded to the first argument's
+        # underlying dictionary tracker (user dict subclass base tracker, or dict tracker);
+        # anything else defers to the parent implementation.
         if name == "__new__":
             if args:
                 # dict.__new__ (tp_new) ignores extra args — only the first
@@ -3272,6 +3735,9 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Build a dict-like object of class user_cls by inlining the
+        # construct-dict polyfill with the class and the given positional and keyword
+        # argument trackers; returns the resulting tracker.
         args_list = list(args)
         return tx.inline_user_function_return(
             VariableTracker.build(tx, polyfills.construct_dict),
@@ -3287,6 +3753,15 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implement fromkeys for dict, OrderedDict or defaultdict (any other
+        # class graph-breaks). Accepts keys plus an optional value (default None); the value
+        # may be a keyword only for OrderedDict; bad argument counts raise an
+        # argument-mismatch error. Builds the result of the right class holding the keys
+        # (reusing existing keys of a set or dict tracker, otherwise iterating the argument,
+        # which must be all hashable) mapped to the shared value; else graph-breaks "failed to
+        # call dict.fromkeys()".
+        # KNOWN ISSUE: the branch testing whether the argument is a raw dictionary can never
+        # be taken because arguments are trackers, not real dictionaries.
         if user_cls not in {dict, OrderedDict, defaultdict}:
             unimplemented(
                 gb_type="Unsupported dict type for fromkeys()",
@@ -3334,6 +3809,9 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         def _make_result(
             items: dict[VariableTracker, VariableTracker],
         ) -> VariableTracker:
+            # [FUNCTION DOC] HELPER: Wrap an item mapping as a new mutable tracker of the
+            # requested class: ordered dict tracker, default-dict tracker (tracked as a new
+            # user-defined object with its base dictionary set), or plain dict tracker.
             if user_cls is OrderedDict:
                 return OrderedDictVariable(items, mutation_type=ValueMutationNew())
             elif user_cls is defaultdict:
@@ -3386,16 +3864,22 @@ class DictBuiltinVariable(BaseBuiltinVariable):
 
 
 class IterBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the iter builtin. Calling it with one argument gets that
+    # object's iterator; with two (callable and sentinel) it builds a callable iterator
+    # through a polyfill.
     """Variable tracker for the `iter` builtin."""
 
     _fn = iter
 
     def __init__(self, value: Any = iter, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is iter;
+        # remaining keyword arguments go to the base tracker.
         if value is not iter:
             raise AssertionError(f"IterBuiltinVariable value must be iter, got {value}")
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "IterBuiltinVariable()"
 
     def call_function(
@@ -3404,6 +3888,10 @@ class IterBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to iter. No arguments raises an observed TypeError.
+        # One argument returns its iterator via the generic iteration protocol. Otherwise
+        # inlines the callable-iterator polyfill with the arguments. Keyword arguments are
+        # ignored in the one-argument case.
         # ref: https://github.com/python/cpython/blob/v3.13.0/Python/bltinmodule.c#L1666-L1682
 
         if not args:
@@ -3422,11 +3910,16 @@ class IterBuiltinVariable(BaseBuiltinVariable):
 
 
 class GetAttrBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the getattr builtin. Realizes lazy args, resolves the attribute
+    # through the generic attribute protocol, and falls back to evaluating the real getattr
+    # on constant arguments if tracing raises a graph break.
     """Variable tracker for the `getattr` builtin."""
 
     _fn = getattr
 
     def __init__(self, value: Any = getattr, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is
+        # getattr; remaining keyword arguments go to the base tracker.
         if value is not getattr:
             raise AssertionError(
                 f"GetAttrBuiltinVariable value must be getattr, got {value}"
@@ -3434,6 +3927,7 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "GetAttrBuiltinVariable()"
 
     def call_function(
@@ -3442,6 +3936,13 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to getattr. Realizes lazy argument trackers, then
+        # resolves through the internal getattr helper. If that graph-breaks and all
+        # arguments are constants or unspecialized scalars, evaluates the real getattr on the
+        # raw values instead: a missing attribute becomes an observed AttributeError, other
+        # errors become observed exceptions of the same type (a constant-conversion failure
+        # is re-raised unchanged), and success returns a tracker for the value. Otherwise
+        # re-raises the graph break.
         from .lazy import LazyVariableTracker
 
         if any(isinstance(a, LazyVariableTracker) for a in args):
@@ -3474,6 +3975,11 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Core of getattr. Reads object, name and optional default
+        # from the arguments (indexing assumes at least two are present). The name must be a
+        # compile-time constant, otherwise graph-breaks "getattr() with non-constant name
+        # argument". Delegates to the generic attribute helper with the default sentinel when
+        # no default was passed.
         obj = args[0]
         name_var = args[1]
         default = args[2] if len(args) > 2 else _NO_DEFAULT
@@ -3491,11 +3997,15 @@ class GetAttrBuiltinVariable(BaseBuiltinVariable):
 
 
 class HasAttrBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the hasattr builtin. Validates arguments and asks the object
+    # tracker whether it has the named attribute.
     """Variable tracker for the `hasattr` builtin."""
 
     _fn = hasattr
 
     def __init__(self, value: Any = hasattr, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is
+        # hasattr; remaining keyword arguments go to the base tracker.
         if value is not hasattr:
             raise AssertionError(
                 f"HasAttrBuiltinVariable value must be hasattr, got {value}"
@@ -3503,6 +4013,7 @@ class HasAttrBuiltinVariable(BaseBuiltinVariable):
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "HasAttrBuiltinVariable()"
 
     def call_function(
@@ -3511,6 +4022,10 @@ class HasAttrBuiltinVariable(BaseBuiltinVariable):
         args: Sequence[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to hasattr. Realizes lazy arguments; requires exactly
+        # two positional arguments with a constant attribute name, else raises an observed
+        # TypeError. Returns the object tracker's attribute-presence answer; graph-breaks
+        # "hasattr() on unsupported type" if the tracker cannot answer.
         from .lazy import LazyVariableTracker
 
         if any(isinstance(a, LazyVariableTracker) for a in args):
@@ -3534,11 +4049,17 @@ class HasAttrBuiltinVariable(BaseBuiltinVariable):
 
 
 class SetAttrBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the setattr builtin. Validates arguments and applies attribute
+    # assignment by delegating to the object's setattr method or by recording attribute
+    # mutations in the side-effect tracker (with special handling for tensor attributes and
+    # module attributes).
     """Variable tracker for the `setattr` builtin."""
 
     _fn = setattr
 
     def __init__(self, value: Any = setattr, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is
+        # setattr; remaining keyword arguments go to the base tracker.
         if value is not setattr:
             raise AssertionError(
                 f"SetAttrBuiltinVariable value must be setattr, got {value}"
@@ -3546,6 +4067,7 @@ class SetAttrBuiltinVariable(BaseBuiltinVariable):
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "SetAttrBuiltinVariable()"
 
     def call_function(
@@ -3554,6 +4076,10 @@ class SetAttrBuiltinVariable(BaseBuiltinVariable):
         args: Sequence[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to setattr. Realizes lazy arguments; requires exactly
+        # three positional arguments (object, name, value), else raises an observed TypeError.
+        # Returns the helper's result when it handled the assignment, otherwise graph-breaks
+        # "setattr() on unsupported type". Side effects: may record attribute mutations.
         from .lazy import LazyVariableTracker
 
         if any(isinstance(a, LazyVariableTracker) for a in args):
@@ -3580,6 +4106,19 @@ class SetAttrBuiltinVariable(BaseBuiltinVariable):
         name_var: VariableTracker,
         val: VariableTracker,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Perform attribute assignment, returning the assigned value
+        # tracker or None when unsupported. User-defined objects, dicts with defaults, nested
+        # functions, exceptions, tracebacks and deques forward to their own setattr method.
+        # A sourced object not yet tracked, with a real attribute dictionary, is registered
+        # as an existing tracked object and the attribute store is recorded. For objects with
+        # tracked attribute mutation and a constant name: tensors get special handling
+        # (requires_grad assignment graph-breaks; data assignment requires a sourced tensor of
+        # equal dtype and, across devices, equal shape/strides, then replaces the tracked
+        # fake entry and records a shallow-copy-data graph call under no-grad; grad names
+        # are unified; getset descriptor names graph-break), then the store is recorded.
+        # Module trackers graph-break when inside a higher-order op, return the existing
+        # attribute when assigning the identical tensor, else are converted to the
+        # unspecialized form. Mutates side-effect and output-graph state.
         if isinstance(
             obj,
             (
@@ -3765,16 +4304,22 @@ class SetAttrBuiltinVariable(BaseBuiltinVariable):
 
 
 class ListBuiltinVariable(BaseBuiltinVariable):
+    # [CLASS DOC] Tracker for the list type itself. Calling it builds a new mutable list
+    # tracker by extending an empty list with the argument, installing guards on sourced
+    # arguments; its allocation method creates list or user-subclass objects.
     """Variable tracker for the `list` builtin constructor."""
 
     _fn = list
 
     def __init__(self, value: type = list, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the tracker. Raises an assertion error unless value is list;
+        # remaining keyword arguments go to the base tracker.
         if value is not list:
             raise AssertionError(f"ListBuiltinVariable value must be list, got {value}")
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Fixed debug string.
         return "ListBuiltinVariable()"
 
     def call_function(
@@ -3783,6 +4328,13 @@ class ListBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle a call to list. Keyword arguments or more than one positional
+        # raise an observed type error. No argument gives a new empty list tracker. For a
+        # sourced, non-constant argument installs a guard so later runs see the same
+        # contents: tuple-iterator length, key order for dicts and ordered sets, mapping
+        # keys for mapping proxies, or sequence length for most others (none for plain
+        # iterators, generators and unspecialized modules). Returns a new list tracker
+        # extended with the argument's items.
         # ref: https://github.com/python/cpython/blob/3.13/Objects/listobject.c#L1265-L1287
         if kwargs:
             raise_type_error(
@@ -3832,6 +4384,10 @@ class ListBuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Unbound method call on list. The allocation method with a single
+        # class argument returns a fresh empty list tracker when the class is list itself,
+        # else tracks a new user-defined object of that subclass. Everything else defers to
+        # the parent implementation.
         if name == "__new__":
             if len(args) == 1 and not kwargs:
                 list_vt = ListVariable([], mutation_type=ValueMutationNew())
@@ -3850,6 +4406,10 @@ class ListBuiltinVariable(BaseBuiltinVariable):
 # pyrefly: ignore [deprecated]
 @contextlib.contextmanager
 def dynamo_disable_grad(tx: "InstructionTranslatorBase") -> typing.Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that turns off gradient mode in the traced
+    # program for the duration of the with-block. On entry creates and enters a grad-mode
+    # tracker set to disabled (recording it for the output graph); on exit, even after an
+    # error, exits that tracker to restore the previous mode.
     from . import GradModeVariable
 
     gmv = GradModeVariable.create(tx, False)
