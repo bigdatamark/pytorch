@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Hashability support for Dynamo VariableTrackers. Provides raise_unhashable
+# (raises an observed TypeError, or graph-breaks if Dynamo wrongly thinks a type
+# is unhashable), is_hashable (lazy-aware hashability check), RawHash (wrapper
+# that preserves a precomputed hash), and HashableTracker (wrapper making a
+# VariableTracker usable as a dict key / set element for ConstDictVariable and
+# SetVariable). No import-time side effects beyond imports.
 """
 Hashability utilities for PyTorch Dynamo variable tracking.
 
@@ -23,6 +30,16 @@ if TYPE_CHECKING:
 def raise_unhashable(
     arg: VariableTracker, tx: "InstructionTranslatorBase | None" = None
 ) -> None:
+    # [FUNCTION DOC]
+    # Raises, inside the traced program, a TypeError "unhashable type" for the
+    # given VariableTracker. If tx is None, the current instruction translator is
+    # used. The type name comes from the tracker's python type when available,
+    # otherwise from the tracker's own class name.
+    # If the real python type is known and defines a hash, Dynamo's hashability
+    # check disagrees with CPython, so instead of a wrong TypeError it triggers a
+    # graph break (unimplemented, "Hashability mismatch").
+    # Always exits by raising (observed exception or graph break); returns None
+    # only nominally.
     if tx is None:
         from torch._dynamo.symbolic_convert import InstructionTranslator
 
@@ -60,6 +77,10 @@ def raise_unhashable(
 
 
 def is_hashable(x: VariableTracker) -> bool:
+    # [FUNCTION DOC]
+    # Returns whether the tracker is hashable. For an unrealized lazy tracker whose
+    # lazy hashability check succeeds, returns True without realizing it (avoids
+    # installing guards); otherwise defers to the tracker's own is_hashable.
     # LazyVT optimization: check hashability without realizing the VT to avoid
     # accidentally inserting guards.
     if (
@@ -73,6 +94,11 @@ def is_hashable(x: VariableTracker) -> bool:
 
 
 class RawHash:
+    # [CLASS DOC]
+    # Immutable-by-convention holder (slot h) of an already computed integer hash.
+    # Its hash returns the stored value unchanged and it equals only other
+    # RawHash objects with the same value. Used to build tuples/frozensets of
+    # per-item hashes without Python's integer hash reduction altering them.
     """Wraps a pre-computed hash value to bypass int.__hash__'s modular reduction.
 
     When building a tuple/frozenset of per-item hashes, using bare ints would
@@ -83,16 +109,26 @@ class RawHash:
     __slots__ = ("h",)
 
     def __init__(self, h: int) -> None:
+        # [FUNCTION DOC] HELPER: Stores the precomputed hash integer h.
         self.h = h
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the stored hash value unchanged.
         return self.h
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: True only if other is a RawHash with an equal stored hash.
         return isinstance(other, RawHash) and self.h == other.h
 
 
 class HashableTracker:
+    # [CLASS DOC]
+    # Wraps a VariableTracker so it can be a key in Python dicts/sets used by
+    # ConstDictVariable and SetVariable. State: vt (the wrapped, possibly
+    # SymNode-specialized tracker), _hash (hash computed at construction), and
+    # _hash_is_identity (True when the hash is identity based, e.g. tensors, so
+    # equality falls back to identity). Hash is fixed at construction; equality
+    # mirrors CPython rich comparison on the traced values.
     """
     Class that wraps a VariableTracker and makes it hashable.
     Note that it's fine to put VTs into dictionaries and sets, but doing so
@@ -102,6 +138,13 @@ class HashableTracker:
     _MISSING = object()
 
     def __init__(self, vt: VariableTracker) -> None:
+        # [FUNCTION DOC]
+        # Wraps vt: specializes SymNodes, then computes the hash. Fast path: an
+        # unrealized lazy tracker that is lazily hashable is hashed from its
+        # original value without realization (no guards), with identity flag False.
+        # Otherwise hashes via generic_hash_impl using the current translator,
+        # which yields (hash, is-identity flag) and raises an observed TypeError
+        # for unhashable values. Sets vt, _hash, _hash_is_identity.
         # We specialize SymNodes
         vt = specialize_symnode(vt)
 
@@ -132,6 +175,12 @@ class HashableTracker:
 
     @classmethod
     def _maybe_constant_torch_size(cls, vt: VariableTracker) -> object:
+        # [FUNCTION DOC] HELPER: Tries to get a concrete torch.Size for vt.
+        # Returns the original value for an unrealized lazy tracker holding a
+        # torch.Size; for a SizeVariable, builds a torch.Size from items that are
+        # python constants or single-element tensor trackers whose fake example
+        # value carries a known constant. Returns the _MISSING sentinel if vt is
+        # not a size or any item cannot be resolved.
         from .lists import SizeVariable
         from .tensor import TensorVariable
 
@@ -169,9 +218,19 @@ class HashableTracker:
         return torch.Size(items)
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Returns the hash computed at construction.
         return self._hash
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC]
+        # Equality of wrapped trackers. False for non-HashableTracker; True if the
+        # same tracker object. If both resolve to concrete torch.Size values,
+        # compares them. If either is a TensorVariable, equal only when both hashes
+        # are identity based and equal (never emits an elementwise eq into the
+        # graph). Otherwise runs generic_richcompare_bool (may run user __eq__ and
+        # observe its exceptions); a constant result is used directly, a symnode
+        # result is guarded on, anything else falls back to identity-hash equality.
+        # Side effects: may install guards or trace user code.
         """
         Checks equality between two HashableTracker instances.
 
