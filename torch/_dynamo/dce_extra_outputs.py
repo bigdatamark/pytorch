@@ -1,3 +1,7 @@
+# [MODULE DOC] Dead-code-elimination pass for unused extra outputs of higher-order
+# op subgraphs (invoke_subgraph, tag_activation_checkpoint). Main entry point is
+# dce_hop_extra_outputs; the rest are private helpers. Import-time side effect: none
+# beyond defining the set of HOPs that are handled.
 """
 DCE pass for unused extra outputs in HOP subgraphs.
 
@@ -29,6 +33,11 @@ _HOPS_WITH_EXTRA_OUTPUTS = {
 
 
 def dce_hop_extra_outputs(gm: torch.fx.GraphModule) -> bool:
+    # [FUNCTION DOC] Walks the graph tree, groups HOP call sites by shared subgraph,
+    # and for each subgraph whose output is a tuple/list drops outputs that no caller
+    # consumes via an index-extraction node with users. Subgraphs where no output or
+    # all outputs are used are left alone. Mutates graphs in place and recompiles
+    # them. Returns true if anything was modified.
     """
     Remove unused extra outputs from HOP calls in all submodules.
 
@@ -88,6 +97,11 @@ def _collect_all_subgraph_usages(
         int, list[tuple[torch.fx.GraphModule, str, torch.fx.Node]]
     ],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursively scans a graph module for calls to the
+    # supported HOPs whose first argument is an attribute node naming a graph module
+    # submodule, appending (parent module, attribute name, call node) to the list
+    # keyed by the subgraph's object identity in the passed mapping. Raises an error
+    # if the attribute target is not a string. Recurses into found subgraphs.
     """Recursively collect all HOP usages across the graph tree."""
     for node in gm.graph.nodes:
         if node.op == "call_function" and node.target in _HOPS_WITH_EXTRA_OUTPUTS:
@@ -114,6 +128,8 @@ def _is_output_used(
     output_idx: int,
     callers: list[tuple[torch.fx.GraphModule, str, torch.fx.Node]],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if any caller has an index-extraction
+    # (getitem) user of its HOP node at the given index that itself has users.
     """Check if output_idx is used by ANY caller (has a getitem with users)."""
     for _parent_gm, _subgraph_name, hop_node in callers:
         for user in hop_node.users:
@@ -128,6 +144,14 @@ def _dce_subgraph(
     callers: list[tuple[torch.fx.GraphModule, str, torch.fx.Node]],
     used_indices: set[int],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Rewrites the subgraph's output node to keep only used
+    # indices, remaps index-extraction nodes at every call site to the new positions
+    # (erasing unused ones, raising an error if an unused one has users or an index is
+    # not an integer), trims the example_value metadata on each HOP node (raising if it
+    # is not a tuple/list), then lints and recompiles the subgraph and parent graphs.
+    # Returns false without changes if all or none of the outputs are used.
+    # KNOWN ISSUE: the autograd_function_apply special case is dead code
+    # (is_autograd_fwd is hard-coded false).
     """
     DCE a subgraph by removing unused output indices.
 

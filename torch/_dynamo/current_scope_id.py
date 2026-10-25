@@ -1,3 +1,7 @@
+# [MODULE DOC] Thread-local nesting counter identifying the active SubgraphTracer scope.
+# Exposes current_scope_id (getter, default 1) and enter_new_scope (context manager
+# that increments the counter and restores it on exit). Import-time side effect:
+# creates the module-level thread-local storage object.
 """
 Provides thread-local scope identification for SubgraphTracer instances.
 
@@ -26,6 +30,8 @@ _current_scope_id = threading.local()
 
 
 def current_scope_id() -> int:
+    # [FUNCTION DOC] Returns the current thread's scope id, initializing it to 1 on
+    # first access in that thread (side effect: sets the thread-local value).
     global _current_scope_id
     if not hasattr(_current_scope_id, "value"):
         _current_scope_id.value = 1
@@ -34,6 +40,8 @@ def current_scope_id() -> int:
 
 @contextlib.contextmanager
 def enter_new_scope() -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that increments the thread-local scope id for
+    # the duration of its body and decrements it on exit (also on error).
     global _current_scope_id
     try:
         _current_scope_id.value = current_scope_id() + 1
