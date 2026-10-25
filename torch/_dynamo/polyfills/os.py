@@ -1,3 +1,6 @@
+# [MODULE DOC] Dynamo polyfill for os.fspath, registered via substitute_in_graph with
+# constant folding allowed. Exports fspath. Import-time side effect: registers the
+# substitution.
 """
 Python polyfills for os
 """
@@ -17,6 +20,10 @@ __all__ = ["fspath"]
 # pyrefly: ignore [bad-argument-type]
 @substitute_in_graph(os.fspath, can_constant_fold_through=True)
 def fspath(path: AnyStr | os.PathLike[AnyStr]) -> AnyStr:
+    # [FUNCTION DOC] Polyfill of os.fspath. Returns str or bytes input unchanged;
+    # otherwise calls the type's __fspath__ and returns its str/bytes result.
+    # Raises TypeError if the type has no __fspath__ or if __fspath__ returns something
+    # other than str or bytes; an AttributeError raised inside __fspath__ propagates.
     if isinstance(path, (str, bytes)):
         return path
 

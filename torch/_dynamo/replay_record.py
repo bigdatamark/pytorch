@@ -1,3 +1,7 @@
+# [MODULE DOC] Records and replays Python execution state: ModuleRecord, DummyModule,
+# ExecutionRecord (dill-serializable snapshot of code, closure, globals, locals, builtins)
+# and ExecutionRecorder (collects them while tracing). Import-time side effect: imports
+# dill via import_dill (may be None if not installed).
 from __future__ import annotations
 
 
@@ -36,23 +40,30 @@ dill = import_dill()
 
 @dataclasses.dataclass
 class ModuleRecord:
+    # [CLASS DOC] Tracks a real module and the attributes accessed on it (name to value),
+    # so a stand-in module can be rebuilt later.
     module: ModuleType
     accessed_attrs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclasses.dataclass
 class DummyModule:
+    # [CLASS DOC] Lightweight stand-in for a module, with name, is_torch flag and an
+    # optional value; attributes accessed during recording are set on it dynamically.
     name: str
     is_torch: bool = False
     value: object = None
 
     @property
     def __name__(self) -> str:
+        # [FUNCTION DOC] Property returning the stand-in module's name.
         return self.name
 
 
 @dataclasses.dataclass
 class ExecutionRecord:
+    # [CLASS DOC] Serializable snapshot of an execution: code object, closure cells, globals,
+    # locals, builtins and code options. Can be dumped to and loaded from a file with dill.
     code: CodeType
     closure: tuple[CellType]
     globals: dict[str, Any] = field(default_factory=dict)
@@ -62,12 +73,16 @@ class ExecutionRecord:
     code_options: CodeOptions = field(default_factory=lambda: cast("CodeOptions", {}))
 
     def dump(self, f: IO[str] | BufferedWriter) -> None:
+        # [FUNCTION DOC] Serializes this record to the open file with dill. Raises
+        # AssertionError if dill is not installed.
         if dill is None:
             raise AssertionError("replay_record requires `pip install dill`")
         dill.dump(self, f)
 
     @classmethod
     def load(cls, f: IO[bytes] | BufferedReader) -> Self:
+        # [FUNCTION DOC] Deserializes and returns a record from the open file with dill.
+        # Raises AssertionError if dill is not installed.
         if dill is None:
             raise AssertionError("replay_record requires `pip install dill`")
         return dill.load(f)
@@ -75,6 +90,10 @@ class ExecutionRecord:
 
 @dataclasses.dataclass
 class ExecutionRecorder:
+    # [CLASS DOC] Collects execution state during tracing: code, closure, globals, locals,
+    # builtins, code options and name_to_modrec (module name to ModuleRecord). Modules stored
+    # as variables are wrapped in ModuleRecords; get_record produces an ExecutionRecord with
+    # modules replaced by DummyModules.
     LOCAL_MOD_PREFIX = "___local_mod_"
 
     code: CodeType
@@ -87,23 +106,33 @@ class ExecutionRecorder:
     name_to_modrec: dict[str, ModuleRecord] = field(default_factory=dict)
 
     def add_local_var(self, name: str, var: Any) -> None:
+        # [FUNCTION DOC] Records a local variable; module values are stored as module records.
         if isinstance(var, ModuleType):
             self.locals[name] = self._add_mod(var)
         else:
             self.locals[name] = var
 
     def add_global_var(self, name: str, var: Any) -> None:
+        # [FUNCTION DOC] Records a global variable; module values are stored as module records.
         if isinstance(var, ModuleType):
             self.globals[name] = self._add_mod(var)
         else:
             self.globals[name] = var
 
     def add_local_mod(self, name: str, mod: ModuleType) -> None:
+        # [FUNCTION DOC] Records a module under the given name. Raises AssertionError if mod
+        # is not a module.
+        # KNOWN ISSUE: despite the name, it registers the module as a global, not a local.
         if not isinstance(mod, ModuleType):
             raise AssertionError(f"Expected ModuleType, got {type(mod)}")
         self.add_global_var(name, mod)
 
     def record_module_access(self, mod: ModuleType, name: str, val: Any) -> None:
+        # [FUNCTION DOC] Notes that attribute name of module mod had value val. Module-valued
+        # attributes are wrapped as module records; other values are stored only if mod is
+        # already tracked.
+        # KNOWN ISSUE: for module-valued attributes the owning module must already be tracked,
+        # otherwise a KeyError is raised.
         if isinstance(val, ModuleType):
             self.name_to_modrec[mod.__name__].accessed_attrs[name] = self._add_mod(val)
             return
@@ -112,6 +141,8 @@ class ExecutionRecorder:
             self.name_to_modrec[mod.__name__].accessed_attrs[name] = val
 
     def get_record(self) -> ExecutionRecord:
+        # [FUNCTION DOC] Builds an ExecutionRecord from the current state, resolving module
+        # records into dummy modules and copying builtins and code options.
         return ExecutionRecord(
             self.code,
             self.closure,
@@ -122,6 +153,8 @@ class ExecutionRecorder:
         )
 
     def _add_mod(self, mod: ModuleType) -> ModuleRecord:
+        # [FUNCTION DOC] HELPER: returns the module record for mod, creating and registering
+        # it by module name if needed.
         if mod.__name__ not in self.name_to_modrec:
             self.name_to_modrec[mod.__name__] = ModuleRecord(mod)
 
@@ -129,7 +162,11 @@ class ExecutionRecorder:
 
     @classmethod
     def _resolve_modules(cls, vars: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: returns a copy of the mapping with every module record
+        # replaced by a dummy module carrying its accessed attributes (resolved recursively).
         def resolve_module(var: Any) -> Any:
+            # [FUNCTION DOC] HELPER: non-records pass through; a record becomes a dummy module
+            # with each accessed attribute set to its resolved value.
             if not isinstance(var, ModuleRecord):
                 return var
 

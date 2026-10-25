@@ -1,3 +1,9 @@
+# [MODULE DOC] Loads and registers all Dynamo polyfill modules on import of torch._dynamo.
+# Defines POLYFILLED_MODULE_NAMES (the pytree module is added only when the C++ pytree is
+# Dynamo-traceable) and POLYFILLED_MODULES (the imported modules). Import-time side
+# effects: imports every polyfill module and removes each polyfilled original function's
+# id from trace_rules._builtin_function_ids so it is dispatched by its own variable
+# tracker instead of the generic builtin one.
 # Used to load and initialize polyfill handlers when importing torch._dynamo
 # Please add a new import when adding a new polyfill module.
 

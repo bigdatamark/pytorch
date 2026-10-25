@@ -1,3 +1,8 @@
+# [MODULE DOC] Precompile support: defines the backend cache artifact base class, the
+# eager artifact, a bypass exception, and PrecompileContext, a process-global registry that
+# collects Dynamo cache entries and backend artifacts and stitches them into
+# PrecompileCacheEntry objects written to DynamoCache. Import-time side effect: creates the
+# module logger only.
 import copy
 import json
 import logging
@@ -42,12 +47,18 @@ class BackendCacheArtifact(Generic[T]):
             result.my_post_deserialization_function(self.my_field)
             return result
     """
+    # [CLASS DOC] Abstract dataclass for one serializable backend artifact from a Dynamo
+    # backend. State: key (identifier used to match artifacts to cache entries) and content
+    # (serializable payload, usually raw bytes). Subclasses implement after_deserialization;
+    # edit_contents lets callers transform the content in place.
 
     key: str
     content: Any
 
     @abstractmethod
     def after_deserialization(self) -> T:
+        # [FUNCTION DOC] Abstract: converts the stored raw content back into the original
+        # backend object after reading from disk. Returns that object (type T).
         """
         Code to be run after reading raw byte contents from disk.
         Generally converts self.content from raw bytes back into its original form.
@@ -55,6 +66,8 @@ class BackendCacheArtifact(Generic[T]):
         ...
 
     def edit_contents(self, edit_fn: Callable[..., Any]) -> None:
+        # [FUNCTION DOC] Replaces the artifact content with the result of calling edit_fn on
+        # the current content (mutates self; returns nothing).
         """
         Edit the contents of the artifact.
         """
@@ -62,11 +75,16 @@ class BackendCacheArtifact(Generic[T]):
 
 
 class EagerCacheArtifact(BackendCacheArtifact[Any]):
+    # [CLASS DOC] Backend artifact for the eager backend: the content is already in its
+    # final form, so no deserialization work is needed.
     def after_deserialization(self) -> Any:
+        # [FUNCTION DOC] Returns the stored content unchanged.
         return self.content
 
 
 class BypassDynamoCacheEntry(Exception):
+    # [CLASS DOC] Exception type signalling that a Dynamo cache entry should be bypassed
+    # (not used or built). Carries no extra state.
     pass
 
 
@@ -85,6 +103,11 @@ class PrecompileContext:
      - BundledAOTAutogradCacheArtifact
 
     """
+    # [CLASS DOC] Global (class-level state only, never instantiated) registry for
+    # precompilation. State: _backend_artifacts_by_key (backend artifacts keyed by
+    # _BackendId, guarded by the compile lock) and _dynamo_cache_entries (Dynamo cache
+    # entries keyed by string). Key methods: record_artifact, record_dynamo_cache_entry,
+    # edit_artifact, create_cache_entries, save_to_dynamo_cache, clear.
 
     # Protected by the compile_lock
     # _backend_artifacts_by_key organizes results by the key of each artifact.
@@ -97,6 +120,8 @@ class PrecompileContext:
 
     @classmethod
     def clear(cls) -> None:
+        # [FUNCTION DOC] Empties both the backend artifact registry and the Dynamo cache
+        # entry registry (mutates global class state).
         cls._backend_artifacts_by_key.clear()
         cls._dynamo_cache_entries.clear()
 
@@ -105,6 +130,9 @@ class PrecompileContext:
         cls,
         artifact: BackendCacheArtifact[Any],
     ) -> None:
+        # [FUNCTION DOC] Stores a deep copy of the artifact in the backend registry under its
+        # key, replacing any prior one. Dispatch modes (e.g. fake tensor mode) are disabled
+        # during the copy so fake or meta tensors can be cloned.
         """
         Records a backend artifact to be used with dynamo cache entries
         """
@@ -122,10 +150,14 @@ class PrecompileContext:
     def record_dynamo_cache_entry(
         cls, cache_entry: _DynamoCacheEntry, key: str
     ) -> None:
+        # [FUNCTION DOC] Registers a Dynamo cache entry under the given key, overwriting any
+        # existing entry for that key.
         cls._dynamo_cache_entries[key] = cache_entry
 
     @classmethod
     def edit_artifact(cls, key: str, edit_fn: Callable[..., Any]) -> None:
+        # [FUNCTION DOC] Applies edit_fn to the content of the recorded artifact with the
+        # given key, in place. Raises AssertionError if no artifact has that key.
         """
         Edit the content of an existing artifact
         """
@@ -136,6 +168,8 @@ class PrecompileContext:
 
     @classmethod
     def serialize_artifact_by_key(cls, key: str) -> BackendCacheArtifact[Any] | None:
+        # [FUNCTION DOC] Looks up and returns the recorded backend artifact for the key, or
+        # None if absent. Does not serialize anything despite the name.
         """
         Return the backend cache artifact with the associated key
         """
@@ -146,6 +180,9 @@ class PrecompileContext:
         dynamo_entries: dict[str, _DynamoCacheEntry],
         backend_artifacts: dict[_BackendId, BackendCacheArtifact[Any]],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Builds a mapping with a "dynamo" list (each entry's debug_info plus
+        # its key) and a "backends" list (keys of the backend artifacts). Pure; returns the
+        # mapping.
         """
         Return a JSON serializable debug dump of all entries in the precompile context
         Called in serialize before serialization, and in populate_caches after deserialization
@@ -164,6 +201,9 @@ class PrecompileContext:
 
     @classmethod
     def save_to_dynamo_cache(cls) -> dict[str, Any]:
+        # [FUNCTION DOC] Builds full precompile cache entries from the registries and writes
+        # each to DynamoCache under its key (disk I/O side effect). Returns the debug info
+        # mapping from entry creation.
         precompile_cache_entries, debug_info = cls.create_cache_entries()
         for key, entry in precompile_cache_entries.items():
             DynamoCache.write(entry, key)
@@ -173,6 +213,11 @@ class PrecompileContext:
     def create_cache_entries(
         cls,
     ) -> tuple[dict[str, PrecompileCacheEntry], dict[str, Any]]:
+        # [FUNCTION DOC] Combines each Dynamo cache entry with the backend artifacts into a
+        # PrecompileCacheEntry. Emits a structured-trace artifact with a JSON debug summary.
+        # Entries whose conversion returns nothing are skipped; entries that raise are logged
+        # as warnings, reported via a structured-trace artifact, and skipped. Returns the
+        # mapping of key to entry and the debug info mapping.
         """
         Grabs all the cache entries in the precompile context and
         stitches them together into full PrecompileCacheEntries.

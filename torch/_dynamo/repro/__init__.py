@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Package for Dynamo repro/minifier support. Exports (in this file) the
+# ReproOptions Protocol describing the parsed command-line options used by the repro
+# entrypoints in after_aot.py and after_dynamo.py. Submodules hold the minifier logic.
 from __future__ import annotations
 
 from typing import Protocol
@@ -15,6 +18,10 @@ class ReproOptions(Protocol):
     never sets tracing_mode -- but each repro_* function only reads the subset
     that its own subparser defines.
     """
+    # [CLASS DOC] Structural (Protocol) type describing the attributes read from the
+    # argparse Namespace by the repro entrypoints. Declares attribute annotations only,
+    # no methods or state. Attributes are grouped as shared, after_aot-only and
+    # after_dynamo-only; not all are set for every subcommand.
 
     # Shared across the after_aot and after_dynamo subparsers.
     command: str

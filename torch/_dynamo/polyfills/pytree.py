@@ -1,5 +1,14 @@
 # Owner(s): ["module: pytree"]
 
+# [MODULE DOC] Pure-Python Dynamo polyfills for the optree C++ pytree API, so Dynamo can
+# trace torch.utils._cxx_pytree. Defines a Python PyTreeSpec analog and substitutes (via
+# substitute_in_graph) optree's tree_is_leaf, tree_iter, tree_leaves, tree_flatten,
+# tree_flatten_with_path, tree_structure, tree_unflatten, treespec_leaf/tuple/dict, the
+# namedtuple/structseq helpers, and the flatten/unflatten callbacks for None and dict.
+# Import-time side effects: imports optree and the C++ pytree extension, registers all
+# substitutions, injects the namedtuple/structseq helper substitutes into module globals,
+# and raises AssertionError if optree has no handler for None or dict.
+
 """
 Python polyfills for torch.utils.pytree
 """
@@ -71,6 +80,9 @@ _VT = TypeVar("_VT")
     can_constant_fold_through=True,
 )
 def _(*args: Any, **kwargs: Any) -> bool:
+    # [FUNCTION DOC] HELPER: placeholder substitute for the optree dict-insertion-order query;
+    # in namespace torch dicts are always insertion ordered. Never called directly because
+    # the constant-fold path calls the original; raises ValueError if it is called.
     # In namespace 'torch', the dictionary is always traversed in insertion order.
     # This function returns True.
     raise ValueError(
@@ -107,6 +119,9 @@ def tree_is_leaf(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> bool:
+    # [FUNCTION DOC] Polyfill of optree.tree_is_leaf. Returns True if tree is None while
+    # none_is_leaf is set, if the is_leaf predicate accepts it, or if its type has no
+    # registered pytree node handler in the namespace; otherwise False.
     if (tree is None and none_is_leaf) or (is_leaf is not None and is_leaf(tree)):
         return True
     if optree.register_pytree_node.get(type(tree), namespace=namespace) is None:
@@ -123,6 +138,9 @@ def tree_iter(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> Iterable[Any]:
+    # [FUNCTION DOC] Polyfill of optree.tree_iter: generator yielding leaves depth-first in
+    # left-to-right order, using an explicit stack and one-level flattening of each non-leaf
+    # node. Args: tree, optional is_leaf predicate, none_is_leaf flag, namespace.
     stack = [tree]
     while stack:
         node = stack.pop()
@@ -153,6 +171,8 @@ def tree_leaves(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> list[Any]:
+    # [FUNCTION DOC] Polyfill of optree.tree_leaves: returns the leaves of tree as a list
+    # (the collected result of tree_iter).
     return list(
         tree_iter(
             tree,
@@ -164,12 +184,17 @@ def tree_leaves(
 
 
 class _Asterisk(str):
+    # [CLASS DOC] HELPER: string subclass whose value is an asterisk and whose repr omits
+    # quotes; used as the leaf marker when printing a PyTreeSpec. One instance is created
+    # and the class name is deleted afterwards.
     __slots__ = ()
 
     def __new__(cls) -> Self:
+        # [FUNCTION DOC] HELPER: creates the string instance with value asterisk.
         return super().__new__(cls, "*")
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: returns an unquoted asterisk.
         return "*"  # no quotes
 
 
@@ -179,6 +204,12 @@ del _Asterisk
 
 @dataclass(frozen=True, repr=False, eq=False, unsafe_hash=False, slots=True)
 class PyTreeSpec:
+    # [CLASS DOC] Frozen slotted dataclass that mimics optree.PyTreeSpec in Python. State:
+    # _children (child specs), _type (node type, None for a leaf), _metadata, _entries
+    # (child keys/indices), _unflatten_func, none_is_leaf, namespace, and derived counts
+    # num_nodes, num_leaves, num_children. Invariants: a leaf has no children, metadata,
+    # entries or unflatten function; a non-leaf has a callable unflatten function. Key
+    # methods: unflatten, flatten_up_to, paths, accessors, children, entries.
     """Analog for :class:`optree.PyTreeSpec` in Python."""
 
     _children: tuple[PyTreeSpec, ...]
@@ -194,6 +225,9 @@ class PyTreeSpec:
     num_children: int = field(init=False)
 
     def __post_init__(self, /) -> None:
+        # [FUNCTION DOC] Validates the leaf/non-leaf invariants (raises AssertionError on
+        # violation) and computes num_nodes, num_leaves and num_children from the children,
+        # storing them on the frozen instance.
         if self._type is None:
             if len(self._children) != 0:
                 raise AssertionError("Leaf node must have no children")
@@ -223,7 +257,13 @@ class PyTreeSpec:
         object.__setattr__(self, "num_children", num_children)
 
     def __repr__(self, /) -> str:
+        # [FUNCTION DOC] Builds a string like the C++ spec repr: nested structure with an
+        # asterisk for leaves, optionally a NoneIsLeaf marker, and the namespace. Builtin,
+        # namedtuple and structseq nodes are rebuilt via their unflatten function on child
+        # strings; custom nodes print as CustomTreeNode with type, metadata and children.
+        # Raises AssertionError if the spec violates leaf/non-leaf invariants.
         def helper(treespec: PyTreeSpec) -> str:
+            # [FUNCTION DOC] HELPER: recursive string builder for one spec node.
             if treespec.is_leaf():
                 if treespec.type is not None:
                     raise AssertionError("Leaf treespec must have type None")
@@ -261,9 +301,13 @@ class PyTreeSpec:
         return f"PyTreeSpec({', '.join(inner)})"
 
     def __len__(self, /) -> int:
+        # [FUNCTION DOC] Returns the number of leaves.
         return self.num_leaves
 
     def __eq__(self, other: Any, /) -> bool:
+        # [FUNCTION DOC] Structural equality: returns NotImplemented for non-specs; otherwise
+        # compares none_is_leaf, node and leaf counts, type, metadata, namespace (ignored if
+        # either side is empty) and children recursively.
         if not isinstance(other, PyTreeSpec):
             return NotImplemented
         if (
@@ -281,6 +325,10 @@ class PyTreeSpec:
         return self._children == other._children
 
     def __hash__(self, /) -> int:
+        # [FUNCTION DOC] Hash consistent with equality: combines none_is_leaf, type, counts,
+        # node data and children. Dict nodes hash their entries, builtin/namedtuple/structseq
+        # nodes their metadata, custom nodes only their type. Namespace is excluded because
+        # an empty namespace compares equal to any.
         node_type = self._type
         if node_type in STANDARD_DICT_TYPES:
             # Dict metadata is the (unhashable) list of keys; hash the keys instead.
@@ -311,13 +359,18 @@ class PyTreeSpec:
 
     @property
     def type(self, /) -> builtins.type | None:
+        # [FUNCTION DOC] Property: the node type of this spec, None for a leaf.
         return self._type
 
     def is_leaf(self, /) -> bool:
+        # [FUNCTION DOC] True if this spec is a single leaf (one node, one leaf).
         return self.num_nodes == 1 and self.num_leaves == 1
 
     def paths(self, /) -> list[tuple[Any, ...]]:
+        # [FUNCTION DOC] Returns the key path (tuple of entries) from the root to each leaf in
+        # flatten order.
         def helper(treespec: PyTreeSpec, path_prefix: list[Any]) -> None:
+            # [FUNCTION DOC] HELPER: recursively appends the path to each leaf.
             if treespec.is_leaf():
                 paths.append(path_prefix)
                 return
@@ -334,10 +387,15 @@ class PyTreeSpec:
         return [tuple(path) for path in paths]
 
     def accessors(self, /) -> list[optree.PyTreeAccessor]:
+        # [FUNCTION DOC] Returns an optree PyTreeAccessor for each leaf, built from path entry
+        # objects created with each node registered handler (kind and entry type). Raises
+        # AssertionError if a non-leaf has no type or no registered handler.
         def helper(
             treespec: PyTreeSpec,
             entry_path_prefix: list[optree.PyTreeEntry],
         ) -> None:
+            # [FUNCTION DOC] HELPER: recursively builds the entry path to each leaf.
+            # Raises AssertionError if a non-leaf lacks a type or handler.
             if treespec.is_leaf():
                 entry_paths.append(entry_path_prefix)
                 return
@@ -368,23 +426,33 @@ class PyTreeSpec:
         return [optree.PyTreeAccessor(path) for path in entry_paths]
 
     def children(self, /) -> list[PyTreeSpec]:
+        # [FUNCTION DOC] Returns a list copy of the child specs.
         return list(self._children)
 
     def child(self, index: int, /) -> PyTreeSpec:
+        # [FUNCTION DOC] Returns the child spec at the index (IndexError if out of range).
         return self._children[index]
 
     def entries(self, /) -> list[Any]:
+        # [FUNCTION DOC] Returns a list copy of the child entries (keys or indices).
         return list(self._entries)
 
     def entry(self, index: int, /) -> Any:
+        # [FUNCTION DOC] Returns the entry at the index (IndexError if out of range).
         return self._entries[index]
 
     def flatten_up_to(self, tree: PyTree, /) -> list[PyTree]:
+        # [FUNCTION DOC] Flattens tree only as deep as this spec, returning the subtrees at leaf
+        # positions. Raises ValueError on type mismatch, arity mismatch, dict key mismatch
+        # (standard dict types are interchangeable), or metadata/context mismatch (deque maxlen
+        # is ignored; custom node types must match exactly).
         def helper(
             treespec: PyTreeSpec,
             node: PyTree,
             subtrees: list[PyTree],
         ) -> None:
+            # [FUNCTION DOC] HELPER: recursively matches a node against a spec node, appending
+            # subtrees found at leaf positions; raises ValueError on any mismatch.
             if treespec.is_leaf():
                 subtrees.append(node)
                 return
@@ -468,6 +536,9 @@ class PyTreeSpec:
         return subtrees
 
     def unflatten(self, leaves: Iterable[Any], /) -> PyTree:
+        # [FUNCTION DOC] Rebuilds a pytree from the given leaves by recursively unflattening
+        # slices per child and calling the node unflatten function. Raises ValueError if the
+        # leaf count differs from num_leaves.
         if not isinstance(leaves, (list, tuple)):
             leaves = list(leaves)
         if len(leaves) != self.num_leaves:
@@ -494,6 +565,8 @@ class PyTreeSpec:
 
 
 def _is_pytreespec_instance(obj: Any, /) -> TypeIs[PyTreeSpec | python_pytree.TreeSpec]:
+    # [FUNCTION DOC] HELPER: type guard, True if obj is this module PyTreeSpec or the
+    # pure-Python pytree TreeSpec.
     return isinstance(obj, (PyTreeSpec, python_pytree.TreeSpec))
 
 
@@ -508,6 +581,8 @@ def treespec_leaf(
     none_is_leaf: bool = False,
     namespace: str = "",  # unused
 ) -> PyTreeSpec:
+    # [FUNCTION DOC] Polyfill of optree.treespec_leaf: returns a leaf PyTreeSpec with the
+    # given none_is_leaf flag and an empty namespace (namespace argument is ignored).
     return PyTreeSpec(
         (),
         None,
@@ -532,6 +607,10 @@ def treespec_tuple(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> PyTreeSpec:
+    # [FUNCTION DOC] Polyfill of optree.treespec_tuple: builds a tuple-node spec from child
+    # specs. Raises ValueError if a child is not a spec or its none_is_leaf or namespace
+    # differs from the parent (empty child namespace allowed); AssertionError if no tuple
+    # handler is registered.
     children = tuple(iterable)
     if any(not _is_pytreespec_instance(child) for child in children):
         raise ValueError(f"Expected a tuple of PyTreeSpecs, got: {children!r}.")
@@ -573,6 +652,9 @@ def treespec_dict(
     namespace: str = "",
     **kwargs: PyTreeSpec,
 ) -> PyTreeSpec:
+    # [FUNCTION DOC] Polyfill of optree.treespec_dict: builds a dict-node spec from a mapping
+    # (or pairs) of child specs plus keyword children, flattening one level to get ordering
+    # metadata. Raises ValueError for non-spec values or mismatched none_is_leaf/namespace.
     dct = dict(mapping, **kwargs)
     if any(not _is_pytreespec_instance(child) for child in dct.values()):
         raise ValueError(f"Expected a dictionary of TreeSpecs, got: {dct!r}.")
@@ -622,7 +704,11 @@ def tree_flatten(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> tuple[list[Any], PyTreeSpec]:
+    # [FUNCTION DOC] Polyfill of optree.tree_flatten: recursively flattens the tree and
+    # returns the list of leaves and the matching PyTreeSpec. Args: tree, is_leaf predicate,
+    # none_is_leaf, namespace.
     def helper(node: PyTree, leaves: list[Any]) -> PyTreeSpec:
+        # [FUNCTION DOC] HELPER: flattens one node, appending leaves and returning its spec.
         if tree_is_leaf(
             node,
             is_leaf=is_leaf,
@@ -682,6 +768,8 @@ def _C_flatten(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> tuple[list[Any], PyTreeSpec]:
+    # [FUNCTION DOC] HELPER: substitute for the optree C-level flatten; forwards to
+    # tree_flatten, mapping leaf_predicate to is_leaf.
     return tree_flatten(  # type: ignore[return-value]
         tree,
         is_leaf=leaf_predicate,
@@ -704,6 +792,8 @@ def tree_flatten_with_path(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> tuple[list[tuple[Any, ...]], list[Any], PyTreeSpec]:
+    # [FUNCTION DOC] Polyfill of optree.tree_flatten_with_path: returns the key paths, leaves
+    # and spec (paths taken from the spec after flattening).
     leaves, treespec = tree_flatten(
         tree,
         is_leaf=is_leaf,
@@ -726,6 +816,8 @@ def _C_flatten_with_path(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> tuple[list[tuple[Any, ...]], list[Any], PyTreeSpec]:
+    # [FUNCTION DOC] HELPER: substitute for the optree C-level flatten_with_path; forwards
+    # to tree_flatten_with_path, mapping leaf_predicate to is_leaf.
     return tree_flatten_with_path(  # type: ignore[return-value]
         tree,
         is_leaf=leaf_predicate,
@@ -748,6 +840,8 @@ def tree_structure(
     none_is_leaf: bool = False,
     namespace: str = "",
 ) -> PyTreeSpec:
+    # [FUNCTION DOC] Polyfill of optree.tree_structure: returns only the spec produced by
+    # tree_flatten.
     return tree_flatten(  # type: ignore[return-value]
         tree,
         is_leaf=is_leaf,
@@ -763,6 +857,9 @@ def tree_structure(
     can_constant_fold_through=False,
 )
 def tree_unflatten(treespec: PyTreeSpec, leaves: Iterable[Any]) -> PyTree:
+    # [FUNCTION DOC] Polyfill of optree.tree_unflatten: rebuilds a tree from a spec and
+    # leaves. Raises TypeError if treespec is not a spec instance; ValueError on leaf count
+    # mismatch (via the spec).
     if not _is_pytreespec_instance(treespec):
         raise TypeError(
             f"Expected `treespec` to be an instance of "
@@ -782,6 +879,8 @@ if _none_registration is None:
     skip_signature_check=True,
 )
 def none_unflatten(_: None, children: Iterable[_T], /) -> None:
+    # [FUNCTION DOC] HELPER: substitute for the None node unflatten callback; returns None.
+    # Raises ValueError if any children are given.
     if len(list(children)) != 0:
         raise ValueError("Expected no children.")
     return None
@@ -801,6 +900,9 @@ with optree.dict_insertion_ordered(False, namespace="torch"):
 def dict_flatten(
     dct: dict[_KT, _VT], /
 ) -> tuple[list[_VT], tuple[list[_KT], list[_KT]], tuple[_KT, ...]]:
+    # [FUNCTION DOC] HELPER: substitute for the dict flatten callback in the torch namespace.
+    # Sorts keys with a total order, returns the values in sorted-key order, metadata of
+    # (original key order, sorted keys) and the sorted keys as entries.
     sorted_keys = optree.utils.total_order_sorted(dct)
     values = [dct[key] for key in sorted_keys]
     original_keys = list(dct)
@@ -817,6 +919,9 @@ def dict_unflatten(
     values: Iterable[_VT],
     /,
 ) -> dict[_KT, _VT]:
+    # [FUNCTION DOC] HELPER: substitute for the dict unflatten callback; rebuilds a dict
+    # with the original key order, assigning values to the sorted keys. Raises ValueError
+    # if the value count differs from the key count.
     original_keys, sorted_keys = metadata
     d = dict.fromkeys(original_keys)
     d.update(zip(sorted_keys, values, strict=True))

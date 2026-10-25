@@ -1,3 +1,7 @@
+# [MODULE DOC] Dynamo polyfills for torch._C._nn._parse_to,
+# torch.__future__.get_swap_module_params_on_conversion and
+# torch._has_compatible_shallow_copy_type, registered via substitute_in_graph. Exports the
+# three polyfill functions. Import-time side effect: registers the substitutions.
 """
 Polyfills for torch._C._nn functions.
 """
@@ -14,6 +18,13 @@ from ..decorators import substitute_in_graph
 def _parse_to_polyfill(
     *args: Any, **kwargs: Any
 ) -> tuple[torch.device, torch.dtype, bool, torch.memory_format]:
+    # [FUNCTION DOC] HELPER: polyfill of torch._C._nn._parse_to. If a torch function mode is
+    # enabled, pops it temporarily and lets it handle the call, returning its result unless it
+    # is NotImplemented. Otherwise parses one optional positional argument (tensor gives
+    # device and dtype; dtype; or device string/object) plus keyword device, dtype,
+    # non_blocking, memory_format. Returns (device, dtype, non_blocking, memory_format) with
+    # None/False defaults. Raises TypeError for an invalid positional type or more than one
+    # positional argument. A string positional device is converted to a device object.
     """
     Polyfill for torch._C._nn._parse_to that parses arguments to nn.Module.to().
 
@@ -86,6 +97,8 @@ def _parse_to_polyfill(
 
 @substitute_in_graph(torch.__future__.get_swap_module_params_on_conversion)
 def get_swap_module_params_on_conversion_polyfill() -> bool:
+    # [FUNCTION DOC] HELPER: polyfill that reads and returns the module-level flag in
+    # torch.__future__ controlling whether module params are swapped on conversion.
     """
     Polyfill for torch.__future__.get_swap_module_params_on_conversion.
 
@@ -101,6 +114,8 @@ def get_swap_module_params_on_conversion_polyfill() -> bool:
 def _has_compatible_shallow_copy_type_polyfill(
     input: torch.Tensor, from_: torch.Tensor
 ) -> bool:
+    # [FUNCTION DOC] HELPER: polyfill of torch._has_compatible_shallow_copy_type; approximates
+    # the C++ check by returning whether both tensors have exactly the same Python type.
     """
     Polyfill for torch._has_compatible_shallow_copy_type.
 
