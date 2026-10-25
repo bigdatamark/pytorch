@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Python dispatcher utilities. Re-exports the C++ context managers
+# enable_python_dispatcher, no_python_dispatcher and enable_pre_dispatch, and
+# provides debugging support for "crossref" functionalization: running each op
+# both under fake tensors without functionalization and with the real
+# functionalized kernel, and comparing output metadata (size, dtype, strides).
+# Holds the module flag CROSSREF_FUNCTIONALIZE, toggled by
+# enable_crossref_functionalize. No import-time side effects beyond binding names.
 import itertools
 import unittest.mock
 from collections.abc import Callable, Generator, Iterator
@@ -27,6 +35,11 @@ _R = TypeVar("_R")
 
 
 def all_py_loaded_overloads() -> Iterator[torch._ops.OpOverload]:
+    # [FUNCTION DOC]
+    # Generator yielding every OpOverload object that has already been
+    # materialized in Python by walking all namespaces, packets and overloads
+    # of torch.ops. Lazy: ops never accessed from Python are not reported, so
+    # the set is incomplete. Used for cache invalidation.
     """
     Warning: the set of overloads this will report is very subtle.  It is precisely
     the set of torch.ops functions that have actually been accessed from Python
@@ -54,6 +67,11 @@ def all_py_loaded_overloads() -> Iterator[torch._ops.OpOverload]:
 
 @contextmanager
 def suspend_functionalization() -> Generator[None, None, None]:
+    # [FUNCTION DOC]
+    # Context manager that temporarily disables functionalization if the
+    # Functionalize dispatch key is currently included in thread-local state,
+    # then re-enables it (with the previously active reapply-views setting) on
+    # exit, even on error. Does nothing if functionalization is not active.
     f_tls = torch._C._dispatch_tls_is_dispatch_key_included(
         torch._C.DispatchKey.Functionalize
     )
@@ -70,6 +88,9 @@ def suspend_functionalization() -> Generator[None, None, None]:
 def check_tensor_metadata_matches(
     nv: torch.Tensor, rv: torch.Tensor, desc: Callable[[], str]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Compare two tensors' size, dtype and significant
+    # strides. desc is a callable producing a description for error messages.
+    # Raises AssertionError on any mismatch or if desc is not callable.
     if not callable(desc):
         raise AssertionError(f"desc must be callable, got {type(desc)}")
     if nv.size() != rv.size():
@@ -86,6 +107,10 @@ def check_tensor_metadata_matches(
 
 
 def check_metadata_matches(n: object, r: object, desc: Callable[[], str]) -> None:
+    # [FUNCTION DOC] HELPER: Flatten two nested outputs and check that they
+    # have the same number of leaves, then compare metadata of each pair whose
+    # second element is a tensor. Raises AssertionError on mismatch. Container
+    # structure (tuple vs list) is not compared.
     if not callable(desc):
         raise AssertionError(f"desc must be callable, got {type(desc)}")
     n_vals, _n_spec = pytree.tree_flatten(n)
@@ -101,14 +126,21 @@ def check_metadata_matches(n: object, r: object, desc: Callable[[], str]) -> Non
 
 
 class Lit:
+    # [CLASS DOC] HELPER: Wrapper around a string whose repr is the raw string,
+    # used to print literal text inside formatted argument lists.
     def __init__(self, s: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the string s.
         self.s = s
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the stored string unchanged.
         return self.s
 
 
 def _fmt(a: object) -> object:
+    # [FUNCTION DOC] HELPER: Replace a tensor with a Lit showing an
+    # empty-strided construction (size, stride, dtype); return other values
+    # unchanged.
     if isinstance(a, torch.Tensor):
         return Lit(
             f"torch.empty_strided({tuple(a.size())}, {a.stride()}, dtype={a.dtype})"
@@ -120,6 +152,14 @@ def _fmt(a: object) -> object:
 def make_crossref_functionalize(
     op: torch._ops.OpOverload[_P, _T], final_key: DispatchKey
 ) -> Callable[_P, _T] | DispatchKey:
+    # [FUNCTION DOC]
+    # Build a dispatch handler for op that cross-checks functionalization.
+    # The handler converts args to fake tensors (unwrapping functional
+    # tensors), runs op under a FakeTensorMode with functionalization
+    # suspended, then runs the real kernel for final_key, and asserts output
+    # metadata matches (AssertionError with a readable call description).
+    # Returns the real result. For lift_fresh.default, returns final_key itself
+    # instead of a handler.
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     # This case is pretty weird, suppress it for now
@@ -127,9 +167,15 @@ def make_crossref_functionalize(
         return final_key
 
     def handler(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # [FUNCTION DOC] HELPER: Run op on fake copies of the inputs and on the
+        # real inputs via the final dispatch key, compare metadata, return the
+        # real output. Raises AssertionError on metadata mismatch.
         fake_mode = FakeTensorMode()
 
         def fakeify_defun(t: _R) -> _R | torch._subclasses.fake_tensor.FakeTensor:
+            # [FUNCTION DOC] HELPER: Convert a tensor to a fake tensor, first
+            # unwrapping functional tensors (asserting inner size and stride
+            # equal the outer); non-tensors pass through.
             if isinstance(t, torch.Tensor):
                 if torch._is_functional_tensor(t):
                     r = torch._from_functional_tensor(t)
@@ -150,6 +196,7 @@ def make_crossref_functionalize(
             return t
 
         def maybe_detach(t: _R) -> _R | torch.Tensor:
+            # [FUNCTION DOC] HELPER: Detach tensors; return other values as is.
             if isinstance(t, torch.Tensor):
                 return t.detach()
             else:
@@ -170,6 +217,8 @@ def make_crossref_functionalize(
         r = op._op_dk(final_key, *args, **kwargs)
 
         def desc() -> str:
+            # [FUNCTION DOC] HELPER: Format the op call with its (fake)
+            # arguments as text for error messages.
             fmt_args = ", ".join(
                 itertools.chain(
                     (repr(pytree.tree_map(_fmt, a)) for a in orig_f_args),
@@ -191,6 +240,12 @@ def make_crossref_functionalize(
 # for debugging purposes.
 @contextmanager
 def enable_crossref_functionalize() -> Generator[None, None, None]:
+    # [FUNCTION DOC]
+    # Debug-only, slow context manager. Invalidates the cached Functionalize
+    # dispatch entry of every loaded op overload, enables the python
+    # dispatcher, and patches CROSSREF_FUNCTIONALIZE to true so the handler
+    # from make_crossref_functionalize is used. On exit (including errors) the
+    # caches are invalidated again.
     for op in all_py_loaded_overloads():
         op._uncache_dispatch(torch._C.DispatchKey.Functionalize)
     try:

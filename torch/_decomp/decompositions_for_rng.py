@@ -1,5 +1,15 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Decompositions that functionalize CUDA RNG ops into Philox-based functional
+# primitives for AOT Autograd tracing. Contains the rng_decompositions registry
+# (keyed by name, mapping op overloads to functions), rand/rand_like
+# decompositions, PhiloxState and PhiloxStateTracker (seed/offset tracking for
+# forward and backward), and extra random decompositions (bernoulli, normal,
+# dropout, ...) that reduce to rand_like.
+# Import-time side effects: builds extra_random_decomps from the global
+# decomposition table, registers bernoulli decompositions, and merges all of
+# them into rng_decompositions.
 import functools
 from collections import defaultdict
 from collections.abc import Callable
@@ -16,10 +26,15 @@ rng_decompositions: dict[str, dict[OpOverload, Callable]] = defaultdict(dict)
 
 
 def register_rng_decomposition(aten_op):
+    # [FUNCTION DOC]
+    # Returns a decorator registering a decomposition for aten_op into the
+    # rng_decompositions registry.
     return decomp.register_decomposition(aten_op, rng_decompositions)
 
 
 def throw_on_non_cuda(device):
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError explaining that RNG
+    # functionalization is only supported for Philox-based (CUDA) devices.
     raise RuntimeError(
         f"You are trying to functionalize a {device.type} RNG operator but {device.type} does not "
         f"use Philox/counter-based RNG. Therefore, functionalizing a {device.type} RNG operator is "
@@ -31,6 +46,12 @@ def throw_on_non_cuda(device):
 # ops like dropout which have fused implementation and can hide the rand inside.
 @register_rng_decomposition(aten.rand)
 def rand(shape, dtype=None, layout=torch.strided, device=None, pin_memory=False):
+    # [FUNCTION DOC]
+    # Decomposition of aten.rand into the functional philox_rand primitive.
+    # Reads (seed, offset) from the tracker, draws a tensor of the given shape
+    # (dtype defaults to float32), and advances the tracker offset by the
+    # amount consumed. Raises RuntimeError for a non-CUDA device. layout and
+    # pin_memory are ignored.
     if device and device.type != "cuda":
         throw_on_non_cuda(device)
     seed, offset = PhiloxStateTracker.get_state_as_tuple()
@@ -51,6 +72,11 @@ def rand_like(
     pin_memory=False,
     memory_format=torch.preserve_format,
 ):
+    # [FUNCTION DOC]
+    # Decomposition of aten.rand_like via philox_rand: draws uniform values
+    # with the shape of x, using x's device and dtype unless overridden, and
+    # advances the tracker offset. Raises RuntimeError for non-CUDA devices.
+    # layout, pin_memory and memory_format are ignored (output is contiguous).
     device = device or x.device
     if device.type != "cuda":
         throw_on_non_cuda(device)
@@ -64,6 +90,12 @@ def rand_like(
 
 
 class PhiloxState:
+    # [CLASS DOC]
+    # Holds one Philox RNG state: seed and base_offset tensors (RNG state just
+    # before tracing) plus an integer relative_offset (offset consumed during
+    # tracing), and a flag offset_advanced_at_least_once. The effective offset
+    # is base_offset + relative_offset. Seed/base_offset are empty tensors until
+    # set; get_state_* validate that they were set.
     """
     Represents a PhiloxRngState - (seed, offset) where offset = base_offset +
     relative_offset. seed and base_offset basically point to the rng state just
@@ -72,15 +104,20 @@ class PhiloxState:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize to the empty/reset state.
         self.reset()
 
     def reset(self):
+        # [FUNCTION DOC] Reset seed and base_offset to empty tensors,
+        # relative_offset to 0, and clear the advanced flag.
         self.seed = torch.tensor(())
         self.base_offset = torch.tensor(())
         self.relative_offset = 0
         self.offset_advanced_at_least_once = False
 
     def validate_state(self):
+        # [FUNCTION DOC] Raise AssertionError if seed or base_offset is still
+        # empty (state never set).
         if self.seed.numel() == 0 or self.base_offset.numel() == 0:
             raise AssertionError(
                 f"seed and base_offset must not be empty, got "
@@ -88,30 +125,48 @@ class PhiloxState:
             )
 
     def advance_offset(self, consumed_offset):
+        # [FUNCTION DOC] Add consumed_offset to relative_offset and mark that
+        # the offset has been advanced.
         self.offset_advanced_at_least_once = True
         self.relative_offset = self.relative_offset + consumed_offset
 
     def set_state(self, seed, base_offset, relative_offset=0):
+        # [FUNCTION DOC] Store seed, base_offset and relative_offset (default
+        # 0). Does not touch the advanced flag.
         self.seed = seed
         self.base_offset = base_offset
         self.relative_offset = relative_offset
 
     def get_state_as_tuple(self):
+        # [FUNCTION DOC] Validate, then return (seed, base_offset +
+        # relative_offset). Raises AssertionError if state is unset.
         self.validate_state()
         return (self.seed, self.base_offset + self.relative_offset)
 
     def get_state_as_tensor(self):
+        # [FUNCTION DOC] Validate, then return seed and the effective offset
+        # stacked into one tensor (used to emulate get_rng_state). Raises
+        # AssertionError if state is unset.
         # Only needed because we override get_rng_state.
         self.validate_state()
         return torch.stack([self.seed, self.base_offset + self.relative_offset])
 
     def set_state_from_tensor(self, state):
+        # [FUNCTION DOC] Unbind a stacked state tensor into seed and
+        # base_offset and reset relative_offset to 0 (emulates set_rng_state).
         # Only needed because we override set_rng_state.
         self.seed, self.base_offset = torch.unbind(state)
         self.relative_offset = 0
 
 
 class PhiloxStateTracker:
+    # [CLASS DOC]
+    # Process-wide singleton (class-level state, no instances needed) tracking
+    # Philox RNG state during AOT Autograd tracing. Class attributes:
+    # fwd_state, bwd_state (PhiloxState each) and running_state, which aliases
+    # whichever is currently active. Usable as a context manager that resets
+    # state on enter and exit. Provides helpers to record state, advance
+    # offsets, and compute final offsets rounded up to a multiple of 4.
     """
     Singleton class to track the philox rng state during AOT Autograd tracing.
     For each aot tracing instance, AOT Autograd resets this tracker and keeps
@@ -127,30 +182,41 @@ class PhiloxStateTracker:
     bwd_state: PhiloxState
 
     def __enter__(self):
+        # [FUNCTION DOC] Reset the global tracker and return self.
         PhiloxStateTracker.reset()
         return self
 
     def __exit__(self, exc_type, exc_cal, exc_tb):
+        # [FUNCTION DOC] Reset the global tracker; never suppresses exceptions.
         PhiloxStateTracker.reset()
 
     @classmethod
     def reset(cls):
+        # [FUNCTION DOC] Replace running, forward and backward states with
+        # fresh PhiloxState objects (running_state is NOT aliased to
+        # fwd_state afterwards).
         cls.running_state = PhiloxState()
         cls.fwd_state = PhiloxState()
         cls.bwd_state = PhiloxState()
 
     @classmethod
     def mark_beginning_of_forward(cls):
+        # [FUNCTION DOC] Make the forward state the running state.
         # Tells the tracker to use fwd_state as the running state
         cls.running_state = cls.fwd_state
 
     @classmethod
     def mark_beginning_of_backward(cls):
+        # [FUNCTION DOC] Make the backward state the running state.
         # Tells the tracker to use bwd_state as the running state
         cls.running_state = cls.bwd_state
 
     @classmethod
     def record_state(cls, seed, offset, mode):
+        # [FUNCTION DOC] Store seed and base offset tensors for the given mode.
+        # For "forward" it sets fwd_state and also makes it the running state;
+        # for "backward" it only sets bwd_state. Any other mode raises
+        # AssertionError.
         # Records the seed and offset tensors. These tensors are used to invoke
         # the philox_rand functional primitives.
         if mode == "forward":
@@ -163,6 +229,8 @@ class PhiloxStateTracker:
 
     @classmethod
     def get_state_as_tensor(cls):
+        # [FUNCTION DOC] Return the running state as a single stacked tensor
+        # (seed, effective offset); see PhiloxState.get_state_as_tensor.
         # The only reason this exists is because we override get_rng_state and
         # set_rng_state during tracing. get_rng_state expects a tensor output,
         # so return (seed, offset) tuple upset other parts of the program like
@@ -179,24 +247,31 @@ class PhiloxStateTracker:
 
     @classmethod
     def get_state_as_tuple(cls):
+        # [FUNCTION DOC] Return (seed, effective offset) of the running state.
         return cls.running_state.get_state_as_tuple()
 
     @classmethod
     def set_state_from_tensor(cls, x):
+        # [FUNCTION DOC] Set the running state from a stacked state tensor x
+        # (seed, offset); relative offset resets to 0.
         # This is only needed because we override set_rng_state. Look at the
         # comment in get_state_from_tensor method.
         cls.running_state.set_state_from_tensor(x)
 
     @classmethod
     def advance_offset(cls, consumed_offset):
+        # [FUNCTION DOC] Advance the running state's relative offset.
         cls.running_state.advance_offset(consumed_offset)
 
     @classmethod
     def get_current_relative_offset(cls):
+        # [FUNCTION DOC] Return the running state's consumed relative offset.
         return cls.running_state.relative_offset
 
     @staticmethod
     def multiple_of_4(offset):
+        # [FUNCTION DOC] HELPER: Round offset up to the next multiple of 4
+        # (CUDA RNG offsets must be multiples of 4). Works on ints or tensors.
         # torch cuda rng state offset must be a multiple of 4. For inductor, as
         # we sum up all the numel, the result might not be a multiple of 4. This
         # method achieves that.
@@ -204,6 +279,9 @@ class PhiloxStateTracker:
 
     @classmethod
     def get_updated_fwd_offset(cls):
+        # [FUNCTION DOC] Return the forward base offset advanced by the
+        # consumed relative offset, rounded up to a multiple of 4. If no rand
+        # op advanced the offset, returns the unchanged base offset.
         # Short circuit if no rand ops were observed
         if not cls.fwd_state.offset_advanced_at_least_once:
             return cls.fwd_state.base_offset
@@ -213,6 +291,8 @@ class PhiloxStateTracker:
 
     @classmethod
     def get_updated_bwd_offset(cls):
+        # [FUNCTION DOC] Same as get_updated_fwd_offset but for the backward
+        # state.
         # Short circuit if no rand ops were observed
         if not cls.bwd_state.offset_advanced_at_least_once:
             return cls.bwd_state.base_offset
@@ -256,6 +336,10 @@ register_extra_random_decomp = functools.partial(
 
 @register_extra_random_decomp([aten.bernoulli_])
 def bernoulli_(self, p=0.5):
+    # [FUNCTION DOC]
+    # In-place bernoulli decomposition: fills self with whether a uniform
+    # float32 draw is below p. Returns NotImplemented on CPU so the
+    # decomposition is skipped there.
     if self.device == torch.device("cpu"):
         return NotImplemented
     return self.copy_(torch.rand_like(self, dtype=torch.float32) < p)
@@ -263,6 +347,10 @@ def bernoulli_(self, p=0.5):
 
 @register_extra_random_decomp([aten.bernoulli.p])
 def bernoulli_p(self, p=0.5, *, generator=None):
+    # [FUNCTION DOC]
+    # Decomposition of bernoulli.p: returns a boolean tensor of self's shape
+    # that is true where a uniform float32 draw is below p. Returns
+    # NotImplemented on CPU. Raises AssertionError if a generator is given.
     if self.device == torch.device("cpu"):
         return NotImplemented
     if generator is not None:

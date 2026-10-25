@@ -1,5 +1,15 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Decompositions used only for forward-mode AD (jvp) when an op has no forward
+# formula. Holds a jvp-specific registry (decomposition_table_for_jvp), a few
+# temporary decompositions (trace, log_sigmoid_forward, layer/batch norm
+# backward that recompute mean/variance so they track gradients), and helpers
+# that torchscript decompositions and register their graphs with the JIT
+# decomposition registry.
+# Import-time side effects: registers decompositions into torch._decomp tables
+# (silently skipped if already registered) and registers JIT graphs for ten
+# aten backward/forward ops at the bottom of the file.
 import inspect
 from collections.abc import Callable
 
@@ -39,7 +49,14 @@ aten = torch.ops.aten
 
 
 def maybe_register_decomposition(op):
+    # [FUNCTION DOC]
+    # Returns a decorator that registers the decorated function as the
+    # decomposition for op in the global table. Any error during registration
+    # (for example a duplicate registration) is swallowed. Args: op, the
+    # operator. Returns: decorator that always returns the original function.
     def decorator(f):
+        # [FUNCTION DOC] HELPER: Try to register f for op; on any exception
+        # return f unchanged.
         try:
             return register_decomposition(op)(f)
         except Exception:
@@ -55,10 +72,20 @@ decomposition_table_for_jvp = {}
 
 
 def register_decomposition_for_jvp(fn):
+    # [FUNCTION DOC]
+    # Returns a decorator that registers a decomposition for operator fn into
+    # the jvp-only registry decomposition_table_for_jvp (not the global table).
     return register_decomposition(fn, registry=decomposition_table_for_jvp)
 
 
 def _register_jit_decomposition_for_jvp(decomp, use_python=False):
+    # [FUNCTION DOC] HELPER: Look up the decomposition of operator decomp
+    # (jvp table first, then the global table), strip any out-wrapper, build a
+    # TorchScript graph for it, and register that graph with the JIT
+    # decomposition registry. With use_python, the function is marked ignored
+    # by the JIT and wrapped by a generated scripted function that calls it,
+    # so the Python body is not compiled. Raises RuntimeError if no
+    # decomposition is found. Side effect: mutates the JIT registry.
     if decomp in decomposition_table_for_jvp:
         decomposition_table_used = decomposition_table_for_jvp
     elif decomp in decomposition_table:
@@ -82,6 +109,9 @@ def _register_jit_decomposition_for_jvp(decomp, use_python=False):
         #   return decomp_fn(x, y, z)
         # Thanks copilot!
         def get_function_def(sig):
+            # [FUNCTION DOC] HELPER: Build source text of a function named
+            # wrapped_decomp whose parameters mirror the signature sig and
+            # which returns the result of calling decomp_fn with them.
             param_def = [f"{param_str}" for param_str in sig.parameters.values()]
             param_use = [f"{param_str}" for param_str in sig.parameters]
 
@@ -100,11 +130,17 @@ def _register_jit_decomposition_for_jvp(decomp, use_python=False):
 # TODO: do these also belong here?
 @maybe_register_decomposition(aten.trace.default)
 def trace(self: Tensor) -> Tensor:
+    # [FUNCTION DOC]
+    # Decomposition of aten.trace: sum of the main diagonal of a matrix.
     return torch.sum(torch.diag(self))
 
 
 @maybe_register_decomposition(aten.log_sigmoid_forward.default)
 def log_sigmoid_forward(self: Tensor) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC]
+    # Decomposition of aten.log_sigmoid_forward. Returns (output, buffer):
+    # output is min(0, x) - log1p(exp(-|x|)); buffer is exp(-|x|) on CPU-like
+    # devices, or an empty tensor on CUDA/XPU (matching those kernels).
     min = torch.minimum(self.new_zeros(()), self)
     z = torch.exp(-torch.abs(self))
     if self.is_cuda or self.is_xpu:
@@ -117,6 +153,11 @@ def log_sigmoid_forward(self: Tensor) -> tuple[Tensor, Tensor]:
 def recompute_mean_var(
     input: Tensor, rstd: Tensor, inner_dim_indices: list[int], keepdim: bool
 ):
+    # [FUNCTION DOC] HELPER: Recompute mean and reciprocal std of input over
+    # inner_dim_indices (population variance, keepdim as given) so they stay
+    # differentiable w.r.t. input. The saved rstd is used only to back out the
+    # epsilon (detached), which is then reused in the recomputed rsqrt.
+    # Returns (mean, rstd).
     # for most norm decompositions, it will be the same as the core version except for here.
     # We recompute the mean and variance so that they track gradients through input
 
@@ -140,6 +181,12 @@ def native_layer_norm_backward(
     bias: Tensor | None,
     output_mask: list[bool],
 ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+    # [FUNCTION DOC]
+    # jvp-specific decomposition of native_layer_norm_backward. Recomputes
+    # mean/rstd from input (ignoring the saved mean) so results track input
+    # gradients. Returns (grad_input, grad_weight, grad_bias). If the outer or
+    # inner element count is zero, returns zero tensors. Outputs masked off by
+    # output_mask are zero tensors instead of None (vjp cannot handle None).
     input_shape = input.shape
     input_ndim = input.dim()
 
@@ -207,6 +254,7 @@ def native_layer_norm_backward(
 
 
 def prod(x: list[int]):
+    # [FUNCTION DOC] HELPER: Product of all integers in x (1 for empty).
     r = 1
     for i in x:
         r *= i
@@ -226,6 +274,13 @@ def native_batch_norm_backward(
     eps: float,
     output_mask: list[bool],
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    # [FUNCTION DOC]
+    # jvp-specific decomposition of native_batch_norm_backward (channel axis
+    # 1). In training mode, mean and invstd are recomputed from input so they
+    # track gradients; in eval mode running statistics are used. Returns
+    # (grad_input, grad_weight, grad_bias), with zero tensors in place of
+    # masked-out outputs. Raises AssertionError if input rank < 2 or required
+    # statistics are missing.
     input_shape = input.shape
     input_rank = input.dim()
     if input_rank < 2:
@@ -318,6 +373,10 @@ def batch_norm_backward(
     output_mask: list[bool],
     reserve: Tensor,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+    # [FUNCTION DOC]
+    # jvp decomposition of batch_norm_backward: forwards to
+    # native_batch_norm_backward, using update as the train flag and dropping
+    # the reserve tensor.
     return native_batch_norm_backward(
         grad_out,
         input,

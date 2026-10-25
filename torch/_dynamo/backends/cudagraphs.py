@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# The cudagraphs Dynamo backend. Wraps forward/backward graphs from AOTAutograd
+# with cudagraph trees (via cudagraphify_impl) after checking for input
+# mutation, multiple devices or CPU nodes, and incompatible ops; if checks
+# fail the graph runs uncaptured. Also contains the standalone cudagraphs_inner
+# helper used in benchmarks. Import-time side effect: registers the backend
+# named cudagraphs in the backend registry.
 """
 This module implements CUDA graphs support for TorchDynamo backends.
 
@@ -56,7 +63,17 @@ log = logging.getLogger(__name__)
 
 
 def find_input_mutations(g: torch.fx.Graph) -> set[int]:
+    # [FUNCTION DOC]
+    # Return the set of placeholder positions whose storage is written by some
+    # op in graph g. Tracks placeholders by tensor storage (so aliases count),
+    # and for each call_function node with a schema, any argument with a write
+    # alias annotation marks all placeholders sharing that argument's storage
+    # as mutated. Nodes without a schema are skipped.
+    # KNOWN ISSUE: arguments that are lists of tensors are not handled (see
+    # the TODO), and unrecognized node kinds are silently ignored.
     def meta_fk(meta: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Return the fake value from node metadata
+        # (val if present, else fake_result; KeyError if neither).
         return meta["val"] if "val" in meta else meta["fake_result"]
 
     inputs = defaultdict(set)
@@ -97,6 +114,8 @@ def find_input_mutations(g: torch.fx.Graph) -> set[int]:
 def get_device_node_mapping(
     gm: torch.fx.GraphModule,
 ) -> dict[torch.device, torch.fx.Node]:
+    # [FUNCTION DOC] Map each device seen on tensor-valued node metadata to the
+    # first node producing a value on that device.
     device_node_mapping: dict[torch.device, torch.fx.Node] = {}
     for n in gm.graph.nodes:
         t = n.meta.get("val", None)
@@ -108,6 +127,9 @@ def get_device_node_mapping(
 def check_for_mutation_ignore_cuda_graph_managed_tensor(
     aot_model: torch.fx.GraphModule, num_fixed: int
 ) -> str | None:
+    # [FUNCTION DOC] Find inputs mutated beyond the first num_fixed ones
+    # (parameters managed by the cudagraph system are excluded). Returns None
+    # if none, else a description with the mutation stack traces.
     mutation_indices = find_input_mutations(aot_model.graph) - set(range(num_fixed))
     if not mutation_indices:
         return None
@@ -117,6 +139,10 @@ def check_for_mutation_ignore_cuda_graph_managed_tensor(
 
 
 def check_for_skip(aot_model: torch.fx.GraphModule, num_fixed: int) -> str | None:
+    # [FUNCTION DOC] Decide whether cudagraphs must be skipped. Returns a
+    # reason string for the first problem found: input mutation (only checked
+    # when the config does not allow input mutation), multiple devices or CPU
+    # nodes, or an op incompatible with cudagraphs; None if capture is allowed.
     if not config.cudagraph_backend_support_input_mutation:
         if mut_skip := check_for_mutation_ignore_cuda_graph_managed_tensor(
             aot_model, num_fixed
@@ -135,6 +161,8 @@ def check_for_skip(aot_model: torch.fx.GraphModule, num_fixed: int) -> str | Non
 
 
 def get_device_index(gm: torch.fx.GraphModule) -> int:
+    # [FUNCTION DOC] Return the index of the first device found in the graph's
+    # tensor metadata; raises AssertionError if it is not CUDA.
     device = next(iter(get_device_node_mapping(gm)))
     if device.type != "cuda":
         raise AssertionError(f"Expected CUDA device, got {device.type}")
@@ -142,6 +170,10 @@ def get_device_index(gm: torch.fx.GraphModule) -> int:
 
 
 def get_stack_traces(gm: torch.fx.GraphModule) -> list[str | None]:
+    # [FUNCTION DOC] Return, for each output of the graph, the stack trace of
+    # the producing node (None for non-node outputs). Returns an empty list if
+    # the output is not iterable. Raises AssertionError if the output node does
+    # not have exactly one argument.
     output = output_node(gm)
     if len(output.args) != 1:
         raise AssertionError(
@@ -157,6 +189,12 @@ def get_stack_traces(gm: torch.fx.GraphModule) -> list[str | None]:
 
 
 def cudagraphs(dynamo_model: torch.fx.GraphModule, dynamo_inputs: Sequence[Any]) -> Any:
+    # [FUNCTION DOC]
+    # Compile a Dynamo graph with AOTAutograd where the forward, inference and
+    # backward compilers wrap the graphs with cudagraph trees. A shared flag
+    # and device index connect forward and backward: if the forward is skipped
+    # the flag disables capture for backward. Skips log a message and bump a
+    # counter. Returns the compiled callable.
     from torch._inductor.cudagraph_trees import cudagraphify_impl
 
     do_cudagraphs = BoxedBool(True)
@@ -167,6 +205,11 @@ def cudagraphs(dynamo_model: torch.fx.GraphModule, dynamo_inputs: Sequence[Any])
         aot_inputs: list[Any],
         is_inference: bool = False,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Forward compiler. Builds an interpreter for
+        # the graph; if checks say to skip, disables capture for the whole
+        # compilation and returns the interpreter. Otherwise records the device
+        # index and returns a cudagraphified callable (boxed calling
+        # convention) treating the leading fixed inputs as static.
         interp = boxed_nop(aot_model, aot_inputs)
         fixed = num_fw_fixed_arguments(len(dynamo_inputs), len(aot_inputs))
         if skip_msg := check_for_skip(aot_model, fixed):
@@ -194,6 +237,12 @@ def cudagraphs(dynamo_model: torch.fx.GraphModule, dynamo_inputs: Sequence[Any])
     def backward_cudagraphs(
         aot_model: torch.fx.GraphModule, aot_inputs: list[Any]
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Backward compiler. If capture was disabled by
+        # the forward, returns the graph module unchanged. If checks say to
+        # skip, returns a boxed callable that marks the cudagraph manager as
+        # running backward then runs the graph (AssertionError if no manager
+        # exists). Otherwise returns a cudagraphified backward callable with
+        # tangents as fixed inputs.
         interp = boxed_nop(aot_model, aot_inputs)
         if not do_cudagraphs:
             return aot_model
@@ -215,6 +264,8 @@ def cudagraphs(dynamo_model: torch.fx.GraphModule, dynamo_inputs: Sequence[Any])
                 raise AssertionError("cudagraph manager must exist for backward")
 
             def fn(inputs: list[Any]) -> Any:
+                # [FUNCTION DOC] HELPER: Mark the manager as running backward,
+                # then run the uncaptured graph on the boxed inputs.
                 # pyrefly: ignore [missing-attribute]
                 manager.set_to_running_backward()
                 return aot_model(inputs)
@@ -246,10 +297,15 @@ def cudagraphs(dynamo_model: torch.fx.GraphModule, dynamo_inputs: Sequence[Any])
 
 
 class CudagraphsBackend:
+    # [CLASS DOC]
+    # Backend object registered under the name cudagraphs. Stateless; calling
+    # it compiles a graph with the cudagraphs function, and reset clears the
+    # global cudagraph trees.
     compiler_name = "cudagraphs"
 
     @staticmethod
     def reset() -> None:
+        # [FUNCTION DOC] Reset all cudagraph trees (global state).
         from torch._inductor.cudagraph_trees import reset_cudagraph_trees
 
         reset_cudagraph_trees()
@@ -258,6 +314,8 @@ class CudagraphsBackend:
     def __call__(
         model: torch.fx.GraphModule, inputs: Sequence[Any], **kwargs: Any
     ) -> Any:
+        # [FUNCTION DOC] Backend entry: warn about and ignore extra kwargs, then
+        # return cudagraphs(model, inputs).
         if kwargs:
             log.warning("cudagraphs backend ignoring extra kwargs %s", kwargs)
         return cudagraphs(model, inputs)
@@ -274,6 +332,15 @@ def cudagraphs_inner(
     copy_outputs: bool = True,
     copy_inputs: bool = True,
 ) -> Callable[..., Sequence[Any]]:
+    # [FUNCTION DOC]
+    # Benchmark helper (not a registered backend): warm up model on a side
+    # stream, capture it into a CUDA graph using static inputs (zero copies of
+    # inputs, or the inputs themselves if copy_inputs is false), and return a
+    # runner that copies new inputs into the static ones (if copy_inputs),
+    # replays the graph, and returns cloned outputs (or the static outputs if
+    # copy_outputs is false). Raises AssertionError if inputs is not a list or
+    # tuple, or if the runner gets a different number of inputs. Requires CUDA
+    # and synchronizes the device.
     """This isn't registered as a backend, but is used in some benchmarks"""
     if not isinstance(inputs, (list, tuple)):
         raise AssertionError(
@@ -302,6 +369,8 @@ def cudagraphs_inner(
         static_outputs = (static_outputs,)
 
     def run(*new_inputs: Any) -> Sequence[Any]:
+        # [FUNCTION DOC] HELPER: Replay the captured graph on new inputs; see
+        # cudagraphs_inner for copy semantics.
         if len(static_inputs) != len(new_inputs):
             raise AssertionError(
                 f"Expected {len(static_inputs)} inputs, got {len(new_inputs)}"

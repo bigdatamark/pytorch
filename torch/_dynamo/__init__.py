@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# TorchDynamo package: a bytecode-level JIT that captures PyTorch programs into
+# FX graphs and compiles them with a backend. Exports the public API
+# (optimize, export, explain, config, mark_dynamic/static, allow_in_graph,
+# disable, graph_break, backend registration, reset, recursion-limit control,
+# etc.). Import-time side effects: registers polyfills, adds _DimRange to
+# serialization safe globals, and wraps torch.manual_seed with the dynamo
+# disable decorator and re-registers it as a JIT builtin.
 """
 TorchDynamo is a Python-level JIT compiler designed to make unmodified PyTorch programs faster.
 TorchDynamo hooks into the frame evaluation API in CPython (PEP 523) to dynamically modify Python
@@ -136,6 +144,15 @@ if torch.manual_seed is torch.random.manual_seed:
 
 
 def reset() -> None:
+    # [FUNCTION DOC]
+    # Clear all Dynamo global state so the process behaves like a fresh one:
+    # code caches, seen-code registries, PGO state, original-code and guard
+    # failure maps, graph break reasons, resume-function cache, guarded backend
+    # cache, frame counters, callbacks, generation tracker, tensorify state,
+    # warn-once cache, compiled autograd, kernel/inductor side tables, fake
+    # tensor dispatch cache, and cudagraph trees if CUDA is initialized. Also
+    # disables saved-tensor-hook tracing. Holds the compile lock. Does not
+    # reset logging or file system caches.
     """
     Clear all compile caches and restore initial state.  This function is intended
     to reset Dynamo's state *as if* you had started a fresh process invocation, which
@@ -196,6 +213,10 @@ def reset() -> None:
 
 
 def reset_code_caches() -> None:
+    # [FUNCTION DOC]
+    # Clear compiled-code caches only: resets PGO code state, resets every
+    # still-alive code object seen as input or output of conversion, and clears
+    # the code context. Holds the compile lock. Narrower than reset.
     """
     Clears in-memory code cache, which is what stores compiled products.  This
     resets less state than :func:`reset` and is mostly only used for testing
@@ -219,6 +240,9 @@ def reset_code_caches() -> None:
 
 
 def get_recursion_limit() -> int:
+    # [FUNCTION DOC]
+    # Return the C-level recursion limit previously set via set_recursion_limit,
+    # or -1 if none is set.
     """
     Returns the internal dynamo recursion limit set by `torch._dynamo.set_recursion_limit`.
 
@@ -228,6 +252,10 @@ def get_recursion_limit() -> int:
 
 
 def set_recursion_limit(limit: int) -> None:
+    # [FUNCTION DOC]
+    # Set Dynamo's internal C recursion limit (must be at least 1, or -1 to
+    # restore the default). Does not change the Python recursion limit. Side
+    # effect: calls into the C eval_frame extension.
     """
     Sets an internal dynamo recursion limit. The limit must be >= 1, or -1 to reset
     to the default (unset) state.

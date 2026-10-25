@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Debugging and testing backends for Dynamo: eager variants (eager,
+# eager_noexcept, eager_debug, pre_dispatch_eager), torchscript, the
+# AOTAutograd-based aot_eager family (using a boxed no-op compiler, optionally
+# with inductor decompositions/partitioner, torch function modes, or fake
+# tensor crossref), invoke_subgraph, intentionally buggy backends for testing
+# the minifier, and explain support (ExplainOutput, ExplainWithBackend,
+# _explain_graph_detail). Import-time side effects: registers many backends in
+# the backend registry and builds the aot_eager_default_partitioner and aot_ts
+# backend objects.
 """
 This module provides debugging backends for TorchDynamo to help diagnose and troubleshoot
 compilation and execution issues. It includes:
@@ -53,6 +63,10 @@ log = logging.getLogger(__name__)
 def eager(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "eager": run the captured graph as is. Warns about
+    # and ignores extra kwargs. Returns the module's forward, or, when the
+    # functorch force_autograd_cache option is on, a serializable wrapper of
+    # the graph module.
     if kwargs:
         log.warning("eager backend ignoring extra kwargs %s", kwargs)
 
@@ -66,12 +80,18 @@ def eager(
 def make_eager_backend_with_torch_function_mode(
     mode: torch.overrides.TorchFunctionMode,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Convenience: build an eager backend that runs graphs under
+    # the single given torch function mode.
     return make_eager_backend_with_torch_function_modes([mode])
 
 
 def make_eager_backend_with_torch_function_modes(
     modes: Iterable[torch.overrides.TorchFunctionMode],
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Build a backend function whose compiled graphs run eagerly
+    # with every given torch function mode entered (in order) around the call,
+    # so the modes execute outside Dynamo tracing. Returns the backend
+    # function (the extra backend kwargs are accepted and ignored).
     """Used to trace HOPs (cond and while) for eager execution, the metadata
     TF mode mutates vars outside of the scope of the HOP, and we can't have graph breaks
     in the HOP, so we need to externally run this mode and not trace it."""
@@ -80,7 +100,11 @@ def make_eager_backend_with_torch_function_modes(
     def fn(
         gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Backend body; returns a wrapper running gm's
+        # forward under the modes.
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Enter all modes, run gm.forward, return
+            # its result; modes exit afterwards.
             with ExitStack() as stack:
                 for mode in modes:
                     stack.enter_context(mode)
@@ -95,12 +119,17 @@ def make_eager_backend_with_torch_function_modes(
 def eager_noexcept(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "eager_noexcept": returns a callable that runs the
+    # graph module and converts any exception into TorchDynamoException (with
+    # the original as cause), to check generated graphs never fail. Warns about
+    # extra kwargs.
     if kwargs:
         log.warning("eager_noexcept backend ignoring extra kwargs %s", kwargs)
 
     # This backend is intended to check that dynamo-generated GraphModules
     # do not cause errors.
     def inner(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Run gm; wrap any exception as described above.
         try:
             return gm(*args)
         except Exception as e:
@@ -115,12 +144,16 @@ def eager_noexcept(
 def pre_dispatch_eager(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Backend "pre_dispatch_eager": re-trace the graph with
+    # make_fx in pre-dispatch mode using the fake inputs, print the resulting
+    # graph (side effect: stdout), and return it. Warns about extra kwargs.
     if kwargs:
         log.warning("pre_dispatch_eager backend ignoring extra kwargs %s", kwargs)
 
     from torch.fx.experimental.proxy_tensor import make_fx
 
     def runnable_gm(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Interpret gm on the args.
         return torch.fx.Interpreter(gm).run(*args)
 
     pre_dispatch_gm = make_fx(runnable_gm, pre_dispatch=True)(*fake_tensor_inputs)
@@ -133,6 +166,9 @@ def pre_dispatch_eager(
 def eager_debug(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "eager_debug": returns a callable that interprets
+    # the graph under schema-check mode to detect custom ops with incorrect
+    # schemas. Warns about extra kwargs.
     if kwargs:
         log.warning("eager_debug backend ignoring extra kwargs %s", kwargs)
 
@@ -142,6 +178,8 @@ def eager_debug(
     # Right now, this backend can be used to check for and error on
     # custom dispatcher ops that have incorrect schemas.
     def inner(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Run the graph with the interpreter inside
+        # schema-check mode.
         with SchemaCheckMode():
             return torch.fx.Interpreter(gm).run(*args)
 
@@ -152,6 +190,8 @@ def eager_debug(
 def torchscript(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor]
 ) -> torch.jit.ScriptModule:
+    # [FUNCTION DOC] Backend "ts": unwrap a lazy graph module and compile it
+    # with TorchScript scripting; returns the script module.
     from torch.fx._lazy_graph_module import _unwrap_lazy_graph_module
 
     return torch.jit.script(_unwrap_lazy_graph_module(gm))
@@ -160,6 +200,10 @@ def torchscript(
 def invoke_subgraph_inner_compiler(
     subgraph: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Compiler for AOTAutograd forward/backward graphs that
+    # returns a boxed-call wrapper which, when traced by make_fx, calls the
+    # invoke_subgraph higher-order op on the subgraph with the operands; the
+    # inner wrapper is disabled for Dynamo and allowed in graph.
     """Inner compiler that wraps forward/backward graphs in invoke_subgraph HOP.
 
     This is used as the fw_compiler/bw_compiler for aot_autograd. When the resulting
@@ -172,11 +216,15 @@ def invoke_subgraph_inner_compiler(
     @torch._dynamo.allow_in_graph
     @disable
     def invoke_subgraph_wrapper_unboxed(*operands: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Call invoke_subgraph_infer on the captured
+        # subgraph with the operands.
         return invoke_subgraph_infer(subgraph, *operands)
 
     # NB: The direct to unboxed path is broken, you MUST DO THIS
 
     def invoke_subgraph_wrapper(args: list[Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Boxed-call adapter: spread the argument list
+        # into the unboxed wrapper.
         # `allow_in_graph` is untyped and its `list` branch leaks a
         # `list | fn` union into the inferred return; as the outer decorator
         # here that makes `invoke_subgraph_wrapper_unboxed` look non-callable.
@@ -245,6 +293,10 @@ def invoke_subgraph_inner_compiler_good(
 def invoke_subgraph(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "invoke_subgraph": compile via AOTAutograd with
+    # invoke_subgraph_inner_compiler for forward and backward, the min-cut
+    # rematerialization partitioner, and input-mutation keeping. Warns about
+    # extra kwargs. Requires the config that forces compile during fx trace.
     """Backend that wraps forward/backward graphs in invoke_subgraph HOP when traced by make_fx.
 
     This backend uses AOTAutograd to partition into forward/backward graphs, then wraps
@@ -270,6 +322,13 @@ def invoke_subgraph(
 
 @dataclasses.dataclass
 class AOTEagerOutputCode(OutputCode):
+    # [CLASS DOC]
+    # OutputCode wrapping a graph module for eager execution so aot_eager-style
+    # backends can take part in the bundled autograd cache and AOT compile
+    # serialization. State: gm (the module, or None while serialized) and
+    # _serialized_gm (pickled graph bytes, set only between
+    # prepare_for_serialization and post_compile). Invariant: exactly one of
+    # them is normally set.
     """
     An OutputCode that wraps a GraphModule for eager-mode execution.
 
@@ -281,11 +340,17 @@ class AOTEagerOutputCode(OutputCode):
     _serialized_gm: bytes | None = dataclasses.field(default=None, init=False)
 
     def __call__(self, inputs: Any) -> Any:
+        # [FUNCTION DOC] Run the graph module's forward on the boxed input list;
+        # raises AssertionError if the module is not loaded.
         if self.gm is None:
             raise AssertionError("gm must not be None")
         return self.gm.forward(inputs)
 
     def prepare_for_serialization(self) -> None:
+        # [FUNCTION DOC] Strip unpicklable node metadata (nn_module_stack,
+        # source_fn_stack, example_value) from the graph, pickle the module
+        # into _serialized_gm, and clear gm. Raises AssertionError if gm is
+        # already None.
         from torch.fx._graph_pickler import GraphPickler, Options
 
         if self.gm is None:
@@ -299,6 +364,10 @@ class AOTEagerOutputCode(OutputCode):
         self.gm = None
 
     def post_compile(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] If the module was serialized, rebuild it with a new
+        # fake tensor mode, set boxed code generation, recompile, and clear
+        # the serialized bytes. Arguments are ignored. Raises AssertionError
+        # if the loaded object is not a GraphModule.
         if self.gm is None and self._serialized_gm is not None:
             from torch._subclasses import FakeTensorMode
             from torch.fx._graph_pickler import GraphPickler
@@ -315,6 +384,7 @@ class AOTEagerOutputCode(OutputCode):
             self._serialized_gm = None
 
     def set_triton_bundle(self, triton_bundle: Any) -> None:
+        # [FUNCTION DOC] No-op: there is no triton bundle for eager output.
         pass
 
 
@@ -322,6 +392,12 @@ class AOTEagerOutputCode(OutputCode):
 def boxed_nop(
     fx_g: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] No-op compiler with the boxed calling convention (takes one
+    # list of inputs). Mutates fx_g: switches to boxed code generation and
+    # recompiles. If the autograd cache options are on, returns an
+    # AOTEagerOutputCode (marked boxed). Otherwise returns a runner that
+    # interprets the graph with a debug interpreter when a debug mode asks for
+    # it, else calls the forward.
     from torch.fx.graph import _BoxedCodeGen
 
     # Set the graph to use boxed codegen
@@ -337,6 +413,9 @@ def boxed_nop(
     forward_fn = fx_g.forward
 
     def run(args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Run the boxed args through a debug interpreter
+        # if an active debug mode requests compile-with-interpreter, else
+        # through the forward.
         from torch.utils._debug_mode import DebugInterpreter, get_active_debug_mode
 
         if (
@@ -355,6 +434,8 @@ def boxed_nop_with_mode(
     *,
     mode: torch.overrides.TorchFunctionMode,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Like boxed_nop, but the returned boxed runner executes the
+    # forward inside the given mode. Mutates fx_g (boxed codegen, recompile).
     from torch.fx.graph import _BoxedCodeGen
 
     # Set the graph to use boxed codegen
@@ -365,6 +446,7 @@ def boxed_nop_with_mode(
     forward_fn = fx_g.forward
 
     def run(args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Run the forward on the boxed args under mode.
         with mode:
             return forward_fn(args)
 
@@ -377,6 +459,9 @@ def fake_crossref_boxed_nop(
     example_inputs: list[torch.Tensor],
     ignore_op_fn: Callable[[torch._ops.OpOverload], bool] | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Like boxed_nop, but the boxed runner executes the forward
+    # under a cross-referencing fake tensor mode, optionally skipping ops for
+    # which ignore_op_fn returns true. Mutates fx_g (boxed codegen, recompile).
     from torch.fx.graph import _BoxedCodeGen
 
     # Set the graph to use boxed codegen
@@ -387,6 +472,8 @@ def fake_crossref_boxed_nop(
     forward_fn = fx_g.forward
 
     def run(args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Run the forward on the boxed args inside the
+        # cross-reference fake mode.
         with torch._subclasses.CrossRefFakeMode(ignore_op_fn):
             return forward_fn(args)
 
@@ -395,12 +482,18 @@ def fake_crossref_boxed_nop(
 
 
 def ignore_builtins(op: torch._ops.OpOverload) -> bool:
+    # [FUNCTION DOC] Return true for ops in the aten, prims or prim namespaces
+    # (built-in ops), so only custom ops are cross-checked.
     return op.namespace in ("aten", "prims", "prim")
 
 
 def get_nop_func() -> Callable[
     [torch.fx.GraphModule, list[torch.Tensor]], Callable[..., Any]
 ]:
+    # [FUNCTION DOC] Choose the no-op compiler from the fake_tensor_crossref
+    # config: boxed_nop if unset, the crossref compiler for all ops if "all",
+    # or the crossref compiler ignoring built-in ops for "custom_ops". Any
+    # other value raises AssertionError.
     if not torch._functorch.config.fake_tensor_crossref:
         return boxed_nop
     elif torch._functorch.config.fake_tensor_crossref == "all":
@@ -423,6 +516,11 @@ def aot_eager(
     bw_compiler: Callable[..., Any] | None = None,
     **kwargs: Any,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "aot_eager": run AOTAutograd with no-op (boxed)
+    # forward and backward compilers unless overridden, the min-cut
+    # rematerialization partitioner, and input mutation keeping. Extra kwargs
+    # are passed to the AOTAutograd backend call (which warns and ignores
+    # them). Returns the compiled callable.
     return aot_autograd(
         fw_compiler=fw_compiler or boxed_nop,
         bw_compiler=bw_compiler or boxed_nop,
@@ -448,6 +546,11 @@ register_backend(
 def aot_eager_decomp_partition(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend "aot_eager_decomp_partition": AOTAutograd with
+    # inductor's decomposition table and min-cut partitioner but no-op
+    # compilers (see get_nop_func), to separate AOT problems from inductor
+    # problems. Applies functorch config patches (effect-token unlifting plus
+    # any compiler bisector changes) while compiling. Warns about extra kwargs.
     if kwargs:
         log.warning(
             "aot_eager_decomp_partition backend ignoring extra kwargs %s", kwargs
@@ -489,6 +592,10 @@ def aot_eager_decomp_partition_with_mode(
     mode: Any,
     **kwarg: Any,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Like aot_eager_decomp_partition, but forward and backward
+    # graphs run inside the given mode (via boxed_nop_with_mode).
+    # KNOWN ISSUE: extra keyword arguments (kwarg) are silently ignored,
+    # unlike the sibling backends which warn.
     return aot_autograd(
         # these are taken from memory_efficient_fusion()
         fw_compiler=functools.partial(boxed_nop_with_mode, mode=mode),
@@ -512,6 +619,9 @@ register_backend(
 def aot_eager_decomp_partition_crossref(
     gm: torch.fx.GraphModule, fake_tensor_inputs: list[torch.Tensor], **kwargs: Any
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Backend variant of aot_eager_decomp_partition that turns on
+    # fake tensor crossref checking: uses the configured value, defaulting to
+    # custom ops only, via a temporary config patch.
     # if the config is set, respect it, otherwise only test custom_ops.
     # custom_op bad metas always manifest as an error whereas aten will only sometimes.
     # by default, use the less noisy option
@@ -541,10 +651,13 @@ register_backend(name="aot_ts", compiler_fn=aot_ts)
 
 
 class ReluCompileError(Exception):
+    # [CLASS DOC] HELPER: Error raised by the relu compile error test backend.
     pass
 
 
 class TestingOnlyCompileError(Exception):
+    # [CLASS DOC] HELPER: Error raised by the non-leaf compile error test
+    # backend.
     pass
 
 
@@ -552,6 +665,8 @@ class TestingOnlyCompileError(Exception):
 def relu_compile_error_TESTING_ONLY(
     gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Test-only backend that raises ReluCompileError if
+    # the graph calls relu; otherwise returns gm.
     for node in gm.graph.nodes:
         if node.target is torch.relu:
             raise ReluCompileError
@@ -562,6 +677,9 @@ def relu_compile_error_TESTING_ONLY(
 def relu_runtime_error_TESTING_ONLY(
     gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Test-only backend that rewrites each relu call to
+    # an always-failing assert with a message, recompiles, and returns gm, so
+    # the error appears at run time.
     for node in gm.graph.nodes:
         if node.target is torch.relu:
             node.target = torch._assert
@@ -574,6 +692,8 @@ def relu_runtime_error_TESTING_ONLY(
 def relu_accuracy_error_TESTING_ONLY(
     gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Test-only backend that rewrites each relu call to
+    # add one to its input (wrong numerics), recompiles, and returns gm.
     for node in gm.graph.nodes:
         if node.target is torch.relu:
             node.target = torch.add
@@ -587,6 +707,9 @@ def relu_accuracy_error_TESTING_ONLY(
 def non_leaf_compile_error_TESTING_ONLY(
     gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Test-only backend: if the graph has at least one
+    # function call and any example input is a non-leaf tensor, raises
+    # TestingOnlyCompileError; otherwise returns gm.
     # Require at least one non-trivial thing in the graph,
     # see https://github.com/pytorch/pytorch/issues/102898
     for node in gm.graph.nodes:
@@ -602,6 +725,10 @@ def non_leaf_compile_error_TESTING_ONLY(
 
 @dataclasses.dataclass
 class ExplainOutput:
+    # [CLASS DOC]
+    # Dataclass result of explain: captured graphs, graph count, graph break
+    # count, break reasons, total op count, and optional per-graph ops, output
+    # guards and compile-time text. Its string form is a readable report.
     """
     This is the output of :func:`torch._dynamo.explain()`
     There is no reason to create this class directly.
@@ -617,6 +744,11 @@ class ExplainOutput:
     compile_times: str | None = None
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Build a multi-line report: counts, each break reason
+        # with its user stack, optional ops per graph, optional guards, and
+        # optional compile times.
+        # KNOWN ISSUE: guard entries are appended without a trailing newline,
+        # so consecutive guards and the following section run together.
         output = f"Graph Count: {self.graph_count}\n"
         output += f"Graph Break Count: {self.graph_break_count}\n"
         output += f"Op Count: {self.op_count}\n"
@@ -660,6 +792,12 @@ def _explain_graph_detail(
     list[list["Target"]],
     list[GraphCompileReason],
 ]:
+    # [FUNCTION DOC] HELPER: Accumulate details of one captured graph: append
+    # gm to graphs, collect its call_function targets, add their count to
+    # op_count, append them to ops_per_graph, and, if the graph was compiled
+    # because of a graph break, append its compile reason to break_reasons.
+    # Mutates the passed lists. Returns (gm, graphs, op_count, ops_per_graph,
+    # break_reasons).
     """
     This function is a utility which processes a torch.fx.GraphModule and
     accumulates information about its ops, graph breaks, and other details. It
@@ -688,6 +826,11 @@ def _explain_graph_detail(
 
 
 class ExplainWithBackend:
+    # [CLASS DOC]
+    # Composable backend that wraps another backend (looked up by name or
+    # callable) and records, for every graph Dynamo captures, the graphs,
+    # total op count and graph break reasons. Calling it delegates compilation
+    # to the wrapped backend; output() summarizes the accumulated data.
     """
     This class is intended to be used as a backend for `torch.compile`. It is
     composable with other backends. When used in this way, it accumulates
@@ -713,6 +856,8 @@ class ExplainWithBackend:
     """
 
     def __init__(self, backend: CompilerFn | str) -> None:
+        # [FUNCTION DOC] Resolve the backend by name or callable and start with
+        # empty graphs, zero op count and no break reasons.
         from .registry import lookup_backend
 
         self.backend = lookup_backend(backend)
@@ -723,6 +868,9 @@ class ExplainWithBackend:
     def __call__(
         self, gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
     ) -> CompiledFn:
+        # [FUNCTION DOC] Record the graph's details into this object (graphs, op
+        # count, break reasons; per-graph ops are discarded), then return the
+        # result of the wrapped backend on the graph and inputs.
         ops_per_graph: list[list[Target]] = []
         gm, self.graphs, self.op_count, _, self.break_reasons = _explain_graph_detail(
             gm, self.graphs, self.op_count, ops_per_graph, self.break_reasons
@@ -730,6 +878,9 @@ class ExplainWithBackend:
         return self.backend(gm, example_inputs)
 
     def output(self) -> ExplainOutput:
+        # [FUNCTION DOC] Return an ExplainOutput of the accumulated data, with
+        # graph break count defined as graph count minus one.
+        # KNOWN ISSUE: with no graphs captured the break count is negative.
         graph_count = len(self.graphs)
         output = ExplainOutput(
             self.graphs,
