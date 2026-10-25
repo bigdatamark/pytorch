@@ -1,3 +1,12 @@
+# [MODULE DOC] Miscellaneous VariableTracker subclasses used by Dynamo's symbolic
+# execution: super(), tracebacks, exceptions, comptime, cells, autograd.Function
+# and its context, attribute/method wrappers, python modules, typing objects,
+# numpy functions and dtypes, string formatting, debugging/logging calls,
+# context variables, random.Random and weakrefs. Each tracks a Python value during
+# tracing, answers attribute/call/compare queries, and knows how to reconstruct
+# itself as bytecode. Also holds numpy<->torch._numpy function maps. Import-time
+# side effects: none beyond defining classes and the np_constant_collections_map
+# table (a Python 3.15-only SentinelVariable is defined conditionally).
 """
 This module contains miscellaneous variable tracker implementations for various Python types
 and features used in Dynamo's symbolic execution. These classes help track and propagate
@@ -95,6 +104,12 @@ if TYPE_CHECKING:
 
 
 class SuperVariable(VariableTracker):
+    # [CLASS DOC] Tracks a super() object. State: typevar (the class passed as first
+    # argument, or the defining class for zero-arg super) and objvar (the instance
+    # or class the lookup starts from). Resolves attributes by walking the MRO past
+    # typevar, and dispatches method calls on the resolved attribute (functions,
+    # classmethods, staticmethods, object/nn.Module __init__, __new__, __delattr__,
+    # __getattribute__, torch function disabling, builtins).
     # PySuper_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/typeobject.c#L11511
     _cpython_type = super
 
@@ -108,6 +123,8 @@ class SuperVariable(VariableTracker):
         objvar: VariableTracker | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores typevar and the optional objvar (None for the
+        # unsupported one-argument form); other kwargs go to VariableTracker.
         super().__init__(**kwargs)
         # typevar is the first argument to super(). In the case where no argument
         # is provided to super(), it is the __class__ object where
@@ -120,9 +137,12 @@ class SuperVariable(VariableTracker):
         self.objvar = objvar
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the builtin super type.
         return builtins.super
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode that calls super with typevar and, when
+        # present, objvar (two-argument form, otherwise one-argument form).
         codegen.add_push_null(lambda: codegen(variables.BuiltinVariable(super)))
         codegen(self.typevar)
         if self.objvar is not None:
@@ -134,6 +154,15 @@ class SuperVariable(VariableTracker):
     def _resolved_getattr_and_source(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> tuple[Any, AttrSource | None]:
+        # [FUNCTION DOC] HELPER: Finds attribute `name` the way super() would: walks
+        # the MRO of type(objvar) (or objvar itself when it is a class) starting just
+        # after typevar and looks only in each class's own dict. Returns the raw
+        # attribute (not bound) and an AttrSource built from the MRO position, or
+        # None when no source is available. If typevar is not in the MRO, falls back
+        # to a real super lookup with no source. Graph-breaks via unimplemented when
+        # objvar is missing (one-arg super) or the attribute is not found.
+        # KNOWN ISSUE: the walrus truthiness test skips attributes whose value is
+        # falsy (0, None, empty containers), so such class attributes are not found.
         if not self.objvar:
             unimplemented(
                 gb_type="1-arg super not implemented",
@@ -203,6 +232,10 @@ class SuperVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Resolves `name` through the super MRO lookup. Literal
+        # constants are returned as ConstantVariable (guarded with CONSTANT_MATCH
+        # when a source exists); anything else is wrapped in a GetAttrVariable so
+        # the real work happens at call time.
         # Check if getattr is a constant. If not, delay the actual work by
         # wrapping the result in GetAttrVariable. Mostly super is called with a
         # method, so most of the work is delayed to call_function.
@@ -225,6 +258,16 @@ class SuperVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calls method `name` found via the super lookup. Picks a
+        # strategy by the kind of resolved attribute: object.__init__ becomes a no-op
+        # lambda; nn.Module.__init__ is traced only for newly created modules without
+        # args; __new__, staticmethod, classmethod (binding cls from objvar or its
+        # type), plain functions, bound methods, standard __setattr__, __delattr__
+        # (records a deletion in side effects, needs a constant string name),
+        # base-class methods of user objects, object.__getattribute__,
+        # _disabled_torch_function_impl (temporarily disables torch function
+        # subclass state), tensor method descriptors and builtins are all supported.
+        # Anything else graph-breaks with unimplemented.
         inner_fn, source = self._resolved_getattr_and_source(tx, name)
         if self.objvar is None:
             raise AssertionError("super() requires objvar to be set for method calls")
@@ -443,11 +486,15 @@ class SuperVariable(VariableTracker):
 
 
 class FrameSummaryVariable(VariableTracker):
+    # [CLASS DOC] Wraps a real traceback.FrameSummary. Exposes lineno, filename,
+    # name and line as read-only members via tp_members.
     def __init__(self, frame_summary: traceback.FrameSummary, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the wrapped frame summary.
         super().__init__(**kwargs)
         self.frame_summary = frame_summary
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns traceback.FrameSummary.
         return traceback.FrameSummary
 
     # traceback.FrameSummary is pure-Python with __slots__ (Lib/traceback.py);
@@ -461,12 +508,18 @@ class FrameSummaryVariable(VariableTracker):
 
 
 class TracebackVariable(VariableTracker):
+    # [CLASS DOC] Models a traceback object as a linked chain. State: frame_summary
+    # (a FrameSummaryVariable for this entry) and tb_next (the next
+    # TracebackVariable, or a None constant at the end). Invariant: the chain has
+    # no cycles (enforced when tb_next is assigned).
     def __init__(
         self,
         frame_summary: FrameSummaryVariable,
         tb_next: Union["TracebackVariable", ConstantVariable],
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores frame_summary and tb_next. Raises AssertionError if
+        # tb_next is None (a None constant must be used to end the chain).
         # The traceback holds four attributes:
         #  - tb_frame
         #  - tb_lineno
@@ -486,18 +539,25 @@ class TracebackVariable(VariableTracker):
         frame_summary: traceback.FrameSummary,
         tb_next: Union["TracebackVariable", ConstantVariable],
     ) -> "TracebackVariable":
+        # [FUNCTION DOC] Builds a TracebackVariable from a raw FrameSummary by
+        # wrapping it in a FrameSummaryVariable, linked to tb_next.
         return cls(FrameSummaryVariable(frame_summary), tb_next=tb_next)
 
     @staticmethod
     def is_valid_traceback(obj: VariableTracker) -> bool:
+        # [FUNCTION DOC] True if obj is exactly a TracebackVariable or a None constant.
         return istype(obj, TracebackVariable) or obj.is_constant_none()
 
     def extract_tb(self) -> list[traceback.FrameSummary | FrameSummaryVariable]:
+        # [FUNCTION DOC] Returns the frame summaries of this entry followed by all
+        # later entries in the chain, in order (recursive over tb_next).
         if istype(self.tb_next, ConstantVariable):
             return [self.frame_summary]
         return [self.frame_summary] + self.tb_next.extract_tb()
 
     def has_reference_cycle(self, tb: VariableTracker) -> bool:
+        # [FUNCTION DOC] Returns True if tb appears (by identity) in the chain that
+        # starts at this traceback, including this one.
         # checks if `tb` is in the chain of tb_next starting from `self`
         curr_tb: TracebackVariable | ConstantVariable = self
         while istype(curr_tb, TracebackVariable):
@@ -507,6 +567,7 @@ class TracebackVariable(VariableTracker):
         return False
 
     def python_type(self) -> type[types.TracebackType]:
+        # [FUNCTION DOC] Returns types.TracebackType.
         return types.TracebackType
 
     def call_setattr(
@@ -515,6 +576,11 @@ class TracebackVariable(VariableTracker):
         name_var: VariableTracker,
         val: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements setting an attribute. Only tb_next is honored:
+        # the value must be a traceback or None (else TypeError is raised in the
+        # traced program) and must not create a cycle in either direction (else
+        # ValueError). Returns a None constant.
+        # KNOWN ISSUE: assignments to any other attribute name are silently ignored.
         name = name_var.as_python_constant()
         if name == "tb_next":
             if not self.is_valid_traceback(val):
@@ -533,6 +599,9 @@ class TracebackVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute read: tb_next, tb_lineno (from the frame summary
+        # line number) and frame_summary are served directly; tb_lasti graph-breaks;
+        # other names fall back to the base implementation.
         if name == "tb_next":
             return self.tb_next
         elif name == "tb_lineno":
@@ -551,6 +620,8 @@ class TracebackVariable(VariableTracker):
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Rich comparison using the default object semantics
+        # (identity based) via object_richcompare.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
@@ -562,6 +633,8 @@ class TracebackVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handles __setattr__ by delegating to call_setattr; every
+        # other method goes to the base class.
         if name == "__setattr__":
             return self.call_setattr(tx, *args)
         return super().call_method(tx, name, args, kwargs)
@@ -571,7 +644,12 @@ class ExceptionVariable(VariableTracker):
     # _PyExc_BaseException: https://github.com/python/cpython/blob/v3.13.0/Objects/exceptions.c
     _cpython_type = BaseException
 
-    # The ExceptionVariable corresponds to the BaseException class in Python
+    # [CLASS DOC] Models a BaseException instance. State: exc_type (the exception
+    # class), args (list of VariableTrackers), the chaining attributes __context__,
+    # __cause__, __suppress_context__ and __traceback__ (each a VariableTracker,
+    # defaulting to None/False constants) and python_stack (user stack summary at
+    # first raise, used when re-raising). Custom attributes live in the side effects
+    # instance dict. Subclasses add extra constructor attributes.
     def __init__(
         self,
         exc_type: Any,
@@ -580,6 +658,9 @@ class ExceptionVariable(VariableTracker):
         source: Source | None = None,
         mutation_type: MutationType | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores exc_type and args and initializes the chaining
+        # attributes to defaults. Graph-breaks (unimplemented) if any keyword args
+        # are given to the constructor.
         super().__init__(source=source, mutation_type=mutation_type)
         self.exc_type = exc_type
         self.args = args
@@ -606,9 +687,14 @@ class ExceptionVariable(VariableTracker):
         self.python_stack: traceback.StackSummary | None = None
 
     def set_context(self, context: VariableTracker) -> None:
+        # [FUNCTION DOC] Sets the implicit __context__ (exception being handled).
         self.__context__ = context
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits bytecode that constructs the builtin exception class
+        # with args, then restores __context__, __cause__ and __suppress_context__
+        # when they are not plain None/True/False constants.
+        # KNOWN ISSUE: __traceback__ and custom attributes are not restored here.
         codegen.add_push_null(
             lambda: codegen.load_import_from("builtins", self.exc_type.__name__)
         )
@@ -616,6 +702,9 @@ class ExceptionVariable(VariableTracker):
         codegen.call_function(len(self.args), False)
 
         def codegen_attr(name: str) -> None:
+            # [FUNCTION DOC] HELPER: For attribute `name`, if it is a constant, only
+            # checks it is True/False/None (AssertionError otherwise; nothing emitted).
+            # Otherwise emits code storing the attribute on the exception on the stack.
             attr = getattr(self, name)
             if istype(attr, ConstantVariable):
                 if attr.value not in (True, False, None):
@@ -633,11 +722,13 @@ class ExceptionVariable(VariableTracker):
         codegen_attr("__suppress_context__")
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the exception class.
         return self.exc_type
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Default identity-based object comparison.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
@@ -649,6 +740,14 @@ class ExceptionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Supports __setattr__ (validated updates of __context__,
+        # __cause__ which also sets __suppress_context__, __suppress_context__,
+        # __traceback__, args, or an arbitrary attribute stored via side effects),
+        # __setstate__ (None is a no-op, a dict is applied through __setattr__) and
+        # with_traceback (sets and returns self). Invalid values raise TypeError in
+        # the traced program. Other methods use the base class.
+        # KNOWN ISSUE: the TypeError text for a bad __suppress_context__ value
+        # wrongly says "exception cause must be None or derive from BaseException".
         if name == "__setattr__":
             name = args[0].as_python_constant()
             val = args[1]
@@ -741,6 +840,9 @@ class ExceptionVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute read for __class__, __context__, __cause__,
+        # __suppress_context__, __traceback__ and args (as a tuple); any other name
+        # goes to the generic lookup and raises an observed AttributeError if absent.
         if name == "__class__":
             return VariableTracker.build(tx, self.exc_type)
         elif name == "__context__":
@@ -772,6 +874,8 @@ class ExceptionVariable(VariableTracker):
             )
 
     def tp_str_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] str() of the exception: empty string for no args, str of the
+        # single arg, or str of the tuple of args otherwise (matches CPython).
         # ref: https://github.com/python/cpython/blob/v3.13.3/Objects/exceptions.c#L118-L129
         if len(self.args) == 0:
             return VariableTracker.build(tx, "")
@@ -784,27 +888,35 @@ class ExceptionVariable(VariableTracker):
             return generic_str(tx, tuple_var)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the class name and exception type.
         return f"{self.__class__.__name__}({self.exc_type})"
 
     __repr__ = __str__
 
     @staticmethod
     def _debug_format_arg(arg: VariableTracker) -> str:
+        # [FUNCTION DOC] HELPER: Text of arg: repr of its constant value if it has
+        # one, else its debug_repr.
         try:
             return repr(arg.as_python_constant())
         except Exception:
             return arg.debug_repr()
 
     def debug_repr(self) -> str:
+        # [FUNCTION DOC] Returns a Python-like rendering such as the type name
+        # followed by comma-separated formatted args.
         args = ", ".join(self._debug_format_arg(arg) for arg in self.args)
         return f"{self.python_type_name()}({args})"
 
     def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] repr() of the exception, built from debug_repr as a string.
         # ref: BaseException_repr in https://github.com/python/cpython/blob/3.13/Objects/exceptions.c#L135-L142
         return VariableTracker.build(tx, self.debug_repr())
 
 
 class StopIterationVariable(ExceptionVariable):
+    # [CLASS DOC] ExceptionVariable for StopIteration; adds a value attribute that is
+    # the first constructor arg (or a None constant).
     def __init__(
         self,
         exc_type: Any,
@@ -813,19 +925,22 @@ class StopIterationVariable(ExceptionVariable):
         source: Source | None = None,
         mutation_type: MutationType | None = None,
     ) -> None:
+        # [FUNCTION DOC] Records value from args, then runs the base constructor.
         self.value = args[0] if args else variables.ConstantVariable.create(None)
         super().__init__(exc_type, args, init_kwargs, source, mutation_type)
 
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Returns value for the value attribute; else base lookup.
         if name == "value":
             return self.value
         return super().tp_getattro_impl(tx, name)
 
 
 class _KwargAttrExceptionVariable(ExceptionVariable):
-    # Base for exceptions whose constructor accepts keyword-only attributes that
+    # [CLASS DOC] HELPER: Base for
+    # exceptions whose constructor accepts keyword-only attributes that
     # default to None (e.g. NameError's `name`, AttributeError's `name`/`obj`).
     # Subclasses list the attribute names in `_kwarg_attrs`; they are popped from
     # init_kwargs, exposed via getattr, and restored on reconstruct.
@@ -839,6 +954,9 @@ class _KwargAttrExceptionVariable(ExceptionVariable):
         source: Source | None = None,
         mutation_type: MutationType | None = None,
     ) -> None:
+        # [FUNCTION DOC] Pops each name listed in _kwarg_attrs from a copy of
+        # init_kwargs into the _attrs mapping (default None constant), then runs the
+        # base constructor with the remaining kwargs (which graph-break if non-empty).
         init_kwargs = dict(init_kwargs) if init_kwargs else {}
         none = variables.ConstantVariable.create(None)
         self._attrs = {name: init_kwargs.pop(name, none) for name in self._kwarg_attrs}
@@ -847,11 +965,15 @@ class _KwargAttrExceptionVariable(ExceptionVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Returns the stored keyword attribute if name is one, else
+        # defers to the base lookup.
         if name in self._attrs:
             return self._attrs[name]
         return super().tp_getattro_impl(tx, name)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Reconstructs the exception, then stores every keyword
+        # attribute whose value is not a None constant onto it.
         super().reconstruct(codegen)
         for name, val in self._attrs.items():
             if not (istype(val, ConstantVariable) and val.value is None):
@@ -862,6 +984,8 @@ class _KwargAttrExceptionVariable(ExceptionVariable):
 
 
 class AttributeErrorVariable(_KwargAttrExceptionVariable):
+    # [CLASS DOC] AttributeError with optional keyword attributes name and obj,
+    # exposed as read-only members.
     # https://docs.python.org/3/library/exceptions.html#AttributeError
     _kwarg_attrs = ("name", "obj")
     tp_members = {
@@ -871,18 +995,23 @@ class AttributeErrorVariable(_KwargAttrExceptionVariable):
 
 
 class NameErrorVariable(_KwargAttrExceptionVariable):
+    # [CLASS DOC] NameError with an optional keyword attribute name, exposed as a
+    # read-only member.
     # https://docs.python.org/3/library/exceptions.html#NameError
     _kwarg_attrs = ("name",)
     tp_members = {"name": Member(getset_read(lambda s: s._attrs["name"]))}
 
 
 class UnknownVariable(VariableTracker):
+    # [CLASS DOC] Placeholder for a value of unknown nature; adds no behavior.
     """
     It could be anything!
     """
 
 
 class DelayGraphBreakVariable(UnknownVariable):
+    # [CLASS DOC] Stack placeholder that defers a graph break until it is called.
+    # State: msg (reason text) and hints (list of hint strings).
     """
     Used to insert a dummy variable in the stack to do the graph break at CALL_FUNCTION.
     """
@@ -893,6 +1022,7 @@ class DelayGraphBreakVariable(UnknownVariable):
         hints: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the break reason message and hints (default empty).
         super().__init__(**kwargs)
         self.msg = msg
         self.hints = hints or []
@@ -903,6 +1033,8 @@ class DelayGraphBreakVariable(UnknownVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Always graph-breaks (unimplemented), reporting the source
+        # name and stored message and hints. Never returns.
         name = "" if self.source is None else self.source.name
         unimplemented(
             gb_type="Unsupported function call (delayed)",
@@ -914,17 +1046,22 @@ class DelayGraphBreakVariable(UnknownVariable):
 
 
 class ComptimeVariable(VariableTracker):
+    # [CLASS DOC] Represents the comptime special form; calling it runs a user
+    # function at Dynamo compile time with a ComptimeContext. Needs a source.
     """
     This variable is special, it lets you execute arbitrary code at
     Dynamo compile time
     """
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Always raises NotImplementedError (cannot be reconstructed).
         raise NotImplementedError("comptime is special form")
 
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Looks up attribute `name` on the comptime helper object and
+        # wraps it with an attribute source. Raises AssertionError without a source.
         from ..comptime import comptime
 
         if self.source is None:
@@ -940,6 +1077,12 @@ class ComptimeVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Runs the first argument (a user or nested user function)
+        # immediately, passing a ComptimeContext for the current translator.
+        # Nested functions must have no free variables (TypeError otherwise) and are
+        # rebuilt as plain functions with their globals and defaults. More than two
+        # args or any kwargs raises an args mismatch error; other argument kinds raise
+        # RuntimeError. The second argument is ignored. Returns a None constant.
         from ..comptime import ComptimeContext
 
         # TODO: support an expression form as well
@@ -983,6 +1126,10 @@ class ComptimeVariable(VariableTracker):
 
 
 class CellVariable(VariableTracker):
+    # [CLASS DOC] Models a closure cell. State: pre_existing_contents (tracker for
+    # the cell value if the cell existed before tracing) and local_name (name usable
+    # for LOAD/STORE_DEREF in the root frame). Mutations of cell contents are
+    # buffered in SideEffects, not stored here.
     # PyCell_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/cellobject.c#L151
     _cpython_type = types.CellType
 
@@ -1001,20 +1148,28 @@ class CellVariable(VariableTracker):
     def __init__(
         self, pre_existing_contents: VariableTracker | None = None, **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] Stores the optional pre-existing cell contents tracker.
         super().__init__(**kwargs)
         self.pre_existing_contents = pre_existing_contents
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns types.CellType.
         return types.CellType
 
 
 class NewGlobalVariable(VariableTracker):
+    # [CLASS DOC] Marker tracker for a global variable newly created during tracing.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Plain pass-through to the base constructor.
         super().__init__(**kwargs)
 
 
 def produce_trampoline_autograd_apply(fn_cls: Any) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Returns a function that forwards all arguments to the
+    # apply method of the given autograd.Function class. The returned function has
+    # an attribute _origin pointing back to this factory so it can be recognized.
     def trampoline_autograd_apply(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls apply on the captured class and returns its result.
         return fn_cls.apply(*args, **kwargs)
 
     # type: ignore[attr-defined]
@@ -1023,6 +1178,10 @@ def produce_trampoline_autograd_apply(fn_cls: Any) -> Callable[..., Any]:
 
 
 class AutogradFunctionVariable(VariableTracker):
+    # [CLASS DOC] Represents a torch.autograd.Function subclass (fn_cls). Handles
+    # apply (either as an opaque call for allowed callables, or by tracing forward
+    # and backward through AutogradFunctionApplyVariable), backward, and static or
+    # class methods. Calling the class itself yields another variable of this kind.
     """represents a torch.autograd.Function subclass"""
 
     _nonvar_fields = {
@@ -1031,10 +1190,12 @@ class AutogradFunctionVariable(VariableTracker):
     }
 
     def __init__(self, fn_cls: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the autograd.Function subclass.
         super().__init__(**kwargs)
         self.fn_cls = fn_cls
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns the type metaclass (the value is a class).
         return type
 
     def _resolve_kwargs(
@@ -1042,6 +1203,12 @@ class AutogradFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> list[VariableTracker] | None:
+        # [FUNCTION DOC] HELPER: Converts keyword arguments of apply into extra
+        # positional arguments using forward's parameter names (skipping the ctx
+        # parameter when setup_context is not defined). Returns None if some keyword
+        # is not a positional parameter name (e.g. keyword-only). Raises TypeError if
+        # a keyword duplicates a positional arg or a needed middle argument is
+        # missing. Gaps are not filled with defaults.
         """Resolve kwargs to positional args using forward().__code__.
 
         Uses co_varnames/co_argcount directly to match the C++
@@ -1084,6 +1251,15 @@ class AutogradFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Traces Function.apply. Kwargs are first resolved to positional
+        # args (graph break if impossible). If any tensor arg requires grad (or an
+        # nn module is training) and grad mode is on, builds an
+        # AutogradFunctionApplyVariable over forward (rewritten together with
+        # setup_context when defined) and backward, graph-breaking on custom vjp or
+        # jvp, and installs closure guards on forward/setup_context. Otherwise
+        # inlines forward directly with a fresh context object as first argument
+        # (dropped if forward does not take it). Graph-breaks if forward is neither
+        # a function nor a method.
         if kwargs:
             resolved = self._resolve_kwargs(args, kwargs)
             if resolved is None:
@@ -1099,6 +1275,8 @@ class AutogradFunctionVariable(VariableTracker):
         requires_grad = False
 
         def visit(vt: VariableTracker) -> None:
+            # [FUNCTION DOC] HELPER: Sets the enclosing requires_grad flag if vt is a
+            # tensor that may require grad or a module in training mode.
             nonlocal requires_grad
             if vt.is_tensor():
                 # type: ignore[attr-defined]
@@ -1221,6 +1399,9 @@ class AutogradFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Inlines the class's backward function. Requires the first
+        # argument to hold a FakeBackwardCFunction, backward to be a plain function
+        # and a source on this variable (AssertionError otherwise).
         fn = self.fn_cls.backward
         if (
             type(args[0].value)  # type: ignore[attr-defined]
@@ -1243,6 +1424,8 @@ class AutogradFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> "AutogradFunctionVariable":
+        # [FUNCTION DOC] Calling the function class returns a new variable for the
+        # same class (arguments are ignored).
         return AutogradFunctionVariable(self.fn_cls)
 
     def call_method(
@@ -1252,6 +1435,11 @@ class AutogradFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] apply: if the class is in the allowed-callables set, emits a
+        # single graph call through a trampoline; otherwise traces via call_apply.
+        # backward: call_backward. Other names: static methods are traced through
+        # trace_rules, class methods through a bound user method; anything else
+        # graph-breaks.
         from .builder import wrap_fx_proxy
 
         if name == "apply":
@@ -1315,10 +1503,16 @@ class AutogradFunctionVariable(VariableTracker):
 
 @dataclasses.dataclass
 class SavedTensorBox:
+    # [CLASS DOC] HELPER: Mutable holder for the list of tensor trackers saved by
+    # save_for_backward; shared so updates are visible across copies.
     tensors: list[VariableTracker] = dataclasses.field(default_factory=list)
 
 
 class AutogradFunctionContextVariable(UserDefinedObjectVariable):
+    # [CLASS DOC] Models the ctx object passed to autograd.Function forward. State:
+    # inference flag, saved_tensors (SavedTensorBox), non_differentiable and
+    # dirty_tensors markers. Supports save_for_backward, mark_dirty and
+    # mark_non_differentiable; other attribute mutation uses side effects.
     """
     Tracks an autograd.Function() context using mutation tracking in side_effects.py
     """
@@ -1340,6 +1534,7 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         dirty_tensors: list[VariableTracker] | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the ctx bookkeeping fields on top of the base object.
         super().__init__(value=value, value_type=value_type, **kwargs)
         self.inference = inference
         self.saved_tensors = saved_tensors
@@ -1352,6 +1547,10 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         args: list[VariableTracker] | None = None,
         kwargs: dict[str, VariableTracker] | None = None,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Creates a new tracked ctx object (inference mode with an
+        # empty SavedTensorBox) registered in side effects. When positional args
+        # exist and no kwargs, stores needs_input_grad (tuple of booleans, true for
+        # tensors requiring grad) as an instance attribute. Returns the new variable.
         out = tx.output.side_effects.track_object_new(
             None,
             torch.autograd.function.FunctionCtx,
@@ -1374,6 +1573,7 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         return out
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] Returns the stored proxy; graph-breaks if none was set.
         # type: ignore[attr-defined]
         if self.proxy is None:
             unimplemented(
@@ -1393,6 +1593,12 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Supports __setattr__ (base behavior), mark_non_differentiable
+        # (records proxied args), mark_dirty (records args; graph-breaks outside
+        # apply) and save_for_backward (replaces previously saved tensors with args;
+        # requires saved_tensors to exist; outside inference mode needs a source and
+        # no kwargs and registers with side effects). Keyword args to mark_* raise
+        # an args mismatch error. Other methods graph-break. Returns a None constant.
         if name == "__setattr__":
             return super().call_method(tx, name, args, kwargs)
         elif name == "mark_non_differentiable":
@@ -1458,6 +1664,9 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Attribute read: the three ctx methods become lambda wrappers
+        # calling call_method; dirty_tensors and saved_tensors are returned as tuple
+        # variables (dirty_tensors None constant if unset); else base lookup.
         if name in ["save_for_backward", "mark_dirty", "mark_non_differentiable"]:
             return LambdaVariable(
                 lambda *args, **kwargs: self.call_method(tx, name, list(args), kwargs)
@@ -1473,6 +1682,8 @@ class AutogradFunctionContextVariable(UserDefinedObjectVariable):
 
 
 class AutogradEngineVariable(UserDefinedObjectVariable):
+    # [CLASS DOC] Wraps the autograd engine object; only queue_callback is supported,
+    # and only inside a compiled autograd region.
     """
     Represents a torch._C._ImperativeEngine instance.
     """
@@ -1483,6 +1694,7 @@ class AutogradEngineVariable(UserDefinedObjectVariable):
         value_type: type[torch._C._ImperativeEngine] | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Forwards to the user-defined object constructor.
         super().__init__(value=value, value_type=value_type, **kwargs)
 
     def call_method(
@@ -1492,6 +1704,10 @@ class AutogradEngineVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] queue_callback inside compiled autograd (requires fullgraph
+        # or error-on-graph-break, else AssertionError) is redirected to the fake
+        # engine with the final-callbacks variable prepended; outside compiled
+        # autograd, or for any other method name, it graph-breaks.
         if name == "queue_callback":
             if torch._dynamo.compiled_autograd.in_compiled_autograd_region:
                 if not (tx.one_graph or tx.error_on_graph_break):
@@ -1527,12 +1743,16 @@ class AutogradEngineVariable(UserDefinedObjectVariable):
 
 
 class LambdaVariable(VariableTracker):
+    # [CLASS DOC] Wraps a Python callable operating directly on VariableTrackers;
+    # calling it invokes the callable with the args and kwargs (no translator).
     # TODO: change to Ts = TypeVarTuple("Ts") for py 3.11+
     def __init__(self, fn: Callable[..., VariableTracker], **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the callable.
         super().__init__(**kwargs)
         self.fn = fn
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Reports types.FunctionType.
         return types.FunctionType
 
     def call_function(
@@ -1541,10 +1761,16 @@ class LambdaVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calls the stored callable with args and kwargs; tx is unused.
         return self.fn(*args, **kwargs)
 
 
 class GetAttrVariable(VariableTracker):
+    # [CLASS DOC] Lazy attribute access obj.name that Dynamo could not resolve to a
+    # concrete tracker. State: obj (base tracker), name, py_type (optional known type
+    # of the result). Calling it calls the method `name` on obj; it can be turned
+    # into an FX proxy or a constant when the base allows, and reconstructs as an
+    # attribute load.
     _nonvar_fields = {
         "name",
         "py_type",
@@ -1558,6 +1784,8 @@ class GetAttrVariable(VariableTracker):
         py_type: type | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores obj, name and optional py_type. Raises AssertionError
+        # if obj is not a VariableTracker or name is not a string.
         super().__init__(**kwargs)
         if not isinstance(obj, VariableTracker):
             raise AssertionError(f"obj must be a VariableTracker, got {type(obj)}")
@@ -1568,22 +1796,29 @@ class GetAttrVariable(VariableTracker):
         self.py_type = py_type  # In some cases we know the type (ex. tensor methods)
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns py_type when known, else the base implementation.
         if self.py_type is not None:
             return self.py_type
         else:
             return super().python_type()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with class name, base and attribute name.
         return f"{self.__class__.__name__}({self.obj}, {self.name})"
 
     @staticmethod
     def create_getattr_proxy(base_proxy: torch.fx.Proxy, attr: str) -> Any:
+        # [FUNCTION DOC] Returns the proxy for attribute attr of base_proxy (an FX
+        # getattr node created lazily by the proxy).
         return getattr(base_proxy, attr)
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] Returns an FX proxy for the attribute of the base's proxy.
         return GetAttrVariable.create_getattr_proxy(self.obj.as_proxy(), self.name)
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Gets the attribute from the base's python constant. Raises
+        # NotImplementedError if the base is not constant or lacks the attribute.
         constant = self.obj.as_python_constant()
         try:
             return getattr(constant, self.name)
@@ -1591,6 +1826,8 @@ class GetAttrVariable(VariableTracker):
             raise NotImplementedError(f"{self} is not a constant") from None
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hashes the resolved constant attribute value; returns the
+        # hash and False (value-based hash). Graph-breaks if the value is not constant.
         # GetAttrVariable can wrap various types (bound methods, descriptors,
         # etc.) with different C tp_hash.  Resolve to the actual value and hash.
         try:
@@ -1610,6 +1847,9 @@ class GetAttrVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> "ConstantVariable":
+        # [FUNCTION DOC] hasattr check on the attribute value. Special case: for the
+        # apply method of an autograd.Function that generates a vmap rule, checks the
+        # real apply function; otherwise uses the base implementation.
         if (
             isinstance(self.obj, AutogradFunctionVariable)
             and self.name == "apply"
@@ -1621,6 +1861,10 @@ class GetAttrVariable(VariableTracker):
         return super().call_obj_hasattr(tx, name)
 
     def const_getattr(self, tx: "InstructionTranslatorBase", name: str) -> Any:
+        # [FUNCTION DOC] Statically reads attribute `name` of the attribute of an
+        # nn module (looked up without triggering descriptors). Raises
+        # NotImplementedError unless the base is an NNModuleVariable and both lookups
+        # are found in instance dicts.
         if not isinstance(self.obj, variables.NNModuleVariable):
             raise NotImplementedError
         step1 = tx.output.get_submodule(self.obj.module_key)
@@ -1632,12 +1876,16 @@ class GetAttrVariable(VariableTracker):
         return inspect.getattr_static(step2, name)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits the base followed by a load of the attribute.
         codegen(self.obj)
         codegen.extend_output(codegen.create_load_attrs(self.name))
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Resolves the attribute on the base (falling back to a real
+        # lookup when the base is a python constant), then compares that resolved
+        # value with other. Graph-breaks if it cannot be resolved.
         from .object_protocol import generic_richcompare
 
         try:
@@ -1664,6 +1912,7 @@ class GetAttrVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calls the method named by this attribute on the base.
         return self.obj.call_method(tx, self.name, args, kwargs)
 
     def mp_subscript_impl(
@@ -1671,12 +1920,17 @@ class GetAttrVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         key: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Subscripting: for the __dict__ attribute of a base that can
+        # produce a dict tracker, indexes that dict; otherwise base behavior.
         if self.name == "__dict__" and hasattr(self.obj, "get_dict_vt"):
             return self.obj.get_dict_vt(tx).mp_subscript_impl(tx, key)
         return super().mp_subscript_impl(tx, key)
 
 
 class CallMethodVariable(VariableTracker):
+    # [CLASS DOC] A bound method tracker: obj (receiver tracker) plus method_name.
+    # Calling it forwards to call_method on the receiver; reconstructs as a load of
+    # the method attribute.
     """A method bound to a VT instance.
 
     Returned by object_generic_getattr when the MRO walk finds a method
@@ -1694,23 +1948,30 @@ class CallMethodVariable(VariableTracker):
         method_name: str,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the receiver and the method name.
         super().__init__(**kwargs)
         self.obj = obj
         self.method_name = method_name
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with receiver and method name.
         return f"{self.__class__.__name__}({self.obj}, {self.method_name})"
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Type of the real bound method if the receiver is constant,
+        # otherwise types.MethodType.
         try:
             return type(self.as_python_constant())
         except (AsPythonConstantNotImplementedError, AttributeError):
             return types.MethodType
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Gets the real bound method from the receiver's constant value.
         return getattr(self.obj.as_python_constant(), self.method_name)
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the real method when constant (value hash, False);
+        # otherwise identity-based id and True.
         try:
             return hash(self.as_python_constant()), False
         except AsPythonConstantNotImplementedError:
@@ -1722,6 +1983,7 @@ class CallMethodVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Default identity-based object comparison.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
@@ -1732,14 +1994,19 @@ class CallMethodVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calls the named method on the receiver.
         return self.obj.call_method(tx, self.method_name, args, kwargs)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits the receiver then loads the method attribute.
         codegen(self.obj)
         codegen.extend_output(codegen.create_load_attrs(self.method_name))
 
 
 class PythonModuleVariable(VariableTracker):
+    # [CLASS DOC] Tracks a Python module object. State: value (the module) and
+    # is_torch (true for torch or torch submodules). Attribute reads honor pending
+    # side-effect mutations, then look up the real module and wrap the result.
     # PyModule_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/moduleobject.c#L1203
     _cpython_type = types.ModuleType
 
@@ -1750,25 +2017,35 @@ class PythonModuleVariable(VariableTracker):
     }
 
     def __init__(self, value: types.ModuleType, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the module and computes is_torch from its name.
         super().__init__(**kwargs)
         self.value = value
         self.is_torch = self.value is torch or self.value.__name__.startswith("torch.")
 
     def python_type(self) -> type[types.ModuleType]:
+        # [FUNCTION DOC] Returns types.ModuleType.
         return types.ModuleType
 
     def as_python_constant(self) -> types.ModuleType:
+        # [FUNCTION DOC] Returns the module itself.
         return self.value
 
     def get_real_python_backed_value(self) -> types.ModuleType:
+        # [FUNCTION DOC] Returns the module itself.
         return self.value
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the module.
         return f"PythonModuleVariable({self.value})"
 
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Reads module attribute `name`. A pending mutation recorded in
+        # side effects wins. Otherwise torch modules (or names missing from the module
+        # dict) use a real getattr, raising an observed AttributeError if absent;
+        # other names read the module dict directly. The value is wrapped with an
+        # attribute source when the module has a source.
         if tx.output.side_effects.has_pending_mutation_of_attr(self, name):
             return tx.output.side_effects.load_attr(self, name)
 
@@ -1787,13 +2064,19 @@ class PythonModuleVariable(VariableTracker):
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Default identity-based object comparison.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
 
 
 class TypingVariable(VariableTracker):
+    # [CLASS DOC] Tracks a typing construct (e.g. typing.List or a subscripted
+    # alias). State: value, the real typing object. Subscripting with a constant key
+    # builds a new TypingVariable; equality and union (or) operations are evaluated
+    # on the real objects; method calls graph-break.
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the typing object.
         super().__init__(**kwargs)
         self.value = value
 
@@ -1802,6 +2085,8 @@ class TypingVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         key: VariableTracker,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Subscripts the typing object with a constant key and wraps
+        # the result in a new TypingVariable. Graph-breaks on non-constant keys.
         # e.g., List[int] → typing.List[int]
         if not key.is_python_constant():
             unimplemented(
@@ -1816,6 +2101,9 @@ class TypingVariable(VariableTracker):
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] For equality or inequality between two TypingVariables,
+        # returns a constant boolean comparing the wrapped objects; otherwise
+        # returns a NotImplemented constant.
         if op in ("__eq__", "__ne__"):
             if istype(other, TypingVariable):
                 result = self.value == other.value
@@ -1832,6 +2120,8 @@ class TypingVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Always graph-breaks; method calls on typing objects are
+        # unsupported.
         unimplemented(
             gb_type="unsupported method call on `typing` variable",
             context=f"typing variable: {self.value}, method name: {name}, args: {args}, kwargs: {kwargs}",
@@ -1848,6 +2138,10 @@ class TypingVariable(VariableTracker):
         other: VariableTracker,
         reverse: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Implements the union operator for generic alias types. If
+        # other is not a constant, or the real operation returns NotImplemented,
+        # returns a NotImplemented tracker; else the wrapped result. The reverse
+        # flag is accepted but unused.
         # GenericAlias types (e.g. Callable[[int], bool]) support __or__ for
         # type unions (e.g. Callable[[int], bool] | None).
         if not other.is_python_constant():
@@ -1862,6 +2156,10 @@ class TypingVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Reads attribute `name` of the typing object (pending side
+        # effect mutations win), wrapping it with a source-based builder if this
+        # variable has a source, else a sourceless one. A missing attribute raises
+        # the real AttributeError (not an observed one).
         from .builder import SourcelessBuilder, VariableBuilder
 
         if tx.output.side_effects.has_pending_mutation_of_attr(self, name):
@@ -1875,15 +2173,20 @@ class TypingVariable(VariableTracker):
             return SourcelessBuilder.create(tx, value)
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped typing object.
         return self.value
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the typing object; value-based (second item False).
         return hash(self.value), False
 
     def get_real_python_backed_value(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped typing object.
         return self.value
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] For generic aliases, loads the alias as a constant (rebuilding
+        # it from parts is unreliable); other values use the base reconstruction.
         if not isinstance(self.value, types.GenericAlias):
             return super().reconstruct(codegen)
         # We're just trying to load the type here. Reconstructing the type from
@@ -1914,6 +2217,9 @@ class TypingVariable(VariableTracker):
 
 @functools.lru_cache(maxsize=1)
 def get_np_to_tnp_map() -> dict[types.BuiltinFunctionType, types.FunctionType]:
+    # [FUNCTION DOC] Builds (once, cached) a mapping from numpy functions to the
+    # equivalent torch._numpy callables, by scanning each paired numpy and
+    # torch._numpy module and keeping callables whose name exists in numpy.
     """
     This generates a mapping from numpy modules to their torch._numpy
     modules equivalents.
@@ -1935,6 +2241,8 @@ def get_np_to_tnp_map() -> dict[types.BuiltinFunctionType, types.FunctionType]:
 
 @functools.lru_cache(maxsize=1)
 def get_tnp_to_np_map() -> dict[types.FunctionType, types.BuiltinFunctionType]:
+    # [FUNCTION DOC] Returns (cached) the inverse of the numpy-to-torch._numpy map:
+    # torch._numpy function to numpy function.
     """
     This is just the reverse mapping of get_np_to_tnp_map() - mapping from
     torch._numpy modules to numpy equivalents.
@@ -1944,6 +2252,10 @@ def get_tnp_to_np_map() -> dict[types.FunctionType, types.BuiltinFunctionType]:
 
 
 class NumpyVariable(VariableTracker):
+    # [CLASS DOC] Wraps a numpy module-level object (function, dtype class, ufunc,
+    # constant). Calling a function maps it to its torch._numpy equivalent and
+    # traces it into the graph (or constant-folds, or builds dtype/finfo/iinfo
+    # collections). constant_fold_functions lists foldable torch._numpy functions.
     """
     Wrapper around `numpy.*`. Currently, is able to trace a small subset of numpy functions as well as numpy dtypes.
     """
@@ -1951,10 +2263,12 @@ class NumpyVariable(VariableTracker):
     constant_fold_functions = (tnp.issubdtype,)
 
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the numpy object.
         super().__init__(**kwargs)
         self.value = value
 
     def get_real_python_backed_value(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped numpy object.
         return self.value
 
     def tp_richcompare_impl(
@@ -1963,6 +2277,9 @@ class NumpyVariable(VariableTracker):
         other: VariableTracker,
         op: str,
     ) -> VariableTracker:
+        # [FUNCTION DOC] For equality or inequality against a tracker that has a
+        # value attribute, returns a constant comparing the wrapped values; any other
+        # operator or tracker gives a NotImplemented constant.
         # NumpyVariable wraps singleton numpy module attrs (dtypes, ufuncs,
         # constants); compare by the backed value for eq/ne, else NotImplemented.
         if op not in ("__eq__", "__ne__") or not hasattr(other, "value"):
@@ -1974,6 +2291,8 @@ class NumpyVariable(VariableTracker):
 
     @classmethod
     def can_constant_fold_through(cls, fn: types.FunctionType) -> bool:
+        # [FUNCTION DOC] True if fn is in the constant-fold set. Raises
+        # AssertionError unless fn lives in a torch._numpy module.
         mod = fn.__module__.split(".")
         if len(mod) < 2:
             raise AssertionError(
@@ -1987,6 +2306,10 @@ class NumpyVariable(VariableTracker):
 
     @classmethod
     def get_constant_collection_for_func(cls, fn: types.FunctionType) -> Any:
+        # [FUNCTION DOC] Returns the tracker class (from the module-level
+        # np_constant_collections_map) used for results of fn when it produces a
+        # constant collection like dtype/finfo/iinfo, or None. Raises AssertionError
+        # unless fn lives in a torch._numpy module.
         mod = fn.__module__.split(".")
         if len(mod) < 2:
             raise AssertionError(
@@ -2004,6 +2327,14 @@ class NumpyVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Traces a call to the numpy function. Graph-breaks when
+        # trace_numpy is off, when no torch._numpy equivalent exists, for numpy
+        # random functions with use_numpy_random_stream, or when collection-producing
+        # functions get non-constant args. Dtype/finfo/iinfo calls run the real numpy
+        # function on constants and wrap the result. Otherwise patches args, constant
+        # folds if allowed and all args are constant, else adds a graph call of the
+        # torch._numpy function (wrapped to convert numpy arrays) and returns an
+        # ndarray tracker.
         if not config.trace_numpy:
             unimplemented(
                 gb_type="attempted to trace numpy function with config.trace_numpy=False",
@@ -2100,6 +2431,7 @@ class NumpyVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Always graph-breaks; numpy functions cannot be called as methods.
         unimplemented(
             gb_type="attempted to trace numpy.* function as a method",
             context=f"numpy function: {self.value}, args: {args}, kwargs: {kwargs}",
@@ -2110,9 +2442,13 @@ class NumpyVariable(VariableTracker):
         )
 
     def as_python_constant(self) -> BuiltinFunctionType:
+        # [FUNCTION DOC] Returns the wrapped numpy object.
         return self.value
 
     def as_proxy(self) -> Any:
+        # [FUNCTION DOC] With numpy tracing on: enum classes are returned as is; type
+        # objects (numpy scalar dtypes) are returned as their name string so no numpy
+        # object lands in the graph. Otherwise uses the base implementation.
         if config.trace_numpy:
             # Can replace with EnumType once we drop 3.10 support
             if isinstance(self.value, enum.EnumMeta):
@@ -2129,13 +2465,19 @@ class NumpyVariable(VariableTracker):
 
 # Used to keep track of NULLs pushed on the stack for Python 3.11 function calls
 class NullVariable(VariableTracker):
+    # [CLASS DOC] Stand-in for the NULL pushed on the stack before calls (Python
+    # 3.11+); reconstructs as a push-null instruction.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Pass-through to the base constructor.
         super().__init__(**kwargs)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Fixed debug string.
         return "NullVariable"
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits a push-null instruction; graph-breaks on Python older
+        # than 3.11, where that instruction does not exist.
         if sys.version_info < (3, 11):
             unimplemented(
                 gb_type="cannot reconstruct NullVariable in Python < 3.11",
@@ -2149,14 +2491,19 @@ class NullVariable(VariableTracker):
         codegen.append_output(create_instruction("PUSH_NULL"))
 
     def reconstruct_pycode(self, codegen: "PyCodegen") -> str:
+        # [FUNCTION DOC] Returns the source text for a null as a None literal.
         return "None"
 
 
 class DeletedVariable(VariableTracker):
+    # [CLASS DOC] Marker value recorded in side effects to denote a deleted attribute.
     """Marker used to implement delattr()"""
 
 
 class StringFormatVariable(VariableTracker):
+    # [CLASS DOC] A deferred str.format call with non-constant arguments. State:
+    # format_string, sym_args (list) and sym_kwargs (mapping). Reconstructs as the
+    # real format call so formatting happens after the graph runs.
     """
     Represents a call to str.format(), we delay calling format until after the graph.
     """
@@ -2164,6 +2511,7 @@ class StringFormatVariable(VariableTracker):
     _nonvar_fields = {"format_string", *VariableTracker._nonvar_fields}
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns str.
         return str
 
     @classmethod
@@ -2173,6 +2521,9 @@ class StringFormatVariable(VariableTracker):
         sym_args: list[VariableTracker],
         sym_kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Factory: if every arg and kwarg is a constant, formats now
+        # and returns a constant string tracker; otherwise returns a deferred
+        # StringFormatVariable holding copies of the args.
         if all(
             x.is_python_constant()
             for x in itertools.chain(sym_args, sym_kwargs.values())
@@ -2192,6 +2543,8 @@ class StringFormatVariable(VariableTracker):
         sym_kwargs: dict[str, VariableTracker],
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores the format string and arguments. Raises
+        # AssertionError if format_string is not a str.
         super().__init__(**kwargs)
         if not isinstance(format_string, str):
             raise AssertionError(
@@ -2202,16 +2555,21 @@ class StringFormatVariable(VariableTracker):
         self.sym_kwargs = sym_kwargs
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with format string and arguments.
         return f"{self.__class__.__name__}({self.format_string!r}, {self.sym_args!r}, {self.sym_kwargs!r})"
 
     @staticmethod
     def _debug_format_arg(arg: VariableTracker) -> object:
+        # [FUNCTION DOC] HELPER: The constant value of arg if it has one, else its
+        # debug_repr text.
         try:
             return arg.as_python_constant()
         except Exception:
             return arg.debug_repr()
 
     def debug_repr(self) -> str:
+        # [FUNCTION DOC] Applies the format string to debug renderings of the args
+        # and returns the quoted result; falls back to repr if formatting fails.
         try:
             rendered = self.format_string.format(
                 *[self._debug_format_arg(arg) for arg in self.sym_args],
@@ -2225,6 +2583,9 @@ class StringFormatVariable(VariableTracker):
         return repr(rendered)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits a call of the format method of the constant format
+        # string, passing the positional args as a tuple and keyword args as a
+        # dict via extended call syntax.
         codegen.add_push_null(
             lambda: codegen.extend_output(
                 [
@@ -2246,20 +2607,26 @@ class ObjectVariable(VariableTracker):
     # PyBaseObject_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/typeobject.c#L7243
     _cpython_type = object
 
+    # [CLASS DOC] Placeholder for an opaque plain object; keeps the real value and
+    # compares by default object semantics.
     # placeholder for unknown / opaque values
     def __init__(self, value: object, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the opaque value.
         super().__init__(**kwargs)
         self.value = value
 
     def get_real_python_backed_value(self) -> object:
+        # [FUNCTION DOC] Returns the stored value.
         return self.value
 
     def python_type(self) -> type[object]:
+        # [FUNCTION DOC] Returns the object type.
         return object
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Default identity-based object comparison.
         from .object_protocol import object_richcompare
 
         return object_richcompare(self, tx, other, op)
@@ -2268,37 +2635,49 @@ class ObjectVariable(VariableTracker):
 if sys.version_info >= (3, 15):
 
     class SentinelVariable(VariableTracker):
+        # [CLASS DOC] Defined only on Python 3.15+. Wraps a builtin sentinel object
+        # (value); reports the sentinel type.
         # Use builtins.sentinel to avoid ruff errors
         _cpython_type = builtins.sentinel
 
         def __init__(self, value: builtins.sentinel, **kwargs: Any) -> None:
+            # [FUNCTION DOC] Stores the sentinel.
             super().__init__(**kwargs)
             self.value = value
 
         def get_real_python_backed_value(self) -> builtins.sentinel:
+            # [FUNCTION DOC] Returns the sentinel.
             return self.value
 
         def python_type(self) -> type[builtins.sentinel]:
+            # [FUNCTION DOC] Returns the sentinel type.
             return self._cpython_type
 
 
 class DebuggingVariable(VariableTracker):
+    # [CLASS DOC] A print-like or registered reorderable logging function. Calls are
+    # not executed during tracing but recorded in the translator's debug_locals list
+    # and replayed after the graph runs. State: value (the function).
     """
     Represents a call to a debugging function like print(), or something
     registered to config.reorderable_logging_functions.
     """
 
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the wrapped function.
         super().__init__(**kwargs)
         self.value = value
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Type of the wrapped function.
         return type(self.value)
 
     @staticmethod
     def is_reorderable_logging_function(
         obj: Any,
     ) -> TypeGuard[types.FunctionType | types.BuiltinFunctionType]:
+        # [FUNCTION DOC] True if obj is a plain or builtin function listed in the
+        # reorderable_logging_functions config set.
         return (
             callable(obj)
             and isinstance(obj, (types.FunctionType, types.BuiltinFunctionType))
@@ -2311,6 +2690,9 @@ class DebuggingVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] In export mode, does nothing. Otherwise checks the call can be
+        # reordered (graph-breaks if not), appends the (self, args) pair to the
+        # translator's debug_locals for later replay, and returns a None constant.
         if tx.export:
             # For export cases, we can just make debugging functions no-ops
             return ConstantVariable.create(None)
@@ -2331,6 +2713,8 @@ class DebuggingVariable(VariableTracker):
         return ConstantVariable.create(None)
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Reloads the function from its source; raises AssertionError
+        # if there is no source.
         if self.source is None:
             raise AssertionError(
                 "DebugLocalVariable requires a source for reconstruction"
@@ -2339,6 +2723,8 @@ class DebuggingVariable(VariableTracker):
 
     @staticmethod
     def can_reorder_logs(fn: Any, args: Sequence[Any], kwargs: dict[str, Any]) -> bool:
+        # [FUNCTION DOC] True only if there are no kwargs and every flattened argument
+        # is a tensor, constant or string-format tracker. fn is unused.
         """
         Run some additional checks for what sort of function calls can we
         actually reorder.
@@ -2363,18 +2749,23 @@ class DebuggingVariable(VariableTracker):
 
 
 class IgnoredFunctionVariable(VariableTracker):
+    # [CLASS DOC] A function whose calls are skipped during tracing; calling it
+    # returns a None constant without running it. State: value (the function).
     """
     Represents a call to an arbitrary function that should be ignored.
     """
 
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the ignored function.
         super().__init__(**kwargs)
         self.value = value
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Type of the wrapped function.
         return type(self.value)
 
     def get_real_python_backed_value(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped function.
         return self.value
 
     def call_function(
@@ -2383,22 +2774,29 @@ class IgnoredFunctionVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Ignores the call and returns a None constant.
         return variables.ConstantVariable.create(None)
 
 
 class LoggingLoggerVariable(VariableTracker):
+    # [CLASS DOC] Wraps a logging.Logger. Method calls are no-ops in export mode or
+    # when listed in the ignore config, are treated as reorderable debugging calls
+    # when registered as such, and otherwise graph-break. State: value (the logger).
     """
     Represents a call to any logging.Logger methods.
     """
 
     def __init__(self, value: logging.Logger, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the logger.
         super().__init__(**kwargs)
         self.value = value
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Type of the wrapped logger.
         return type(self.value)
 
     def get_real_python_backed_value(self) -> logging.Logger:
+        # [FUNCTION DOC] Returns the wrapped logger.
         return self.value
 
     def call_method(
@@ -2408,6 +2806,11 @@ class LoggingLoggerVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handles logger.<name>(...). Export mode: None constant. If the
+        # bound method (or its underlying function) is in ignore_logging_functions:
+        # None constant. If this logger has a source and the method is in
+        # reorderable_logging_functions: delegates to a DebuggingVariable call.
+        # Otherwise graph-breaks with hints on how to ignore or reorder the call.
         if tx.export:
             # For export cases, we can just make logging functions no-ops.
             return variables.ConstantVariable.create(None)
@@ -2443,6 +2846,12 @@ class LoggingLoggerVariable(VariableTracker):
 
 
 class ConstantLikeVariable(VariableTracker):
+    # [CLASS DOC] Wraps a compile-time constant that is not a simple literal (e.g.
+    # regex match, numpy finfo/iinfo). Method calls run for real when all args are
+    # constant and results are literals or regex matches; attribute reads convert
+    # numpy floats/dtypes/scalar types to the matching trackers. Class attributes
+    # np_floating, np_dtype, np_generic are numpy types, or dummy types if numpy is
+    # not installed (np_generic is then undefined).
     """self.value is a compile-time constant, but not a literal"""
 
     try:
@@ -2458,11 +2867,14 @@ class ConstantLikeVariable(VariableTracker):
         np_dtype = type("invalid_type", (), {})
 
     def __init__(self, value: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the constant value.
         super().__init__(**kwargs)
         self.value = value
 
     @property
     def _error_prefix(self) -> str:
+        # [FUNCTION DOC] HELPER: Qualified type name of the value (module omitted for
+        # builtins), used in graph break messages.
         """Dynamically compute the prefix from the value's type"""
         t = type(self.value)
 
@@ -2473,14 +2885,17 @@ class ConstantLikeVariable(VariableTracker):
         return f"{t.__module__}.{t.__qualname__}"
 
     def as_python_constant(self) -> Any:
+        # [FUNCTION DOC] Returns the wrapped value.
         return self.value
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Value hash; second item False (value-based).
         return hash(self.value), False
 
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Compares using the generic python-constant comparison.
         from .object_protocol import python_constant_richcompare_impl
 
         return python_constant_richcompare_impl(self, tx, other, op)
@@ -2492,6 +2907,9 @@ class ConstantLikeVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calls the real method with constant-converted args. Graph-breaks
+        # if any arg is not constant. The result becomes a constant tracker if it is a
+        # literal, a new ConstantLikeVariable if it is a regex match, else graph-breaks.
         # pyrefly: ignore [implicit-any]
         cargs, ckwargs = [], {}
         try:
@@ -2527,6 +2945,10 @@ class ConstantLikeVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Reads the real attribute: numpy floats become Python floats,
+        # numpy dtypes become NumpyDTypeVariable, numpy scalar types become
+        # NumpyVariable, literals become constant trackers; anything else is a lazy
+        # GetAttrVariable. A missing attribute raises the real AttributeError.
         result = getattr(self.value, name)
         if isinstance(result, self.np_floating):
             result = float(result)
@@ -2541,7 +2963,10 @@ class ConstantLikeVariable(VariableTracker):
 
 
 class NumpyDTypeVariable(ConstantLikeVariable):
+    # [CLASS DOC] A constant numpy dtype object; appears in graphs as the name of its
+    # scalar type.
     def as_proxy(self) -> str:
+        # [FUNCTION DOC] Returns the name of the dtype's scalar type as a string.
         """Similar to how numpy dtype descriptors (e.g. np.float32 ) are handled by NumpyVariable:
 
         np.dtype() objects are serialized as strings, torch._numpy wrappers will normalize to the torch dtype.
@@ -2558,6 +2983,9 @@ np_constant_collections_map = {
 
 
 class ContextVarVariable(VariableTracker):
+    # [CLASS DOC] Wraps a contextvars.ContextVar (cv_obj). get is resolved at trace
+    # time using a source that makes a guard re-check the value; set and reset
+    # graph-break; the name attribute is a constant. Requires a source for get.
     """Wraps a contextvars.ContextVar for Dynamo tracing.
 
     .get() is resolved at trace time with a guard that re-checks at cache time.
@@ -2570,10 +2998,12 @@ class ContextVarVariable(VariableTracker):
     }
 
     def __init__(self, cv_obj: contextvars.ContextVar[Any], **kwargs: Any) -> None:
+        # [FUNCTION DOC] Stores the context variable.
         super().__init__(**kwargs)
         self.cv_obj = cv_obj
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns contextvars.ContextVar.
         return contextvars.ContextVar
 
     def call_method(
@@ -2583,6 +3013,8 @@ class ContextVarVariable(VariableTracker):
         args: "list[VariableTracker]",
         kwargs: "dict[str, VariableTracker]",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] get is handled by _handle_get; set and reset graph-break;
+        # other methods use the base implementation.
         if name == "get":
             return self._handle_get(tx, args, kwargs)
         elif name in ("set", "reset"):
@@ -2604,6 +3036,11 @@ class ContextVarVariable(VariableTracker):
         args: "list[VariableTracker]",
         kwargs: "dict[str, VariableTracker]",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] HELPER: Implements get. Keyword args or more than one arg
+        # raise an observed TypeError; a default must be a safe compile-time constant
+        # (else graph-break). Reads the current value now and returns it wrapped with a
+        # ContextVarGetSource (base source, default flag and value) so guards re-check
+        # it. Raises AssertionError without a source.
         from ..source import ContextVarGetSource
         from ..utils import is_safe_constant
         from .base import NO_SUCH_SUBOBJ
@@ -2653,6 +3090,9 @@ class ContextVarVariable(VariableTracker):
         has_default: bool,
         default_value: Any,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Reads the real context variable, with the default if
+        # has_default is set. A missing value without default raises an observed
+        # LookupError.
         if has_default:
             return self.cv_obj.get(default_value)
         try:
@@ -2663,18 +3103,22 @@ class ContextVarVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] The name attribute is a string constant; others use base lookup.
         if name == "name":
             return ConstantVariable.create(self.cv_obj.name)
         return super().tp_getattro_impl(tx, name)
 
 
 class RandomClassVariable(VariableTracker):
+    # [CLASS DOC] The random.Random class; calling it creates a RandomVariable.
     """random.Random"""
 
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Pass-through to the base constructor.
         super().__init__(**kwargs)
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Reports the type metaclass (the value is a class).
         return type
 
     def call_function(
@@ -2683,6 +3127,9 @@ class RandomClassVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> "RandomVariable":
+        # [FUNCTION DOC] Creates a RandomVariable seeded with the optional single
+        # argument (None constant if absent); marked as newly created for mutation
+        # tracking. Graph-breaks on more than one arg or any kwargs.
         if len(args) > 1 or kwargs:
             unimplemented(
                 gb_type="random.Random() with improper arguments",
@@ -2699,6 +3146,11 @@ class RandomClassVariable(VariableTracker):
 
 
 class RandomVariable(VariableTracker):
+    # [CLASS DOC] Tracks a random.Random instance by holding a private real Random
+    # object (random) whose state is advanced during tracing. Supports seed,
+    # getstate, setstate, shuffle, sample, random, randint, randrange and uniform
+    # through tp_methods (_supported_fn_names lists the value-producing ones). Mutating
+    # methods notify side effects; reconstruct recreates the object with its state.
     """random.Random()
 
     Implemented by wrapping a VariableTracker around a random.Random object.
@@ -2726,6 +3178,9 @@ class RandomVariable(VariableTracker):
         seed: VariableTracker | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Creates the private Random: copies the state of rand if given
+        # (must be an unmodified random.Random, else AssertionError), otherwise seeds
+        # a new one from seed (a constant-convertible tracker, or None).
         super().__init__(**kwargs)
         if rand is not None:
             if not self.is_supported_random_obj(rand):
@@ -2739,13 +3194,18 @@ class RandomVariable(VariableTracker):
             self.random = random.Random(seed)
 
     def python_type(self) -> type[random.Random]:
+        # [FUNCTION DOC] Returns random.Random.
         return random.Random
 
     def as_python_constant(self) -> random.Random:
+        # [FUNCTION DOC] Returns the private real Random object (not a copy).
         return self.random
 
     @staticmethod
     def is_supported_random_obj(val: Random) -> bool:
+        # [FUNCTION DOC] True only if val is exactly random.Random and each of the
+        # supported methods plus seed, getstate and setstate is the stock
+        # implementation (not overridden or monkey patched).
         if type(val) is not random.Random:
             return False
         for name in itertools.chain(
@@ -2765,6 +3225,8 @@ class RandomVariable(VariableTracker):
 
     @staticmethod
     def check_state(state: tuple[int, tuple[int, ...], float | None]) -> None:
+        # [FUNCTION DOC] HELPER: Validates a Random state: a tuple of an int, a tuple
+        # of ints, and a float or None. Raises AssertionError otherwise.
         if type(state) is not tuple:
             raise AssertionError(f"state must be a tuple, got {type(state)}")
         if type(state[0]) is not int:
@@ -2780,6 +3242,8 @@ class RandomVariable(VariableTracker):
 
     @staticmethod
     def wrap_state(state: tuple[int, tuple[int, ...], float | None]) -> TupleVariable:
+        # [FUNCTION DOC] HELPER: Validates a real Random state and converts it to a
+        # nested tuple tracker of constants.
         RandomVariable.check_state(state)
         return variables.TupleVariable(
             [
@@ -2795,6 +3259,8 @@ class RandomVariable(VariableTracker):
     def unwrap_state(
         state: VariableTracker,
     ) -> tuple[int, tuple[int, ...], float | None]:
+        # [FUNCTION DOC] HELPER: Converts a constant state tracker to a real state
+        # tuple and validates it (AssertionError if malformed).
         state_obj = state.as_python_constant()
         RandomVariable.check_state(state_obj)
         return state_obj
@@ -2805,6 +3271,8 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method seed: records the mutation, reseeds the private Random
+        # with constant-converted args, returns a None constant.
         tx.output.side_effects.mutation(self)
         self.random.seed(
             *[x.as_python_constant() for x in args],
@@ -2818,6 +3286,7 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method getstate: returns the current state as a tuple tracker.
         return self.wrap_state(self.random.getstate())
 
     def setstate(
@@ -2826,6 +3295,8 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method setstate: records the mutation and installs the state
+        # given by the first argument (must be a valid constant state); returns None.
         tx.output.side_effects.mutation(self)
         self.random.setstate(self.unwrap_state(args[0]))
         return variables.ConstantVariable.create(None)
@@ -2836,6 +3307,10 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method shuffle: takes exactly one positional list or tuple
+        # tracker and no keywords. Advances the RNG by shuffling an index list of the
+        # same length, then reorders the tracker's items in place (recording the
+        # mutation). Returns a None constant; AssertionError if the arg has no items.
         name = "shuffle"
         check_positional(tx, name, len(args), 1, 1)
         no_keywords(tx, name, kwargs)
@@ -2858,6 +3333,10 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Method sample: exactly two positional args (population, count k;
+        # no keywords). k must be a constant int in range (ValueError otherwise).
+        # Samples indices from the RNG and returns a new list tracker of the chosen
+        # elements, marked as newly created.
         name = "sample"
         check_positional(tx, name, len(args), 2, 2)
         no_keywords(tx, name, kwargs)
@@ -2879,10 +3358,17 @@ class RandomVariable(VariableTracker):
         )
 
     def _call_random(self, tx, name, args, kwargs):
+        # [FUNCTION DOC] HELPER: Shared implementation of random, randint, randrange
+        # and uniform. Records the mutation, advances the private Random by running
+        # the real method on constant-converted args, and delegates to call_random_fn
+        # with a function replaying the method from the pre-call state (so the result
+        # may be computed with tensors or symbolic values).
         tx.output.side_effects.mutation(self)
         state = self.random.getstate()
 
         def call_random_meth(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the named method on a fresh Random restored
+            # to the saved pre-call state and returns the result.
             r = random.Random()
             r.setstate(state)
             return getattr(r, name)(*args, **kwargs)
@@ -2902,6 +3388,7 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Method random via _call_random.
         return self._call_random(tx, "random", args, kwargs)
 
     def _randint(
@@ -2910,6 +3397,7 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Method randint via _call_random.
         return self._call_random(tx, "randint", args, kwargs)
 
     def _randrange(
@@ -2918,6 +3406,7 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Method randrange via _call_random.
         return self._call_random(tx, "randrange", args, kwargs)
 
     def _uniform(
@@ -2926,6 +3415,7 @@ class RandomVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Method uniform via _call_random.
         return self._call_random(tx, "uniform", args, kwargs)
 
     tp_methods = {
@@ -2941,6 +3431,8 @@ class RandomVariable(VariableTracker):
     }
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits code creating a new random.Random and restoring the
+        # current state through setstate, leaving the object on the stack.
         codegen.add_push_null(
             lambda: codegen.extend_output(
                 [
@@ -2960,7 +3452,11 @@ class RandomVariable(VariableTracker):
 
 
 class WeakRefVariable(VariableTracker):
+    # [CLASS DOC] Tracks a weakref.ref. State: referent_vt (tracker of the referent,
+    # returned when the ref is called) and callback_vt (tracker of the callback).
+    # Hashing and equality follow the referent.
     def python_type(self) -> type:
+        # [FUNCTION DOC] Returns weakref.ref.
         return weakref.ref
 
     @staticmethod
@@ -2971,6 +3467,9 @@ class WeakRefVariable(VariableTracker):
         source: Source | None,
         **options: Any,
     ) -> "WeakRefVariable":
+        # [FUNCTION DOC] Builds a tracker for an existing weakref: wraps its callback
+        # (attribute source) and its live referent (weakref-call source), then
+        # creates the WeakRefVariable with that source. AssertionError if source is None.
         if source is None:
             raise AssertionError("WeakRefVariable.build requires a source")
         callback = weakref_value.__callback__
@@ -2985,6 +3484,7 @@ class WeakRefVariable(VariableTracker):
     def __init__(
         self, referent_vt: VariableTracker, callback_vt: VariableTracker, **options: Any
     ) -> None:
+        # [FUNCTION DOC] Stores the referent and callback trackers.
         super().__init__(**options)
         self.referent_vt = referent_vt
         self.callback_vt = callback_vt
@@ -2995,15 +3495,18 @@ class WeakRefVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Calling the ref returns the referent tracker (assumes alive).
         return self.referent_vt
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
+        # [FUNCTION DOC] Emits a call to weakref.ref with the referent and callback.
         codegen.add_push_null(lambda: codegen.load_import_from("weakref", "ref"))
         codegen(self.referent_vt)
         codegen(self.callback_vt)
         codegen.extend_output(create_call_function(2, False))
 
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
+        # [FUNCTION DOC] Hash of the referent via the generic hash helper.
         # CPython weakref_hash: hash(referent)
         # https://github.com/python/cpython/blob/e76aa128fe/Objects/weakrefobject.c#L186
         from .object_protocol import generic_hash_impl
@@ -3013,6 +3516,8 @@ class WeakRefVariable(VariableTracker):
     def tp_richcompare_impl(
         self, tx: "InstructionTranslatorBase", other: "VariableTracker", op: str
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Equality or inequality between two WeakRefVariables compares
+        # their referents; other operators or other types give a NotImplemented constant.
         from .object_protocol import generic_richcompare
 
         # Weak references only support equality, not ordering. Two weak references
