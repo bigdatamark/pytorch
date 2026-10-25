@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Recompile-limit accounting for Dynamo's per-code-object guard cache. Provides a
+# dataclass summarizing cache occupancy for a frame, helpers that count cache entries
+# sharing the frame's ID_MATCH'd objects, and predicates deciding whether a frame is a
+# recompilation or has exceeded recompile_limit / accumulated_recompile_limit from
+# config. Import-time side effect: creates the module logger only.
 import logging
 import weakref
 from dataclasses import dataclass
@@ -70,6 +76,10 @@ mentioned earlier.
 
 @dataclass
 class CacheSizeRelevantForFrame:
+    # [CLASS DOC]
+    # Snapshot of cache occupancy for one frame: entries in the current region,
+    # entries whose ID_MATCH'd objects equal the frame's, and total entries across all
+    # regions of the code object. Provides limit-check predicates against config.
     """
     We track the number of cache entries that have same id_match objects as the
     given frame.
@@ -90,6 +100,9 @@ class CacheSizeRelevantForFrame:
     total_cache_entries_all_regions: int = 0
 
     def will_compilation_exceed(self, limit: int) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if either the accumulated limit or the given per-ID_MATCH limit
+        # is already reached (so one more compilation would exceed it).
         # Checks if a compilation will exceed the given limit (that's why >=).
         return (
             self.will_compilation_exceed_accumulated_limit()
@@ -97,18 +110,28 @@ class CacheSizeRelevantForFrame:
         )
 
     def will_compilation_exceed_accumulated_limit(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if total entries across all regions has reached
+        # config.accumulated_recompile_limit.
         # accumulated_recompile_limit is a global safety cap across all regions.
         return (
             self.total_cache_entries_all_regions >= config.accumulated_recompile_limit
         )
 
     def will_compilation_exceed_specific_limit(self, limit: int) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if the count of entries sharing the frame's ID_MATCH'd objects
+        # has reached the given limit.
         return self.num_cache_entries_with_same_id_matched_objs >= limit
 
 
 def _get_weakref_from_f_locals(
     frame: DynamoFrameType, local_name: str
 ) -> weakref.ref[Any] | None:
+    # [FUNCTION DOC] HELPER: Looks up a local variable by name in the frame's locals
+    # and returns a weak reference to it, or None if the value is missing (None) or
+    # cannot be weakly referenced (e.g. bool, int). Note weakref.ref to the same live
+    # object is typically the identical ref object, which callers compare by identity.
     obj = frame.f_locals.get(local_name, None)
     weak_id = None
     try:
@@ -119,6 +142,10 @@ def _get_weakref_from_f_locals(
 
 
 def _has_same_id_matched_objs(frame: DynamoFrameType, cache_entry: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if every still-alive ID_MATCH'd object
+    # recorded in the cache entry's guard manager corresponds to the same weakref found
+    # for that local name in the frame. Falsy cache_entry returns False. Entries whose
+    # referent died are skipped. Returns True when there are no ID_MATCH'd objects.
     """
     Checks if the ID_MATCH'd objects saved on cache_entry are same as the ones
     in frame.f_locals.
@@ -144,6 +171,10 @@ def compute_cache_size(
     cache_entries: list[Any],
     total_cache_entries_all_regions: int = 0,
 ) -> CacheSizeRelevantForFrame:
+    # [FUNCTION DOC]
+    # Counts the entries in one region's cache list and how many share the frame's
+    # ID_MATCH'd objects. Returns a CacheSizeRelevantForFrame whose all-regions total
+    # is the larger of the supplied total and this region's count. No side effects.
     # cache_entries is already scoped to a single isolate_recompiles region.
     # recompile_limit is checked per-region. accumulated_recompile_limit uses
     # total_cache_entries_all_regions as a global safety cap.
@@ -163,6 +194,10 @@ def compute_cache_size(
 
 
 def is_recompilation(cache_size: CacheSizeRelevantForFrame) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if at least one existing entry already shares the frame's ID_MATCH'd
+    # objects (limit of 1) or the accumulated limit is reached, i.e. this compile is a
+    # recompilation rather than a first compile.
     """
     If the frame (earlier parsed by compute_cache_size) has more than 1 cache
     entry with same ID_MATCH'd objects, then its a recompilation.
@@ -178,6 +213,12 @@ def is_recompilation(cache_size: CacheSizeRelevantForFrame) -> bool:
 def exceeds_recompile_limit(
     cache_size: CacheSizeRelevantForFrame, compile_id: CompileId
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC]
+    # Decides whether compiling again would exceed a limit. Returns (True, name) with
+    # name "accumulated_recompile_limit" or "recompile_limit", else (False, ""). Also
+    # trips the accumulated limit if the compile id's frame_compile_id reaches it
+    # (guards against endless recompiles with a non-growing cache). Raises an error
+    # if frame_compile_id is None.
     """
     Checks if we are exceeding the cache size limit.
     """

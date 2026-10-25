@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Low-level bytecode toolkit for Dynamo. Defines a mutable Instruction type and
+# exception-table entry type, factories for version-specific instructions (calls, swaps,
+# rotations, null pushes, slices), the pipeline that converts code objects to Instruction
+# lists (cleaned_instructions, virtualized jumps and exception tables) and assembles
+# them back into code objects (transform_code_object, assemble, line/exception tables),
+# plus helpers to clone code, generate code from template functions and fix up jump
+# targets. Version-conditional definitions are selected at import time by the running
+# Python version; no other import-time side effects.
 """
 This module provides utilities for analyzing, transforming and manipulating Python bytecode.
 It includes functionality for:
@@ -41,6 +50,11 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(slots=True)
 class InstructionExnTabEntry:
+    # [CLASS DOC]
+    # One exception-table entry expressed over Instruction objects (not offsets): the
+    # inclusive start and end instructions of the protected range, the handler target
+    # instruction, the stack depth to unwind to, and whether the last-instruction offset
+    # is pushed. Equality is by identity of the three instructions plus depth and lasti.
     start: "Instruction"
     end: "Instruction"
     target: "Instruction"
@@ -48,6 +62,8 @@ class InstructionExnTabEntry:
     lasti: bool
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a readable string using short representations of the three instructions.
         return (
             f"InstructionExnTabEntry(start={self.start.short_inst_repr()}, "
             f"end={self.end.short_inst_repr()}, "
@@ -56,6 +72,9 @@ class InstructionExnTabEntry:
         )
 
     def __eq__(self, o: object) -> bool:
+        # [FUNCTION DOC]
+        # True only for another entry with the identical start, end and target
+        # instruction objects and equal depth and lasti; False for other types.
         if not isinstance(o, InstructionExnTabEntry):
             return False
         return (
@@ -69,6 +88,11 @@ class InstructionExnTabEntry:
 
 @dataclasses.dataclass(slots=True)
 class Instruction:
+    # [CLASS DOC]
+    # Mutable counterpart of dis.Instruction: opcode, name, raw arg, resolved argval,
+    # offset, source line, jump-target flag, positions, plus Dynamo extras: target (the
+    # Instruction a jump points to), exn_tab_entry and argrepr. Hashing and equality
+    # are by object identity so instructions can key mappings while being mutated.
     """A mutable version of dis.Instruction"""
 
     opcode: int
@@ -86,15 +110,24 @@ class Instruction:
     argrepr: str | None = None
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC]
+        # Identity-based hash.
         return id(self)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC]
+        # Identity-based equality: true only for the same object.
         return id(self) == id(other)
 
     def short_inst_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a compact string with just the opcode name and offset.
         return f"Instruction(opname={self.opname}, offset={self.offset})"
 
     def copy_positions(self, other: "Instruction") -> None:
+        # [FUNCTION DOC]
+        # Copies the source line number and position info from another instruction onto
+        # this one (mutates this instruction).
         self.starts_line = other.starts_line
         self.positions = other.positions
 
@@ -102,6 +135,9 @@ class Instruction:
 if sys.version_info >= (3, 13):
 
     def convert_instruction(i: dis.Instruction) -> Instruction:
+        # [FUNCTION DOC]
+        # Converts a dis instruction to a mutable Instruction (3.13+ variant: line comes
+        # from the line_number field; positions are kept).
         return Instruction(
             i.opcode,
             i.opname,
@@ -116,6 +152,9 @@ if sys.version_info >= (3, 13):
 elif sys.version_info >= (3, 11):
 
     def convert_instruction(i: dis.Instruction) -> Instruction:
+        # [FUNCTION DOC]
+        # Converts a dis instruction to a mutable Instruction (3.11/3.12 variant: uses
+        # starts_line and keeps positions).
         return Instruction(
             i.opcode,
             i.opname,
@@ -130,6 +169,9 @@ elif sys.version_info >= (3, 11):
 else:
 
     def convert_instruction(i: dis.Instruction) -> Instruction:
+        # [FUNCTION DOC]
+        # Converts a dis instruction to a mutable Instruction (pre-3.11 variant: no
+        # position info available, so positions is None).
         return Instruction(
             i.opcode,
             i.opname,
@@ -143,23 +185,33 @@ else:
 
 
 class _NotProvided:
+    # [CLASS DOC] HELPER: Sentinel type marking an argument as not supplied, so None can
+    # remain a valid explicit value.
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the sentinel's name.
         return "_NotProvided"
 
 
 if sys.version_info >= (3, 12):
 
     def inst_has_op_bits(name: str) -> bool:
+        # [FUNCTION DOC]
+        # True if the opcode name encodes flag bits in its arg (3.12+: load-attr,
+        # load-global, load-super-attr).
         return name in ("LOAD_ATTR", "LOAD_GLOBAL", "LOAD_SUPER_ATTR")
 
 elif sys.version_info >= (3, 11):
 
     def inst_has_op_bits(name: str) -> bool:
+        # [FUNCTION DOC]
+        # True if the opcode name encodes flag bits in its arg (3.11: load-global only).
         return name == "LOAD_GLOBAL"
 
 else:
 
     def inst_has_op_bits(name: str) -> bool:
+        # [FUNCTION DOC]
+        # Always False before 3.11: no opcodes carry flag bits in the arg.
         return False
 
 
@@ -170,6 +222,12 @@ def create_instruction(
     argval: Any | None = _NotProvided,
     target: Instruction | None = None,
 ) -> Instruction:
+    # [FUNCTION DOC]
+    # Builds an Instruction by opcode name. At most one of arg, argval and target may be
+    # given (except opcodes with flag bits, where arg is the flag value, default 0, and
+    # argval may also be given; target is then forbidden). Raises a runtime error on
+    # ambiguous arguments, a non-integer arg, or target on a flag-bit opcode. Raises
+    # KeyError for an unknown opcode name for this Python version.
     """
     At most one of `arg`, `argval`, and `target` can be not None/_NotProvided.
     This is to prevent ambiguity, e.g. does
@@ -207,15 +265,24 @@ def create_instruction(
 
 # Python 3.11 remaps
 def create_jump_absolute(target: Instruction) -> Instruction:
+    # [FUNCTION DOC]
+    # Builds an unconditional jump to target: a forward jump on 3.11+ (absolute jumps
+    # no longer exist, jumps are relative and later fixed up), else absolute jump.
     inst = "JUMP_FORWARD" if sys.version_info >= (3, 11) else "JUMP_ABSOLUTE"
     return create_instruction(inst, target=target)
 
 
 def is_jump_absolute(target: Instruction) -> bool:
+    # [FUNCTION DOC]
+    # True if the instruction is an unconditional jump (forward or absolute form).
+    # The parameter is named target but is the instruction being tested.
     return target.opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE")
 
 
 def create_load_const(val: Any, checked: bool = True) -> Instruction:
+    # [FUNCTION DOC]
+    # Builds a constant-load instruction carrying val. When checked, raises an error if
+    # val is not a safe (immutable) constant; unchecked allows arbitrary objects.
     """
     In general we should only create `LOAD_CONST` for immutable objects, but
     sometimes it's convenient _and safe_ for Dynamo create `LOAD_CONST` for
@@ -228,6 +295,10 @@ def create_load_const(val: Any, checked: bool = True) -> Instruction:
 
 
 def create_breakpoint() -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns a load-constant of the bytecode debugger's marker followed by a pop; a
+    # no-op at runtime that the bytecode debugger recognizes as a breakpoint. Imports
+    # the marker lazily from the bytecode debugger module.
     """
     Create instructions that trigger the bytecode debugger to stop.
 
@@ -246,12 +317,20 @@ def create_breakpoint() -> list[Instruction]:
 
 
 def create_dup_top() -> Instruction:
+    # [FUNCTION DOC]
+    # Returns an instruction duplicating the top of stack (copy 1 on 3.11+, dup-top
+    # before).
     if sys.version_info >= (3, 11):
         return create_instruction("COPY", arg=1)
     return create_instruction("DUP_TOP")
 
 
 def create_rot_n(n: int) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions moving top of stack down to position n. Empty for n <= 1.
+    # On 3.11+ a descending series of swaps; before 3.11 a single rotate opcode (two,
+    # three, four, or general ROT_N) which may not exist, in which case an AttributeError
+    # style failure from opcode lookup propagates and callers fall back.
     """
     Returns a "simple" sequence of instructions that rotates TOS to the n-th
     position in the stack. For Python < 3.11, returns a single ROT_*
@@ -277,6 +356,12 @@ def create_rot_n(n: int) -> list[Instruction]:
 def add_push_null(
     inst_or_insts: Instruction | list[Instruction],
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Given an instruction or list that pushes exactly one callable, returns a list that
+    # also pushes the NULL used by the 3.11+ call convention: sets the low arg bit on a
+    # load-global/load-attr/load-super-attr when possible (mutating it), else adds a
+    # push-null before (3.11, 3.12) or after (3.13+) the callable. Returns the list
+    # unchanged before 3.11. Raises an error if a non-list non-Instruction is passed.
     """
     Appends or prepends a PUSH_NULL instruction to `inst_or_insts`,
     depending on Python version. Used when you know that
@@ -301,11 +386,15 @@ def add_push_null(
         insts = inst_or_insts
 
     def inst_has_bit_set(idx: int) -> bool:
+        # [FUNCTION DOC] HELPER: True if the low (push-null) bit of the arg of the
+        # instruction at idx is set; raises an error if that arg is None.
         if insts[idx].arg is None:
             raise AssertionError(f"expected insts[{idx}].arg to be not None")
         return insts[idx].arg & 1 == 1  # type: ignore[operator]
 
     def set_inst_bit(idx: int) -> None:
+        # [FUNCTION DOC] HELPER: Sets the low (push-null) bit of the arg of the
+        # instruction at idx in place; raises an error if that arg is None.
         if insts[idx].arg is None:
             raise AssertionError(f"expected insts[{idx}].arg to be not None")
         insts[idx].arg |= 1  # type: ignore[operator]
@@ -341,6 +430,11 @@ def add_push_null(
 def add_push_null_call_function_ex(
     inst_or_insts: Instruction | list[Instruction],
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Variant of add_push_null for callables that will be invoked with the call-ex
+    # opcode: only a load-global's low bit may be set (the load-attr bit is not used);
+    # otherwise a push-null is added before (3.11/3.12) or after (3.13+). Unchanged
+    # before 3.11. Raises an error for invalid input type or a load-global with no arg.
     """Like add_push_null, but the low bit of LOAD_ATTR/LOAD_SUPER_ATTR
     is not set, due to an expected CALL_FUNCTION_EX instruction.
     """
@@ -375,6 +469,10 @@ def add_push_null_call_function_ex(
 
 
 def create_call_function(nargs: int, push_null: bool) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions calling the callable on the stack with nargs positional
+    # args. On 3.11+: optionally pushes a NULL and rotates it into place when push_null
+    # is true, then a precall (3.11 only) and call; before 3.11 a single call-function.
     """
     Creates a sequence of instructions that makes a function call.
 
@@ -432,6 +530,11 @@ def create_call_function(nargs: int, push_null: bool) -> list[Instruction]:
 def create_call_function_ex(
     has_kwargs: bool, push_null: bool, ignore_314_kwargs_push: bool = False
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions for a call-ex call (args tuple, optional kwargs mapping on
+    # the stack). On 3.14+ without kwargs, pushes a NULL as the kwargs slot unless the
+    # caller already did. With push_null on 3.11+, pushes a NULL and rotates it below the
+    # callable. The flag argument encodes whether kwargs are present.
     """
     Assumes that in 3.14+, if has_kwargs=False, there is NOT a NULL
     on the TOS for the kwargs. This utility function will add a PUSH_NULL.
@@ -464,6 +567,9 @@ def create_call_function_ex(
 
 
 def create_call_method(nargs: int) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns the version-specific instructions that call a method loaded earlier with
+    # nargs args: a call (3.12+), precall plus call (3.11), or call-method (earlier).
     if sys.version_info >= (3, 12):
         return [create_instruction("CALL", arg=nargs)]
     if sys.version_info >= (3, 11):
@@ -475,6 +581,9 @@ def create_call_method(nargs: int) -> list[Instruction]:
 
 
 def create_load_method(name: str) -> Instruction:
+    # [FUNCTION DOC]
+    # Returns an instruction that loads a method by name: a load-attr with the method
+    # flag bit set on 3.12+, else a load-method.
     if sys.version_info >= (3, 12):
         # in 3.12, create a LOAD_ATTR instruction with the low bit set
         return create_instruction("LOAD_ATTR", arg=1, argval=name)
@@ -482,11 +591,19 @@ def create_load_method(name: str) -> Instruction:
 
 
 def create_setup_with(target: Instruction) -> Instruction:
+    # [FUNCTION DOC]
+    # Returns the context-manager entry instruction (before-with on 3.11+, setup-with
+    # before) whose jump target is the given handler instruction.
     opname = "BEFORE_WITH" if sys.version_info >= (3, 11) else "SETUP_WITH"
     return create_instruction(opname, target=target)
 
 
 def create_swap(n: int) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions swapping the top of stack with the n-th item. A single swap
+    # on 3.11+. Before 3.11: nothing for n of 1, rotate opcodes for 2 and 3, and for
+    # larger n a sequence that packs the top n-1 items in a list, swaps its last
+    # element with the top, and unpacks it (reversing as needed).
     if sys.version_info >= (3, 11):
         return [create_instruction("SWAP", arg=n)]
     # in Python < 3.11, SWAP is a macro that expands to multiple instructions
@@ -533,6 +650,10 @@ def create_swap(n: int) -> list[Instruction]:
 
 
 def get_call_callable_depth(opname: str, arg: int) -> int:
+    # [FUNCTION DOC]
+    # Returns the 1-based stack depth (top = 1) of the callable for a call instruction,
+    # given its opname and arg, using per-Python-version stack layouts (call, call with
+    # keywords, call-function variants, call-ex). Raises ValueError for non-call opnames.
     """Return the depth of the callable from TOS for a call instruction.
 
     Depth is 1-indexed: TOS = 1, below-TOS = 2, etc.  This encodes the
@@ -582,6 +703,11 @@ def get_call_callable_depth(opname: str, arg: int) -> int:
 def create_binary_slice(
     start: int | None, end: int | None, store: bool = False
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions performing a slice load (or store when store is true) of
+    # start:end on the container on the stack: a slice constant plus subscript (3.14+),
+    # two constants plus slice opcode (3.12/3.13), or build-slice plus subscript (older).
+    # KNOWN ISSUE: the docstring refers to a `set` flag but the parameter is `store`.
     """
     BINARY_SLICE and STORE_SLICE (if `set` is True) for all Python versions
     """
@@ -611,6 +737,9 @@ def create_binary_slice(
 
 
 def create_copy(i: int) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns instructions pushing a copy of the i-th stack item on top. Native copy on
+    # 3.11+; before that, dup-top for 1 and otherwise a swap/dup/swap sequence.
     if sys.version_info >= (3, 11):
         return [create_instruction("COPY", arg=i)]
     if i == 1:
@@ -631,6 +760,8 @@ def create_copy(i: int) -> list[Instruction]:
 
 # mainly for debugging generated bytecode
 def create_print_on_stack(depth: int) -> list[Instruction]:
+    # [FUNCTION DOC] HELPER: Debug aid. Returns instructions that copy the stack item at
+    # the given depth and print it, leaving the stack unchanged.
     return [
         *add_push_null(create_instruction("LOAD_CONST", argval=print)),
         *create_copy(depth + (2 if sys.version_info >= (3, 11) else 1)),
@@ -641,6 +772,8 @@ def create_print_on_stack(depth: int) -> list[Instruction]:
 
 # mainly for debugging generated bytecode
 def create_print_value(value: Any) -> list[Instruction]:
+    # [FUNCTION DOC] HELPER: Debug aid. Returns instructions that print a constant
+    # value at runtime, leaving the stack unchanged.
     return [
         *add_push_null(create_instruction("LOAD_CONST", argval=print)),
         create_instruction("LOAD_CONST", argval=value),
@@ -650,6 +783,9 @@ def create_print_value(value: Any) -> list[Instruction]:
 
 
 def create_binary_subscr() -> Instruction:
+    # [FUNCTION DOC]
+    # Returns a subscript instruction: dedicated opcode before 3.14, else the generic
+    # binary-op with the hard-coded subscript operator code.
     if sys.version_info < (3, 14):
         return create_instruction("BINARY_SUBSCR")
     # https://github.com/python/cpython/blob/0e46c0499413bc5f9f8336fe76e2e67cf93f64d8/Include/opcode.h#L36
@@ -657,6 +793,9 @@ def create_binary_subscr() -> Instruction:
 
 
 def create_build_tuple(n: int) -> Instruction:
+    # [FUNCTION DOC]
+    # Returns an instruction building a tuple from n stack items; on 3.14+ an empty
+    # tuple is instead a constant load.
     if sys.version_info >= (3, 14) and n == 0:
         return create_load_const(())
     return create_instruction("BUILD_TUPLE", arg=n)
@@ -665,6 +804,11 @@ def create_build_tuple(n: int) -> Instruction:
 def linetable_writer(
     first_lineno: int,
 ) -> tuple[list[int], Callable[[int, int], None], Callable[[int], None]]:
+    # [FUNCTION DOC]
+    # Python 3.10 only (raises an error otherwise). Returns a mutable byte list holding
+    # the line table plus two writers: update(new_line, new_byte_offset) records a line
+    # change, and end(total_bytes) flushes the remainder. Encoding is pairs of byte
+    # delta and signed line delta, split into chunks within the format limits.
     """
     Used to create typing.CodeType.co_linetable
     See https://github.com/python/cpython/blob/3.10/Objects/lnotab_notes.txt
@@ -680,6 +824,8 @@ def linetable_writer(
     byteno = 0
 
     def _update(byteno_delta: int, lineno_delta: int) -> None:
+        # [FUNCTION DOC] HELPER: Appends one or more (byte delta, line delta) pairs to the
+        # line table, clamping each to the encodable ranges, until both deltas are consumed.
         while byteno_delta != 0 or lineno_delta != 0:
             byte_offset = max(0, min(byteno_delta, 254))
             line_offset = max(-127, min(lineno_delta, 127))
@@ -690,6 +836,8 @@ def linetable_writer(
             linetable.extend((byte_offset, line_offset & 0xFF))
 
     def update(lineno_new: int, byteno_new: int) -> None:
+        # [FUNCTION DOC] HELPER: Flushes the pending delta for the bytes since the last
+        # call and remembers the new line delta to emit with the next update or end.
         nonlocal lineno, lineno_delta, byteno
         byteno_delta = byteno_new - byteno
         byteno = byteno_new
@@ -698,12 +846,18 @@ def linetable_writer(
         lineno = lineno_new
 
     def end(total_bytes: int) -> None:
+        # [FUNCTION DOC] HELPER: Flushes the final pending byte and line deltas given the
+        # total code size in bytes.
         _update(total_bytes - byteno, lineno_delta)
 
     return linetable, update, end
 
 
 def encode_varint(n: int) -> list[int]:
+    # [FUNCTION DOC]
+    # Encodes a non-negative integer as 6-bit chunks, least significant first, with the
+    # continuation bit on all but the last (3.11 location table format). Raises an error
+    # for negative input.
     """
     6-bit chunk encoding of an unsigned integer
     See https://github.com/python/cpython/blob/3.11/Objects/locations.md
@@ -724,6 +878,12 @@ if sys.version_info >= (3, 11):
     def linetable_311_writer(
         first_lineno: int,
     ) -> tuple[list[int], Callable[[dis.Positions | None, int], None]]:
+        # [FUNCTION DOC]
+        # Python 3.11+ only. Returns a mutable byte list holding the location table plus
+        # an update(positions, inst_size) writer that appends entries (long form with
+        # column info when positions are complete, no-column form otherwise), splitting
+        # instructions longer than 8 code units into several entries. Line deltas are
+        # relative to the previously written line.
         """
         Used to create typing.CodeType.co_linetable
         See https://github.com/python/cpython/blob/3.11/Objects/locations.md
@@ -737,10 +897,16 @@ if sys.version_info >= (3, 11):
         lineno = first_lineno
 
         def update(positions: dis.Positions | None, inst_size: int) -> None:
+            # [FUNCTION DOC] HELPER: Appends location-table entries covering inst_size
+            # code units for the given positions (None means no line change).
             nonlocal lineno
             lineno_new = positions.lineno if positions else None
 
             def _update(delta: int, size: int) -> None:
+                # [FUNCTION DOC] HELPER: Emits one entry for up to 8 code units: a header
+                # byte, the zigzag-encoded line delta, and (when positions are complete)
+                # end-line delta and 1-based columns. Raises an error if size is outside
+                # 1..8.
                 if not (0 < size <= 8):
                     raise AssertionError(f"size must be in range (0, 8], got {size}")
                 # first byte - use 13 (no column info) is positions is
@@ -788,6 +954,10 @@ if sys.version_info >= (3, 11):
 
 @dataclasses.dataclass(slots=True)
 class ExceptionTableEntry:
+    # [CLASS DOC]
+    # Offset-based exception table entry as stored in a code object: byte offsets of
+    # the protected range start and (inclusive) last code unit, handler target offset,
+    # stack depth, and lasti flag.
     start: int
     end: int
     target: int
@@ -796,6 +966,9 @@ class ExceptionTableEntry:
 
 
 def encode_exception_table_varint(n: int) -> list[int]:
+    # [FUNCTION DOC]
+    # Encodes a non-negative integer as 6-bit chunks, most significant first, with the
+    # continuation bit set on all but the last. Raises an error for negative input.
     """
     Similar to `encode_varint`, but the 6-bit chunks are ordered in reverse.
     """
@@ -815,6 +988,9 @@ def encode_exception_table_varint(n: int) -> list[int]:
 
 
 def decode_exception_table_varint(bytes_iter: Iterator[int]) -> int:
+    # [FUNCTION DOC]
+    # Consumes bytes from the iterator and decodes one exception-table varint. Raises
+    # StopIteration if the iterator is exhausted.
     """
     Inverse of `encode_exception_table_varint`.
     """
@@ -828,6 +1004,9 @@ def decode_exception_table_varint(bytes_iter: Iterator[int]) -> int:
 
 
 def check_exception_table(tab: list[ExceptionTableEntry]) -> None:
+    # [FUNCTION DOC]
+    # Validates that entries are non-empty, sorted and non-overlapping; raises an
+    # error naming the offending adjacent pair otherwise.
     """
     Verifies that a list of ExceptionTableEntries will make a well-formed
     jump table: entries are non-empty, sorted, and do not overlap.
@@ -846,6 +1025,10 @@ def check_exception_table(tab: list[ExceptionTableEntry]) -> None:
 
 
 def parse_exception_table(exntab: bytes) -> list[ExceptionTableEntry]:
+    # [FUNCTION DOC]
+    # Decodes the raw exception table bytes into entries with byte offsets (values in
+    # the table are in code units and are doubled), then validates them. Raises an
+    # error if the entries are malformed.
     """
     Parse the exception table according to
     https://github.com/python/cpython/blob/3.11/Objects/exception_handling_notes.txt
@@ -868,6 +1051,9 @@ def parse_exception_table(exntab: bytes) -> list[ExceptionTableEntry]:
 
 
 def assemble_exception_table(tab: list[ExceptionTableEntry]) -> bytes:
+    # [FUNCTION DOC]
+    # Encodes entries back to the raw table bytes: start (with the high bit marking the
+    # entry start), length, target, and depth-plus-lasti, all in code units.
     """
     Inverse of parse_exception_table - encodes list of exception
     table entries into bytes.
@@ -886,6 +1072,12 @@ def assemble_exception_table(tab: list[ExceptionTableEntry]) -> bytes:
 
 
 def assemble(instructions: list[Instruction], firstlineno: int) -> tuple[bytes, bytes]:
+    # [FUNCTION DOC]
+    # Encodes instructions into raw bytecode bytes and a line/location table bytes
+    # object. Each instruction emits its opcode and low arg byte, padded with zero
+    # code units to its full size (inline cache entries). On 3.11+ extended-arg
+    # instructions adopt the positions of the real instruction following them. Returns
+    # (code bytes, line table bytes).
     """Do the opposite of dis.get_instructions()"""
     code: list[int] = []
     if sys.version_info >= (3, 11):
@@ -926,6 +1118,9 @@ def assemble(instructions: list[Instruction], firstlineno: int) -> tuple[bytes, 
 def _get_instruction_by_offset(
     offset_to_inst: dict[int, Instruction], offset: int
 ) -> Instruction | None:
+    # [FUNCTION DOC] HELPER: Looks up the instruction at the offset, skipping any
+    # leading extended-arg prefixes (up to three). Returns None if all four are extended
+    # args; raises KeyError if an offset is missing.
     """
     Get the instruction located at a given offset, accounting for EXTENDED_ARGs
     """
@@ -936,6 +1131,10 @@ def _get_instruction_by_offset(
 
 
 def virtualize_jumps(instructions: Iterable[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # For every absolute or relative jump, sets its target attribute to the Instruction
+    # object at the jump's destination offset (skipping extended-arg prefixes), so code
+    # can be edited without recomputing offsets. Mutates instructions in place.
     """Replace jump targets with pointers to make editing easier"""
     jump_targets = {
         inst.offset: inst for inst in instructions if inst.offset is not None
@@ -950,6 +1149,10 @@ _REL_JUMPS = set(dis.hasjrel)
 
 
 def flip_jump_direction(instruction: Instruction) -> None:
+    # [FUNCTION DOC]
+    # Switches a relative jump between its forward and backward opcode variant in place
+    # (3.11+). Raises RuntimeError before 3.11, AttributeError if the opname is neither
+    # forward nor backward, and an assertion error if the result is not a relative jump.
     if sys.version_info < (3, 11):
         raise RuntimeError("Cannot flip jump direction in Python < 3.11")
     if "FORWARD" in instruction.opname:
@@ -966,6 +1169,9 @@ def flip_jump_direction(instruction: Instruction) -> None:
 
 
 def _get_instruction_front(instructions: list[Instruction], idx: int) -> Instruction:
+    # [FUNCTION DOC] HELPER: Returns the first of up to three consecutive extended-arg
+    # instructions preceding instructions[idx], or the instruction itself if none; this
+    # is where a jump to it must land.
     """
     i.e. get the first EXTENDED_ARG instruction (if any) when targeting
     instructions[idx] with a jump.
@@ -980,6 +1186,13 @@ def _get_instruction_front(instructions: list[Instruction], idx: int) -> Instruc
 
 
 def devirtualize_jumps(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Inverse of virtualize_jumps: computes arg, argval and argrepr of every jump from
+    # its target object using current offsets. First flips relative jump direction
+    # where the target lies on the opposite side (3.11+; raises RuntimeError for a
+    # negative jump before 3.11), recomputes offsets (sizes may change), then sets args
+    # (absolute offset/2 before 3.11; relative magnitude in code units otherwise).
+    # Raises on missing targets/offsets or on absolute jumps in 3.11+.
     """Fill in args for virtualized jump target after instructions may have moved"""
     jumps = set(dis.hasjabs).union(set(dis.hasjrel))
 
@@ -1047,6 +1260,12 @@ def devirtualize_jumps(instructions: list[Instruction]) -> None:
 def virtualize_exception_table(
     exn_tab_bytes: bytes, instructions: list[Instruction]
 ) -> None:
+    # [FUNCTION DOC]
+    # Parses the raw exception table and attaches to each covered instruction an
+    # InstructionExnTabEntry (a copy) whose start, end and target are Instruction
+    # objects. Walks instructions in order alongside the sorted table. The end is
+    # resolved to the last instruction starting at or before the entry's last byte.
+    # Mutates instructions; raises an error if any instruction lacks an offset.
     """Replace exception table entries with pointers to make editing easier"""
     exn_tab = parse_exception_table(exn_tab_bytes)
     offset_to_inst = {cast(int, inst.offset): inst for inst in instructions}
@@ -1056,6 +1275,8 @@ def virtualize_exception_table(
     try:
 
         def step() -> tuple[ExceptionTableEntry, InstructionExnTabEntry]:
+            # [FUNCTION DOC] HELPER: Advances to the next raw table entry (StopIteration
+            # when exhausted) and returns it with its instruction-based equivalent.
             nonlocal end_offset_idx
             entry = next(exn_tab_iter)
             # find rightmost offset <= entry.end, since entry.end may not be
@@ -1098,6 +1319,12 @@ def virtualize_exception_table(
 def compute_exception_table(
     instructions: list[Instruction],
 ) -> list[ExceptionTableEntry]:
+    # [FUNCTION DOC]
+    # Builds an offset-based exception table from instructions' exn_tab_entry fields
+    # (offsets must be current). Collects distinct (start, end) ranges, extending starts
+    # to include extended-arg prefixes, raising an error on conflicting handlers for the
+    # same range. Because Python forbids overlap, nested ranges are flattened: outer
+    # ranges are split around inner ones. Validates the result and returns it.
     """Compute exception table in list format from instructions with exn_tab_entries"""
     exn_dict: dict[tuple[int, int], tuple[int, int, bool]] = {}
     indexof = get_indexof(instructions)
@@ -1153,6 +1380,9 @@ def compute_exception_table(
     exn_tab: list[ExceptionTableEntry] = []
 
     def pop() -> None:
+        # [FUNCTION DOC] HELPER: Pops the innermost open range and, if any of it lies
+        # at or after the next free byte, appends a flat entry for it and advances the
+        # next free byte.
         """
         Pop the key_stack and append an exception table entry if possible.
         """
@@ -1192,6 +1422,10 @@ def compute_exception_table(
 def check_inst_exn_tab_entries_nested(
     tab: list[InstructionExnTabEntry], indexof: dict[Instruction, int]
 ) -> None:
+    # [FUNCTION DOC]
+    # Verifies the entries (sorted by start ascending then end descending, by
+    # instruction index) form a properly nested family with no partial overlaps. Raises
+    # an assertion error describing the first violation.
     """
     Checks `tab` is a properly sorted list of nested InstructionExnTabEntry's,
     i.e. no entries partially overlap.
@@ -1213,6 +1447,10 @@ def check_inst_exn_tab_entries_nested(
 
 
 def propagate_inst_exn_table_entries(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Gathers distinct entries from instructions that carry one, checks they nest
+    # properly, then assigns a copy of each entry to every instruction in its range
+    # (inner entries applied later so they win). Raises on conflicting duplicates.
     """
     Copies exception table entries to all instructions in an entry's range.
     Supports nested exception table entries.
@@ -1243,6 +1481,11 @@ def propagate_inst_exn_table_entries(instructions: list[Instruction]) -> None:
 
 
 def check_inst_exn_tab_entries_valid(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Asserts every instruction's exception entry is well formed: the entry object is
+    # not shared, its start, end and target are in the list, and the instruction lies
+    # within start..end. Also fails on duplicate instructions or on any entry before
+    # Python 3.11.
     """
     Checks that exn_tab_entries of instructions are valid.
     An entry's start, end, and target must be in instructions.
@@ -1284,6 +1527,9 @@ def check_inst_exn_tab_entries_valid(instructions: list[Instruction]) -> None:
 
 
 def strip_extended_args(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Removes all extended-arg instructions from the list in place (they are regenerated
+    # during assembly).
     instructions[:] = [i for i in instructions if i.opcode != dis.EXTENDED_ARG]
 
 
@@ -1295,6 +1541,12 @@ def strip_extended_args(instructions: list[Instruction]) -> None:
 def overwrite_instruction(
     old_inst: Instruction, new_insts: list[Instruction]
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Replaces old_inst by the sequence new_insts without disturbing jumps into it: the
+    # old object is mutated to become the first new instruction (opcode, name, arg,
+    # argval, target) and the rest copy its exception entry (extending the entry end if
+    # old_inst was the end) and positions. Returns the old object followed by the
+    # remaining new instructions, which the caller must splice into the list.
     # update old_inst.exn_tab_entry.end if necessary
     if (
         old_inst.exn_tab_entry
@@ -1316,6 +1568,10 @@ def overwrite_instruction(
 
 
 def remove_load_call_method(instructions: list[Instruction]) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Pre-3.11 only (raises an error on 3.11+). Rewrites method-load into plain
+    # attribute-load and method-call into plain function-call in place, avoiding the
+    # extra NULL on the stack. Returns the same list.
     """LOAD_METHOD puts a NULL on the stack which causes issues, so remove it"""
     if sys.version_info >= (3, 11):
         raise AssertionError(
@@ -1330,6 +1586,11 @@ def remove_load_call_method(instructions: list[Instruction]) -> list[Instruction
 
 
 def remove_jump_if_none(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Rewrites every jump-if-none / jump-if-not-none instruction into a load of None,
+    # an identity test (negated for the not-none form) and a pop-jump-if-true to the same
+    # target, using overwrite_instruction to keep inbound jumps valid. Replaces the list
+    # contents in place.
     new_insts = []
     for inst in instructions:
         if "_NONE" in inst.opname:
@@ -1361,6 +1622,11 @@ def remove_jump_if_none(instructions: list[Instruction]) -> None:
 
 
 def remove_binary_store_slice(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Rewrites each slice-load / slice-store instruction into a build-slice (arg 2) in
+    # place followed by a new subscript-load / subscript-store, copying exception entry
+    # and positions (and moving the entry end if needed). Replaces list contents in
+    # place.
     new_insts = []
     for inst in instructions:
         new_insts.append(inst)
@@ -1384,6 +1650,10 @@ def remove_binary_store_slice(instructions: list[Instruction]) -> None:
 
 
 def remove_load_attr_method_variant(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Replaces each method-flavored load-attr (odd arg) by a plain load-attr, a push of
+    # NULL, and on versions before 3.13 a swap so NULL ends up below the callable.
+    # Uses overwrite_instruction to preserve jumps; replaces list contents in place.
     """On 3.12+, LOAD_ATTR with arg%2==1 is the method variant that pushes 2
     values (NULL/self + method).  Normalize it to a non-method LOAD_ATTR
     (1 value) followed by PUSH_NULL (+ SWAP on 3.12 where NULL goes below
@@ -1413,6 +1683,10 @@ FUSED_INSTS = {
 
 
 def remove_fused_load_store(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Splits each fused two-variable load/store instruction (3.13+) into its two simple
+    # instructions using the pair of names in argval, preserving jumps and exception
+    # entries via overwrite_instruction. Replaces the list contents in place.
     new_insts = []
     for inst in instructions:
         if inst.opname in FUSED_INSTS:
@@ -1432,6 +1706,9 @@ def remove_fused_load_store(instructions: list[Instruction]) -> None:
 # adds GRAPH_BREAK_IF_LEAF (not a real instruction) before RETURN_* instructions
 # for testing purposes
 def add_graph_break_if_leaf_instructions(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC] HELPER: Testing aid. Before every return instruction, inserts a
+    # marker no-op whose argval is a leaf-graph-break tag (keeping jumps valid). Replaces
+    # the list contents in place.
     new_insts = []
     for inst in instructions:
         if "RETURN" in inst.opname:
@@ -1446,6 +1723,10 @@ def add_graph_break_if_leaf_instructions(instructions: list[Instruction]) -> Non
 
 
 def remove_graph_break_if_leaf_instructions(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC] HELPER: Removes leaf-graph-break marker no-ops that directly precede
+    # a return instruction, retargeting any jumps and exception-entry start/end/target
+    # that referenced the marker to the following return. Replaces list contents in
+    # place. Requires a non-empty list.
     new_insts = []
     for inst, next_inst in itertools.pairwise(instructions):
         if (
@@ -1473,6 +1754,13 @@ def remove_graph_break_if_leaf_instructions(instructions: list[Instruction]) -> 
 
 
 def explicit_super(code: types.CodeType, instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # For Python before 3.12: after each load of the global super that is immediately
+    # called with zero args, inserts loads of the class cell and the first local
+    # variable (as a cell load if it is a cell/free var, else a fast load) and changes the
+    # call to take two args (also the following call when a precall precedes it on 3.11).
+    # Does nothing for functions without locals. Raises an error if no class cell exists.
+    # Replaces list contents in place.
     """convert super() with no args into explicit arg form"""
     cell_and_free = (code.co_cellvars or ()) + (code.co_freevars or ())
     if not len(code.co_varnames):
@@ -1514,10 +1802,17 @@ def explicit_super(code: types.CodeType, instructions: list[Instruction]) -> Non
 
 
 def fix_extended_args(instructions: list[Instruction]) -> int:
+    # [FUNCTION DOC]
+    # Inserts the extended-arg prefix instructions needed for any instruction whose arg
+    # exceeds one byte (up to three prefixes), reusing and trimming existing prefixes
+    # but never shrinking the code. Mutates the list in place and returns the number of
+    # instructions added; raises an error if the count would be negative.
     """Fill in correct argvals for EXTENDED_ARG ops"""
     output: list[Instruction] = []
 
     def maybe_pop_n(n: int) -> None:
+        # [FUNCTION DOC] HELPER: Removes up to n trailing extended-arg instructions from
+        # the output being built (stopping when the last one is not an extended arg).
         for _ in range(n):
             if output and output[-1].opcode == dis.EXTENDED_ARG:
                 output.pop()
@@ -1551,6 +1846,10 @@ def fix_extended_args(instructions: list[Instruction]) -> int:
 
 
 def instruction_size(inst: Instruction) -> int:
+    # [FUNCTION DOC]
+    # Returns the size in bytes of the instruction including inline cache entries: two
+    # bytes on Python before 3.11, else two times one plus the opcode's cache entry
+    # count taken from the eval-frame extension. Imports torch lazily.
     import torch
 
     if sys.version_info >= (3, 11):
@@ -1559,6 +1858,9 @@ def instruction_size(inst: Instruction) -> int:
 
 
 def check_offsets(instructions: Sequence[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Verifies that each instruction's offset equals the running sum of preceding
+    # instruction sizes; raises an assertion error naming the first mismatch.
     offset = 0
     for inst in instructions:
         if inst.offset != offset:
@@ -1569,6 +1871,9 @@ def check_offsets(instructions: Sequence[Instruction]) -> None:
 
 
 def update_offsets(instructions: Sequence[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Assigns each instruction an offset equal to the running sum of preceding sizes
+    # (mutates the instructions).
     offset = 0
     for inst in instructions:
         inst.offset = offset
@@ -1577,6 +1882,9 @@ def update_offsets(instructions: Sequence[Instruction]) -> None:
 
 
 def debug_bytes(*args: bytes) -> str:
+    # [FUNCTION DOC] HELPER: Formats the given byte strings as aligned decimal rows with
+    # an index row and a final row flagging positions where the last two differ. Returns
+    # a message starting with "bytes mismatch". Requires at least two arguments.
     index = range(max(map(len, args)))
     result = [
         " ".join(f"{x:03}" for x in arg)
@@ -1589,6 +1897,9 @@ def debug_bytes(*args: bytes) -> str:
 
 
 def debug_checks(code: types.CodeType) -> None:
+    # [FUNCTION DOC] HELPER: Debug check that disassembling and reassembling the code
+    # object with no transformation (safe mode) reproduces identical raw bytecode;
+    # raises an assertion error with a byte diff otherwise.
     """Make sure our assembler produces same bytes as we start with"""
     dode, _ = transform_code_object(code, lambda x, y: None, safe=True)
     if code.co_code != dode.co_code:
@@ -1607,6 +1918,10 @@ HAS_CONST = set(dis.hasconst)
 
 
 def get_const_index(code_options: dict[str, Any], val: Any) -> int:
+    # [FUNCTION DOC]
+    # Returns the index of val in the constants tuple of code_options, comparing by
+    # identity (so equal-but-distinct values such as 0.0 and -0.0 stay separate). If not
+    # found, appends it to the tuple (mutating code_options) and returns the new index.
     for i, v in enumerate(code_options["co_consts"]):
         # NOTE: stronger comparison is required, since we have
         # examples where two values compare equal but have
@@ -1623,10 +1938,20 @@ def fix_vars(
     code_options: dict[str, Any],
     varname_from_oparg: Callable[..., Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Computes the integer arg of every instruction from its symbolic argval: names (adding
+    # missing ones to co_names), local/free variable slots, constant indices (adding
+    # missing constants), and the packed forms for load-global, load-attr, load-super-attr
+    # (name index shifted with flag bits kept) and fused instructions (3.13+). On 3.11+
+    # varname_from_oparg is required to map slots to names; before 3.11 it must be None.
+    # Mutates instructions and code_options; raises assertion errors on missing argvals
+    # or args.
     # compute instruction arg from argval if arg is not provided
     names = {name: idx for idx, name in enumerate(code_options["co_names"])}
 
     def get_name_index(name: str) -> int:
+        # [FUNCTION DOC] HELPER: Returns the index of the name in co_names, appending it
+        # to the names tuple (and the local lookup) when absent.
         try:
             idx = names[name]
         except KeyError:
@@ -1668,6 +1993,8 @@ def fix_vars(
     for i in range(len(instructions)):
 
         def should_compute_arg() -> bool:
+            # [FUNCTION DOC] HELPER: True if the current instruction has an argval, which
+            # takes priority over an existing arg.
             # argval is prioritized over arg
             return instructions[i].argval is not _NotProvided
 
@@ -1768,6 +2095,10 @@ def fix_vars(
 
 
 def clear_instruction_args(instructions: list[Instruction]) -> None:
+    # [FUNCTION DOC]
+    # Resets arg to None for instructions that have a symbolic argval and use a
+    # name/local/free/const index (except load-global, load-attr, load-super-attr, whose
+    # flag bits are in arg), so args are recomputed during assembly. Mutates in place.
     # Clear the instruction arg for instructions that have argvals.
     # Useful for using dis'd bytecode within generated bytecode.
     for inst in instructions:
@@ -1786,6 +2117,10 @@ def clear_instruction_args(instructions: list[Instruction]) -> None:
 
 @functools.lru_cache
 def get_code_keys() -> list[str]:
+    # [FUNCTION DOC]
+    # Returns (cached) the ordered list of code-object attribute names matching the
+    # code-object constructor positional order for the running Python version (adds
+    # qualified name and exception table on 3.11+).
     # Python 3.11 changes to code keys are not fully documented.
     # See https://github.com/python/cpython/blob/3.11/Objects/clinic/codeobject.c.h#L24
     # for new format.
@@ -1828,6 +2163,13 @@ def transform_code_object(
     ],
     safe: bool = False,
 ) -> tuple[types.CodeType, Optional["DynamoTracerOutput"]]:
+    # [FUNCTION DOC]
+    # Main entry for rewriting a code object. Extracts its attributes into a mutable
+    # mapping, disassembles to Instruction objects (cleaned; safe mode skips rewrites),
+    # re-propagates line numbers, calls the transformations callback with (instructions,
+    # code options) to mutate them in place, then assembles a new code object. Returns
+    # (new code, whatever the callback returned). Raises an error if local variable name
+    # count disagrees with the local count.
     keys = get_code_keys()
     code_options = {k: getattr(code, k) for k in keys}
     if len(code_options["co_varnames"]) != code_options["co_nlocals"]:
@@ -1848,6 +2190,14 @@ def transform_code_object(
 def clean_and_assemble_instructions(
     instructions: list[Instruction], keys: list[str], code_options: dict[str, Any]
 ) -> tuple[list[Instruction], types.CodeType]:
+    # [FUNCTION DOC]
+    # Finalizes edited instructions into a code object. Drops leaf graph-break markers,
+    # validates exception entries, refreshes the local count, resolves args from argvals,
+    # then iterates offsets/jump resolution/extended-arg insertion to a fixed point.
+    # Assembles bytes and line table, computes stack size, assembles the exception table
+    # (3.11+), and builds the code object from code_options in key order. Returns
+    # (instructions, new code). Mutates instructions and code_options; raises on key
+    # mismatches or invalid exception entries.
     remove_graph_break_if_leaf_instructions(instructions)
     # also implicitly checks for no duplicate instructions
     check_inst_exn_tab_entries_valid(instructions)
@@ -1889,6 +2239,9 @@ def clean_and_assemble_instructions(
 
 
 def populate_kw_names_argval(instructions: Sequence[Instruction], consts: Any) -> None:
+    # [FUNCTION DOC]
+    # For each keyword-names instruction, sets argval to the constant at index arg in the
+    # given constants (so the tuple of names is available symbolically). Mutates in place.
     for inst in instructions:
         if inst.opname == "KW_NAMES":
             inst.argval = consts[inst.arg]
@@ -1897,6 +2250,10 @@ def populate_kw_names_argval(instructions: Sequence[Instruction], consts: Any) -
 # If safe=True, we do not make any bytecode modifications.
 # Mainly used for debugging bytecode_transformation (see debug_checks)
 def cleaned_instructions(code: types.CodeType, safe: bool = False) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Returns a fresh, editable list of normalized Instructions for the code object.
+    # Uses a cache keyed by (code, safe) and returns a deep-enough clone each call
+    # since callers mutate the result. Safe mode skips bytecode rewrites.
     instructions = _cached_cleaned_instructions(code, safe)
     # We have a lot of code that implicitly mutates the instruction array. We
     # could do better here by making the copies explicit when necessary.
@@ -1905,6 +2262,9 @@ def cleaned_instructions(code: types.CodeType, safe: bool = False) -> list[Instr
 
 # Copy an instructions array, making sure to remap the individual instruction targets.
 def _clone_instructions(instructions: Sequence[Instruction]) -> list[Instruction]:
+    # [FUNCTION DOC] HELPER: Copies instructions field by field and remaps jump targets
+    # and exception entries (new entry objects) to point at the copies. Hot path; avoids
+    # generic copy utilities.
     # This is super hot and this is the fastest way to do this (tried copy.copy
     # and dataclasses.replace).
     copied = [
@@ -1945,6 +2305,13 @@ def _clone_instructions(instructions: Sequence[Instruction]) -> list[Instruction
 def _cached_cleaned_instructions(
     code: types.CodeType, safe: bool = False
 ) -> Sequence[Instruction]:
+    # [FUNCTION DOC] HELPER: Cached worker for cleaned_instructions. Disassembles the code,
+    # propagates line numbers, checks offsets, virtualizes keyword names, the exception
+    # table and jumps, strips extended args, and (unless safe) applies version-specific
+    # rewrites (method calls, explicit super, jump-if-none, slices, load-attr method
+    # variant, fused loads/stores, optional leaf-return graph breaks). Finally recomputes
+    # offsets and jump args on 3.11+. The returned list is shared by the cache and must
+    # not be mutated.
     instructions = list(map(convert_instruction, dis.get_instructions(code)))
     # propagate now in case we remove some instructions
     propagate_line_nums(instructions)
@@ -1978,6 +2345,10 @@ _unique_id_counter = itertools.count()
 
 
 def unique_id(name: str, with_uuid: bool = False) -> str:
+    # [FUNCTION DOC]
+    # Returns the name suffixed with an underscore and the next value of a process-global
+    # counter; optionally also a random uuid (with dashes turned into underscores).
+    # Side effect: advances the counter.
     ret = f"{name}_{next(_unique_id_counter)}"
     if with_uuid:
         ret += f"_{uuid.uuid4()}".replace("-", "_")
@@ -1992,14 +2363,22 @@ _COMPILED_FN_NAME_RE = re.compile(
 
 
 def make_compiled_fn_name() -> str:
+    # [FUNCTION DOC]
+    # Returns a new unique name for a compiled graph function: the compiled-function
+    # prefix plus counter and uuid (matches the pattern checked by is_compiled_fn_name).
     return unique_id(COMPILED_FN_PREFIX, with_uuid=True)
 
 
 def is_compiled_fn_name(name: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the whole name matches the generated compiled-function name pattern
+    # (prefix, counter, then a uuid with underscores).
     return _COMPILED_FN_NAME_RE.fullmatch(name) is not None
 
 
 def is_generator(code: types.CodeType) -> bool:
+    # [FUNCTION DOC]
+    # True if the code object's flags include the generator flag.
     co_generator = 0x20
     return (code.co_flags & co_generator) > 0
 
@@ -2010,6 +2389,13 @@ def bytecode_from_template(
     noreturn: bool = True,
     noprefix: bool = True,
 ) -> list[Instruction]:
+    # [FUNCTION DOC]
+    # Produces a reusable Instruction list from a template function's code. Clears
+    # symbolic-arg-derived args, optionally drops everything through the first resume
+    # (noprefix), clears line info, and renames argvals via varname_map. With noreturn,
+    # converts return-constant to constant load (3.12+) and replaces returns by jumps to
+    # a final no-op (a single trailing return is just removed); returned values stay on
+    # the stack. Returns the list of instructions.
     """Generates bytecode from a template function `fn` for use in
     dynamo bytecode generation.
 
