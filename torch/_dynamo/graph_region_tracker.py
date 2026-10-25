@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Identifies groups of identical, non-overlapping subgraph regions in an FX graph (used for
+# deduplicating repeated code into subgraph higher-order ops). Nodes are hashed at insertion time
+# by source location, instruction pointer, global torch state, and normalized argument metadata;
+# equal hashes form duplicate groups, which are then grown backward through argument edges into
+# maximal identical regions. Contains the pickler used for hashing, a backward BFS iterator, a
+# per-region wrapper tracking ancestors for cycle checks, and the GraphRegionTracker.
+# Import-time side effects: creates a module logger and the "graph_region_expansion" artifact logger.
 """
 This module provides functionality for tracking and managing regions in computational graphs.
 It supports graph optimization by identifying and grouping similar regions based on their
@@ -66,12 +74,16 @@ graph_expansion_log = torch._logging.getArtifactLogger(
 
 
 def debug_log(msg: str, *args) -> None:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Emit a debug message with lazy formatting arguments to the graph region expansion artifact logger.
     graph_expansion_log.debug(msg, *args)
 
 
 def _extract_tensor_metadata_for_node_hash(
     x: torch.Tensor,
 ) -> tuple[Callable[[T], T], tuple[Any, ...]]:
+    # [FUNCTION DOC] HELPER: Pickle reducer for fake tensors. Extracts the inductor cache-key tensor
+    # metadata and returns an identity-callable plus a tuple of its field values, so tensors with
+    # equal metadata pickle identically. Imports inductor codecache lazily.
     from torch._inductor.codecache import _ident, extract_tensor_metadata_for_cache_key
 
     out = []
@@ -83,11 +95,18 @@ def _extract_tensor_metadata_for_node_hash(
 
 
 class NodeHashException(Exception):
+    # [CLASS DOC] Raised when a node's hash key cannot be pickled; callers skip tracking that node.
     pass
 
 
 class InputPickler(pickle.Pickler):
+    # [CLASS DOC] HELPER: Pickler that serializes node hash keys deterministically into a reusable
+    # in-memory buffer. Its dispatch table is the default copyreg table extended so fake tensors
+    # pickle as their cache-key metadata and symbolic ints/bools/floats pickle as their string form.
+    # Fast mode is on (no memoization). The buffer is cleared after every dumps call.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Create the byte buffer, initialize the base pickler on it, and install the
+        # custom dispatch table and fast mode.
         from torch._inductor.codecache import _ident
 
         stream = io.BytesIO()
@@ -105,6 +124,8 @@ class InputPickler(pickle.Pickler):
         self.fast = True
 
     def dumps(self, obj: Any) -> bytes:
+        # [FUNCTION DOC] Serialize obj and return the bytes. Raises NodeHashException if pickling hits a
+        # type or attribute error. Always resets the shared buffer afterwards.
         """
         Pickle an object and return a byte string.
         """
@@ -119,6 +140,8 @@ class InputPickler(pickle.Pickler):
 
 
 def _extract_args(arg: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Map an argument to a hashable stand-in: for a graph node, its recorded
+    # example value (or null); tensors and ints are returned as is; anything else becomes null.
     if isinstance(arg, Node):
         return arg.meta.get("example_value")
     elif isinstance(arg, (torch.Tensor, int)):
@@ -130,6 +153,8 @@ def _extract_args(arg: Any) -> Any:
 def _normalize_args(
     node: Node,
 ) -> tuple[tuple[str, ...], tuple[Any | None, ...]]:
+    # [FUNCTION DOC] HELPER: Flatten a node's positional args and key-sorted kwargs; return the sorted
+    # keyword names plus a tuple of stand-in values for every flattened argument. Used in node hashing.
     flat_args, _ = tree_flatten(node.args)
     sorted_kwargs = sorted(node.kwargs.items(), key=operator.itemgetter(0))
     sorted_keys = tuple(sorted(node.kwargs.keys()))
@@ -141,6 +166,9 @@ def _normalize_args(
 def _sort_with_ref_region(
     index_to_rank: dict[int, int], regions: list[list[Any]]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reorder every region in place using the order implied by the first
+    # region: positions are sorted by the rank given in index_to_rank, and the same permutation is
+    # applied to all regions so they stay aligned. Mutates the regions; returns nothing.
     # sort topologically
     # we need to handle edge cases where some nodes have no dependencies
     # so first we map each node to its ranking
@@ -151,6 +179,9 @@ def _sort_with_ref_region(
 
 
 def get_global_state_key() -> GlobalStateKey:
+    # [FUNCTION DOC] Return a tuple snapshot of global torch state that affects op semantics: grad and
+    # inference mode, thread count, cublas reduced-precision and tf32 flags, default dtype,
+    # deterministic-algorithm flags, and saved-tensor-hooks enablement. Read-only.
     return (
         torch.is_grad_enabled(),
         torch.is_inference_mode_enabled(),
@@ -173,12 +204,19 @@ def get_global_state_key() -> GlobalStateKey:
 # Note: this iterates backward through the graph by looking at args/kwargs
 # of a node
 class BackwardBfsArgIter:
+    # [CLASS DOC] HELPER: Breadth-first iterator walking backward from an origin node through node
+    # arguments. State: the current candidate and a queue of pending nodes. Children of a node are
+    # enqueued only when the caller explicitly calls add_children, so callers control which branches
+    # are explored. Use create to build one with the origin already consumed.
     def __init__(self, origin: Node) -> None:
+        # [FUNCTION DOC] Start with origin as the current node and an empty queue.
         self._cur: Node | None = origin
         self._queue: deque[Node | None] = deque()
 
     @staticmethod
     def create(origin: Node) -> BackwardBfsArgIter:
+        # [FUNCTION DOC] Build an iterator for origin, enqueue its argument nodes, and consume the origin
+        # itself. Raises an error if the origin could not be consumed.
         it = BackwardBfsArgIter(origin)
         it.add_children(origin)
         # pop the origin node, since it is the origin of
@@ -188,6 +226,8 @@ class BackwardBfsArgIter:
         return it
 
     def next(self) -> Node | None:
+        # [FUNCTION DOC] Return the current node and advance to the next queued node (or none if the
+        # queue is empty). Returns none when exhausted.
         ret = self._cur
         if not self._queue:
             self._cur = None
@@ -196,25 +236,36 @@ class BackwardBfsArgIter:
         return ret
 
     def peek(self) -> Node | None:
+        # [FUNCTION DOC] Return the current node without advancing.
         return self._cur
 
     def add_children(self, node: Node) -> None:
+        # [FUNCTION DOC] Enqueue each distinct node appearing in the node's args and kwargs.
         flat_args = _get_flat_args_unique(node, {})
         for arg in flat_args:
             if isinstance(arg, Node):
                 self._append(arg)
 
     def _append(self, arg: Node) -> None:
+        # [FUNCTION DOC] HELPER: Make arg the current node if none is current, else add to the queue.
+        # KNOWN ISSUE: nodes are not deduplicated across calls, so a node reachable through several
+        # paths can be yielded more than once; callers rely on the seen-node checks to cope.
         if self._cur is None:
             self._cur = arg
         else:
             self._queue.append(arg)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string with the current node and queue.
         return f"BackwardBfsArgIter(cur={self._cur}, queue={self._queue})"
 
 
 class GraphRegionTracker:
+    # [CLASS DOC] Records nodes added to the output graph, grouping those with equal hash keys, and later
+    # computes maximal identical regions. State: hash_to_duplicates (hash to node list),
+    # node_to_duplicates (node to its group list, shared by identity), node_to_mutated_arg_positions
+    # (node to flattened argument positions mutated), and an InputPickler. Key methods: track_node,
+    # track_node_mutations, add_node_mutation, get_identical_regions.
     """
     GraphRegionTracker tracks each node added to the output graph and generates a key based on the source location,
     instruction pointer, input shapes, and global state at the time the node is inserted into the graph. Nodes with
@@ -226,6 +277,7 @@ class GraphRegionTracker:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize empty duplicate-group mappings, mutation-position mapping, and a pickler.
         self.hash_to_duplicates: dict[str, IdenticalNodes] = defaultdict(list)
         self.node_to_duplicates: dict[Node, IdenticalNodes] = {}
         # Note: position is in flattened args/kwargs list
@@ -235,6 +287,9 @@ class GraphRegionTracker:
     def _hash_node(
         self, filename: str, lineno: int, instruction_pointer: int | None, node: Node
     ) -> str:
+        # [FUNCTION DOC] HELPER: Compute a SHA-256 hex digest of a key made from global torch state, file
+        # name, line number, instruction pointer, and the node's normalized args. Raises
+        # NodeHashException if the key cannot be pickled.
         from torch._inductor.codecache import sha256_hash
 
         key = (
@@ -247,6 +302,8 @@ class GraphRegionTracker:
         return sha256_hash(self.input_pickler.dumps(key))
 
     def _is_identical(self, n0: Node, n1: Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if both nodes are tracked, are distinct, and share the very same
+        # duplicate group.
         return (
             n0 in self.node_to_duplicates
             and n1 in self.node_to_duplicates
@@ -255,6 +312,9 @@ class GraphRegionTracker:
         )
 
     def track_node(self, tx: InstructionTranslatorBase, node: Node) -> None:
+        # [FUNCTION DOC] Hash the node using the translator's code file name, line number and instruction
+        # pointer, and append it to the matching duplicate group. Nodes already tracked are ignored.
+        # If hashing fails, a debug message is logged and the node is left untracked (no raise).
         """
         The main entry point for tracking a node. This function will hash the node argument and group
         nodes with the same hash together. It updates the hash_to_duplicates and node_to_duplicates dictionaries
@@ -280,6 +340,9 @@ class GraphRegionTracker:
         flat_args_kwargs: list[Any],
         id_to_initial_version: dict[int, int],
     ) -> None:
+        # [FUNCTION DOC] For each flattened arg whose object identity is in id_to_initial_version and whose
+        # current version counter differs from the recorded one, record its position as mutated by node.
+        # Stores nothing if no position was mutated. Mutates node_to_mutated_arg_positions.
         """
         This function tracks which argument positions are mutated by the given node. Subgraph HOP does not support
         input mutations today so we will skip regions which have inputs that are mutated.
@@ -301,12 +364,20 @@ class GraphRegionTracker:
         node: Node,
         arg_pos: int,
     ) -> None:
+        # [FUNCTION DOC] Record that the flattened argument at arg_pos of node is mutated, creating the
+        # node's position set if needed.
         if node in self.node_to_mutated_arg_positions:
             self.node_to_mutated_arg_positions[node].add(arg_pos)
         else:
             self.node_to_mutated_arg_positions[node] = OrderedSet([arg_pos])
 
     def get_identical_regions(self, graph: torch.fx.Graph) -> list[list[Region]]:
+        # [FUNCTION DOC] Build region groups from duplicate groups with more than one member present in the
+        # graph (each region initially one node), order groups so those latest in the graph go first,
+        # expand each group backward as far as all regions stay identical and non-overlapping, and sort
+        # each group's regions topologically using the first region as reference. Returns the groups
+        # whose regions have more than one node. Assumes tracked nodes belong to graph. Mutates
+        # nothing outside local state.
         """
         This function is responsible for extracting the largest regions of identical nodes from the given graph.
         **Note**: This function assumes the nodes that have been tracked with track_node are in the provided graph argument.
@@ -373,15 +444,22 @@ class GraphRegionTracker:
         ]
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Debug string of the duplicate mappings.
         return f"GraphRegionTracker(hash_to_duplicates={self.hash_to_duplicates}, node_to_duplicates={self.node_to_duplicates})"
 
 
 class RegionWrapper:
+    # [CLASS DOC] HELPER: Wraps one region under expansion. State: the region list (mutated in place),
+    # a backward BFS iterator of candidate nodes, the ordered set of member nodes, the union of all
+    # members' recursive ancestors, and the shared ancestor map. Provides cycle checking before a
+    # node is added.
     """Holds state for regions e.g. ancestors and new candidate nodes for consideration"""
 
     def __init__(
         self, region: Region, node_to_recursive_ancestors: dict[Node, set[Node]]
     ) -> None:
+        # [FUNCTION DOC] Initialize from a single-node region: create the BFS iterator, member set, and
+        # ancestor set. Raises an error if the region does not have exactly one node.
         if len(region) != 1:
             raise AssertionError("all regions should start with one node")
         node = region[0]
@@ -392,9 +470,12 @@ class RegionWrapper:
         self.region = region
 
     def next_candidate(self) -> Node | None:
+        # [FUNCTION DOC] Pop and return the next candidate node from the iterator, or none if exhausted.
         return self.iter.next()
 
     def will_inclusion_create_cycle(self, node: Node) -> bool:
+        # [FUNCTION DOC] Return True if any user of node outside the region is an ancestor of the region,
+        # meaning that collapsing the node into the region would create a dependency cycle.
         external_users = [user for user in node.users if user not in self.nodes_unique]
         for user in external_users:
             if user in self.ancestors:
@@ -403,6 +484,8 @@ class RegionWrapper:
         return False
 
     def add(self, node: Node) -> None:
+        # [FUNCTION DOC] Add node to the region: record membership, append to the region list, enqueue its
+        # argument nodes as future candidates, and merge its ancestors into the region's ancestor set.
         self.nodes_unique.add(node)
         self.region.append(node)
         self.iter.add_children(node)
@@ -415,6 +498,12 @@ def fully_expand_region_group(
     node_to_recursive_ancestors: dict[Node, set[Node]],
     is_identical_fn: Callable[[Node, Node], bool],
 ) -> None:
+    # [FUNCTION DOC] Grow every single-node region in the group in lockstep, in place. Each step takes the
+    # next backward candidate from each region and adds the set only if all candidates exist, are
+    # unclaimed, distinct, not placeholders or attribute fetches, pairwise identical to the first
+    # region's candidate, and would not create a cycle. Added nodes are put in seen_nodes. At the end each
+    # region is reversed into topological order. Raises an error if any region does not start with one
+    # node or if the number of nodes to add differs from the number of regions.
     debug_log("--------------------------------------------------")
     debug_log("expanding new region group: %s", regions)
 
@@ -493,6 +582,8 @@ def fully_expand_region_group(
 
 
 def _populate_recursive_ancestor_map(graph: torch.fx.Graph) -> dict[Node, set[Node]]:
+    # [FUNCTION DOC] HELPER: Return a mapping from each graph node to the set of all nodes it transitively
+    # depends on, computed in one pass over the graph in order (relies on topological node order).
     node_to_recursive_ancestors: dict[Node, set[Node]] = {}
     for node in graph.nodes:
         node_to_recursive_ancestors[node] = set()
