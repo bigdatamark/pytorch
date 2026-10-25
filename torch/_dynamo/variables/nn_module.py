@@ -1,3 +1,8 @@
+# [MODULE DOC] Variable trackers for torch.nn.Module instances in Dynamo tracing.
+# Defines NNModuleVariable (specialized per instance, params live on the GraphModule),
+# UnspecializedNNModuleVariable (treated like a user-defined object, params are graph inputs),
+# its builtin and FSDP subclasses, plus helpers for lazy module init, nn_module_stack
+# recording and guards detecting a monkeypatched forward. No import-time side effects.
 """
 This module implements variable tracking for PyTorch nn.Module instances during Dynamo tracing.
 
@@ -90,6 +95,11 @@ def initialize_lazy_module(
     args: list[VariableTracker],
     kwargs: dict[str, VariableTracker],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Materialize a lazy module before tracing its call.
+    # If the module has an initialize hook, convert proxy args to fake (or concretized) tensors
+    # and run the module's parameter inference on them so the hook is removed.
+    # Raises an observed AttributeError in the traced program if inference raises AttributeError.
+    # Side effect: mutates the real module (parameters created, hook deleted).
     """
     Fairly coupled helper used by NNModuleVariable and UnspecializedNNModuleVariable.
 
@@ -100,6 +110,9 @@ def initialize_lazy_module(
     if inspect.getattr_static(mod, "_initialize_hook", None) is not None:
 
         def convert_to_fake(x: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Recursively replace proxies in nested containers with fake tensors; symbolic
+            # shapes are concretized to hints with real empty tensors. Non-proxy values pass through.
+            # Raises AssertionError if a concretized shape entry is not an integer.
             if is_namedtuple(x):
                 return type(x)(*(convert_to_fake(elem) for elem in x))
             elif isinstance(x, dict):
@@ -149,6 +162,10 @@ def record_nn_module_stack(
     tx: "InstructionTranslatorBase",
     mod: torch.nn.Module,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Context manager recording a module call on tx.nn_module_stack.
+    # Builds a qualified name from the source name (collapsing internal dict accessors), suffixes
+    # the key with a call count for repeated calls, and bumps tx.num_calls. The entry is removed
+    # on exit even when an error occurs.
     fully_qualified_name = source.name
     # Remove redundant namings
     fully_qualified_name = re.sub(
@@ -169,6 +186,10 @@ def record_nn_module_stack(
 def guard_to_detect_forward_monkeypatching(
     source: Source | None, mod: torch.nn.Module
 ) -> None:
+    # [FUNCTION DOC] HELPER: Install guards detecting a patched instance forward method.
+    # If forward is in the instance dict and callable, guard on its function identity (or recurse
+    # for partial objects); otherwise guard that forward is absent from the instance dict.
+    # Does nothing when source is None. Side effect: installs guards.
     # Users sometimes patch the forward method of a nn module instance to
     # perform optimizations like quantization. Though this is not a good
     # software practice, but python allows this and Dynamo needs to detect
@@ -213,6 +234,9 @@ def guard_to_detect_forward_partial_monkeypatching(
     partial_source: Source,
     partial_obj: functools.partial[Any],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Guard a functools.partial used as forward: type, wrapped func (recursing for
+    # nested partials), args length and each arg, and keywords (None check or keys plus values).
+    # Side effect: installs guards.
     install_guard(partial_source.make_guard(GuardBuilder.TYPE_MATCH))
 
     func_source = AttrSource(partial_source, "func")
@@ -248,6 +272,9 @@ def guard_to_detect_forward_partial_value(
     value_source: Source,
     value: Any,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Guard one value inside a forward partial: dedupe guard or identity if it is the
+    # module itself, recurse for partials, closure match for functions, constant match for safe
+    # constants, identity match otherwise. Side effect: installs guards.
     if value is mod:
         dupe_guard = make_dupe_guard(value_source, module_source)
         install_guard(value_source.make_guard(dupe_guard or GuardBuilder.ID_MATCH))
@@ -264,6 +291,10 @@ def guard_to_detect_forward_partial_value(
 
 
 class NNModuleVariable(VariableTracker):
+    # [CLASS DOC] Tracks an nn.Module specialized on its instance: the module is registered on the output
+    # graph under module_key and parameters live on the GraphModule (one graph per instance).
+    # State: module_type, module_key, value (real module), nn_module_stack_source (BC naming source).
+    # Calls to torch.nn builtin modules become call_module nodes; others are inlined.
     _nonvar_fields = {
         "module_type",
         "module_key",
@@ -275,6 +306,7 @@ class NNModuleVariable(VariableTracker):
     def __init__(
         self, module_type: type, module_key: str, value: torch.nn.Module, **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] Store module type, graph key and real module; initialize nn_module_stack_source to source.
         super().__init__(**kwargs)
         self.module_type = module_type
         self.module_key = module_key
@@ -286,24 +318,30 @@ class NNModuleVariable(VariableTracker):
         self.nn_module_stack_source = self.source
 
     def get_nn_module_stack_source(self) -> Source:
+        # [FUNCTION DOC] Return nn_module_stack_source, or source if unset. Raises AssertionError if neither exists.
         res = self.nn_module_stack_source or self.source
         if not res:
             raise AssertionError("nn_module_stack_source must not be None")
         return res
 
     def set_nn_module_stack_source(self, source: Source) -> None:
+        # [FUNCTION DOC] Override the source used for nn_module_stack naming.
         self.nn_module_stack_source = source
 
     def python_type(self) -> type:
+        # [FUNCTION DOC] Return the module's python class (module_type).
         return self.module_type
 
     def get_id(self, tx: "InstructionTranslatorBase") -> int | None:
+        # [FUNCTION DOC] Return the id of the submodule currently registered under module_key on the output graph.
         return id(tx.output.get_submodule(self.module_key))
 
     def get_real_python_backed_value(self) -> object:
+        # [FUNCTION DOC] Return the real underlying nn.Module.
         return self.value
 
     def nb_bool_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Truthiness: evaluate bool on the real module (containers use their length) and return a constant.
         """nb_bool for nn.Module.
 
         nn.Module itself has no __bool__ or __len__, so bare modules are always
@@ -317,6 +355,7 @@ class NNModuleVariable(VariableTracker):
         return ConstantVariable.create(bool(mod))
 
     def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Return a constant string holding the repr of the real module.
         mod = tx.output.get_submodule(self.module_key)
         return VariableTracker.build(tx, repr(mod))
 
@@ -328,11 +367,17 @@ class NNModuleVariable(VariableTracker):
         *key_extra: Any,
         **options: Any,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Intentionally a no-op stub; wraps nothing and returns None.
+        # KNOWN ISSUE: unused stub, apparently dead code.
         return
 
     def unpack_var_sequence(
         self, tx: "InstructionTranslatorBase"
     ) -> list[VariableTracker]:
+        # [FUNCTION DOC] Expand the module into a list of variables for iteration.
+        # ModuleDict yields key constants (registering each submodule); ModuleList, ParameterList and
+        # Sequential yield registered submodule variables. Raises AssertionError for other types.
+        # Side effect: registers submodules on the output graph.
         # implement list/iter/tuple/etc calls
         base = tx.output.get_submodule(self.module_key)
         result: list[VariableTracker] = []
@@ -368,6 +413,8 @@ class NNModuleVariable(VariableTracker):
     def call_obj_hasattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> "ConstantVariable":
+        # [FUNCTION DOC] Evaluate hasattr on the real module, install a HASATTR guard on the attribute name, and
+        # return the result as a constant.
         mod = tx.output.get_submodule(self.module_key)
         result = hasattr(mod, name)
         install_guard(
@@ -376,10 +423,14 @@ class NNModuleVariable(VariableTracker):
         return VariableTracker.build(tx, result)
 
     def is_training(self, tx: "InstructionTranslatorBase") -> bool:
+        # [FUNCTION DOC] Return the real module's training flag (False if absent).
         mod = tx.output.get_submodule(self.module_key)
         return getattr(mod, "training", False)
 
     def convert_to_unspecialized(self, tx: "InstructionTranslatorBase") -> None:
+        # [FUNCTION DOC] Abort specialized tracing: tag the module with the generation tracker, mark its class dynamic
+        # unless currently inside an __init__ frame, and raise UnspecializeRestartAnalysis so the
+        # analysis restarts with an unspecialized variable. Never returns normally.
         """Restart analysis treating this module as an UnspecializedNNModuleVariable"""
         mod = tx.output.get_submodule(self.module_key)
         GenerationTracker.tag(mod)
@@ -396,6 +447,10 @@ class NNModuleVariable(VariableTracker):
         name: str,
         obj_source: Source,
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Fallback attribute lookup via custom __getattribute__ or __getattr__.
+        # Traces a custom __getattribute__ if present (observed AttributeError is handled; untraceable
+        # causes a graph break), else traces a plain-function custom __getattr__. Returns None if no
+        # custom __getattr__ exists; graph breaks if it is not a plain function.
         """Check for a __getattr__ and handle it specially if it is implemented"""
         if object_has_getattribute(base):
             getattribute_fn = inspect.getattr_static(type(base), "__getattribute__")
@@ -455,6 +510,13 @@ class NNModuleVariable(VariableTracker):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Resolve attribute name on the module during tracing.
+        # Looks in instance dict, then _modules, _parameters, _buffers, then class attributes. Instance
+        # members are built as NNModuleSource-backed variables; class members become property calls,
+        # classmethods, staticmethods, bound methods, or safe constants/tensors. Missing names try the
+        # custom getattr fallback, else raise an observed AttributeError. Graph breaks if no source
+        # or unsupported attribute type. Installs forward monkeypatch guards for forward.
+        # KNOWN ISSUE: the trailing call to the base class implementation is unreachable.
         source = self.source and AttrSource(self.source, name)
 
         base = tx.output.get_submodule(self.module_key)
@@ -577,6 +639,10 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Call the module. Records the module on nn_module_stack. Sequential with default forward is
+        # unrolled child by child (restarts unspecialized if it has hooks; kwargs rejected). Lazy modules
+        # are initialized first. On the root tracer, torch.nn/torch.ao builtins emit a call_module node
+        # (restarting if hooks exist); otherwise the module call (or GraphModule forward) is inlined.
         mod = tx.output.get_submodule(self.module_key)
 
         with record_nn_module_stack(
@@ -688,6 +754,11 @@ class NNModuleVariable(VariableTracker):
         tx: "InstructionTranslatorBase",
         key: "VariableTracker",
     ) -> "VariableTracker":
+        # [FUNCTION DOC] Implement indexing on module containers. Non-builtin __getitem__ is inlined for str or int
+        # constant keys. Slices: under export register sliced submodules and return the new module,
+        # otherwise restart as unspecialized. Other keys must be constant or symbolic ints; returns the
+        # registered submodule. Graph breaks for unsupported keys.
+        # KNOWN ISSUE: in the export slice branch the result list is built but never used.
         # nn.Module containers (ModuleList/Dict/Sequential/ParameterDict/ParameterList)
         # These are Python-level __getitem__, not CPython C slots.
         from .lists import SliceVariable
@@ -782,6 +853,7 @@ class NNModuleVariable(VariableTracker):
         )
 
     def tp_iter_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # [FUNCTION DOC] Return a list iterator over the unpacked module sequence.
         from . import ListIteratorVariable
 
         return ListIteratorVariable(
@@ -790,6 +862,8 @@ class NNModuleVariable(VariableTracker):
 
     @staticmethod
     def _gen_source(source: Source, name: str) -> Source:
+        # [FUNCTION DOC] HELPER: Extend source with an attribute access for each dot-separated part of name;
+        # an empty first part returns source unchanged.
         name_split = name.split(".")
         if name_split[0] == "":
             return source
@@ -801,6 +875,8 @@ class NNModuleVariable(VariableTracker):
     def _generic_call_method_helper(
         self, tx: "InstructionTranslatorBase", name: str, args: Any, kwargs: Any
     ) -> VariableTracker:
+        # [FUNCTION DOC] HELPER: Emit a call_method graph node on the module (fetched via get_attr) with the
+        # given args, and wrap the result. Hooks are not triggered.
         # Put a `call_method` node in the FX graph, with the nn.Module as the
         # first arg.
         module = tx.output.get_submodule(self.module_key)
@@ -819,6 +895,7 @@ class NNModuleVariable(VariableTracker):
     def _assert_all_args_kwargs_const(
         self, tx: "InstructionTranslatorBase", name: str, args: Any, kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] HELPER: Graph break if any positional or keyword arg is not a python constant.
         if not all(
             x.is_python_constant() for x in itertools.chain(args, kwargs.values())
         ):
@@ -839,6 +916,8 @@ class NNModuleVariable(VariableTracker):
         kwargs: Any,
         *names: str,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Require constant args, bind them to the real method's signature with defaults
+        # applied, and return the bound values for the requested parameter names.
         self._assert_all_args_kwargs_const(tx, name, args, kwargs)
         module = tx.output.get_submodule(self.module_key)
         fn = getattr(module, name)
@@ -853,6 +932,7 @@ class NNModuleVariable(VariableTracker):
     def _wrap_values(
         self, tx: "InstructionTranslatorBase", items: Iterable[tuple[Any, Any]]
     ) -> "variables.ListIteratorVariable":
+        # [FUNCTION DOC] HELPER: Register each (name, submodule) pair on the graph and return a list iterator of them.
         result: list[VariableTracker] = []
         for name, submod in items:
             result.append(
@@ -868,6 +948,7 @@ class NNModuleVariable(VariableTracker):
     def _named_embed(
         self, tx: "InstructionTranslatorBase", name: str, obj: Any
     ) -> "variables.TupleVariable":
+        # [FUNCTION DOC] HELPER: Return a tuple variable of (name constant, registered object).
         return variables.TupleVariable(
             [
                 VariableTracker.build(tx, name),
@@ -886,6 +967,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle _call_impl: same as calling the module (inlined, hooks included).
         # Example: `self.layer.__call__(x)`. Dynamo inlines `__call__`,
         # including hooks.
         return self.call_function(tx, args, kwargs)
@@ -896,6 +978,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle explicit forward calls: record the module stack and emit a call_method graph node;
+        # hooks are not run.
         # Example: `self.layer.forward(x)`. Dynamo puts a `call_method` node in
         # the FX graph and does not trigger hooks.
         module = tx.output.get_submodule(self.module_key)
@@ -910,6 +994,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle _get_item_by_idx: needs a tuple first arg and constant index, else raises a type error.
+        # Returns the selected module variable (registering it if specialized).
         module = tx.output.get_submodule(self.module_key)
         if not args[1].is_python_constant():
             raise_type_error(
@@ -936,6 +1022,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle named_children: guard on _modules key order, reject any args (error), return an
+        # iterator of (name, child) tuples.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_modules"))
         if args or kwargs:
@@ -956,6 +1044,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle named_parameters: guard on _parameters order, accept constant prefix and recurse
+        # args, return an iterator of (name, parameter) tuples.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_parameters"))
         kw = self._get_kwargs(tx, "named_parameters", args, kwargs, "prefix", "recurse")
@@ -970,6 +1060,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle named_buffers: guard on _buffers order, accept constant prefix, recurse and
+        # remove_duplicate, return an iterator of (name, buffer) tuples.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_buffers"))
         kw = self._get_kwargs(
@@ -986,6 +1078,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle named_modules: guard on _modules order, accept constant memo, prefix and
+        # remove_duplicate, return an iterator of (name, module) tuples.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_modules"))
         kw = self._get_kwargs(
@@ -1002,6 +1096,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle children: guard on _modules order, reject any args, return an iterator of children.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_modules"))
         if args or kwargs:
@@ -1019,6 +1114,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle modules: guard on _modules order and return an iterator over all submodules.
+        # Args are ignored.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_modules"))
         return self._wrap_values(tx, module.named_modules())
@@ -1029,6 +1126,8 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle parameters: guard on _parameters order, accept constant recurse, return an
+        # iterator of parameters.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_parameters"))
         kw = self._get_kwargs(tx, "parameters", args, kwargs, "recurse")
@@ -1040,6 +1139,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle buffers: guard on _buffers order, accept constant recurse, return an iterator of buffers.
         module = tx.output.get_submodule(self.module_key)
         tx.output.guard_on_key_order.add(AttrSource(self.source, "_buffers"))
         kw = self._get_kwargs(tx, "buffers", args, kwargs, "recurse")
@@ -1051,6 +1151,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle keys (ModuleDict-like): reject any args and return an iterator of key constants.
         module = tx.output.get_submodule(self.module_key)
         if args or kwargs:
             raise_args_mismatch(
@@ -1071,6 +1172,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle values: reject any args and return an iterator of the registered item values.
         module = tx.output.get_submodule(self.module_key)
         if args or kwargs:
             raise_args_mismatch(
@@ -1087,6 +1189,7 @@ class NNModuleVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle items: reject any args and return an iterator of (key, value) tuples.
         module = tx.output.get_submodule(self.module_key)
         if args or kwargs:
             raise_args_mismatch(
@@ -1126,6 +1229,10 @@ class NNModuleVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
         constant: bool = False,
     ) -> VariableTracker:
+        # [FUNCTION DOC] Dispatch a method call. Special cases: constant-true _check_input_dim, constant folding when
+        # constant is set, __iter__, ModuleDict/ParameterDict __contains__ with constant key, inlining of
+        # conv helpers and _get_abs_string_index, generic call_method node for class-defined methods with
+        # all-tensor args, otherwise the base class dispatch.
         from .constant import ConstantVariable
 
         module = tx.output.get_submodule(self.module_key)
@@ -1184,12 +1291,17 @@ class NNModuleVariable(VariableTracker):
             return super().call_method(tx, name, list(args), kwargs)
 
     def sq_length_impl(self, tx: "InstructionTranslatorBase") -> "VariableTracker":
+        # [FUNCTION DOC] Return the length of the container module as a constant.
         """Sequence length for container modules (e.g., nn.Sequential)."""
         module = tx.output.get_submodule(self.module_key)
         return VariableTracker.build(tx, len(module))  # type: ignore[arg-type]
 
 
 class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
+    # [CLASS DOC] Tracks an nn.Module as a user-defined object (one graph per class): parameters and
+    # buffers are passed as graph inputs and forward is inlined.
+    # State: is_state_mutated (set when parameters, buffers or submodules are assigned),
+    # nn_module_stack_source (naming source for nn_module_stack). Subclasses adjust sourcing.
     _nonvar_fields = {
         "value_type",
         "is_state_mutated",
@@ -1206,6 +1318,9 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     """
 
     def __init__(self, value: torch.nn.Module, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the variable; if value_type is a lazy module's pre-materialization class and the value
+        # has already become the materialized class, fix value_type. Initializes is_state_mutated to
+        # false and nn_module_stack_source to source.
         if "value_type" in kwargs:
             lazy_value_to_become = getattr(kwargs["value_type"], "cls_to_become", None)
             if type(value) is lazy_value_to_become:
@@ -1226,21 +1341,26 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         self.nn_module_stack_source = self.source
 
     def _wrap_source(self, attr_source: Source) -> Source:
+        # [FUNCTION DOC] HELPER: Return attr_source unchanged (already wrapped in the unspecialized source).
         # the vt is already wrapped with UnspecializedNNModuleSource
         return attr_source
 
     def get_nn_module_stack_source(self) -> Source:
+        # [FUNCTION DOC] Return nn_module_stack_source, or source if unset. Raises AssertionError if neither exists.
         res = self.nn_module_stack_source or self.source
         if not res:
             raise AssertionError("nn_module_stack_source must not be None")
         return res
 
     def set_nn_module_stack_source(self, source: Source) -> None:
+        # [FUNCTION DOC] Override the source used for nn_module_stack naming.
         self.nn_module_stack_source = source
 
     @staticmethod
     @functools.cache
     def _nn_module_method_ids() -> set[int]:
+        # [FUNCTION DOC] HELPER: Cached set of code object ids for torch.nn.Module methods except __setattr__,
+        # __init__ and __delattr__; used to graph break on unsupported base Module methods.
         # Allow __setattr__ to fall through to base class handler
         supported = {
             torch.nn.Module.__setattr__,
@@ -1256,6 +1376,9 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     def unpack_var_sequence(
         self, tx: "InstructionTranslatorBase"
     ) -> list[VariableTracker]:
+        # [FUNCTION DOC] Unpack for iteration. For ModuleList, ParameterList and Sequential iterators, inline the
+        # __iter__ function to see tracked mutations; otherwise use the base class. Raises
+        # NotImplementedError if the class has no __iter__.
         try:
             fn = inspect.getattr_static(self.value_type, "__iter__")
         except AttributeError as e:
@@ -1285,6 +1408,10 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Call the module. Initializes lazy modules and updates value_type. Uses __call__ (or
+        # _call_impl for GraphModule), but short-circuits to forward when the default call path is unpatched,
+        # forward is not in the instance dict and no instance or global hooks exist. Installs forward
+        # monkeypatch guards, records nn_module_stack, and traces the chosen function.
         mod = self.value
         # see comment on lazy module handling in NNModuleVariable.call_function for context
         if is_lazy_module(mod):  # type: ignore[arg-type]
@@ -1315,6 +1442,7 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                 globals_vt = tx.nn_modules_globals_vt
 
                 def _hooks_dict_len(obj: VariableTracker, attr: str) -> int:
+                    # [FUNCTION DOC] HELPER: Return the length of the hook dict attribute obtained from obj, realizing lazily.
                     vt = obj.tp_getattro_impl(tx, attr)
                     vt = vt.realize() if hasattr(vt, "realize") else vt
                     return vt.len()  # type: ignore[union-attr]
@@ -1380,6 +1508,10 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
+        # [FUNCTION DOC] Handle method calls. _call_impl variants are traced directly. For methods not in the instance
+        # dict: staticmethods are traced, unsupported base Module methods graph break, and __setattr__
+        # on parameters, buffers or submodules sets is_state_mutated. Deleting attributes is traced through
+        # Module __delattr__. Otherwise defers to the base class.
         if name in ["_call_impl", "_wrapped_call_impl"]:
             fn = getattr(self.value_type, name)
             if self.source:
@@ -1470,6 +1602,8 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     def getattr_helper(
         self, tx: "InstructionTranslatorBase", field: str, name_vt: VariableTracker
     ) -> VariableTracker | None:
+        # [FUNCTION DOC] HELPER: Fetch the dict attribute field (unwrapping user-defined dict) and look up the constant
+        # key name_vt; returns None if not a const dict or key missing.
         dict_vt = self.tp_getattro_impl(tx, field)
         if isinstance(dict_vt, variables.UserDefinedDictVariable):
             dict_vt = dict_vt._base_vt
@@ -1480,6 +1614,10 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     def tp_getattro_impl(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Resolve attribute access. Graph breaks on parameter/buffer/module iterators when state was
+        # mutated with pending mutations. Empty hook dicts get an empty-hooks guard and an empty dict
+        # variable. Non-empty forward hook dicts become NNModuleHooksDictVariable guarded by length and
+        # key order but not key values. Otherwise defers to the base class.
         if (
             tx.output.side_effects.is_attribute_mutation(self)
             and name
@@ -1556,6 +1694,8 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
             def build_key_value(
                 i: int, k: Any, v: Any
             ) -> tuple[VariableTracker, VariableTracker]:
+                # [FUNCTION DOC] HELPER: Build a (sourceless key, lazy value) pair for the i-th hook entry, accessing the
+                # value by key position so guards do not depend on the key value.
                 # Make key sourceless to avoid any guard on it
                 key = VariableTracker.build(tx, k)
 
@@ -1577,6 +1717,9 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     def manually_trace_nn_module_getattr(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker:
+        # [FUNCTION DOC] Fast path for nn.Module __getattr__: look up name in _parameters, _modules, then _buffers
+        # dicts directly instead of tracing. Raises an observed AttributeError if absent.
+        # KNOWN ISSUE: the second None check and AssertionError are unreachable.
         """
         Dynamo tracing of nn.Module __getattr__ can be expensive if the model
         has deep submodule hierarchy. Since the __getattr__ is stable, we can
@@ -1607,16 +1750,22 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
 
 
 class UnspecializedBuiltinNNModuleVariable(UnspecializedNNModuleVariable):
+    # [CLASS DOC] Marks builtin torch.nn modules (such as Linear), distinct from user-defined modules.
+    # Behavior is inherited; only the source wrapping hook is overridden.
     """
     Differentiates between builtin nn modules (e.g. torch.nn.Linear) and user defined nn modules.
     """
 
     def _wrap_source(self, attr_source: Source) -> Source:
+        # [FUNCTION DOC] HELPER: Return attr_source unchanged (already wrapped in the builtin unspecialized source).
         # vt is already wrapped with the UnspecializedBuiltinNNModuleSource
         return attr_source
 
 
 class FSDPManagedNNModuleVariable(UnspecializedNNModuleVariable):
+    # [CLASS DOC] Variable for FSDP-managed modules: submodules are traced as unspecialized with parameters
+    # as graph inputs. When skip_fsdp_guards is set, many guards are dropped by using FSDP sources.
+    # Requires a source.
     """
     Tracing behavior: trace into submodules and treat them as Unspecialized, do not
     register parameters to the top-level, treat them as function inputs.
@@ -1629,6 +1778,7 @@ class FSDPManagedNNModuleVariable(UnspecializedNNModuleVariable):
     """
 
     def __init__(self, value: torch.nn.Module, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Create the variable. Raises AssertionError if no source is given; stores the source.
         source = kwargs.get("source")
         if source is None:
             raise AssertionError(
@@ -1639,6 +1789,8 @@ class FSDPManagedNNModuleVariable(UnspecializedNNModuleVariable):
         self.source = source
 
     def _wrap_source(self, attr_source: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Wrap attr_source: unless already an FSDP or unspecialized module source, wrap it in
+        # FSDPNNModuleSource when skip_fsdp_guards is set, else UnspecializedNNModuleSource.
         if not isinstance(
             attr_source, (FSDPNNModuleSource, UnspecializedNNModuleSource)
         ):
