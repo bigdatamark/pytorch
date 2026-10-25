@@ -1,3 +1,15 @@
+# [PACKAGE DOC]
+# Top-level entry point of the torch package. Importing it loads the compiled
+# torch._C extension (optionally preloading CUDA/global-dependency shared
+# libraries first, or Windows DLL directories), re-exports the public C
+# bindings, and defines the symbolic scalar types (SymInt, SymFloat, SymBool)
+# plus sym_* helpers, basic utilities (typename, is_tensor, is_storage),
+# global default device/dtype and deterministic-algorithm settings, and further
+# global configuration helpers. Later in the file it imports many submodules
+# and re-exports names such as Tensor, storage classes, autograd, compile and
+# export. Import-time side effects: platform-specific library loading,
+# patching __module__ of C-extension objects to "torch", registering C
+# submodules in sys.modules, and growing __all__ with names from torch._C.
 """
 The torch package contains data structures for multi-dimensional
 tensors and defines mathematical operations over these tensors.
@@ -48,6 +60,7 @@ from typing_extensions import (
 # we need to keep this. @todo: Remove tests that rely on this check as
 # they are likely stale.
 def _running_with_deploy() -> builtins.bool:
+    # [FUNCTION DOC] HELPER: Legacy check kept for old torch.package code; always returns False.
     return False
 
 
@@ -180,6 +193,12 @@ else:
 if sys.platform == "win32":
 
     def _load_dll_libraries() -> None:
+        # [FUNCTION DOC] HELPER: Windows only. Builds the list of DLL search directories (torch lib dir
+        # located via the torch._C extension, Python prefix dirs, user base, optional NvToolsExt and CUDA
+        # bin dirs), registers them with the loader, warns if the VC++ runtime is missing, then loads each
+        # DLL in the torch lib dir. Raises the Windows error (annotated with the DLL name) if a load fails.
+        # Side effects: may prepend to the PATH environment variable, prints a warning, changes error mode
+        # temporarily. Called once at import and then deleted.
         import importlib.util
         import sysconfig
 
@@ -311,6 +330,9 @@ if sys.platform == "win32":
 
 
 def _get_cuda_dep_paths(path: str, lib_folder: str, lib_name: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns candidate file paths for a CUDA shared library under one search
+    # root, checking the nvidia vendor folder (both per-library and per-CUDA-major layouts) first and
+    # then the plain library folder. Pure file-system lookup; returns a possibly empty list.
     # Libraries can either be in
     # path/nvidia/lib_folder/lib or
     # path/nvidia/cuXX/lib (since CUDA 13.0) or
@@ -331,6 +353,10 @@ def _get_cuda_dep_paths(path: str, lib_folder: str, lib_name: str) -> list[str]:
 
 
 def _preload_cuda_lib(lib_folder: str, lib_name: str, required: bool = True) -> None:  # type: ignore[valid-type]
+    # [FUNCTION DOC] HELPER: Linux only. Scans every entry of the module search path for the named CUDA
+    # library and loads the first match into the process via the dynamic loader. Raises AssertionError
+    # on non-Linux platforms and ValueError if the library is not found while required is true.
+    # Side effect: loads a shared library.
     """Preloads cuda library if it could not be found otherwise."""
     # Should only be called on Linux if default path resolution have failed
     if platform.system() != "Linux":
@@ -349,6 +375,10 @@ def _preload_cuda_lib(lib_folder: str, lib_name: str, required: bool = True) -> 
 
 
 def _preload_cuda_deps(err: OSError | None = None, required: bool = True) -> None:
+    # [FUNCTION DOC] HELPER: Preloads the ordered list of CUDA wheel libraries (cublasLt before cublas
+    # on purpose) plus the optional NVTX library. If an error is given and it does not mention any of
+    # the known libraries, that error is re-raised unchanged. With required false, missing libraries
+    # are skipped instead of raising ValueError. Side effect: loads shared libraries.
     cuda_libs: list[tuple[str, str]] = [
         # NOTE: Order matters! We must preload libcublasLt BEFORE libcublas to prevent
         # libcublas from loading a mismatched system-wide libcublasLt via its RUNPATH.
@@ -391,6 +421,11 @@ def _preload_cuda_deps(err: OSError | None = None, required: bool = True) -> Non
 
 # See Note [Global dependencies]
 def _load_global_deps() -> None:
+    # [FUNCTION DOC] HELPER: Loads libtorch_global_deps with global symbol visibility (no-op on Windows).
+    # Falls back to the installed distribution location for editable installs. After a successful load,
+    # if libcudart is mapped into the process it best-effort preloads CUDA wheel dependencies; if the
+    # first load fails with OSError it preloads CUDA deps for that error and retries. Side effects:
+    # loads shared libraries, reads the process memory map file.
     if platform.system() == "Windows":
         return
 
@@ -514,6 +549,10 @@ class _SymTypingMagicAlsoBool(
         _PrimType, _BecomesIntPrimType, _BecomesIntSymType, _FloatPromotionType
     ]
 ):
+    # [CLASS DOC] HELPER: Typing-only generic base declaring the magic methods shared by SymInt,
+    # SymFloat and SymBool (equality, add, sub, mul and their reflected forms) with overloads that
+    # describe result types. Every real method body raises TypeError because the actual
+    # implementations are installed at runtime by torch.fx.experimental.sym_node.
     # Magic methods installed by torch.fx.experimental.sym_node
     # From sym_node: also_bool_magic_methods
 
@@ -529,6 +568,7 @@ class _SymTypingMagicAlsoBool(
     def __eq__(self, other: object) -> builtins.bool: ...
 
     def __eq__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -538,6 +578,7 @@ class _SymTypingMagicAlsoBool(
     def __ne__(self, other: object) -> builtins.bool: ...
 
     def __ne__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     # bool_becomes_int_magic_methods
@@ -549,6 +590,7 @@ class _SymTypingMagicAlsoBool(
     def __add__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __add__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     # Tensor + SymT -> Tensor
@@ -565,6 +607,7 @@ class _SymTypingMagicAlsoBool(
     def __radd__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __radd__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -574,6 +617,7 @@ class _SymTypingMagicAlsoBool(
     def __sub__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __sub__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     # Tensor - SymT = Tensor
@@ -590,6 +634,7 @@ class _SymTypingMagicAlsoBool(
     def __rsub__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __rsub__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -599,6 +644,7 @@ class _SymTypingMagicAlsoBool(
     def __mul__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __mul__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -608,6 +654,7 @@ class _SymTypingMagicAlsoBool(
     def __rmul__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __rmul__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
 
@@ -615,6 +662,10 @@ class _SymTypingMagic(
     _SymTypingMagicAlsoBool[_PrimType, _PrimType, _SymType, _FloatPromotionType],
     typing.Generic[_PrimType, _SymType, _FloatPromotionType],
 ):
+    # [CLASS DOC] HELPER: Typing-only extension of the shared symbolic base adding ordering
+    # comparisons, unary ops, shifts, modulo, power helpers, rounding helpers and the sym_* math hooks
+    # (sym_sqrt, sym_sin, sym_max, ...) used by SymInt and SymFloat. All real bodies raise TypeError
+    # because sym_node installs the real methods at runtime.
     # Magic methods installed by torch.fx.experimental.sym_node
     # From sym_node:
     #   magic_methods
@@ -634,6 +685,7 @@ class _SymTypingMagic(
     def __ge__(self, other: object) -> builtins.bool: ...
 
     def __ge__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -643,6 +695,7 @@ class _SymTypingMagic(
     def __gt__(self, other: object) -> builtins.bool: ...
 
     def __gt__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -652,6 +705,7 @@ class _SymTypingMagic(
     def __le__(self, other: object) -> builtins.bool: ...
 
     def __le__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -661,45 +715,59 @@ class _SymTypingMagic(
     def __lt__(self, other: object) -> builtins.bool: ...
 
     def __lt__(self, other: object) -> "builtins.bool | SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __abs__(self) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __ceil__(self) -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __float_pow__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rfloat_pow__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __float_truediv__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rfloat_truediv__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __floor__(self) -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __int_floordiv__(self, other: _LikeNumber) -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rint_floordiv__(self, other: _LikeNumber) -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __int_truediv__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rint_truediv__(self, other: _LikeNumber) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __lshift__(self, other: "IntLikeType") -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rlshift__(self, other: "IntLikeType") -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -709,6 +777,7 @@ class _SymTypingMagic(
     def __mod__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __mod__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     @_overload
@@ -718,89 +787,118 @@ class _SymTypingMagic(
     def __rmod__(self, other: _FloatPromotionType) -> "SymFloat": ...
 
     def __rmod__(self, other: object) -> object:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __neg__(self) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __pos__(self) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __pow_by_natural__(self, other: "IntLikeType") -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rpow_by_natural__(self, other: "IntLikeType") -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rshift__(self, other: "IntLikeType") -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rrshift__(self, other: "IntLikeType") -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_acos__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_asin__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_atan__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_cos__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_cosh__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_float__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_max__(self, other: _LikeNumber) -> _LikeNumber:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_min__(self, other: _LikeNumber) -> _LikeNumber:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_sin__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_sinh__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_sqrt__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_tan__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __sym_tanh__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __trunc__(self) -> "SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
 
 class _SymTypingMagicBitwise(typing.Generic[_BitwiseLikeType]):
+    # [CLASS DOC] HELPER: Typing-only generic base declaring bitwise and/or/xor (and reflected forms)
+    # for SymInt and SymBool. Bodies raise TypeError; sym_node installs the real methods at runtime.
     # Magic methods installed by torch.fx.experimental.sym_node
     # From sym_node: bitwise_ops
 
     def __and__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rand__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __or__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __ror__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __xor__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __rxor__(self, other: _BitwiseLikeType) -> _Self:
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
 
@@ -808,6 +906,12 @@ class SymInt(
     _SymTypingMagic[builtins.int, "SymInt", "FloatLikeType"],
     _SymTypingMagicBitwise["IntLikeType"],
 ):
+    # [CLASS DOC] Symbolic integer: a Python-int-like value that wraps a node object (attribute node,
+    # name fixed because C++ bindings read it) and forwards arithmetic to it so operations are recorded
+    # symbolically for dynamic shapes. Arithmetic magic methods come from the stub bases and are
+    # installed by sym_node; this class adds conversion (bool, int, index), true/floor division, power
+    # with guard on exponent sign, repr, hashing (only for nested ints) and hint/constant accessors.
+    # Converting to a concrete int or bool forces a guard.
     """
     Like an int (including magic methods), but redirects all operations on the
     wrapped node. This is used in particular to symbolically record operations
@@ -815,27 +919,36 @@ class SymInt(
     """
 
     def __init__(self, node: "_SymNodeLike") -> None:
+        # [FUNCTION DOC] Stores the given node object (any of the symbolic node kinds) in the attribute
+        # named node. No validation or copying is done.
         # This field MUST be named node; C++ binding code assumes that this
         # class has a field named node that stores SymNode
         self.node = typing.cast("SymNode", node)
 
     def __bool__(self) -> builtins.bool:
+        # [FUNCTION DOC] Truthiness: compares against zero (producing a symbolic bool) and converts it to
+        # a concrete bool, which installs a guard.
         return builtins.bool(self != 0)
 
     def __int__(self) -> builtins.int:
+        # [FUNCTION DOC] Returns the concrete Python int by asking the node to evaluate (guarding).
         # pyrefly: ignore[missing-attribute]  # duck-typed: not on NestedIntNode/ConstantIntNode/LocalIntNode
         return self.node.int_()
 
     def __index__(self) -> builtins.int:
+        # [FUNCTION DOC] Allows use as a sequence index; returns the concrete int from the node (guarding).
         # pyrefly: ignore[missing-attribute]  # duck-typed: not on NestedIntNode/ConstantIntNode/LocalIntNode
         return self.node.int_()
 
     # Magic methods installed by torch.fx.experimental.sym_node
 
     def __round__(self, ndigits: builtins.int | None = None) -> "SymInt":
+        # [FUNCTION DOC] Rounding an integer is the identity; returns self and ignores ndigits.
         return self
 
     def __truediv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] True division. A float/SymFloat operand converts self to SymFloat first; an
+        # int/SymInt operand uses integer true division; any other type returns NotImplemented.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(self).__float_truediv__(other)
         if not isinstance(other, (builtins.int, SymInt)):
@@ -843,6 +956,8 @@ class SymInt(
         return self.__int_truediv__(other)
 
     def __rtruediv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Reflected true division (other divided by self); same dispatch rules as
+        # __truediv__, returning NotImplemented for unsupported operand types.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(self).__rfloat_truediv__(other)
         if not isinstance(other, (builtins.int, SymInt)):
@@ -856,6 +971,8 @@ class SymInt(
     def __floordiv__(self, other: "builtins.float | SymFloat") -> "SymFloat": ...
 
     def __floordiv__(self, other: object) -> "SymInt | SymFloat":
+        # [FUNCTION DOC] Floor division. With a float operand, divides as floats, floors, and returns a
+        # SymFloat; with an int operand uses integer floor division; otherwise returns NotImplemented.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(math.floor(sym_float(self) / other))
         if not isinstance(other, (builtins.int, SymInt)):
@@ -869,6 +986,8 @@ class SymInt(
     def __rfloordiv__(self, other: "builtins.float | SymFloat") -> "SymFloat": ...
 
     def __rfloordiv__(self, other: object) -> "SymInt | SymFloat":
+        # [FUNCTION DOC] Reflected floor division (other floor-divided by self); same dispatch rules as
+        # __floordiv__.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(math.floor(other / sym_float(self)))
         if not isinstance(other, (builtins.int, SymInt)):
@@ -880,6 +999,9 @@ class SymInt(
     # just always return complex.  Neener neener pretend this problem
     # doesn't exist
     def __pow__(self, other: object) -> "SymInt | SymFloat":
+        # [FUNCTION DOC] Exponentiation. Float exponent: float power. Int exponent: guards on whether it
+        # is non-negative; non-negative gives an integer power, negative promotes both to float and does
+        # a float power (matching Python). Other types return NotImplemented.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(self).__pow__(other)
         if not isinstance(other, (builtins.int, SymInt)):
@@ -904,6 +1026,9 @@ class SymInt(
             return sym_float(self).__pow__(sym_float(other))
 
     def __rpow__(self, other: object) -> "SymInt | SymFloat":
+        # [FUNCTION DOC] Reflected exponentiation where self is the exponent and other the base. Guards
+        # on self being non-negative: integer power if so, otherwise float power. Float base uses float
+        # power; other types return NotImplemented.
         if isinstance(other, (builtins.float, SymFloat)):
             return sym_float(self).__rpow__(other)
         if not isinstance(other, (builtins.int, SymInt)):
@@ -914,13 +1039,17 @@ class SymInt(
             return sym_float(self).__rpow__(sym_float(other))
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the node's graph-style string form of the symbolic expression.
         return self.node._graph_repr()
 
     def _sympy_(self) -> "sympy.Basic":
+        # [FUNCTION DOC] HELPER: Sympy conversion hook; returns the node's underlying sympy expression.
         # pyrefly: ignore[missing-attribute]  # duck-typed: not on NestedIntNode/ConstantIntNode/LocalIntNode
         return self.node.expr
 
     def __hash__(self) -> builtins.int:
+        # [FUNCTION DOC] Hashes only nested ints (using the nested int identity); raises TypeError
+        # (unhashable) for every other SymInt on purpose, because libraries like einops rely on that.
         if self.node.is_nested_int():
             # pyrefly: ignore[missing-attribute]  # narrowed by is_nested_int(); only NestedIntNode/SymNode reach here
             return hash(self.node.nested_int())
@@ -934,10 +1063,12 @@ class SymInt(
             # return hash(builtins.int(self))
 
     def as_integer_ratio(self) -> tuple["SymInt", builtins.int]:
+        # [FUNCTION DOC] Returns the pair (self, 1) as the exact integer ratio.
         """Represent this int as an exact integer ratio"""
         return self, 1
 
     def bit_length(self) -> builtins.int:
+        # [FUNCTION DOC] Returns the bit length of the concrete int value (forces specialization/guard).
         # TODO: A more relaxed guard is possible here, where you guard to
         # allow all integer quantities which would result in the same bit
         # length.  We can also just make a dedicated Sympy function for
@@ -945,21 +1076,29 @@ class SymInt(
         return builtins.int(self).bit_length()
 
     def conjugate(self) -> "SymInt":
+        # [FUNCTION DOC] Complex conjugate of an integer is itself; returns self.
         return self
 
     def has_hint(self) -> builtins.bool:
+        # [FUNCTION DOC] Returns whether the node carries a concrete hint value.
         return self.node.has_hint()
 
     @property
     def hint(self) -> builtins.int | None:
+        # [FUNCTION DOC] Property: the node's concrete hint value as an int, or None when unavailable.
         return typing.cast(builtins.int | None, self.node.hint)
 
     @property
     def constant(self) -> builtins.int | None:
+        # [FUNCTION DOC] Property: the constant int value if the node is a constant, else None.
         return typing.cast(builtins.int | None, self.node.constant)
 
 
 class SymFloat(_SymTypingMagic[builtins.float, "SymFloat", _Never]):
+    # [CLASS DOC] Symbolic float: wraps a node (attribute node, name fixed for C++ bindings) and
+    # forwards operations to it for symbolic shape tracing. Arithmetic magic methods are installed by
+    # sym_node; this class defines division, floor division, power (requires non-negative base via a
+    # check), conversions, repr, hashing via the concrete float, and hint/constant accessors.
     """
     Like a float (including magic methods), but redirects all operations on the
     wrapped node. This is used in particular to symbolically record operations
@@ -967,48 +1106,62 @@ class SymFloat(_SymTypingMagic[builtins.float, "SymFloat", _Never]):
     """
 
     def __init__(self, node: "SymNode") -> None:
+        # [FUNCTION DOC] Stores the given SymNode in the attribute named node (name required by C++).
         # This field MUST be named node; C++ binding code assumes that this
         # class has a field named node that stores SymNode
         self.node = node
 
     def __truediv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] True division by an int/float/Sym operand (converted to SymFloat); returns
+        # NotImplemented for other types.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         return self.__float_truediv__(sym_float(other))
 
     def __rtruediv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Reflected true division (other divided by self); NotImplemented for other types.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         return self.__rfloat_truediv__(sym_float(other))
 
     def __floordiv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Floor division implemented as float division followed by floor, returned as a
+        # SymFloat; NotImplemented for unsupported operand types.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         return sym_float(math.floor(self / sym_float(other)))
 
     def __rfloordiv__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Reflected floor division (other floor-divided by self), returned as SymFloat.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         return sym_float(math.floor(sym_float(other) / self))
 
     def __bool__(self) -> builtins.bool:
+        # [FUNCTION DOC] Truthiness via the node's concrete boolean evaluation (installs a guard).
         return self.node.bool_()
 
     def __float__(self) -> builtins.float:
+        # [FUNCTION DOC] Returns the concrete Python float by guarding on the node's value.
         return self.node.guard_float("", 0)
 
     def __int__(self) -> builtins.int:
+        # [FUNCTION DOC] Truncates toward zero symbolically, then converts the result to a concrete int.
         return self.__trunc__().__int__()
 
     # Symbolic power does NOT work with negative base, this is to avoid
     # potential complex outputs
     def __pow__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Power with a numeric exponent. Asserts via a check that the base is non-negative
+        # (to avoid complex results), then uses float power. NotImplemented for other operand types.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         torch._check(self >= 0)
         return self.__float_pow__(other)
 
     def __rpow__(self, other: object) -> "SymFloat":
+        # [FUNCTION DOC] Reflected power where other is the base; checks that the base is non-negative,
+        # then uses reflected float power. NotImplemented for other operand types.
         if not isinstance(other, (builtins.int, builtins.float, SymInt, SymFloat)):
             return NotImplemented  # type: ignore[return-value]
         torch._check(other >= 0)
@@ -1023,48 +1176,62 @@ class SymFloat(_SymTypingMagic[builtins.float, "SymFloat", _Never]):
     def __round__(self, ndigits: "IntLikeType") -> "SymFloat": ...
 
     def __round__(self, ndigits: "IntLikeType | None" = None) -> "SymFloat | SymInt":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     # def __sym_int__(self) -> "SymInt":
     #     raise TypeError("type stub not overridden")
 
     def __sym_log2__(self) -> "SymFloat":
+        # [FUNCTION DOC] HELPER: Typing stub; raises TypeError until overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def is_integer(self) -> builtins.bool:
+        # [FUNCTION DOC] HELPER: Typing stub (docstring says it returns whether the float is integral);
+        # raises TypeError until overridden by sym_node at runtime.
         """Return True if the float is an integer."""
         raise TypeError("type stub not overridden")
 
     def as_integer_ratio(self) -> tuple[builtins.int, builtins.int]:
+        # [FUNCTION DOC] Returns the exact (numerator, denominator) ratio of the concrete float value
+        # (forces a guard through float conversion).
         """Represent this float as an exact integer ratio"""
         return builtins.float(self).as_integer_ratio()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the node's graph-style string form of the symbolic expression.
         return self.node._graph_repr()
 
     def _sympy_(self) -> "sympy.Basic":
+        # [FUNCTION DOC] HELPER: Sympy conversion hook; returns the node's sympy expression.
         return self.node.expr
 
     def __hash__(self) -> builtins.int:
+        # [FUNCTION DOC] Hashes the concrete float value (forces a guard).
         return hash(builtins.float(self))
 
     def conjugate(self) -> "SymFloat":
+        # [FUNCTION DOC] Complex conjugate of a real float is itself; returns self.
         """Returns the complex conjugate of the float."""
         return self
 
     def hex(self) -> str:
+        # [FUNCTION DOC] Returns the hexadecimal string of the concrete float value (guards).
         """Returns the hexadecimal representation of the float."""
         return self.node.guard_float("", 0).hex()
 
     def has_hint(self) -> builtins.bool:
+        # [FUNCTION DOC] Returns whether the node carries a concrete hint value.
         return self.node.has_hint()
 
     @property
     def hint(self) -> builtins.float | None:
+        # [FUNCTION DOC] Property: the node's concrete hint as a float, or None when unavailable.
         return typing.cast(builtins.float | None, self.node.hint)
 
     @property
     def constant(self) -> builtins.float | None:
+        # [FUNCTION DOC] Property: the constant float value if the node is constant, else None.
         return typing.cast(builtins.float | None, self.node.constant)
 
 
@@ -1072,6 +1239,10 @@ class SymBool(
     _SymTypingMagicAlsoBool[builtins.bool, builtins.int, "SymInt", "FloatLikeType"],
     _SymTypingMagicBitwise["BoolLikeType"],
 ):
+    # [CLASS DOC] Symbolic boolean: wraps a node (attribute node, name fixed for C++ bindings) and
+    # forwards operations to it. Python truthiness converts to a concrete bool and installs a guard;
+    # use bitwise operators and sym_not to stay symbolic. Provides sym_not/sym_ite stubs, repr, hashing,
+    # float conversion and hint/constant accessors.
     """
     Like a bool (including magic methods), but redirects all operations on the
     wrapped node. This is used in particular to symbolically record operations
@@ -1082,14 +1253,17 @@ class SymBool(
     """
 
     def __init__(self, node: "SymNode") -> None:
+        # [FUNCTION DOC] Stores the given SymNode in the attribute named node (name required by C++).
         # This field MUST be named node; C++ binding code assumes that this
         # class has a field named node that stores SymNode
         self.node = node
 
     def __bool__(self) -> builtins.bool:
+        # [FUNCTION DOC] Concrete truth value from the node (installs a guard).
         return self.node.bool_()
 
     def __int__(self) -> builtins.int:
+        # [FUNCTION DOC] Returns 1 or 0 from the concrete truth value (installs a guard).
         return builtins.int(self.node.bool_())
 
     # Magic methods installed by torch.fx.experimental.sym_node
@@ -1112,18 +1286,27 @@ class SymBool(
     #     so we reuse the conventional operators there for readability.
     #
     def __sym_not__(self) -> "SymBool":
+        # [FUNCTION DOC] HELPER: Typing stub for symbolic logical negation; raises TypeError until
+        # overridden by sym_node. Deliberately not named after the invert operator, which would
+        # give wrong results on booleans.
         raise TypeError("type stub not overridden")
 
     def __sym_ite__(self, then_val: _SymIteT, else_val: _SymIteT) -> _SymIteT:
+        # [FUNCTION DOC] HELPER: Typing stub for symbolic if-then-else; raises TypeError until
+        # overridden by sym_node at runtime.
         raise TypeError("type stub not overridden")
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the node's graph-style string form of the symbolic expression.
         return self.node._graph_repr()
 
     def _sympy_(self) -> "sympy.Basic":
+        # [FUNCTION DOC] HELPER: Sympy conversion hook; returns the node's sympy expression.
         return self.node.expr
 
     def __hash__(self) -> builtins.int:
+        # [FUNCTION DOC] Hash of the constant truth value if the node is constant; otherwise forces
+        # specialization by hashing the concrete bool (installs a guard).
         if self.node.is_constant():
             return hash(self.node.bool_())
         else:
@@ -1131,6 +1314,8 @@ class SymBool(
             return hash(builtins.bool(self))
 
     def __sym_float__(self) -> "SymFloat":
+        # [FUNCTION DOC] Returns a SymFloat (0.0 or 1.0) for this symbolic bool by wrapping the node's
+        # float conversion; used by sym_float when casting.
         """
         Provides a SymFloat representation (0.0 or 1.0) for this SymBool.
         Called by torch.sym_float() when casting SymBool to float.
@@ -1142,10 +1327,12 @@ class SymBool(
 
     @property
     def hint(self) -> builtins.bool | None:
+        # [FUNCTION DOC] Property: the node's concrete hint as a bool, or None when unavailable.
         return typing.cast(builtins.bool | None, self.node.hint)
 
     @property
     def constant(self) -> builtins.bool | None:
+        # [FUNCTION DOC] Property: the constant bool value if the node is constant, else None.
         return typing.cast(builtins.bool | None, self.node.constant)
 
 
@@ -1158,6 +1345,10 @@ def sym_not(a: object) -> object: ...
 
 
 def sym_not(a: object) -> object:
+    # [FUNCTION DOC] Logical negation that works on SymBool. Dispatches to torch-function overrides if
+    # present, then to the object's symbolic-not method, then to bitwise invert for sympy expressions,
+    # and otherwise uses plain boolean not. Returns the negated value (symbolic when possible).
+    # Raises ImportError if sympy is missing.
     r"""SymInt-aware utility for logical negation.
 
     Args:
@@ -1184,6 +1375,9 @@ def sym_float(a: object) -> "FloatLikeType": ...
 
 
 def sym_float(a: object) -> "FloatLikeType":
+    # [FUNCTION DOC] Casts to float while preserving symbolic values: honors torch-function overrides,
+    # returns a SymFloat unchanged, uses an object's symbolic float-cast method if it has one, else
+    # falls back to the builtin float conversion (which may raise TypeError/ValueError).
     r"""SymInt-aware utility for float casting.
 
     Args:
@@ -1208,6 +1402,9 @@ def sym_int(a: object) -> builtins.int: ...
 
 
 def sym_int(a: object) -> "IntLikeType":
+    # [FUNCTION DOC] Casts to int while preserving symbolic values: honors torch-function overrides,
+    # returns a SymInt unchanged, truncates a SymFloat toward zero, else uses the builtin int
+    # conversion (which may raise TypeError/ValueError).
     r"""SymInt-aware utility for int casting.
 
     Args:
@@ -1236,6 +1433,10 @@ def sym_max(
 def sym_max(
     a: "IntLikeType | FloatLikeType", b: "IntLikeType | FloatLikeType"
 ) -> "IntLikeType | FloatLikeType":
+    # [FUNCTION DOC] Maximum of two int/float values without branching on symbolic comparisons.
+    # Honors torch-function overrides; if either side is symbolic, delegates to its symbolic max
+    # method. Otherwise requires both to be Python or numpy int/float (raises AssertionError
+    # otherwise) and returns a float if either is a float, else the builtin max.
     """
     SymInt-aware utility for max which avoids branching on a < b.
     Unlike builtins.max(), this only works for int/float, and it always
@@ -1266,6 +1467,8 @@ def sym_max(
 
 
 def __all_and_float_types() -> tuple[tuple[type, ...], tuple[type, ...]]:
+    # [FUNCTION DOC] HELPER: Returns a pair of type tuples (all accepted numeric types, float types):
+    # Python int/float, plus numpy integer/floating types when numpy is importable.
     try:
         import numpy as np
 
@@ -1296,6 +1499,9 @@ def sym_min(
 def sym_min(
     a: "IntLikeType | FloatLikeType", b: "IntLikeType | FloatLikeType"
 ) -> "IntLikeType | FloatLikeType":
+    # [FUNCTION DOC] Minimum of two int/float values without branching on symbolic comparisons.
+    # Same dispatch and type rules as sym_max: overrides first, then symbolic min method, then an
+    # AssertionError for non-numeric inputs, float result if either input is a float.
     """SymInt-aware utility for min()."""
     if overrides.has_torch_function((a, b)):
         # pyrefly: ignore[bad-argument-type]
@@ -1320,6 +1526,10 @@ def sym_min(
 def sym_sum(
     *args: "IntLikeType | _Sequence[IntLikeType]",
 ) -> "IntLikeType":
+    # [FUNCTION DOC] Sums many ints in one n-ary symbolic add. Accepts either varargs or a single
+    # list/tuple. Honors torch-function overrides. If any item is not an int/SymInt, or none is a
+    # SymInt, returns the builtin sum; otherwise converts items to nodes and returns a wrapped
+    # symbolic sum.
     """
     N-ary add which is faster to compute for long lists than iterated binary
     addition.  Only does something special for integers.
@@ -1351,7 +1561,13 @@ def sym_sum(
 
 # Drop in replacement for math.sqrt, math.sin, math.cos etc
 def _get_sym_math_fn(name: str) -> _Callable[[_Any], _Any]:
+    # [FUNCTION DOC] HELPER: Factory returning a replacement for the math module function with the
+    # given name that understands symbolic numbers. Used at import time to create the module-level
+    # sym math functions; deleted afterwards.
     def fn(a: _Any) -> _Any:
+        # [FUNCTION DOC] HELPER: Applies the named math function: honors torch-function overrides,
+        # casts SymInt to SymFloat, uses the argument's symbolic method for that function if present,
+        # otherwise calls the standard math function on the plain value.
         if overrides.has_torch_function_unary(a):
             return overrides.handle_torch_function(fn, (a,), a)
         if isinstance(a, SymInt):
@@ -1391,6 +1607,9 @@ __all__.append("sym_sqrt")
 
 
 def sym_ite(b: "BoolLikeType", t: _SymIteT, f: _SymIteT) -> _SymIteT:
+    # [FUNCTION DOC] Symbolic ternary: returns t if b is true else f. Honors torch-function overrides.
+    # Raises AssertionError if b is not a SymBool or bool, or if t and f have different types. A
+    # SymBool condition delegates to its symbolic if-then-else; a plain bool selects directly.
     """SymInt-aware utility for ternary operator (``t if b else f``.)"""
     if overrides.has_torch_function((b, t, f)):
         return overrides.handle_torch_function(sym_ite, (b, t, f), b, t, f)
@@ -1405,6 +1624,8 @@ def sym_ite(b: "BoolLikeType", t: _SymIteT, f: _SymIteT) -> _SymIteT:
 
 # Create a fresh unbacked int, from an (possibly unbacked int) expression.
 def sym_fresh_size(expr: "IntLikeType") -> "IntLikeType":
+    # [FUNCTION DOC] Creates a fresh unbacked symbolic int from an expression by building a tensor
+    # from it and reading back its item. Returns the resulting int-like value.
     return typing.cast("IntLikeType", torch.tensor(expr).item())
 
 
@@ -1466,6 +1687,10 @@ if not TYPE_CHECKING:
     # pickle expect to be able to import them as "from _C.sub import attr"
     # which fails with "_C is not a package
     def _import_extension_to_sys_modules(module, memo=None):
+        # [FUNCTION DOC] HELPER: Recursively walks a C extension module's attributes and registers
+        # every submodule whose name starts with the parent's name in sys.modules (without
+        # overriding existing entries), so attributes of those submodules can be pickled. The memo
+        # set prevents revisiting modules. Side effect: mutates sys.modules.
         if memo is None:
             memo = set()
         if module in memo:
@@ -1489,6 +1714,9 @@ if not TYPE_CHECKING:
 
 
 def typename(obj: object, /) -> str:
+    # [FUNCTION DOC] Returns a fully qualified type name string. For a tensor returns its tensor type
+    # string; otherwise uses the object's module and qualified (or plain) name, falling back to its
+    # class when it has neither. Builtins and empty modules yield the bare name.
     """
     String representation of the type of an object.
 
@@ -1524,6 +1752,7 @@ def typename(obj: object, /) -> str:
 
 
 def is_tensor(obj: object, /) -> _TypeIs["torch.Tensor"]:
+    # [FUNCTION DOC] Returns whether obj is an instance of Tensor (type-narrowing predicate).
     r"""Returns True if `obj` is a PyTorch tensor.
 
     Args:
@@ -1539,6 +1768,8 @@ def is_tensor(obj: object, /) -> _TypeIs["torch.Tensor"]:
 
 
 def is_storage(obj: object, /) -> _TypeGuard["TypedStorage | UntypedStorage"]:
+    # [FUNCTION DOC] Returns whether the exact type of obj is one of the registered storage classes
+    # (module-level collection defined later). Subclasses of storage classes are not matched.
     r"""Returns True if `obj` is a PyTorch storage object.
 
     Args:
@@ -1573,6 +1804,9 @@ _GLOBAL_DEVICE_CONTEXT = threading.local()
 
 
 def get_default_device() -> "torch.device":
+    # [FUNCTION DOC] Returns the current default device for new tensors. The innermost active device
+    # context manager wins; otherwise the global device set by set_default_device; otherwise cpu.
+    # If the chosen device has no index, the index is resolved by creating an empty tensor.
     r"""Gets the default ``torch.Tensor`` to be allocated on ``device``"""
     global _GLOBAL_DEVICE_CONTEXT
 
@@ -1580,6 +1814,8 @@ def get_default_device() -> "torch.device":
     from torch.utils._device import DeviceContext
 
     def _get_device_with_index(device: "torch.device") -> "torch.device":
+        # [FUNCTION DOC] HELPER: Returns the device unchanged if it has an index, else the device of a
+        # freshly created empty tensor (which fills in the current index).
         if device.index is not None:
             return device
         else:
@@ -1606,6 +1842,11 @@ def get_default_device() -> "torch.device":
 
 
 def set_default_device(device: "Device") -> None:
+    # [FUNCTION DOC] Sets (or, when None, clears) the process-wide default device. Exits any previously
+    # installed global device context, then enters a new one for the given device and stores it in the
+    # thread-local global slot. Side effects: global state mutation, adds per-call overhead to torch API.
+    # KNOWN ISSUE: the stored context lives in thread-local storage, so the default only applies to the
+    # calling thread despite the docstring calling it global.
     """Sets the default ``torch.Tensor`` to be allocated on ``device``.  This
     does not affect factory function calls which are called with an explicit
     ``device`` argument.  Factory calls will be performed as if they
@@ -1670,6 +1911,9 @@ def set_default_device(device: "Device") -> None:
 
 
 def set_default_tensor_type(t: type["torch.Tensor"] | str, /) -> None:
+    # [FUNCTION DOC] Deprecated. Sets the default floating-point tensor type; a string is first resolved
+    # to a type by dotted-name import. Delegates to the C extension. Side effect: global default dtype
+    # and type change. Raises on unresolvable names or invalid types.
     r"""
     .. warning::
 
@@ -1701,6 +1945,8 @@ def set_default_tensor_type(t: type["torch.Tensor"] | str, /) -> None:
 
 
 def set_default_dtype(d: "torch.dtype", /) -> None:
+    # [FUNCTION DOC] Sets the global default floating-point dtype (and implied complex dtype) via the
+    # C extension. Non-floating dtypes raise an error. Side effect: changes global type inference.
     r"""
 
     Sets the default floating point dtype to :attr:`d`. Supports floating point dtype
@@ -1758,6 +2004,10 @@ def use_deterministic_algorithms(
     *,
     warn_only: builtins.bool = False,
 ) -> None:
+    # [FUNCTION DOC] Globally enables or disables deterministic-algorithm mode. Also sets the inductor
+    # config deterministic flag to the same value, then forwards the mode and warn_only flag to the C
+    # extension. With warn_only, nondeterministic ops warn instead of raising RuntimeError.
+    # Side effects: global state (core and inductor config).
     r"""Sets whether PyTorch operations must use "deterministic"
     algorithms. That is, algorithms which, given the same input, and when
     run on the same software and hardware, always produce the same output.
@@ -1904,6 +2154,7 @@ def use_deterministic_algorithms(
 
 
 def are_deterministic_algorithms_enabled() -> builtins.bool:
+    # [FUNCTION DOC] Returns whether deterministic algorithms mode is currently on (reads C extension state).
     r"""Returns True if the global deterministic flag is turned on. Refer to
     :func:`torch.use_deterministic_algorithms` documentation for more details.
     """
@@ -1911,6 +2162,7 @@ def are_deterministic_algorithms_enabled() -> builtins.bool:
 
 
 def is_deterministic_algorithms_warn_only_enabled() -> builtins.bool:
+    # [FUNCTION DOC] Returns whether deterministic mode is in warn-only mode (reads C extension state).
     r"""Returns True if the global deterministic flag is set to warn only.
     Refer to :func:`torch.use_deterministic_algorithms` documentation for more
     details.
@@ -1919,6 +2171,11 @@ def is_deterministic_algorithms_warn_only_enabled() -> builtins.bool:
 
 
 def set_deterministic_debug_mode(debug_mode: builtins.int | str) -> None:
+    # [FUNCTION DOC] Sets deterministic mode via a level: default/0 = off, warn/1 = on with warn-only,
+    # error/2 = on with errors. Raises TypeError if the argument is neither int nor str, RuntimeError for
+    # unknown strings or ints outside 0-2. Side effect: sets the C extension global flags.
+    # KNOWN ISSUE: unlike use_deterministic_algorithms, this does not update the inductor deterministic
+    # config flag.
     r"""Sets the debug mode for deterministic operations.
 
     .. note:: This is an alternative interface for
@@ -1963,6 +2220,8 @@ def set_deterministic_debug_mode(debug_mode: builtins.int | str) -> None:
 
 
 def get_deterministic_debug_mode() -> builtins.int:
+    # [FUNCTION DOC] Returns the current deterministic level: 0 when off, 1 when on in warn-only mode,
+    # 2 when on and raising errors.
     r"""Returns the current value of the debug mode for deterministic
     operations. Refer to :func:`torch.set_deterministic_debug_mode`
     documentation for more details.
@@ -1978,6 +2237,7 @@ def get_deterministic_debug_mode() -> builtins.int:
 
 
 def get_float32_matmul_precision() -> str:
+    # [FUNCTION DOC] Returns the current float32 matmul precision string (highest, high or medium).
     r"""Returns the current value of float32 matrix multiplication precision. Refer to
     :func:`torch.set_float32_matmul_precision` documentation for more details.
     """
@@ -1985,6 +2245,8 @@ def get_float32_matmul_precision() -> str:
 
 
 def set_float32_matmul_precision(precision: str) -> None:
+    # [FUNCTION DOC] Sets the internal precision used for float32 matrix multiplication (highest, high
+    # or medium) by forwarding to the C extension, which validates the string. Side effect: global state.
     r"""Sets the internal precision of float32 matrix multiplications.
 
     Running float32 matrix multiplications in lower precision may significantly increase
@@ -2051,6 +2313,8 @@ def set_float32_matmul_precision(precision: str) -> None:
 
 
 def set_warn_always(b: builtins.bool, /) -> None:
+    # [FUNCTION DOC] Sets the global flag that forces once-per-process warnings to be emitted every
+    # time when true. Side effect: global state in the C extension.
     r"""When this flag is False (default) then some PyTorch warnings may only
     appear once per process. This helps avoid excessive warning information.
     Setting it to True causes these warnings to always appear, which may be
@@ -2064,6 +2328,7 @@ def set_warn_always(b: builtins.bool, /) -> None:
 
 
 def is_warn_always_enabled() -> builtins.bool:
+    # [FUNCTION DOC] Returns the current value of the global warn-always flag.
     r"""Returns True if the global warn_always flag is turned on. Refer to
     :func:`torch.set_warn_always` documentation for more details.
     """
@@ -2083,6 +2348,12 @@ def _check_with(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Core of the _check family. Validates cond is a bool or SymBool (raises
+    # TypeError for tensors with a hint to use the tensor variant, or any other type). A condition
+    # that is true, or that symbolic shape machinery can assume true, returns silently. Otherwise
+    # builds the message (default text, or the string of the message, calling it first if callable)
+    # and raises error_type with it. Raises AssertionError if error_type is not an Exception subclass
+    # or is a Warning subclass.
     if not isinstance(cond, (builtins.bool, SymBool)):
         if isinstance(cond, torch.Tensor):
             raise TypeError(
@@ -2122,6 +2393,8 @@ def _check(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError with the optional message if cond is false (mirrors the
+    # C++ check macro). Delegates to _check_with.
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2151,6 +2424,10 @@ def _check_is_size(
     *,
     max: "IntLikeType | None" = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Deprecated (emits FutureWarning). Checks i is non-negative (raising
+    # RuntimeError with message otherwise), tells the symbolic shape system that i is a size, and if max
+    # is given also checks i <= max and records the upper bound. Side effect: records symbolic range
+    # facts for unbacked symbols.
     """Checks that a given integer is a valid size (i.e., is non-negative).
     You should use this over ``_check(i >= 0)`` because it can prevent
     ``GuardOnDataDependentSymNode`` exceptions by opting yourself into alternate
@@ -2185,6 +2462,8 @@ def _check_index(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises IndexError with the optional message if cond is false (mirrors the
+    # C++ index check macro). Delegates to _check_with.
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2207,6 +2486,8 @@ def _check_value(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError with the optional message if cond is false (mirrors the
+    # C++ value check macro). Delegates to _check_with.
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2229,6 +2510,8 @@ def _check_type(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises TypeError with the optional message if cond is false (mirrors the
+    # C++ type check macro). Delegates to _check_with.
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2251,6 +2534,8 @@ def _check_not_implemented(
     cond: builtins.bool | SymBool,
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises NotImplementedError with the optional message if cond is false
+    # (mirrors the C++ not-implemented check macro). Delegates to _check_with.
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2274,6 +2559,9 @@ def _check_tensor_all_with(
     cond: "torch.Tensor",
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Requires cond to be a boolean tensor (raises TypeError if not a tensor or
+    # wrong dtype), reduces it to a single all-true value (a device sync via item), and raises
+    # error_type with the message if any element is false.
     if not is_tensor(cond):
         raise TypeError(f"cond must be a tensor, but got {type(cond)}")
 
@@ -2288,6 +2576,8 @@ def _check_tensor_all(
     cond: "torch.Tensor",
     message: _LiteralString | _Callable[[], object] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError with the optional message unless every element of the
+    # boolean tensor cond is true (mirrors the C++ tensor-all check macro).
     r"""Throws error containing an optional message if the specified condition
     is False.
 
@@ -2340,189 +2630,240 @@ from torch.storage import (
 # NOTE: New <type>Storage classes should never be added. When adding a new
 # dtype, use torch.storage.TypedStorage directly.
 class ByteStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the uint8 element type. No new storage classes should be added.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (uint8) without warning.
         return torch.uint8
 
 
 class DoubleStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the float64 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (float64) without warning.
         return torch.double
 
 
 class FloatStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the float32 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (float32) without warning.
         return torch.float
 
 
 class HalfStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the float16 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (float16) without warning.
         return torch.half
 
 
 class LongStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the int64 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (int64) without warning.
         return torch.long
 
 
 class IntStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the int32 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (int32) without warning.
         return torch.int
 
 
 class ShortStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the int16 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (int16) without warning.
         return torch.short
 
 
 class CharStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the int8 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (int8) without warning.
         return torch.int8
 
 
 class BoolStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the bool element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (bool) without warning.
         return torch.bool
 
 
 class BFloat16Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the bfloat16 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (bfloat16) without warning.
         return torch.bfloat16
 
 
 class ComplexDoubleStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the complex128 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (complex128) without warning.
         return torch.cdouble
 
 
 class ComplexFloatStorage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the complex64 element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (complex64) without warning.
         return torch.cfloat
 
 
 class QUInt8Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the quantized unsigned 8-bit element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (quint8) without warning.
         return torch.quint8
 
 
 class QInt8Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the quantized signed 8-bit element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (qint8) without warning.
         return torch.qint8
 
 
 class QInt32Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the quantized signed 32-bit element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (qint32) without warning.
         return torch.qint32
 
 
 class QUInt4x2Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the packed quantized unsigned 4-bit (two per byte) element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (quint4x2) without warning.
         return torch.quint4x2
 
 
 class QUInt2x4Storage(_LegacyStorage):
+    # [CLASS DOC] Legacy typed storage fixed to the packed quantized unsigned 2-bit (four per byte) element type.
     @classproperty
     def dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] Class-level property: emits the typed-storage deprecation warning, then returns the element dtype.
         _warn_typed_storage_removal(stacklevel=3)
         return self._dtype
 
     @classproperty
     def _dtype(self) -> "torch.dtype":
+        # [FUNCTION DOC] HELPER: Class-level property returning the fixed element dtype (quint2x4) without warning.
         return torch.quint2x4
 
 
@@ -2573,6 +2914,9 @@ from torch.serialization import load, save
 
 # Shared memory manager needs to know the exact location of manager executable
 def _manager_path() -> bytes:
+    # [FUNCTION DOC] HELPER: Returns the UTF-8 encoded path of the shared-memory manager executable
+    # (empty bytes on Windows). Prepares the multiprocessing environment as a side effect and raises
+    # RuntimeError if the executable is missing.
     if platform.system() == "Windows":
         return b""
     path = get_file_path("torch", "bin", "torch_shm_manager")
@@ -2664,6 +3008,9 @@ del _LegacyStorage
 
 # needs to be before the submodule imports to avoid circular dependencies
 def _assert(condition: object, message: object) -> None:
+    # [FUNCTION DOC] HELPER: Symbolically traceable assert. For non-tensor conditions with torch-function
+    # overrides, dispatches to the override. Otherwise raises AssertionError with the message if the
+    # condition is falsy (evaluating truthiness, which may guard).
     r"""A wrapper around Python's assert which is symbolically traceable."""
     if type(condition) is not torch.Tensor and overrides.has_torch_function(
         (condition,)
@@ -2747,6 +3094,8 @@ del _torch_docs, _tensor_docs, _storage_docs, _size_docs
 
 
 def compiled_with_cxx11_abi() -> builtins.bool:
+    # [FUNCTION DOC] Returns True always (hardcoded) to report the build uses the C++11 ABI.
+    # KNOWN ISSUE: the value is a constant, not queried from the build.
     r"""Returns whether PyTorch was built with _GLIBCXX_USE_CXX11_ABI=1"""
     return True
 
@@ -2816,6 +3165,10 @@ from torch.utils.dlpack import from_dlpack, to_dlpack
 
 
 class _TorchCompileInductorWrapper:
+    # [CLASS DOC] HELPER: Callable backend object that compiles an FX graph with Inductor. Holds a
+    # config mapping (dotted option names to values built from mode, user options and compiler
+    # bisector overrides), the dynamic-shape flag and an optional region name. Compared by value.
+    # Key methods: apply_mode, apply_options, call (compile), get_compiler_config, reset.
     compiler_name = "inductor"
 
     def __init__(
@@ -2825,6 +3178,10 @@ class _TorchCompileInductorWrapper:
         dynamic: builtins.bool | None,
         name: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores dynamic and name, then builds the config by applying the mode
+        # preset, the user options and any bisector config change. When CUDA graphs are enabled with an
+        # older CUDA version or no lazy CUPTI support, sets environment variables disabling lazy CUPTI
+        # re-init and CUPTI teardown. Raises RuntimeError via apply_options for bad options.
         from torch._inductor.compiler_bisector import CompilerBisector
 
         self.config: dict[str, _Any] = {}
@@ -2852,6 +3209,8 @@ class _TorchCompileInductorWrapper:
             os.environ["TEARDOWN_CUPTI"] = "0"
 
     def __eq__(self, other: object) -> builtins.bool:
+        # [FUNCTION DOC] HELPER: Equal when other is also an inductor wrapper with the same config,
+        # dynamic flag and name. KNOWN ISSUE: defines equality without hash, so instances are unhashable.
         return (
             isinstance(other, _TorchCompileInductorWrapper)
             and self.config == other.config
@@ -2860,12 +3219,18 @@ class _TorchCompileInductorWrapper:
         )
 
     def apply_mode(self, mode: str | None) -> None:
+        # [FUNCTION DOC] HELPER: For a non-empty mode other than default, looks up that mode's option
+        # preset (depending on the dynamic flag) and applies it to the config. No-op otherwise.
         if mode and mode != "default":
             from torch._inductor import list_mode_options
 
             self.apply_options(list_mode_options(mode, self.dynamic))
 
     def apply_options(self, options: dict[str, _Any] | None) -> None:
+        # [FUNCTION DOC] HELPER: Merges options into the config. Keys have dashes turned into
+        # underscores and must name a known inductor config entry, otherwise raises RuntimeError listing
+        # known options. Values are type-checked against the config entry type when that type is a plain
+        # class (generic types are skipped); a mismatch raises RuntimeError. Mutates self.config.
         if not options:
             return
 
@@ -2899,6 +3264,9 @@ class _TorchCompileInductorWrapper:
         *,
         config_patches: dict[str, _Any] | None = None,
     ) -> _Any:
+        # [FUNCTION DOC] HELPER: Compiles the given graph module and example inputs with Inductor,
+        # using the stored config overlaid with any extra config patches, and the region name. Returns
+        # the compiled callable.
         from torch._inductor.compile_fx import compile_fx
 
         all_patches = {**self.config, **(config_patches or {})}
@@ -2910,11 +3278,14 @@ class _TorchCompileInductorWrapper:
         )
 
     def get_compiler_config(self) -> dict[str, _Any]:
+        # [FUNCTION DOC] HELPER: Returns the full inductor config dictionary with this wrapper's config applied.
         from torch._inductor.compile_fx import get_patched_config_dict
 
         return get_patched_config_dict(config_patches=self.config)
 
     def reset(self) -> None:
+        # [FUNCTION DOC] HELPER: If CUDA graphs are enabled (by this config, or globally unless this
+        # config disables it), resets the global CUDA graph trees state. Side effect: global state reset.
         from torch._inductor import config
 
         if "triton.cudagraphs" in self.config or config.triton.cudagraphs:
@@ -2925,6 +3296,8 @@ class _TorchCompileInductorWrapper:
 
 
 class _TorchCompileAOTInductorWrapper(_TorchCompileInductorWrapper):
+    # [CLASS DOC] HELPER: Inductor wrapper variant for ahead-of-time compilation: forces the C++
+    # wrapper and AOT package options on, and compiles under AOT compilation mode.
     compiler_name = "aotinductor"
 
     def __init__(
@@ -2934,6 +3307,8 @@ class _TorchCompileAOTInductorWrapper(_TorchCompileInductorWrapper):
         dynamic: builtins.bool | None,
         name: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Runs the base initializer, then enables the cpp_wrapper and
+        # aot_inductor.package options.
         super().__init__(mode, options, dynamic, name)
         self.apply_options({"cpp_wrapper": True})
         self.apply_options({"aot_inductor.package": True})
@@ -2945,6 +3320,9 @@ class _TorchCompileAOTInductorWrapper(_TorchCompileInductorWrapper):
         *,
         config_patches: dict[str, _Any] | None = None,
     ) -> _Any:
+        # [FUNCTION DOC] HELPER: Compiles like the base class but inside AOT compilation mode, with
+        # autograd for AOT enabled in the inductor config and, if a fake mode is detected from the
+        # inputs, temporarily allowing non-fake inputs. Returns the compiled result.
         from contextlib import nullcontext
         from unittest import mock
 
@@ -2966,6 +3344,9 @@ class _TorchCompileAOTInductorWrapper(_TorchCompileInductorWrapper):
 
 
 class _TorchCompileWrapper:
+    # [CLASS DOC] HELPER: Callable adapter around any non-inductor dynamo backend. Holds the resolved
+    # backend function, a display name, the dynamic flag and keyword arguments (mode and options, only
+    # when non-default). Compared by value.
     def __init__(
         self,
         backend: str | _Callable[..., _Any],
@@ -2973,6 +3354,9 @@ class _TorchCompileWrapper:
         options: dict[str, _Any] | None,
         dynamic: builtins.bool | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Resolves the backend (name string or callable) via the backend
+        # registry, derives compiler_name from the string, the callable name, or its string form, and
+        # records mode and options as keyword arguments only if non-empty and non-default.
         from torch._dynamo.backends.registry import lookup_backend
 
         if isinstance(backend, str):
@@ -2991,6 +3375,9 @@ class _TorchCompileWrapper:
             self.kwargs["options"] = options
 
     def __eq__(self, other: object) -> builtins.bool:
+        # [FUNCTION DOC] HELPER: Equal when other is also a generic wrapper with the same backend
+        # function, kwargs and dynamic flag. KNOWN ISSUE: defines equality without hash, so
+        # instances are unhashable.
         return (
             isinstance(other, _TorchCompileWrapper)
             and self.compiler_fn == other.compiler_fn
@@ -2999,9 +3386,12 @@ class _TorchCompileWrapper:
         )
 
     def __call__(self, model_: _Any, inputs_: _Any) -> _Any:
+        # [FUNCTION DOC] HELPER: Invokes the backend function on the graph module and example inputs
+        # with the stored keyword arguments; returns its compiled callable.
         return self.compiler_fn(model_, inputs_, **self.kwargs)
 
     def reset(self) -> None:
+        # [FUNCTION DOC] HELPER: Calls the backend's own reset method if it has one; otherwise no-op.
         if hasattr(self.compiler_fn, "reset"):
             self.compiler_fn.reset()
 
@@ -3060,6 +3450,17 @@ def compile(
     _Callable[[_Callable[_InputT, _RetT]], _Callable[_InputT, _RetT]]
     | _Callable[_InputT, _RetT]
 ):
+    # [FUNCTION DOC] Public torch.compile entry. Wraps a function or module with TorchDynamo plus the
+    # chosen backend; with no model it returns a decorator that applies the same settings.
+    # Behavior: logs API usage; raises RuntimeError on Python 3.15+ or on free-threaded builds below
+    # 3.13.3; defaults the backend; wraps a parameter spec into a shapes spec and resolves a spec
+    # attached to the model; raises RuntimeError if both mode and options are given (mode defaults to
+    # default when neither is); lets the compiler bisector override the backend; pops guard_filter_fn
+    # and use_aoti out of options (mutating the caller's dict); inside an export region warns and
+    # returns the model unchanged; builds an inductor, AOT inductor or generic backend wrapper; and
+    # returns the dynamo-optimized callable. Args mirror the docstring.
+    # KNOWN ISSUE: the two typing overloads omit recompile_limit and isolate_recompiles and default
+    # backend to inductor, while the implementation defaults backend to None.
     """
     Optimizes given model/function using TorchDynamo and specified backend.
     If you are compiling an :class:`torch.nn.Module`, you can also use :meth:`torch.nn.Module.compile`
@@ -3213,6 +3614,8 @@ def compile(
     if model is None:
 
         def fn(model: _Callable[_InputT, _RetT]) -> _Callable[_InputT, _RetT]:
+            # [FUNCTION DOC] HELPER: Decorator returned when compile is called without a model. Raises
+            # RuntimeError if given None; otherwise calls compile with the captured settings.
             if model is None:
                 raise RuntimeError("Model can't be None")
             return compile(  # pyrefly: ignore  # no-matching-overload
@@ -3290,6 +3693,10 @@ def compile(
 
 
 def _register_device_module(device_type: str, module: _ModuleType) -> None:
+    # [FUNCTION DOC] HELPER: Registers an external device runtime module as an attribute of torch and
+    # in sys.modules under the dotted name. The device type is normalized through the device class;
+    # raises RuntimeError if an attribute for that device type already exists. Side effects: mutates
+    # the torch module and sys.modules.
     r"""Register an external runtime module of the specific :attr:`device_type`
     supported by torch.
 
@@ -3340,6 +3747,9 @@ from torch import compiler as compiler, fx as fx
 
 
 class _TritonLibrary:
+    # [CLASS DOC] HELPER: Namespace holder (class-level state only) for custom operators in the triton
+    # namespace. lib is the shared operator library; ops_table maps (operator key, dispatch key) to the
+    # registered implementation so each pair registers at most once.
     lib = torch.library.Library("triton", "DEF")
     ops_table: dict[tuple[str, str], _Callable[..., _Any]] = {}
 
@@ -3351,6 +3761,10 @@ class _TritonLibrary:
         op_impl: _Callable[..., _Any],
         dispatch_key: str,
     ) -> _Callable[..., _Any]:
+        # [FUNCTION DOC] HELPER: Idempotently registers an operator: if the (op_key, dispatch_key)
+        # pair is new, defines the schema and registers the implementation for that dispatch key on the
+        # triton library and records it. Returns the implementation stored for the pair (the first one
+        # registered; later different implementations are ignored).
         if (op_key, dispatch_key) not in cls.ops_table:
             cls.lib.define(full_schema)
             cls.lib.impl("triton::" + op_key, op_impl, dispatch_key)
@@ -3388,6 +3802,10 @@ else:
     }
 
     def __getattr__(name: str) -> _Any:
+        # [FUNCTION DOC] Module-level lazy attribute hook, called only when normal lookup fails. Deprecated
+        # has_* backend flags warn and return the result of the matching availability function; lazy
+        # submodule names (dynamo, inductor, export, onnx) are imported on demand and returned;
+        # set_vital warns and returns a no-op function; anything else raises AttributeError.
         # Deprecated attrs
         replacement = _deprecated_attrs.get(name)
         if replacement is not None:
@@ -3415,6 +3833,9 @@ else:
 
 @functools.cache
 def get_device_module(device: "torch.device | str | None" = None) -> _ModuleType:
+    # [FUNCTION DOC] Returns the torch submodule for a device (device object, device string, or None for
+    # the current accelerator, falling back to cpu). Raises RuntimeError for other argument types or if
+    # no torch attribute exists for that device type. Results are cached per argument.
     """
     Returns the module associated with a given device(e.g., torch.device('cuda'), "mtia:0", "xpu", ...).
     If no device is given, return the module for the current accelerator or CPU if none is present.
@@ -3444,6 +3865,9 @@ def _constrain_as_size(
     min: builtins.int | None = None,
     max: builtins.int | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Marks a symbolic (typically unbacked) int as size-like with optional
+    # min/max bounds by forwarding to the symbolic range-for-size constraint function.
+    # KNOWN ISSUE: the docstring ends with a stray code-fence marker.
     """
     This indicates that a given int is size-like, and can be used in any context where a size is expected.
     You will typically use this when reading out integers from Tensors, e.g., max.item() or lengths.tolist()
@@ -3467,6 +3891,9 @@ def _constrain_as_size(
 
 
 def _import_device_backends() -> None:
+    # [FUNCTION DOC] HELPER: Discovers entry points in the torch.backends group, loads each and calls
+    # it, to autoload out-of-tree device extensions. Any failure is re-raised as RuntimeError naming
+    # the extension and mentioning how to disable autoload. Side effects: imports and runs plugin code.
     """
     Leverage the Python plugin mechanism to load out-of-the-tree device extensions.
     See this RFC: https://github.com/pytorch/pytorch/issues/122468
@@ -3490,6 +3917,8 @@ def _import_device_backends() -> None:
 
 
 def _is_device_backend_autoload_enabled() -> builtins.bool:
+    # [FUNCTION DOC] HELPER: Returns True unless the environment variable TORCH_DEVICE_BACKEND_AUTOLOAD
+    # is set to something other than 1.
     """
     Whether autoloading out-of-the-tree device extensions is enabled.
     The switch depends on the value of the environment variable
@@ -3507,6 +3936,9 @@ def _is_device_backend_autoload_enabled() -> builtins.bool:
 
 
 def _as_tensor_fullprec(t: object) -> "torch.Tensor":
+    # [FUNCTION DOC] HELPER: Converts to a tensor keeping Python scalars at full precision: exact float
+    # becomes float64 and exact int becomes int64, both on cpu; any other input goes through the
+    # ordinary as_tensor conversion.
     """
     Like torch.as_tensor, but when given Python data types it will keep
     them in full precision.  Used for calling convention for Dynamo.
