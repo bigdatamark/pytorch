@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Central configuration for TorchDynamo. Defines module-level flags (booleans, ints,
+# strings, sets, dicts, and Config objects) controlling tracing, guards, dynamic
+# shapes, recompile limits, debugging/minifier/repro behavior, caching/PGO, and
+# experimental features. Many defaults are read from environment variables at import
+# time (TORCHDYNAMO_*, TORCH_COMPILE_*, etc.). Some flags are deprecated no-ops or
+# aliases of other flags (cache_size_limit variants, ignore_logger_methods).
+# Import-time side effects: computes the debug dir root, probes fbcode/free-threading,
+# and finally calls install_config_module on this module, which replaces it with a
+# config-module object providing patch(), save/load, and alias/deprecation handling.
+# The TYPE_CHECKING block only supplies typing stubs and never runs.
+# KNOWN ISSUE: the optimize_ddp comment mentions "mode 1 and mode 4" but only three
+# modes are listed (and more string options exist in the type than are described).
 """
 Configuration module for TorchDynamo compiler and optimization settings.
 
@@ -644,6 +657,12 @@ record_compile_time_instruction_count = False
 
 
 def default_debug_dir_root() -> str:
+    # [FUNCTION DOC]
+    # Returns the root directory for torch compile debug artifacts. If the
+    # TORCH_COMPILE_DEBUG_DIR environment variable is set, uses a torch_compile_debug
+    # folder inside it; in fbcode, uses one under the temp dir and user name; otherwise
+    # uses one under the current working directory. Reads environment and cwd only;
+    # does not create the directory.
     # [@compile_ignored: debug]
     DEBUG_DIR_VAR_NAME = "TORCH_COMPILE_DEBUG_DIR"
     if DEBUG_DIR_VAR_NAME in os.environ:
