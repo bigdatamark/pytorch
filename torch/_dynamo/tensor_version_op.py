@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Defines two traceable primitives, _tensor_version and _unsafe_set_version_counter,
+# that let Dynamo capture reads/writes of a tensor's autograd version counter.
+# Also registers their FakeTensorMode and FunctionalTensorMode implementations so
+# the ops are executed eagerly (and vanish from the graph) under functionalization.
+# Import-time side effects: creates the prims via _make_prim and marks
+# _unsafe_set_version_counter as a side-effecting FX function.
 """This module implements tensor version operations for Dynamo tracing.
 
 It provides primitives for handling tensor versioning during tracing, particularly in the
@@ -37,6 +44,10 @@ _tensor_version = _make_prim(
 
 @_tensor_version.py_impl(FakeTensorMode)  # type: ignore[misc]
 def _tensor_version_fake(fake_mode: FakeTensorMode, self_tensor: Any) -> SymInt:
+    # [FUNCTION DOC] HELPER: FakeTensorMode implementation of the _tensor_version prim.
+    # Takes the active fake mode and the tensor (unused); returns a fresh unbacked
+    # SymInt from the mode's shape env so tracing does not specialize on the version.
+    # Raises AssertionError if the fake mode has no shape_env.
     """
     The initial dynamo capture of _tensor_version + _unsafe_set_version_counter turns the
     `._version` into an unbacked SymInt so that we don't need to specialize on the `._version`
@@ -59,6 +70,9 @@ torch.fx.node.has_side_effect(_unsafe_set_version_counter)
 
 @_tensor_version.py_impl(FunctionalTensorMode)  # type: ignore[misc]
 def _tensor_version_functional(mode: FunctionalTensorMode, self: Any) -> int:
+    # [FUNCTION DOC] HELPER: FunctionalTensorMode implementation of _tensor_version.
+    # Eagerly returns the tensor's actual integer _version; the op does not appear in
+    # the functionalized graph. The mode argument is unused.
     return self._version
 
 
@@ -68,4 +82,8 @@ def _unsafe_set_version_counter_functional(
     tensors: tuple[torch.Tensor, ...],
     versions: tuple[int, ...],
 ) -> None:
+    # [FUNCTION DOC] HELPER: FunctionalTensorMode implementation of
+    # _unsafe_set_version_counter. Eagerly sets each tensor's version counter to the
+    # matching entry in versions (mutates autograd state, returns nothing); the op is
+    # not recorded in the graph. ctx is unused.
     torch._C._autograd._unsafe_set_version_counter(tensors, versions)

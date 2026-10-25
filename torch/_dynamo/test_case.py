@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Dynamo test base classes: run_tests (a guarded wrapper around the common test runner),
+# TestCase (patches Dynamo config per class, resets counters and grad-mode checks per
+# test) and CPythonTestCase (for CPython test-suite ports traced by Dynamo).
+# No significant import-time side effects; a module logger is created.
 """Testing utilities for Dynamo, providing a specialized TestCase class and test running functionality.
 
 This module extends PyTorch's testing framework with Dynamo-specific testing capabilities.
@@ -37,6 +42,11 @@ log = logging.getLogger(__name__)
 
 
 def run_tests(needs: str | tuple[str, ...] = ()) -> None:
+    # [FUNCTION DOC] Runs the test suite of the calling module unless it should be skipped.
+    # needs: a module name or tuple of names that must be importable ("cuda" instead
+    # requires CUDA availability). Returns silently without running anything when
+    # running under TorchDynamo/crossref, on Windows without XPU unless
+    # TORCHINDUCTOR_WINDOWS_TESTS is set, or when a requirement is missing.
     from torch.testing._internal.common_utils import run_tests
 
     if TEST_WITH_TORCHDYNAMO or TEST_WITH_CROSSREF:
@@ -65,15 +75,25 @@ def run_tests(needs: str | tuple[str, ...] = ()) -> None:
 
 
 class TestCase(TorchTestCase):
+    # [CLASS DOC] Base class for Dynamo tests. Class-level state: _exit_stack holding a
+    # config patch (strict errors, no metrics, canonical node order) active for the
+    # whole class. Per test it clears counters, enables nested graph breaks, installs a
+    # null trace_log handler and restores grad mode and config afterward. Also disables
+    # some assertions when debug_disable_compile_counter is set.
     _exit_stack: contextlib.ExitStack
 
     @classmethod
     def tearDownClass(cls) -> None:
+        # [FUNCTION DOC] Closes the class-wide exit stack (undoing the config patch)
+        # and then calls the parent tearDownClass.
         cls._exit_stack.close()
         super().tearDownClass()
 
     @classmethod
     def setUpClass(cls) -> None:
+        # [FUNCTION DOC] Calls the parent setUpClass, then creates the exit stack and
+        # enters a Dynamo config patch (raise_on_ctx_manager_usage, no suppress_errors,
+        # no compilation metrics logging, canonicalized output graph node order).
         super().setUpClass()
         cls._exit_stack = contextlib.ExitStack()  # type: ignore[attr-defined]
         cls._exit_stack.enter_context(  # type: ignore[attr-defined]
@@ -86,6 +106,9 @@ class TestCase(TorchTestCase):
         )
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Records the current grad mode and nested_graph_breaks config,
+        # forces nested_graph_breaks on, calls parent setUp, clears Dynamo counters and
+        # attaches a null logging handler to trace_log (so structured tracing is active).
         self._prior_is_grad_enabled = torch.is_grad_enabled()
         self._prior_nested_graph_breaks = config.nested_graph_breaks
         config.nested_graph_breaks = True
@@ -95,6 +118,9 @@ class TestCase(TorchTestCase):
         trace_log.addHandler(self.handler)
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Removes the trace_log handler, logs and clears counters,
+        # re-enables saved tensor hooks, calls parent tearDown, restores grad mode
+        # (with a warning if the test changed it) and restores nested_graph_breaks.
         trace_log.removeHandler(self.handler)
         for k, v in utils.counters.items():
             log.debug("%s %s", k, v.most_common())
@@ -107,10 +133,16 @@ class TestCase(TorchTestCase):
         config.nested_graph_breaks = self._prior_nested_graph_breaks
 
     def before_cuda_memory_leak_check(self) -> None:
+        # [FUNCTION DOC] Hook run before the CUDA memory leak check: calls the parent
+        # hook and clears Dynamo counters.
         super().before_cuda_memory_leak_check()
         utils.counters.clear()
 
     def assertEqual(self, x: Any, y: Any, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] Delegates to the parent assertEqual, except that when
+        # config.debug_disable_compile_counter is set it silently skips checks where
+        # either side is a CompileCounterInt or where the calling line mentions
+        # counters. Raises whatever the parent raises on mismatch.
         if config.debug_disable_compile_counter:
             if isinstance(x, utils.CompileCounterInt) or isinstance(
                 y, utils.CompileCounterInt
@@ -127,6 +159,9 @@ class TestCase(TorchTestCase):
         return super().assertEqual(x, y, *args, **kwargs)
 
     def assertExpectedInline(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] Delegates to the parent assertExpectedInline with the skip
+        # frame count incremented by one (so the caller's source line is found); does
+        # nothing when config.debug_disable_compile_counter is set.
         if config.debug_disable_compile_counter:
             return
         kwargs["skip"] = kwargs.get("skip", 0) + 1
@@ -134,6 +169,11 @@ class TestCase(TorchTestCase):
 
 
 class CPythonTestCase(TestCase):
+    # [CLASS DOC] Base class for CPython test-suite ports under test/cpython/vX_YY.
+    # Restores the plain unittest assertion methods (or traceable polyfills) so Dynamo
+    # can trace through them, sets dynamo_strict_nopython, and enables tracing of
+    # unittest and load_build_class via a class-level _stack config patch. Tests are
+    # skipped unless the running Python version matches the path's version.
     """
     Test class for CPython tests located in "test/cpython/v{Py_version}/*".
 
@@ -189,6 +229,9 @@ class CPythonTestCase(TestCase):
         backend: str | Callable[..., Any],
         nopython: bool,
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] Wraps the current test method (not setup code) with
+        # torch._dynamo.optimize using the given backend and error_on_graph_break=nopython,
+        # replaces the method on the instance, and returns fn unchanged. Mutates self.
         # We want to compile only the test function, excluding any setup code
         # from unittest
 
@@ -199,6 +242,9 @@ class CPythonTestCase(TestCase):
         return fn
 
     def _dynamo_test_key(self) -> str:
+        # [FUNCTION DOC] HELPER: Builds the test key. Returns the parent key unchanged
+        # if the test file path has no version directory; otherwise returns the key
+        # prefixed with "CPython", the digits of the version, and the test file name.
         suffix = super()._dynamo_test_key()
         test_cls = self.__class__
         test_file = inspect.getfile(test_cls).split(os.sep)[-1].split(".")[0]
@@ -211,11 +257,16 @@ class CPythonTestCase(TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
+        # [FUNCTION DOC] Closes the class-level config patch stack, then calls parent.
         cls._stack.close()
         super().tearDownClass()
 
     @classmethod
     def setUpClass(cls) -> None:
+        # [FUNCTION DOC] Raises unittest.SkipTest if the test file path lacks a
+        # cpython/vM_NN directory or its version differs from the running Python.
+        # Otherwise calls the parent setUpClass and enters a config patch enabling
+        # enable_trace_unittest and enable_trace_load_build_class on a new _stack.
         # Skip test if python versions doesn't match
         search_path = inspect.getfile(cls)
 
@@ -249,10 +300,14 @@ class CPythonTestCase(TestCase):
 
     @contextlib.contextmanager
     def subTest(self, *args, **kwargs):
+        # [FUNCTION DOC] No-op context manager replacing unittest subTest; ignores all
+        # arguments and just yields (avoids pytest constructs Dynamo cannot trace).
         # pytest 9.x addSubTest uses typing._GenericAlias calls that
         # Dynamo cannot trace. Use a no-op subTest instead.
         yield
 
     # pyrefly: ignore [implicit-any]
     def wrap_with_policy(self, method_name: str, policy: Callable) -> None:
+        # [FUNCTION DOC] HELPER: Intentionally a no-op override; disables the parent's
+        # policy wrapping of test methods for CPython tests.
         pass
