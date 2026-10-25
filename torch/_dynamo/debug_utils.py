@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Debugging support for Dynamo/Inductor repro and minifier tooling: serializes
+# fx GraphModules into runnable source (NNModuleToString), records/replays graph
+# inputs (InputWriter/InputReader/NopInputReader), checks accuracy of a compiled
+# backend against eager (same_two_models, backend_accuracy_fails), emits env var
+# and config prelude strings for repro scripts, writes the minifier launcher
+# file, parses printed AOT graphs into runnable kwargs, and offers a cProfile
+# decorator. Optional Buck helpers (BuckTargetWriter) are used only in fbcode.
+# Import-time side effects: imports torch._inductor.config, detects fbcode
+# (use_buck) and, if so, imports libfb build info and builds extra_deps,
+# cur_target and extra_imports module globals.
 """
 Debug utilities for TorchDynamo compilation and execution.
 
@@ -100,7 +111,16 @@ BUCK_CMD_PREFIX = ["buck2", "run", "@mode/dev-nosan"]
 
 
 class BuckTargetWriter:
+    # [CLASS DOC] Generates a Buck TARGETS python_binary rule for a single
+    # repro/minifier script so it can be run with buck2. Attributes: subdir and
+    # py_file (location of script), target (file name without extension), path
+    # (fbcode-relative dotted main module), cmd_line_path (buck target label).
+    # Only meaningful for scripts located under an fbcode checkout.
     def __init__(self, filename: str) -> None:
+        # [FUNCTION DOC] Splits the absolute path of filename into directory and
+        # file, and derives the target name, the dotted main_module path (text
+        # after "fbcode.") and the buck command line target. Assumes the path
+        # contains "fbcode/"; otherwise the derived paths are garbled (no error).
         self.subdir, self.py_file = os.path.split(os.path.abspath(filename))
         self.target = self.py_file.replace(".py", "")
 
@@ -115,6 +135,9 @@ class BuckTargetWriter:
         self.cmd_line_path = f"//{tmp}:{self.target}"
 
     def build(self) -> str:
+        # [FUNCTION DOC] Returns the text of a TARGETS file defining a
+        # python_binary for the script, with torch/functorch/triton deps, the
+        # current build rule, and the global extra_deps as cpp_deps.
         extra_cpp_deps = "\n".join([f'        "{x}",' for x in extra_deps])
         return textwrap.dedent(
             f"""
@@ -141,6 +164,10 @@ python_binary(
         )
 
     def write(self, print_msg: bool = True) -> list[str]:
+        # [FUNCTION DOC] Writes the generated rule to a file named TARGETS in the
+        # script directory (overwriting any existing file; OSError propagates).
+        # If print_msg is true, logs a warning with the buck command to run.
+        # Returns the buck command as a list of tokens.
         target_file = os.path.join(self.subdir, "TARGETS")
         with open(target_file, "w") as fd:
             fd.write(self.build())
@@ -155,6 +182,11 @@ python_binary(
 
 
 def minifier_dir() -> str:
+    # [FUNCTION DOC] Returns the directory used for minifier output (a
+    # "minifier" subdirectory of the Dynamo debug dir), creating it if missing.
+    # Side effect: creates directories on disk.
+    # KNOWN ISSUE: os.path.join never returns None, so the temp-dir fallback
+    # branch is dead code.
     path = os.path.join(get_debug_dir(), "minifier")
     if path is None:
         path = f"{tempfile.gettempdir()}/minifier_{getpass.getuser()}"
@@ -167,10 +199,19 @@ MAX_CONSTANT_NUMEL_INLINE = 4
 
 
 class UnsupportedNNModuleError(AssertionError):
+    # [CLASS DOC] Raised by NNModuleToString.convert when a child module cannot
+    # be expressed as constructor source. Subclasses AssertionError; no state.
     pass
 
 
 class NNModuleToString:
+    # [CLASS DOC] Namespace of static helpers that turn an fx GraphModule into
+    # the source text of a torch.nn.Module class named Repro (plus classes for
+    # nested subgraph GraphModules). Class attributes: fake_quant_modules,
+    # qat_conv_modules, qat_linear_modules (fully qualified type names handled
+    # by special constructors), default_qat_qconfig_backends (backends tried when
+    # matching a default QAT qconfig), safe_reprs (module types whose repr is a
+    # valid constructor call). Entry points: can_convert_to_string and convert.
     fake_quant_modules = {
         "torch.ao.quantization.fake_quantize.FakeQuantize",
         "torch.ao.quantization.fake_quantize.FusedMovingAvgObsFakeQuantize",
@@ -226,6 +267,10 @@ class NNModuleToString:
 
     @staticmethod
     def can_convert_to_string(gm: torch.fx.GraphModule) -> bool:
+        # [FUNCTION DOC] Returns true if every child module of gm is either a
+        # nested GraphModule (serialized recursively) or has a safe constructor
+        # string. Otherwise logs a warning listing the offending modules and
+        # returns false. Does not mutate gm.
         cant_convert = set()
         for _, module in gm.named_children():
             # Nested GraphModules (e.g. torch.cond / torch.while_loop subgraphs)
@@ -244,14 +289,23 @@ class NNModuleToString:
 
     @staticmethod
     def _module_type_name(module: torch.nn.Module) -> str:
+        # [FUNCTION DOC] HELPER: Returns the fully qualified "module.ClassName"
+        # string of the module's type.
         return f"{type(module).__module__}.{type(module).__name__}"
 
     @staticmethod
     def _type_name(type_: type[object]) -> str:
+        # [FUNCTION DOC] HELPER: Returns the fully qualified "module.ClassName"
+        # string of a type object.
         return f"{type_.__module__}.{type_.__name__}"
 
     @staticmethod
     def _fake_quant_constructor(module: torch.nn.Module) -> str | None:
+        # [FUNCTION DOC] HELPER: For FakeQuantize-style modules, returns a
+        # constructor call string using the observer class, quant_min/max (scaled
+        # back up when the observer used reduce_range), dtype, qscheme,
+        # is_dynamic and, when present, reduce_range and ch_axis. Returns None
+        # for any other module type.
         module_type = NNModuleToString._module_type_name(module)
         if module_type not in NNModuleToString.fake_quant_modules:
             return None
@@ -278,6 +332,10 @@ class NNModuleToString:
 
     @staticmethod
     def _qat_qconfig_constructor(module: torch.nn.Module) -> str | None:
+        # [FUNCTION DOC] HELPER: Compares the module's qconfig by repr against the
+        # default QAT qconfig of each known backend (skipping backends that raise
+        # AssertionError) and returns a keyword argument string selecting the
+        # first match, or None if no default qconfig matches.
         qconfig = getattr(module, "qconfig", None)
         for backend in NNModuleToString.default_qat_qconfig_backends:
             try:
@@ -293,6 +351,11 @@ class NNModuleToString:
 
     @staticmethod
     def _qat_conv_constructor(module: torch.nn.Module) -> str | None:
+        # [FUNCTION DOC] HELPER: For known QAT conv (optionally fused with
+        # batchnorm/relu) modules whose qconfig is a default one, returns a
+        # constructor call string with channels, conv hyperparameters, bias,
+        # padding mode, batchnorm eps/momentum/freeze_bn when a bn child exists,
+        # and the qconfig. Returns None otherwise.
         module_type = NNModuleToString._module_type_name(module)
         if module_type not in NNModuleToString.qat_conv_modules:
             return None
@@ -325,6 +388,9 @@ class NNModuleToString:
 
     @staticmethod
     def _qat_linear_constructor(module: torch.nn.Module) -> str | None:
+        # [FUNCTION DOC] HELPER: For known QAT linear modules with a default
+        # qconfig, returns a constructor call string (features, bias, qconfig).
+        # Returns None otherwise.
         module_type = NNModuleToString._module_type_name(module)
         if module_type not in NNModuleToString.qat_linear_modules:
             return None
@@ -342,6 +408,9 @@ class NNModuleToString:
 
     @staticmethod
     def _can_emit_module_constructor(module: torch.nn.Module, module_str: str) -> bool:
+        # [FUNCTION DOC] HELPER: True only if the module's exact type is in
+        # safe_reprs and module_str compiles as a valid expression (no syntax
+        # error); false otherwise.
         if type(module) not in NNModuleToString.safe_reprs:
             return False
 
@@ -355,6 +424,10 @@ class NNModuleToString:
     def _module_constructor_string(
         module: torch.nn.Module, *, allow_unsafe_repr: bool = False
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Returns source text that constructs an
+        # equivalent module: the repr if the type is safe, else a fake-quant or
+        # QAT special constructor, else (only when allow_unsafe_repr is true) the
+        # raw repr. Returns None if none applies.
         module_str = repr(module)
         if NNModuleToString._can_emit_module_constructor(module, module_str):
             return module_str
@@ -371,6 +444,15 @@ class NNModuleToString:
 
     @staticmethod
     def convert(gm: torch.fx.GraphModule, *, allow_unsafe_repr: bool = False) -> str:
+        # [FUNCTION DOC] Returns python source (starting with a star import of
+        # torch.nn) defining class Repro for gm, preceded by classes for any
+        # nested GraphModule subgraphs (deduplicated by identity). Children are
+        # constructed from constructor strings (moved to their device if not
+        # CPU); buffers become literal tensors when tiny, otherwise random
+        # tensors of the same shape/dtype; parameters become random Parameters;
+        # the forward code is gm.code. Raises UnsupportedNNModuleError for a
+        # child with no constructor string, AssertionError if the tensor print
+        # threshold is below the inline limit.
         from torch.nn.modules.module import _addindent
 
         tab = " " * 4
@@ -385,6 +467,9 @@ class NNModuleToString:
         subgraph_defs: list[str] = []
 
         def register_subgraph(name_hint: str, sub: torch.fx.GraphModule) -> str:
+            # [FUNCTION DOC] HELPER: Returns the generated class name for a
+            # nested GraphModule, emitting its class definition into
+            # subgraph_defs the first time it is seen (keyed by object identity).
             # Reserve the name before recursing so nested/shared subgraphs are
             # deduplicated by identity and cannot recurse infinitely.
             if id(sub) in subgraph_classes:
@@ -396,6 +481,10 @@ class NNModuleToString:
             return class_name
 
         def emit_module_body(module: torch.nn.Module) -> str:
+            # [FUNCTION DOC] HELPER: Returns the indented source of an __init__
+            # (children, buffers, parameters) followed by the module's generated
+            # forward code. Raises UnsupportedNNModuleError for unconvertible
+            # children.
             model_str = (
                 f"{tab}def __init__(self) -> None:\n{tab * 2}super().__init__()\n"
             )
@@ -468,6 +557,10 @@ class NNModuleToString:
 
 @functools.cache  # subprocess is expensive
 def _cuda_system_info_comment() -> str:
+    # [FUNCTION DOC] HELPER: Cached. Returns comment-line text describing CUDA
+    # toolkit (nvcc --version output, skipped on ROCm or when nvcc is missing)
+    # and GPU names with counts; or a single comment if CUDA is unavailable.
+    # Side effect: runs the nvcc subprocess once.
     if not torch.cuda.is_available():
         return "# torch.cuda.is_available()==False, no GPU info collected\n"
 
@@ -495,6 +588,11 @@ def _cuda_system_info_comment() -> str:
 
 
 def generate_env_vars_string(*, stable_output: bool = False) -> str:
+    # [FUNCTION DOC] Returns python source that sets the current process's
+    # TORCH/DYNAMO/INDUCTOR/TRITON environment variables (excluding some Triton
+    # path vars and the repro-trigger vars, which are popped instead so repros do
+    # not recurse). Single quotes in values are replaced with double quotes.
+    # With stable_output, returns a placeholder comment instead.
     """
     Generate a string configuration for environment variables related to Dynamo, Inductor, and Triton.
     """
@@ -506,6 +604,8 @@ def generate_env_vars_string(*, stable_output: bool = False) -> str:
     repro_env_vars = ["TORCHDYNAMO_REPRO_AFTER", "TORCHDYNAMO_REPRO_LEVEL"]
 
     def filter(key: str) -> bool:
+        # [FUNCTION DOC] HELPER: True if the variable name contains an allowed
+        # keyword and is not in the skip or repro lists.
         return (
             any(string in key for string in allow_list)
             and key not in skip_list
@@ -527,6 +627,11 @@ import os
 
 
 def generate_config_string(*, stable_output: bool = False) -> str:
+    # [FUNCTION DOC] Returns python source that imports the dynamo, inductor,
+    # functorch and fx experimental config modules and assigns every non-default
+    # value (via each module's codegen_config), plus non-default settings of
+    # registered third-party inductor backend config modules. With stable_output,
+    # returns a placeholder comment instead.
     import torch._functorch.config
     import torch._inductor.config
     from torch._inductor.codegen import common
@@ -561,10 +666,16 @@ import torch.fx.experimental._config
 
 
 def get_minifier_repro_path() -> str:
+    # [FUNCTION DOC] Returns the path of minifier_launcher.py inside the minifier
+    # directory (creating the directory as a side effect).
     return os.path.join(minifier_dir(), "minifier_launcher.py")
 
 
 def helper_for_dump_minify(contents: str) -> None:
+    # [FUNCTION DOC] HELPER: Writes contents to the minifier launcher path
+    # (logging a warning with the path; also writes a Buck TARGETS file under
+    # fbcode). Raises NotImplementedError chained from the OSError if the file
+    # cannot be written.
     minified_repro_path = get_minifier_repro_path()
     log.warning("Writing minified repro to:\n%s", minified_repro_path)
 
@@ -580,10 +691,15 @@ def helper_for_dump_minify(contents: str) -> None:
 
 
 class AccuracyError(Exception):
+    # [CLASS DOC] Exception signalling that compiled output does not match the
+    # reference within tolerance. No state.
     pass
 
 
 def clone_inputs_retaining_gradness(example_inputs: Sequence[Any]) -> list[Any]:
+    # [FUNCTION DOC] Clones the inputs and forces each cloned tensor's
+    # requires_grad to match the original (without a leaf check). Returns the
+    # list of clones; inputs are not modified.
     """
     This clone inputs is different from utils clone_input. In case of minifier,
     all the tensors are leaf tensors while creating a new graph. So, we set the
@@ -602,6 +718,11 @@ def run_fwd_maybe_bwd(
     only_fwd: bool = False,
     disable_clone: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Runs gm on args using a deep copy of gm and (unless
+    # disable_clone) cloned args. Supports the boxed calling convention. Returns
+    # the raw output if only_fwd; otherwise runs backward on a scalar loss when
+    # the output needs it and returns the collected results (outputs, grads).
+    # With disable_clone the caller's args may be destroyed.
     """
     Runs a forward and possibly backward iteration for a given mod and args.
 
@@ -637,6 +758,10 @@ def same_two_models(
     require_fp64: bool = False,
     ignore_non_fp: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Returns whether opt_gm matches gm on example_inputs within
+    # config.repro_tolerance, optionally using an fp64 reference. If the fp64 run
+    # fails it raises RuntimeError when require_fp64 else only warns. If opt_gm
+    # itself raises, logs and returns True (treated as an unrelated problem).
     """
     Check two models have same accuracy.
 
@@ -687,6 +812,10 @@ def same_two_models(
 
 
 def cast_dtype_args_to_fp64(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Rewrites, in place, floating dtype arguments in the graph
+    # (convert_element_type targets and dtype keyword arguments of call_function
+    # nodes) to float64, then lints and recompiles. Returns the same model.
+    # Raises AssertionError if a convert_element_type node lacks exactly two args.
     for node in model.graph.nodes:
         if (
             node.op == "call_function"
@@ -713,6 +842,9 @@ def cast_dtype_args_to_fp64(model: torch.fx.GraphModule) -> torch.fx.GraphModule
 def cast_to(
     dtype: torch.dtype, model: torch.fx.GraphModule, inputs: list[Any]
 ) -> tuple[torch.fx.GraphModule, list[Any]]:
+    # [FUNCTION DOC] Converts the model to dtype (also rewriting embedded dtype
+    # arguments when dtype is float64) and casts floating tensors in the inputs
+    # pytree to dtype. Returns the model and new inputs.
     from torch.utils._pytree import tree_map
 
     model = model.to(dtype)
@@ -733,6 +865,7 @@ def cast_to(
 def cast_to_fp64(
     model: torch.fx.GraphModule, inputs: list[Any]
 ) -> tuple[torch.fx.GraphModule, list[Any]]:
+    # [FUNCTION DOC] Shortcut for casting model and inputs to float64.
     return cast_to(torch.float64, model, inputs)
 
 
@@ -745,6 +878,9 @@ def backend_accuracy_fails(
     require_fp64: bool = False,
     ignore_non_fp: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Compiles a copy of gm with compiler_fn and returns true if
+    # the result disagrees with gm in accuracy. Any exception during compile or
+    # comparison is logged and treated as no accuracy failure (returns false).
     try:
         compiled_gm = compiler_fn(
             copy.deepcopy(gm), clone_inputs_retaining_gradness(example_inputs)
@@ -782,10 +918,14 @@ def _stride_or_default(
     *,
     shape: torch._prims_common.ShapeType,
 ) -> torch._prims_common.StrideType:
+    # [FUNCTION DOC] HELPER: Returns stride if given, else contiguous strides
+    # for shape.
     return stride if stride is not None else utils.make_contiguous_strides_for(shape)
 
 
 def _mk_defaulter(d: T) -> Callable[[T | None], T]:
+    # [FUNCTION DOC] HELPER: Returns a function mapping None to the default d and
+    # any other value to itself.
     return lambda x: x if x is not None else d
 
 
@@ -797,7 +937,11 @@ _is_leaf_or_default = _mk_defaulter(False)
 
 
 class NopInputReader:
+    # [CLASS DOC] HELPER: Reader that ignores all inputs, only counting storages
+    # and opaque objects in total. Used to count how many items a load_args
+    # function would read (e.g. for a progress bar).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the total counter to zero.
         self.total = 0
 
     def storage(
@@ -808,33 +952,49 @@ class NopInputReader:
         device: torch._prims_common.DeviceLikeType | None = None,
         dtype_hint: torch.dtype | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Counts one storage; returns nothing.
         self.total += 1
 
     def tensor(self, *args: Any, **kwargs: Any) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Ignores the call and returns None.
         pass
 
     def symint(self, *args: Any, **kwargs: Any) -> int | None:
+        # [FUNCTION DOC] HELPER: Ignores the call and returns None.
         pass
 
     def const(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Ignores the call.
         pass
 
     def unsupported(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Ignores the call.
         pass
 
     def generator(self, device_type: str, device_index: int) -> None:
+        # [FUNCTION DOC] HELPER: Ignores the call.
         pass
 
     def opaque(self, script_class_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Counts one opaque object; returns nothing.
         self.total += 1
 
 
 # TODO: Support bundling the entire repro into a zip file for ease of
 # transferring around
 class InputReader:
+    # [CLASS DOC] Replays the load_args function emitted by InputWriter: each
+    # reader method rebuilds one argument (storage, tensor, symint, constant,
+    # generator, ...), appending it to self.args in order. State: store (content
+    # store reader or None meaning use random data), args (rebuilt arguments),
+    # pbar (optional progress bar), and a lazily created symint_exprs mapping from
+    # argument position to symbolic expression text.
     def __init__(
         self, save_dir: str | None = None, *, pbar: tqdm | None = None
     ) -> None:
+        # [FUNCTION DOC] Creates a reader backed by a content store in save_dir,
+        # or, when save_dir is None, warns and falls back to random data.
+        # pbar, if given, is advanced once per storage read.
         # If None, we will generate random data instead.  It's important
         # to natively support this use case as it will allow people to
         # share repros without including the real data, if the problem
@@ -853,6 +1013,10 @@ class InputReader:
         device: torch._prims_common.DeviceLikeType | None = None,
         dtype_hint: torch.dtype | None = None,
     ) -> UntypedStorage:
+        # [FUNCTION DOC] Returns an untyped storage for storage_hash: loaded from
+        # the store when available (warning if its device differs from the
+        # requested one), otherwise a warn-once fallback to random strided data of
+        # nbytes using dtype_hint (default float32) on device (default CPU).
         if self.pbar is not None:
             self.pbar.update(1)
         device = _device_or_default(device)  # type: ignore[arg-type]
@@ -886,6 +1050,11 @@ class InputReader:
         is_leaf: bool | None = None,
         **metadata: Any,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Builds a tensor viewing storage with the given shape,
+        # stride, offset and dtype (defaults fill None values), restoring
+        # requires_grad, leaf-ness (non-leaves get fake autograd history via a
+        # clone) and extra metadata. Appends it to args and returns it. Raises
+        # AssertionError if the resulting leaf status differs from is_leaf.
         stride = _stride_or_default(stride, shape=shape)
         storage_offset = _storage_offset_or_default(storage_offset)
         dtype = _dtype_or_default(dtype)
@@ -912,6 +1081,9 @@ class InputReader:
         return t  # for BC
 
     def symint(self, val: Any, *, expr: str | None = None) -> Any:
+        # [FUNCTION DOC] Appends val as the next argument and returns it; if expr
+        # is given, records it in symint_exprs (created on first use) under the
+        # argument's position.
         self.args.append(val)
         if expr is not None:
             if not hasattr(self, "symint_exprs"):
@@ -920,18 +1092,26 @@ class InputReader:
         return val  # for BC
 
     def const(self, name: str) -> None:
+        # [FUNCTION DOC] Appends None as a placeholder for a constant argument
+        # that was filtered out during compilation.
         self.args.append(None)
 
     def unsupported(self, name: str) -> None:
+        # [FUNCTION DOC] Appends None as a placeholder for an argument of an
+        # unsupported type.
         self.args.append(None)
 
     def generator(self, device_type: str, device_index: int) -> Any:
+        # [FUNCTION DOC] Creates a new torch Generator on the given device,
+        # appends it to args and returns it (RNG state is not restored).
         device = torch.device(device_type, device_index)
         gen = torch.Generator(device=device)
         self.args.append(gen)
         return gen
 
     def opaque(self, script_class_name: str) -> None:
+        # [FUNCTION DOC] Appends None as a placeholder for an opaque script-class
+        # object (not reconstructed).
         self.args.append(None)
 
 
@@ -948,6 +1128,8 @@ class InputReader:
 
 
 def _serialize_storage_nbytes(nbytes: int | torch.SymInt) -> str:
+    # [FUNCTION DOC] HELPER: Returns source text for a storage byte size: the
+    # printed symbolic expression for a SymInt, otherwise the repr of the int.
     if isinstance(nbytes, torch.SymInt):
         from torch.fx.experimental.symbolic_shapes import SymExprPrinter
 
@@ -956,7 +1138,16 @@ def _serialize_storage_nbytes(nbytes: int | torch.SymInt) -> str:
 
 
 class InputWriter:
+    # [CLASS DOC] Records graph inputs as source lines of a load_args(reader)
+    # function that an InputReader can replay. State: _lines (emitted statements),
+    # storage_counter (names buf0, buf1, ...), save_dir and store (optional
+    # content store that receives real storage data), seen_storages (weak-ref to
+    # buffer name map so shared storages are emitted once). Methods mirror the
+    # reader: storage, tensor, symint, const, unsupported, generator, opaque.
     def __init__(self, save_dir: str | None, *, stable_hash: bool = False) -> None:
+        # [FUNCTION DOC] Initializes empty state; creates a content store writer
+        # in save_dir (with stable_hash option) unless save_dir is None, in which
+        # case storage contents are not saved.
         self._lines: list[str] = []
         # TODO: consider ensuring tensor and storage counters line up?
         self.storage_counter = itertools.count()
@@ -969,6 +1160,9 @@ class InputWriter:
         self.seen_storages: dict[StorageWeakRef, str] = {}
 
     def lines(self) -> list[str]:
+        # [FUNCTION DOC] Returns the source lines of the load_args function: a
+        # def line, the indented recorded statements, and a version attribute
+        # assignment.
         r = [
             "def load_args(reader):",
         ]
@@ -990,6 +1184,11 @@ class InputWriter:
         device_hint: torch._prims_common.DeviceLikeType | None = None,
         dtype_hint: torch.dtype | None = None,
     ) -> str:
+        # [FUNCTION DOC] Emits a reader.storage statement for untyped_storage
+        # (once per distinct storage) and returns the variable name bound to it.
+        # Writes real data to the store unless the storage is on meta; meta
+        # storages use device_hint as the device (AssertionError if absent).
+        # Dtype and device arguments are emitted only when not the defaults.
         ws = StorageWeakRef(untyped_storage)
         v = self.seen_storages.get(ws)
         if v is not None:
@@ -1022,6 +1221,9 @@ class InputWriter:
         return v
 
     def tensor(self, name: str, t: torch.Tensor) -> None:
+        # [FUNCTION DOC] Records a storage plus a reader.tensor statement for t,
+        # listing only non-default stride, dtype, storage offset, extra metadata,
+        # requires_grad and leaf-ness; name appears as a trailing comment.
         from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 
         storage = self.storage(
@@ -1054,6 +1256,10 @@ class InputWriter:
         )
 
     def unsupported(self, name: str, arg: Any) -> None:
+        # [FUNCTION DOC] Records a reader.unsupported statement noting the arg's
+        # type. For list or tuple args it also emits, inside a string literal
+        # block, best-effort statements for each element (tensor, symint, or
+        # recursively unsupported) so a user can repair the repro by hand.
         # NB: Try hard not to /print/ a tensor, that will be very slow
         self._lines.append(
             f"reader.unsupported({name!r})  # unsupported type for dumping: {type(arg)}"
@@ -1074,12 +1280,16 @@ class InputWriter:
 
     # write out that the arg was filtered out as it is constant
     def const(self, name: str) -> None:
+        # [FUNCTION DOC] Records a reader.const statement for an argument that was
+        # filtered out during compilation as a constant.
         self._lines.append(
             f"reader.const({name!r})  # {name}, filtered out during compilation"
         )
 
     # TODO: this doesn't actually symint atm
     def symint(self, name: str, val: Any) -> None:
+        # [FUNCTION DOC] Records a reader.symint statement: for a SymInt, its
+        # hint and symbolic expression text; for a plain int, just the value.
         if isinstance(val, torch.SymInt):
             expr_str = str(val.node.expr)
             hint = val.node.hint
@@ -1088,12 +1298,16 @@ class InputWriter:
             self._lines.append(f"reader.symint({val!r})  # {name}")
 
     def generator(self, name: str, arg: torch._C.Generator) -> None:
+        # [FUNCTION DOC] Records a reader.generator statement with the
+        # generator's device type and index (RNG state is not saved).
         device = arg.device
         self._lines.append(
             f"reader.generator({device.type!r}, {device.index!r})  # {name}"
         )
 
     def opaque(self, name: str, script_class_name: str) -> None:
+        # [FUNCTION DOC] Records a reader.opaque statement naming the script
+        # class of an opaque object argument.
         self._lines.append(f"reader.opaque({script_class_name!r})  # {name}")
 
 
@@ -1103,6 +1317,13 @@ def aot_graph_input_parser(
     sym_shapes: dict[str, int] | None = None,
     default_sym_shape: int | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds keyword arguments for calling func, a function whose
+    # source came from a printed fx graph. Parses parameter annotations for dtype
+    # and shape (random floats or zeros on device) and symbolic-size annotations
+    # (looked up in sym_shapes, else default_sym_shape; torch._check fails if
+    # neither exists). Symbolic dims are marked dynamic. If func takes self, adds
+    # a container with tensor constants parsed from the source text. Requires
+    # retrievable source (inspect errors propagate).
     """
     Takes in a function which has been printed with print_readable() and constructs kwargs to run it.
 
@@ -1134,6 +1355,8 @@ def aot_graph_input_parser(
     sym_shape_regex = r"Sym\((s\d+)\)"
 
     class TensorContainer:
+        # [CLASS DOC] HELPER: Empty attribute holder standing in for self, with
+        # generated tensor constants attached as attributes.
         "Container for tensors as attributes"
 
     # Dictionary for tensors from annotations
@@ -1142,6 +1365,9 @@ def aot_graph_input_parser(
     sym_shapes_dict: dict[str, int] = sym_shapes or {}
 
     def get_sym_int(symint: str) -> int:
+        # [FUNCTION DOC] HELPER: Returns the concrete size for a symbol name from
+        # the provided mapping or the default; raises via torch._check if neither
+        # is available.
         torch._check(
             symint in sym_shapes_dict or default_sym_shape is not None,
             lambda: f"{symint} not in symbolic_shapes and default sym shape not passed in",
@@ -1149,6 +1375,10 @@ def aot_graph_input_parser(
         return sym_shapes_dict.get(symint, default_sym_shape)  # type: ignore[return-value]
 
     def gen_tensor(shape: torch._prims_common.ShapeType, dtype: torch.dtype) -> Tensor:
+        # [FUNCTION DOC] HELPER: Creates a tensor on the target device from
+        # textual dims: symbolic dims (those containing the letter s) are
+        # resolved via get_sym_int and marked dynamic, empty dims are dropped.
+        # Floating dtypes get random normal data, others zeros.
         # Resolve symbolic shapes to concrete values
         resolved_shape = []
         dynamic_dims = []
@@ -1201,6 +1431,12 @@ def aot_graph_input_parser(
 
 
 def profile_to_file(filename: str) -> Callable[[T], T]:
+    # [FUNCTION DOC] Returns a decorator that runs the wrapped function under a
+    # shared cProfile profiler and, at interpreter exit (atexit hook registered
+    # here), dumps stats to filename (expanded to an absolute path) and prints a
+    # snakeviz hint to stderr.
+    # KNOWN ISSUE: the declared return type says Callable[[T], T] but the
+    # decorator accepts and returns arbitrary callables.
     """
     Decorator to cProfile a given function and save the result to disk on process exit.
 
@@ -1211,8 +1447,11 @@ def profile_to_file(filename: str) -> Callable[[T], T]:
     filename = os.path.abspath(os.path.expanduser(filename))
 
     def decorator(fn: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Wraps fn so each call is profiled.
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Enables the profiler, calls fn and always
+            # disables the profiler afterwards; returns fn's result.
             prof.enable()
             try:
                 return fn(*args, **kwargs)
@@ -1222,6 +1461,8 @@ def profile_to_file(filename: str) -> Callable[[T], T]:
         return wrapper
 
     def save_it() -> None:
+        # [FUNCTION DOC] HELPER: Writes accumulated profile stats to the file and
+        # prints viewing instructions to stderr (runs at exit).
         prof.dump_stats(filename)
         sys.stderr.write(
             textwrap.dedent(

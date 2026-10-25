@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Public decorators and context managers controlling Dynamo tracing: run,
+# disable, skip, set_stance, allow_in_graph, disallow_in_graph, forbid_in_graph,
+# nonstrict_trace, leaf_function, substitute_in_graph (polyfills), dimension
+# markers (mark_dynamic, mark_unbacked, maybe_mark_dynamic, mark_static,
+# mark_static_address), traceable config patching (patch_dynamo_config,
+# dont_skip_tracing, disable_nested_graph_breaks), error_on_graph_break,
+# override_cudagraphs, override_optimization_hint, allow_c_slot.
+# Import-time side effects: copies public names of the C eval_frame extension
+# into module globals; marks justknobs_check as a Dynamo constant; registers the
+# code of the nonrecursive disable wrapper as skipped; validates the
+# allowed-config-patch names (AssertionError if one is missing from config);
+# registers an einops module-init hook with trace_rules.
 """
 This module provides decorators and utilities for controlling TorchDynamo's behavior during compilation.
 """
@@ -75,6 +88,10 @@ F = TypeVar("F", bound=FuncType)
 
 
 def run(fn: Callable[_P, _R] | None = None) -> Any:
+    # [FUNCTION DOC] Run-only mode: with fn, returns fn (innermost unwrapped)
+    # wrapped by RunOnlyContext so only existing cached compilations are used and
+    # no new compilation happens; without fn, returns the context object for use
+    # as decorator/context manager. Raises AssertionError if fn is not callable.
     """Don't do any dynamic compiles, just use prior optimizations"""
     if fn is not None:
         fn = innermost_fn(fn)
@@ -85,6 +102,12 @@ def run(fn: Callable[_P, _R] | None = None) -> Any:
 
 
 def disable(fn=None, recursive=True, *, reason=None, wrapping=True):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Disables Dynamo for fn. Recursive mode returns a
+    # DisableContext applied to fn (or the context itself if fn is None); callee
+    # frames are skipped too. Non-recursive mode returns a wrapper tagged with
+    # disable attributes (reason, original callable, recursive=False) that skips
+    # only fn's own frame; with fn None it returns a decorator. reason is shown
+    # when tracing reaches the function. Raises AssertionError for non-callables.
     """
     Decorator to disable TorchDynamo
 
@@ -106,6 +129,9 @@ def disable(fn=None, recursive=True, *, reason=None, wrapping=True):  # type: ig
     else:
 
         def wrap(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] HELPER: Builds the non-recursive disable wrapper for
+            # fn and sets the disable marker attributes on it; returns it.
+            # Raises AssertionError if fn is not callable.
             fn = innermost_fn(fn)
             if not callable(fn):
                 raise AssertionError("fn must be callable")
@@ -130,6 +156,10 @@ skip_code(_nonrecursive_disable_wrapper_code)
 
 
 def skip(fn: Callable[_P, _R] | None = None) -> Callable[..., Any]:
+    # [FUNCTION DOC] Marks fn's code object as skipped (frame not compiled, but
+    # callees still processed) and tags fn as disabled; mutates fn and returns
+    # it. With no fn, returns skip itself so it works as a decorator factory.
+    # Raises AssertionError if fn is not callable.
     """
     Skip frames associated with the function code, but still process recursively
     invoked frames
@@ -145,6 +175,12 @@ def skip(fn: Callable[_P, _R] | None = None) -> Callable[..., Any]:
 
 
 class set_stance(_DecoratorContextManager):
+    # [CLASS DOC] Sets Dynamo's global compiler stance. State: stance (a
+    # DynamoStance value) and prev (the stance in effect at construction).
+    # Construction applies the stance immediately (so a plain call works as a
+    # function); as a context manager it applies on enter and restores prev on
+    # exit; as a decorator it restores prev right away and re-applies per call.
+    # Marked forbidden in graph.
     """
     Decorator, context manager, function to set the current stance of the compiler.
 
@@ -160,6 +196,9 @@ class set_stance(_DecoratorContextManager):
         skip_guard_eval_unsafe: bool = False,
         force_backend: str | Callable[..., Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the DynamoStance and sets it globally, saving the
+        # previous stance in prev. Raises RuntimeError if force_backend is given
+        # with a non-default stance.
         if force_backend is not None and stance != "default":
             raise RuntimeError("non-default stance cannot have force_backend set")
 
@@ -167,6 +206,9 @@ class set_stance(_DecoratorContextManager):
         self.prev = _set_stance(self.stance)
 
     def __call__(self, fn: F) -> F:
+        # [FUNCTION DOC] Decorator use: undoes the stance set in the constructor
+        # (restores prev), then wraps fn via the base class so the stance applies
+        # per call; marks the wrapper as forbidden in graph and returns it.
         _set_stance(self.prev)
         wrapper = super().__call__(fn)
         # forbid wrapper in graph
@@ -174,6 +216,7 @@ class set_stance(_DecoratorContextManager):
         return wrapper
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Applies this stance globally.
         _set_stance(self.stance)
 
     def __exit__(
@@ -182,18 +225,32 @@ class set_stance(_DecoratorContextManager):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Restores the stance saved in prev; exceptions are not
+        # suppressed.
         _set_stance(self.prev)
 
     def clone(self) -> "set_stance":
+        # [FUNCTION DOC] Creates a new set_stance with the same stance name and
+        # backend (which applies it globally as a side effect). The
+        # skip_guard_eval_unsafe flag is not carried over.
+        # KNOWN ISSUE: skip_guard_eval_unsafe is dropped, so the clone may differ
+        # from the original.
         return self.__class__(self.stance.stance, force_backend=self.stance.backend)
 
 
 def assume_constant_result(fn):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Marks fn (mutating it) so Dynamo treats its call result as a
+    # compile-time constant; returns fn.
     fn._dynamo_marked_constant = True  # type: ignore[attr-defined]
     return fn
 
 
 def allow_in_graph(fn):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Registers a callable (or each in a list/tuple, returning a
+    # list) in trace_rules so Dynamo places it directly in the graph. Moves the id
+    # from the disallowed to the allowed set unless already treated as in-graph,
+    # and removes the id again when fn is garbage collected. Returns fn.
+    # Raises AssertionError if fn is not callable.
     """
     Tells the compiler frontend (Dynamo) to skip symbolic introspection of the function
     and instead directly write it to the graph when encountered.
@@ -213,6 +270,8 @@ def allow_in_graph(fn):  # type: ignore[no-untyped-def]
 
         # Avoid id reuse which creates subtle bugs.
         def deregister() -> None:
+            # [FUNCTION DOC] HELPER: Finalizer removing fn's id from the allowed
+            # set.
             trace_rules._allowed_callable_ids.remove(fn_id)
 
         weakref.finalize(fn, deregister)
@@ -221,6 +280,8 @@ def allow_in_graph(fn):  # type: ignore[no-untyped-def]
 
 # pyrefly: ignore [implicit-any]
 def _check_mutually_exclusive_decorators(fn: Callable, decorator_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError if fn is already marked with the
+    # other of leaf_function / nonstrict_trace than decorator_name.
     mutually_exclusive = {
         "leaf_function": trace_rules.is_leaf_function,
         "nonstrict_trace": trace_rules.is_nonstrict_trace_callable,
@@ -236,6 +297,10 @@ def _check_mutually_exclusive_decorators(fn: Callable, decorator_name: str) -> N
 
 
 def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Returns a wrapper of traceable_fn whose id is registered as
+    # allowed in graph and as nonstrict-traced (deregistered on garbage
+    # collection). Raises AssertionError for non-callables and ValueError if the
+    # function is already a leaf_function.
     """
     Decorator to mark a function as nonstrict-traceable for dynamo.
 
@@ -248,6 +313,7 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
     @functools.wraps(traceable_fn)
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Forwards the call to traceable_fn.
         return traceable_fn(*args, **kwargs)
 
     wrapped_id = id(wrapped)
@@ -260,6 +326,8 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
     # Avoid id reuse which creates subtle bugs.
     def deregister() -> None:
+        # [FUNCTION DOC] HELPER: Finalizer removing the wrapper id from the
+        # allowed and nonstrict-trace sets.
         trace_rules._allowed_callable_ids.remove(wrapped_id)
         trace_rules._nonstrict_trace_callable_ids.remove(wrapped_id)
 
@@ -277,6 +345,13 @@ def _invoke_leaf_function_python(
     hook_fn: Callable[..., Any] | None = None,
     hook_fake_fn: Callable[..., Any] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Executes a leaf function through the
+    # invoke_leaf_function higher-order op without Dynamo. Collects nn.Module
+    # arguments (deduplicated), registers them for make_fx, replaces them by
+    # state, flattens inputs, wraps real/fake implementations (recording the
+    # output tree spec), optionally attaches the backward hook pair and resolves
+    # mutated argument indices from mutates_args, then returns the unflattened
+    # outputs. Raises AssertionError if the output spec was never captured.
     """Call invoke_leaf_function HOP directly from Python.
 
     This enables @leaf_function to work with make_fx
@@ -341,18 +416,31 @@ def _invoke_leaf_function_python(
 
 
 @overload
-def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
+def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Typing overload for bare decorator use.
+    ...
 
 
 @overload
 def leaf_function(
     *, mutates_args: set[str]
-) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] HELPER: Typing overload for decorator use with mutates_args.
+    ...
 
 
 def leaf_function(
     fn: Callable[_P, _R] | None = None, *, mutates_args: set[str] | None = None
 ) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Decorator marking fn as an opaque leaf function. If fn is
+    # None, returns a partial applying mutates_args. Otherwise validates that fn
+    # is not nonstrict_trace and that every mutates_args root name is a
+    # parameter of fn (ValueError otherwise), then returns a wrapper that runs fn
+    # eagerly through the invoke_leaf_function op. The wrapper carries attributes
+    # for real/fake implementations, mutated args and hook functions, plus
+    # register_fake and register_multi_grad_hook setters; calling it before a
+    # fake is registered raises ValueError. Registers the wrapper id as allowed
+    # and as a leaf function (deregistered on garbage collection).
     """
     Decorator to mark a function as a leaf function for :func:`torch.compile`.
 
@@ -691,6 +779,9 @@ def leaf_function(
 
     @functools.wraps(fn)
     def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Eager entry point of the leaf function. Raises
+        # ValueError if no fake implementation is registered; otherwise invokes
+        # the real function via the leaf-function op and returns its outputs.
         if inner._torchdynamo_leaf_fake_fn is None:  # type: ignore[attr-defined]
             raise ValueError(
                 f"leaf_function '{getattr(fn, '__name__', fn)}' "
@@ -723,18 +814,25 @@ def leaf_function(
     trace_rules._leaf_function_ids.add(wrapped_id)
 
     def deregister() -> None:
+        # [FUNCTION DOC] HELPER: Finalizer removing the wrapper id from the
+        # allowed and leaf-function sets.
         trace_rules._allowed_callable_ids.remove(wrapped_id)
         trace_rules._leaf_function_ids.remove(wrapped_id)
 
     weakref.finalize(inner, deregister)
 
     def register_fake_setter(fake_fn: Callable[..., Any]) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Stores fake_fn as the fake implementation and
+        # returns the leaf function wrapper (not fake_fn).
         inner._torchdynamo_leaf_fake_fn = fake_fn  # type: ignore[attr-defined]
         return inner
 
     inner.register_fake = register_fake_setter  # type: ignore[attr-defined]
 
     def register_hook_setter(hook_fn: Callable[..., Any]) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Stores hook_fn as the multi-grad backward hook,
+        # sets a no-op fake hook returning None, and returns the leaf function
+        # wrapper.
         inner._torchdynamo_leaf_hook_fn = hook_fn  # type: ignore[attr-defined]
         inner._torchdynamo_leaf_hook_fake_fn = lambda *args, **kwargs: None  # type: ignore[attr-defined]
         return inner
@@ -745,7 +843,14 @@ def leaf_function(
 
 
 def _disallow_in_graph_helper(throw_if_not_allowed: bool) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Returns a decorator that moves a callable's id from
+    # the allowed and nonstrict-trace sets into the disallowed set (forcing a
+    # graph break). When throw_if_not_allowed is true, raises RuntimeError for
+    # callables that are not already in-graph torch callables.
     def inner(fn: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Applies the disallow registration to fn (or each
+        # element of a list/tuple, returning a list) and returns fn. Raises
+        # AssertionError for non-callables.
         if isinstance(fn, (list, tuple)):
             return [disallow_in_graph(x) for x in fn]
         if not callable(fn):
@@ -769,6 +874,9 @@ def _disallow_in_graph_helper(throw_if_not_allowed: bool) -> Callable[..., Any]:
 
 
 def disallow_in_graph(fn: Callable[..., Any]) -> Any:
+    # [FUNCTION DOC] Makes Dynamo graph-break on fn (an already allowed torch
+    # callable, or a list/tuple of them). Returns fn; raises RuntimeError if fn
+    # was not in-graph. Mutates global trace_rules id sets.
     """
     Customize which functions TorchDynamo will exclude in the generated
     graph and force a graph break on.
@@ -795,17 +903,23 @@ def disallow_in_graph(fn: Callable[..., Any]) -> Any:
 
 @_disallow_in_graph_helper(throw_if_not_allowed=False)
 def graph_break(msg: str = "") -> None:
+    # [FUNCTION DOC] Marker that forces a graph break when traced by Dynamo
+    # (registered as disallowed). Does nothing when run eagerly; msg is unused.
     """Force a graph break"""
 
 
 # NOTE: primarily used for internal debugging purposes!
 @_disallow_in_graph_helper(throw_if_not_allowed=False)
 def skip_frame(msg: str = "") -> None:
+    # [FUNCTION DOC] Internal debugging marker that makes Dynamo skip the
+    # current frame when traced. Does nothing when run eagerly; msg is unused.
     """Force a skipped frame"""
 
 
 @_disallow_in_graph_helper(throw_if_not_allowed=False)
 def step_unsupported(msg: str = "") -> None:
+    # [FUNCTION DOC] Marker that makes Dynamo compile the graph traced so far and
+    # skip the rest of the frame when traced. Does nothing when run eagerly.
     """Force a step unsupported graph break, which results in compiling
     the traced FX graph so far, then skipping the rest of the frame.
     In order to get expected behavior, there should be at least 2 ops
@@ -813,6 +927,9 @@ def step_unsupported(msg: str = "") -> None:
 
 
 def forbid_in_graph(fn: Any) -> Any:
+    # [FUNCTION DOC] Marks fn (or each element of a list/tuple, returning a
+    # list) with a forbidden attribute so Dynamo asserts if it is traced.
+    # Mutates fn and returns it. Raises AssertionError for non-callables.
     """
     Customize which functions TorchDynamo will assert are not present while tracing.
 
@@ -837,6 +954,13 @@ def substitute_in_graph(
     # type that is embedded in the Python interpreter
     is_embedded_type: bool = False,  # internal use only
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Returns a decorator that registers the decorated function
+    # as the polyfill used when Dynamo inlines original_fn. Raises TypeError if
+    # original_fn (or the polyfill) is not a function (a class is allowed when
+    # is_embedded_type). For embedded itertools types, marks them polyfilled.
+    # The decorator validates signatures unless skipped, checks for duplicate
+    # registrations (ValueError), then registers dispatch, rule-map and handler
+    # entries globally and returns a wrapper that calls original_fn eagerly.
     """
     Register a polyfill handler for a function, usually a C function from the C extension, to be
     used in place of the original function when inlining the original function in the graph.
@@ -903,6 +1027,10 @@ def substitute_in_graph(
             ITERTOOLS_POLYFILLED_TYPE_IDS.add(id(original_fn))
 
     def wrapper(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Performs the registration of traceable_fn as the
+        # polyfill for original_fn; returns the eager wrapper carrying polyfill
+        # attributes. Raises TypeError on signature mismatch or non-function,
+        # ValueError on duplicate registration.
         if not is_function(traceable_fn):
             raise TypeError(
                 f"@substitute_in_graph(...) expects a function but got {type(traceable_fn)!r}"
@@ -919,6 +1047,9 @@ def substitute_in_graph(
                 def sig_ident(
                     sig: inspect.Signature,
                 ) -> tuple[tuple[str, ...], set[str], dict[str, Any]]:
+                    # [FUNCTION DOC] HELPER: Returns a comparable signature key:
+                    # names of non-keyword, non-variadic parameters, the set of
+                    # keyword-only names, and a mapping of names to defaults.
                     # Ignore annotations for parameters and return type
                     return (
                         tuple(
@@ -996,11 +1127,15 @@ def substitute_in_graph(
         # C++ function.
         @functools.wraps(traceable_fn)
         def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            # [FUNCTION DOC] HELPER: Calls the original function eagerly.
             return original_fn(*args, **kwargs)
 
         def dispatch_fn(
             self: VariableBuilder, value: Callable[_P, _R]
         ) -> PolyfilledFunctionVariable:
+            # [FUNCTION DOC] HELPER: VariableBuilder dispatch handler: installs a
+            # class/module/id match guard for value and returns a
+            # PolyfilledFunctionVariable. Raises AssertionError if no guards.
             if inspect.isclass(value):
                 guard_type = GuardBuilder.CLASS_MATCH
             elif inspect.ismodule(value):
@@ -1037,6 +1172,11 @@ def substitute_in_graph(
 def _apply_func_to_inner_tensors_of_same_dim(
     func: Callable[..., Any], t: object, *args: Any, **kwargs: Any
 ) -> None:
+    # [FUNCTION DOC] HELPER: For a traceable wrapper tensor subclass t, calls
+    # func on each inner tensor whose dimension count equals t's, passing the
+    # extra arguments; non-tensor custom class attributes are ignored. Raises
+    # AssertionError if t is not a traceable wrapper subclass tensor or an
+    # attribute is neither tensor nor custom class.
     if not is_traceable_wrapper_subclass(t):
         raise AssertionError(f"Expected a traceable wrapper subclass, got {type(t)}")
 
@@ -1058,6 +1198,9 @@ def _apply_func_to_inner_tensors_of_same_dim(
 
 @dataclass(frozen=True, slots=True)
 class _DimRange:
+    # [CLASS DOC] HELPER: Immutable record of a tensor dimension index and its
+    # allowed min/max sizes (either may be None), stored on tensors by
+    # mark_dynamic.
     """
     This represents a dimension of a tensor and the corresponding
     min and max values it can take.  Don't create this
@@ -1080,6 +1223,16 @@ def mark_unbacked(
     min: int | None = None,
     max: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] Marks dimension(s) index of tensor t as unbacked by setting
+    # bookkeeping attributes on t (unbacked indices, hint overrides, bounds,
+    # shape ids, specialization lists, or strict indices when strict). A list or
+    # tuple index recurses per element (only shape_id, min and max are forwarded
+    # then). DTensors are marked via their local tensor. Raises AssertionError
+    # for traceable wrapper subclasses or invalid index types. Must be called
+    # outside compiled code.
+    # KNOWN ISSUE: the recursion and DTensor paths drop hint_override, strict and
+    # specialize_on; also the hasattr check uses _specialized_on while the
+    # attribute set is _specialize_on, so it is reset on every call.
     """
     Mark a tensor as having an unbacked dimension. This changes the semantics of operations:
     - The size of the specified dimension will always be reported as not equal to zero or one.
@@ -1184,6 +1337,12 @@ def mark_dynamic(
     max: int | None = None,
     specialize_on: list[Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Marks dimension(s) index of tensor t as dynamic by setting
+    # attributes on t: dynamic indices, a set of _DimRange(min, max), optional
+    # hint overrides and per-dim specialization criteria. Wrapper subclasses
+    # mirror the call onto same-rank inner tensors. A list or tuple index
+    # recurses (hint_override is not forwarded). Raises AssertionError for
+    # invalid index types. Must be called outside compiled code.
     """
     Mark a tensor as having a dynamic dim and set corresponding min and max range for the dim.
 
@@ -1272,6 +1431,11 @@ def mark_dynamic(
 
 @forbid_in_graph
 def maybe_mark_dynamic(t: Any, index: int | list[Any] | tuple[Any]) -> None:
+    # [FUNCTION DOC] Records dimension(s) index of t as weakly dynamic (no error
+    # if specialized) in a weak-dynamic-indices attribute and sets the dim
+    # marking flag; mirrors onto same-rank inner tensors of wrapper subclasses
+    # and recurses over list/tuple indices. Raises AssertionError for invalid
+    # index types.
     """
     Mark a tensor as having a dynamic dim, but don't enforce it (i.e., if this
     dimension ends up getting specialized, don't error).
@@ -1299,6 +1463,12 @@ def maybe_mark_dynamic(t: Any, index: int | list[Any] | tuple[Any]) -> None:
 
 
 def mark_static(t: Any, index: int | list[Any] | tuple[Any] | None = None) -> None:
+    # [FUNCTION DOC] When called during compilation, forces the sizes of t (all
+    # dims or the given one) to be static. Otherwise marks tensor dims static
+    # (all dims if index is None, or an int / list of ints) by setting static
+    # index attributes, mirroring onto inner tensors of wrapper subclasses; for
+    # an nn.Module class sets a static marker and returns the class. Raises
+    # TypeError for other types and AssertionError for invalid index types.
     """
     Mark a tensor as having a static dim or mark a nn module class as static.
 
@@ -1369,6 +1539,9 @@ def mark_static(t: Any, index: int | list[Any] | tuple[Any] | None = None) -> No
 
 @forbid_in_graph
 def mark_static_address(t: Any, guard: bool = False) -> None:
+    # [FUNCTION DOC] Tags tensor t with a static input type of guarded (data
+    # pointer is guarded, recompiling on change) or unguarded, so cudagraphs can
+    # avoid copying it. Raises TypeError if t is not a tensor.
     """
     Marks an input tensor whose address should be treated as constant across calls to the
     same dynamo-compiled function. This indicates to cudagraphs that an extra allocation
@@ -1386,14 +1559,20 @@ def mark_static_address(t: Any, guard: bool = False) -> None:
 
 
 def _patch_einops_symint_compat(einops_mod: Any) -> None:
+    # [FUNCTION DOC] HELPER: For old einops, replaces two lru_cached helper
+    # functions in einops_mod with wrappers that fall back to the uncached
+    # function on TypeError (unhashable SymInt). Mutates the module.
     """Backport the SymInt lru_cache fix from einops 0.7.0 into einops <= 0.6.1."""
     for name in ("_reconstruct_from_shape", "_prepare_transformation_recipe"):
         cached = getattr(einops_mod, name)
         uncached = cached.__wrapped__
 
         def make_wrapper(cached_fn: Any, uncached_fn: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Builds the cached-with-fallback wrapper.
             @functools.wraps(cached_fn)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Calls the cached function; on TypeError
+                # calls the uncached one instead.
                 try:
                     return cached_fn(*args, **kwargs)
                 except TypeError:
@@ -1421,6 +1600,8 @@ _EINOPS_LRU_CACHE_WRAPPER_ALLOWLIST = (
 
 
 def _einops_supports_dynamo_tracing(einops_mod: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the einops version is at least the minimum
+    # that Dynamo can trace directly; false if too old or unparseable.
     try:
         return Version(einops_mod.__version__) >= _EINOPS_DYNAMO_TRACING_MIN_VERSION
     except InvalidVersion:
@@ -1428,6 +1609,9 @@ def _einops_supports_dynamo_tracing(einops_mod: Any) -> bool:
 
 
 def _allow_lru_cache_trace_without_warning_for_einops() -> None:
+    # [FUNCTION DOC] HELPER: Imports each allowlisted einops module (skipping
+    # missing ones) and exempts the listed lru_cache wrapped helpers from the
+    # trace warning.
     import importlib
 
     for module_name, attr_names in _EINOPS_LRU_CACHE_WRAPPER_ALLOWLIST:
@@ -1445,6 +1629,11 @@ def _allow_lru_cache_trace_without_warning_for_einops() -> None:
 # Dynamo can trace through einops 0.8.2+ directly (no allow_in_graph needed).
 # Older versions still need the allow_in_graph registration below.
 def _allow_in_graph_einops() -> None:
+    # [FUNCTION DOC] HELPER: Module-init hook run when einops is imported. For
+    # new einops, pre-registers its backend and exempts lru_cache helpers. For
+    # older versions, relies on einops' own registration or else patches SymInt
+    # compatibility and registers rearrange/reduce/repeat/einsum/pack/unpack
+    # (when present) as allowed in graph.
     import einops
 
     if _einops_supports_dynamo_tracing(einops):
@@ -1486,28 +1675,41 @@ trace_rules.add_module_init_func("einops", _allow_in_graph_einops)
 
 
 class _ConfigPatchProtocol(Protocol):
+    # [CLASS DOC] HELPER: Structural type for the object returned by
+    # config.patch: has a changes mapping and enter/exit methods.
     """The config.patch() context manager object wrapped by DynamoConfigPatchProxy."""
 
     changes: dict[str, Any]
 
-    def __enter__(self) -> None: ...
+    def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: Protocol stub; applies the config changes.
+        ...
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
-    ) -> None: ...
+    ) -> None:
+        # [FUNCTION DOC] HELPER: Protocol stub; restores the config.
+        ...
 
 
 # Proxy class for torch._dynamo.config patching - so dynamo can identify context managers/decorators
 # created by patch_dynamo_config, compared to ones created by a raw torch._dynamo.config.patch.
 class DynamoConfigPatchProxy:
+    # [CLASS DOC] Wrapper around a config.patch object so Dynamo can recognize
+    # and trace config patches made through patch_dynamo_config. State:
+    # config_patch (the wrapped patch). Works as context manager and decorator
+    # (the decorator form is implemented in external_utils).
     def __init__(self, config_patch: _ConfigPatchProtocol) -> None:
+        # [FUNCTION DOC] Stores the wrapped config patch object.
         self.config_patch = config_patch
 
     @property
     def changes(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the mapping of config names to patched values
+        # from the wrapped patch.
         return self.config_patch.changes
 
     # Decorator implementation that simply sets up `self` as a context manager.
@@ -1515,6 +1717,7 @@ class DynamoConfigPatchProxy:
     __call__ = wrap_dunder_call_ctx_manager
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Applies the wrapped config patch.
         return self.config_patch.__enter__()
 
     def __exit__(
@@ -1523,6 +1726,7 @@ class DynamoConfigPatchProxy:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Restores the config by delegating to the wrapped patch.
         return self.config_patch.__exit__(exc_type, exc_val, exc_tb)
 
 
@@ -1557,6 +1761,8 @@ del config
 
 
 def _patch_dynamo_config_check(changes: dict[str, Any]) -> None:
+    # [FUNCTION DOC] HELPER: Validates a config patch mapping. Raises ValueError
+    # if any key is not in the allowed list or any value is not a safe constant.
     for k, v in changes.items():
         if k not in _allowed_config_patches:
             raise ValueError(
@@ -1577,6 +1783,10 @@ def patch_dynamo_config(
     arg2: Any = None,
     **kwargs: Any,
 ) -> DynamoConfigPatchProxy:
+    # [FUNCTION DOC] Creates a config.patch from the same arguments (a tuple of
+    # pairs is converted to a mapping), validates its changes against the
+    # allowed list of traceable patches (ValueError on disallowed key or
+    # non-constant value) and returns it wrapped in a DynamoConfigPatchProxy.
     """
     A wrapper around torch._dynamo.config.patch that can be traced by Dynamo to
     temporarily change config values DURING tracing.
@@ -1601,14 +1811,21 @@ def patch_dynamo_config(
 
 
 @overload
-def dont_skip_tracing(fn: None = None) -> DynamoConfigPatchProxy: ...
+def dont_skip_tracing(fn: None = None) -> DynamoConfigPatchProxy:
+    # [FUNCTION DOC] HELPER: Typing overload for context manager use.
+    ...
 
 
 @overload
-def dont_skip_tracing(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
+def dont_skip_tracing(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Typing overload for decorator use.
+    ...
 
 
 def dont_skip_tracing(fn: Any | None = None) -> Any:
+    # [FUNCTION DOC] Returns a traceable config patch enabling the
+    # dont_skip_tracing option; if fn is given returns fn decorated with it,
+    # otherwise the patch to use as a context manager.
     """
     Context manager/decorator to trace into functions intentionally marked by developers to be skipped
     when tracing.
@@ -1622,14 +1839,21 @@ def dont_skip_tracing(fn: Any | None = None) -> Any:
 
 
 @overload
-def disable_nested_graph_breaks(fn: None = None) -> DynamoConfigPatchProxy: ...
+def disable_nested_graph_breaks(fn: None = None) -> DynamoConfigPatchProxy:
+    # [FUNCTION DOC] HELPER: Typing overload for context manager use.
+    ...
 
 
 @overload
-def disable_nested_graph_breaks(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
+def disable_nested_graph_breaks(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Typing overload for decorator use.
+    ...
 
 
 def disable_nested_graph_breaks(fn: Any | None = None) -> Any:
+    # [FUNCTION DOC] Returns a traceable config patch turning off nested graph
+    # breaks; if fn is given returns fn decorated with it, otherwise the patch to
+    # use as a context manager.
     """
     Context manager/decorator to disable nested graph breaks when tracing
     this function and any nested functions. Used when nested graph breaks
@@ -1642,13 +1866,21 @@ def disable_nested_graph_breaks(fn: Any | None = None) -> Any:
 
 
 class ErrorOnGraphBreakDecoratorContextManager:
+    # [CLASS DOC] Context manager/decorator that sets the global
+    # error-on-graph-break flag for its scope. State: error_on_graph_break
+    # (target value) and prev_error_on_graph_break (stack of previous values, or
+    # None where no change was made, to support re-entrancy).
     def __init__(self, error_on_graph_break: bool) -> None:
+        # [FUNCTION DOC] Stores the target flag value and an empty previous-value
+        # stack.
         self.error_on_graph_break = error_on_graph_break
         self.prev_error_on_graph_break: list[bool | None] = []
 
     __call__ = wrap_dunder_call_ctx_manager
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Pushes the previous flag value (or None if already
+        # equal) and sets the global flag to the target value.
         current_error_on_graph_break = _get_error_on_graph_break()
         if current_error_on_graph_break != self.error_on_graph_break:
             self.prev_error_on_graph_break.append(current_error_on_graph_break)
@@ -1662,6 +1894,8 @@ class ErrorOnGraphBreakDecoratorContextManager:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Pops the saved value and restores the global flag if it
+        # had been changed; exceptions are not suppressed.
         prev_error_on_graph_break = self.prev_error_on_graph_break.pop()
         if prev_error_on_graph_break is not None:
             _set_error_on_graph_break(prev_error_on_graph_break)
@@ -1670,6 +1904,9 @@ class ErrorOnGraphBreakDecoratorContextManager:
 def error_on_graph_break(
     error_on_graph_break: bool,
 ) -> ErrorOnGraphBreakDecoratorContextManager:
+    # [FUNCTION DOC] Returns a context manager/decorator that sets Dynamo's
+    # error_on_graph_break flag to the given value within its scope (no effect
+    # under fullgraph).
     """
     Context manager/decorator to toggle torch.compile's `error_on_graph_break` setting at compile time.
 
@@ -1688,9 +1925,15 @@ def error_on_graph_break(
 
 
 class CudagraphOverrideContextManager:
+    # [CLASS DOC] Context manager/decorator that sets a global cudagraph override
+    # pair (forward, backward) for its scope. State: fwd and bwd (True force on,
+    # False disable, None no override) and prev_cudagraph_override (stack of
+    # earlier override values).
     """Context manager that overrides cudagraph recording during tracing."""
 
     def __init__(self, fwd: bool | None = None, bwd: bool | None = None) -> None:
+        # [FUNCTION DOC] Stores the forward/backward override settings and an
+        # empty previous-value stack.
         self.fwd = fwd
         self.bwd = bwd
         self.prev_cudagraph_override: list[tuple[bool | None, bool | None] | None] = []
@@ -1698,6 +1941,8 @@ class CudagraphOverrideContextManager:
     __call__ = wrap_dunder_call_ctx_manager
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Pushes the current global cudagraph override and sets
+        # the (fwd, bwd) override globally.
         # Set the override at runtime so it follows the dynamic call stack.
         # Dynamo handles the lexical `with` symbolically and does not run this
         # __enter__ at trace time; it runs when the generated/resumed bytecode
@@ -1713,12 +1958,16 @@ class CudagraphOverrideContextManager:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Pops and restores the previous global cudagraph
+        # override; exceptions are not suppressed.
         _set_cudagraph_override(self.prev_cudagraph_override.pop())
 
 
 def override_cudagraphs(
     fwd: bool | None = None, bwd: bool | None = None
 ) -> CudagraphOverrideContextManager:
+    # [FUNCTION DOC] Returns a CudagraphOverrideContextManager for the given
+    # forward/backward settings, usable as a context manager or decorator.
     """
     Context manager/decorator to override cudagraph recording for compiled graphs.
 
@@ -1738,6 +1987,10 @@ def override_cudagraphs(
 
 
 def override_optimization_hint(x: Any, val: int) -> None:
+    # [FUNCTION DOC] Records val as the optimization hint of the unbacked symbol
+    # behind SymInt x in its shape env (a no-op for plain int x). Raises
+    # TypeError if val is not an int or x is not SymInt/int, and ValueError if x
+    # is a derived expression or a backed symbol. Mutates the shape env.
     """Override the optimization hint for a scalar unbacked symbol.
 
     When the compiler or runtime needs a non-guarding integer hint for an
@@ -1812,6 +2065,8 @@ def override_optimization_hint(x: Any, val: int) -> None:
 
 
 def is_dynamo_disable_recursive(method: Callable[[Any], Any]) -> bool | None:
+    # [FUNCTION DOC] Returns the recursive flag recorded by disable on method:
+    # true, false, or None if method was not wrapped by disable.
     """
     Check if a method is marked as `dynamo_disable` recursively. It returns:
     - True if disable(recursive=True)
@@ -1831,6 +2086,10 @@ def allow_c_slot(
     tp_hash: bool = True,
     tp_richcompare: bool = True,
 ) -> type:
+    # [FUNCTION DOC] Adds the type's C-level hash and/or comparison slot
+    # functions (those not inherited from object) to Dynamo's safe slot set so
+    # tracing does not graph-break on them. Returns tp unchanged. Raises
+    # TypeError if tp is not a type. Mutates global state.
     """Register a C extension type's slots as safe to call at trace time.
 
     By default, ``torch.compile`` graph-breaks when it encounters ``hash()``
