@@ -1,3 +1,8 @@
+# [MODULE DOC] Implements torch.switch, an N-way branch selection control-flow op, as the
+# higher-order op switch_op. Contains the public switch function, dense/proxy/fake/functionalize
+# implementations, a custom autograd Function that builds per-branch backward graphs, and output
+# merging for fake tensor mode. Import-time side effects: creates the switch_op singleton and
+# registers all its implementations.
 import contextlib
 import functools
 import logging
@@ -33,16 +38,26 @@ log = logging.getLogger(__name__)
 
 
 class SwitchOp(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator "switch": runs the branch chosen by an index on the
+    # operands. Stateless; singleton instance is switch_op.
     def __init__(self):
+        # [FUNCTION DOC] Registers the operator under the name "switch".
         super().__init__("switch")
 
     def __call__(self, index, branches, operands):
+        # [FUNCTION DOC] Validates the operand types as legal subgraph arguments, then forwards
+        # index, branches and operands to the generic higher-order-op dispatch.
         validate_subgraph_args_types(operands)
         # pyrefly: ignore [missing-attribute]
         return super().__call__(index, branches, operands)
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, index, branches, operands):
+        # [FUNCTION DOC] Builds the op's FunctionSchema for a concrete call. Each branch is
+        # materialized as a graph on the operands and checked for input mutation; operands mutated
+        # by any branch are marked mutated. Arguments are index, one graph per branch, then the
+        # operands; outputs come from the first branch only. Registers the original structure as
+        # the tree spec and returns the schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
         from torch._higher_order_ops.utils import materialize_as_graph
 
@@ -80,11 +95,15 @@ switch_op = SwitchOp()
 
 
 def wrap_branch_fn_flat(*args, branch_fn, spec_operands):
+    # [FUNCTION DOC] HELPER: Rebuilds the structured operands from flat leaves using spec_operands
+    # and calls branch_fn with them unpacked; returns its result.
     operands = pytree.tree_unflatten(args, spec_operands)
     return branch_fn(*operands)
 
 
 def _get_branch(branches, idx):
+    # [FUNCTION DOC] HELPER: Returns the branch at idx; raises AssertionError if idx is outside
+    # the valid range.
     if not 0 <= idx < len(branches):
         raise AssertionError(
             f"switch index {idx} out of range for {len(branches)} branches"
@@ -98,6 +117,13 @@ def switch(
     branches: tuple[Callable, ...] | list[Callable],
     operands: tuple | list = (),
 ) -> Any:
+    # [FUNCTION DOC] Public torch.switch. Flattens the operands to tensor leaves, validates
+    # inputs (RuntimeError for a bad index type, a multi-element index tensor, empty or
+    # non-callable branches, or non-tensor operand leaves), wraps each branch to take flat leaves,
+    # short-circuits a single branch to a plain call, clamps the index into range, and for a
+    # Python int index outside compilation just calls that branch (warning if inside non-strict
+    # export tracing). Otherwise runs switch_op via the compile-and-run helper. Returns branch
+    # outputs.
     r"""
     Selects and runs one of N branch functions by index.
 
@@ -135,6 +161,9 @@ def switch(
     leaves_operands, spec_operands = pytree.tree_flatten(operands)
 
     def _validate_input(index, branches, operands):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError unless index is an int, SymInt or
+        # single-element tensor, branches is a non-empty tuple/list of callables, and every
+        # operand leaf is a tensor.
         if not isinstance(index, (int, torch.SymInt, torch.Tensor)):
             raise RuntimeError(
                 f"Expected index to be int or single-element tensor, but got {index}."
@@ -200,6 +229,7 @@ def switch(
 
     # Use _maybe_compile_and_run_fn pattern from scan/associative_scan
     def run_switch(index, wrapped_branches, leaves_operands):
+        # [FUNCTION DOC] HELPER: Invokes switch_op with the given index, branches and leaves.
         return switch_op(index, wrapped_branches, leaves_operands)
 
     return _maybe_compile_and_run_fn(
@@ -208,6 +238,11 @@ def switch(
 
 
 def trace_switch(proxy_mode, func_overload, index, branches, operands):
+    # [FUNCTION DOC] Traces every branch into an FX graph, requires all branches to have the same
+    # output tree structure (RuntimeError otherwise; AssertionError for bad operands/branches
+    # types), registers each graph on the tracer root under a unique name, emits a call_function
+    # node for the op with (index, graphs, operands), runs the op on the graphs for real outputs,
+    # and returns the outputs tracked to the node. Side effect: mutates the tracer graph.
     if not isinstance(operands, (list, tuple)):
         raise AssertionError(
             f"Switch operands must be a list or tuple of tensors and SymInts {operands}"
@@ -252,6 +287,9 @@ def trace_switch(proxy_mode, func_overload, index, branches, operands):
 
 @switch_op.py_impl(DispatchKey.CompositeExplicitAutograd)
 def switch_op_dense(index, branches, operands):
+    # [FUNCTION DOC] Eager implementation: operands must be tensors or ints (RuntimeError
+    # otherwise); no dispatch mode may be active (AssertionError). Converts index (tensor or
+    # number) to an int, selects that branch (AssertionError if out of range) and calls it.
     if not all(isinstance(o, (torch.Tensor, int)) for o in operands):
         raise RuntimeError(
             f"Dense implementation operands must be a list of tensors and ints {operands}"
@@ -264,6 +302,10 @@ def switch_op_dense(index, branches, operands):
 
 
 class SwitchAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for switch_op. Forward stores the index, a backward function
+    # per branch, the dispatch key sets and saved operands, then runs switch_op below autograd.
+    # Backward materializes a backward graph per branch and runs switch_op on them with the same
+    # index. Stores a mask of which outputs are tensors on the context.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -272,6 +314,9 @@ class SwitchAutogradOp(torch.autograd.Function):
         branches,
         *operands,
     ):
+        # [FUNCTION DOC] Saves index, per-branch backward functions, dispatch key sets and
+        # operands on ctx, runs the forward switch_op without autograd, records which flat outputs
+        # are tensors, and returns the outputs.
         ctx._index = index
         # Build one bw fn per branch.
         ctx._branch_bw_fns = [
@@ -298,6 +343,11 @@ class SwitchAutogradOp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *flat_grads):
+        # [FUNCTION DOC] Keeps only gradients of tensor outputs, materializes each branch's
+        # backward function as a graph (with grad enabled and the forward's dispatch key sets) on
+        # the saved operands plus those gradients, runs switch_op on the backward graphs with the
+        # saved index, and returns None for index and branches followed by operand gradients, with
+        # None placeholders refilled per the first branch's mask.
         operands = saved_values(ctx)
         tensor_grads = tuple(
             g for g, keep in zip(flat_grads, ctx._fw_output_is_tensor) if keep
@@ -332,6 +382,7 @@ class SwitchAutogradOp(torch.autograd.Function):
 
 @switch_op.py_autograd_impl
 def switch_autograd(index, branches, operands):
+    # [FUNCTION DOC] Autograd key implementation; applies SwitchAutogradOp to the operands.
     return SwitchAutogradOp.apply(
         index,
         branches,
@@ -341,11 +392,15 @@ def switch_autograd(index, branches, operands):
 
 @switch_op.py_impl(ProxyTorchDispatchMode)
 def inner(mode, index, branches, operands):
+    # [FUNCTION DOC] Proxy-mode implementation; delegates to trace_switch with switch_op.
     return trace_switch(mode, switch_op, index, branches, operands)
 
 
 @switch_op.py_impl(FakeTensorMode)
 def switch_fake_tensor_mode(mode, index, branches, operands):
+    # [FUNCTION DOC] Fake tensor implementation: runs every branch under the fake mode (ignoring
+    # fresh unbacked symbols), requires identical output tree structure (RuntimeError otherwise),
+    # then merges corresponding output leaves across branches and returns the merged structure.
     # Ignore here, because if you've gotten here but you're not manually
     # tracing the inner graphs, that means that you intend to reuse the graph
     # directly.  Which means the old unbacked symbol bindings are appropriate.
@@ -372,6 +427,9 @@ def switch_fake_tensor_mode(mode, index, branches, operands):
 
 
 def _merge_output(xs: tuple[torch.Tensor | int | None, ...], mode: FakeTensorMode):
+    # [FUNCTION DOC] HELPER: Merges one output leaf from all branches. If any is None all must be
+    # (AssertionError otherwise) and None is returned; if all are plain ints they are merged into a
+    # symbolic int; otherwise tensors are merged pairwise with the cond op's merge routine.
     from torch._higher_order_ops.cond import (
         _merge_ints_to_symint,
         _merge_output as cond_merge_output,
@@ -392,6 +450,10 @@ def _merge_output(xs: tuple[torch.Tensor | int | None, ...], mode: FakeTensorMod
 
 @switch_op.py_functionalize_impl
 def switch_func(ctx, index, branches, inputs):
+    # [FUNCTION DOC] Functionalization implementation. If auto-functionalization applies and the
+    # context has a mode, defers to it with flattened args. Otherwise unwraps index and inputs,
+    # functionalizes each branch, checks each branch for aliasing/mutation of inputs, re-invokes
+    # switch_op below the functionalize key and wraps the outputs.
     from torch._higher_order_ops.auto_functionalize import (
         can_auto_functionalize,
         do_auto_functionalize_v2,

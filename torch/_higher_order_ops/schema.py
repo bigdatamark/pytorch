@@ -1,3 +1,8 @@
+# [MODULE DOC] Generates torch FunctionSchema objects for HigherOrderOperator invocations from
+# example values. Contains HopArgumentInfo (argument description), generators for argument infos,
+# JIT types, C arguments and function schemas, the HopSchemaGenerator builder, the HopSchema
+# FunctionSchema subclass (which also carries a pytree spec) and find_hop_schema for FX graphs.
+# Import-time side effects: builds a mapping from Python scalar types to JIT types.
 import copy
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +20,9 @@ from torch.fx.node import Target
 # would have different schema.
 @dataclass(frozen=True, slots=True)
 class HopArgumentInfo:
+    # [CLASS DOC] Immutable record describing one hop argument or output: name, example value,
+    # default value, whether the subgraph mutates it (always False for outputs) and whether it is
+    # keyword-only.
     # Could give a name to the operand by default it's empty string.
     name: str
     example_value: Any
@@ -27,6 +35,7 @@ class HopArgumentInfo:
 
 
 class HopArgumentInfoGen:
+    # [CLASS DOC] Namespace of static factory helpers that build HopArgumentInfo objects.
     @staticmethod
     def from_example(
         example_value: Any,
@@ -36,6 +45,9 @@ class HopArgumentInfoGen:
         is_mutated: bool = False,
         kw_only: bool = False,
     ) -> HopArgumentInfo:
+        # [FUNCTION DOC] Builds a HopArgumentInfo from an example value and optional name,
+        # default, mutation flag and keyword-only flag. If a default is given its type must be
+        # exactly the type of the example value, else AssertionError is raised.
         if default_value is not None:
             if type(example_value) is not type(default_value):
                 raise AssertionError(
@@ -52,6 +64,8 @@ class HopArgumentInfoGen:
 
 
 class CTypeGen:
+    # [CLASS DOC] Maps example Python values to torch JIT types. Class attribute convert_to_base_ty
+    # maps int, float, str and bool to their JIT types (KNOWN ISSUE: not used by from_example).
     convert_to_base_ty = {
         int: torch._C.IntType.get(),
         float: torch._C.FloatType.get(),
@@ -62,6 +76,10 @@ class CTypeGen:
     # should return torch._C.JitType but that annotation is busted
     @staticmethod
     def from_example(obj: Any) -> Any:
+        # [FUNCTION DOC] Returns the JIT type for an example value: GraphModule maps to the Any
+        # type; SymInt, SymBool map to their sym types; SymFloat to Float; fake script objects,
+        # pytree specs and registered opaque/custom classes to the PyObject type; anything else
+        # uses JIT type inference (which may fail for unsupported values).
         import torch
 
         if isinstance(obj, torch.fx.GraphModule):
@@ -80,10 +98,14 @@ class CTypeGen:
 
 
 class CArgumentGen:
+    # [CLASS DOC] Namespace of static helpers that build torch._C.Argument objects.
     @staticmethod
     def from_hop_argument_info(
         arg_idx: int, arg_info: HopArgumentInfo, is_output: bool = False
     ) -> Any:
+        # [FUNCTION DOC] Converts a HopArgumentInfo to a torch._C.Argument. Outputs get an unnamed
+        # argument of the inferred type. Inputs carry name, default, keyword-only flag and alias
+        # info; a mutated input gets a write alias set unique to its position (arg_idx).
         typ = CTypeGen.from_example(arg_info.example_value)
         if is_output:
             return torch._C.Argument("", typ, None, None, False, None)
@@ -101,7 +123,12 @@ class CArgumentGen:
 
 
 class HopSchemaGenerator:
+    # [CLASS DOC] Builder for a hop's FunctionSchema. State: arg_infos (ordered argument records),
+    # example_outputs (flat list of output examples), schema_tree_spec (optional pytree spec of the
+    # original unflattened inputs) and the hop. Usage: add_arg per flat input, add_output per
+    # output, optionally add_schema_tree_spec, then gen_schema.
     def __init__(self, hop: torch._ops.HigherOrderOperator):
+        # [FUNCTION DOC] Stores the hop and initializes empty argument, output and tree spec state.
         self.arg_infos: list[HopArgumentInfo] = []
         self.example_outputs: list[Any] = []
         self.schema_tree_spec: pytree.TreeSpec | None = None
@@ -115,6 +142,9 @@ class HopSchemaGenerator:
         is_mutated: bool = False,
         kw_only: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Appends an argument description. Callable examples must be GraphModules
+        # or operators (AssertionError otherwise, except registered custom classes). The example
+        # must be a pytree leaf, otherwise RuntimeError is raised. Mutates arg_infos.
         if callable(example_value) and not is_custom_class(type(example_value)):
             if not isinstance(
                 example_value, (torch.fx.GraphModule, torch._ops.OperatorBase)
@@ -144,9 +174,13 @@ class HopSchemaGenerator:
         self.arg_infos.append(arg_info)
 
     def add_output(self, output: Any) -> None:
+        # [FUNCTION DOC] Appends one example output value to the output list.
         self.example_outputs.append(output)
 
     def add_schema_tree_spec(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Records the pytree spec obtained by flattening the given positional and
+        # keyword arguments together, so the original structured inputs can be rebuilt. Overwrites
+        # any earlier spec.
         """schema tree spec is the tree spec from flattening all inputs to the hop with pytree.tree_flatten
         Since torch.FunctionSchema only have proper mutation/alias support for flattened inputs, we need
         to store the tree spec in order to reconstruct the inputs to the hop.
@@ -154,6 +188,9 @@ class HopSchemaGenerator:
         self.schema_tree_spec = pytree.tree_flatten((args, kwargs))[1]
 
     def gen_schema(self) -> torch._C.FunctionSchema:
+        # [FUNCTION DOC] Builds the HopSchema. Raises RuntimeError if any argument example is not a
+        # pytree leaf and no tree spec was registered. Outputs are packed into a single tuple
+        # record named out. Returns the schema named after the hop.
         for i, arg_info in enumerate(self.arg_infos):
             arg_spec = pytree.tree_flatten(arg_info.example_value)[1]
             if not arg_spec.is_leaf() and self.schema_tree_spec is None:
@@ -172,6 +209,8 @@ class HopSchemaGenerator:
 
 
 class CFunctionSchemaGen:
+    # [CLASS DOC] Namespace holding the static function that assembles a HopSchema from argument
+    # records; enforces flat inputs, tuple outputs and no output mutation (see docstring note).
     """
     Note: [HigherOrderOperator schema generation]
     Each invocation of a HigherOrderOperator will have a different schema.
@@ -214,6 +253,10 @@ class CFunctionSchemaGen:
         out_argument_info: HopArgumentInfo,
         schema_tree_spec: pytree.TreeSpec | None,
     ) -> Any:
+        # [FUNCTION DOC] Builds a HopSchema from op name, input records, a single output record and
+        # the optional tree spec. The output example must be a tuple (AssertionError otherwise) and
+        # must not be marked mutated. A one-element tuple yields a single return of the tuple type
+        # (the whole output record); otherwise one return per element named out0, out1 and so on.
         args = []
         for i, arg_info in enumerate(inp_argument_info):
             args.append(CArgumentGen.from_hop_argument_info(i, arg_info))
@@ -257,6 +300,8 @@ class CFunctionSchemaGen:
 
 
 class HopSchema(torch._C.FunctionSchema):
+    # [CLASS DOC] FunctionSchema subclass that additionally stores tree_spec, the pytree spec of the
+    # original hop inputs, plus is_vararg and is_varret flags.
     def __init__(
         self,
         name: str,
@@ -267,6 +312,8 @@ class HopSchema(torch._C.FunctionSchema):
         is_varret: bool,
         schema_tree_spec: pytree.TreeSpec | None,
     ):
+        # [FUNCTION DOC] Stores the tree spec and vararg flags, then initializes the base schema
+        # with the given name, overload name, arguments and returns.
         self.tree_spec = schema_tree_spec
         self.is_vararg = is_vararg
         self.is_varret = is_varret
@@ -280,6 +327,8 @@ class HopSchema(torch._C.FunctionSchema):
         )
 
     def __deepcopy__(self, memo: Any) -> "HopSchema":
+        # [FUNCTION DOC] Returns a new HopSchema sharing arguments and returns but with a deep copy
+        # of the tree spec. memo is unused.
         # Need to additionally copy the tree_spec since
         # it's not a member of torch._C.FunctionSchema
         return HopSchema(
@@ -296,10 +345,16 @@ class HopSchema(torch._C.FunctionSchema):
 def find_hop_schema(
     gm: torch.fx.GraphModule, target: Target
 ) -> list[torch._C.FunctionSchema]:
+    # [FUNCTION DOC] For every call_function node in gm targeting the given hop, reconstructs
+    # example args/kwargs (get_attr nodes resolved to module attributes, other nodes to their
+    # example_value or val metadata) and calls the target's gen_schema with them. Returns the list
+    # of schemas in node order. Raises KeyError if a node has neither example_value nor val meta.
     schemas = []
     for node in gm.graph.find_nodes(op="call_function", target=target):
 
         def _get_example_value(node: torch.fx.Node) -> Any:
+            # [FUNCTION DOC] HELPER: Returns the module attribute for a get_attr node (target must
+            # be a string, else AssertionError), otherwise the node's example_value or val meta.
             if node.op == "get_attr":
                 if not isinstance(node.target, str):
                     raise AssertionError(

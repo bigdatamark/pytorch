@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements torch.scan (inclusive scan with carry) as the higher-order op scan_op.
+# Contains the public scan function, helpers for flattening/stacking, a dense loop implementation
+# (generic_scan), tracing (trace_scan), a partitioner-based autograd implementation
+# (ScanAutogradOp / ScanAutogradImpl with intermediate handling policies), and proxy, fake tensor,
+# functionalize and vmap rules, plus a test-only eager reference (_fake_scan).
+# Import-time side effects: creates the scan_op singleton and registers all implementations.
 import enum
 import functools
 import itertools
@@ -54,6 +60,9 @@ aten = torch._ops.ops.aten
 def wrap_combine_fn_flat(
     *args, combine_fn, spec_init, spec_xs, num_init_leaves, num_inp_leaves
 ):
+    # [FUNCTION DOC] HELPER: Adapter turning a pytree-based combine_fn into one taking flat leaves.
+    # Expects init leaves followed by xs leaves (AssertionError if the count is wrong), rebuilds
+    # the carry and xs structures from their specs and returns combine_fn(carry, xs).
     if len(args) != (num_init_leaves + num_inp_leaves):
         raise AssertionError(
             f"combine_fn received wrong number of arguments, expected {num_init_leaves + num_inp_leaves}, but got {len(args)}"
@@ -64,6 +73,8 @@ def wrap_combine_fn_flat(
 
 
 def _extract_carry_and_out(flat_out: list[Any], num_carry: int):
+    # [FUNCTION DOC] HELPER: Splits a flat output list into the first num_carry carry entries and
+    # the remaining per-step outputs; returns the two chunks.
     return split_into_chunks(flat_out, [num_carry, len(flat_out) - num_carry])
 
 
@@ -71,6 +82,8 @@ def _extract_carry_and_out(flat_out: list[Any], num_carry: int):
 # eager semantic of scan, which stacks the outputs. The result is contiguous
 # as a result of the stack operation.
 def stack_y(y: torch.Tensor, scan_length: int) -> torch.Tensor:
+    # [FUNCTION DOC] Returns a contiguous tensor with y repeated scan_length times along a new
+    # leading dimension; used to build fake/meta shapes of stacked scan outputs.
     return (
         y.unsqueeze(0)
         .repeat(*([scan_length] + [1] * y.ndim))
@@ -79,12 +92,19 @@ def stack_y(y: torch.Tensor, scan_length: int) -> torch.Tensor:
 
 
 def call_operator(operator, *args):
+    # [FUNCTION DOC] HELPER: Calls operator with args and returns the flattened list of leaves of
+    # its result.
     return pytree.tree_leaves(operator(*args))
 
 
 def _build_empty_output_for_length_zero(
     combine_fn: Callable, init: pytree.PyTree
 ) -> pytree.PyTree:
+    # [FUNCTION DOC] HELPER: Builds the per-step output structure for a zero-length scan. Runs
+    # combine_fn once on fake copies of init and a None x (under a detected or new fake mode) to
+    # learn the output pytree, then replaces each tensor leaf by an empty tensor with a new
+    # leading dimension of size 0 (same dtype/device); None leaves pass through; any other leaf
+    # raises AssertionError.
     """Probe combine_fn(init, None) to learn the output structure for length==0."""
     fake_mode = detect_fake_mode(pytree.tree_leaves(init)) or FakeTensorMode()
     with fake_mode:
@@ -97,6 +117,8 @@ def _build_empty_output_for_length_zero(
         _, sample_y = combine_fn(fake_init, None)
 
     def _empty_or_passthrough(l):
+        # [FUNCTION DOC] HELPER: Maps a tensor leaf to an empty tensor with a zero-size leading
+        # dim; returns None unchanged; raises AssertionError for other types.
         if isinstance(l, torch.Tensor):
             return torch.empty([0] + list(l.shape), dtype=l.dtype, device=l.device)
         if l is not None:
@@ -117,6 +139,15 @@ def scan(
     reverse: bool = False,
     length: int | None = None,
 ) -> tuple[pytree.PyTree, pytree.PyTree]:
+    # [FUNCTION DOC] Public torch.scan. Flattens init and xs; with an explicit length and no xs
+    # tensors it iterates length times using a fabricated counter input (combine_fn receives None
+    # as x), returns (init, empty outputs) for length 0 in eager mode (RuntimeError under
+    # compile), and without length and tensors returns (init, empty list). Validates arguments
+    # (RuntimeError on a non-callable combine_fn, non-int dim, non-bool reverse, bad length,
+    # length mismatch, empty or non-tensor init leaves, xs leaves of low rank or differing scan
+    # size). Moves the scan dim to the front, optionally flips for reverse, runs scan_op on flat
+    # leaves via the compile-and-run helper, then undoes the flip and dim move on the stacked
+    # outputs. Returns (final carry, stacked outputs).
     r"""
     Performs an inclusive scan with a combine function.
 
@@ -218,11 +249,17 @@ def scan(
             _user_combine_fn = combine_fn
 
             def combine_fn(carry, _ignored):  # noqa: E306
+                # [FUNCTION DOC] HELPER: Wrapper that ignores the dummy counter slice and calls
+                # the user combine function with None as x.
                 return _user_combine_fn(carry, None)
     elif not xs_has_tensors:
         return init, []
 
     def _validate_input(cfn, lxs, linit, d, r, l):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError unless combine_fn is callable, dim is an int,
+        # reverse is a bool, length (if given) matches xs size along dim, init is non-empty with
+        # tensor leaves, and xs leaves are tensors with more than dim dimensions and equal size
+        # along the scan dim.
         # Basic arguments check
         if not callable(cfn):
             raise RuntimeError(f"Combine_fn must be a callable, but got {cfn}")
@@ -279,6 +316,7 @@ def scan(
     )
 
     def run_flattened_scan(combine_fn, leaves_init, leaves_xs):
+        # [FUNCTION DOC] HELPER: Invokes scan_op on flat leaves with no additional inputs.
         return scan_op(combine_fn, leaves_init, leaves_xs, ())
 
     carry, out = _maybe_compile_and_run_fn(
@@ -302,7 +340,11 @@ def scan(
 
 
 class ScanOp(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator "scan" taking combine_fn, init leaves, xs leaves and
+    # additional (loop-invariant) inputs, with optional mutated_arg_indices. Stateless; singleton
+    # instance is scan_op.
     def __init__(self):
+        # [FUNCTION DOC] Registers the operator under the name "scan".
         super().__init__("scan")
 
     def __call__(
@@ -314,6 +356,10 @@ class ScanOp(HigherOrderOperator):
         *,
         mutated_arg_indices: str = "",
     ):
+        # [FUNCTION DOC] Validates that additional_inputs is a tuple or list (AssertionError
+        # otherwise; a list is converted to a tuple), checks subgraph argument types, and forwards
+        # to the generic dispatch, passing mutated_arg_indices (a comma separated string of
+        # indices) only when non-empty.
         # There is currently an issue that the ScanOp is sometimes called with
         # the additional_inputs being a list. See https://github.com/pytorch/pytorch/issues/145785
         # Once this issue is resolved, the assertion should only allow tuples
@@ -338,6 +384,11 @@ class ScanOp(HigherOrderOperator):
     def gen_schema(
         self, combine_fn, init, xs, additional_inputs, mutated_arg_indices=""
     ):
+        # [FUNCTION DOC] Builds the op's FunctionSchema for a concrete call. Materializes
+        # combine_fn as a graph on sample inputs (init, one slice per xs, additional inputs), adds
+        # args named init<i>, xs<i>, additional_input<i> (only additional inputs listed in
+        # mutated_arg_indices are marked mutated; init and xs never are), adds the graph outputs,
+        # registers the original structure as the tree spec and returns the schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
 
         all_inputs = tuple(
@@ -405,7 +456,18 @@ scan_op = ScanOp()
 
 
 def generic_scan(operator, init, xs, dim=0, additional_inputs=()):
+    # [FUNCTION DOC] Dense eager scan over flat tensor lists. Applies operator step by step along
+    # dim, feeding the carry, the current slice of each xs and the additional inputs; returns the
+    # final carry followed by outputs stacked along a new leading dimension (None for non-tensor
+    # outputs). Output shapes are inferred from the first step's real result. See _scan.
     def _scan(init, xs):
+        # [FUNCTION DOC] HELPER: Runs the loop. With empty xs returns (carry, empty list). Runs
+        # step 0 to learn output shapes, preallocates output buffers sized by the number of
+        # elements, writes each step's tensor outputs into its slot via scatter, and returns a flat
+        # tuple of final carry then expanded outputs. If there are zero elements it returns init
+        # plus the empty buffers.
+        # KNOWN ISSUE: with zero elements xs[0] has size 0 yet step 0 is still run first, so the
+        # operator is called on empty slices.
         """Perform scan on `elems` using `elems_init."""
         carry = init
         if len(xs) == 0:
@@ -459,6 +521,8 @@ def generic_scan(operator, init, xs, dim=0, additional_inputs=()):
             return (*init, *outs_expanded)
 
         def store_out_in_outs(out, ind):
+            # [FUNCTION DOC] HELPER: Writes each tensor in out into slot ind of the matching
+            # preallocated output buffer using scatter along dim 0.
             # Store the intermediate out in the outs matrix
             for o, x, idx in zip(outs, out, idxs):
                 # o: (num_elems, M, N ...)
@@ -501,6 +565,13 @@ def trace_scan(
     additional_inputs: tuple[torch.Tensor],
     mutated_arg_indices: str = "",
 ):
+    # [FUNCTION DOC] Proxy tracing of scan. Traces combine_fn into a graph on cloned sample inputs
+    # (init clones, first slice of each xs, additional inputs) with proxy tracing disabled, finds
+    # the single output node (AssertionError if none or multiple), checks that init metadata
+    # matches the carry outputs, registers the graph under a unique "scan_combine_graph" name on
+    # the tracer root, emits a call_function node for func_overload (passing mutated_arg_indices if
+    # non-empty), and builds fake outputs (carry plus outputs stacked to the scan length; outputs
+    # must be tensors or None, else AssertionError). Returns them tracked to the node's proxy.
     from torch._dynamo.utils import clone_input
 
     with disable_proxy_modes_tracing():
@@ -576,6 +647,8 @@ def trace_scan(
 
 @scan_op.py_impl(DispatchKey.CompositeExplicitAutograd)
 def scan_op_dense(combine_fn, init, xs, additional_inputs, mutated_arg_indices=""):
+    # [FUNCTION DOC] Eager implementation: requires no active dispatch mode (AssertionError) and
+    # runs generic_scan with the given inputs; mutated_arg_indices is ignored.
     mode = _get_current_dispatch_mode()
     if mode is not None:
         raise AssertionError("Mode should never be enabled for CPU/CUDA key")
@@ -583,6 +656,10 @@ def scan_op_dense(combine_fn, init, xs, additional_inputs, mutated_arg_indices="
 
 
 class ScanAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for scan_op. Forward builds a ScanAutogradImpl from a
+    # partitioned (forward/backward) graph and the operands, stores it on ctx and runs the forward
+    # scan; backward runs the reverse scan and returns gradients (None for the four non-tensor
+    # leading arguments).
     """
     NOTE: [scan partial grad handling]
     If any element of init, of xs, of the outputs or of the additional_inputs does not require gradients,
@@ -606,6 +683,9 @@ class ScanAutogradOp(torch.autograd.Function):
         n_additional_inputs,
         *operands,
     ):
+        # [FUNCTION DOC] Splits operands into init, xs and additional inputs by the given counts,
+        # stores a new ScanAutogradImpl on ctx, and returns its forward outputs (carry then
+        # stacked outputs), computed below autograd.
         init, xs, additional_inputs = split_into_chunks(
             operands, [n_init, n_xs, n_additional_inputs]
         )
@@ -617,6 +697,8 @@ class ScanAutogradOp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_fw_outputs):
+        # [FUNCTION DOC] Returns four None entries for the non-tensor forward arguments followed by
+        # the gradients computed by the stored impl's backward scan.
         return (
             None,
             None,
@@ -627,6 +709,10 @@ class ScanAutogradOp(torch.autograd.Function):
 
 
 class ScanForwardIntermediatesHandlingPolicy(enum.Enum):
+    # [CLASS DOC] Enumeration of how each forward-graph intermediate saved for backward is handled:
+    # KEEP (stack as a per-step output), CLONE (a carried init value; clone then stack),
+    # REMOVE_XS (an xs input; reuse the original xs) and REMOVE_ADDITIONAL_INPUTS (an additional
+    # input; reuse it directly).
     """
     Partitioner can add intermediates to the output of original graph.
     These intermediates fall into 4 categories and we want to have different policies for handling them by
@@ -656,6 +742,12 @@ class ScanForwardIntermediatesHandlingPolicy(enum.Enum):
 
 
 class ScanAutogradImpl:
+    # [CLASS DOC] Holds the state for one scan autograd call: the partitioned graph, the init, xs
+    # and additional inputs, the per-intermediate handling policies, the saved xs / additional
+    # inputs / intermediates for backward, and the pytree spec of the forward inputs. The
+    # constructor rewrites the forward and backward graphs in place (mutates hop_partitioned_graph).
+    # call_forward runs the forward scan once and saves intermediates; call_backward builds and
+    # runs the reversed scan producing gradients.
     """
     Wraps over partitioned graph and encapsulates scan-specific implementation details
     """
@@ -663,6 +755,9 @@ class ScanAutogradImpl:
     def __init__(
         self, hop_partitioned_graph: HopPartitionedGraph, init, xs, additional_inputs
     ):
+        # [FUNCTION DOC] Stores the inputs, initializes empty policy/saved lists and the forward
+        # input spec, then rewrites the forward graph's intermediates and breaks input/output
+        # aliasing in the backward graph (both modify the graphs in place).
         self.hop_partitioned_graph = hop_partitioned_graph
         self.init = init
         self.xs = xs
@@ -680,6 +775,8 @@ class ScanAutogradImpl:
     def _insert_clone(
         self, need_copy_node: torch.fx.Node, output_node: torch.fx.Node
     ) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Inserts a clone call node for need_copy_node just before
+        # output_node in its graph, copies the original node's metadata to the clone and returns it.
         graph: torch.fx.Graph = output_node.graph
         with graph.inserting_before(output_node):
             clone_node = graph.call_function(
@@ -692,6 +789,10 @@ class ScanAutogradImpl:
         return clone_node
 
     def _break_bw_input_output_aliasing(self) -> None:
+        # [FUNCTION DOC] HELPER: Rewrites the backward graph so no output is a placeholder or shares
+        # storage with a placeholder's example value: such outputs are replaced by clones. If any
+        # rewrite happened, the output node is updated, the graph linted and recompiled. Raises
+        # AssertionError if the output node does not have exactly one argument.
         """
         The min-cut partitioner can produce a ``bw_gm`` whose output aliases
         an input placeholder. The most common case is a direct placeholder
@@ -722,6 +823,8 @@ class ScanAutogradImpl:
                 ph_storages.add(StorageWeakRef(val._typed_storage()))
 
         def _aliases_placeholder(node: torch.fx.Node) -> bool:
+            # [FUNCTION DOC] HELPER: True if node is a placeholder or its example tensor value
+            # shares storage with any placeholder's example tensor; else False.
             if node.op == "placeholder":
                 return True
             val = node.meta.get("val", None) if hasattr(node, "meta") else None
@@ -743,6 +846,13 @@ class ScanAutogradImpl:
             bw_gm.recompile()
 
     def _optimize_forward_intermediates(self):
+        # [FUNCTION DOC] HELPER: Classifies each saved forward intermediate (outputs of the forward
+        # graph beyond the real outputs) by which kind of placeholder it is: init (CLONE), xs
+        # (REMOVE_XS), additional input (REMOVE_ADDITIONAL_INPUTS) or computed (KEEP). Fills the
+        # policy list and the saved xs / additional inputs lists, then rewrites the forward output
+        # node to keep the real outputs plus cloned and kept intermediates only, linting and
+        # recompiling the graph. Raises AssertionError if state lists are not initially empty.
+        # Side effect: mutates the forward graph module.
         """
         We optimize the forward intermediates by categorize forward intermediates into categories
         and construct a ScanForwardIntermediatesHandlingPolicy for them
@@ -840,6 +950,9 @@ class ScanAutogradImpl:
             )
 
     def call_forward(self):
+        # [FUNCTION DOC] Runs scan_op on the forward graph with the stored inputs, splits the
+        # result into real outputs and intermediates, saves the intermediates for backward
+        # (AssertionError if some were already saved) and returns the real outputs as a tuple.
         fw_outputs_and_intermediates: tuple[Any] = scan_op(
             self.hop_partitioned_graph.fw_gm, self.init, self.xs, self.additional_inputs
         )  # type: ignore[return-type]
@@ -857,6 +970,13 @@ class ScanAutogradImpl:
         return tuple(fw_outs)
 
     def call_backward(self, *grad_fw_outputs):
+        # [FUNCTION DOC] Computes gradients by running a reversed scan over the backward graph.
+        # Carry gradients are carried, additional-input gradients are accumulated (only for tensor
+        # additional inputs), and per-step xs gradients are stacked. Saved intermediates are
+        # reassembled per step according to the handling policies. Inputs are flipped along the scan
+        # dimension before and the xs gradients flipped back after. Returns init gradients, xs
+        # gradients, then additional-input gradients (None for non-tensors).
+        # Raises AssertionError if the gradient spec was never set.
         """
         Recall that fw_outputs = (*carry, *ys), bw_gm takes in (*fw_intermediates, *grad_carry, *grad_ys)
         and returns (*grad_init, *grad_xs, *grad_additional_inputs)
@@ -913,6 +1033,12 @@ class ScanAutogradImpl:
         grad_spec = None
 
         def bw_single_step_wrapper(*args):
+            # [FUNCTION DOC] HELPER: One backward step on flat args. Rebuilds the structured carry
+            # grads, accumulated additional-input grads, per-step grads, saved xs and intermediates;
+            # reorders intermediates per policy (RuntimeError for an unknown policy); calls the
+            # backward graph; returns the flat list of next carry grads, updated accumulated
+            # additional-input grads (previous plus current) and xs grads. Records the output spec
+            # in the enclosing grad_spec variable.
             bw_init, bw_xs, bw_additional_inputs = pytree.tree_unflatten(
                 args, flat_spec
             )
@@ -1003,6 +1129,10 @@ class ScanAutogradImpl:
 
 @scan_op.py_autograd_impl
 def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices=""):
+    # [FUNCTION DOC] Autograd key implementation. Temporarily turns on requires_grad for
+    # floating/complex init tensors that lack it (so gradients flow through the carry), builds a
+    # min-cut partitioned forward/backward graph of combine_fn, restores requires_grad, and applies
+    # ScanAutogradOp. mutated_arg_indices is ignored. Returns the scan outputs.
     with disable_proxy_modes_tracing():
         # If init was passed in with requires_grad=False, AOT joint creation drops it from
         # grad_primals and zero-fills, severing the carry chain and silently
@@ -1044,6 +1174,7 @@ def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices="
 def scan_proxy_mode(
     mode, combine_fn, init, xs, additional_inputs, mutated_arg_indices=""
 ):
+    # [FUNCTION DOC] Proxy-mode implementation; delegates to trace_scan with scan_op.
     return trace_scan(
         mode,
         scan_op,
@@ -1059,6 +1190,9 @@ def scan_proxy_mode(
 def scan_fake_tensor_mode(
     mode, combine_fn, init, xs, additional_inputs, mutated_arg_indices=""
 ):
+    # [FUNCTION DOC] Fake tensor implementation: under the fake mode, runs combine_fn once on init,
+    # the first slice of each xs and the additional inputs; outputs must be tensors or None
+    # (AssertionError otherwise). Returns the carry followed by outputs stacked to the scan length.
     with mode:
         scan_length = xs[0].shape[0]
         carry, outputs = _extract_carry_and_out(
@@ -1088,6 +1222,11 @@ def scan_fake_tensor_mode(
 def scan_functionalize(
     ctx, combine_fn, init, xs, additional_inputs, mutated_arg_indices=""
 ):
+    # [FUNCTION DOC] Functionalization implementation. If the context has a mode and the op can be
+    # auto-functionalized, delegates to that path. Otherwise unwraps init, xs and additional
+    # inputs, functionalizes combine_fn, checks combine_fn for input aliasing/mutation on sample
+    # inputs, re-invokes scan_op below the functionalize key (forwarding mutated_arg_indices) and
+    # wraps the outputs.
     from torch._higher_order_ops.utils import (
         _check_alias_and_mutation,
         _maybe_run_with_interpreter,
@@ -1148,6 +1287,11 @@ def scan_functionalize(
 def scan_batch_rule(
     interpreter, combine_fn, init, xs, additional_inputs, mutated_arg_indices=""
 ):
+    # [FUNCTION DOC] vmap batching rule. Unwraps batched inputs, moves every batch dimension to
+    # the last position so it does not interfere with scan's leading dimension, runs scan_op one
+    # level below with combine_fn wrapped to vmap-restore and move output batch dims last, then
+    # rewraps outputs as batched using the recorded output dims. Raises AssertionError if output
+    # dims were never recorded.
     unbatched_args, in_dims = unwrap_batched(
         (init, xs, additional_inputs), interpreter.level()
     )
@@ -1167,6 +1311,9 @@ def scan_batch_rule(
         out_dims = None
 
         def wrapper(*args):
+            # [FUNCTION DOC] HELPER: Runs combine_fn under restored vmap, moves batched outputs'
+            # batch dim to last, records output dims (last or none) in the enclosing out_dims and
+            # returns the outputs tuple.
             nonlocal out_dims
             outputs, per_slice_out_dims = restore_vmap(
                 combine_fn,
@@ -1212,6 +1359,12 @@ def scan_batch_rule(
 
 # dense implementation for scan. Used for testing only.
 def _fake_scan(combine_fn, init, xs=None, dim=0, reverse=False, length=None):
+    # [FUNCTION DOC] HELPER: Pure-Python reference scan for tests. Supports a length counter mode
+    # without xs tensors (length 0 returns init and empty outputs), returns (init, empty list) when
+    # there are no xs tensors and no length, otherwise loops over the scan dim (reversed if asked),
+    # calling combine_fn on the carry and each slice, and stacks per-step outputs along dim (empty
+    # tensors for zero steps; None leaves stay None, other non-tensors raise AssertionError).
+    # Returns (final carry, outputs).
     carry_leaves, carry_spec = pytree.tree_flatten(init)
     inp_leaves, inp_spec = pytree.tree_flatten(xs)
     xs_has_tensors = any(isinstance(l, torch.Tensor) for l in inp_leaves)
@@ -1223,6 +1376,8 @@ def _fake_scan(combine_fn, init, xs=None, dim=0, reverse=False, length=None):
         _user_combine_fn = combine_fn
 
         def combine_fn(carry, _ignored):
+            # [FUNCTION DOC] HELPER: Wrapper that ignores the counter slice and calls the user
+            # combine function with None as x.
             return _user_combine_fn(carry, None)
 
         # Dummy length-N iteration counter; the wrapped combine_fn passes x=None.

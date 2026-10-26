@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines the call_torchbind higher-order op, which represents a method call on a
+# torchbind (ScriptObject) instance, plus a context manager that reroutes ScriptMethod calls to it
+# during tracing. Registers dense, proxy, fake, autograd (deferred error) and functionalize impls.
+# Import-time side effects: creates the call_torchbind singleton, marks it side-effectful for FX,
+# and saves the original ScriptMethod call implementation.
 import logging
 from contextlib import contextmanager
 
@@ -27,15 +32,25 @@ log = logging.getLogger(__name__)
 # We do not expect users to write this operator directly. Instead it will be
 # emitted by Dynamo when tracing encounters a torchbind object.
 class CallTorchBind(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator "call_torchbind": invokes a named method on a torchbind
+    # object with the given args/kwargs. Stateless; singleton instance is call_torchbind.
     def __init__(self):
+        # [FUNCTION DOC] Registers the operator under the name "call_torchbind".
         super().__init__("call_torchbind")
 
     def __call__(self, obj, method, *args, **kwargs):
+        # [FUNCTION DOC] Forwards the object, method name and all extra args to the generic
+        # higher-order-op dispatch.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(obj, method, *args, **kwargs)
 
     @staticmethod
     def schema(obj, method) -> torch.FunctionSchema:
+        # [FUNCTION DOC] Builds a FunctionSchema for a call_torchbind invocation. obj must be an
+        # Inductor TorchBindObject (AssertionError otherwise). Takes the real object's method
+        # schema and rewrites it so the first argument is the object, followed by a string
+        # "method" argument, then the original remaining arguments and return types; returns the
+        # parsed schema.
         """
         Returns the schema of ``CallTorchbind.__call__``.
         """
@@ -67,6 +82,9 @@ _orig_scriptmethod_call = torch.ScriptMethod.__call__
 
 
 def torchbind_method_redispatch(self, *args, **kwargs):
+    # [FUNCTION DOC] Replacement for ScriptMethod call: if the method's owner is a script object,
+    # routes the call through call_torchbind (so it can be traced); otherwise calls the original
+    # ScriptMethod call implementation. Returns the call result.
     if _is_script_object(self.raw_owner):
         return call_torchbind(self.raw_owner, self.name, *args, **kwargs)
     return _orig_scriptmethod_call(self, *args, **kwargs)
@@ -74,6 +92,11 @@ def torchbind_method_redispatch(self, *args, **kwargs):
 
 @contextmanager
 def enable_torchbind_tracing():
+    # [FUNCTION DOC] Context manager enabling torchbind tracing. On entry it appends ScriptObject
+    # to the AOT autograd KNOWN_TYPES list and monkeypatches the ScriptMethod call to the
+    # redispatch function. On exit (even on error) it pops KNOWN_TYPES and restores the original
+    # call. Raises AssertionError if the popped type is not ScriptObject (list tampered with).
+    # Side effects: mutates global state; not thread safe.
     """Context manager that acts as a feature flag to enable torchbind tracing
     behavior. Once torchbind tracing has been stabilized, we can remove this and
     turn it always on.
@@ -92,6 +115,9 @@ def enable_torchbind_tracing():
 
 @call_torchbind.py_impl(DispatchKey.CompositeExplicitAutograd)
 def call_torchbind_impl(obj, method, *args, **kwargs):
+    # [FUNCTION DOC] Eager implementation. For a real ScriptObject it calls the named method via
+    # the original ScriptMethod call; for a FakeScriptObject it calls the method on the wrapped
+    # object. Raises RuntimeError for any other object type. Returns the method result.
     if isinstance(obj, torch.ScriptObject):
         return _orig_scriptmethod_call(getattr(obj, method), *args, **kwargs)
     elif isinstance(obj, FakeScriptObject):
@@ -102,6 +128,11 @@ def call_torchbind_impl(obj, method, *args, **kwargs):
 
 @call_torchbind.py_impl(ProxyTorchDispatchMode)
 def inner(mode, *args, **kwargs):
+    # [FUNCTION DOC] Proxy-mode implementation. Emits a call_function node for call_torchbind with
+    # proxied args/kwargs, executes the call for real to get the output, and logs a warning if the
+    # object is a real ScriptObject (it may be mutated by tracing). Tracks the output tensors to
+    # the proxy; if the node lacks a val in its meta, stores the raw output there, which must be
+    # None, int, float or bool (AssertionError otherwise). Returns the tracked output.
     proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, args)
     proxy_kwargs = pytree.tree_map(mode.tracer.unwrap_proxy, kwargs)
 
@@ -143,6 +174,8 @@ def inner(mode, *args, **kwargs):
 # we need to convert it to fake tensor manually. Dynamic shape is supported.
 @call_torchbind.py_impl(FakeTensorMode)
 def call_torchbind_fake(mode, *args, **kwargs):
+    # [FUNCTION DOC] Fake tensor implementation: runs the eager implementation under the fake mode,
+    # then converts any non-fake tensors in the output into fake tensors with static shapes.
     with mode:
         out = call_torchbind_impl(*args, **kwargs)
         return pytree.tree_map_only(
@@ -161,6 +194,9 @@ call_torchbind.py_autograd_impl(
 
 @call_torchbind.py_functionalize_impl
 def call_torchbind_func(ctx, *args, **kwargs):
+    # [FUNCTION DOC] Functionalization implementation: handles the call as an effectful op by
+    # delegating to handle_effects with the mode's token discovery flag and token map; returns
+    # its result.
     from torch._higher_order_ops.effects import handle_effects
 
     return handle_effects(
