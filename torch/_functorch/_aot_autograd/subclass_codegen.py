@@ -1,3 +1,10 @@
+# [MODULE DOC] Source-code generator for the tensor-subclass wrapper used by AOTAutograd.
+# Builds Python source text (via PySourceBuilder) for a function that flattens subclass
+# inputs into plain tensors/opaques/symints, calls the compiled function, and rebuilds
+# subclass outputs through __tensor_unflatten__. All indices, attribute names, types and
+# symint positions come from SubclassCreationMeta/PlainTensorMeta and are baked into the
+# generated text. Entry points: codegen_subclass_wrapper and codegen_backward_subclass_fns.
+# No import-time side effects beyond imports.
 """
 Codegen for AOTDispatchSubclassWrapper.
 
@@ -24,6 +31,9 @@ if TYPE_CHECKING:
 
 
 def _is_symint_placeholder(x: None | int | SymInt) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if a size/stride entry needs a runtime value:
+    # the entry is None (already replaced after make_runtime_safe) or a SymInt that is not
+    # a nested int. Concrete ints and nested ints return False. Pure function.
     """Check whether a size/stride entry is symbolic and needs a runtime value.
 
     Works both before make_runtime_safe() (entries are SymInt) and after
@@ -37,16 +47,26 @@ def _is_symint_placeholder(x: None | int | SymInt) -> bool:
 
 
 def _compute_placeholders(outer: Iterable[None | int | SymInt]) -> list[bool]:
+    # [FUNCTION DOC] HELPER: Maps each size/stride entry to a boolean saying whether it is
+    # a symint placeholder (see _is_symint_placeholder). Returns a list of the same length.
     return [_is_symint_placeholder(s) for s in outer]
 
 
 def _safe_attr_access(var: str, attr: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns source text that reads attribute attr from variable
+    # var: plain dotted access when attr is a valid non-keyword identifier, otherwise a
+    # getattr call with the quoted name.
     if attr.isidentifier() and not keyword.iskeyword(attr):
         return f"{var}.{attr}"
     return f"getattr({var}, {attr!r})"
 
 
 class _OutputWrapState:
+    # [CLASS DOC] HELPER: Compile-time bookkeeping used while emitting output-wrapping code.
+    # Tracks how many flat outputs must still be consumed at minimum (remaining_min_count,
+    # symint outputs excluded) and at maximum (remaining_max_count, all optional symints
+    # included), plus the global name of the runtime predicate that decides whether an
+    # optional symint output is present. Both counts must reach zero when emission ends.
     def __init__(
         self,
         *,
@@ -54,15 +74,21 @@ class _OutputWrapState:
         remaining_max_count: int,
         optional_symint_check: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the initial min/max remaining output counts and the
+        # name of the optional-symint check global (empty string when no optional symints).
         self.remaining_min_count = remaining_min_count
         self.remaining_max_count = remaining_max_count
         self.optional_symint_check = optional_symint_check
 
     def mark_required(self) -> None:
+        # [FUNCTION DOC] HELPER: Records one definitely-present output: decrements both the
+        # min and max remaining counts.
         self.remaining_min_count -= 1
         self.remaining_max_count -= 1
 
     def mark_optional(self) -> None:
+        # [FUNCTION DOC] HELPER: Records one possibly-present (symint) output slot:
+        # decrements only the max remaining count.
         self.remaining_max_count -= 1
 
 
@@ -70,6 +96,9 @@ def _maybe_wait_async_collective_tensor(
     x: object,
     AsyncCollectiveTensor: type["AsyncCollectiveTensor"],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Runtime helper bound into generated code. If x is an
+    # AsyncCollectiveTensor, calls trigger_wait on it and returns the resulting tensor;
+    # otherwise returns x unchanged. AsyncCollectiveTensor is passed in as a parameter.
     """Wait on ACT values and leave all other runtime inputs unchanged."""
     if isinstance(x, AsyncCollectiveTensor):
         return cast("AsyncCollectiveTensor", x).trigger_wait()
@@ -85,10 +114,20 @@ def _codegen_unwrap_subclass(
     act_input_paths: set[tuple[str, ...]] | None = None,
     act_wait_fn: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emits, into the PySourceBuilder, statements that flatten the
+    # subclass held in variable var into the list named unwrapped_args, following meta.attrs
+    # in order: plain tensors and opaques are appended (after an ACT wait call when the attr
+    # path is in act_input_paths), nested subclasses are recursed into, then (if
+    # include_symints) the symbolic outer sizes and strides are appended.
+    # Raises AssertionError if an ACT path continues past a leaf or stops at a subclass, or
+    # if an ACT path exists but act_wait_fn is None. Side effect: appends lines to state.
     """Emit code to recursively unwrap a single subclass input."""
     act_input_paths = act_input_paths or set()
 
     def emit_plain_tensor_symints(var: str, meta: PlainTensorMeta) -> None:
+        # [FUNCTION DOC] HELPER: When include_symints is set, emits code that appends the
+        # symbolic size and stride entries (as marked by the meta placeholders) of the plain
+        # tensor in var to unwrapped_args. Emits nothing otherwise.
         if not include_symints:
             return
 
@@ -184,6 +223,9 @@ def _codegen_unwrap_subclass(
 
 
 def _concrete_value(val: None | int | SymInt) -> int:
+    # [FUNCTION DOC] HELPER: Returns the int to bake into generated code for a non-symbolic
+    # size/stride entry: the int itself, or -1 for a nested-int SymInt. Raises
+    # AssertionError for anything else (None or a non-nested SymInt).
     """Get the concrete int value for a non-symbolic size/stride entry.
 
     Used for entries that are NOT symbolic placeholders, meaning they are
@@ -199,6 +241,8 @@ def _concrete_value(val: None | int | SymInt) -> int:
 
 
 def _is_optional_symint_output(val: object) -> bool:
+    # [FUNCTION DOC] HELPER: Runtime predicate used by generated code; True if val is an int
+    # or SymInt (so it can be an optional symint output rather than a tensor).
     return isinstance(val, (int, SymInt))
 
 
@@ -207,6 +251,12 @@ def _codegen_wrap_subclass(
     meta: SubclassCreationMeta,
     output_state: _OutputWrapState,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Emits code that rebuilds one subclass output from the flat list
+    # unwrapped_outs using a running index _out_idx: reads each attr (plain, opaque, or
+    # recursively wrapped subclass), builds the inner-tensor dict, determines outer size and
+    # stride (from a designated attr, or from baked ints plus consumed symint outputs), and
+    # calls the subclass's __tensor_unflatten__ with registered globals for type and meta.
+    # Updates output_state counts. Returns the name of the generated result variable.
     """Emit code to reconstruct one subclass output. Returns the variable name."""
     inner_dict_var = state.fresh_name("_out_inner")
     entries: list[str] = []
@@ -239,6 +289,10 @@ def _codegen_wrap_subclass(
     def _build_tuple(
         outer: Iterable[None | int | SymInt], placeholders: list[bool]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Builds the source text of a size/stride tuple: symbolic
+        # positions consume the next flat output (emitting a read and counting it as
+        # required), other positions are baked as concrete ints. Single-element tuples get
+        # a trailing comma.
         parts: list[str] = []
         for val, is_sym in zip(outer, placeholders):
             if is_sym:
@@ -254,6 +308,9 @@ def _codegen_wrap_subclass(
         return f"({', '.join(parts)})"
 
     def _consume_optional_placeholders(placeholders: list[bool]) -> None:
+        # [FUNCTION DOC] HELPER: For each symbolic placeholder, emits the optional-symint
+        # skip logic so any symint outputs present are skipped (used when size/stride come
+        # from an inner attr instead of the flat outputs).
         for is_sym in placeholders:
             if is_sym:
                 _emit_optional_symint_skip(state, output_state)
@@ -291,6 +348,11 @@ def _count_output_args(
     *,
     include_subclass_symints: bool,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Counts how many flat output slots a meta occupies. Plain tensor:
+    # its arg_count if symints are included, else 1. Subclass: sum over attrs (opaque = 1,
+    # others recursive) plus, when symints are included, all symbolic outer size/stride
+    # entries; when not included, those entries are counted only if size/stride are not
+    # taken from an inner attr.
     if isinstance(meta, PlainTensorMeta):
         return meta.arg_count if include_subclass_symints else 1
 
@@ -318,6 +380,11 @@ def _emit_optional_symint_skip(
     state: PySourceBuilder,
     output_state: _OutputWrapState,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emits code for one symint output slot that may or may not be
+    # present at runtime. The generated code computes how many outputs remain, decides
+    # whether the next flat output is consumed as a symint (index bump) using the
+    # remaining-count windows and the optional-symint predicate, and asserts the layout is
+    # consistent. Calls output_state.mark_optional.
     remaining_var = state.fresh_name("_remaining_outs")
     include_var = state.fresh_name("_include_symints")
     later_min_count = output_state.remaining_min_count
@@ -349,6 +416,8 @@ def _emit_optional_plain_tensor_symint_skips(
     output_state: _OutputWrapState,
     meta: PlainTensorMeta,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For a plain tensor meta, emits one optional-symint skip for
+    # every symbolic size placeholder, then for every symbolic stride placeholder.
     for is_sym in meta.size_symbol_placeholders:
         if is_sym:
             _emit_optional_symint_skip(state, output_state)
@@ -362,6 +431,13 @@ def _emit_output_wrapping(
     out_metas: list[PlainTensorMeta | SubclassCreationMeta],
     num_fw_outs_saved_for_bw: int | None,
 ) -> tuple[list[str], int]:
+    # [FUNCTION DOC] HELPER: Emits the whole output-wrapping section: computes min/max
+    # flat output counts across out_metas, registers the optional-symint predicate when
+    # they differ, emits the output index setup and a length assertion (excluding
+    # num_fw_outs_saved_for_bw trailing activations), wraps each meta (plain or subclass),
+    # and emits a final consumption assertion. Returns the result expression names and the
+    # total arg_count tallied. Raises AssertionError if the compile-time counts do not
+    # balance to zero.
     """Emit wrapping code for output metas.
 
     Returns (result_exprs, num_args_tallied) where result_exprs are Python
@@ -446,6 +522,11 @@ def _emit_input_unwrapping(
     act_input_paths_by_input: dict[int, set[tuple[str, ...]]] | None = None,
     act_wait_fn: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emits code appending each input to unwrapped_args. Plain tensor
+    # inputs are appended directly (through the ACT wait function if flagged); frozen
+    # subclass inputs append None; other subclass inputs get a runtime exact-type
+    # assertion then are unwrapped via _codegen_unwrap_subclass. Raises AssertionError on
+    # inconsistent ACT paths or a missing wait function.
     """Emit unwrapping code for input metas into unwrapped_args.
 
     Caller must have already emitted ``unwrapped_args = []``.
@@ -498,6 +579,11 @@ def _codegen_subclass_wrapper_source(
     frozen_inp_indices: frozenset[int] = frozenset(),
     act_input_paths: ActInputPaths | None = None,
 ) -> tuple[str, dict[str, object]]:
+    # [FUNCTION DOC] HELPER: Builds the full source of the forward wrapper function
+    # inner_fn(args): unwrap inputs, pass through trailing extra args, clear args, call
+    # compiled_fn, wrap outputs, and return the wrapped tuple (plus saved activations when
+    # num_fw_outs_saved_for_bw is given). Registers an ACT wait helper global when
+    # act_input_paths is non-empty. Returns (source, globals) without compiled_fn.
     """Generate source and globals for a subclass wrapper.
 
     Returns (source, globals_dict).  The globals_dict will NOT contain
@@ -558,6 +644,9 @@ def _codegen_subclass_wrapper_source(
 def _codegen_subclass_wrap_source(
     out_metas: list[PlainTensorMeta | SubclassCreationMeta],
 ) -> tuple[str, dict[str, object]]:
+    # [FUNCTION DOC] HELPER: Builds source of wrap_fn(unwrapped_outs) that rebuilds
+    # subclass/plain outputs from a flat list and returns them as a tuple. Returns
+    # (source, globals).
     """Generate source for wrapping flat outputs into subclasses.
 
     Used for the backward epilogue. Shares output-wrapping logic with
@@ -577,6 +666,10 @@ def _codegen_subclass_wrap_source(
 def codegen_backward_subclass_fns(
     grad_input_metas: list[PlainTensorMeta | SubclassCreationMeta] | None = None,
 ) -> tuple[Callable[..., object], Callable[..., object] | None]:
+    # [FUNCTION DOC] Compiles the backward-pass helpers. Always builds unwrap_fn, which
+    # returns its argument list as a new list. If grad_input_metas is given, also generates
+    # and compiles wrap_fn that rebuilds grad inputs into subclasses; otherwise wrap_fn is
+    # None. Returns (unwrap_fn, wrap_fn). Side effect: executes generated source.
     """Generate codegen'd unwrap and wrap functions for the backward pass.
 
     Returns (unwrap_fn, wrap_fn). unwrap_fn is used by the backward prologue
@@ -609,6 +702,10 @@ def codegen_subclass_wrapper(
     frozen_inp_indices: frozenset[int] = frozenset(),
     act_input_paths: ActInputPaths | None = None,
 ) -> Callable[..., object]:
+    # [FUNCTION DOC] Public entry point: generates the forward wrapper source for the given
+    # input/output metas, binds compiled_fn into its globals, compiles it, and returns the
+    # resulting callable (taking a single args list, which it clears) that unwraps subclass
+    # inputs, calls compiled_fn, and re-wraps outputs.
     """Generate a specialized wrapper function for subclass unwrap/wrap."""
     source, globals_dict = _codegen_subclass_wrapper_source(
         inp_metas,

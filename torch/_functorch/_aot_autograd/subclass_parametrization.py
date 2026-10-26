@@ -1,3 +1,9 @@
+# [MODULE DOC] Utility that replaces tensor-subclass parameters/buffers of an nn.Module
+# with parametrizations holding their plain inner tensors, so the subclass is rebuilt on
+# access instead of being flattened on every call. Contents: SubclassCreationMeta (a small
+# local record of how to rebuild a subclass), UnwrapTensorSubclass (the parametrization
+# module) and unwrap_tensor_subclass_parameters (the module-tree transformation).
+# No import-time side effects beyond imports.
 from __future__ import annotations
 
 import dataclasses
@@ -21,6 +27,12 @@ if TYPE_CHECKING:
 # so just recreated a new dataclass.
 @dataclasses.dataclass
 class SubclassCreationMeta:
+    # [CLASS DOC] Dataclass describing how to rebuild one tensor subclass from a flat list
+    # of plain tensors/opaques: start_idx and num_tensors locate its slice in the flat list,
+    # class_type is the subclass type, attrs maps each inner attr name to a nested meta,
+    # an OpaqueMeta, or None for a plain tensor, metadata is the __tensor_flatten__ context,
+    # and outer_size/outer_stride are the wrapper's size and stride. Distinct from the
+    # SubclassCreationMeta in schemas (this one is simpler and local to this module).
     start_idx: int
     num_tensors: int
     class_type: Any
@@ -32,10 +44,24 @@ class SubclassCreationMeta:
 
 
 class UnwrapTensorSubclass(torch.nn.Module):
+    # [CLASS DOC] Parametrization module for torch.nn.utils.parametrize. right_inverse
+    # flattens a subclass tensor into a list of plain tensors/opaques and records the
+    # rebuild recipe in the attribute subclass_meta (set dynamically, not in __init__);
+    # forward takes those flat tensors and rebuilds the original subclass via
+    # __tensor_unflatten__. forward must only be used after right_inverse has set
+    # subclass_meta.
     def forward(self, *tensors) -> torch.Tensor:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Rebuilds the subclass tensor from the flat inputs using the stored
+        # subclass_meta, consuming tensors in order (depth-first over attrs) and calling
+        # __tensor_unflatten__ at each level. Returns the reconstructed tensor. Raises
+        # AttributeError if right_inverse has not run (subclass_meta missing).
         todo: list[torch.Tensor | CustomClassBase] = list(tensors)
 
         def _unwrap_tensor_subclasses(subclass_meta, tensors, offset):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Recursive rebuild. A None meta takes the next flat
+            # tensor; otherwise gathers each attr (opaque takes the next item, others
+            # recurse), then calls the class's __tensor_unflatten__ with the stored
+            # metadata, outer size and stride. Returns (rebuilt tensor, new offset).
             if subclass_meta is None:
                 return tensors[offset], offset + 1
             inner_tensors = {}
@@ -61,11 +87,20 @@ class UnwrapTensorSubclass(torch.nn.Module):
     def right_inverse(
         self, tensor: torch.Tensor
     ) -> list[torch.Tensor | CustomClassBase]:
+        # [FUNCTION DOC] Flattens a subclass tensor into a list of plain tensors and
+        # reference-type opaques (depth-first over __tensor_flatten__ attrs), stores the
+        # rebuild recipe in self.subclass_meta, and returns the flat list. Raises
+        # AssertionError if the input is a plain torch.Tensor or an attr is neither a Tensor
+        # nor an opaque; raises ValueError for a non-symbolic-type opaque attr.
         if type(tensor) is torch.Tensor:
             raise AssertionError("tensor must be a subclass, not torch.Tensor")
         plain_tensors: list[torch.Tensor | CustomClassBase] = []
 
         def _create_subclass_meta(tensor, idx, plain_tensor_container):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Recursive flatten. A plain tensor is appended to the
+            # container and yields meta None. For a subclass, walks its flatten attrs,
+            # building nested metas (OpaqueMeta for opaques) and appending leaves to the
+            # container, and returns (SubclassCreationMeta, next index).
             if type(tensor) is torch.Tensor:
                 plain_tensor_container.append(tensor)
                 return None, idx + 1
@@ -113,6 +148,10 @@ class UnwrapTensorSubclass(torch.nn.Module):
 
 
 def unwrap_tensor_subclass_parameters(module: torch.nn.Module) -> torch.nn.Module:
+    # [FUNCTION DOC] Walks the module tree (recursing into children after handling the
+    # module's own direct parameters and buffers) and registers an UnwrapTensorSubclass
+    # parametrization on each parameter/buffer that is a traceable wrapper subclass.
+    # Mutates the module in place (state_dict keys change) and returns the same module.
     """
     Model transformation that replaces all the parameters that are subclasses to plain tensors.
     This reduces runtime overhead of flattening/unflattening the parameters.

@@ -1,3 +1,10 @@
+# [MODULE DOC] Helpers for AOTAutograd's handling of traceable tensor subclasses: building
+# rebuild metadata (create_subclass_meta / create_subclass_metadata), flattening subclasses
+# into plain tensors/opaques/symints both at trace time (unwrap_tensor_subclasses) and at
+# runtime (runtime_unwrap_tensor_subclasses), re-wrapping flat values (wrap_tensor_subclasses
+# and its joint variant), remapping static-input indices, and recomputing mutated input
+# indices after flattening. Import-time side effects: rebinds the module-level name zip to a
+# strict zip that raises on length mismatch.
 """
 This file contains utilities for tracing through __torch_dispatch__ based tensor subclasses and modes.
 AOTAutograd's responsibility is to trace through all pytorch capabilities that live in the pytorch dispatcher,
@@ -53,6 +60,9 @@ T = TypeVar("T", bound=torch.Tensor)
 def requires_subclass_dispatch(
     args: FakifiedFlatArgs, fw_metadata: ViewAndMutationMeta
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the runtime must unwrap/wrap subclasses: any flattened
+    # tensor argument is a traceable wrapper subclass, or any forward-graph output meta is a
+    # SubclassCreationMeta. Pure; args are flattened with pytree.
     args_flattened = pytree.arg_tree_leaves(*args)
     any_subclass_args = any(
         is_traceable_wrapper_subclass(x)
@@ -74,6 +84,8 @@ from .schemas import MemoryFormatMeta
 def maybe_suggest_memory_format(
     t: Tensor, with_memory_format: bool
 ) -> MemoryFormatMeta | None:
+    # [FUNCTION DOC] Returns None when with_memory_format is False, else the
+    # MemoryFormatMeta computed from tensor t.
     if not with_memory_format:
         return None
 
@@ -84,6 +96,8 @@ def _safe_metadata_eq(
     outer: Iterable[IntLikeType],
     inner: Iterable[IntLikeType],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Compares two int/SymInt sequences for equality without adding
+    # guards; returns True only if equality is provably true, else False.
     return guard_or_false(sym_eq(tuple(outer), tuple(inner)))
 
 
@@ -93,7 +107,11 @@ def _find_attr_matching_outer_metadata(
     *,
     metadata_fn: Callable[[Tensor], Iterable[IntLikeType]],
 ) -> str | None:
-    tensor_attrs = [key for key in inner_keys if isinstance(getattr(a, key), Tensor)]
+    # [FUNCTION DOC] HELPER: Among the inner attrs of subclass a that hold Tensors, finds
+    # one whose size (or stride, per metadata_fn) can stand in for a's own. Returns the first
+    # tensor attr name if every tensor attr's metadata provably equals a's, else None (also
+    # None when there are no tensor attrs).
+    tensor_attrs =[key for key in inner_keys if isinstance(getattr(a, key), Tensor)]
     if not tensor_attrs:
         return None
 
@@ -109,18 +127,29 @@ def _find_attr_matching_outer_metadata(
 
 
 def _symint_placeholders(lst: Iterable[IntLikeType]) -> tuple[bool, ...]:
+    # [FUNCTION DOC] HELPER: Returns a tuple of booleans, True for each entry that is a
+    # SymInt but not a nested int.
     return tuple(isinstance(s, SymInt) and not s.node.is_nested_int() for s in lst)
 
 
 def get_subclass_typing_container(
     tensor_subclass: torch.Tensor,
 ) -> dict[type[torch.Tensor], list[type[torch.Tensor]]]:
+    # [FUNCTION DOC] Recursively walks a traceable subclass and returns a mapping (default
+    # dict of lists) from each subclass type found to the list of instances of that type,
+    # including nested inner subclasses. Plain tensors and opaques are skipped. Raises
+    # AssertionError if an inner attr is neither a Tensor nor a CustomClassBase.
+    # KNOWN ISSUE: the docstring says it maps "inner tensors to subclass types", but the
+    # result maps subclass types to lists of subclass instances.
     """
     Given a subclass, returns a recursive dictionary mapping each
     inner tensors to its subclass types.
     """
 
     def _get_types_for_subclass(tensor_subclass: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Records the subclass instance under its type in the
+        # tracker, then recurses into Tensor inner attrs; opaque attrs are ignored. Does
+        # nothing for non-subclass tensors.
         if not is_traceable_wrapper_subclass(tensor_subclass):
             return
         tracker[type(tensor_subclass)].append(tensor_subclass)
@@ -147,6 +176,14 @@ def create_subclass_metadata(
     count_symints: bool,
     with_memory_format: bool = False,
 ) -> tuple[Any, int]:
+    # [FUNCTION DOC] Builds rebuild metadata for tensor a whose flattened values start at
+    # start_idx. A plain tensor yields a PlainTensorMeta (with symint size/stride
+    # placeholders if count_symints). A subclass yields a SubclassCreationMeta recording
+    # nested attr metas (OpaqueMeta for opaque attrs), flatten metadata, outer size/stride,
+    # the original subclass, optional memory format, and which inner attr can supply outer
+    # size/stride; its arg_count includes appended size/stride symints when count_symints.
+    # Returns (meta, next flat index). Raises RuntimeError for a non-symbolic opaque attr
+    # and AssertionError for attrs that are neither Tensor nor opaque.
     if not is_traceable_wrapper_subclass(a):
         size_symbol_placeholders = (
             _symint_placeholders(a.size()) if count_symints else ()
@@ -239,6 +276,13 @@ def create_subclass_meta(
     count_symints: bool = True,
     with_memory_format: bool = False,
 ) -> list[PlainTensorMeta | SubclassCreationMeta]:
+    # [FUNCTION DOC] For a flat list of args, returns one meta per arg describing how to
+    # rebuild it from flattened tensors: a SubclassCreationMeta for traceable subclasses, a
+    # PlainTensorMeta otherwise, tracking a running flat index by each meta's arg_count.
+    # Keyword-only count_symints and with_memory_format are forwarded for subclasses.
+    # Raises AssertionError if a traceable wrapper subclass is not a Tensor.
+    # KNOWN ISSUE: plain args get a PlainTensorMeta with no symint placeholders even when
+    # count_symints is true, unlike create_subclass_metadata's plain-tensor branch.
     idx = 0
     infos: list[PlainTensorMeta | SubclassCreationMeta] = []
     for a in curr_args:
@@ -269,14 +313,19 @@ def create_subclass_meta(
 
 
 def enumerate_filter_symints(lst: Iterable[IntLikeType]) -> list[tuple[int, SymInt]]:
+    # [FUNCTION DOC] Returns (position, value) pairs for the entries of lst that are SymInts
+    # but not nested ints.
     # Capture all SymInts from the iterable.
     def symint_check(s: IntLikeType) -> TypeGuard[SymInt]:
+        # [FUNCTION DOC] HELPER: True if s is a non-nested SymInt.
         return isinstance(s, SymInt) and not s.node.is_nested_int()
 
     return [(i, s) for i, s in enumerate(lst) if symint_check(s)]
 
 
 def compute_symint_placeholders(lst: Iterable[None | int | SymInt]) -> list[bool]:
+    # [FUNCTION DOC] Returns a list of booleans, True for each entry that is None (the
+    # marker make_runtime_safe leaves for non-nested symbolic ints).
     # Non-nested symints are replaced with None in `make_runtime_safe()`
     return [s is None for s in lst]
 
@@ -306,7 +355,17 @@ def unwrap_tensor_subclasses(
     *,
     append_symints: bool,
 ) -> tuple[list[FxValue], list[AOTDescriptor]]:
+    # [FUNCTION DOC] Trace-time flattening of a list of values (with parallel AOT
+    # descriptors) into plain tensors/opaques. Each traceable subclass is expanded
+    # depth-first over its __tensor_flatten__ attrs, each leaf getting a SubclassGetAttr
+    # descriptor chain. If append_symints, the non-nested SymInt sizes and strides are
+    # appended (with size/stride descriptors) after each subclass, and also after plain
+    # tensor leaves that came from a subclass attr. Opaque objects are wrapped as fake
+    # script objects when a fake mode is active. Returns (flat values, flat descriptors).
     def _maybe_fakeify_opaque(v: Any) -> Any:
+        # [FUNCTION DOC] HELPER: If v is a custom-class opaque and a fake mode is active
+        # and its type is a registered custom class, returns its fake wrapper; otherwise
+        # returns v unchanged.
         # Registered opaque types need to be wrapped as FakeScriptObject for
         # compile-time FX tracing (proxy slot tracking, hashability, etc.).
         if isinstance(v, CustomClassBase):
@@ -325,6 +384,10 @@ def unwrap_tensor_subclasses(
         *,
         out: tuple[list[FxValue], list[AOTDescriptor]],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Recursive worker; appends the flattened values and their
+        # descriptors of t to the out lists (mutates out). Non-subclass values are appended
+        # as is; subclasses are expanded per attr, then symint sizes/strides are appended
+        # when append_symints is set.
         # unwrap a subclass into plain tensors and their size/stride if "append_symint"
         # is True
         if not is_traceable_wrapper_subclass(t):
@@ -393,13 +456,26 @@ def runtime_unwrap_tensor_subclasses(
     append_symints: bool,
     subclass_metas: list[PlainTensorMeta | SubclassCreationMeta] | None = None,
 ) -> list[int | Tensor | SymInt | CustomClassBase]:
+    # [FUNCTION DOC] Runtime flattening of wrapped_args: non-subclass args pass through;
+    # subclasses are expanded into their inner tensors/opaques (via get_plain_tensors when
+    # subclass_metas is None, otherwise guided by the per-arg SubclassCreationMeta, and
+    # appending runtime SymInt sizes/strides at metadata-designated positions when
+    # append_symints). Returns the flat list. Raises AssertionError if append_symints is set
+    # without subclass_metas, a meta has the wrong type, or size/stride lengths mismatch.
     def flatten_subclass(
         x: Tensor | TraceableWrapperSubclass,
         subclass_meta: PlainTensorMeta | SubclassCreationMeta | OpaqueMeta | None,
         *,
         out: list[CustomClassBase | SymInt | Tensor | int],
     ) -> list[CustomClassBase | SymInt | Tensor | int]:
+        # [FUNCTION DOC] HELPER: Appends x's flattened values to out (mutating and
+        # returning it). Plain values are appended (plus symint sizes/strides for plain
+        # tensors with PlainTensorMeta when append_symints); subclasses recurse over their
+        # attrs and then append the symbolic outer size/stride entries.
         def append_plain_tensor_symints(tensor: Tensor, meta: PlainTensorMeta) -> None:
+            # [FUNCTION DOC] HELPER: Appends to out the size and stride entries of tensor
+            # at positions marked symbolic in meta. Raises AssertionError on a length
+            # mismatch between the tensor and the placeholder lists.
             size = tensor.size()
             if len(size) != len(meta.size_symbol_placeholders):
                 raise AssertionError(
@@ -507,6 +583,9 @@ def runtime_unwrap_tensor_subclasses(
 def unwrap_tensor_subclasses_with_indices_to_original(
     wrapped_args: list[Any],
 ) -> tuple[list[Any], list[int]]:
+    # [FUNCTION DOC] Flattens each arg (without symints) and returns the concatenated flat
+    # list plus a parallel list giving, for each flat value, the index of the original arg
+    # it came from.
     ret_unwrapped = []
     ret_indices_to_original = []
     for i, a in enumerate(wrapped_args):
@@ -523,7 +602,14 @@ def unwrap_tensor_subclasses_with_indices_to_original(
 def remap_unwrapped_subclass_arg_indices(
     wrapped_args: list[Any], static_input_indices: list[int]
 ) -> list[int]:
+    # [FUNCTION DOC] Maps indices of static inputs in the original arg list to indices in
+    # the flattened (subclass-unwrapped, symint-appended) arg list. Each original arg expands
+    # to a number of slots; only slots that hold tensors/opaques (not forwarded SymInts)
+    # of a static arg are reported. Returns the new indices in increasing order.
     def static_arg_slots(arg: Any, *, include_plain_tensor_symints: bool) -> list[bool]:
+        # [FUNCTION DOC] HELPER: Returns one boolean per flattened slot of arg: True for
+        # tensor/opaque slots, False for forwarded SymInt slots. Raises AssertionError for
+        # inner attrs that are neither Tensor nor opaque.
         # Forwarded SymInts occupy flattened arg positions, but static input indices
         # describe tensor/opaque slots whose value should not be copied.
         if not is_traceable_wrapper_subclass(arg):
@@ -589,6 +675,13 @@ def wrap_tensor_subclasses(
     is_runtime: bool = False,
     make_subclass_override: Callable[..., Any] | None = None,
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Rebuilds wrapped values from the flat list unwrapped_args using
+    # subclass_metas: plain metas pick their flat value by index; subclass metas are rebuilt
+    # through make_subclass_override if given, else the meta's creation_fn (with is_runtime).
+    # Checks each subclass meta's included_subclass_symints equals the argument. If
+    # num_fw_outs_saved_for_bw is set, the trailing activations are appended unchanged to the
+    # result; otherwise all flat values must be consumed. Returns a tuple. Raises
+    # AssertionError on meta type mismatch or count mismatch.
     # pyrefly: ignore [implicit-any]
     wrapped_args = []
     num_args_tallied = 0
@@ -671,6 +764,11 @@ def wrap_tensor_subclasses_maybe_joint(
     is_joint_structure: bool,
     meta: ViewAndMutationMeta,
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Wraps flat dense args back into subclasses for either structure. Joint
+    # (is_joint_structure): unwrapped_args must be a 2-tuple of (primals, tangents) lists;
+    # primals use subclass_inp_meta with symints, tangents use subclass_tangent_meta without;
+    # returns (wrapped_primals, wrapped_tangents). Inference: wraps the single list with
+    # subclass_inp_meta and returns the wrapped tuple. Raises AssertionError on bad structure.
     # Since this function is reused for both inference and joint graphs,
     if is_joint_structure:
         if not (isinstance(unwrapped_args, tuple) and len(unwrapped_args) == 2):
@@ -715,6 +813,12 @@ def compute_inner_mutated_inp_indices_from_subclass_meta(
     fw_metadata: ViewAndMutationMeta,
     inner_metadata: ViewAndMutationMeta,
 ) -> list[int]:
+    # [FUNCTION DOC] Computes the indices, in the flattened inner-graph input list, of inputs
+    # mutated outside the graph. Each outer input's info is replicated across the flat
+    # slots of its subclass (arg_count slots; one for plain tensors), then slots whose
+    # mutation_type is MUTATED_OUT_GRAPH are returned. With no subclass_inp_meta, returns
+    # inner_metadata.mutated_inp_runtime_indices as is. Raises AssertionError when lengths or
+    # per-input infos of the two metadata objects are inconsistent.
     # Note: [Recomputing subclass mutation handling]
     #
     # Generally, if a subclass requires grad, its components will not require grad.

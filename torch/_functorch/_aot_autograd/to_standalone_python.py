@@ -1,3 +1,11 @@
+# [MODULE DOC] Lowers a post-trace GraphModule to one self-contained Python source string
+# (compile_to_python) and loads it back (load_from_python). Runs AOTAutograd with a
+# capture-only inner compiler to record the codegen'd runtime-wrapper sources, runs Inductor
+# once on the dense graph, then composes inner Inductor code plus the captured wrappers as
+# real top-level defs with hoisted globals resolved by object identity. Main contents:
+# _compose_standalone_module (composition and guards), _resolve_global, _module_level_names,
+# _find_effectful_op, _graph_has_dynamic_shapes and the process-wide re-entrant lock
+# _COMPILE_LOCK. Import-time side effects: creates that lock; nothing is compiled on import.
 """Lower a GraphModule to a self-contained Python module via AOTAutograd + Inductor.
 
 This is the AOT half of the backend contract behind ``torch.compiler.precompile``:
@@ -176,6 +184,12 @@ _COMPILE_LOCK = threading.RLock()
 # import in the standalone module (rather than reconstructed field-by-field). Maps
 # object id -> (import_statement, expression). Built lazily to avoid import cycles.
 def _known_helper_table() -> dict[int, tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Lazily builds (to avoid import cycles) a mapping from object
+    # identity to (import statement, expression) for runtime helpers that generated wrappers
+    # may close over: the torch module, increment_version, and several helpers re-exported
+    # by standalone_runtime (normalize_as_list, mark_dynamo_propagated_dynamic_indices,
+    # gen_alias_from_base, _unwrap_tensoralias, two CUDARngStateHelper static methods).
+    # Returns a fresh dict on every call; no side effects beyond importing.
     # Generated artifacts import runtime helpers from the single stable surface
     # ``standalone_runtime`` (not scattered AOTAutograd internals).
     import torch
@@ -237,6 +251,12 @@ def _resolve_global(
     orch_closure_id: int | None = None,
     orch_entry_name: str | None = None,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Resolves one closed-over global object to a source expression,
+    # checked in order by identity: the inner call -> "_inner_call"; the orchestration
+    # closure -> orch_entry_name (AssertionError if that is None); a sibling wrapper fn -> its
+    # def name; a known helper -> its expression (adding its import to imports); otherwise
+    # reconstructed as source via emit_value. Mutates imports. Raises NotImplementedError
+    # (from emit_value) if the object cannot be expressed as source.
     """Return a Python expression (valid in the generated module) that reproduces
     ``obj``, recording any needed import. Raises NotImplementedError if ``obj`` is
     neither the inner call, a sibling wrapper, a known helper, nor source-
@@ -263,6 +283,10 @@ def _resolve_global(
 
 
 def _module_level_names(tree: ast.Module) -> set[str]:
+    # [FUNCTION DOC] HELPER: Returns the set of names bound at module scope by a parsed
+    # module: function/class defs, plain and annotated assignment targets (including
+    # unpacking), and imports (first dotted part or alias). Names removed by a module-level
+    # del statement are dropped from the set. Pure.
     """Names bound at module scope by a parsed module. Used to seed ``_reserve`` so an
     inlined wrapper's def name or hoisted global (chain wrapper or orchestration) cannot
     silently shadow a top-level name the inner Inductor module already binds."""
@@ -295,6 +319,17 @@ def _module_level_names(tree: ast.Module) -> set[str]:
 def _compose_standalone_module(
     inner_python: str, captured: list[GeneratedSource], inner_call_obj: Any
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the final standalone module text from inner Inductor
+    # source, the captured wrapper sources and the placeholder inner-call object. Steps:
+    # filter captured wrappers to the last orchestration's origin; reject backward wrappers;
+    # require exactly one orchestration with the expected positional signature; separate
+    # outer wrappers (walked outward from the orchestration closure) from inner-side ones;
+    # pick the chain head and guard capture order; reserve every top-level name; hoist each
+    # wrapper's globals as assignments and splice its def verbatim; check each wrapper is
+    # wired in and the inner module binds a module-level call; emit header, imports, optional
+    # rebuild helper, inner code, wrappers and a final call function. Returns the source.
+    # Raises NotImplementedError on any violated guard (name collision, unsupported or
+    # unwired wrapper, ambiguous closure, missing call binding).
     """Compose the inner Inductor ``call`` with AOTAutograd's captured runtime
     wrappers into one standalone module exposing ``call(flat_inputs) -> outputs``.
 
@@ -412,6 +447,9 @@ def _compose_standalone_module(
     _INNER_NAMES = ("compiled_fn", "_compiled_fn_")
 
     def _inner_ref(g: GeneratedSource) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the object a captured wrapper closes over as its
+        # inner callable (first present of the names in _INNER_NAMES in its globals), or None
+        # if it has none.
         for nm in _INNER_NAMES:
             if nm in g.globals_dict:
                 return g.globals_dict[nm]
@@ -530,6 +568,8 @@ def _compose_standalone_module(
     }
 
     def _reserve(name: str) -> None:
+        # [FUNCTION DOC] HELPER: Claims a top-level name in the composed module. Raises
+        # NotImplementedError if already claimed; otherwise records it in emitted_names.
         if name in emitted_names:
             raise NotImplementedError(
                 "aot_autograd.compile_to_python: generated top-level name "
@@ -544,6 +584,9 @@ def _compose_standalone_module(
         _reserve(_g.fn_name)
 
     def _resolve_globals(globals_dict: dict[str, object]) -> list[tuple[str, str]]:
+        # [FUNCTION DOC] HELPER: Resolves every global of a wrapper (skipping the builtins
+        # entry) to a source expression via _resolve_global; returns (name, expression)
+        # pairs in dict order and may add entries to the shared imports set.
         # Resolve each global a wrapper closes over to a standalone source expression.
         # ``globals_dict`` is the pre-exec snapshot from codegen.py, so the
         # interpreter ``__builtins__`` is absent; the skip is kept defensively in case a
@@ -565,6 +608,10 @@ def _compose_standalone_module(
         return out
 
     def _emit_inline(source: str, globals_dict: dict[str, object]) -> str:
+        # [FUNCTION DOC] HELPER: Returns text consisting of one assignment per resolved global
+        # (skipping names that already equal their expression, such as imports), followed by
+        # the wrapper source verbatim. Each hoisted name is reserved, so a collision raises
+        # NotImplementedError.
         # Splice the wrapper's def verbatim at module scope, hoisting each closed-over global
         # to a top-level assignment (skipping a name already module-available -- an imported
         # helper or ``torch`` -- detected as gname == its resolved expr). No exec / private
@@ -752,6 +799,11 @@ def _compose_standalone_module(
 
 
 def _find_effectful_op(gm: GraphModule, get_effect: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Depth-first search of gm and its child GraphModules (reached via
+    # get_attr nodes or node arguments, including inside containers) for a call_function
+    # node whose target is an op overload or higher-order operator for which get_effect
+    # returns a non-None effect. Returns the first such target, or None. Tracks visited
+    # modules by identity to avoid revisiting.
     """Return the first effectful op target reachable from ``gm``, or None.
 
     The target may be an ``OpOverload`` (e.g. ``aten::_print``) or a
@@ -770,6 +822,8 @@ def _find_effectful_op(gm: GraphModule, get_effect: Any) -> Any:
     seen: set[int] = set()
 
     def _scan(g: _GraphModule) -> Any:
+        # [FUNCTION DOC] HELPER: Scans one module's nodes for an effectful target, recursing
+        # into subgraphs; returns the first found target or None. Skips already-seen modules.
         if id(g) in seen:
             return None
         seen.add(id(g))
@@ -790,6 +844,8 @@ def _find_effectful_op(gm: GraphModule, get_effect: Any) -> Any:
         return None
 
     def _walk_values(value: Any) -> Iterator[_GraphModule]:
+        # [FUNCTION DOC] HELPER: Generator yielding every GraphModule found in value,
+        # descending through lists, tuples and dict values.
         # A GraphModule can appear as a direct node arg OR nested one level (or more)
         # inside a list/tuple/dict arg -- some HOPs pass their branch/body callables
         # inside a container -- so descend into containers before the isinstance check,
@@ -804,6 +860,9 @@ def _find_effectful_op(gm: GraphModule, get_effect: Any) -> Any:
                 yield from _walk_values(item)
 
     def _iter_subgraphs(g: _GraphModule, node: Any) -> Iterator[_GraphModule]:
+        # [FUNCTION DOC] HELPER: Generator yielding child GraphModules of a node: the module
+        # fetched by a get_attr node (looked up as a flat attribute of g) plus any
+        # GraphModule in its args or kwargs values.
         # A child graph reaches a node either as an attribute fetched by get_attr or
         # as a (possibly container-nested) argument (the form HOPs use for their
         # branch/body callables). make_fx emits FLAT get_attr targets (e.g.
@@ -820,6 +879,9 @@ def _find_effectful_op(gm: GraphModule, get_effect: Any) -> Any:
 
 
 def _graph_has_dynamic_shapes(gm: GraphModule) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any placeholder's recorded value is a SymInt, or
+    # a tensor with a symbolic size, stride or storage offset; False otherwise. Reads node
+    # metadata only. Unbacked symints appearing only on intermediates are not detected.
     """True if any placeholder is itself a SymInt or carries symbolic (SymInt) size,
     stride, or storage-offset metadata -- i.e. the graph was traced with dynamic dims.
     Drives the shapes mode for the capture pass: dynamic graphs stay dynamic, static
@@ -832,6 +894,7 @@ def _graph_has_dynamic_shapes(gm: GraphModule) -> bool:
     import torch
 
     def _is_symbolic(v: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if v is a torch SymInt.
         return isinstance(v, torch.SymInt)
 
     for node in gm.graph.nodes:
@@ -855,6 +918,15 @@ def compile_to_python(
     *,
     options: dict[str, Any] | None = None,
 ) -> tuple[str, bytes | None]:
+    # [FUNCTION DOC] Public entry point. Validates gm is a GraphModule (TypeError otherwise)
+    # and contains no effectful op (NotImplementedError). Under the process-wide lock, runs
+    # Inductor's compile_fx on a deep copy under no_grad with a capture-only inner compiler
+    # and a thread-local sink to record the AOTAutograd wrapper sources (dynamic or static
+    # shapes mode chosen from the graph), then compiles the captured dense graph with
+    # Inductor's compile_to_python (options forwarded) and composes everything into one
+    # module string. Returns (python source, optional opaque cache bytes). Raises
+    # RuntimeError if no inner forward graph was captured; NotImplementedError if more than
+    # one inner graph appears or composition guards fail.
     """Compile ``gm`` to ``(python_code, cache)``; see the module docstring.
 
     THREADING: serialized by a process-global lock (``_COMPILE_LOCK``). The wrapper-source
@@ -919,6 +991,10 @@ def compile_to_python(
         dense: dict[str, Any] = {}
 
         def _capture_inner_compile(dense_gm, dense_inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Stand-in inner compiler. Stores the dense graph and a
+            # boxed placeholder callable (whose identity marks the inner call) in the
+            # enclosing dense dict and returns the placeholder; never compiles. Raises
+            # NotImplementedError if called a second time (more than one inner forward graph).
             if "gm" in dense:
                 raise NotImplementedError(
                     "aot_autograd.compile_to_python does not support a graph whose "
@@ -983,6 +1059,9 @@ def compile_to_python(
 def load_from_python(
     python_code: str, cache: bytes | None = None
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Inverse of compile_to_python: delegates to Inductor's load_from_python
+    # with the source and optional cache bytes and returns the resulting runnable call
+    # function. Executing the module may JIT-compile kernels; the cache only warms them.
     """Load the module emitted by ``compile_to_python`` into a runnable ``call`` -- the
     inverse of ``compile_to_python``: (python_code, cache) in, runnable ``call`` out.
 
