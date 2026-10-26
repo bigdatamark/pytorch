@@ -5,6 +5,16 @@
 
 # NOTE: this file may be removed once we move to a dynamo frontend
 
+# [MODULE DOC]
+# Defines the local_map_hop higher order operator used by the AutoParallel flow:
+# a graph body executed on local (per-shard) shapes while the surrounding graph
+# sees global shapes. Contains placement-based redistribution helpers that
+# compute local/global fake tensors, a joint-graph forward/backward partitioner
+# (create_hop_fw_bw), an autograd Function, and autograd / functionalize / fake /
+# proxy / eager implementations. A module-level flag toggled by the defer_inlining
+# context manager chooses between inlining the body and proxying the HOP.
+# Import-time side effects: creates the singleton local_map_hop and registers it
+# with the activation-checkpointing caching dispatch modes via redirect_to_mode.
 import contextlib
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
@@ -37,6 +47,9 @@ GraphArg: TypeAlias = tuple[torch.Tensor, int, torch.SymInt, None]
 
 @contextmanager
 def defer_inlining() -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that sets the module-global defer-inlining flag
+    # to True for its body (so local_map is proxied and traced with local shapes
+    # rather than inlined) and restores the prior value on exit, even on error.
     global _DEFER_INLINING
     prior = _DEFER_INLINING
     try:
@@ -52,6 +65,12 @@ def _new_tensor(
     new_shape: Sequence[int] | None = None,
     new_stride: Sequence[int] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: For a tensor, returns a fresh empty strided tensor with
+    # the same device, dtype and requires_grad, using the given shape/stride when
+    # provided and the original otherwise (this strips wrapper classes like
+    # FunctionalTensor or Parameter). Non-tensors are returned unchanged. Raises
+    # AssertionError for tensor subclasses other than FunctionalTensor, FakeTensor
+    # and plain Tensor.
     if isinstance(t, torch.Tensor):
         if type(t) not in (FunctionalTensor, FakeTensor, torch.Tensor):
             raise AssertionError(f"No subclasses support for now, found {type(t)}")
@@ -72,6 +91,11 @@ def _redistribute(
     mesh: Any,
     shape_stride_fn: Callable[[torch.Tensor, Any, Any], tuple[list[int], list[int]]],
 ) -> GraphArg:
+    # [FUNCTION DOC] HELPER: Creates new fake tensors for args with shapes and strides
+    # recomputed per entry via shape_stride_fn(tensor, mesh, placements), under the
+    # detected fake mode with functionalization and proxy tracing disabled. None
+    # entries are left as they are. Raises AssertionError if no fake mode is found
+    # or an output is not a fake tensor / int / SymInt / None. Returns a tuple.
     from torch._dispatch.python import suspend_functionalization
     from torch._guards import detect_fake_mode
     from torch._subclasses.functional_tensor import disable_functional_mode
@@ -115,6 +139,9 @@ def _redistribute(
 def redistribute_fw_inputs(
     global_args: Any, all_placements: Any, mesh: Any, _: int | None = None
 ) -> GraphArg:
+    # [FUNCTION DOC] HELPER: Converts global-shaped forward inputs into local-shaped
+    # fakes using the input placements on the mesh. Requires one placement per
+    # input (AssertionError otherwise). The last parameter is unused.
     if len(global_args) != len(all_placements):
         raise AssertionError(
             f"global_args length ({len(global_args)}) != all_placements length ({len(all_placements)})"
@@ -130,6 +157,11 @@ def redistribute_fw_inputs(
 def redistribute_fw_outputs(
     local_outs: Any, all_placements: Any, mesh: Any, num_activations: int
 ) -> GraphArg:
+    # [FUNCTION DOC] HELPER: Converts local forward outputs to global-shaped fakes.
+    # local_outs holds the forward outputs followed by num_activations saved
+    # activations; only the outputs are redistributed (by out placements), the
+    # activations are appended unchanged. AssertionError if lengths mismatch or
+    # there are no forward outputs.
     if len(local_outs) != len(all_placements) + num_activations:
         raise AssertionError(
             f"local_outs length ({len(local_outs)}) != "
@@ -153,6 +185,10 @@ def redistribute_fw_outputs(
 def redistribute_bw_inputs(
     global_args: Any, all_placements: Any, mesh: Any, num_activations: int
 ) -> GraphArg:
+    # [FUNCTION DOC] HELPER: Backward-input counterpart. global_args holds
+    # num_activations activations first, then the incoming gradients; the
+    # gradients are converted to local shapes by placements and the activations
+    # pass through unchanged. AssertionError on length mismatch or no gradients.
     if len(global_args) != len(all_placements) + num_activations:
         raise AssertionError(
             f"global_args length ({len(global_args)}) != "
@@ -176,6 +212,9 @@ def redistribute_bw_inputs(
 def redistribute_bw_outputs(
     local_outs: Any, all_placements: Any, mesh: Any, _: int | None = None
 ) -> GraphArg:
+    # [FUNCTION DOC] HELPER: Converts local backward outputs (input gradients) to
+    # global-shaped fakes using the placements. One placement per output is
+    # required (AssertionError otherwise). The last parameter is unused.
     if len(local_outs) != len(all_placements):
         raise AssertionError(
             f"local_outs length ({len(local_outs)}) != all_placements length ({len(all_placements)})"
@@ -189,10 +228,16 @@ def redistribute_bw_outputs(
 
 
 class LocalMapHOP(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator "local_map_hop": runs a GraphModule body (whose
+    # meta carries local_map_kwargs: in/out placements and device mesh) on local
+    # shards. Stateless.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the operator under the name "local_map_hop".
         super().__init__("local_map_hop")
 
     def __call__(self, gm: GraphModule, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Dispatches the body graph module gm with args and kwargs
+        # through the HOP dispatcher and returns the outputs.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(gm, *args, **kwargs)
 
@@ -208,6 +253,20 @@ def create_hop_fw_bw(
     fw_gm: GraphModule,
     *_args: Any,
 ) -> tuple[GraphModule, GraphModule, int, int, set[int]]:
+    # [FUNCTION DOC] Builds forward and backward graph modules for a local_map body.
+    # Reads in_placements, out_placements and device_mesh from fw_gm.meta
+    # (AssertionError if absent or in_placements length differs from the args).
+    # Under a fake mode (detected, or created if missing) converts args to local
+    # shapes, runs fw_gm to get example outputs/gradients, and records indices of
+    # outputs that are tensors requiring grad. Traces a joint function (via
+    # AOTAutograd create_joint, which rejects unbacked symints) with make_fx,
+    # copies forward metadata to backward nodes, partitions it with the Inductor
+    # partition function, tags nodes as forward/backward, copies local_map_kwargs
+    # into both graph metas (backward in/out placements derived from forward
+    # out/in placements), validates input/output/activation counts (AssertionError
+    # on any mismatch), and stores num_activations and is_backward in metas.
+    # Returns (fw graph, bw graph, number of forward inputs, number of forward
+    # outputs, set of output indices that receive gradients).
     """
     Traces a joint, applies passes and partitions it
     """
@@ -291,13 +350,23 @@ def create_hop_fw_bw(
         def joint_f(
             *primals_and_tangents: list[torch.Tensor],
         ) -> Any:
+            # [FUNCTION DOC] HELPER: Joint forward+backward function traced by
+            # make_fx. Splits inputs into primals and tangents, runs the body
+            # through create_joint, raises AssertionError if free unbacked symbols
+            # appear in the outputs or grads, clones outputs that alias inputs,
+            # and returns the gradients followed by the forward outputs.
             primals = primals_and_tangents[:num_fw_inputs]
             tangents = primals_and_tangents[num_fw_inputs:]
 
             def prepare_fw_with_masks(
                 fw_gm: torch.fx.GraphModule,
             ) -> Callable[..., Any]:
+                # [FUNCTION DOC] HELPER: Returns a function that runs fw_gm and also
+                # reports, per output, whether it is a tensor requiring grad.
                 def fw_with_masks(*args: Any) -> tuple[tuple[Any], list[bool]]:
+                    # [FUNCTION DOC] HELPER: Runs fw_gm via an FX Interpreter (to
+                    # carry node metadata through); raises AssertionError if the
+                    # result is not a tuple. Returns (outputs, requires-grad masks).
                     # The Interpreter here is required to propagate metadata
                     # from the dynamo graph body to the local_map graph body.
                     # This is required for fx_traceback.annotate for work.
@@ -455,6 +524,10 @@ def create_hop_fw_bw(
 
 
 class LocalMapAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd Function for local_map_hop. Forward runs the partitioned
+    # forward graph (outputs plus saved activations) below autograd; backward runs
+    # the partitioned backward graph on saved activations and incoming grads.
+    # State on ctx: bw_gm, num_fw_ins, filtered_grads_idx, expected tangent metadata.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -467,6 +540,11 @@ class LocalMapAutogradOp(torch.autograd.Function):
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor | None, ...]:
+        # [FUNCTION DOC] Stores backward graph, input count and gradient indices on
+        # ctx, runs local_map_hop on fw_gm below autograd, saves the trailing
+        # activations for backward, records memory-format expectations of each
+        # gradient-receiving output (forced memory-format mode because backward
+        # tangents are global-shaped), and returns only the forward outputs.
         from torch._functorch._aot_autograd.schemas import MemoryFormatMeta
 
         ctx.bw_gm = bw_gm
@@ -493,6 +571,17 @@ class LocalMapAutogradOp(torch.autograd.Function):
     def backward(
         ctx: Any, *_grads: tuple[torch.Tensor]
     ) -> tuple[torch.Tensor | None, ...]:
+        # [FUNCTION DOC] Computes input gradients. Requires saved-value positions to
+        # be sorted (AssertionError otherwise, i.e. no interleaving of tensors and
+        # symints), reverses them so symints come first, selects incoming grads at
+        # filtered indices, coerces each to the expected memory format, runs
+        # local_map_hop on the backward graph with activations and grads, and
+        # raises RuntimeError if the number of gradients differs from the number
+        # of forward inputs. Returns None for the five non-tensor forward args
+        # followed by the input gradients.
+        # KNOWN ISSUE: coercion indexes the filtered grad list by the original
+        # output index (keys of expected_tangent_metadata), which is only right
+        # when filtered indices are contiguous from zero.
         from torch._functorch._aot_autograd.runtime_wrappers import (
             coerce_to_expected_memory_format,
         )
@@ -529,6 +618,10 @@ def autograd_key(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
+    # [FUNCTION DOC] Autograd-key implementation. Raises AssertionError if
+    # in_grad_placements is set (unsupported). When deferred inlining is on,
+    # builds forward/backward graphs with create_hop_fw_bw and applies
+    # LocalMapAutogradOp; otherwise simply interprets fw_gm on the args (inlined).
     local_map_kwargs = fw_gm.meta["local_map_kwargs"]  # type: ignore[attr-defined]
     if local_map_kwargs.get("in_grad_placements", None) is not None:
         raise AssertionError("local_map in_grad_placements are not yet supported.")
@@ -548,6 +641,9 @@ def autograd_key(
 def functional_mode_key(
     ctx: Any, gm: GraphModule, *args: Any, **kwargs: Any
 ) -> tuple[torch.Tensor]:
+    # [FUNCTION DOC] Functionalization implementation: requires no kwargs
+    # (AssertionError), unwraps tensor args, redispatches local_map_hop to the
+    # next key and wraps the outputs.
     if kwargs:
         raise AssertionError(f"kwargs must be empty, got {kwargs}")
 
@@ -563,6 +659,11 @@ def fake_mode_key(
     *args: Any,
     **kwargs: Any,
 ) -> GraphArg:
+    # [FUNCTION DOC] Fake-tensor implementation (not cached). Without deferred
+    # inlining, just runs gm on the args. Otherwise redistributes the global-shaped
+    # args to local shapes (backward or forward variant per gm.meta is_backward,
+    # using num_activations), runs gm, and converts the local outputs back to
+    # global shapes using out placements. Returns the global outputs.
     if not _DEFER_INLINING:
         return gm(*args, **kwargs)
 
@@ -597,6 +698,10 @@ def _proxy_mode_arg(
     proxy_mode: ProxyTorchDispatchMode,
     arg: Any,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Converts an argument to its proxy. A GraphModule not
+    # already a submodule of the tracer root is first registered there under a
+    # fresh name local_map_body so generated code can reference it as an
+    # attribute. Returns the unwrapped proxy for the argument.
     if isinstance(arg, torch.fx.GraphModule):
         # Install local_map bodies as real submodules so FX source emission can
         # reload them through self instead of closing over a local Python target.
@@ -616,6 +721,12 @@ def proxy_mode_key_common(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[torch.Tensor]:
+    # [FUNCTION DOC] Shared proxy-tracing logic. Requires an active proxy mode and no
+    # kwargs (AssertionError), computes example outputs by calling local_map_hop,
+    # records a call_function node for the HOP with proxied args, requires
+    # gm.meta to hold non-empty local_map_kwargs (AssertionError otherwise) and
+    # copies them onto the new node's meta. Returns the example outputs tracked to
+    # the new proxy. Side effects: may register submodules and adds a graph node.
     if proxy_mode is None:
         raise AssertionError("Mode should always be enabled for python fallback key")
     if len(kwargs) != 0:
@@ -651,6 +762,8 @@ def proxy_mode_key(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: ProxyTorchDispatchMode implementation; delegates to
+    # proxy_mode_key_common.
     return proxy_mode_key_common(proxy_mode, gm, *args, **kwargs)
 
 
@@ -661,4 +774,6 @@ def real_impl(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Eager implementation with real tensors; calls the body
+    # graph module directly and returns its outputs.
     return gm(*args, **kwargs)

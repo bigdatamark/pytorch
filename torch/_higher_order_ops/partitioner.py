@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Utilities to build a joint forward/backward graph for a higher order op body
+# and split it into forward and backward graph modules using the min-cut
+# rematerialization partitioner. Contains HopJointGraph (normalizes the joint
+# graph), HopPartitionedGraph (validated partition result), the
+# create_hop_joint_graph builder and the HopGraphMinCutPartitioner entry point.
+# Import-time side effect: creates the module logger only.
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -10,6 +17,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _find_hop_subgraph_outputs(gm: torch.fx.GraphModule) -> tuple[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Returns the tuple of nodes returned by the graph's
+    # (first) output node. Raises AssertionError if the output node's args are not
+    # a tuple.
     output_node_args = gm.graph.find_nodes(op="output")[0].args
     if not isinstance(output_node_args, tuple):
         raise AssertionError(
@@ -19,10 +29,18 @@ def _find_hop_subgraph_outputs(gm: torch.fx.GraphModule) -> tuple[torch.fx.Node]
 
 
 def is_complex_expr(expr: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if a symbolic expression is neither a
+    # bare symbol nor a constant (i.e. a compound expression such as a sum).
     return not expr.is_symbol and not expr.is_constant()
 
 
 class HopPartitionedGraph:
+    # [CLASS DOC] Result of partitioning a HOP joint graph. Holds fw_gm (outputs:
+    # original forward outputs followed by saved intermediates), bw_gm (inputs:
+    # intermediates followed by output gradients), the count of forward outputs and
+    # of intermediates, and a flag forbidding complex symbolic expressions at the
+    # boundary. Construction reorders fw_gm outputs to match bw_gm inputs and then
+    # validates the boundary, raising on mismatch.
     def __init__(
         self,
         fw_gm: torch.fx.GraphModule,
@@ -31,6 +49,10 @@ class HopPartitionedGraph:
         n_intermediates: int,
         no_complex_exprs_at_boundary: bool,
     ):
+        # [FUNCTION DOC] Stores the two graph modules and counts, then normalizes
+        # fw_gm's output order and checks the partition boundary. Raises
+        # RuntimeError (from the check) if the partition is invalid. Mutates
+        # fw_gm in place (output order, recompile).
         self.fw_gm = fw_gm
         self.bw_gm = bw_gm
         self.n_fw_outputs = n_fw_outputs
@@ -40,6 +62,15 @@ class HopPartitionedGraph:
         self._check_partition_boundary()
 
     def _check_partition_boundary(self) -> None:
+        # [FUNCTION DOC] HELPER: Validates the partition. Collects reasons when: a fw
+        # output lacks a val meta or is not a SymInt/Tensor; a SymInt output is a
+        # complex expression while that is disallowed; the fw output count differs
+        # from forward outputs plus intermediates; fw output count differs from bw
+        # input count; fw intermediates differ from bw intermediates in name or
+        # size/expression; or forward outputs differ from bw gradient inputs in
+        # size/expression. Raises RuntimeError listing all reasons. No mutation.
+        # KNOWN ISSUE: with zero forward outputs the slices of bw placeholders by
+        # negative n_fw_outputs would select everything or nothing incorrectly.
         """check partitioned graph is in valid state."""
         invalid_reasons = []
         fw_outputs = _find_hop_subgraph_outputs(self.fw_gm)
@@ -84,6 +115,8 @@ class HopPartitionedGraph:
             val1: torch.SymInt | torch.Tensor,
             val2: torch.SymInt | torch.Tensor,
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if both values are the same kind and
+            # match: SymInts compare by symbolic expression, tensors by size.
             if type(val1) is not type(val2):
                 return False
 
@@ -111,6 +144,11 @@ class HopPartitionedGraph:
             )
 
     def _reorder_fw_output(self) -> None:
+        # [FUNCTION DOC] HELPER: Reorders fw_gm's trailing intermediate outputs to
+        # follow the order of the first n_intermediates bw_gm placeholders, matching
+        # by node name. Rewrites the output node args, lints and recompiles fw_gm.
+        # No-op when there are no intermediates. Raises KeyError if a bw name has
+        # no matching fw intermediate.
         """
         Before the pass, fw_gm returns (*fw_outputs, *intermediates1)
         and bw_gm takes (*intermediates2, *grad_fw_outputs) as input.
@@ -167,6 +205,11 @@ class HopPartitionedGraph:
 
 
 class HopJointGraph:
+    # [CLASS DOC] Wrapper around a joint forward+backward GraphModule. Attributes:
+    # joint_gm, n_primals (leading placeholders that are primal inputs), n_fw_outputs,
+    # functionalized flag, and n_tangents (set while renaming placeholders). Construction
+    # renames placeholders and removes redundant sym_size nodes; partition() splits the
+    # graph into a HopPartitionedGraph.
     def __init__(
         self,
         joint_gm: torch.fx.GraphModule,
@@ -175,6 +218,9 @@ class HopJointGraph:
         *,
         functionalized: bool,
     ):
+        # [FUNCTION DOC] Stores the joint graph and counts, then renames
+        # placeholders (primals_N / tangents_N) and removes redundant sym_size ops,
+        # mutating joint_gm in place.
         self.joint_gm = joint_gm
         self.n_primals = n_primals
         self.n_fw_outputs = n_fw_outputs
@@ -184,6 +230,10 @@ class HopJointGraph:
         self._remove_redundant_sym_size_ops()
 
     def _rename_phs(self) -> None:
+        # [FUNCTION DOC] HELPER: Renames the first n_primals placeholders to
+        # primals_i and the rest to tangents_j (target and name), counts tangents
+        # into n_tangents, then lints and recompiles the graph module. Mutates
+        # joint_gm and sets n_tangents.
         """
         Rename the placeholders for joint_gm so that the partitioner
         could recognize which inputs are primals and which are tangents.
@@ -202,6 +252,10 @@ class HopJointGraph:
         self.joint_gm.compile()
 
     def _remove_redundant_sym_size_ops(self) -> None:
+        # [FUNCTION DOC] HELPER: Maps symbolic expressions of SymInt placeholders to
+        # their nodes; every sym_size.int call whose value expression equals one
+        # of those is replaced by the placeholder and erased. Raises AssertionError
+        # if a sym_size node lacks a val meta. Lints and recompiles joint_gm.
         """
         Deletes torch.ops.sym_size.int operators whose output is a
         corresponding placeholder that holds the same symbol, and replace all usage
@@ -243,6 +297,10 @@ class HopJointGraph:
         self.joint_gm.recompile()
 
     def _mark_complex_exprs_as_must_recompute(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the recompute meta of every call_function node
+        # whose val is a SymInt with a complex expression to MUST_RECOMPUTE so such
+        # values are not saved across the partition boundary. Raises AssertionError
+        # if such a node already has a recompute policy. Lints and recompiles.
         """
         For control flow operators such as scan, we don't want to
         have symint in the partitioning boundaries because otherwise we would need to support stacking
@@ -278,6 +336,12 @@ class HopJointGraph:
     def partition(
         self, partition_fn: Callable, always_recompute_complex_exprs: bool
     ) -> HopPartitionedGraph:
+        # [FUNCTION DOC] Splits the joint graph with partition_fn (called with the
+        # joint graph, no profiling info, and the forward output count). When
+        # always_recompute_complex_exprs is set, first marks complex SymInt nodes
+        # as must-recompute. Computes the number of intermediates as the forward
+        # graph output count minus forward outputs and returns a validated
+        # HopPartitionedGraph. Logs graphs at debug level.
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "before min_cut_partition:\n%s",
@@ -312,6 +376,12 @@ def create_hop_joint_graph(
     fw_args: tuple[torch.Tensor | torch.SymInt, ...],
     functionalize: bool,
 ) -> HopJointGraph:
+    # [FUNCTION DOC] Traces fw_fn with fw_args (grad enabled), checks every output
+    # is a node carrying a tensor val (AssertionError otherwise), builds zero
+    # example gradients per output, traces the backward-with-forward-outputs
+    # function on args plus gradients into a joint graph and, if requested,
+    # functionalizes it (removing mutations and views) after tracing. Returns
+    # a HopJointGraph with primals count equal to len(fw_args).
     fw_gm = materialize_as_graph(fw_fn, fw_args, force_enable_grad=True)
     fw_gm_output_nodes = _find_hop_subgraph_outputs(fw_gm)
 
@@ -351,6 +421,7 @@ def create_hop_joint_graph(
 
 
 class HopGraphMinCutPartitioner:
+    # [CLASS DOC] Stateless namespace exposing the min-cut based partitioning entry point.
     @staticmethod
     def create_partitioned_graph(
         fw_fn: Callable,
@@ -358,6 +429,10 @@ class HopGraphMinCutPartitioner:
         *,
         always_recompute_complex_exprs: bool = False,
     ) -> HopPartitionedGraph:
+        # [FUNCTION DOC] Builds a functionalized joint graph for fw_fn and fw_args
+        # and partitions it with the min-cut rematerialization partitioner.
+        # always_recompute_complex_exprs keyword forces complex symbolic
+        # expressions to be recomputed in backward. Returns a HopPartitionedGraph.
         """
         Inputs:
             - fw_fn: the forward function that we'll use to create a joint graph and partition

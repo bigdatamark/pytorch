@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the map higher order operator: apply a function to each slice along
+# the first dimension of the mapped tensors (plus shared extra arguments) and
+# stack the results. Contains the public map function, the map_impl operator,
+# its autograd Function, and dense / proxy-tracing / fake-tensor / functionalize
+# implementations, plus a reference eager implementation (_fake_map).
+# Import-time side effects: creates the singleton map_impl and registers its
+# dispatch implementations (dense, autograd, proxy, fake, functionalize).
 import functools
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -40,7 +48,11 @@ from torch.fx.experimental.proxy_tensor import (
 
 
 class MapImpl(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator "map_impl" taking a body function f, a sequence
+    # of mapped tensors xs, additional positional args, and an optional keyword
+    # string of comma-separated indices of mutated xs. Stateless.
     def __init__(self):
+        # [FUNCTION DOC] Initializes the operator under the name "map_impl".
         super().__init__("map_impl")
 
     def __call__(
@@ -51,6 +63,9 @@ class MapImpl(HigherOrderOperator):
         *,
         mutated_arg_indices: str = "",
     ) -> Any:
+        # [FUNCTION DOC] Dispatches the map: forwards f, xs, pos_args and the
+        # mutated_arg_indices keyword to the HOP dispatcher and returns the
+        # stacked outputs.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(
             f, xs, pos_args, mutated_arg_indices=mutated_arg_indices
@@ -58,6 +73,13 @@ class MapImpl(HigherOrderOperator):
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, f, xs, pos_args, mutated_arg_indices: str = ""):
+        # [FUNCTION DOC] Builds the HOP function schema. Creates example inputs
+        # (per-slice empty tensors with the stride and dtype of each mapped x, plus
+        # the extra args), traces f into a graph, and declares: the body graph arg,
+        # one arg per xs (marked mutated when its index is listed in
+        # mutated_arg_indices, a comma-separated string), one per additional input
+        # (never mutable, since sharing a mutable buffer would break iteration
+        # independence), the body's outputs, and the pytree spec. Returns the schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
 
         all_inputs = tuple(
@@ -113,6 +135,13 @@ def map(
     xs: pytree.PyTree | torch.Tensor,
     *args: TypeVarTuple,
 ):
+    # [FUNCTION DOC] Public map API. Flattens xs and args with pytree, requires
+    # every leaf of xs to be a tensor with the same non-zero leading dimension,
+    # then calls map_impl on a wrapper that unflattens the leaves and invokes f
+    # with the xs slice followed by args, optionally compiling it via the shared
+    # compile-and-run helper. Returns the stacked outputs. Raises RuntimeError if
+    # xs has non-tensor leaves, a zero leading dimension, or inconsistent
+    # leading dimensions.
     r"""
     Performs a map of f with xs. Intuitively, you can think of the semantic being::
 
@@ -171,8 +200,12 @@ def map(
         )
 
     def run_flattened_map(f, flat_xs, flat_args):
+        # [FUNCTION DOC] HELPER: Binds f and the tree specs into a flat-argument
+        # function and runs map_impl on the flat xs and flat extra args.
         def wrapped_fn(*flat_args, f, xs_tree_spec, args_tree_spec, num_xs):
-            xs = pytree.tree_unflatten(flat_args[:num_xs], xs_tree_spec)
+            # [FUNCTION DOC] HELPER: Rebuilds xs (first num_xs leaves) and the extra
+            # args from flat leaves using the saved specs and calls f with them.
+            xs =pytree.tree_unflatten(flat_args[:num_xs], xs_tree_spec)
             args = pytree.tree_unflatten(flat_args[num_xs:], args_tree_spec)
             return f(xs, *args)
 
@@ -191,9 +224,17 @@ def map(
 
 
 class MapAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd Function for map_impl. Forward runs map_impl below
+    # autograd and saves inputs plus the body function, counts and dispatch key
+    # sets on ctx; backward traces a per-slice backward graph and runs it via
+    # map_impl over the slices.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, f, num_mapped_args, *flat_args):
+        # [FUNCTION DOC] Saves f, number of mapped and positional args, the current
+        # dispatch TLS include/exclude key sets, and the inputs on ctx, then runs
+        # map_impl with autograd disabled. Args: f body, num_mapped_args, flat_args
+        # (mapped tensors followed by positional args). Returns a tuple of outputs.
         ctx._f = f
         ctx._num_mapped_args = num_mapped_args
         ctx._num_pos_args = len(flat_args) - num_mapped_args
@@ -210,6 +251,16 @@ class MapAutogradOp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *flat_grads):
+        # [FUNCTION DOC] Computes gradients. Splits saved forward args into mapped and
+        # positional ones, builds a per-slice backward function from f, wraps it so
+        # arguments are reordered (mapped, grads, pos) and non-tensor gradients are
+        # recorded as masks, traces it to a graph using first-slice example inputs
+        # (functionalization and proxy tracing suspended, forward key sets reused,
+        # grad enabled), and runs map_impl with that graph over mapped args and
+        # gradients. Returns None for f and num_mapped_args followed by input
+        # gradients with None restored via the masks.
+        # KNOWN ISSUE: positional-arg gradients come out stacked per slice by
+        # map_impl rather than reduced across iterations.
         fw_args = saved_values(ctx)
         num_mapped_args = ctx._num_mapped_args
         num_pos_args = ctx._num_pos_args
@@ -229,6 +280,10 @@ class MapAutogradOp(torch.autograd.Function):
 
         # Create a wrapper around thefor the bw_f
         def bw_f_wrapper(*args):
+            # [FUNCTION DOC] HELPER: Backward body for one slice. Takes mapped args,
+            # upstream grads and pos args, reorders them to primals then tangents,
+            # runs bw_f, records which gradient outputs are tensors in the
+            # enclosing grads_tensor_masks, and returns only the masked-in grads.
             nonlocal grads_tensor_masks
 
             # Dissect args and re-order them for the ``ctx._bw_f``
@@ -247,6 +302,10 @@ class MapAutogradOp(torch.autograd.Function):
             return filter_with_masks(gradients, grads_tensor_masks)
 
         def construct_args_single_step_bw():
+            # [FUNCTION DOC] HELPER: Builds example inputs for tracing one backward
+            # step: first-slice copies of mapped args and of gradients (keeping
+            # their requires_grad), and the positional args unwrapped from
+            # functional tensors. Returns them as one tuple in the same order.
             unwrapped_mapped_xs = pytree.tree_map(_from_fun, fw_mapped_args)
             # Use first_slice_copy instead of _unstack_pytree to avoid
             # iterating over batch dim, which would guard on symbolic sizes.
@@ -285,6 +344,9 @@ class MapAutogradOp(torch.autograd.Function):
 
 
 def _broadcast_to_batch(output, batch_size):
+    # [FUNCTION DOC] HELPER: For each tensor in the output pytree, adds a leading
+    # dimension of batch_size by expanding and cloning into contiguous memory;
+    # non-tensor leaves are returned unchanged. Returns the same pytree structure.
     """Expand each tensor in output pytree to include batch dimension.
 
     Note: Although outputs are flattened in the compiled path (via torch.compile),
@@ -293,6 +355,7 @@ def _broadcast_to_batch(output, batch_size):
     """
 
     def expand_with_batch(t):
+        # [FUNCTION DOC] HELPER: Leaf transform for tensors described above.
         if isinstance(t, torch.Tensor):
             # Use contiguous_format to match torch.stack behavior
             return (
@@ -313,10 +376,17 @@ def trace_map(
     pos_args: Sequence[torch.fx.node.BaseArgumentTypes],
     mutated_arg_indices: str = "",
 ) -> Any:
+    # [FUNCTION DOC] Proxy-tracing helper. With proxy tracing disabled, traces f on
+    # first-slice example inputs plus pos_args into a body graph; registers that
+    # graph as a fresh submodule (body_graph_N) on the tracer root; calls map_impl
+    # on real/fake inputs to get outputs; creates a map_impl call_function node
+    # (including the mutated_arg_indices keyword only when non-empty) and tracks
+    # the outputs to that proxy. Returns the tracked outputs. Side effects:
+    # registers a module and adds a node to the graph.
     with disable_proxy_modes_tracing():
         # Use first_slice_copy instead of _unstack_pytree to avoid
         # iterating over batch dim, which would guard on symbolic sizes.
-        example_input = pytree.tree_map(first_slice_copy, xs)
+        example_input =pytree.tree_map(first_slice_copy, xs)
 
         body_graph = reenter_make_fx(f)(*example_input, *pos_args)
 
@@ -343,12 +413,19 @@ def trace_map(
 
 @map_impl.py_impl(DispatchKey.CompositeExplicitAutograd)
 def map_dense(f, xs, pos_args, mutated_arg_indices=""):
+    # [FUNCTION DOC] Eager implementation: unstacks xs along the first dimension,
+    # calls f for each slice with pos_args, and stacks the per-slice output
+    # pytrees. Returns the stacked pytree.
+    # KNOWN ISSUE: mutated_arg_indices is ignored; mutations simply happen in f.
     pytrees = [f(*inp, *pos_args) for inp in _unstack_pytree(xs)]
     return _stack_pytree(pytrees)
 
 
 @map_impl.py_autograd_impl
 def map_autograd(f, xs, pos_args, mutated_arg_indices=""):
+    # [FUNCTION DOC] Autograd-key implementation: applies MapAutogradOp to f, the
+    # number of mapped args, xs and pos_args and returns its outputs.
+    # KNOWN ISSUE: mutated_arg_indices is dropped and not forwarded.
     num_mapped_args = len(xs)
     flat_out = MapAutogradOp.apply(f, num_mapped_args, *xs, *pos_args)
     return flat_out
@@ -356,6 +433,7 @@ def map_autograd(f, xs, pos_args, mutated_arg_indices=""):
 
 @map_impl.py_impl(ProxyTorchDispatchMode)
 def map_proxy_torch_dispatch_mode(mode, f, xs, pos_args, mutated_arg_indices=""):
+    # [FUNCTION DOC] HELPER: Proxy-mode implementation; delegates to trace_map.
     return trace_map(
         mode, map_impl, f, xs, pos_args, mutated_arg_indices=mutated_arg_indices
     )
@@ -363,6 +441,10 @@ def map_proxy_torch_dispatch_mode(mode, f, xs, pos_args, mutated_arg_indices="")
 
 @register_fake(map_impl, skip_cache=True)
 def map_fake_tensor_mode(f, xs, pos_args, mutated_arg_indices=""):
+    # [FUNCTION DOC] Fake-tensor implementation (not cached): runs f on the first
+    # slice of each x with pos_args and expands every output tensor with a leading
+    # dimension equal to the batch size of the first flattened x. Returns the
+    # resulting pytree.
     # Use first_slice_copy instead of _unstack_pytree to avoid
     # iterating over batch dim, which would guard on symbolic sizes.
     first_row = pytree.tree_map(first_slice_copy, xs)
@@ -376,6 +458,12 @@ def map_fake_tensor_mode(f, xs, pos_args, mutated_arg_indices=""):
 
 @map_impl.py_functionalize_impl
 def map_functionalize(ctx, f, xs, pos_args, mutated_arg_indices=""):
+    # [FUNCTION DOC] Functionalization implementation. If the context has a mode and
+    # the map call can be auto-functionalized, delegates to the v2 auto
+    # functionalization with flattened inputs. Otherwise unwraps tensors,
+    # functionalizes f, checks (on first-slice example inputs) that f has no
+    # disallowed aliasing or mutation, then redispatches map_impl and wraps the
+    # result. Raises via the alias/mutation check when f violates it.
     from torch._higher_order_ops.utils import _check_alias_and_mutation
 
     if hasattr(ctx, "mode"):
@@ -417,6 +505,8 @@ def map_functionalize(ctx, f, xs, pos_args, mutated_arg_indices=""):
 
 
 def _fake_map(f, x, *args):
+    # [FUNCTION DOC] HELPER: Reference eager map using the control-flow helpers:
+    # unstacks x, calls f on each slice with args, and stacks the results.
     from functorch.experimental.control_flow import _stack_pytree, _unstack_pytree
 
     x_pytrees = _unstack_pytree(x)

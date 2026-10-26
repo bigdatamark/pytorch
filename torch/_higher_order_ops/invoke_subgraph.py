@@ -1,5 +1,17 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Defines the invoke_subgraph higher order operator, which calls a traced
+# subgraph by identifier so identical regions can be compiled once and reused
+# (the mechanism behind mark_compile_region / nested compile regions). Contains:
+# the NestedCompileRegionOptions and OutputMetadata dataclasses; helpers that
+# generate per-call ids, fw/bw joint graphs and output metadata; the
+# InvokeSubgraphHOP operator; the autograd Function; and autograd, debug-mode,
+# dense, functionalization, fake-tensor and proxy-mode implementations; plus
+# helpers that compile subgraphs through Inductor.
+# Import-time side effects: creates the singleton invoke_subgraph, registers it
+# with the activation-checkpointing caching modes, and registers all its dispatch
+# implementations; defines a module-level counter and a thread-local call state.
 import contextlib
 import copy
 import functools
@@ -51,6 +63,10 @@ invoke_subgraph_counter = 0
 # InvokeSubgraphAutogradOp.
 @dataclass
 class OutputMetadata:
+    # [CLASS DOC] Facts about a subgraph's outputs: num_fw_outs (count), the set of
+    # output indexes holding SymInts, and the set of indexes that do not
+    # require grad (including SymInts). Used by the autograd Function to filter
+    # tangents. Mutable record with defaults.
     num_fw_outs: int | None = None
     indexes_with_symint: set[int] = field(default_factory=set)
     indexes_with_no_grad: set[int] = field(default_factory=set)
@@ -60,6 +76,11 @@ class OutputMetadata:
 # as well as the subgraph's gm.meta["nested_region_config"].
 @dataclass
 class NestedCompileRegionOptions:
+    # [CLASS DOC] Per-region compile configuration attached to nested compile
+    # regions: optional forward/backward compilers, a partitioner (callable or
+    # one of two named strings), decompositions (None means inherit the parent),
+    # and Inductor config patches for forward and (as a full replacement) for
+    # backward. Plain data holder, no invariants enforced.
     # A Callable that takes (gm, example_inputs, decompositions=None, **kwargs) as inputs.
     # Returns AOTCompiledArtifact
     fw_compiler: Callable | None = None
@@ -90,6 +111,12 @@ class NestedCompileRegionOptions:
 
 
 def _extract_nested_region_config(fn):
+    # [FUNCTION DOC] HELPER: Finds the GraphModule behind fn (fn itself, or the
+    # subgraph of a FunctionalizeCtxWrapper) and, if its meta holds a
+    # NestedCompileRegionOptions under nested_region_config, returns that
+    # option's decompositions table (possibly None); otherwise returns None.
+    # KNOWN ISSUE: the name and docstring say it extracts the config, but it
+    # returns only the decompositions field.
     """
     Extract the NestedCompileRegionOptions from the HOP subgraph gm.meta["nested_region_config"]
     """
@@ -114,6 +141,11 @@ def _extract_nested_region_config(fn):
 def get_backward_nested_region_config(
     fw_config: NestedCompileRegionOptions | None,
 ) -> NestedCompileRegionOptions | None:
+    # [FUNCTION DOC] Returns the config to use for compiling the backward subgraph:
+    # a copy of fw_config whose Inductor patches are replaced by the backward
+    # patches (and the backward field cleared) when bw_inductor_config_patches is
+    # set; otherwise returns fw_config itself (same object, relied on for
+    # identity checks, including None).
     """Region config for compiling the backward subgraph.
 
     When the region sets bw_inductor_config_patches, the backward compiles under
@@ -142,17 +174,25 @@ _invoke_subgraph_call_state = threading.local()
 
 
 def _next_invoke_subgraph_call_id() -> int:
+    # [FUNCTION DOC] HELPER: Returns the current thread-local call counter value
+    # (default 0) and increments the stored counter. Side effect: mutates
+    # thread-local state.
     counter = getattr(_invoke_subgraph_call_state, "counter", 0)
     _invoke_subgraph_call_state.counter = counter + 1
     return counter
 
 
 def _current_invoke_subgraph_call_id() -> int | None:
+    # [FUNCTION DOC] HELPER: Returns the call id currently set for this thread, or
+    # None when none is active.
     return getattr(_invoke_subgraph_call_state, "current", None)
 
 
 @contextlib.contextmanager
 def _set_invoke_subgraph_call_id(call_id: int):
+    # [FUNCTION DOC] HELPER: Context manager that makes call_id the thread-local
+    # current call id for its body and restores the previous value on exit
+    # (even on exceptions).
     prev = getattr(_invoke_subgraph_call_state, "current", None)
     _invoke_subgraph_call_state.current = call_id
     try:
@@ -168,6 +208,13 @@ def warn_and_trace_duplicate_backward(
     num_primals: int,
     tangents: tuple[Any, ...],
 ) -> None:
+    # [FUNCTION DOC] Diagnostics for duplicate backward variants of one forward
+    # identifier. Does nothing when suffix is 0 (first variant). Otherwise builds
+    # per-tangent summaries (matching backward placeholder name, and for tensors
+    # shape, stride, dtype, device; non-tensors are labelled), emits a one-time
+    # warning, and records a structured-trace JSON artifact named
+    # invoke_subgraph_backward_duplicate with explanations. Args: identifier,
+    # variant suffix, backward graph, number of primal inputs, tangents.
     if suffix == 0:
         return
 
@@ -251,7 +298,13 @@ def warn_and_trace_duplicate_backward(
 
 
 class InvokeSubgraphHOP(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator "invoke_subgraph" (cacheable, stateless): calls a
+    # subgraph (GraphModule or functionalization wrapper) tagged with a string
+    # identifier on tensor/int/SymInt/Generator/script-object operands. Attribute
+    # subgraph_indexes tells the fake tensor cache which argument is the subgraph.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the operator as cacheable and sets
+        # subgraph_indexes to position zero.
         # Invoke subgraph does not have any state, it is just a wrapper over a
         # subgraph, so we can safely cache the HOP.
         super().__init__("invoke_subgraph", cacheable=True)
@@ -270,6 +323,10 @@ class InvokeSubgraphHOP(HigherOrderOperator):
         identifier: str | None,
         *operands,
     ):
+        # [FUNCTION DOC] Validates and dispatches the call. Raises AssertionError if
+        # identifier is neither None nor a string, or if any non-None operand is
+        # not a tensor, int, SymInt, Generator, script object or registered
+        # opaque class instance. Returns the subgraph outputs from dispatch.
         if identifier is not None and not isinstance(identifier, str):
             raise AssertionError(
                 f"identifier must be None or a string, got {type(identifier)}"
@@ -292,6 +349,12 @@ class InvokeSubgraphHOP(HigherOrderOperator):
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, subgraph, identifier, *operands):
+        # [FUNCTION DOC] Builds the HOP function schema. Reuses the subgraph as is when
+        # its captured buffers are all FunctionalTensors (already functionalized);
+        # otherwise traces it with materialize_as_graph using the region's
+        # decompositions. Declares subgraph and identifier args, one arg per
+        # operand (marked mutated per input mutation analysis of the graph) and
+        # the graph's outputs. Returns the schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
         from torch._higher_order_ops.utils import (
             check_input_alias_and_mutation_return_outputs,
@@ -354,6 +417,12 @@ def invoke_subgraph_infer(
     subgraph: GraphModule | FunctionalizeCtxWrapper,
     *operands,
 ):
+    # [FUNCTION DOC] Calls a subgraph for inference. With no active proxy mode,
+    # calls the subgraph directly (as a boxed call with a list when the subgraph
+    # is marked boxed). With a proxy mode, looks up or allocates a unique name
+    # (prefix invoke_subgraph) cached per proxy mode keyed by subgraph object
+    # identity, then invokes the HOP with that name as identifier. Side effect:
+    # updates the proxy mode's name set and cache.
     """Inference-only entrypoint for invoke_subgraph that auto-generates identifier.
 
     This is intended for use cases where we are building an inference graph and
@@ -419,6 +488,10 @@ redirect_to_mode(invoke_subgraph, _CachedTorchDispatchMode)
 
 
 def invoke_subgraph_placeholder(func, *args, **kwargs):
+    # [FUNCTION DOC] Stand-in that Dynamo replaces with the HOP. Raises
+    # RuntimeError if reached while Dynamo is compiling. When exporting, routes
+    # the call through Dynamo's compile-and-call helper so non-strict export
+    # still traces it. Otherwise (eager) simply calls func with the args.
     if torch.compiler.is_dynamo_compiling():
         # This is just a placeholder for Dynamo to replace with invoke_subgraph
         raise RuntimeError("invoke_subgraph should not be called directly in Dynamo")
@@ -427,6 +500,7 @@ def invoke_subgraph_placeholder(func, *args, **kwargs):
         # For non-strict export tracing, we still want to go through Dynamo
 
         def _invoke_subgraph_placeholder_wrapper(func, args, kwargs):
+            # [FUNCTION DOC] HELPER: Re-enters the placeholder with unpacked args.
             return invoke_subgraph_placeholder(func, *args, **kwargs)
 
         from torch._higher_order_ops.utils import _hop_compile_and_call
@@ -444,6 +518,12 @@ def mark_compile_region(
     max_reuse_entries: int = 8,
     reuse_hash_fn=None,
 ):
+    # [FUNCTION DOC] Decorator marking a function as a compile region. Usable as a
+    # bare decorator or with arguments. The returned wrapper unwraps nested marked
+    # functions and calls invoke_subgraph_placeholder on the innermost; in eager
+    # it is effectively a pass-through. Side effect: sets attributes on the
+    # original function recording the options, max reuse entries and reuse hash
+    # function, and a back-reference attribute on the wrapper.
     """
     This wrapper instructs torch.compile to compile the wrapped region once and
     reuse the compiled artifact, instead of the usual way of aggressively
@@ -463,7 +543,11 @@ def mark_compile_region(
     """
 
     def wrap(func):
+        # [FUNCTION DOC] HELPER: Builds the wrapper for func and tags func with the
+        # region attributes; returns the wrapper.
         def inner(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Resolves the innermost marked function and
+            # calls it through invoke_subgraph_placeholder.
             # Get the innermost function to avoid nested compile regions
             inner_func = func
             while hasattr(inner_func, "__marked_compile_region_fn__"):
@@ -484,6 +568,8 @@ def mark_compile_region(
 
 
 def get_invoke_subgraph_cache():
+    # [FUNCTION DOC] Returns the HOP dispatch cache for invoke_subgraph from the
+    # current tracing context, or None if there is no tracing context.
     cache = None
     if tracing_ctx := torch._guards.TracingContext.try_get():
         cache = tracing_ctx.hop_dispatch_set_cache.get_cache(invoke_subgraph)
@@ -492,6 +578,10 @@ def get_invoke_subgraph_cache():
 
 # TODO (@anijain2305) - Delete this function when base_hop uses invoke_subgraph infra
 def trace_joint_graph(fn, fw_inputs, fw_outputs):
+    # [FUNCTION DOC] HELPER: Traces a joint forward+backward graph of fn. The joint
+    # function takes primals then tangents and returns gradients followed by
+    # forward outputs (outputs aliasing inputs are cloned). Example tangents
+    # come from fw_outputs. Returns the traced graph module.
     """
     Naively trace out a joint graph. This simplifies the reconstruction of joint
     graph in the min-cut partitioner later on.
@@ -508,6 +598,8 @@ def trace_joint_graph(fn, fw_inputs, fw_outputs):
     # Having grads first makes the min-cut partitioner HOP graph stitching
     # easier.
     def joint_fn(*primals_and_tangents):
+        # [FUNCTION DOC] HELPER: Splits inputs by the number of forward inputs, runs
+        # the joint computation and returns gradients then forward outputs.
         primals = primals_and_tangents[: len(fw_inputs)]
         tangents = primals_and_tangents[len(fw_inputs) :]
 
@@ -533,6 +625,13 @@ def trace_joint_graph(fn, fw_inputs, fw_outputs):
 
 # TODO (@anijain2305) - Delete this function when base_hop uses invoke_subgraph infra
 def create_fw_bw_graph(subgraph, operands, grad_outputs=None):
+    # [FUNCTION DOC] HELPER: Under disabled functionalization and proxy tracing,
+    # converts operands to plain example tensors, runs the subgraph to get its
+    # outputs, records OutputMetadata (count, SymInt indexes, no-grad indexes),
+    # derives grad_outputs from the forward outputs when not given (dropping
+    # None and no-grad ones, forced contiguous), traces the forward graph and
+    # the joint graph. Raises RuntimeError if grad outputs are not tensors/None.
+    # Returns (forward graph, backward graph, OutputMetadata).
     with suspend_functionalization(), disable_functional_mode():
         with disable_proxy_modes_tracing():
             # args are functional tensors, generate some example tensors
@@ -606,6 +705,11 @@ def create_fw_bw_graph(subgraph, operands, grad_outputs=None):
 
 
 def get_output_metadata(subgraph, *operands):
+    # [FUNCTION DOC] Computes OutputMetadata for a subgraph, preferring static
+    # analysis of the graph's output node (values' meta decide SymInt/no-grad;
+    # non-node outputs count as no-grad and ints as SymInts). Falls back to
+    # executing the subgraph when it is not a GraphModule or some output lacks
+    # val meta. Unwraps a functionalization wrapper first.
     """
     Extract metadata about the subgraph outputs WITHOUT executing the subgraph.
     This avoids running side-effectful operations twice (once here, once in forward).
@@ -656,6 +760,11 @@ def get_output_metadata(subgraph, *operands):
 
 
 def _get_output_metadata_by_execution(subgraph, *operands):
+    # [FUNCTION DOC] HELPER: Runs the subgraph on example tensors (functionalization
+    # and proxy tracing off) and builds OutputMetadata from the real outputs.
+    # Side effect: executes the subgraph, including any side-effectful ops.
+    # KNOWN ISSUE: assumes every non-SymInt output has requires_grad; a None or
+    # non-tensor output would raise AttributeError.
     """
     Fallback: Extract metadata by executing the subgraph.
     This should only be used when static analysis fails.
@@ -696,6 +805,12 @@ def _get_output_metadata_by_execution(subgraph, *operands):
 def trace_joint_graph_as_bwd(
     subgraph, num_primals, joint_operands, include_key_set, exclude_key_set
 ):
+    # [FUNCTION DOC] Traces a joint graph to be used as the backward graph. Wraps a
+    # GraphModule subgraph in an interpreter run (to preserve stack traces),
+    # builds a joint function (inputs primals then tangents; outputs gradients
+    # then forward outputs), converts joint_operands to plain tensors, forces
+    # the given dispatch key include/exclude sets, enables grad and traces with
+    # the region's decompositions. Returns the traced graph module.
     """
     Naively trace out a joint graph. This simplifies the reconstruction of joint
     graph in the min-cut partitioner later on.
@@ -707,6 +822,8 @@ def trace_joint_graph_as_bwd(
     if isinstance(subgraph, torch.fx.GraphModule):
 
         def graph_with_interpreter(*args):
+            # [FUNCTION DOC] HELPER: Runs the subgraph with an FX Interpreter while
+            # preserving node metadata (needed to propagate stack traces).
             # Running graph with interpreter is needed for propagating the stack_trace
             with torch.fx.traceback.preserve_node_meta():
                 return torch.fx.Interpreter(subgraph).run(*args)
@@ -723,6 +840,9 @@ def trace_joint_graph_as_bwd(
     # Having grads first makes the min-cut partitioner HOP graph stitching
     # easier.
     def joint_fn(*primals_and_tangents):
+        # [FUNCTION DOC] HELPER: Splits inputs at num_primals, runs the joint
+        # computation, and returns gradients then forward outputs (outputs
+        # aliasing inputs are cloned).
         primals = primals_and_tangents[:num_primals]
         tangents = primals_and_tangents[num_primals:]
 
@@ -751,6 +871,10 @@ def trace_joint_graph_as_bwd(
 
 
 def get_non_differentiable_indices(subgraph) -> list[int]:
+    # [FUNCTION DOC] Returns indexes of subgraph outputs whose recorded example value
+    # is a tensor that does not require grad. Returns an empty list when subgraph
+    # is not a GraphModule or has no output node; a non-sequence output is
+    # treated as a single output; non-node outputs are skipped.
     """Inspect a subgraph's output node metadata to find outputs that
     were non-differentiable (requires_grad=False) during Dynamo tracing.
 
@@ -789,6 +913,12 @@ def get_non_differentiable_indices(subgraph) -> list[int]:
 
 
 class InvokeSubgraphAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd Function for invoke_subgraph with lazy backward. State on
+    # ctx: subgraph, identifier, OutputMetadata, per-call id, snapshot of dispatch
+    # key include/exclude sets, saved operands, and indexes of non-differentiable
+    # outputs. Forward runs the HOP under a "fw_" identifier; backward traces (or
+    # fetches from cache) a joint graph keyed by identifier and tangent metadata and
+    # runs it under a "bw_" identifier.
     """
     Saves the subgraph, i.e. original callable, in the forward method. And then
     traces out a joint graph in the backward. This delaying of tracing in
@@ -805,6 +935,13 @@ class InvokeSubgraphAutogradOp(torch.autograd.Function):
         output_metadata,
         *operands,
     ):
+        # [FUNCTION DOC] Stores subgraph, identifier, output metadata, a fresh call id
+        # and the dispatch key sets on ctx, saves operands for backward, runs
+        # invoke_subgraph (below autograd, with the call id set) under the
+        # identifier prefixed by fw_. Raises AssertionError if an integer output
+        # appears at an index not recorded as a SymInt output. Marks outputs
+        # reported by get_non_differentiable_indices as non-differentiable and
+        # stores those indexes on ctx. Returns the outputs.
         # We want to delay the backward graph construction until the backward.
         # So in forward, we just run the fw callable as is. And save all the
         # information necessary to construct the backward graph in the ctx.
@@ -857,6 +994,19 @@ class InvokeSubgraphAutogradOp(torch.autograd.Function):
         ctx,
         *grad_outs,
     ):
+        # [FUNCTION DOC] Computes gradients lazily. Filters incoming grads: drops
+        # those for SymInt, no-grad and non-differentiable outputs (AssertionError
+        # for an unexpected None). Builds a cache key from tangent tensor metadata
+        # plus aliasing groups (tangents that are the same object). Looks up a
+        # cached backward graph by identifier and key; on a miss traces a joint
+        # graph as backward (timed), copies the nested region config to it and
+        # stores it (emitting a duplicate-variant warning for repeats). Requires
+        # a fake mode (AssertionError). Runs invoke_subgraph on the backward graph
+        # with identifier bw_<identifier>_<suffix> and the forward call id, and
+        # drops the trailing forward-output results. Returns None for the three
+        # non-tensor forward args followed by input gradients.
+        # KNOWN ISSUE: when no cache exists the suffix stays None, so the backward
+        # identifier becomes bw_<identifier>_None.
         from torch._dynamo.utils import dynamo_timed
 
         subgraph = ctx._subgraph
@@ -984,6 +1134,11 @@ class InvokeSubgraphAutogradOp(torch.autograd.Function):
 
 @invoke_subgraph.py_autograd_impl
 def _(subgraph, identifier, *operands):
+    # [FUNCTION DOC] Autograd-key implementation. Without a fake mode (eager
+    # backend with real tensors) just calls the subgraph so regular autograd
+    # records through it. Otherwise reuses a cached autograd callable for the
+    # identifier if present; else computes output metadata, builds a callable
+    # that applies InvokeSubgraphAutogradOp, caches it and calls it on operands.
     from torch._guards import detect_fake_mode
 
     # Eager backends run the captured HOP with real tensors and no AOTAutograd
@@ -1004,6 +1159,8 @@ def _(subgraph, identifier, *operands):
     output_metadata = get_output_metadata(subgraph, *operands)
 
     def autograd_fn_callable(*args):
+        # [FUNCTION DOC] HELPER: Applies the autograd Function with the captured
+        # subgraph, identifier and output metadata to the given operands.
         return InvokeSubgraphAutogradOp.apply(
             subgraph, identifier, output_metadata, *args
         )
@@ -1017,6 +1174,10 @@ def _(subgraph, identifier, *operands):
 
 @invoke_subgraph.py_impl(DebugMode)
 def _(debug_mode, subgraph, identifier, *operands):
+    # [FUNCTION DOC] DebugMode implementation. Records the HOP call (with identifier
+    # and operands) and enter/exit annotations, adjusts the mode's call depth,
+    # runs the subgraph (boxed or unboxed) with the debug mode active, records
+    # the output and returns the result. Side effect: mutates debug mode records.
     # record HOP call
     call = torch.utils._debug_mode._OpCall(
         invoke_subgraph,
@@ -1046,6 +1207,9 @@ def _(debug_mode, subgraph, identifier, *operands):
 
 @invoke_subgraph.py_impl(DispatchKey.CompositeExplicitAutograd)
 def _(subgraph, identifier, *operands):
+    # [FUNCTION DOC] Eager (CompositeExplicitAutograd) implementation: raises
+    # AssertionError if any dispatch mode is active, then calls the subgraph with
+    # the operands (as a list for boxed-call subgraphs). Returns its outputs.
     from torch.utils._python_dispatch import _get_current_dispatch_mode
 
     mode = _get_current_dispatch_mode()
@@ -1061,6 +1225,18 @@ def _(subgraph, identifier, *operands):
 
 @invoke_subgraph.py_functionalize_impl
 def _(ctx, subgraph, identifier, *operands):
+    # [FUNCTION DOC] Functionalization implementation. Tracks effect tokens: if the
+    # cache records an effect for this identifier (only one allowed, else
+    # AssertionError) the subgraph is wrapped to take and return the effect
+    # token. Builds (and caches) the HOP schema; if the call mutates inputs it
+    # is auto-functionalized: with keep_input_mutations the call is wrapped in
+    # auto_functionalized_v2; otherwise the subgraph is wrapped to also return
+    # updated mutated operands, called under a functionalized_ identifier, and
+    # the outputs are written back to the operands (replace, commit, sync).
+    # Without mutation, a functionalizing wrapper is invoked at the next key.
+    # Afterwards compares effect tokens before/after: new or changed tokens are
+    # recorded in the cache (AssertionError if token discovery is not allowed).
+    # Returns the wrapped tensor outputs.
     from torch._higher_order_ops.auto_functionalize import (
         can_auto_functionalize,
         do_auto_functionalize_v2,
@@ -1087,7 +1263,12 @@ def _(ctx, subgraph, identifier, *operands):
         operands = (token_input, *operands)
 
         def wrap_subgraph(subgraph):
+            # [FUNCTION DOC] HELPER: Returns a wrapper around subgraph (see below).
             def wrapped_subgraph(token, *args):
+                # [FUNCTION DOC] HELPER: Ignores the incoming token argument, runs
+                # the subgraph on the remaining args, and returns the updated
+                # effect token (unwrapped from the mode's token table) followed
+                # by the subgraph results.
                 res = subgraph(*args)
                 return ctx.unwrap_tensors(ctx.mode._tokens[effects]), *res
 
@@ -1213,6 +1394,9 @@ def _(ctx, subgraph, identifier, *operands):
 # Register the hop fake fn. This will be called in the fake_tensor _dispatch_impl.
 @register_fake(invoke_subgraph)
 def _(subgraph, identifier, *operands):
+    # [FUNCTION DOC] Fake-tensor implementation: runs the subgraph on the fake
+    # operands (as a list for boxed-call subgraphs) under a timing event and
+    # returns the outputs.
     from torch._dynamo.utils import dynamo_timed
 
     with dynamo_timed("invoke_subgraph_fake_tensor", log_pt2_compile_event=True):
@@ -1223,6 +1407,15 @@ def _(subgraph, identifier, *operands):
 
 @invoke_subgraph.py_impl(ProxyTorchDispatchMode)
 def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
+    # [FUNCTION DOC] Proxy-tracing implementation. Gets the traced graph for the
+    # identifier from the cache or re-traces the subgraph (with the region's
+    # decompositions, preserving sequence numbers), copies the nested region config
+    # to the new graph, inserts deferred runtime asserts when dynamic shapes are
+    # in use, requires an FX tracer (AssertionError) and caches the graph. Then
+    # emits a call_function node for the HOP with proxied args (registering a
+    # graph module not yet in the root as submodule repeated_subgraph), stamps
+    # nested_region_config and the current call id into node meta custom, runs the
+    # HOP for example outputs and returns them tracked to the node's proxy.
     # Check if we have already traced the subgraph.
     graph = None
     invoke_subgraph_cache = get_invoke_subgraph_cache()
@@ -1277,6 +1470,9 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
     node_args = (graph, identifier, *operands)
 
     def _unwrap_proxy(arg):
+        # [FUNCTION DOC] HELPER: Converts one argument to its proxy; a GraphModule that
+        # is not yet a submodule of the tracer root is first registered there
+        # under a fresh name so the generated graph can reference it.
         if isinstance(arg, torch.fx.GraphModule):
             # NOTE: [invoke_subgraph proxy_mode x auto_functionalize]
             # Previously, we assumed that `invoke_subgraph` would always be traced with the same tracer.
@@ -1349,6 +1545,14 @@ def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
 def invoke_subgraph_inductor_compile(
     gm, example_inputs, inductor_config_patches=None, **kwargs
 ):
+    # [FUNCTION DOC] Compiles a subgraph with Inductor and returns an AOTCompiledArtifact
+    # wrapping a boxed-call forward function. Optionally records a deep copy of gm
+    # for testing. Marks all node outputs of gm as user-visible (so padding does
+    # not alter strides crossing the HOP boundary), compiles under the given
+    # config patches, raises AssertionError if the compiled function is not
+    # boxed, and attaches convenience attributes (zero_grad, named parameters
+    # and buffers, serialize placeholder). kwargs is accepted but unused.
+    # Side effects: mutates gm's output node meta.
     from torch._functorch._aot_autograd.runtime_wrappers import (
         SerializableCompiledFunction,
     )
@@ -1394,6 +1598,8 @@ def invoke_subgraph_inductor_compile(
     # Follow boxed calling convention
     @simple_wraps(compiled_fn_inner)
     def forward(*runtime_args: tuple[Any]):
+        # [FUNCTION DOC] HELPER: Adapts normal positional calls to the boxed calling
+        # convention by collecting arguments into a list for the compiled function.
         full_args = []
         full_args.extend(runtime_args)
         return compiled_fn_inner(full_args)
@@ -1416,6 +1622,13 @@ def get_invoke_subgraph_compile_options(
     *,
     bw_inductor_config_patches=None,
 ):
+    # [FUNCTION DOC] Builds NestedCompileRegionOptions for compiling a region with
+    # Inductor. Forward patches default to enabling autotune at compile time;
+    # backward uses its own patches when given, else the forward ones. Raises
+    # ValueError if any config key does not exist in the Inductor config.
+    # Returns options with forward/backward compilers (the Inductor compile
+    # helper with the respective patches), the partitioner name (default min-cut
+    # rematerialization), decompositions and both patch dicts.
     if fw_inductor_config_patches is None:
         fw_inductor_config_patches = {"triton.autotune_at_compile_time": True}
 

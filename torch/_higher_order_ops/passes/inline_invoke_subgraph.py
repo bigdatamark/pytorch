@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# FX graph passes that inline invoke_subgraph higher order op calls into their
+# caller graph: either only subgraphs with a single call site across the module
+# tree, or all of them. Provides counting, submodule hoisting and node-inlining
+# helpers. No import-time side effects.
 import operator
 from collections import Counter
 from typing import Any, TYPE_CHECKING
@@ -11,6 +16,9 @@ if TYPE_CHECKING:
 
 
 def count_subgraph_uses(gm: GraphModule) -> Counter[str]:
+    # [FUNCTION DOC] Walks gm and every nested module that is a GraphModule and
+    # counts invoke_subgraph call nodes, keyed by the string form of the
+    # identifier argument (second argument). Returns the counter; no mutation.
     """Count invoke_subgraph references by identifier string across all
     descendant GraphModules."""
     counts: Counter[str] = Counter()
@@ -25,6 +33,10 @@ def count_subgraph_uses(gm: GraphModule) -> Counter[str]:
 
 
 def inline_single_use_invoke_subgraph(gm: GraphModule) -> GraphModule:
+    # [FUNCTION DOC] Pass entry point: computes global use counts over the module
+    # tree, then recursively inlines invoke_subgraph nodes whose identifier is used
+    # exactly once (and that carry no nested region config). Mutates gm and its
+    # submodules in place and returns gm.
     """Inline invoke_subgraph HOPs whose subgraph module has exactly one call
     site across the entire module tree.
 
@@ -40,6 +52,12 @@ def inline_single_use_invoke_subgraph(gm: GraphModule) -> GraphModule:
 
 
 def inline_single_use_recursive(gm: GraphModule, global_counts: Counter[str]) -> None:
+    # [FUNCTION DOC] HELPER: Recurses into every named GraphModule submodule first,
+    # then inlines in gm the invoke_subgraph nodes whose identifier count in
+    # global_counts is one and whose referenced subgraph module has no
+    # nested_region_config in its meta. Mutates gm in place; returns None.
+    # KNOWN ISSUE: named_modules yields all descendants, so deeper modules may be
+    # processed more than once (once per ancestor); harmless but redundant.
     # Recursively apply to nested subgraph modules first.
     for name, mod in gm.named_modules():
         if name and isinstance(mod, GraphModule):
@@ -68,6 +86,9 @@ def inline_single_use_recursive(gm: GraphModule, global_counts: Counter[str]) ->
 
 
 def hoist_submodules(gm: GraphModule, subgraph: GraphModule) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Registers each direct child module of subgraph on gm,
+    # choosing a unique name by appending a numeric suffix on collision. Returns a
+    # mapping from old child name to new name. Side effect: adds modules to gm.
     """Move submodules of *subgraph* onto *gm*, returning a name-remap dict.
 
     For each direct child module of *subgraph* (e.g. ``fwd_body_0``), register
@@ -90,6 +111,13 @@ def hoist_submodules(gm: GraphModule, subgraph: GraphModule) -> dict[str, str]:
 
 
 def inline_invoke_subgraph_nodes(gm: GraphModule, invoke_nodes: list["Node"]) -> None:
+    # [FUNCTION DOC] HELPER: For each invoke_subgraph node, hoists the subgraph's
+    # submodules onto gm, copies the subgraph's non-placeholder, non-output nodes
+    # before the call (placeholders bound to the call operands, get_attr targets
+    # renamed per the hoist map), rewires getitem users of the call to the
+    # corresponding subgraph outputs, then erases the call, its getitem users and
+    # the now-unused get_attr node. Mutates gm's graph; returns None.
+    # Assumes the subgraph output is a tuple/list indexed only through getitem.
     """Shared helper that inlines a list of invoke_subgraph nodes."""
     for node in invoke_nodes:
         get_attr_node: torch.fx.Node = node.args[0]  # pyrefly: ignore[bad-assignment]
@@ -129,6 +157,9 @@ def inline_invoke_subgraph_nodes(gm: GraphModule, invoke_nodes: list["Node"]) ->
 
 
 def inline_invoke_subgraph(gm: GraphModule) -> GraphModule:
+    # [FUNCTION DOC] Pass entry point that inlines every invoke_subgraph call in gm.
+    # First recursively flattens each nested GraphModule, then inlines the calls
+    # in gm itself. Mutates in place and returns gm.
     """Inline all invoke_subgraph HOPs, producing a flat FX graph.
 
     This is useful when downstream compilers (like vllm-compile) don't support
