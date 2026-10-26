@@ -1,3 +1,8 @@
+# [MODULE DOC] Manual overlap scheduling for collectives: given user-specified module FQN plans, buckets the all-gathers,
+# reduce-scatters and all-reduces inside each module into single fused collectives, then reorders the fx graph (and optionally adds
+# control dependencies) so all-gathers prefetch during the previous module's compute and reduce-scatter waits are deferred.
+# Main contents: ManualOverlapPreservingBucketer, ManualOverlapScheduler and the entry point manual_overlap_bucketing.
+# Import-time side effect: creates the module logger only.
 from __future__ import annotations
 
 import heapq
@@ -44,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 
 def _collect_nodes_must_be_after(node: fx.Node) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Breadth-first forward walk from node collecting it and each transitive user whose inputs are all already in the
+    # collected set (so nodes depending on anything outside are excluded). Returns the list in discovery order, starting with node.
     """BFS forward collecting node and its transitive users with no external inputs."""
     result: list[fx.Node] = [node]
     result_set: OrderedSet[fx.Node] = OrderedSet([node])
@@ -62,6 +69,8 @@ def _collect_nodes_must_be_after(node: fx.Node) -> list[fx.Node]:
 def _collect_nodes_must_be_before(
     node: fx.Node, node_positions: dict[fx.Node, int]
 ) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Walks backward from node through input nodes (placeholders excluded) and returns the visited nodes sorted by
+    # their graph position from the given position map (topological order). Includes node itself.
     """BFS backward collecting node and its non-placeholder dependencies, topo-sorted."""
     visited: OrderedSet[fx.Node] = OrderedSet()
     queue = [node]
@@ -77,6 +86,8 @@ def _collect_nodes_must_be_before(
 def _bucket_trace_inputs(
     coll_node: fx.Node, node_in: object, group_name_arg: int
 ) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Returns the nodes that anchor insertion of a bucketed collective: the collective's input node and, if the group name
+    # argument at the given position is an fx node, that node too. Raises an error if the input is not an fx node.
     if not isinstance(node_in, fx.Node):
         raise AssertionError(f"expected node input to be a Node, got {type(node_in)}")
     inputs = [node_in]
@@ -88,6 +99,9 @@ def _bucket_trace_inputs(
 
 
 def _all_gather_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Bucket-trace inputs for an all-gather start node. If the input is a mergeable dtype conversion, anchors on the
+    # converted source tensor instead (the conversion is erased by the bucket). Group name is argument 2.
+    # Raises an error if the expected input is not an fx node.
     node_in: object = coll_node.args[0]
     # The dtype conversion is erased by the all-gather bucket trace, so anchor
     # insertion on the tensor that remains as a graph input to the bucket.
@@ -101,10 +115,12 @@ def _all_gather_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
 
 
 def _reduce_scatter_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Bucket-trace inputs for a reduce-scatter start node (tensor is argument 0, group name argument 3).
     return _bucket_trace_inputs(coll_node, coll_node.args[0], group_name_arg=3)
 
 
 def _all_reduce_bucket_trace_inputs(coll_node: fx.Node) -> list[fx.Node]:
+    # [FUNCTION DOC] HELPER: Bucket-trace inputs for an all-reduce start node (tensor is argument 0, group name argument 2).
     # all_reduce(tensor, reduce_op, group_name): tensor at 0, group_name at 2.
     return _bucket_trace_inputs(coll_node, coll_node.args[0], group_name_arg=2)
 
@@ -114,6 +130,10 @@ def _move_wait_users_after_latest_inputs(
     replacements: dict[fx.Node, fx.Node],
     replaced_users: dict[fx.Node, list[fx.Node]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: After old waits are replaced by bucketed outputs, moves existing consumers of the old waits that now sit before
+    # the new output so they come after their latest input. Uses a work queue: each moved node's users are re-queued, and positions are
+    # recomputed after every move. Args: graph, mapping of old to new outputs, and the saved users of each old wait.
+    # Side effect: reorders nodes in the graph in place. Returns nothing.
     node_positions = {n: i for i, n in enumerate(graph.nodes)}
     initial_users: OrderedSet[fx.Node] = OrderedSet()
     for old_out, new_out in replacements.items():
@@ -160,6 +180,11 @@ def _move_overlap_nodes(
     overlap_deps: dict[fx.Node, OrderedSet[fx.Node]],
     bucketed_node_types: dict[fx.Node, str],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Applies overlap dependencies by physically moving nodes. Does nothing if there are no dependencies.
+    # For targets depending on bucketed reduce-scatter or all-reduce starts, moves the target and its must-follow nodes to just after the
+    # latest such start. For targets depending on bucketed all-gather starts located at or after the target, moves each start and its
+    # dependencies to just before the target. Args: graph, mapping target to its set of source nodes, mapping node to type string.
+    # Side effect: reorders the graph in place.
     if not overlap_deps:
         return
 
@@ -199,6 +224,10 @@ def _move_overlap_nodes(
 
 
 class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
+    # [CLASS DOC] Overlap-preserving bucketer that buckets collectives chosen by the user (per module) rather than by a heuristic.
+    # State: node_to_wait_map maps each new bucketed wait to the canonical (last) new wait; bucketed_node_types maps new nodes to a type
+    # string (bucketed_all_gather, bucketed_reduce_scatter, bucketed_all_reduce, plus a wait suffix), scoped per instance.
+    # Key methods: manual_bucket_collectives (groups and buckets) and the private bucket/split helpers.
     """
     Buckets collective operations based on user specifications.
     The actual bucket happens in bucket_collectives, where all-gathers/reduce-scatters in
@@ -210,6 +239,7 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
         *args: Any,
         **kwargs: Any,
     ):
+        # [FUNCTION DOC] Forwards all arguments to the base bucketer and initializes the empty wait map and bucketed node type map.
         super().__init__(*args, **kwargs)
         self.node_to_wait_map: dict[fx.Node, fx.Node] = defaultdict()
         # Maps bucketed nodes to their type string, scoped to this bucketer
@@ -217,6 +247,11 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
         self.bucketed_node_types: dict[fx.Node, str] = {}
 
     def _bucket_group(self, coll_nodes: list[fx.Node]) -> None:
+        # [FUNCTION DOC] HELPER: Fuses the given same-kind collective start nodes into one bucketed collective. Chooses the merge function and
+        # type string by whether the first node is an all-gather, reduce-scatter or all-reduce; raises ValueError for any other kind and an error
+        # if the list is empty or no new wait is produced. Inserts the new collective after its latest input and the new wait no earlier than the
+        # first old wait, repositions consumers of old waits, then records the types of the new start and wait nodes and maps each new wait to the
+        # last new wait. Side effects: mutates the graph and the bucketer's maps, logs at debug level.
         if len(coll_nodes) <= 0:
             raise AssertionError("bucketed coll_nodes should have nonzero node")
 
@@ -298,6 +333,10 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
     def _split_independent_collectives(
         self, coll_nodes: OrderedSet[fx.Node], scope_nodes: list[fx.Node]
     ) -> list[list[fx.Node]]:
+        # [FUNCTION DOC] HELPER: Partitions same-key collectives into dependency-free buckets so that no fused collective's input depends on its own
+        # output. Computes for each collective the length of the longest chain of same-key collectives ending at it using one forward pass over the
+        # scope nodes in original order (a collective's chain propagates through its wait node), then groups by that level. Returns a list of
+        # collective lists ordered by level. Args: set of start nodes and the scope nodes. Assumes each collective has recorded info.
         """Partition same-key collectives so no bucket contains a collective that
         depends on another member's result.
 
@@ -344,6 +383,10 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
         return [buckets[lvl] for lvl in sorted(buckets)]
 
     def manual_bucket_collectives(self, nodes: list[fx.Node]) -> None:
+        # [FUNCTION DOC] Buckets the fsdp all-gathers, fsdp reduce-scatters and all-reduces among the given nodes. Ignores nodes that are not known
+        # collectives, groups the rest by their full bucket key (custom ops mode; nodes without a key are dropped), splits each group into
+        # dependency-free sub-buckets, and buckets each one. Side effect: mutates the graph. Returns nothing.
+        # KNOWN ISSUE: the docstring mentions only all-gather and reduce-scatter but all-reduce is also bucketed.
         """
         Bucket all all-gather/reduce-scatter nodes from nodes into one all-gather/reduce-scatter.
         """
@@ -374,6 +417,10 @@ class ManualOverlapPreservingBucketer(OverlapPreservingBucketer):
 
 
 class ManualOverlapScheduler(OverlapScheduler):
+    # [CLASS DOC] Overlap scheduler that buckets and reorders collectives following user module plans instead of runtime estimates.
+    # State: module_bucket_plans (module FQNs), nodes_in_subgraph (node lists per plan entry), a ManualOverlapPreservingBucketer, the
+    # insert_overlap_deps flag and the module stack function. Collectives get zero size and time estimates. Key methods: run (entry point),
+    # _manual_bucket_collectives, _manual_reorder_graph.
     """
     Scheduler that manual buckets and reorders collective nodes based on module_bucket_plans
     """
@@ -386,6 +433,9 @@ class ManualOverlapScheduler(OverlapScheduler):
         module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]] | None = None,
         bucket_mode: BucketMode | None = None,
     ):
+        # [FUNCTION DOC] Configures the base scheduler with bucketing on and all memory/overlap limits off, using a no-op runtime estimator
+        # (always zero) because estimates are unused. Args: graph module, module plans, whether to insert control dependencies, optional module
+        # stack function, optional bucket mode (defaults to custom ops). Creates the bucketer over the whole graph and stores the plan fields.
         # Manual overlap historically used "custom_ops" mode for bucketing
         bucket_mode = bucket_mode or "custom_ops"
         super().__init__(
@@ -422,6 +472,8 @@ class ManualOverlapScheduler(OverlapScheduler):
         self.module_stack_fn = module_stack_fn
 
     def _identify_collectives(self) -> None:
+        # [FUNCTION DOC] HELPER: Registers every schedulable wait node and its start node as a collective with zero size and zero time estimates,
+        # filling collective_info, wait_to_start and the unscheduled collective set.
         """Identify all collective operations."""
         for node in self.nodes:
             if _schedulable_wait_node(node):
@@ -438,10 +490,12 @@ class ManualOverlapScheduler(OverlapScheduler):
                 self.unscheduled_collectives.add(start)
 
     def _add_to_ready_queue(self, node: fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Pushes the node onto the single ready heap keyed by its original node index, preserving original order.
         """Manual scheduling uses single queue ordered by original node index."""
         heapq.heappush(self.on_path_ready, (self.node_idx[node], node))
 
     def run(self) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Entry point: buckets collectives per module plan, then reorders the graph to realize the overlap. Returns the (mutated) graph module.
         """Entry point to run the manual bucket algorithm"""
         # Bucket collectives in each bucket_module
         self._manual_bucket_collectives()
@@ -452,6 +506,11 @@ class ManualOverlapScheduler(OverlapScheduler):
         return self.gm
 
     def _manual_reorder_graph(self) -> None:
+        # [FUNCTION DOC] HELPER: Reorders the graph to enforce manual overlap. Rebuilds the ready queue, then schedules nodes in original order while
+        # deferring each bucketed reduce-scatter/all-reduce wait behind the next group's start nodes (recorded as dependencies). Then walks the
+        # reversed schedule and makes each bucketed all-gather wait depend on the preceding picked all-gather starts (prefetch); leftover starts
+        # attach to the last compute node unless already its ancestor. Finally physically moves the nodes, lints the graph, and, if enabled,
+        # inserts control dependencies preserving the order. Side effects: mutates graph and scheduler state.
         """
         Reorder nodes in the FX graph to enforce manual overlap dependencies.
 
@@ -561,6 +620,9 @@ class ManualOverlapScheduler(OverlapScheduler):
             preserve_node_ordering(self.graph, overlap_deps)
 
     def _manual_bucket_collectives(self) -> None:
+        # [FUNCTION DOC] HELPER: Buckets collectives within each module's node list from the plans, lints the graph, then refreshes the node list and
+        # in-degree counts from the modified graph. Side effect: mutates the graph.
+        # KNOWN ISSUE: the enumerate index in the loop is unused.
         """Bucket nodes in each module_bucket from module_bucket_plans."""
         self._obtain_nodes_in_subgraph()
         for i, nodes in enumerate(self.nodes_in_subgraph):
@@ -571,6 +633,8 @@ class ManualOverlapScheduler(OverlapScheduler):
         self.in_degree = Counter(user for node in self.nodes for user in node.users)
 
     def _schedule(self, node: fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Marks a node scheduled and queues users whose in-degree drops to zero. Raises an error if already scheduled or if
+        # any input is not yet scheduled.
         """Schedule a node."""
         if node in self.scheduled:
             raise AssertionError(f"node already scheduled: {node}")
@@ -583,6 +647,8 @@ class ManualOverlapScheduler(OverlapScheduler):
                 self._add_to_ready_queue(user)
 
     def _obtain_nodes_in_subgraph(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds a graph view from the module stack function and fills nodes_in_subgraph with the nodes of each plan entry.
+        # Does nothing if no view can be built. Raises an error if any node appears in more than one subgraph.
         """
         Obtain nodes in each subgraph from module_bucket_plans
         """
@@ -613,6 +679,9 @@ def manual_overlap_bucketing(
     module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]] | None = None,
     bucket_mode: BucketMode | None = None,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Public entry point: runs the manual scheduler on the graph module with the given module bucket plans (bucketing then
+    # reordering), recompiles the module and returns it. Args: graph module, module FQN plans, whether to insert control dependencies,
+    # optional module stack function and bucket mode. Side effect: mutates and recompiles the input module.
     """Schedule nodes based on user specifications in module_bucket_plans
     The manual overlapping consists of two steps:
     Step 1: bucket all-gather/reduce-scatter in each module in module_bucket_plans

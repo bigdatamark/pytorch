@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Debug utilities that numerically compare a model before and after pre/post grad fx passes.
+# Runs both models for several iterations with deterministic seeds and compares parameters, forward outputs,
+# gradients and (optionally) parameters after an SGD step; mismatches are only logged, never raised.
+# Import-time side effect: sets the CUBLAS_WORKSPACE_CONFIG environment variable to a fixed value.
 import gc
 import logging
 import os
@@ -26,6 +30,8 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 # such as certain types of parallelism or asynchronous execution,
 # this can also lead to different outputs.
 def set_deterministic() -> None:
+    # [FUNCTION DOC] Seeds torch, random and numpy with the fixed main seed and enables deterministic algorithms globally.
+    # Side effects: mutates global RNG state and the torch deterministic-algorithms flag. Returns nothing.
     """Make torch manual seed deterministic."""
 
     torch.manual_seed(MAIN_RANDOM_SEED)
@@ -35,6 +41,8 @@ def set_deterministic() -> None:
 
 
 def clean_memory() -> None:
+    # [FUNCTION DOC] Runs garbage collection and empties the CUDA caching allocator cache to reduce OOM risk.
+    # Requires a CUDA-capable torch build. Returns nothing.
     """Clean memory to avoid OOM."""
     gc.collect()
     torch.cuda.empty_cache()
@@ -43,6 +51,10 @@ def clean_memory() -> None:
 # We compare the numerical results before and after pre/post grad fx passes
 # transformation to make sure the numerical results are the same.
 def compare_dict_tensors(dict_base, dict_control, precision):
+    # [FUNCTION DOC] Compares two mappings of name to tensor within a tolerance (rtol and atol both set to precision, NaNs equal).
+    # Returns False immediately if the key counts differ; otherwise returns True only if every pair of non-None tensors is close.
+    # Entries where either side is None are skipped; mismatches are logged as warnings/debug, not raised.
+    # KNOWN ISSUE: a key missing from the control mapping only logs a warning, then the lookup of that key in the control mapping raises a KeyError.
     if len(OrderedSet(dict_base.keys())) != len(OrderedSet(dict_control.keys())):
         logger.warning("Mismatch keys found before and after pre/post grad fx passes.")
         logger.debug("keys before pre/post grad fx passes %s", dict_base.keys())
@@ -75,6 +87,9 @@ def compare_dict_tensors(dict_base, dict_control, precision):
 
 
 def compare_tuple_tensors(tuple_base, tuple_control, precision):
+    # [FUNCTION DOC] Compares two sequences of tensors elementwise within a tolerance (rtol and atol both set to precision, NaNs equal).
+    # Returns False if lengths differ; otherwise True only if all pairs of non-None entries are close. None entries are skipped.
+    # Mismatches are logged only.
     if len(tuple_base) != len(tuple_control):
         logger.warning(
             "Mismatch fw output length. before transformation: %s, after transformation: %s",
@@ -105,6 +120,7 @@ def compare_tuple_tensors(tuple_base, tuple_control, precision):
 
 
 def compare_parameters(model_base, model_control, precision):
+    # [FUNCTION DOC] Compares the named parameters of two models via the dict comparison helper. Returns True if all are close.
     return compare_dict_tensors(
         dict(model_base.named_parameters()),
         dict(model_control.named_parameters()),
@@ -113,6 +129,7 @@ def compare_parameters(model_base, model_control, precision):
 
 
 def compare_forward_output(pred_base, pred_control, precision):
+    # [FUNCTION DOC] Compares two forward outputs (sequences of tensors) via the tuple comparison helper. Returns True if all are close.
     return compare_tuple_tensors(
         pred_base,
         pred_control,
@@ -121,6 +138,8 @@ def compare_forward_output(pred_base, pred_control, precision):
 
 
 def compare_gradients(model_base, model_control, precision):
+    # [FUNCTION DOC] Collects the gradient of each named parameter of both models and compares them via the dict comparison helper.
+    # Parameters without a gradient are None and are skipped. Returns True if all are close.
     grad_base = {key: param.grad for key, param in model_base.named_parameters()}
     grad_pt2 = {key: param.grad for key, param in model_control.named_parameters()}
     return compare_dict_tensors(
@@ -133,6 +152,11 @@ def compare_gradients(model_base, model_control, precision):
 def run_model(
     model_base, model_control, model_input, num_iterations=10, precision=1e-4
 ):
+    # [FUNCTION DOC] Runs both models on the same inputs for num_iterations iterations and logs numeric comparison results.
+    # Each iteration: reseed deterministically before each forward, compare parameters and forward outputs, then run backward on the
+    # first output of each model and compare gradients (exceptions are logged and printed, not raised). If the config option
+    # requires_optimizer is set, also steps an SGD optimizer (learning rate 0.01) on each model and compares parameters again.
+    # Side effects: frees CUDA memory first, mutates model parameters and gradients, logs. Returns nothing.
     clean_memory()
     for i in range(num_iterations):
         logger.info("start %s iteration", i)
@@ -194,6 +218,9 @@ def numeric_check_if_enabled(
     num_iterations,
     precision,
 ):
+    # [FUNCTION DOC] Runs the numeric comparison of the graph module before and after fx passes with anomaly detection enabled.
+    # Args: the two graph modules, example inputs, iteration count and precision. All exceptions are caught, logged as a warning
+    # and printed, so a failing check never blocks the model run. Returns nothing.
     # need to topo-sort graphmodule before we run the model,
     # otherwise it may fail as refer before def
     # fail silently in order not to block the model run

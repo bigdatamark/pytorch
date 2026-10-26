@@ -1,3 +1,6 @@
+# [MODULE DOC] Runtime estimation helpers for the overlap scheduler: collective cache keys, NCCL and Inductor analytical
+# estimates, CUDA-event benchmarking of collectives with a process-local cache, and structured-trace (tlparse) CSV artifact logging
+# of compute and collective estimations. Import-time side effect: creates the node_runtime_estimation artifact logger.
 """
 Node runtime estimation for overlap scheduling.
 """
@@ -24,6 +27,7 @@ from torch.fx.operator_schemas import normalize_function
 
 
 def _format_csv(headers: list[str], rows: list[list[str]]) -> str:
+    # [FUNCTION DOC] HELPER: Joins headers and rows into a CSV string (comma separated, newline between lines, values converted to text).
     """Format data as CSV. Human-readable and easily parseable."""
     lines = [",".join(headers)]
     for row in rows:
@@ -32,6 +36,9 @@ def _format_csv(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def _get_collective_key(coll_node: fx.Node) -> str:
+    # [FUNCTION DOC] HELPER: Builds a string key for a collective fx node from its target, group size, resolved group name and the byte size
+    # of the first input tensor found in its fake args (None if unavailable or any dimension has no hint).
+    # Raises an error if the node arguments cannot be normalized.
     """Extract a unique key for a collective node including group info and tensor size."""
     from torch._inductor import fx_utils
 
@@ -55,6 +62,8 @@ def _get_collective_key(coll_node: fx.Node) -> str:
     if success:
 
         def extract_first_tensor_bytes(t: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Tree-map callback that, for the first tensor seen, records its byte size (product of hinted dims times element size)
+            # into the enclosing variable; leaves it unset if any dimension lacks a hint. Returns the tensor unchanged.
             nonlocal tensor_bytes
             if tensor_bytes is None:
                 shape = [get_hint(dim) for dim in t.shape]
@@ -71,6 +80,8 @@ def _get_collective_key(coll_node: fx.Node) -> str:
 
 
 def _get_collective_estimations(coll_node: fx.Node) -> tuple[float, float]:
+    # [FUNCTION DOC] HELPER: Returns the pair (nccl_ms, inductor_ms) of estimated collective runtimes in milliseconds for an fx node,
+    # computed once with the NCCL estimator and once with Inductor's analytical model.
     """Get NCCL and Inductor analytical estimations for a collective node.
 
     Returns: (nccl_ms, inductor_ms)
@@ -98,21 +109,27 @@ log = getArtifactLogger(__name__, "node_runtime_estimation")
 @clear_on_fresh_cache
 @lru_cache
 def _get_collective_cache() -> dict[str, float]:
+    # [FUNCTION DOC] HELPER: Returns the process-local mapping from collective key to benchmarked runtime. Cached per process via a memoized
+    # call and cleared when the Inductor fresh-cache hook fires.
     """Get process-local cache for collective benchmarks."""
     return {}
 
 
 def get_cached_runtime(key: str) -> float | None:
+    # [FUNCTION DOC] Returns the cached benchmarked runtime for the key, or None if absent.
     """Get cached runtime from process-local cache."""
     return _get_collective_cache().get(key)
 
 
 def set_cached_runtime(key: str, value: float) -> None:
+    # [FUNCTION DOC] Stores a benchmarked runtime for the key in the process-local cache. Mutates the cache.
     """Set cached runtime in process-local cache."""
     _get_collective_cache()[key] = value
 
 
 def get_hint(x: int | torch.SymInt) -> int | None:
+    # [FUNCTION DOC] Returns the concrete integer for an int or a SymInt with a hint, or None for a SymInt without a hint.
+    # Raises an error if the argument is neither int nor SymInt.
     if isinstance(x, int):
         return x
     if not isinstance(x, torch.SymInt):
@@ -121,6 +138,8 @@ def get_hint(x: int | torch.SymInt) -> int | None:
 
 
 def can_benchmark_collective() -> bool:
+    # [FUNCTION DOC] Returns True only if torch.distributed is initialized and the default group's backend is not the fake backend,
+    # i.e. real collectives can be run for benchmarking.
     """Check if we can benchmark collectives (not fake process group)."""
     import torch.distributed as c10d
 
@@ -138,6 +157,7 @@ def can_benchmark_collective() -> bool:
 
 
 def _median(lst):
+    # [FUNCTION DOC] HELPER: Returns the median of a non-empty list of numbers as a Python float; raises an error on an empty list.
     if len(lst) == 0:
         raise AssertionError("expected non-empty list for median")
     return torch.median(torch.tensor(lst)).item()
@@ -149,6 +169,10 @@ def _benchmark_collective_with_cuda_events_impl(
     kwargs: dict[str, Any],
     nruns: int,
 ) -> float | None:
+    # [FUNCTION DOC] HELPER: Benchmarks one collective node. Converts fake tensor args to real random strided tensors using hinted shapes/strides,
+    # replaces SymInts by optimization hints (with the configured unbacked fallback), runs one warmup call with synchronization, then
+    # nruns timed calls (each followed by a wait on the result) measured with timing events. Returns the median time in ms.
+    # Raises an error if a tensor has a dimension with no hint. Side effects: executes real collectives; requires an accelerator.
     """
     Core benchmarking logic using CUDA events and barriers.
     Returns runtime in ms or None on failure.
@@ -157,6 +181,8 @@ def _benchmark_collective_with_cuda_events_impl(
 
     # Convert FakeTensors to real tensors before benchmarking
     def to_real(t: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Converts a fake tensor into a real random tensor with the same hinted shape, stride, device and dtype.
+        # Raises an error if any size or stride has no hint.
         shape = [get_hint(dim) for dim in t.shape]
         stride = [get_hint(s) for s in t.stride()]
 
@@ -205,6 +231,10 @@ def benchmark_collective_with_cuda_events(
     n: torch.fx.Node,
     nruns: int = 2,
 ) -> tuple[float | None, str]:
+    # [FUNCTION DOC] Public wrapper that benchmarks a collective node with timing events while all current dispatch modes are disabled
+    # (needed because a context manager is not allowed under the profiler). Returns (runtime_ms, cache_key), or (None, empty string)
+    # on failure. Default nruns is 2.
+    # KNOWN ISSUE: the docstring describes the same behavior as the impl function; the two have different default nruns (2 vs 3).
     """
     Benchmark collective with CUDA events. Returns (runtime_ms, cache_key) or (None, "") on failure.
     """
@@ -217,6 +247,10 @@ def benchmark_collective_with_cuda_events_impl(
     n: torch.fx.Node,
     nruns: int = 3,
 ) -> tuple[float | None, str]:
+    # [FUNCTION DOC] Computes a cache key from target, group size and input size in bytes, returns the cached runtime if present,
+    # otherwise benchmarks via the private helper and caches the result. Returns (runtime_ms, key); (None, empty string) if collectives
+    # cannot be benchmarked, fake args are unavailable, or no tensor size is known; (None, key) if the benchmark returns None.
+    # Raises an error if the node arguments cannot be normalized. Side effect: updates the process-local cache.
     """
     Benchmark collective with CUDA events. Returns (runtime_ms, cache_key) or (None, "") on failure.
     """
@@ -247,6 +281,8 @@ def benchmark_collective_with_cuda_events_impl(
     actual_bytes: int | None = None
 
     def extract_tensor_info(t: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Tree-map callback that records, for the first tensor with fully hinted shape, its size in bytes in the enclosing
+    # variable; later tensors (e.g. out-variants) are ignored. Returns the tensor unchanged.
         nonlocal actual_bytes
         if actual_bytes is None:
             shape = [get_hint(dim) for dim in t.shape]
@@ -293,12 +329,16 @@ def _log_compute_estimations(
     benchmarked_estimations: list[float],
     analytical_estimations: list[float],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emits a structured-trace artifact with a CSV comparing benchmarked and analytical runtime estimates per compute node
+    # (summary with dtypes and shapes of node inputs, both estimates converted to microseconds, ratio, difference and flop count).
+    # Inputs are three parallel lists. Side effect: writes the trace artifact. Returns nothing.
     """Log compute node runtime estimations comparing benchmarked vs analytical."""
     import torch.utils._pytree as pytree
     from torch._inductor.fx_utils import count_flops_fx
     from torch.utils._dtype_abbrs import dtype_abbrs
 
     def _node_summary(n: fx.Node) -> str:
+        # [FUNCTION DOC] HELPER: Returns the node name followed by dtype abbreviation and shape of each fx-node argument with tensor metadata.
         ret = str(n)
         for arg in pytree.arg_tree_leaves(n.args, n.kwargs):
             if not isinstance(arg, torch.fx.Node):
@@ -321,6 +361,7 @@ def _log_compute_estimations(
     ]
 
     def _fmt(v: object) -> str:
+        # [FUNCTION DOC] HELPER: Formats a number to four decimals; symbolic values are shown with their hint when one exists.
         if isinstance(v, torch.types.py_sym_types):
             if v.node.has_hint():
                 return f"{v}({v.node.hint:.4f})"
@@ -354,6 +395,8 @@ def _log_compute_estimations(
 
 
 def _log_graph_collective_benchmarks(gm: fx.GraphModule, artifact_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Walks the graph, finds each schedulable wait node, takes its start collective, benchmarks it (5 runs; failures count as 0.0),
+    # and logs all results with world size under the given artifact name. Does nothing if no collectives are found.
     collective_nodes = []
     collective_keys = []
     benchmarked = []
@@ -388,6 +431,9 @@ def _log_collective_benchmarks(
     world_size: int | None = None,
     artifact_name: str = "fx_collectives_analytical_estimation",
 ) -> None:
+    # [FUNCTION DOC] HELPER: Logs a CSV artifact for tlparse comparing NCCL and Inductor estimates of each collective, and benchmarked medians
+    # with ratios of estimate to benchmark if provided (ratio is 0 when the benchmark is not positive). Keys are computed if not given;
+    # world size defaults to the distributed world size or 1. Side effect: writes the structured trace. Returns nothing.
     """Log collective estimations for tlparse. Includes benchmarks if provided."""
     if world_size is None:
         world_size = (
