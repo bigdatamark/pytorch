@@ -1,3 +1,6 @@
+# [MODULE DOC] Autotuning config heuristics for Triton reduction kernels: non-persistent, persistent, cooperative (RSPLIT), split-scan and mix-order RSPLIT_SIZE processing.
+# Contains a default (CUDA) ReductionHeuristic plus ROCm/HIP and XPU subclasses overriding hook methods, and helper functions for tiling-aware block sizing.
+# Import-time side effect: registers the heuristics under the name reduction; queries torch.version.hip and torch.xpu.
 """Codegen heuristics for Triton reduction kernel autotuning.
 
 Contains the default (CUDA) heuristic and device-specific overrides for
@@ -33,6 +36,7 @@ def _get_tiling_scores(
     inductor_meta: dict[str, Any],
     size_hints: dict[str, int],
 ) -> dict[str, float]:
+    # [FUNCTION DOC] HELPER: Return the tiling scores from inductor_meta, or a mapping giving every dim in size_hints a score of one if absent or empty.
     """Retrieve tiling scores, providing suitable defaults if missing."""
     return inductor_meta.get("tiling_scores") or dict.fromkeys(size_hints, 1)
 
@@ -44,6 +48,9 @@ def _match_target_block_product(
     min_block_size=1,
     min_red_block: int | None = 4,
 ):
+    # [FUNCTION DOC] HELPER: Distribute block sizes over dimensions by tiling score so the product of block sizes approaches target_block_product.
+    # Starts every dim at the minimum size (reduction dims use min_red_block; zero-score non-reduction dims get 1), then repeatedly doubles the dim with the highest remaining relative score,
+    # halving that score, until the target is met; dims at the Triton max block or at their size hint are dropped. If all scores sum to zero they are replaced by uniform scores. Returns a mapping dim -> block size.
     """
     Distribute block sizes across dimensions according to tiling scores,
     aiming to match a target product of block sizes.
@@ -102,6 +109,9 @@ def _adapt_config_for_tiling(
     *,
     warp_size: int = 32,
 ) -> Config:
+    # [FUNCTION DOC] HELPER: Build a tiled-reduction Triton config whose total block size equals original_x times original_r but is redistributed by tiling scores.
+    # Raises AssertionError if some dim in size_hints lacks a tiling score. Returns the config from triton_config_tiled_reduction.
+    # KNOWN ISSUE: parameters num_warps and persistent_reduction are accepted but never used.
     """
     Create an adapted configuration based on tiling scores,
     redistributing the same total block size (x * r) according to tiling scores.
@@ -132,6 +142,8 @@ def _adapt_config_for_tiling(
 def _outer_config_opt(
     make_config, size_hints, rnumel, inductor_meta, num_dynamic, register_intensive
 ):
+    # [FUNCTION DOC] HELPER: Pick the outer-reduction config for CUDA. Chooses x block, reduction block and optionally num_warps from the size of x, the number of dynamic dims
+    # and the load count in inductor_meta, then returns make_config called with those values.
     """Optimized outer config for CUDA (non-HIP)."""
     max_x_block, x_block = 256, 64
     load_factor = inductor_meta.get("num_load", 0)
@@ -177,6 +189,8 @@ def _outer_config_opt(
 
 @register_codegen_heuristic("reduction")
 class ReductionHeuristic(CodegenConfigHeuristics):
+    # [CLASS DOC] Default (CUDA) reduction heuristic. Public methods build config lists for regular, persistent, cooperative and split-scan reductions and post-process RSPLIT_SIZE configs.
+    # Device subclasses override the underscore hook methods (outer config, finalize, xblock values, persistent inner config, extra max-autotune configs, warps limit).
     """Default reduction autotuning configs (CUDA non-ROCm)."""
 
     def get_configs(
@@ -187,6 +201,9 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         triton_meta: dict[str, Any],
         num_dynamic: int = 0,
     ) -> list[Config]:
+        # [FUNCTION DOC] Generate non-persistent reduction autotune configs.
+        # Computes the total reduction size and a max reduction block (reduced on large register pressure), returns matmul configs directly for native matmul (3 or 4 dims, else NotImplementedError).
+        # Otherwise builds contiguous, tiny and outer configs, optionally a persistent-rblock config; with a reduction hint and no max_autotune returns just the matching config, else a list of several configs passed to _finalize_configs.
         """Generate non-persistent reduction autotuning configs."""
         from torch._inductor.runtime.triton_heuristics import (
             get_total_reduction_numel,
@@ -238,6 +255,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             dynamic_scale_rblock=True,
             waves_per_eu=None,
         ):
+            # [FUNCTION DOC] HELPER: Build one config for the given x and r block sizes. Uses the tiling-aware adaptation when a y dim exists, otherwise the plain reduction config factory.
             if "y" in size_hints:
                 tiling_scores = _get_tiling_scores(inductor_meta, size_hints)
                 return _adapt_config_for_tiling(
@@ -335,6 +353,9 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         inductor_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
+        # [FUNCTION DOC] Generate persistent reduction autotune configs.
+        # Handles native matmul (capped matmul configs; NotImplementedError for unsupported shapes), batch-invariant mode (x hint raised to at least 4096), builds one config per candidate xblock that fits the persistent block limit (tiled when a y dim exists),
+        # then narrows by reduction hint (inner, outer, outer-tiny) or extends in max_autotune mode. Finally removes the reduction-dim BLOCK kwargs from every config and returns the list.
         """Generate persistent reduction autotuning configs."""
         from torch._inductor.runtime.triton_heuristics import (
             get_total_reduction_numel,
@@ -484,6 +505,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         num_dynamic,
         register_intensive,
     ):
+        # [FUNCTION DOC] HOOK: Return the outer-reduction config; the CUDA default delegates to the optimized outer config helper.
         """Outer config. CUDA uses optimized heuristic."""
         return _outer_config_opt(
             make_config,
@@ -495,10 +517,12 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         )
 
     def _finalize_configs(self, configs, make_config, size_hints, inductor_meta):
+        # [FUNCTION DOC] HOOK: Post-process the non-persistent config list; the default returns it unchanged.
         """Post-process non-persistent configs."""
         return configs
 
     def _persistent_xblock_vals(self) -> list[int]:
+        # [FUNCTION DOC] HOOK: Return candidate XBLOCK values for persistent reductions (1, 8, 32, 128).
         """XBLOCK values for persistent reduction."""
         return [1, 8, 32, 128]
 
@@ -511,6 +535,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         reduction_hint,
         warp_size: int = 32,
     ) -> list[Config]:
+        # [FUNCTION DOC] HOOK: Return a one-element list with a single-warp persistent config for the INNER reduction hint, with x block at most 8 and bounded by 1024 divided by rnumel.
         """Config for INNER hint in persistent reduction."""
         from torch._inductor.runtime.triton_heuristics import triton_config_reduction
 
@@ -529,6 +554,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         ]
 
     def _persistent_max_autotune_extras(self, configs, tiny_configs):
+        # [FUNCTION DOC] HOOK: Extra handling of persistent configs in max_autotune mode; the default returns configs unchanged.
         """Extra processing in max_autotune mode for persistent reduction."""
         return configs
 
@@ -540,6 +566,9 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         inductor_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
+        # [FUNCTION DOC] Generate configs for cooperative reductions (single reduction dim only; raises AssertionError otherwise).
+        # Computes a split factor from the device multiprocessor count and sizes, builds persistent or non-persistent configs on the per-split reduction size,
+        # and sets the RSPLIT kwarg on each config. Returns the list.
         """Generate configs for cooperative reduction (RSPLIT)."""
         from torch._inductor.runtime.hints import TRITON_MAX_RSPLIT
         from torch._inductor.runtime.runtime_utils import last_power_of_2
@@ -577,6 +606,9 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         size_hints: dict[str, int],
         inductor_meta: dict[str, Any],
     ) -> list[Config]:
+        # [FUNCTION DOC] Post-process persistent configs for mix-order reduction when RSPLIT_SIZE is set (returns configs untouched if not set).
+        # Sets RSPLIT_SIZE, XBLOCK and NUM_STAGES kwargs on each config, adjusts num_warps by reduction size, and under max_autotune adds a deep-copied variant with a different warp count.
+        # Mutates the given configs in place. Returns the de-duplicated list.
         """Apply RSPLIT_SIZE / mix-order post-processing to persistent configs."""
         import copy
 
@@ -642,6 +674,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         return unique_configs(new_configs)
 
     def _max_warps_limit(self) -> int:
+        # [FUNCTION DOC] HOOK: Maximum number of warps allowed when doubling warps in RSPLIT_SIZE processing (32 by default).
         """Max warps limit for RSPLIT_SIZE processing."""
         return 32
 
@@ -652,6 +685,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         inductor_meta: dict[str, Any],
         triton_meta: dict[str, Any],
     ) -> list[Config]:
+        # [FUNCTION DOC] Generate configs for split-scan kernels: take the regular reduction configs and raise any reduction block kwarg below min_split_scan_rblock (default 256) up to that minimum. Mutates configs in place and returns them.
         """Generate configs for split scan kernels."""
         configs = self.get_configs(
             size_hints=size_hints,
@@ -673,6 +707,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
 
 @register_codegen_heuristic("reduction", "hip", register=torch.version.hip is not None)
 class ROCmReductionHeuristic(ReductionHeuristic):
+    # [CLASS DOC] ROCm/HIP reduction heuristic overriding the outer config, finalization, xblock candidates, max-autotune extras and warps limit.
     """Reduction configs for ROCm/HIP devices."""
 
     def _get_outer_config(
@@ -684,10 +719,12 @@ class ROCmReductionHeuristic(ReductionHeuristic):
         num_dynamic,
         register_intensive,
     ):
+        # [FUNCTION DOC] HOOK: ROCm outer config: a fixed 64 by 8 config without the CUDA optimized heuristic.
         # HIP uses simple outer config (no outer_config_opt)
         return make_config(64, 8, register_intensive=register_intensive)
 
     def _finalize_configs(self, configs, make_config, size_hints, inductor_meta):
+        # [FUNCTION DOC] HOOK: Append two ROCm-specific configs and, if max_persistent_rblock is positive in inductor_meta, drop configs whose XBLOCK times that value exceeds 4096. Returns the list.
         hip_configs = [
             make_config(1024, 8, num_warps=4, num_stages=1, waves_per_eu=2),
             make_config(512, 8, num_warps=4, num_stages=1, waves_per_eu=1),
@@ -704,6 +741,7 @@ class ROCmReductionHeuristic(ReductionHeuristic):
         return configs
 
     def _persistent_xblock_vals(self) -> list[int]:
+        # [FUNCTION DOC] HOOK: ROCm candidate XBLOCK values for persistent reductions (powers of two from 1 to 256).
         return [1, 4, 8, 16, 32, 64, 128, 256]
 
     def _persistent_max_autotune_extras(self, configs, tiny_configs):
@@ -711,9 +749,11 @@ class ROCmReductionHeuristic(ReductionHeuristic):
             if conf not in configs:
                 configs.append(conf)
         return configs
+        # [FUNCTION DOC] HOOK: In max_autotune mode, append any tiny configs not already present to the persistent configs and return them.
 
     def _max_warps_limit(self) -> int:
         return 16
+        # [FUNCTION DOC] HOOK: ROCm maximum warps limit (16).
 
 
 # ------------------------------------------------------------------
@@ -723,6 +763,7 @@ class ROCmReductionHeuristic(ReductionHeuristic):
 
 @register_codegen_heuristic("reduction", "xpu", register=torch.xpu._is_compiled())
 class XPUReductionHeuristic(ReductionHeuristic):
+    # [CLASS DOC] XPU reduction heuristic overriding the persistent inner config.
     """Reduction configs for XPU devices."""
 
     def _persistent_inner_config(
@@ -734,6 +775,8 @@ class XPUReductionHeuristic(ReductionHeuristic):
         reduction_hint,
         warp_size: int = 32,
     ) -> list[Config]:
+        # [FUNCTION DOC] HOOK: XPU persistent inner config: x block of 8, reduced to 1 when xnumel is small or there are many loads and stores; returns a one-element list.
+        # Leaves num_warps and reduction_hint unset so Triton's cost model decides.
         from torch._inductor.runtime.triton_heuristics import triton_config_reduction
 
         # TODO(Intel): CUDA uses num_warps = 1 to disable shared memory.

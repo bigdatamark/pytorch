@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Codegen heuristics for inductor-generated Triton kernels (pointwise, reduction, ...).
+# Re-exports CodegenConfigHeuristics, get_codegen_heuristic and register_codegen_heuristic from the registry,
+# and imports the pointwise and reduction submodules so their heuristics get registered.
 """
 Codegen heuristics for inductor-generated Triton kernels.
 

@@ -1,3 +1,6 @@
+# [MODULE DOC] Analysis to invert index expressions that are mixed-radix sums of ModularIndexing / FloorDiv terms of a single variable,
+# producing a reconstruction expression that decomposes the variable and rebuilds it. Main entry: generate_inverse_formula. Uses the current graph's sizevars for static comparisons.
+# No import-time side effects.
 from dataclasses import dataclass, replace
 
 import sympy
@@ -10,11 +13,13 @@ from .virtualized import V
 
 
 def static_eq(a: _IntLike, b: _IntLike) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether two integer-like values are statically known to be equal in the current graph.
     return V.graph.sizevars.statically_known_equals(a, b)
 
 
 @dataclass(frozen=True)
 class Term:
+    # [CLASS DOC] HELPER: Frozen record for one term of a sum: coefficient, range (None if unbounded), the original expression, and the multiplier used to reconstruct the variable.
     coefficient: _IntLike
     range: _IntLike | None  # None for unbounded
     original_expr: sympy.Expr
@@ -24,6 +29,9 @@ class Term:
 def generate_inverse_formula(
     expr: sympy.Expr, var: sympy.Symbol, var_range: _IntLike | None = None
 ) -> sympy.Expr | None:
+    # [FUNCTION DOC] Check whether expr is an invertible mixed-radix sum in var and, if so, return the reconstruction expression, else None.
+    # Pre-processes the expression by combining modular indexing pairs and joining dimensions, parses terms, sorts by coefficient descending, checks invertibility (with optional exclusive var_range) and generates the expression,
+    # simplified using var_range when given.
     """
      Analyze an expression to see if it matches a specific invertible pattern that we
      know how to reverse.
@@ -105,6 +113,7 @@ def generate_inverse_formula(
 
 
 def parse_terms(expr: sympy.Expr, var: sympy.Symbol) -> list[Term] | None:
+    # [FUNCTION DOC] HELPER: Parse an expression (a sum or a single term) into a list of Term objects. Returns None if any term of a sum fails to parse; for a single unparseable term returns an empty list.
     """Parse expression into terms."""
     if not isinstance(expr, sympy.Add):
         # Single term
@@ -123,6 +132,7 @@ def parse_terms(expr: sympy.Expr, var: sympy.Symbol) -> list[Term] | None:
 
 
 def parse_single_term(term: sympy.Expr, var: sympy.Symbol) -> Term | None:
+    # [FUNCTION DOC] HELPER: Parse one product term into a Term (coefficient, range, original expression, reconstruction multiplier). Returns None if there is more than one non-constant factor, none, or the expression is not recognized.
     """Parse a single term and extract coefficient, range, and reconstruction multiplier."""
     # Extract coefficient and expression parts
     coefficient, expr_parts = term.as_coeff_mul()
@@ -151,6 +161,8 @@ def parse_single_term(term: sympy.Expr, var: sympy.Symbol) -> Term | None:
 def analyze_expression_properties(
     expr: sympy.Expr, var: sympy.Symbol
 ) -> tuple[_IntLike | None, _IntLike | None]:
+    # [FUNCTION DOC] HELPER: Recognize ModularIndexing(var), FloorDiv of ModularIndexing(var) or FloorDiv(var) and return (range, reconstruction multiplier);
+    # unbounded range is None. Returns (None, None) if unrecognized or if the modulus is not statically a multiple of the divisor.
     """Analyze an expression to determine its range and reconstruction multiplier."""
     # ModularIndexing(var, divisor, modulo) = (var // divisor) % modulo
     if isinstance(expr, ModularIndexing):
@@ -179,6 +191,8 @@ def analyze_expression_properties(
 
 
 def check_invertibility(terms: list[Term], var_range: _IntLike | None = None) -> bool:
+    # [FUNCTION DOC] HELPER: Check that terms form a valid mixed-radix system: unbounded terms get a range from var_range, coefficients are strictly decreasing, each coefficient equals the product of the ranges of smaller terms,
+    # only the smallest-coefficient term may be unbounded, and the source ranges are covered. Returns a bool.
     """Check if the terms represent an invertible transformation."""
     if not terms:
         return False
@@ -219,6 +233,8 @@ def check_reconstruction_coverage(
     terms: list[Term],
     var_range: _IntLike | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Check that, ordered by reconstruction multiplier, the terms cover contiguous non-overlapping ranges starting at one;
+    # an unbounded term must be last and var_range must be None, otherwise the final product must equal var_range. Returns a bool.
     """Check that terms reconstruct non-overlapping contiguous source ranges."""
     if not terms:
         return False
@@ -242,6 +258,7 @@ def check_reconstruction_coverage(
 
 
 def generate_reconstruction_expr(terms: list[Term], var: sympy.Symbol) -> sympy.Expr:
+    # [FUNCTION DOC] HELPER: Build the reconstruction expression: for each term in order, divide the running remainder by the term coefficient (and reduce the remainder modulo the coefficient for all but the last), multiply by the term's multiplier, and sum.
     y = var
     reconstruction = sympy.S.Zero
     remainder = y

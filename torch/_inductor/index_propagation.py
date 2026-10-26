@@ -1,3 +1,6 @@
+# [MODULE DOC] Implements IndexPropagation, an ops handler wrapper that propagates constants and sympy index expressions (from index_expr) through supported ops,
+# so that indirect indexing derived from them can become direct indexing. Contains TypedExpr, SymPyOps (sympy-based op semantics), IndexPropVar and IndexPropagation.
+# No import-time side effects.
 # mypy: allow-untyped-defs
 """This file implements the IndexPropagation ops handler, which wraps an
 underlying handler to add a limited form of constant propagation, as well as
@@ -42,26 +45,31 @@ _ExprType = sympy.Expr | float | int | bool
 
 
 def _is_constant(val: _ExprType):
+    # [FUNCTION DOC] HELPER: Return True if val is a numeric sympy value or a plain int, float or bool.
     if isinstance(val, sympy.Basic):
         return val.is_number
     return isinstance(val, (int, float, bool))
 
 
 def upper_bound(val: _ExprType):
+    # [FUNCTION DOC] HELPER: Return the upper bound of val's value range if it is a sympy expression, else val itself.
     return bound_sympy(val).upper if isinstance(val, sympy.Expr) else val
 
 
 @dataclass
 class TypedExpr:
+    # [CLASS DOC] HELPER: A value (sympy expression or Python scalar) paired with a torch dtype. Constant values are wrapped to the dtype in post-init (integer overflow wraparound).
     """A SymPy expression with associated type"""
 
     expr: _ExprType
     dtype: torch.dtype
 
     def is_constant(self):
+        # [FUNCTION DOC] HELPER: Whether the stored expression is a constant.
         return _is_constant(self.expr)
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: For constants, cast the expression to the dtype's Python type and, for integer dtypes, wrap it into the representable range (two's complement for signed); stores the result.
         if _is_constant(self.expr):
             expr = self.expr
             if isinstance(expr, sympy.Expr):
@@ -78,6 +86,7 @@ class TypedExpr:
 
 
 class SymPyOps:
+    # [CLASS DOC] Ops handler in which values are TypedExpr. Static methods implement ops as sympy expressions; unsupported cases (non-integer floordiv/mod, bool min/max, uncertain remainder) return NotImplemented. Stateless.
     """An ops handler where all IR values are SymPy expressions
 
     When a value cannot be represented as a SymPy expression, the method is
@@ -87,18 +96,22 @@ class SymPyOps:
 
     @staticmethod
     def identity(value: Any) -> Any:
+        # [FUNCTION DOC] Return the value unchanged.
         return value
 
     @staticmethod
     def constant(value: int | float | bool, dtype: torch.dtype) -> TypedExpr:
+        # [FUNCTION DOC] Wrap a constant value and dtype as a TypedExpr.
         return TypedExpr(value, dtype)
 
     @staticmethod
     def index_expr(value: sympy.Expr | int, dtype: torch.dtype) -> TypedExpr:
+        # [FUNCTION DOC] Wrap an index expression and dtype as a TypedExpr.
         return TypedExpr(value, dtype)
 
     @staticmethod
     def value_expr(value: sympy.Expr | int, dtype: torch.dtype) -> TypedExpr:
+        # [FUNCTION DOC] Wrap a value expression and dtype as a TypedExpr.
         return TypedExpr(value, dtype)
 
     @staticmethod
@@ -108,37 +121,45 @@ class SymPyOps:
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = False,
     ) -> TypedExpr:
+        # [FUNCTION DOC] Return a TypedExpr with the same expression but the new dtype (no actual conversion of the expression; src_dtype and use_compute_types are ignored).
         return TypedExpr(value.expr, dtype)
 
     @staticmethod
     def abs(x: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Absolute value of the expression, same dtype.
         return TypedExpr(abs(x.expr), x.dtype)  # type: ignore[arg-type]
 
     @staticmethod
     def square(x: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Square of the expression, same dtype.
         return TypedExpr(x.expr * x.expr, x.dtype)
 
     @staticmethod
     def add(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Sum of the expressions with the promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         return TypedExpr(x.expr + y.expr, result_type)
 
     @staticmethod
     def sub(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Difference of the expressions with the promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         return TypedExpr(x.expr - y.expr, result_type)
 
     @staticmethod
     def mul(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Product of the expressions with the promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         return TypedExpr(x.expr * y.expr, result_type)
 
     @staticmethod
     def neg(x: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Negated expression, same dtype.
         return TypedExpr(-x.expr, x.dtype)
 
     @staticmethod
     def floordiv(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Floor division as a FloorDiv expression; returns NotImplemented if the promoted dtype is not an integer type.
         result_type = torch.promote_types(x.dtype, y.dtype)
         if not is_integer_dtype(result_type):
             return NotImplemented
@@ -147,6 +168,7 @@ class SymPyOps:
 
     @staticmethod
     def mod(x: TypedExpr, y: TypedExpr) -> TypedExpr | None:
+        # [FUNCTION DOC] Modulo as a ModularIndexing expression; returns NotImplemented for non-integer promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         if not is_integer_dtype(result_type):
             return NotImplemented
@@ -156,6 +178,8 @@ class SymPyOps:
 
     @staticmethod
     def remainder(x: TypedExpr, y: TypedExpr) -> TypedExpr | None:
+        # [FUNCTION DOC] C-style remainder. Returns NotImplemented for non-integer dtype; converts to ModularIndexing only when the sign condition between operands is provable, otherwise NotImplemented.
+        # KNOWN ISSUE: the check compares nonnegativity of x with positivity of y for equality, which also holds when both are known false (negative x with non-positive y), where Python modulo and C remainder differ.
         result_type = torch.promote_types(x.dtype, y.dtype)
         if not is_integer_dtype(result_type):
             return NotImplemented
@@ -174,6 +198,7 @@ class SymPyOps:
 
     @staticmethod
     def minimum(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Min of the expressions; NotImplemented for bool promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         if result_type == torch.bool:
             return NotImplemented
@@ -181,6 +206,7 @@ class SymPyOps:
 
     @staticmethod
     def maximum(x: TypedExpr, y: TypedExpr) -> TypedExpr:
+        # [FUNCTION DOC] Max of the expressions; NotImplemented for bool promoted dtype.
         result_type = torch.promote_types(x.dtype, y.dtype)
         if result_type == torch.bool:
             return NotImplemented
@@ -189,14 +215,17 @@ class SymPyOps:
 
 @dataclass
 class IndexPropVar:
+    # [CLASS DOC] A value in the index propagation handler: either an IR value from the inner handler, or (when is_symbolic is true) a TypedExpr that can still be simplified symbolically.
     value: Any  # Either an IR value, or TypedExpr if is_symbolic is true
     is_symbolic: bool = False
 
     @staticmethod
     def new_symbolic(expr: TypedExpr) -> "IndexPropVar":
+        # [FUNCTION DOC] Create a symbolic IndexPropVar holding the given TypedExpr.
         return IndexPropVar(expr, is_symbolic=True)
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validate the invariant that a symbolic IndexPropVar holds a TypedExpr; raises AssertionError otherwise.
         if not (not self.is_symbolic or isinstance(self.value, TypedExpr)):
             raise AssertionError("Symbolic IndexPropVar must contain a TypedExpr")
 
@@ -205,6 +234,8 @@ IndexPropResult: TypeAlias = IndexPropVar | tuple["IndexPropResult", ...]
 
 
 class IndexPropagation(DefaultHandler):
+    # [CLASS DOC] Ops handler wrapper around an inner handler. Ops on symbolic values are folded using SymPyOps when possible; otherwise symbolic arguments are materialized and the op is forwarded to the inner handler.
+    # State: inner handler, shape env, variable ranges (var_to_range), indirect_var_ranges (kept as a reference so the caller can update it) and axioms. Key methods: indirect_indexing, fallback, propagate_sympy.
     """Ops wrapper that tries to propagate constant and index_expr values through the computation.
 
     This aims to maximize the compile time simplification possible, and convert
@@ -218,6 +249,7 @@ class IndexPropagation(DefaultHandler):
         iter_ranges: dict[sympy.Symbol, sympy.Expr],
         indirect_var_ranges: dict[sympy.Symbol, sympy.Expr],
     ) -> None:
+        # [FUNCTION DOC] Store the inner handler, shape env from the current graph, value ranges for iteration variables (zero up to size minus one) combined with shape env ranges, the indirect var range mapping (by reference), and axioms (bounds of iter vars plus shape env axioms).
         self._inner = inner
         self.shape_env = V.graph.sizevars.shape_env
 
@@ -238,6 +270,7 @@ class IndexPropagation(DefaultHandler):
         self.axioms = tuple(axioms) + self.shape_env.get_axioms()
 
     def materialize_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> Any:
+        # [FUNCTION DOC] Turn a sympy expression into an inner-handler value: a constant if it is numeric, otherwise an index_expr.
         # Construct a new constant/index_expr from the SymPy expression
         if _is_constant(expr):
             val = dtype_to_type(dtype)(expr)
@@ -245,9 +278,11 @@ class IndexPropagation(DefaultHandler):
         return self._inner.index_expr(expr, dtype)
 
     def value_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> IndexPropResult:
+        # [FUNCTION DOC] Create a value_expr in the inner handler and wrap the result.
         return self.wrap(self._inner.value_expr(expr, dtype))
 
     def unwrap(self, a: Any | IndexPropVar) -> Any:
+        # [FUNCTION DOC] Convert wrapped values (recursing into sequences) back to inner-handler values; symbolic ones are materialized from their expression, non-IndexPropVar values pass through.
         if isinstance(a, (list, tuple)):
             return tuple(self.unwrap(v) for v in a)
 
@@ -261,6 +296,7 @@ class IndexPropagation(DefaultHandler):
         return a.value
 
     def wrap(self, a) -> IndexPropResult:
+        # [FUNCTION DOC] Wrap inner-handler values (recursing into sequences) as non-symbolic IndexPropVar objects.
         if isinstance(a, (list, tuple)):
             return tuple(self.wrap(v) for v in a)
         return IndexPropVar(a)
@@ -281,6 +317,7 @@ class IndexPropagation(DefaultHandler):
     def fallback(
         self, name: str, args: Sequence[Any], kwargs: dict[str, Any]
     ) -> IndexPropResult:
+        # [FUNCTION DOC] Call the named op on the inner handler with unwrapped arguments and wrap the result.
         # Fallback to the wrapped handler
         new_args = [self.unwrap(a) for a in args]
         new_kwargs = {k: self.unwrap(v) for k, v in kwargs.items()}
@@ -289,8 +326,11 @@ class IndexPropagation(DefaultHandler):
     def propagate_sympy(
         self, name: str, args: Sequence[Any], kwargs: dict[str, Any]
     ) -> IndexPropResult:
+        # [FUNCTION DOC] Try to compute the op with SymPyOps on the symbolic values. Falls back to the inner handler on overflow/value errors, NotImplemented results, or non-integer non-constant expressions;
+        # otherwise returns a new symbolic IndexPropVar.
         # Build a new SymPy expression from this ops call
         def unwrap(a: Any | IndexPropVar) -> Any:
+        # [FUNCTION DOC] HELPER: Return the underlying value of an IndexPropVar, or the argument itself.
             if not isinstance(a, IndexPropVar):
                 return a
             return a.value
@@ -312,6 +352,7 @@ class IndexPropagation(DefaultHandler):
         return IndexPropVar.new_symbolic(new_expr)
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] Default handler for any op: fall back to the inner handler if SymPyOps has no such op or any IndexPropVar argument is non-symbolic; otherwise propagate symbolically.
         if not hasattr(SymPyOps, name):
             return self.fallback(name, args, kwargs)
 
@@ -326,6 +367,7 @@ class IndexPropagation(DefaultHandler):
         return self.propagate_sympy(name, args, kwargs)
 
     def statically_true(self, e):
+        # [FUNCTION DOC] Return whether the expression is provably true using the value ranges, indirect var ranges, axioms and shape env.
         """
         Given some iter_ranges, return a function that given an expression, returns whether
         it is true or false using value ranges, guard knowledge and runtime_asserts.
@@ -355,6 +397,8 @@ class IndexPropagation(DefaultHandler):
         check: bool = True,
         wrap_neg=True,
     ) -> Any:
+        # [FUNCTION DOC] Handle indirect indexing. For a symbolic index, returns the sympy expression (wrapped for negative values if wrap_neg, using Where when sign is unknown)
+        # and emits a bounds check through the inner handler for bounds that cannot be proven (when asserts are enabled). For other indices, delegates to the inner handler and returns its value.
         if isinstance(index, IndexPropVar) and index.is_symbolic:
             # If we find something we can convert into a direct indexing we do so
             # We still need to (perhaps) wrap the expression and add bound checks
@@ -365,6 +409,7 @@ class IndexPropagation(DefaultHandler):
 
             # TODO Perhaps move this logic to the simplify indexing pass
             def wrap_expr(expr):
+            # [FUNCTION DOC] HELPER: Wrap a negative-capable index into range: unchanged if provably nonnegative, plus size if provably negative, otherwise a conditional expression.
                 # Positive, negative, mixed
                 if self.statically_true(0 <= expr):
                     return expr

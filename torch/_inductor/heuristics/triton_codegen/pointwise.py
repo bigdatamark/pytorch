@@ -1,3 +1,6 @@
+# [MODULE DOC] Autotuning config heuristics for Triton pointwise kernels: a default (CUDA) class plus ROCm/HIP and XPU overrides.
+# Each class is registered in the codegen heuristic registry under the name pointwise (device-specific ones only when the backend is available).
+# Import-time side effect: registers the heuristics; queries torch.version.hip and torch.xpu.
 """Codegen heuristics for Triton pointwise kernel autotuning.
 
 Contains the default (CUDA) heuristic and device-specific overrides for
@@ -28,6 +31,8 @@ if TYPE_CHECKING:
 
 @register_codegen_heuristic("pointwise")
 class PointwiseHeuristic(CodegenConfigHeuristics):
+    # [CLASS DOC] Default pointwise heuristic. Dispatches on the number of dimensions in size_hints (1, 2 or 3) to per-dimension config builders.
+    # Subclasses override only the per-dimension methods that differ.
     """Default pointwise autotuning configs (CUDA non-ROCm)."""
 
     def get_configs(
@@ -39,6 +44,9 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
         tile_hint: TileHint | None = None,
         inductor_meta: dict[str, Any] | None = None,
     ) -> list[Any]:
+        # [FUNCTION DOC] Build the list of candidate Triton configs for a pointwise kernel.
+        # Args: size_hints (mapping of dim name to size), bs (block size), triton_config_fn (config factory), hinted_configs (extra configs), tile_hint, inductor_meta (may be None).
+        # Returns a list of configs from the 1d, 2d or 3d builder. Raises NotImplementedError for other dimension counts.
         inductor_meta = inductor_meta or {}
         n = len(size_hints)
         if n == 1:
@@ -63,6 +71,8 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
     def _configs_1d(
         self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 1d configs. Returns a single default config when pointwise autotune is disabled and max_autotune flags are off;
+        # otherwise two configs with different elements-per-warp plus the hinted configs.
         if not inductor_meta.get("autotune_pointwise", True) and not (
             inductor_meta.get("max_autotune")
             or inductor_meta.get("max_autotune_pointwise")
@@ -77,6 +87,8 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
     def _configs_2d(
         self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 2d configs. Returns only a 32x32 config when autotune is disabled or tile hint is square (and max_autotune is off);
+        # otherwise a fixed set of tile shapes plus the hinted configs.
         if (
             not inductor_meta.get("autotune_pointwise", True)
             or tile_hint == TileHint.SQUARE
@@ -98,6 +110,7 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
     def _configs_3d(
         self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 3d configs. Returns a single 16x16x16 config unless max_autotune is on, in which case a fixed set of tile shapes plus hinted configs.
         if not (
             inductor_meta.get("max_autotune")
             or inductor_meta.get("max_autotune_pointwise")
@@ -122,6 +135,7 @@ class PointwiseHeuristic(CodegenConfigHeuristics):
 
 @register_codegen_heuristic("pointwise", "hip", register=torch.version.hip is not None)
 class ROCmPointwiseHeuristic(PointwiseHeuristic):
+    # [CLASS DOC] ROCm/HIP pointwise heuristic; inherits the 3d builder and overrides the 1d and 2d builders with extra ROCm-tuned configs.
     """Pointwise configs for ROCm/HIP devices.
 
     Inherits _configs_3d from PointwiseHeuristic (same configs).
@@ -130,6 +144,8 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
     def _configs_1d(
         self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: Base 1d configs plus, when the base returned more than one, extra ROCm configs (max block, 4096, and an 8-warp variant);
+        # adds a single-warp config when atomic adds were found in the kernel. Returns the list.
         configs = super()._configs_1d(
             size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
         )
@@ -164,6 +180,8 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
     def _configs_2d(
         self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 2d configs for ROCm. Does not special-case square tile hints; returns one 32x32 config when autotune is disabled,
+        # otherwise the base shapes, hinted configs, and extra ROCm-tuned shapes.
         # ROCm doesn't skip autotune for SQUARE tile hints
         if not inductor_meta.get("autotune_pointwise", True) and not (
             inductor_meta.get("max_autotune")
@@ -192,11 +210,13 @@ class ROCmPointwiseHeuristic(PointwiseHeuristic):
 
 @register_codegen_heuristic("pointwise", "xpu", register=torch.xpu._is_compiled())
 class XPUPointwiseHeuristic(PointwiseHeuristic):
+    # [CLASS DOC] XPU pointwise heuristic; overrides the 1d, 2d and 3d builders with XPU-specific configs.
     """Pointwise configs for XPU devices."""
 
     def _configs_1d(
         self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: Base 1d configs plus an extra small-block config (32) when more than one config exists (workaround for an Intel Triton backend issue).
         configs = super()._configs_1d(
             size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
         )
@@ -210,6 +230,8 @@ class XPUPointwiseHeuristic(PointwiseHeuristic):
     def _configs_2d(
         self, size_hints, bs, hinted_configs, triton_config_fn, tile_hint, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 2d configs for XPU. Does not special-case square tile hints; returns one 32x32 config when autotune is disabled,
+        # otherwise base shapes, hinted configs, and two XPU-specific configs.
         # XPU doesn't skip autotune for SQUARE tile hints
         if not inductor_meta.get("autotune_pointwise", True) and not (
             inductor_meta.get("max_autotune")
@@ -233,6 +255,7 @@ class XPUPointwiseHeuristic(PointwiseHeuristic):
     def _configs_3d(
         self, size_hints, bs, hinted_configs, triton_config_fn, inductor_meta
     ):
+        # [FUNCTION DOC] HELPER: 3d configs for XPU. Always returns the full set of configs, with no max_autotune gate.
         # XPU always uses full set of configs (no autotune gate)
         return [
             triton_config_fn(size_hints, 16, 16, 16),

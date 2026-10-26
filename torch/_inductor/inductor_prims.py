@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines Inductor-specific custom primitives via make_prim: seed/random ops, rand eager offsets, force_stride_order, unsafe index_put, fma, online softmax prep,
+# low-memory max pool offset ops, and e8m0 conversion, plus their eager reference implementations and the autograd formula for fma.
+# Import-time side effects: registers these ops in the inductor_prims library, registers fma autograd, and registers DTensor strategies when distributed is available.
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
@@ -25,14 +28,18 @@ def make_prim(
     doc: str = "",
     tags: Sequence[torch.Tag] | None = None,
 ):
+    # [FUNCTION DOC] Create and register a prim from a schema string and an eager implementation.
+    # The meta function (used for tracing) wraps the eager implementation's outputs as TensorMeta (a tuple of them when return_type is a tuple). Returns the prim created by _prims._make_prim.
     if isinstance(return_type, tuple):
 
         def meta(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Meta function for multi-output prims; returns a tuple of TensorMeta computed from the eager implementation.
             return tuple(_prims.TensorMeta(o) for o in impl_aten(*args, **kwargs))
 
     else:
 
         def meta(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Meta function for single-output prims; returns a TensorMeta computed from the eager implementation.
             return _prims.TensorMeta(impl_aten(*args, **kwargs))
 
     return _prims._make_prim(
@@ -46,6 +53,7 @@ def make_prim(
 
 
 def eager_force_stride(input_tensor: Tensor, stride) -> Tensor:
+    # [FUNCTION DOC] Return input_tensor if its stride already equals stride; otherwise return a copy of the data laid out with the requested stride.
     if input_tensor.stride() == stride:
         return input_tensor
     new_tensor = input_tensor.clone().as_strided(
@@ -57,6 +65,7 @@ def eager_force_stride(input_tensor: Tensor, stride) -> Tensor:
 
 
 def eager_prepare_softmax(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Eager reference for online softmax preparation: returns the max along dim and the sum of exponentials of (x minus max), both keeping the reduced dim.
     amax = torch.amax(x, dim, keepdim=True)
     return amax, torch.sum(torch.exp(x - amax), dim, keepdim=True)
 
@@ -100,6 +109,9 @@ randint = make_prim(
 
 
 def _reserve_rng_state(device: torch.device, used_offset):
+    # [FUNCTION DOC] HELPER: Reserve used_offset Philox samples on the given device via the reserve-rng-state op and return (seed, base) with base in units of four samples.
+    # For non-CUDA devices returns (0, 0) without doing anything. Side effect: advances the CUDA generator offset.
+    # May sync to host if the intra-offset tensor lives on a different device type than the offset tensor.
     """
     Reserve `used_offset` 32-bit Philox samples on the given CUDA device and
     return (seed, base), where base is in Philox-4x32 units.
@@ -133,6 +145,8 @@ def _reserve_rng_state(device: torch.device, used_offset):
 
 
 def _rand_eager_offset_impl(offset, device: torch.device) -> Tensor:
+    # [FUNCTION DOC] HELPER: Placeholder implementation returning an uninitialized int64 tensor of two elements on device; replaced later by the batched offsets op in a graph pass.
+    # KNOWN ISSUE: docstring and registered prim doc say a 1-element tensor, but the code returns two elements.
     """
     Reserve `offset` 32-bit Philox samples and return a 1-element int64 tensor
     Place-holder: will be replaced by rand_eager_offsets
@@ -143,6 +157,9 @@ def _rand_eager_offset_impl(offset, device: torch.device) -> Tensor:
 
 
 def _rand_eager_offsets_impl(offsets, device: torch.device) -> Tensor:
+    # [FUNCTION DOC] HELPER: Batched eager implementation: reserve RNG state for each entry in offsets and return an int64 tensor of shape (len(offsets), 2) holding packed (seed, base).
+    # Side effect: advances the generator offsets.
+    # KNOWN ISSUE: the prim doc says 64-bit Philox samples while the other op and code reserve 32-bit samples.
     """
     Batched version of _rand_eager_offset_impl. For each entry in `offsets`,
     reserve that many 32-bit Philox samples and return a 1D int64 tensor
@@ -153,6 +170,7 @@ def _rand_eager_offsets_impl(offsets, device: torch.device) -> Tensor:
     bases = [b for _, b in states]
 
     def _to_i64(x):
+        # [FUNCTION DOC] HELPER: Convert a value to a tensor, leaving tensors unchanged and making int64 tensors on the device from scalars.
         if isinstance(x, torch.Tensor):
             return x
         return torch.as_tensor(x, device=device, dtype=torch.int64)
@@ -164,6 +182,7 @@ def _rand_eager_offsets_impl(offsets, device: torch.device) -> Tensor:
 
 
 def _rand_eager_offsets_meta(offsets, device: torch.device):
+    # [FUNCTION DOC] HELPER: Meta function for the batched offsets op; returns an empty int64 tensor of shape (len(offsets), 2).
     return torch.empty((len(offsets), 2), dtype=torch.int64, device=device)
 
 
@@ -213,6 +232,7 @@ fma = make_prim(
 
 
 def _fma_setup_context(ctx, inputs, output):
+    # [FUNCTION DOC] HELPER: Autograd setup for fma: record shape of a and c, whether b is a tensor (saving it and a for backward) or a plain scalar (saving a only and keeping b on ctx).
     a, b, c = inputs
     ctx.a_shape = a.shape
     ctx.b_is_tensor = isinstance(b, Tensor)
@@ -226,6 +246,8 @@ def _fma_setup_context(ctx, inputs, output):
 
 
 def _fma_backward(ctx, grad):
+    # [FUNCTION DOC] HELPER: Backward for fma. Returns grads for a, b and c: grad times b summed to a's shape, grad times a summed to b's shape (only when b is a tensor), and grad summed to c's shape;
+    # each is None when that input does not need a gradient.
     if ctx.b_is_tensor:
         a, b = ctx.saved_tensors
     else:
@@ -266,6 +288,8 @@ prepare_softmax_online = make_prim(
 
 
 def _flattened_index_to_nd(indices, width):
+    # [FUNCTION DOC] HELPER: Convert flat indices into a list of per-dimension indices for the given widths, recursively, using floor division (symbolic when sympy expressions are involved).
+    # Raises ValueError for an empty width list.
     import sympy
 
     from torch.utils._sympy.functions import FloorDiv
@@ -287,6 +311,7 @@ def _flattened_index_to_nd(indices, width):
 
 
 def _flatten_index(indices, width):
+    # [FUNCTION DOC] HELPER: Combine per-dimension indices into a single flat index using the widths (row-major).
     result = indices[0]
     for d in range(1, len(indices)):
         result = width[d] * result + indices[d]
@@ -301,6 +326,8 @@ def _low_memory_max_pool_with_offsets_aten(
     dilation,
     ceil_mode,
 ):
+    # [FUNCTION DOC] HELPER: Eager implementation of max pool (2d or 3d, chosen by kernel_size length) that returns values and int8 window offsets instead of flat indices.
+    # Computes standard indices, converts them to per-dim indices, subtracts the window base position, divides by dilation and flattens by kernel size.
     dim = len(kernel_size)
     if dim == 2:
         vals, indices = torch.ops.aten.max_pool2d_with_indices(
@@ -338,6 +365,7 @@ def _low_memory_max_pool_offsets_to_indices_aten(
     padding,
     dilation,
 ):
+    # [FUNCTION DOC] HELPER: Inverse of the offsets computation: convert int8 window offsets back into flat input indices using stride, padding, dilation and input_size.
     dim = len(kernel_size)
     offsets = offsets.to(torch.int64)
     dhw_inc = _flattened_index_to_nd(offsets, kernel_size)
@@ -370,6 +398,8 @@ _low_memory_max_pool_offsets_to_indices = make_prim(
 
 
 def _cvt_e8m0_rceil_aten(inp: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Convert float32/float16/bfloat16 values to e8m0 (biased exponent byte) with round-up on any nonzero mantissa and saturation to 254.
+    # Returns a uint8 tensor. Raises ValueError for unsupported input dtypes.
     """
     Convert float to e8m0 format with ceiling rounding and satfinite semantics.
 
