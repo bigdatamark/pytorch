@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared utilities for the Inductor C++ backend codegen: torch dtype/device/layout
+# to C++ and ATen name tables, a C++ sympy printer (cexpr), a CSE variable subclass that tracks
+# vectorization and dependent loop variables, local-buffer localization (LocalBufferContext and
+# LocalizeBufferHandler), mask dtype unification, random-number vector codegen, GEMM epilogue
+# IR construction, and template/epilogue fusion support checks.
+# Import-time side effects: builds the module-level tables and the cexpr printer function only.
 import contextlib
 import dataclasses
 import functools
@@ -104,6 +110,10 @@ GemmBlocking = namedtuple("GemmBlocking", ["block_m", "block_n", "block_k"])
 
 
 def get_promote_dtype(args):
+    # [FUNCTION DOC] Computes the common promoted dtype of all CppCSEVariable entries in args
+    # (other entries are ignored) by folding torch.promote_types. Returns None if any such
+    # variable has no dtype yet, since the result cannot be determined. With no CSE variables
+    # the reduce over an empty list would raise a TypeError.
     return (
         # pyrefly: ignore [no-matching-overload]
         functools.reduce(
@@ -117,7 +127,12 @@ def get_promote_dtype(args):
 
 
 def promote_args(new_args):
+    # [FUNCTION DOC] Casts all CppCSEVariable arguments to their common promoted dtype.
+    # Returns a new list with casted variables when every CSE variable has a known dtype and a
+    # promote type exists; otherwise returns new_args unchanged. Non-variable args pass through.
     def promote_arg(arg, promote_type):
+        # [FUNCTION DOC] HELPER: If arg is a typed CSE variable whose dtype differs from
+        # promote_type, emits a to_dtype op, unwraps the result and sets its dtype; returns arg.
         if (
             isinstance(arg, CppCSEVariable)
             and arg.dtype
@@ -147,6 +162,10 @@ def promote_args(new_args):
 
 
 class CppCSEVariable(CSEVariable):
+    # [CLASS DOC] CSE variable for the C++ backend. Extends the base variable with is_vec (true
+    # if the value is a vectorized register type) and dependent_itervars (the set of loop
+    # iteration symbols the value depends on, directly or via other CSE variables). Both are
+    # updated by update_on_args as ops are generated.
     def __init__(
         self,
         name,
@@ -154,17 +173,26 @@ class CppCSEVariable(CSEVariable):
         dtype: torch.dtype | None = None,
         shape: BlockShapeType = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base variable and sets is_vec to false and
+        # dependent_itervars to an empty ordered set.
         super().__init__(name, bounds, dtype, shape=shape)
         self.is_vec = False
         self.dependent_itervars = OrderedSet[sympy.Symbol]()
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a debug string with name, bounds, is_vec, dtype and
+        # dependent_itervars.
         return (
             f"CppCSEVariable(name: {self.name}, bounds: {self.bounds}, is_vec: {self.is_vec}, dtype: {self.dtype}, "
             f"dependent_itervars: {self.dependent_itervars})"
         )
 
     def update_on_args(self, name, args, kwargs):
+        # [FUNCTION DOC] Updates dependency metadata after op `name` produced this variable.
+        # For a load, dependent itervars come from the index argument (third positional arg).
+        # Otherwise itervars of all CSE-variable args are merged in; index_expr and value_expr
+        # also add itervars from their first arg; is_vec becomes true if any arg is vectorized.
+        # Mutates self only.
         if name == "load":
             # args[2] is index
             self._set_dependent_itervars(args[2])
@@ -183,6 +211,9 @@ class CppCSEVariable(CSEVariable):
                 self.is_vec = True
 
     def _set_dependent_itervars(self, index: sympy.Expr):
+        # [FUNCTION DOC] HELPER: Adds to dependent_itervars every free symbol of index that is a
+        # current kernel itervar, and for symbols naming other CSE variables, that variable's
+        # dependent itervars. Reads the active kernel via the virtualized state V.
         """
         Set the relevant itervars for this variable based on the `index` expression.
         This includes the itervars directly used in the `index` as well as relevant itervars
@@ -197,17 +228,26 @@ class CppCSEVariable(CSEVariable):
                 )
 
     def depends_on(self, itervar: sympy.Symbol):
+        # [FUNCTION DOC] Returns whether the given loop iteration symbol is in the dependent set.
         return itervar in self.dependent_itervars
 
 
 class CppPrinter(_CppPrinter):
+    # [CLASS DOC] Sympy-to-C++ expression printer that optionally simplifies expressions with
+    # the current graph's size variables before printing and always parenthesizes modulo terms.
     def doprint(self, expr, *, simplify: bool = True, p=True):
+        # [FUNCTION DOC] Prints expr as C++ source text. If simplify is set, expr is a sympy
+        # expression and the current graph has sizevars, expr is first simplified through them.
+        # The p argument is unused. Returns a string.
         # TODO: why are people passing strings to the printer here :think:
         if simplify and isinstance(expr, sympy.Expr) and hasattr(V.graph, "sizevars"):
             expr = V.graph.sizevars.simplify(expr)
         return super().doprint(expr)
 
     def parenthesize(self, item: sympy.Expr, level: int, strict: bool = False) -> str:
+        # [FUNCTION DOC] Returns item printed as a string; modulo expressions are always wrapped
+        # in parentheses to work around wrong precedence in some sympy versions, everything else
+        # defers to the base printer using level and strict.
         if isinstance(item, sympy.Mod):
             # use parenthesis to enforce precedence.
             # in sympy 1.13.3, -2*Mod(x,y) becomes -2*x%y, which is wrong.
@@ -222,10 +262,16 @@ cexpr = CppPrinter().doprint
 
 
 def cexpr_index(index):
+    # [FUNCTION DOC] Returns C++ source that prints index and casts it to the index type (int64).
     return f"static_cast<{INDEX_TYPE}>({cexpr(index)})"
 
 
 def value_to_cpp(value, cpp_type):
+    # [FUNCTION DOC] Renders a Python scalar as a C++ literal expression of cpp_type: negative
+    # and positive infinity and NaN become numeric_limits expressions, booleans become a cast of
+    # true/false, and other values become a cast of their repr. Returns a string.
+    # KNOWN ISSUE: the NaN check runs on non-bool values only through math.isnan, which would
+    # raise for non-numeric inputs.
     if value == float("-inf"):
         return f"-std::numeric_limits<{cpp_type}>::infinity()"
     elif value == float("inf"):
@@ -243,6 +289,11 @@ def rewrite_index_for_function(
     index: sympy.Expr,
     global_buf_name: str,
 ):
+    # [FUNCTION DOC] Index rewriter for localized function bodies. Finds the scheduler node
+    # defining the global buffer, takes the loop ranges of its reduction-or-pointwise group, and
+    # keeps only the loop index symbols (named with x prefix) that correspond to the innermost
+    # dimensions covered by the local buffer; other x symbols are substituted by zero.
+    # Returns the new index expression. Raises an error if the buffer has no defining op.
     # Local buffer at the inner dimensions
     snode = V.graph.scheduler.name_to_buf[global_buf_name].defining_op
     if snode is None:
@@ -272,7 +323,10 @@ def rewrite_index_for_nodes(
     index: sympy.Expr,
     global_buf_name: str,
 ):
-    used_vars = OrderedSet(
+    # [FUNCTION DOC] Index rewriter for localized IR nodes. For each dimension of the local
+    # buffer, uses the matching index symbol if the original index uses it, else zero, and
+    # returns the local buffer layout's flat index computed from those variables.
+    used_vars =OrderedSet(
         s for s in index.free_symbols if symbol_is_type(s, SymT.INDEX)
     )
     index_vars = []
@@ -285,17 +339,24 @@ def rewrite_index_for_nodes(
 
 
 class LocalizeBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] Ops-handler wrapper that redirects loads and stores of global buffers to their
+    # registered local buffers, rewriting indices with a supplied callback. State: global_to_local
+    # mapping of buffer name to local buffer, and rewrite_index callback.
     def __init__(
         self,
         inner,
         global_to_local: dict[str, ir.Buffer],
         rewrite_index: Callable[["LocalizeBufferHandler", sympy.Expr, str], sympy.Expr],
     ) -> None:
+        # [FUNCTION DOC] Wraps the inner handler and stores the name mapping and index rewriter.
         super().__init__(inner)
         self.global_to_local = global_to_local
         self.rewrite_index = rewrite_index
 
     def localize(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] If name is a mapped global buffer, rewrites index with rewrite_index and
+        # replaces name with the local buffer's name. Returns the (name, index) pair, unchanged
+        # for unmapped names. Raises an error if a rewrite is needed but no rewriter is set.
         if self.global_to_local and name in self.global_to_local:
             if self.rewrite_index is None:
                 raise AssertionError("expected rewrite_index to be set, got None")
@@ -304,9 +365,14 @@ class LocalizeBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
         return name, index
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Forwards a load to the inner handler using the localized name and index.
         return self._inner.load(*self.localize(name, index))
 
     def store(self, name, index, value, mode=None):
+        # [FUNCTION DOC] Forwards a store to the inner handler with localized name and index and
+        # returns its result. When the target was a mapped global buffer and the active kernel is
+        # a Kernel, removes the local buffer name from the kernel's store_buffer_names (added
+        # by the inner store) so it is not treated as a real output.
         local_buffer_name, local_buffer_index = self.localize(name, index)
         res = self._inner.store(local_buffer_name, local_buffer_index, value, mode)
         if (
@@ -320,11 +386,19 @@ class LocalizeBufferHandler(V.WrapperHandler):  # type: ignore[name-defined]
         return res
 
     def store_reduction(self, name, index, value):
+        # [FUNCTION DOC] Forwards a reduction store to the inner handler with localized name and
+        # index and returns its result.
         # pyrefly: ignore [bad-argument-count]
         return self._inner.store_reduction(*self.localize(name, index), value)
 
 
 class LocalBufferContext:
+    # [CLASS DOC] Context manager enabling codegen with function-local buffers. State:
+    # kernel_args (the kernel argument registry that gets patched), exit_stack, and mappings
+    # local_buffers (name to local buffer), global_buffers (name to global buffer),
+    # global_to_local, plus removed_buffers (global names this context added to the graph's
+    # removed set). On entry it patches graph dtype lookup and kernel input/output so local
+    # buffers are not treated as arguments, and registers itself in V; exit undoes all of it.
     """
     This class creates a context that helps to generate code involving Inductor IR with
     function local buffers. These buffers are constructed during the codegen process and
@@ -335,6 +409,8 @@ class LocalBufferContext:
     """
 
     def __init__(self, kernel_args: KernelArgs) -> None:
+        # [FUNCTION DOC] Stores kernel_args and creates empty buffer mappings, the removed-buffer
+        # set and an exit stack. No patching happens until the context is entered.
         self.kernel_args = kernel_args
         self.exit_stack = contextlib.ExitStack()
         # map local buffer name to local buffer
@@ -347,10 +423,15 @@ class LocalBufferContext:
         self.removed_buffers: OrderedSet[str] = OrderedSet()
 
     def __enter__(self):
+        # [FUNCTION DOC] Enters the exit stack and patches (a) the graph's get_dtype to answer
+        # for local buffers, (b) kernel_args input and output to return local buffer names
+        # directly instead of registering arguments, and (c) sets this context as the current
+        # local buffer context in V. Returns self. Patches are reverted by __exit__.
         self.exit_stack.__enter__()
         original_get_dtype = V.graph.get_dtype
 
         def get_dtype(name):
+            # [FUNCTION DOC] HELPER: dtype of a local buffer if registered, else original lookup.
             if name in self.local_buffers:
                 return self.local_buffers[name].get_dtype()
             return original_get_dtype(name)
@@ -360,6 +441,7 @@ class LocalBufferContext:
         original_input = self.kernel_args.input
 
         def input(name):
+            # [FUNCTION DOC] HELPER: returns name itself for local buffers, else original input.
             if name in self.local_buffers:
                 return name
             return original_input(name)
@@ -369,6 +451,7 @@ class LocalBufferContext:
         original_output = self.kernel_args.output
 
         def output(name):
+            # [FUNCTION DOC] HELPER: returns name itself for local buffers, else original output.
             if name in self.local_buffers:
                 return name
             return original_output(name)
@@ -381,12 +464,18 @@ class LocalBufferContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Clears the local buffer registry and unwinds the exit stack, restoring
+        # all patched attributes and the V context. Exception info is passed through to the stack.
         self.local_buffers.clear()
         self.exit_stack.__exit__(exc_type, exc_val, exc_tb)
 
     def add_local_buffer(
         self, local_buffer: ir.Buffer, global_buffers: list[ir.Buffer] | None = None
     ):
+        # [FUNCTION DOC] Registers local_buffer by name and optionally maps each given global
+        # buffer to it. Raises an error if the local buffer or any global buffer is already
+        # registered. Each global buffer not already removed from the graph is marked removed
+        # in the graph and recorded in removed_buffers so it can be restored later.
         if local_buffer.get_name() in self.local_buffers:
             raise AssertionError(
                 f"local buffer {local_buffer.get_name()} already registered"
@@ -418,7 +507,11 @@ class LocalBufferContext:
             ["LocalizeBufferHandler", sympy.Expr, str], sympy.Expr
         ] = rewrite_index_for_function,
     ):
+        # [FUNCTION DOC] Returns a wrapper of fn that, when called, runs fn with the current ops
+        # handler wrapped in a LocalizeBufferHandler (using global_to_local and rewrite_index),
+        # so loads/stores of global buffers hit local buffers. Returns fn's result when called.
         def inner(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls fn under the localizing ops handler.
             with V.set_ops_handler(
                 LocalizeBufferHandler(
                     V.get_ops_handler(),
@@ -437,6 +530,10 @@ class LocalBufferContext:
             ["LocalizeBufferHandler", sympy.Expr, str], sympy.Expr
         ] = rewrite_index_for_nodes,
     ) -> list[ir.IRNode]:
+        # [FUNCTION DOC] Returns new IR nodes equivalent to nodes but whose inner functions are
+        # wrapped by localize_function, redirecting registered global buffers to local ones.
+        # Each node must be a Loops or a ComputedBuffer wrapping Loops; ComputedBuffers are
+        # rebuilt with the same name and layout. Raises an error for empty input or other types.
         """
         Given `local_buf` and `global_buf` registered in current `LocalBufferContext`
         though the method of `add_local_buffer`, localizes the `global_buf` to `local_buf`
@@ -452,6 +549,8 @@ class LocalBufferContext:
             raise AssertionError(f"expected non-empty nodes, got {len(nodes)}")
 
         def wrap_inner_fn_for_node(node: ir.IRNode):
+            # [FUNCTION DOC] HELPER: copies the node's Loops with a localized inner function and
+            # re-wraps it in a ComputedBuffer if the node was one.
             loops = node.data if isinstance(node, ir.ComputedBuffer) else node
             if not isinstance(loops, ir.Loops):
                 raise AssertionError(f"expected ir.Loops, got {type(loops)}")
@@ -478,6 +577,9 @@ def unify_mask_base_type(
     vars: tuple[CSEVariable, ...],
     dtype=torch.float,
 ):
+    # [FUNCTION DOC] Casts each given CSE variable to the mask type for dtype, emitting a CSE
+    # definition into buffer per variable. Returns a lazy generator (not a tuple) of the new
+    # variables; code is only emitted as it is consumed.
     """
     Given list of cse variables,
     Cast each to new mask base dtype and return casted cse variable.
@@ -493,6 +595,9 @@ def unify_mask_base_type(
 
 
 def may_unify_binary_op_mask_type(a, b):
+    # [FUNCTION DOC] If a is boolean, requires b to be boolean too (raises an error otherwise)
+    # and returns both cast to an int32 mask type via the kernel's compute buffer (a lazy
+    # generator). Otherwise returns the pair (a, b) unchanged.
     """
     Given two cse variables, when dtype is bool, unify them to the same mask dtype and return casted cse variable.
     """
@@ -505,6 +610,11 @@ def may_unify_binary_op_mask_type(a, b):
 
 
 def codegen_rand(offset, code, rand_function, dst_dtype=torch.float32):
+    # [FUNCTION DOC] Emits C++ for a vectorized random-number computation into the code buffer:
+    # an immediately invoked lambda that stores the vector offset into a scratch array, runs the
+    # per-lane rand_function statement in a loop over the tiling factor to fill a result array
+    # of dst_dtype, then loads it as a Vectorized (or VectorizedN if more than one vector is
+    # needed). Raises an error if offset is not an integer dtype. Returns the code buffer.
     if not is_integer_dtype(offset.dtype):
         raise AssertionError(f"expected integer dtype, got {offset.dtype}")
     code.writeline("[&]()")
@@ -533,6 +643,8 @@ def codegen_rand(offset, code, rand_function, dst_dtype=torch.float32):
 
 
 def get_gemm_template_output_and_compute_dtype(input_dtype):
+    # [FUNCTION DOC] Returns (output dtype, compute dtype) for a GEMM template: both int32 for
+    # 8-bit integer inputs, both float32 otherwise.
     if input_dtype in [torch.uint8, torch.int8]:
         return (torch.int32, torch.int32)
     else:
@@ -540,11 +652,20 @@ def get_gemm_template_output_and_compute_dtype(input_dtype):
 
 
 def create_epilogue_with_attr(input_buffer, attr, **kwargs):
+    # [FUNCTION DOC] Builds a Pointwise IR node applying the named epilogue activation or binary
+    # op to input_buffer, with the same device and size. Supported attr values: relu, gelu
+    # (needs algorithm none or tanh), swish, sigmoid, tanh, hardswish, hardsigmoid, leaky_relu
+    # (one scalar), hardtanh (two scalars min and max), add/sub/mul (needs other; other's leading
+    # dims may be fewer and are broadcast by dropping leading index dims), bias_add (needs other,
+    # beta, dtype; computes beta times other plus input, and overrides the output dtype).
+    # Non-float inputs are computed in float and cast back for the float-based activations.
+    # Raises an error for missing kwargs and ValueError for unsupported attr.
     input_loader = input_buffer.make_loader()
     dtype = input_buffer.get_dtype()
     if attr == "relu":
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: elementwise maximum of the loaded value and zero.
             input = input_loader(index)
             zero = ops.constant(0, dtype)
             return ops.maximum(input, zero)
@@ -555,12 +676,13 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         if kwargs["algorithm"] == "none":
 
             def inner_fn(index):
+                # [FUNCTION DOC] HELPER: exact gelu using erf, computed in float.
                 input = input_loader(index)
                 if dtype != torch.float:
                     input = ops.to_dtype(input, torch.float)
                 half = ops.constant(0.5, torch.float)
                 one = ops.constant(1.0, torch.float)
-                const = ops.constant(0.7071067811865476, torch.float)
+                const =ops.constant(0.7071067811865476, torch.float)
                 result = input * half * (ops.erf(input * const) + one)
                 if dtype != torch.float:
                     result = ops.to_dtype(result, dtype)
@@ -573,12 +695,13 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
                 )
 
             def inner_fn(index):
+                # [FUNCTION DOC] HELPER: tanh-approximated gelu, computed in float.
                 input = input_loader(index)
                 if dtype != torch.float:
                     input = ops.to_dtype(input, torch.float)
                 half = ops.constant(0.5, torch.float)
                 one = ops.constant(1.0, torch.float)
-                const1 = ops.constant(0.7978845608028654, torch.float)
+                const1 =ops.constant(0.7978845608028654, torch.float)
                 const2 = ops.constant(0.044715, torch.float)
                 result = (
                     half
@@ -595,6 +718,7 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
     elif attr == "swish":
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: swish, the value times its sigmoid.
             input = input_loader(index)
             result = input * ops.sigmoid(input)
             return result
@@ -602,16 +726,19 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
     elif attr == "sigmoid":
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: sigmoid of the loaded value.
             return ops.sigmoid(input_loader(index))
 
     elif attr == "tanh":
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: tanh of the loaded value.
             return ops.tanh(input_loader(index))
 
     elif attr == "hardswish" or attr == "hardsigmoid":
 
         def hardsigmoid_float(input):
+            # [FUNCTION DOC] HELPER: hard sigmoid in float, clamp(input + 3, 0, 6) divided by 6.
             zero = ops.constant(0, torch.float)
             six = ops.constant(6, torch.float)
             three = ops.constant(3, torch.float)
@@ -621,6 +748,8 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
             return min * one_over_six
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: hardsigmoid, or hardswish (input times hardsigmoid) when attr
+            # says so, computed in float and cast back to the buffer dtype.
             input = input_loader(index)
             if dtype != torch.float:
                 input = ops.to_dtype(input, torch.float)
@@ -639,6 +768,7 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         negative_slope = kwargs["scalars"][0]
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: leaky relu in float: value if positive else value times slope.
             input = input_loader(index)
             if dtype != torch.float:
                 input = ops.to_dtype(input, torch.float)
@@ -659,6 +789,7 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         max_value = kwargs["scalars"][1]
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: clamps the value between min_value and max_value in float.
             input = input_loader(index)
             if dtype != torch.float:
                 input = ops.to_dtype(input, torch.float)
@@ -680,6 +811,8 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         other_loader = other.make_loader()
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: applies the binary op named by attr to the input and other,
+            # indexing other with the leading index dims dropped when other has fewer dims.
             op = getattr(ops, attr)
             if dims_diff != 0:
                 return op(input_loader(index), other_loader(index[dims_diff:]))
@@ -699,6 +832,8 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
         bias_loader = other.make_loader()
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: bias plus input, with the bias scaled by beta when beta is
+            # not one.
             bias = bias_loader(index)
             input = input_loader(index)
             if beta != 1:
@@ -718,6 +853,10 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
 
 
 def _get_loop_body(fn_list):
+    # [FUNCTION DOC] HELPER: Extracts the LoopBody objects behind a list of inner functions.
+    # Accepts LoopBody objects directly, localized wrappers exposing an original_fn partial, or
+    # plain partials whose first argument holds a body; the forms must not be mixed. Raises an
+    # error if the expected structure is not found. Returns a list of LoopBody.
     if all(isinstance(fn, LoopBody) for fn in fn_list):
         loop_bodies = fn_list
     else:
@@ -742,6 +881,9 @@ def _get_loop_body(fn_list):
 
 
 def _get_dtype_from_loopbodies(loop_bodies):
+    # [FUNCTION DOC] HELPER: Collects the set of dtypes recorded in the optimization context
+    # metadata of every method-call node in the root block and all subblocks of the given loop
+    # bodies. Returns an ordered set of dtypes.
     dtypes = OrderedSet[torch.dtype]()
     for loop_body in loop_bodies:
         graphs = [loop_body.root_block.graph] + [
@@ -758,9 +900,16 @@ def _get_dtype_from_loopbodies(loop_bodies):
 def template_fusion_with_epilogues_supported(
     template: BaseSchedulerNode, epilogues: list[BaseSchedulerNode]
 ) -> tuple[bool, bool]:
+    # [FUNCTION DOC] Checks whether the epilogue scheduler nodes can be fused into the template
+    # node. Returns (supported, same_indexes): supported is true if every epilogue reads the
+    # template outputs through at most one distinct index and that index equals the index of all
+    # its writes; same_indexes is true if all epilogues satisfy that index equality. Raises an
+    # error if template is not a template node.
     def _get_indexes_of_template_buf_read(
         epilogue_node: ir.Operation, template_buf_names: list[str]
     ) -> list[sympy.Expr]:
+        # [FUNCTION DOC] HELPER: indices of all reads by the epilogue of buffers named in the
+        # template buffer name list.
         return [
             read.index
             for read in epilogue_node.get_reads()
@@ -771,6 +920,9 @@ def template_fusion_with_epilogues_supported(
         index_of_template_buf_read: Sequence[sympy.Expr],
         epilogue_writes: OrderedSet[Dep],
     ) -> tuple[bool, bool]:
+        # [FUNCTION DOC] HELPER: Returns (supported, same_index) for one epilogue. Several
+        # distinct read indexes: neither. No reads: both true. One read index: same_index is
+        # whether all writes use that index, and supported equals it.
         num_indexes = len(OrderedSet(index_of_template_buf_read))
 
         if num_indexes > 1:
@@ -793,6 +945,8 @@ def template_fusion_with_epilogues_supported(
     def _template_fusion_supported(
         template_outputs: Sequence[SchedulerBuffer], epilogue_nodes: list[ir.Operation]
     ) -> tuple[bool, bool]:
+        # [FUNCTION DOC] HELPER: Applies the per-epilogue index check to every epilogue operation
+        # and returns (all supported, all same index).
         template_buf_names = [x.get_name() for x in template_outputs]
         indexes_of_template_buf_reads = [
             _get_indexes_of_template_buf_read(epilogue_node, template_buf_names)
