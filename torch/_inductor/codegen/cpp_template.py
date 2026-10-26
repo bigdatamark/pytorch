@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines CppTemplate, the base class for inductor C++ code templates. It renders a
+# template through CppTemplateKernel, validates call arguments, builds a CppBenchmarkRequest and
+# returns a CppTemplateCaller for autotuning. No import-time side effects besides creating a logger.
 import ctypes
 import functools
 import itertools
@@ -21,6 +24,11 @@ log = logging.getLogger(__name__)
 
 
 class CppTemplate(KernelTemplate):
+    # [CLASS DOC] Base class for C++ kernel templates used by inductor CPU autotuning (e.g. GEMM).
+    # State: input_nodes, output_node (a buffer or list of buffers named by a unique per-instance
+    # index), layout, num_threads and an optional epilogue_creator. The class-level index_counter
+    # makes names unique. generate() produces a CppTemplateCaller; header() gives common includes;
+    # render() must be implemented by subclasses.
     index_counter = itertools.count()
 
     def __init__(
@@ -31,6 +39,9 @@ class CppTemplate(KernelTemplate):
         num_threads: int,
         epilogue_creator: Callable[[ir.Buffer], ir.Pointwise] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the input nodes, output layout, thread count and optional epilogue
+        # creator; takes a unique index from the class-wide counter (mutating it) and creates the output
+        # buffer node named with that index.
         super().__init__(name)
         self.input_nodes = input_nodes
         self.index = next(self.index_counter)
@@ -42,6 +53,14 @@ class CppTemplate(KernelTemplate):
         self.epilogue_creator = epilogue_creator
 
     def generate(self, **kwargs):
+        # [FUNCTION DOC] Renders this template once to C++ source and wraps it as a CppTemplateCaller
+        # for autotuning. Under temporary patches (fake dtype lookup for the output node, flexible layout
+        # indexing allowed, current device set to the layout device) it renders with a CppTemplateKernel,
+        # logs the code and arguments, and checks that the leading kernel call arguments equal the
+        # unique input names followed by the output name(s); raises AssertionError otherwise.
+        # Remaining (size) arguments are converted via size hints to unsigned 64-bit ctypes values for
+        # benchmarking only. Builds a CppBenchmarkRequest from tensor metadata and the source.
+        # Returns the CppTemplateCaller with a kernel-render factory; kwargs go to the render call.
         kernel_name = f"cpp_{self.name}"
         with (
             patch.object(V.graph, "get_dtype", self._fake_get_dtype(self.output_node)),
@@ -98,6 +117,11 @@ class CppTemplate(KernelTemplate):
             flag_template_buffer_has_other_users: bool,
             epilogue_nodes: list[ir.IRNode] | None = None,
         ):
+            # [FUNCTION DOC] HELPER: Callback handed to the CppTemplateCaller. Creates a fresh
+            # CppTemplateKernel named by a kernel-name placeholder and a render callable bound to this
+            # template, the given template buffer node, a flag saying whether the template buffer has
+            # other users, the optional epilogue nodes and the original generate kwargs.
+            # Returns the pair (kernel, render callable); the callable is not invoked here.
             kernel = CppTemplateKernel(
                 kernel_name=str(Placeholder.KERNEL_NAME), num_threads=self.num_threads
             )
@@ -125,6 +149,10 @@ class CppTemplate(KernelTemplate):
         )
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Builds the common C++ include preamble in a new indented buffer: the inductor
+        # cpp prefix, the c10 unroll header and the AOTI shim header. When kernel profiling is enabled in
+        # config and the platform is linux or win32, also includes the AOTI runtime utils header.
+        # Returns the buffer; no global side effects.
         res = IndentedBuffer()
         res.writeline("#include <torch/csrc/inductor/cpp_prefix.h>")
         # TODO: add c10::ForcedUnroll test to test_aoti_abi_check
@@ -139,4 +167,6 @@ class CppTemplate(KernelTemplate):
         return res
 
     def render(self, **kwargs) -> str:
+        # [FUNCTION DOC] Abstract hook: subclasses return the C++ source text of the template.
+        # Always raises NotImplementedError in this base class.
         raise NotImplementedError

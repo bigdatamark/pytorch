@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] C++ micro GEMM kernel generators for inductor CPU GEMM templates. Defines the
+# CppMicroGemm base class and implementations (reference, vectorized float, AVX512 VNNI, AMX,
+# oneDNN brgemm, weight-only int4 variants), a config dataclass, and a registry populated at import
+# time by the register_micro_gemm decorator. create_micro_gemm selects the best implementation for
+# a problem shape and dtypes.
 import dataclasses
 import operator
 import sys
@@ -26,6 +31,8 @@ from .cpp_utils import DTYPE_TO_CPP, GemmBlocking, value_to_cpp
 
 
 class LayoutType(Enum):
+    # [CLASS DOC] Enumeration of memory layouts for the B matrix: plain row-major, or interleaved
+    # VNNI layouts grouping 2 or 4 consecutive K elements.
     NORMAL = 0
     VNNI2 = 1
     VNNI4 = 2
@@ -35,6 +42,7 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 def get_restrict_keyword() -> str:
+    # [FUNCTION DOC] Returns the C++ no-alias pointer qualifier for the platform: the MSVC spelling on Windows, else the GCC/Clang spelling.
     if _IS_WINDOWS:
         # https://learn.microsoft.com/en-us/cpp/cpp/extension-restrict?view=msvc-170
         return "__restrict"
@@ -43,6 +51,10 @@ def get_restrict_keyword() -> str:
 
 
 class CppMicroGemm:
+    # [CLASS DOC] Base class for generators of small-matrix GEMM kernels in C++ text. State: name,
+    # dtypes (input, weight, output, compute), register_blocking, alpha and a local VNNI packing flag.
+    # Subclasses implement codegen_define (kernel body), and may override init/finalize code, extra
+    # kernel arguments, and the required B layout. codegen_call produces the call site code.
     """
     A class that codegens a kernel that computes small-sized matrix multiplication.
 
@@ -82,6 +94,9 @@ inline void {{kernel_name}}(
         register_blocking,
         alpha=1,
     ) -> None:
+        # [FUNCTION DOC] Stores the kernel name, dtypes (input, weight, output, compute), register
+        # blocking and alpha scale; local VNNI packing is off initially. Raises AssertionError if
+        # input2_dtype is None.
         self.name = name
         self.input_dtype = input_dtype
         if input2_dtype is None:
@@ -94,6 +109,11 @@ inline void {{kernel_name}}(
         self.pack_vnni_B_locally = False
 
     def get_common_options(self):
+        # [FUNCTION DOC] Builds the mapping of template rendering options: dtypes and their C++ type
+        # names, kernel name, alpha, extra-argument declaration, int8 flag, VNNI size (4 for 8-bit
+        # inputs else 2), restrict keyword, local-pack flag, this object and the int4 flag.
+        # Raises AssertionError for 8-bit inputs unless compute and output dtypes are int32 and the
+        # weight dtype is int8.
         if self.input_dtype in [torch.uint8, torch.int8]:
             if self.compute_dtype != torch.int32:
                 raise AssertionError(
@@ -129,16 +149,23 @@ inline void {{kernel_name}}(
         }
 
     def get_kernel_declaration(self):
+        # [FUNCTION DOC] Renders the kernel declaration template (signature with accumulate and
+        # prefetch template flags and pointer, size and stride parameters) using the common options.
+        # Returns the C++ declaration string.
         options = self.get_common_options()
         return KernelTemplate._template_from_string(self.DECLARE_KERNEL).render(options)
 
     def get_kernel_extra_args_declare(self) -> str:
+        # [FUNCTION DOC] Returns extra C++ parameter declarations for the kernel; empty by default.
         return ""
 
     def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        # [FUNCTION DOC] Returns extra C++ call argument lines matching the extra declarations; empty by default.
         return []
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Abstract: subclasses return the C++ source defining the micro kernel function.
+        # Always raises NotImplementedError here.
         raise NotImplementedError
 
     def codegen_call(
@@ -151,6 +178,11 @@ inline void {{kernel_name}}(
         prefetch: bool = False,
         **kwargs_for_extra_args,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ code calling the generated micro kernel on matrices A, B and C
+        # (pointers to the first elements, found via the kernel's index helper) with M and N taken
+        # from C, K from A, and leading dimensions from the row strides. The template arguments are
+        # the accumulate and prefetch flags. Extra kernel arguments come from get_kernel_extra_args,
+        # given the kernel plus the extra keyword arguments (which are mutated to add the kernel).
         """
         Generate the code for calling the templated kernel that computes
         `C += alpha * A @ B` if `accum` is True, or `C = alpha * A @ B` otherwise.
@@ -186,21 +218,25 @@ inline void {{kernel_name}}(
         return res.getvalue()
 
     def use_local_vnni_blocking(self, should_block_weight: bool):
+        # [FUNCTION DOC] Sets whether B should be repacked into VNNI layout inside the kernel (local packing).
         self.pack_vnni_B_locally = should_block_weight
 
     def codegen_init(
         self,
         kernel: CppTemplateKernel,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ setup code emitted once before calls; empty by default.
         return ""
 
     def codegen_finalize(
         self,
         kernel: CppTemplateKernel,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ teardown code emitted after all calls; empty by default.
         return ""
 
     def get_b_layout(self) -> LayoutType:
+        # [FUNCTION DOC] Returns the memory layout this kernel needs for B; the default is normal.
         return LayoutType.NORMAL
 
     ALLOCATE_WEIGHT_BUFFER = r"""
@@ -220,6 +256,8 @@ inline void {{kernel_name}}(
     def codegen_allocate_weight_buffer(
         self, buffer_name: str, buffer_dtype: str, *size_args
     ) -> str:
+        # [FUNCTION DOC] Returns C++ code declaring a scratch weight buffer of the product of the size
+        # arguments: heap allocated on MSVC, else a 4096-byte aligned stack array.
         buffer_size = " * ".join(map(str, size_args))
         return KernelTemplate._template_from_string(self.ALLOCATE_WEIGHT_BUFFER).render(
             {
@@ -231,11 +269,16 @@ inline void {{kernel_name}}(
         )
 
     def is_woq_int4(self):
+        # [FUNCTION DOC] Returns False; overridden by weight-only int4 quantized subclasses.
         return False
 
 
 @dataclasses.dataclass
 class CppMicroGemmConfig:
+    # [CLASS DOC] Dataclass describing one selectable micro gemm variant: activation, weight, output
+    # and compute dtypes, the required vector ISA class, the register blocking (block_m, block_n,
+    # block_k) and an optional extra applicability predicate called with the problem shape, alpha,
+    # thread count and keyword hints.
     input_dtype: torch.dtype
     input2_dtype: torch.dtype
     output_dtype: torch.dtype
@@ -249,7 +292,11 @@ micro_gemm_configs: dict[type[CppMicroGemm], list[CppMicroGemmConfig]] = {}
 
 
 def register_micro_gemm(*configs):
+    # [FUNCTION DOC] Class decorator factory. The returned decorator records the given configs for the
+    # decorated class in the global micro_gemm_configs registry and returns the class unchanged.
     def inner(cls):
+        # [FUNCTION DOC] HELPER: Performs the registration. Raises AssertionError if the class is
+        # already registered or no configs were provided. Mutates the global registry.
         if cls in micro_gemm_configs:
             raise AssertionError(f"Duplicate micro_gemm registration for {cls}")
         if len(configs) <= 0:
@@ -269,6 +316,9 @@ def generate_gemm_config(
     compute_dtype=None,
     extra_check=None,
 ):
+    # [FUNCTION DOC] Builds a list of CppMicroGemmConfig, one per register blocking tuple, for the given
+    # ISA class and dtypes. Defaults: output dtype equals input dtype, compute dtype equals output
+    # dtype, second input dtype equals input dtype. Each tuple becomes a GemmBlocking. Pure function.
     if output_dtype is None:
         output_dtype = input_dtype
     if compute_dtype is None:
@@ -290,6 +340,9 @@ def generate_gemm_config(
 
 
 class CppMicroGemmRef(CppMicroGemm):
+    # [CLASS DOC] Reference micro gemm emitting a plain triple loop in C++, with no vectorization and
+    # a 1x1x1 register blocking. Used as the fallback when no optimized config matches and for
+    # correctness debugging.
     """
     A reference implementation of the CppMicroGemm class with naive C++ code.
     It is used for correctness debugging.
@@ -312,6 +365,7 @@ class CppMicroGemmRef(CppMicroGemm):
     def __init__(
         self, name, input_dtype, input2_dtype, output_dtype, compute_dtype, alpha
     ) -> None:
+        # [FUNCTION DOC] Initializes the base class with a fixed 1x1x1 register blocking.
         super().__init__(
             name,
             input_dtype,
@@ -323,6 +377,8 @@ class CppMicroGemmRef(CppMicroGemm):
         )
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Renders the naive triple-loop reference kernel from the entry template and
+        # returns the C++ source string.
         options = {
             "declare_kernel": self.get_kernel_declaration(),
             **self.get_common_options(),
@@ -331,6 +387,8 @@ class CppMicroGemmRef(CppMicroGemm):
 
 
 def is_int8_woq_gemm_small_m_dim_corner_case(config, m, n, k):
+    # [FUNCTION DOC] Returns True when k and n are multiples of the config's block_k and block_n and
+    # m is below 16.
     return (
         k % config.register_blocking.block_k == 0
         and n % config.register_blocking.block_n == 0
@@ -340,6 +398,8 @@ def is_int8_woq_gemm_small_m_dim_corner_case(config, m, n, k):
 
 # extra check for small M dimension for int8 WoQ case
 def check_int8_woq_small_m_dim(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check for the small-M int8 weight-only blockings: true when the small-M
+    # corner case holds and the dynamic_M keyword (default False) is not set.
     return is_int8_woq_gemm_small_m_dim_corner_case(config, m, n, k) and not kwargs.get(
         "dynamic_M", False
     )
@@ -347,6 +407,8 @@ def check_int8_woq_small_m_dim(config, m, n, k, alpha, num_threads, **kwargs):
 
 # For int8 WoQ GEMM with small M, we use different blockings that shouldn't be used otherwise
 def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check: returns the negation of the small-M int8 weight-only check, so the
+    # general blockings are not used when the small-M special blockings apply.
     return not check_int8_woq_small_m_dim(config, m, n, k, alpha, num_threads, **kwargs)
 
 
@@ -445,6 +507,11 @@ def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **
     ),
 )
 class CppMicroGemmFP32Vec(CppMicroGemm):
+    # [CLASS DOC] Vectorized float32-compute micro gemm for AVX512, AVX2, NEON and SVE. Handles float,
+    # bfloat16, half (and bfloat16 with int8 weights) inputs, accumulating in float. Flags: tail_n
+    # supports an N that is not a multiple of block_n; trans_b supports transposed B using one of two
+    # strategies. The entry template dispatches to compile-time-sized inner kernels by block_m.
+    # Subclassed by the weight-only int4 AVX512 kernel.
     """
     This class generates the code for micro gemm using fp32 vec instructions for compute.
     It supports input types of torch.float, torch.bfloat16, and torch.half with fp32 output.
@@ -904,6 +971,9 @@ inline void {{kernel_name}}_transpose_b_kernel(
         tail_n=False,
         trans_b=False,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base class and stores the tail_n flag (support N tails) and
+        # trans_b flag (B is transposed). When trans_b is set, raises AssertionError unless the
+        # detected vector ISA is AVX512 or AVX2 (the only ones with a block transpose helper).
         super().__init__(
             name,
             input_dtype,
@@ -929,6 +999,10 @@ inline void {{kernel_name}}_transpose_b_kernel(
         self.trans_b = trans_b
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Renders the C++ definition: the inner kernel template (with sub-block sizes
+        # when B is transposed), then, if tail handling is enabled, a second inner kernel variant for
+        # the N tail, then the entry function that dispatches over M and N block sizes. Returns the
+        # concatenated source string.
         options = {
             "declare_kernel": self.get_kernel_declaration(),
             "kernel": kernel,
@@ -973,6 +1047,8 @@ inline void {{kernel_name}}_transpose_b_kernel(
 
 
 def check_vnni_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check for the VNNI kernel: returns True when k is a multiple of 4. Raises
+    # AssertionError if the config is not uint8 input with int8 weights.
     if not (config.input_dtype == torch.uint8 and config.input2_dtype == torch.int8):
         raise AssertionError(
             "expected input_dtype == torch.uint8 and input2_dtype == torch.int8, "
@@ -995,6 +1071,10 @@ def check_vnni_extra(config, m, n, k, alpha, num_threads, **kwargs):
     ),
 )
 class CppMicroGemmAVX512VNNI(CppMicroGemm):
+    # [CLASS DOC] Micro gemm for uint8 by int8 to int32 products using AVX512 VNNI dot-product
+    # instructions. Requires B in 4-way VNNI layout, N a multiple of block_n and K a multiple of 4.
+    # The entry template iterates M in full blocks plus a switch over tail sizes, calling the inner
+    # kernel. Registered with a single 6x64x4 blocking guarded by check_vnni_extra.
     """
     This class generates the code for micro gemm using AVX512 VNNI instructions for compute.
     It supports u8s8s32 GEMM only.
@@ -1119,6 +1199,8 @@ inline void {{kernel_name}}_kernel(
         register_blocking,
         alpha=1,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base class and verifies that the dtypes are unsigned 8-bit
+        # activations and signed 8-bit weights; raises AssertionError otherwise.
         super().__init__(
             name,
             input_dtype,
@@ -1134,6 +1216,9 @@ inline void {{kernel_name}}_kernel(
             )
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Renders the VNNI inner kernel template followed by the entry template, using
+        # the register blocking, common options and a vector length of 16 int32 lanes. Returns the
+        # combined C++ source string.
         options = {
             "declare_kernel": self.get_kernel_declaration(),
             "kernel": kernel,
@@ -1149,16 +1234,22 @@ inline void {{kernel_name}}_kernel(
         ) + KernelTemplate._template_from_string(self.TEMPLATE_ENTRY).render(options)
 
     def get_b_layout(self):
+        # [FUNCTION DOC] Returns the 4-way VNNI layout required for B.
         return LayoutType.VNNI4
 
 
 # extra check for CppMicroGemmAMX
 def check_amx_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check for AMX kernels: returns True when k is a multiple of the VNNI group
+    # size (4 for 8-bit inputs, else 2) and alpha equals one.
     vnni_size = 4 if config.input_dtype in [torch.uint8, torch.int8] else 2
     return k % vnni_size == 0 and alpha == 1
 
 
 def check_int8_bf16_amx_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check for the bfloat16 activation with int8 weight AMX kernel: requires the
+    # detected ISA (vec_isa keyword; raises AssertionError if missing) to support avx512 bf16 and the
+    # generic AMX check to pass. Returns a boolean.
     # We need avx512_bf16 to dequant int8 to bf16
     vec_isa = kwargs.get("vec_isa")
     if vec_isa is None:
@@ -1170,6 +1261,9 @@ def check_int8_bf16_amx_extra(config, m, n, k, alpha, num_threads, **kwargs):
 
 # amx_fp16 need to be checked separately since it is not always supported when amx is supported
 def check_amx_fp16_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra check for the float16 AMX kernel: returns True only if the detected ISA
+    # reports AMX fp16 support, k is even and alpha equals one. Raises AssertionError if the config
+    # is not float16 input with float output or if the vec_isa keyword is missing.
     if not (config.input_dtype == torch.float16 and config.output_dtype == torch.float):
         raise AssertionError(
             "expected input_dtype == torch.float16 and output_dtype == torch.float, "
@@ -1226,6 +1320,13 @@ def check_amx_fp16_extra(config, m, n, k, alpha, num_threads, **kwargs):
     ),
 )
 class CppMicroGemmAMX(CppMicroGemm):
+    # [CLASS DOC] Micro gemm using Intel AMX tile instructions. Supports int8/uint8, bfloat16 and
+    # float16 inputs (and bfloat16 with int8 weights, dequantized into a cached buffer). B uses a
+    # VNNI layout. Carries an AMX state variable created in codegen_init and released in
+    # codegen_finalize, passed to every kernel as an extra argument. The entry template loops over
+    # N and M blocks and dispatches to tile kernels by row count.
+    # KNOWN ISSUE: the class docstring only mentions bfloat16 input with fp32 output, but the
+    # registered configs also cover int8, uint8 and float16 inputs.
     """
     This class generates the code for micro gemm using Advanced Matrix extension (AMX)
     instructions available in 4th generation Intel Xeon for compute.
@@ -1475,6 +1576,11 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 """
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Validates the register blocking (block_m and block_n multiples of 16; block_k
+        # 64 for 8-bit inputs else 32; raises AssertionError otherwise), then renders one tile kernel
+        # per row count from block_m down to 16 in steps of 16, followed by the entry function.
+        # Enables a cached dequantized-B buffer when inputs are bfloat16 and weights are 8-bit.
+        # Returns the combined C++ source string.
         block_m, block_n, block_k = self.register_blocking
         if block_m % 16 != 0:
             raise AssertionError("Only support block_m % 16 == 0 for AMX")
@@ -1518,21 +1624,26 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
         self,
         kernel: CppTemplateKernel,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ code declaring the AMX tile state variable used by the kernels.
         return "AMXState amx_state;"
 
     def codegen_finalize(
         self,
         kernel: CppTemplateKernel,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ code releasing the AMX state, executing the tile release instruction.
         return "amx_state.release([]() { _tile_release(); });"
 
     def get_kernel_extra_args_declare(self) -> str:
+        # [FUNCTION DOC] Returns the extra C++ parameter declaration: a reference to the AMX state.
         return "AMXState& amx_state,"
 
     def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        # [FUNCTION DOC] Returns the extra C++ call argument line passing the AMX state variable.
         return ["amx_state,"]
 
     def get_b_layout(self):
+        # [FUNCTION DOC] Returns the 4-way VNNI layout for 8-bit inputs and the 2-way layout otherwise.
         if self.input_dtype in [torch.uint8, torch.int8]:
             return LayoutType.VNNI4
         else:
@@ -1541,6 +1652,9 @@ inline void {{kernel_name}}_amx_kernel_{{num_rows}}_{{num_columns}}(
 
 # extra check for CppMicroBrgemm
 def check_brgemm_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra applicability check for the brgemm kernel: returns True only if the CPU
+    # supports AMX fp16, k is even and alpha equals one. Raises AssertionError if the config is not
+    # half input with float output.
     if not (config.input_dtype == torch.half and config.output_dtype == torch.float):
         raise AssertionError(
             "expected input_dtype == torch.half and output_dtype == torch.float, "
@@ -1561,6 +1675,10 @@ def check_brgemm_extra(config, m, n, k, alpha, num_threads, **kwargs):
     ),
 )
 class CppMicroBrgemm(CppMicroGemm):
+    # [CLASS DOC] Micro gemm that delegates to the oneDNN batch-reduce gemm in ATen, for half inputs
+    # with float output when AMX fp16 is available. B must be in 2-way VNNI layout (optionally packed
+    # locally). Provides the entry template, a finalize hook releasing the brgemm context and
+    # registration for blockings 32x32x32, 48x16x32 and 16x48x32.
     """
     This class generates the code for micro gemm using oneDNN brgemm.
     It supports input types of torch.half.
@@ -1592,6 +1710,9 @@ class CppMicroBrgemm(CppMicroGemm):
 """
 
     def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        # [FUNCTION DOC] Renders the brgemm-based kernel definition (declaration, optional local VNNI
+        # packing of B, call into the ATen brgemm routine) from the entry template with the blocking
+        # and common options, and returns the C++ source string.
         options = {
             "declare_kernel": self.get_kernel_declaration(),
             "kernel": kernel,
@@ -1611,9 +1732,12 @@ class CppMicroBrgemm(CppMicroGemm):
         self,
         kernel: CppTemplateKernel,
     ) -> str:
+        # [FUNCTION DOC] Returns C++ code releasing the oneDNN brgemm hardware context.
         return "at::native::cpublas::brgemm_release();"
 
     def get_b_layout(self):
+        # [FUNCTION DOC] Returns the 2-way VNNI layout for B. Raises AssertionError unless the input
+        # dtype is half and AMX fp16 is supported on this CPU.
         if not (self.input_dtype == torch.half and torch.cpu._is_amx_fp16_supported()):
             raise AssertionError(
                 "expected input_dtype == torch.half and AMX fp16 support, "
@@ -1623,6 +1747,10 @@ class CppMicroBrgemm(CppMicroGemm):
 
 
 def check_woq_int4_extra(config, m, n, k, alpha, num_threads, **kwargs):
+    # [FUNCTION DOC] Extra applicability check for weight-only int4 kernels. Returns False unless
+    # alpha equals one, the required q_group_size keyword is one of 32, 64 or 128, k is a multiple of
+    # the group size, block_k does not exceed the group size, k is a multiple of block_k and n is a
+    # multiple of 64. Raises AssertionError if q_group_size was not passed.
     if alpha != 1:
         return False
     q_group_size = kwargs.get("q_group_size")
@@ -1650,6 +1778,11 @@ def check_woq_int4_extra(config, m, n, k, alpha, num_threads, **kwargs):
     ),
 )
 class CppMicroGemmWoQInt4Avx512(CppMicroGemmFP32Vec):
+    # [CLASS DOC] AVX512 micro gemm for weight-only int4 quantized weights with bfloat16 activations
+    # and float output/compute. Replaces the entry and kernel templates with ones that dequantize
+    # packed int4 weights using a lookup table and per-group scales and zeros inside the compute
+    # loop. Declares extra kernel parameters (group size, scale-and-zeros, leading dimension, k
+    # start). Registered for AVX512 with block sizes 4x64 and block_k of 32, 64 or 128.
     """
     This class generates the code for WoQ int4 micro gemm using AVX512 intrinsics.
     It is based on the corresponding ATen kernel.
@@ -1863,6 +1996,8 @@ inline void {{kernel_name}}_kernel(
 """
 
     def get_kernel_extra_args_declare(self) -> str:
+        # [FUNCTION DOC] Returns the extra C++ parameter declarations: group size, scale-and-zeros
+        # pointer, its leading dimension and the K start offset.
         return (
             "const int64_t q_group_size,\n"
             "    const at::BFloat16* __restrict__ ScaleAndZeros,\n"
@@ -1871,6 +2006,10 @@ inline void {{kernel_name}}_kernel(
         )
 
     def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        # [FUNCTION DOC] Returns the extra C++ call argument lines: group size, a pointer to the first
+        # element of the scale-and-zeros buffer (indexed via the kernel), the leading dimension of
+        # that buffer (twice N) and the K start offset. Requires keyword arguments kernel and
+        # qscale_and_zeros; raises AssertionError if either is missing.
         if "kernel" not in kwargs:
             raise AssertionError("expected 'kernel' in kwargs")
         if "qscale_and_zeros" not in kwargs:
@@ -1885,6 +2024,7 @@ inline void {{kernel_name}}_kernel(
         ]
 
     def is_woq_int4(self):
+        # [FUNCTION DOC] Returns True: this implementation is a weight-only int4 quantized kernel.
         return True
 
 
@@ -1903,6 +2043,11 @@ inline void {{kernel_name}}_kernel(
     ),
 )
 class CppMicroGemmWoQInt4Amx(CppMicroGemmAMX):
+    # [CLASS DOC] AMX micro gemm for weight-only int4 quantized weights with bfloat16 activations and
+    # float output. Overrides the entry template to dequantize each block of packed int4 B (using
+    # per-group scales and zeros) into a cached bfloat16 buffer, then calls the inherited AMX
+    # tile kernel. Declares extra kernel parameters (AMX state, group size, scale-and-zeros, leading
+    # dimension, k start). Registered for the AMX ISA with block sizes 16x32x32 and 32x32x32.
     """
     This class generates the code for WoQ int4 micro gemm using AMX intrinsics,
     which are available on 4th and newer generations of Intel Xeon.
@@ -2109,6 +2254,8 @@ inline bool {{kernel_name}}_is_block_start(int index, int k_start, int group_siz
 """
 
     def get_kernel_extra_args_declare(self) -> str:
+        # [FUNCTION DOC] Returns the extra C++ parameter declarations: AMX state reference, group
+        # size, scale-and-zeros pointer, its leading dimension and the K start offset.
         return (
             "AMXState& amx_state,\n"
             "    const int64_t q_group_size,\n"
@@ -2118,6 +2265,10 @@ inline bool {{kernel_name}}_is_block_start(int index, int k_start, int group_siz
         )
 
     def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        # [FUNCTION DOC] Returns the extra C++ call argument lines: AMX state, group size, a pointer to
+        # the first element of the scale-and-zeros buffer (indexed via the kernel), the leading
+        # dimension of that buffer (twice N) and the K start offset. Requires keyword arguments
+        # kernel and qscale_and_zeros; raises AssertionError if either is missing.
         if "kernel" not in kwargs:
             raise AssertionError("expected 'kernel' in kwargs")
         if "qscale_and_zeros" not in kwargs:
@@ -2133,6 +2284,7 @@ inline bool {{kernel_name}}_is_block_start(int index, int k_start, int group_siz
         ]
 
     def is_woq_int4(self):
+        # [FUNCTION DOC] Returns True: this implementation is a weight-only int4 quantized kernel.
         return True
 
 
@@ -2150,12 +2302,24 @@ def create_micro_gemm(
     use_ref=True,
     q_group_size=None,
 ) -> CppMicroGemm | None:
+    # [FUNCTION DOC] Picks the best registered micro gemm implementation for an (m, n, k) problem with
+    # given input/weight/output/compute dtypes, alpha, thread count (default: parallel thread count)
+    # and optional WoQ int4 group size. Requires n and k to be concrete numbers and m to have an
+    # optimization hint (m with free symbols is treated as dynamic). Scans all registered configs
+    # whose required ISA is a superclass of the detected ISA and whose dtypes match and whose extra
+    # check passes (skipping AMX for small-M weight-only quantization), scoring each by ISA (AMX >
+    # VNNI > vector), divisibility by block sizes, thread occupancy, and register block size
+    # (smaller preferred when occupancy is poor). Returns an instance of the top-scored class. If
+    # nothing matches returns the reference implementation when use_ref is set, else None.
+    # Raises AssertionError if n, k or the m hint are not numbers.
     """
     Based on the provided info, try to find the config of the micro-kernel that would
     deliver the best performance in terms of lower latency for this case.
     """
 
     def create_from_config(cls, config: CppMicroGemmConfig):
+        # [FUNCTION DOC] HELPER: Instantiates the given micro gemm class with the closed-over name and
+        # alpha and the dtypes and register blocking taken from the config.
         return cls(
             name,
             config.input_dtype,
@@ -2167,6 +2331,9 @@ def create_micro_gemm(
         )
 
     def skip_amx_kernel_for_woq(dynamic_M):
+        # [FUNCTION DOC] HELPER: Returns True when the AMX micro kernel should be skipped: a bfloat16
+        # activation with int8/uint8 weights (weight-only quantization), static M, and M below 5.
+        # Returns False in all other cases (including dynamic M).
         # For WoQ GEMM, AMX micro-kernel may not perform well if m is small.
         # Exception: for dynamic shapes, we consider using the AMX micro-kernel.
         if (

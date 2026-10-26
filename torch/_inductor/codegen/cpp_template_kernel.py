@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines CppTemplateKernel, the kernel context used when rendering inductor C++ templates
+# (argument registration, buffer/index helpers, epilogue-fused output stores), and CppTemplateCaller,
+# the autotuning choice wrapping a rendered template. Also small sympy/IR helper functions. No
+# import-time side effects.
 import itertools
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -24,6 +28,9 @@ from .cpp_utils import cexpr_index, DTYPE_TO_CPP, LocalBufferContext
 
 
 def parse_expr_with_index_symbols(expr):
+    # [FUNCTION DOC] HELPER: Converts an expression (or list/tuple of them, recursively) into sympy
+    # expressions whose free symbols are replaced by integer index symbols of the same names. Existing
+    # sympy expressions are returned unchanged; other values are parsed from their string form.
     if isinstance(expr, sympy.Expr):
         return expr
     elif isinstance(expr, (list, tuple)):
@@ -35,19 +42,29 @@ def parse_expr_with_index_symbols(expr):
 
 
 def wrap_with_tensorbox(node) -> ir.TensorBox:
+    # [FUNCTION DOC] HELPER: Wraps an IR node in a TensorBox, using the create path for buffers and the direct constructor otherwise.
     return (
         ir.TensorBox.create(node) if isinstance(node, ir.Buffer) else ir.TensorBox(node)
     )
 
 
 class CppTemplateKernel(CppKernel):
+    # [CLASS DOC] CppKernel specialization used while rendering C++ templates. State: kernel_name,
+    # render_hooks (placeholder to deferred callable, resolved at the end of render) and local_buffers
+    # (name to IR buffer for kernel-local scratch buffers). Offers helpers templates call: def_kernel,
+    # size/stride/index/dtype queries, slice/select/view/permute, local buffer codegen and
+    # store_output(s) for epilogue fusion.
     def __init__(self, kernel_name, num_threads):
+        # [FUNCTION DOC] Initializes the CppKernel base with the thread count and stores the kernel
+        # name, an empty render-hook mapping and an empty local-buffer mapping.
         super().__init__(None, num_threads)
         self.kernel_name = kernel_name
         self.render_hooks = {}
         self.local_buffers = {}
 
     def render(self, template, **kwargs):
+        # [FUNCTION DOC] Renders the template with this kernel (plus kwargs) and resolves all
+        # registered render hooks, returning the final source string.
         return PartialRender(
             template.render(kernel=self, **kwargs), self.render_hooks
         ).finalize_all()
@@ -61,6 +78,12 @@ class CppTemplateKernel(CppKernel):
         extra_sizevars: list[sympy.Expr] | None = None,
         placeholder: str = "<DEF_KERNEL>",
     ) -> str:
+        # [FUNCTION DOC] Registers template inputs and outputs (name to buffer mappings) as kernel
+        # arguments, adds optional aliases of existing buffers, and collects the sorted free size
+        # symbols of inputs, outputs and extra_sizevars as integer size arguments. Registers a render
+        # hook under placeholder that later yields the C++ function signature (function_name defaults
+        # to the kernel name). Returns the placeholder text. Raises AssertionError if the placeholder
+        # is already registered.
         if len(function_name) == 0:
             function_name = str(self.kernel_name)
         for name, inp in inputs.items():
@@ -101,6 +124,9 @@ class CppTemplateKernel(CppKernel):
             self.args.sizevars[sizevar] = f"k{sizevar}"
 
         def hook():
+            # [FUNCTION DOC] HELPER: Deferred render hook. Marks every alias output buffer as removed
+            # (raises AssertionError if an alias is also an input buffer), then returns the C++
+            # function signature string with the final argument definitions.
             # remove all aliases before generate function definition
             if aliases is not None:
                 for alias in aliases:
@@ -119,26 +145,36 @@ class CppTemplateKernel(CppKernel):
         return placeholder
 
     def call_kernel(self, name: str, node: ir.CppTemplateBuffer):
+        # [FUNCTION DOC] Emits a non-Triton kernel call named name into the graph's wrapper code,
+        # using this kernel's C++ call arguments and argument types. Side effect: writes wrapper code.
         wrapper = V.graph.wrapper_code
         _, call_args, arg_types = self.args.cpp_argdefs()
         wrapper.generate_kernel_call(name, call_args, triton=False, arg_types=arg_types)
 
     def dtype(self, node: ir.Buffer) -> str:
+        # [FUNCTION DOC] Returns the C++ type name for the buffer's dtype.
         return DTYPE_TO_CPP[node.get_dtype()]
 
     def acc_dtype(self, node: ir.Buffer) -> str:
+        # [FUNCTION DOC] Returns the C++ accumulation type name: "float" for float32, bfloat16 and
+        # half buffers. Raises NotImplementedError for any other dtype.
         if node.get_dtype() in [torch.float32, torch.bfloat16, torch.half]:
             return "float"
         else:
             raise NotImplementedError(f"Unsupported dtype: {node.get_dtype()}")
 
     def size(self, node: ir.Buffer, dim: int) -> str:
+        # [FUNCTION DOC] Returns the C++ expression string for the size of node along dim, with symbols renamed.
         return cexpr_index(self.rename_indexing(node.get_size()[dim]))
 
     def stride(self, node: ir.Buffer, dim: int) -> str:
+        # [FUNCTION DOC] Returns the C++ expression string for the stride of node along dim, with symbols renamed.
         return cexpr_index(self.rename_indexing(node.get_stride()[dim]))
 
     def index(self, node: ir.Buffer, indices: list[Any]) -> str:
+        # [FUNCTION DOC] Returns a C++ element-access expression for node at the given multi-dim indices,
+        # using the node's fixed layout indexer. Uses the buffer's own name if it is a local buffer,
+        # else registers it as a kernel input (side effect on args) and uses its argument name.
         indexer = node.get_layout().as_fixed().make_indexer()
         index = indexer(parse_expr_with_index_symbols(indices))
         index = self.rename_indexing(index)
@@ -151,6 +187,10 @@ class CppTemplateKernel(CppKernel):
         return f"{inner_name}[{cexpr_index(index)}]"
 
     def slice_nd(self, node, ranges: list[tuple[Any, Any]]) -> ir.ReinterpretView:
+        # [FUNCTION DOC] Slices node along each dim by the matching (start, end) range, skipping dims
+        # with an empty range, without clamping. Returns the resulting ReinterpretView. Raises
+        # AssertionError if the number of ranges differs from the rank, a range has length other than
+        # 0 or 2, or the result is not a ReinterpretView.
         """
         Slice the given node with a list of ranges (start and end) corresponding to its dims.
         The dim is not sliced if the corresponding range is empty.
@@ -172,6 +212,9 @@ class CppTemplateKernel(CppKernel):
         return sliced.data
 
     def select(self, node, dim: int, idx: int) -> ir.ReinterpretView:
+        # [FUNCTION DOC] Selects index idx (negative allowed) along dim of node by slicing without
+        # clamping then squeezing that dim; returns the resulting ReinterpretView. Raises AssertionError
+        # if the result is not a ReinterpretView.
         # We avoid using L.select here because we need clamp=False so the dim after slicing
         # is 1 instead of a sympy expression of symbol - dim_size.
         node = wrap_with_tensorbox(node)
@@ -182,11 +225,14 @@ class CppTemplateKernel(CppKernel):
         return sliced.data
 
     def view(self, node, sizes: list[Any]) -> ir.IRNode:
+        # [FUNCTION DOC] Returns the IR node for a view of node reshaped to sizes (parsed into index symbols).
         node = wrap_with_tensorbox(node)
         sizes = parse_expr_with_index_symbols(sizes)
         return L.view(node, sizes).data
 
     def permute(self, node, dims):
+        # [FUNCTION DOC] Returns a ReinterpretView of node with dimensions permuted by dims. Raises
+        # AssertionError if the result is not a ReinterpretView.
         node = wrap_with_tensorbox(node)
         permuted = L.permute(node, dims).data
         if not isinstance(permuted, ir.ReinterpretView):
@@ -194,6 +240,9 @@ class CppTemplateKernel(CppKernel):
         return permuted
 
     def maybe_codegen_profile(self, prefix_kernel_name: str | None = None) -> str:
+        # [FUNCTION DOC] When kernel profiling is enabled in config, returns C++ code declaring an
+        # AOTI record-function handle named from the graph id, optional prefix and kernel name;
+        # otherwise returns an empty string.
         if config.cpp.enable_kernel_profile:
             graph_id = V.graph.graph_id
             prefix = "graph_" + str(graph_id) + "_" if graph_id is not None else ""
@@ -208,12 +257,17 @@ class CppTemplateKernel(CppKernel):
             return ""
 
     def unroll_pragma(self, unroll):
+        # [FUNCTION DOC] Returns the compiler-specific unroll pragma line (GCC form or generic form)
+        # for the given unroll factor.
         if cpp_builder.is_gcc():
             return f"#pragma GCC unroll {unroll}"
         else:
             return f"#pragma unroll {unroll}"
 
     def define_buffer(self, name, sizes: list[Any], dtype=torch.float) -> str:
+        # [FUNCTION DOC] Registers a local CPU buffer (name, sizes parsed into index symbols, dtype) in
+        # local_buffers and returns C++ code allocating it on the heap via a unique pointer plus a raw
+        # pointer variable of the given name.
         """Define kernel local buffer"""
         sizes = parse_expr_with_index_symbols(sizes)
         buf = ir.Buffer(
@@ -227,6 +281,8 @@ class CppTemplateKernel(CppKernel):
     def define_stack_allocated_buffer(
         self, name, sizes: list[Any], dtype=torch.float
     ) -> str:
+        # [FUNCTION DOC] Registers a local CPU buffer with the given name, sizes and dtype in
+        # local_buffers and returns C++ code declaring a 64-byte aligned stack array plus a pointer to it.
         """Define stack-allocated buffer"""
         sizes = parse_expr_with_index_symbols(sizes)
         buf = ir.Buffer(
@@ -238,6 +294,8 @@ class CppTemplateKernel(CppKernel):
         return f"alignas(64) {ctype} _{name}[{numel}]; {ctype}* {name} = _{name};"
 
     def reinit_buffer_if_null(self, name):
+        # [FUNCTION DOC] Returns C++ code that reallocates the named local buffer (previously made by
+        # define_buffer) when its owning pointer is null. Raises AssertionError if the name is unknown.
         """Reinit the previously defined local buffer if it is null"""
         if name not in self.local_buffers:
             raise AssertionError(f"unknown local buffer: {name}")
@@ -247,6 +305,8 @@ class CppTemplateKernel(CppKernel):
         return f"if (_{name} == nullptr) {{ _{name} = std::make_unique<{ctype}[]>({numel}); {name} = _{name}.get(); }}"
 
     def release_buffer(self, name):
+        # [FUNCTION DOC] Returns C++ code releasing ownership of the named local buffer's smart pointer.
+        # Raises AssertionError if the name is not a known local buffer.
         """Codegen the code to release the ownership of a local buffer to others"""
         if name not in self.local_buffers:
             raise AssertionError(f"unknown local buffer: {name}")
@@ -259,6 +319,13 @@ class CppTemplateKernel(CppKernel):
         offsets: list[sympy.Expr] | None = None,
         reindexers: list[Callable[[list[Any]], list[Any]] | None] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Generates C++ loop code that evaluates a chain of pointwise nodes over the
+        # shape of dst and stores the last result to dst (earlier nodes store to their own names).
+        # Offsets (default zeros, one per dim) shift the indices given to every node; reindexers
+        # (default none) optionally remap indices per node. Builds a loop body per node, emits them
+        # through a CppKernelProxy sharing this kernel's args, with parallelization disabled.
+        # Returns the generated loop code string. Raises AssertionError on non-pointwise nodes or a
+        # wrong offsets length. Mutates this kernel's args via buffer registration.
         var_sizes = (tuple(dst.get_size()), ())
         var_ranges = {
             sympy_index_symbol_with_prefix(SymT.INDEX, i): sz
@@ -285,6 +352,10 @@ class CppTemplateKernel(CppKernel):
                 raise AssertionError(node)
 
             def fn(*args):
+                # [FUNCTION DOC] HELPER: LoopBody body function. Takes the index list and an empty
+                # reduction list, adds the per-dim offsets, optionally applies the node's reindexer,
+                # then stores the pointwise node's loaded value to the output at the destination index.
+                # Raises AssertionError if the argument shapes are unexpected.
                 if len(args) != 2:
                     raise AssertionError(f"expected 2 args, got {len(args)}")
                 if len(args[0]) != len(var_sizes[0]):
@@ -317,6 +388,8 @@ class CppTemplateKernel(CppKernel):
         cpp_kernel_proxy.codegen_loop_bodies(bodies, var_sizes_list)
 
         def max_parallel_depth():
+            # [FUNCTION DOC] HELPER: Replacement for the loop nest's max_parallel_depth that reports
+            # zero parallel depth so the generated epilogue loops are never parallelized.
             return ParallelDepth(parallel_depth=0, start_depth=0)
 
         # This loop is not parallelized since it is not the outermost loop.
@@ -334,6 +407,12 @@ class CppTemplateKernel(CppKernel):
         reindexers: list[Callable[[list[Any]], list[Any]] | None],
         output_names: list[str],
     ) -> str:
+        # [FUNCTION DOC] Grouped-GEMM variant of store_pointwise_nodes. The iteration space is the
+        # shape of the first dst; each node gets its own offset list, optional reindexer and explicit
+        # output buffer name (parallel lists indexed by node). Emits loop code through a CppKernelProxy
+        # sharing this kernel's args with parallelization disabled and returns the code string.
+        # Raises AssertionError if offsets are empty, any offset length mismatches the rank, or a
+        # node is not pointwise.
         ref_dst = dst[0]
         var_sizes = (tuple(ref_dst.get_size()), ())
         var_ranges = {
@@ -357,6 +436,10 @@ class CppTemplateKernel(CppKernel):
                 raise AssertionError(node)
 
             def fn(*args):
+                # [FUNCTION DOC] HELPER: LoopBody body function. Takes the index list and an empty
+                # reduction list, adds this node's per-dim offsets, optionally applies the node's
+                # reindexer, then stores the pointwise node's loaded value to its output name at the
+                # reference destination index. Raises AssertionError if argument shapes are unexpected.
                 if len(args) != 2:
                     raise AssertionError(f"expected 2 args, got {len(args)}")
                 if len(args[0]) != len(var_sizes[0]):
@@ -389,6 +472,8 @@ class CppTemplateKernel(CppKernel):
         cpp_kernel_proxy.codegen_loop_bodies(bodies, var_sizes_list)
 
         def max_parallel_depth():
+            # [FUNCTION DOC] HELPER: Replacement for the loop nest's max_parallel_depth that reports
+            # zero parallel depth so the generated epilogue loops are never parallelized.
             return ParallelDepth(parallel_depth=0, start_depth=0)
 
         # This loop is not parallelized since it is not the outermost loop.
@@ -427,6 +512,12 @@ class CppTemplateKernel(CppKernel):
            c) If `src` is local, we need to add a local buffer for it and localize the `orig_src` buffer
               in `epilogue_nodes` with `src`.
         """
+        # [FUNCTION DOC] Generates C++ code storing src into dst (same size), applying pointwise
+        # epilogue nodes first if given (localizing orig_src to src when names differ, with optional
+        # index offsets and reindexers). Without epilogues: if names differ, src is treated as a local
+        # buffer and copied to dst; if identical, layouts must match and nothing is emitted.
+        # Returns the code string ("" for in-place). Raises AssertionError on bad dst type, size
+        # mismatch, missing orig_src or layout mismatch.
         if not isinstance(dst, (ir.Buffer, ir.ReinterpretView)):
             raise AssertionError(
                 f"expected ir.Buffer or ir.ReinterpretView, got {type(dst)}"
@@ -476,6 +567,14 @@ class CppTemplateKernel(CppKernel):
         reindexers: list[Callable[[list[Any]], list[Any]] | None] | None = None,
         multi_output_buffers: tuple[ir.MultiOutput, ...] | None = None,
     ):
+        # [FUNCTION DOC] Grouped-GEMM counterpart of store_output: stores each src buffer to the matching
+        # dst, optionally applying pointwise epilogue nodes. With epilogues: localizes them, adds local
+        # buffers for GEMM outputs that differ from the originals (also localizing MultiOutput buffers
+        # read by epilogues), appends copy nodes for outputs no epilogue reads, then generates code via
+        # store_grouped_gemm_pointwise_nodes and removes MultiOutput buffers read by epilogues from the
+        # kernel args. Without epilogues: copies src to dst if names differ, else checks they match.
+        # Returns the generated code string ("" when nothing to store). Raises AssertionError on
+        # non-iterable dst, size/name/layout mismatches or missing orig_src.
         if not isinstance(dst, Iterable):
             raise AssertionError(f"expected Iterable, got {type(dst)}")
         if not all(_dst.get_size() == _src.get_size() for _src, _dst in zip(src, dst)):
@@ -584,11 +683,16 @@ class CppTemplateKernel(CppKernel):
                 return ""
 
     def check_bounds(self, expr, size, lower, upper):
+        # [FUNCTION DOC] No-op override; bounds checks are not generated for C++ templates.
         # CppTemplateKernel does not need codegen related operations
         return
 
 
 class CppTemplateCaller(ir.ChoiceCaller):
+    # [CLASS DOC] Autotuning choice wrapping a rendered C++ template. Holds category, a factory that
+    # builds (kernel, render) for a template buffer, a CppBenchmarkRequest, the owning template and
+    # optional info kwargs. Provides precompile, benchmark, hash_key, info_dict and output_node, which
+    # materializes a CppTemplateBuffer as the chosen IR node.
     """
     CppTemplateCaller
 
@@ -619,6 +723,8 @@ class CppTemplateCaller(ir.ChoiceCaller):
         info_kwargs: dict[str, ir.PrimitiveInfoType | list[ir.PrimitiveInfoType]]
         | None = None,
     ):
+        # [FUNCTION DOC] Initializes the ChoiceCaller base and stores category, kernel-render factory,
+        # benchmark request, template and optional info kwargs.
         super().__init__(name, input_nodes, layout, description="")
         self.category = category
         self.make_kernel_render = make_kernel_render
@@ -627,11 +733,17 @@ class CppTemplateCaller(ir.ChoiceCaller):
         self.info_kwargs = info_kwargs
 
     def precompile(self) -> None:
+        # [FUNCTION DOC] Compiles the benchmark request's kernel ahead of time. Raises AssertionError
+        # if there is no benchmark request.
         if self.bmreq is None:
             raise AssertionError("bmreq must not be None")
         self.bmreq.precompile()
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Benchmarks the compiled kernel on the given inputs writing into out and
+        # returns the measured time as a float. Uses profiler-based timing when the config flag
+        # profile_bandwidth_with_do_bench_using_profiling is set, else the request's own benchmark.
+        # Raises AssertionError if there is no benchmark request.
         if self.bmreq is None:
             raise AssertionError("bmreq must not be None")
         if config.profile_bandwidth_with_do_bench_using_profiling:
@@ -640,6 +752,7 @@ class CppTemplateCaller(ir.ChoiceCaller):
         return self.bmreq.benchmark(*args, out=out)
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Returns a cache key string: category joined with the benchmark request's hash key.
         return "-".join(
             [
                 self.category,
@@ -650,9 +763,13 @@ class CppTemplateCaller(ir.ChoiceCaller):
     def info_dict(
         self,
     ) -> dict[str, ir.PrimitiveInfoType | list[ir.PrimitiveInfoType]]:
+        # [FUNCTION DOC] Returns a fixed info mapping with backend "CPP" and op_type "unknown".
         return {"backend": "CPP", "op_type": "unknown"}
 
     def output_node(self) -> ir.TensorBox:
+        # [FUNCTION DOC] Creates a CppTemplateBuffer from this caller's layout, inputs, kernel-render
+        # factory, template and itself, copies the "ktc" annotation onto it if present, and returns it
+        # wrapped in a TensorBox.
         buffer = ir.CppTemplateBuffer(
             layout=self.layout,
             inputs=self.input_nodes,
