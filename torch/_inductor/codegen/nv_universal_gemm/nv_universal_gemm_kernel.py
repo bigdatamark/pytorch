@@ -425,7 +425,7 @@ def _get_scaled_gemm_modes(
     # [FUNCTION DOC] HELPER: Converts Inductor scale/swizzle types for A and B into
     # cutlass scale and swizzle modes; returns the four modes (A scale, A swizzle,
     # B scale, B swizzle). Raises NotImplementedError if any is unsupported.
-    scale_mode_a, swizzle_mode_a =to_cutlass_scale_mode(scale_type_a, swizzle_type_a)
+    scale_mode_a, swizzle_mode_a = to_cutlass_scale_mode(scale_type_a, swizzle_type_a)
     scale_mode_b, swizzle_mode_b = to_cutlass_scale_mode(scale_type_b, swizzle_type_b)
     if any(
         mode is None
@@ -608,7 +608,7 @@ def _create_gemm_cache_key(
     # [FUNCTION DOC] HELPER: Builds a flat tuple key from the shape/stride/dtype of
     # every input and the output. With an epilogue, appends a marker, the aux
     # tensor signatures and the epilogue specialization tuple.
-    cache_key =tuple(s for t in input_tensors for s in _tensor_sig(t))
+    cache_key = tuple(s for t in input_tensors for s in _tensor_sig(t))
     cache_key = (*cache_key, *_tensor_sig(out))
 
     if has_epilogue:

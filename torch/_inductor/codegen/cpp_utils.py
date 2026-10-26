@@ -326,7 +326,7 @@ def rewrite_index_for_nodes(
     # [FUNCTION DOC] Index rewriter for localized IR nodes. For each dimension of the local
     # buffer, uses the matching index symbol if the original index uses it, else zero, and
     # returns the local buffer layout's flat index computed from those variables.
-    used_vars =OrderedSet(
+    used_vars = OrderedSet(
         s for s in index.free_symbols if symbol_is_type(s, SymT.INDEX)
     )
     index_vars = []
@@ -682,7 +682,7 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
                     input = ops.to_dtype(input, torch.float)
                 half = ops.constant(0.5, torch.float)
                 one = ops.constant(1.0, torch.float)
-                const =ops.constant(0.7071067811865476, torch.float)
+                const = ops.constant(0.7071067811865476, torch.float)
                 result = input * half * (ops.erf(input * const) + one)
                 if dtype != torch.float:
                     result = ops.to_dtype(result, dtype)
@@ -701,7 +701,7 @@ def create_epilogue_with_attr(input_buffer, attr, **kwargs):
                     input = ops.to_dtype(input, torch.float)
                 half = ops.constant(0.5, torch.float)
                 one = ops.constant(1.0, torch.float)
-                const1 =ops.constant(0.7978845608028654, torch.float)
+                const1 = ops.constant(0.7978845608028654, torch.float)
                 const2 = ops.constant(0.044715, torch.float)
                 result = (
                     half

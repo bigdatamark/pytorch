@@ -4,16 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# [MODULE DOC] Eager-mode implementation of the torch.func function transforms: vjp, jvp, jacrev,
-# jacfwd, hessian, linearize, functionalize and debug_unwrap, the shared grad/grad_and_value
-# implementations (the public grad wrappers live in apis.py), plus helpers for argnums
-# validation, differentiable-wrapping of tensors, standard-basis construction for Jacobians,
-# nesting-level context managers (grad/jvp/functionalize) and a global JVP_NESTING counter.
-# Transforms are built on the C++ functorch levels (_grad_increment_nesting etc.), autograd.grad,
-# forward-mode AD and vmap. Public functions are re-exported under torch.func via exposed_in.
-# Import-time side effects: defines module globals (including JVP_NESTING) and decorates
-# public functions; no registration beyond that.
-
 from __future__ import annotations
 
 import contextlib

@@ -111,7 +111,7 @@ def _find_attr_matching_outer_metadata(
     # one whose size (or stride, per metadata_fn) can stand in for a's own. Returns the first
     # tensor attr name if every tensor attr's metadata provably equals a's, else None (also
     # None when there are no tensor attrs).
-    tensor_attrs =[key for key in inner_keys if isinstance(getattr(a, key), Tensor)]
+    tensor_attrs = [key for key in inner_keys if isinstance(getattr(a, key), Tensor)]
     if not tensor_attrs:
         return None
 

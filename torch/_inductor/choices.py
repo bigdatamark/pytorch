@@ -512,7 +512,7 @@ class InductorChoices:
         # over min(numel hint, 32); multi_kernel multiplies by 16. Returns whether the
         # reduction size is statically known to be at most the threshold.
         """
-        Heuristic to decide if a persistent should be used.
+        Heuristic to decide if a persistent reduction should be used.
         """
         if not config.triton.persistent_reductions:
             return False

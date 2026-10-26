@@ -1068,7 +1068,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
         # (logging a warning if epilogue codegen fails), generates source only with the given
         # benchmark_kernel config patched, replaces the kernel name placeholder with a benchmark
         # prefix, and appends benchmark helpers when benchmark_kernel is set. hint_override is unused.
-        prologue, template, epilogue =nodes[0].get_prologue_template_epilogue(
+        prologue, template, epilogue = nodes[0].get_prologue_template_epilogue(
             list(nodes)
         )
 
@@ -1143,7 +1143,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
         # call function invoking the main benchmark kernel on the current CUDA stream. Returns
         # the extended source.
         template_node = cast(SchedulerNode, template_node)
-        ctb:NVUniversalGemmBuffer = self.get_nv_gemm_buffer_from_node(
+        ctb: NVUniversalGemmBuffer = self.get_nv_gemm_buffer_from_node(
             template_node, require_epilogue_fusion=bool(epilogue_nodes)
         )
 

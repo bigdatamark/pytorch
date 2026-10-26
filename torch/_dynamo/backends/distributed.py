@@ -52,6 +52,7 @@ def args_str(args: Any) -> str:
     # [FUNCTION DOC] HELPER: Debug formatter. Renders a tensor as its shape, tuples and lists
     # recursively with a tuple or list prefix, and anything else via string conversion.
     # Pure; returns a string.
+    # a debug helper
     if torch.is_tensor(args):
         return f"T[{args.shape}]"
     elif isinstance(args, tuple):
@@ -164,6 +165,7 @@ def has_higher_order_op(gm: fx.GraphModule) -> bool:
     # [FUNCTION DOC] Returns True if any get_attr node in the graph refers to an attribute that
     # is itself a GraphModule (a higher-order-op body subgraph). Read-only.
     # KNOWN ISSUE: not referenced elsewhere in this file; may be unused here.
+    # Check if there is a higher order op in the graph
     for node in gm.graph.nodes:
         if node.op == "get_attr":
             maybe_param = getattr(gm, node.target)

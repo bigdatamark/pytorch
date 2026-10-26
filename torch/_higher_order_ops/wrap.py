@@ -303,7 +303,7 @@ class WrapWithSetGradEnabled(HigherOrderOperator):
         @disable
         def wrapper():
             # [FUNCTION DOC] HELPER: Saves grad mode, sets it, runs wrapped_func, restores mode, returns result.
-            prev =torch.is_grad_enabled()
+            prev = torch.is_grad_enabled()
             torch.set_grad_enabled(enable_grad)
             res = wrapped_func(*args, **kwargs)
             torch.set_grad_enabled(prev)

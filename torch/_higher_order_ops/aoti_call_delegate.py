@@ -1,11 +1,5 @@
 # mypy: allow-untyped-defs
 
-# [MODULE DOC] Defines the aoti_call_delegate higher-order op, which calls an
-# AOTInductor-compiled submodule from an ExportedProgram graph. Provides the HOP object
-# and its implementations for real execution, proxy tracing, fake tensor mode and
-# functionalization. Import time: creates the HOP and registers fallthroughs for the
-# PythonDispatcher, PythonTLSSnapshot, ADInplaceOrView and AutocastCPU dispatch keys.
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #

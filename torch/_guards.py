@@ -423,7 +423,7 @@ class Guard:
     def __str__(self) -> str:
         # [FUNCTION DOC] Human readable multi-line description: name, source, create function,
         # guard types, code list and the weakrefs.
-        output = f"Name:{repr(self.name)}\n"
+        output = f"Name: {repr(self.name)}\n"
         source = self.source.name.lower() if self.source else ""
         output += f"    Source: {source}\n"
         output += f"    Create Function: {self.inner_create_fn().__name__}\n"

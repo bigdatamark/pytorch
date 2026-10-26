@@ -979,7 +979,7 @@ class _DynamoBytecodeCodeGen(torch.fx.graph.CodeGen):
         # [FUNCTION DOC] HELPER: Returns source text that packs the function arguments into a
         # tuple and unpacks the result of calling the module's flatten attribute on it into the
         # free variables (annotations and comments stripped from their names).
-        without_annotation =[x.split(":")[0].split("#")[0] for x in free_vars]
+        without_annotation = [x.split(":")[0].split("#")[0] for x in free_vars]
         if len(fn_args) == 0:
             fn_signature = ""
         elif len(fn_args) == 1:

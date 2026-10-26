@@ -1223,9 +1223,7 @@ class DynamoStore(abc.ABC):
         PrecompileContext.record_artifact(result)
 
     @abc.abstractmethod
-    def clear(self) -> None:
-        # [FUNCTION DOC] Abstract: remove all stored packages.
-        ...
+    def clear(self) -> None: ...
 
     @abc.abstractmethod
     def write(

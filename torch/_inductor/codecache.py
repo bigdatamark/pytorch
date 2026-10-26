@@ -3208,7 +3208,7 @@ class AotCodeCompiler:
                 # [FUNCTION DOC] HELPER: Builds GNU assembly text defining the start/end symbols of
                 # the constants section: one byte directive per value for small blobs, or a magic
                 # placeholder plus reserved space for large blobs. Returns (text, "weights.S").
-                consts_asm =f"\t.section\t{section_attr}\n"
+                consts_asm = f"\t.section\t{section_attr}\n"
                 consts_asm += f"\t.balign {align_bytes}\n"
                 consts_asm += f"\t.globl\t{symbol_prefix}_binary_constants_bin_start\n"
                 consts_asm += f"{symbol_prefix}_binary_constants_bin_start:\n"
@@ -5848,7 +5848,7 @@ class CUTLASSCodeCache:
         # [FUNCTION DOC] HELPER: Stores a compile failure: serializes (command parts, error text)
         # as JSON, saves it in the class cache entry, writes it to the error file next to the
         # output, and uploads that file to the remote binary cache when enabled.
-        error_json =json.dumps([cmd_parts, error_str])
+        error_json = json.dumps([cmd_parts, error_str])
         cls.cache[key_with_ext] = cls.CacheEntry(input_path, output_path, error_json)
         error_path = binary_error_path(output_path)
         with open(error_path, "w", encoding="utf-8") as fh:

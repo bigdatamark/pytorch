@@ -176,7 +176,7 @@ def functionalize(
 
 def make_functional(model: nn.Module, disable_autograd_tracking: bool = False) -> Any:
     # [FUNCTION DOC] Warns of deprecation (suggesting functional_call) and returns make_functional(model, disable_autograd_tracking).
-    warn_deprecated("make_functional","torch.func.functional_call")
+    warn_deprecated("make_functional", "torch.func.functional_call")
     return _nn_impl.make_functional(model, disable_autograd_tracking)
 
 

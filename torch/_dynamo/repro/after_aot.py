@@ -951,14 +951,8 @@ def save_graph_repro(
     check_str: str | None = None,
     stable_hash: bool = False,
 ) -> None:
-    # [FUNCTION DOC] Writes a complete runnable repro script to the file object.
-    # If any arg is a BackwardState, writes only an explanatory message and returns.
-    # Otherwise writes the generated body, then a main block calling run_repro with
-    # accuracy (defaulting to whether compiler_name contains accuracy), tracing mode
-    # (symbolic if any arg has free symbols, else real), command, save_dir and
-    # check_str; adds fake process group setup and teardown when the graph has
-    # distributed ops. Side effect: writes to fd.
-
+    if any(
+        isinstance(arg, torch.fx.experimental._backward_state.BackwardState)
         for arg in args
     ):
         fd.write(

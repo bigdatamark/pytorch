@@ -53,7 +53,7 @@ def parse_list(lst: str) -> list[int]:
     # Parses a string such as a bracketed comma separated list of integers into a list
     # of ints by stripping brackets and splitting on commas. Raises ValueError on
     # non-integer items (including an empty list string).
-    lst =lst.replace("[", "").replace("]", "")
+    lst = lst.replace("[", "").replace("]", "")
     substrings = lst.split(",")
 
     return [int(substring.strip()) for substring in substrings]

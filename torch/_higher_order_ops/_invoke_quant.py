@@ -1,11 +1,6 @@
 # mypy: allow-untyped-defs
 # need to fix prim_hop_base type annotations first
 
-# [MODULE DOC] Defines the invoke_quant higher-order ops, which keep a quantization
-# subgraph as a single operator so it can be pattern matched and custom lowered, plus the
-# user-facing InvokeQuant callable wrapper. Import time: instantiates the two HOP objects
-# invoke_quant_packed and invoke_quant (registering their names with the HOP machinery).
-
 import dataclasses
 
 import torch

@@ -103,7 +103,7 @@ def print_proxy_torch_dispatch_mode(
     # kwargs and records a call_function node for print in the tracer graph. The
     # format string is passed through as a constant. Returns None. Side effect:
     # adds a node to the graph.
-    proxy_args =pytree.tree_map(mode.tracer.unwrap_proxy, args)  # type: ignore[union-attr]
+    proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, args)  # type: ignore[union-attr]
     proxy_kwargs = pytree.tree_map(mode.tracer.unwrap_proxy, kwargs)  # type: ignore[union-attr]
     mode.tracer.create_proxy(
         "call_function", print, (format_str, *proxy_args), proxy_kwargs

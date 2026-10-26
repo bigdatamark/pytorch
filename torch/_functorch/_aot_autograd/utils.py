@@ -447,7 +447,7 @@ def unlift_tokens(
         # [FUNCTION DOC] HELPER: Inserts a make-token call before the given placeholder node,
         # redirects all of the placeholder's uses to it, and erases the placeholder.
         with module.graph.inserting_before(node):
-            new_token_node =module.graph.call_function(
+            new_token_node = module.graph.call_function(
                 torch.ops.prims._make_token.default, ()
             )
             new_token_node.meta["val"] = torch.tensor([])

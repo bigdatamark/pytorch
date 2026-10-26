@@ -1,13 +1,5 @@
 # mypy: disable-error-code="method-assign"
 
-# [MODULE DOC] Runtime entry point of TorchDynamo. Defines the context managers/decorators
-# (OptimizeContext, RunOnlyContext, DisableContext) that install the PEP 523 eval-frame callback,
-# the OptimizedModule wrapper returned for compiled nn.Modules, the optimize/optimize_assert/explain
-# /export public entry points, the "stance" mechanism (set_stance) that overrides the callback,
-# thread-local trace bookkeeping (DynamoTLS), and TorchPatcher which disables Dynamo on some torch
-# internals. Import-time side effects: creates module globals (default stance, cached_backends,
-# thread-local state, always_optimize_code_objects), and registers an atexit hook that logs traced frames.
-
 """
 This module implements the core frame evaluation handler for TorchDynamo's compilation system.
 The eval frame handler intercepts Python bytecode execution at runtime to enable dynamic

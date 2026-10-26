@@ -1,12 +1,5 @@
 # mypy: allow-untyped-defs
 
-# [MODULE DOC] Defines the executorch_call_delegate higher-order operator, which represents
-# a call into a lowered (backend-delegated) ExecuTorch module inside a traced graph, and
-# registers its implementations: eager/CPU fallback, autograd, proxy tracing, fake tensor and
-# functionalization. Import-time side effects: creates the global operator instance and
-# sets fallthrough for the PythonDispatcher, PythonTLSSnapshot, ADInplaceOrView and
-# AutocastCPU dispatch keys.
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #

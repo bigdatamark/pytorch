@@ -205,7 +205,7 @@ def map(
         def wrapped_fn(*flat_args, f, xs_tree_spec, args_tree_spec, num_xs):
             # [FUNCTION DOC] HELPER: Rebuilds xs (first num_xs leaves) and the extra
             # args from flat leaves using the saved specs and calls f with them.
-            xs =pytree.tree_unflatten(flat_args[:num_xs], xs_tree_spec)
+            xs = pytree.tree_unflatten(flat_args[:num_xs], xs_tree_spec)
             args = pytree.tree_unflatten(flat_args[num_xs:], args_tree_spec)
             return f(xs, *args)
 
@@ -386,7 +386,7 @@ def trace_map(
     with disable_proxy_modes_tracing():
         # Use first_slice_copy instead of _unstack_pytree to avoid
         # iterating over batch dim, which would guard on symbolic sizes.
-        example_input =pytree.tree_map(first_slice_copy, xs)
+        example_input = pytree.tree_map(first_slice_copy, xs)
 
         body_graph = reenter_make_fx(f)(*example_input, *pos_args)
 

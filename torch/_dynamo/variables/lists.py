@@ -911,6 +911,7 @@ class RangeVariable(BaseListVariable):
         # [FUNCTION DOC] Implements "in": for int/bool items uses arithmetic membership via
         # range_count; otherwise compares against every element of the expanded range.
         # range_contains:https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/rangeobject.c#L482-L490
+        # range_contains: https://github.com/python/cpython/blob/60403a5409ff2c3f3b07dd2ca91a7a3e096839c7/Objects/rangeobject.c#L482-L490
         if maybe_get_python_type(item) in (int, bool):
             return VariableTracker.build(tx, bool(self.range_count(item)))
         return iter_contains(self.unpack_var_sequence(tx), item, tx)
@@ -936,6 +937,7 @@ class RangeVariable(BaseListVariable):
         # [FUNCTION DOC] Indexes the range by an already-converted integer key (no slices); raises
         # observed IndexError when out of range.
         # range_item:https://github.com/python/cpython/blob/62a6e898e01/Objects/rangeobject.c#L405-L416
+        # range_item: https://github.com/python/cpython/blob/62a6e898e01/Objects/rangeobject.c#L405-L416
         # CPython's sq_item takes Py_ssize_t (already int from generic_getitem's
         # nb_index_impl).  Unlike mp_subscript (range_subscript), no slices.
         index = key.as_python_constant()
@@ -1033,6 +1035,7 @@ class RangeVariable(BaseListVariable):
     def hash_impl(self, tx: "InstructionTranslatorBase") -> tuple[int, bool]:
         # [FUNCTION DOC] Returns (hash of the equivalent real range, False); requires constant bounds.
         # CPython range_hash:https://github.com/python/cpython/blob/e76aa128fe/Objects/rangeobject.c#L572
+        # CPython range_hash: https://github.com/python/cpython/blob/e76aa128fe/Objects/rangeobject.c#L572
         return hash(self.as_python_constant()), False
 
 
@@ -1267,6 +1270,7 @@ class ListVariable(CommonListMethodsVariable):
         # constant count and returns self. Records a mutation. Raises AssertionError if the list is
         # immutable; memory/overflow errors become observed exceptions.
         # list_inplace_repeat:https://github.com/python/cpython/blob/v3.13.13/Objects/listobject.c#L1071
+        # list_inplace_repeat: https://github.com/python/cpython/blob/v3.13.13/Objects/listobject.c#L1071
         if not self.is_mutable():
             raise AssertionError(
                 f"sq_inplace_repeat_impl reached an immutable {type(self).__name__}; "
@@ -1706,6 +1710,7 @@ class DequeVariable(CommonListMethodsVariable):
         # [FUNCTION DOC] Indexes the deque by an already-converted integer key; raises observed
         # IndexError when out of range.
         # deque_item:https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1888
+        # deque_item: https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L1888
         # CPython's sq_item takes Py_ssize_t (already int from generic_getitem's
         # nb_index_impl).  deque has no mp_subscript, so this is the real path.
         index = key.as_python_constant()
@@ -1787,6 +1792,7 @@ class DequeVariable(CommonListMethodsVariable):
         # returns self. Raises AssertionError if immutable; memory/overflow errors become observed.
         # KNOWN ISSUE: does not bump the state counter, unlike other structural mutations.
         # deque_inplace_repeat:https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L811
+        # deque_inplace_repeat: https://github.com/python/cpython/blob/v3.13.0/Modules/_collectionsmodule.c#L811
         if not self.is_mutable():
             raise AssertionError(
                 f"sq_inplace_repeat_impl reached an immutable {type(self).__name__}; "
@@ -2163,6 +2169,7 @@ class TupleVariable(BaseListVariable):
         # reduced again), matching CPython. Returns (hash, is_fake) where is_fake is True if any
         # item's hash was a placeholder.
         # CPython tuplehash:https://github.com/python/cpython/blob/e76aa128fe/Objects/tupleobject.c#L321
+        # CPython tuplehash: https://github.com/python/cpython/blob/e76aa128fe/Objects/tupleobject.c#L321
         # Collect per-item hashes and feed them through tuplehash.  We wrap
         # each hash in RawHash to bypass int.__hash__'s modular reduction,
         # so tuplehash sees the original hash values — matching CPython exactly.
@@ -2354,6 +2361,7 @@ class SizeVariable(TupleVariable):
         # is, other index-like keys are converted to an integer, and keys that cannot be indexes raise
         # observed TypeError. Delegates to get_item_dyn.
         # tuple_subscript:https://github.com/python/cpython/blob/62a6e898e01/Objects/tupleobject.c#L877-L930
+        # tuple_subscript: https://github.com/python/cpython/blob/62a6e898e01/Objects/tupleobject.c#L877-L930
         try:
             key_type = key.python_type()
         except NotImplementedError:

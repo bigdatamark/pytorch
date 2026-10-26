@@ -416,17 +416,13 @@ def _invoke_leaf_function_python(
 
 
 @overload
-def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    # [FUNCTION DOC] HELPER: Typing overload for bare decorator use.
-    ...
+def leaf_function(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
 
 
 @overload
 def leaf_function(
     *, mutates_args: set[str]
-) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
-    # [FUNCTION DOC] HELPER: Typing overload for decorator use with mutates_args.
-    ...
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 
 
 def leaf_function(
@@ -1681,18 +1677,14 @@ class _ConfigPatchProtocol(Protocol):
 
     changes: dict[str, Any]
 
-    def __enter__(self) -> None:
-        # [FUNCTION DOC] HELPER: Protocol stub; applies the config changes.
-        ...
+    def __enter__(self) -> None: ...
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
-    ) -> None:
-        # [FUNCTION DOC] HELPER: Protocol stub; restores the config.
-        ...
+    ) -> None: ...
 
 
 # Proxy class for torch._dynamo.config patching - so dynamo can identify context managers/decorators
@@ -1811,15 +1803,11 @@ def patch_dynamo_config(
 
 
 @overload
-def dont_skip_tracing(fn: None = None) -> DynamoConfigPatchProxy:
-    # [FUNCTION DOC] HELPER: Typing overload for context manager use.
-    ...
+def dont_skip_tracing(fn: None = None) -> DynamoConfigPatchProxy: ...
 
 
 @overload
-def dont_skip_tracing(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    # [FUNCTION DOC] HELPER: Typing overload for decorator use.
-    ...
+def dont_skip_tracing(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
 
 
 def dont_skip_tracing(fn: Any | None = None) -> Any:
@@ -1839,15 +1827,11 @@ def dont_skip_tracing(fn: Any | None = None) -> Any:
 
 
 @overload
-def disable_nested_graph_breaks(fn: None = None) -> DynamoConfigPatchProxy:
-    # [FUNCTION DOC] HELPER: Typing overload for context manager use.
-    ...
+def disable_nested_graph_breaks(fn: None = None) -> DynamoConfigPatchProxy: ...
 
 
 @overload
-def disable_nested_graph_breaks(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    # [FUNCTION DOC] HELPER: Typing overload for decorator use.
-    ...
+def disable_nested_graph_breaks(fn: Callable[_P, _R]) -> Callable[_P, _R]: ...
 
 
 def disable_nested_graph_breaks(fn: Any | None = None) -> Any:

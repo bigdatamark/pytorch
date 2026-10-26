@@ -651,7 +651,7 @@ def _create_getitem_nodes(
     # example value recorded. Returns (list of created nodes in creation order, mapping from the
     # index path of each element to its position in that list). Raises AssertionError if the
     # node's example value is not a tuple.
-    tup =node.meta["example_value"]
+    tup = node.meta["example_value"]
     if not isinstance(tup, tuple):
         raise AssertionError("_get_getitem_children expects tuple")
 

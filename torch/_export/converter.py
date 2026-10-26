@@ -645,7 +645,7 @@ class TS2FXGraphConverter:
         # [FUNCTION DOC] Registers subgraph under a generated name of the form
         # subgraph_N (N is the current count); mutates the subgraph table and
         # returns the name.
-        name =f"subgraph_{len(self.subgraphs)}"
+        name = f"subgraph_{len(self.subgraphs)}"
         self.subgraphs[name] = subgraph
         return name
 
@@ -893,7 +893,7 @@ class TS2FXGraphConverter:
         # value kinds and None (no value attribute). A tensor constant is stored
         # under a lifted-tensor alias name and gets a get_attr node mapped to the
         # original output name. Raises ValueError for other kinds.
-        name =node.output().debugName()
+        name = node.output().debugName()
 
         value: Any = None
         if node.hasAttribute("value"):

@@ -43,10 +43,7 @@ use_legacy_dynamo_graph_capture = True
 if TYPE_CHECKING:
     from torch.utils._config_typing import *  # noqa: F403
 
-    def _make_closure_patcher(**changes: Any) -> Any:
-        # [FUNCTION DOC] HELPER: type-checking-only stub (body is an ellipsis);
-        # declares the patcher factory that install_config_module provides.
-        ...
+    def _make_closure_patcher(**changes: Any) -> Any: ...
 
 
 install_config_module(sys.modules[__name__])

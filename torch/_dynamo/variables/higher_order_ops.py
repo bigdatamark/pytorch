@@ -5788,7 +5788,7 @@ class AutogradFunctionApplyVariable(VariableTracker):
         # passed to subgraph speculation. Returns the context variable.
         from . import AutogradFunctionContextVariable
 
-        ctx =AutogradFunctionContextVariable.create(tx, args, kwargs)
+        ctx = AutogradFunctionContextVariable.create(tx, args, kwargs)
         with discard_graph_changes(tx):
             # A little hacky, but we need a dummy ctx proxy for speculate_subgraph.
             # We should clean this up at some point.

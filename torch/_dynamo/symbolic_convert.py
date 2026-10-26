@@ -2547,7 +2547,7 @@ class InstructionTranslatorBase(
     def DELETE_FAST(self, inst: Instruction) -> None:
         # [FUNCTION DOC] Opcode: delete a symbolic local; tensors may first get a stream
         # sync-dealloc emitted. Raises KeyError if the local is not bound.
-        var =self.symbolic_locals.get(inst.argval)
+        var = self.symbolic_locals.get(inst.argval)
         if isinstance(var, TensorVariable):
             self._maybe_emit_sync_dealloc(var)
         del self.symbolic_locals[inst.argval]
@@ -3603,7 +3603,7 @@ class InstructionTranslatorBase(
     def CALL_FUNCTION(self, inst: Instruction) -> None:
         # [FUNCTION DOC] Opcode (graph-break capable): pop the positional arguments and the callee and
         # push the call result.
-        args =self.popn(inst.argval)
+        args = self.popn(inst.argval)
         fn = self.pop()
         self.call_function(fn, args, {})
 
@@ -4540,7 +4540,7 @@ class InstructionTranslatorBase(
     def BUILD_LIST_UNPACK(self, inst: Instruction, cls: type = ListVariable) -> None:
         # [FUNCTION DOC] Opcode (legacy): pop argval iterables, concatenate their unpacked items and
         # push a new container of type cls (list by default). Graph breaks if an item cannot be unpacked.
-        seqs =self.popn(inst.argval)
+        seqs = self.popn(inst.argval)
         items = []
         for seq in seqs:
             try:
@@ -4575,7 +4575,7 @@ class InstructionTranslatorBase(
         # [FUNCTION DOC] Opcode (legacy): pop argval mappings, convert each to a dict, merge them in
         # order (later keys win) and push the merged dict variable. Raises AssertionError if a
         # conversion does not yield a constant dict variable.
-        items =self.popn(inst.argval)
+        items = self.popn(inst.argval)
         # ensure everything is a dict
         items = [
             VariableTracker.build(self, dict).call_function(self, [x], {})
@@ -5102,7 +5102,7 @@ class InstructionTranslatorBase(
     def MATCH_SEQUENCE(self, inst: Instruction) -> None:
         # [FUNCTION DOC] Opcode (match statement): push whether the top item is a sequence, via the
         # inlined impl_MATCH_SEQUENCE polyfill. The item stays on the stack.
-        tos =self.stack[-1]
+        tos = self.stack[-1]
         self.push(
             self.inline_user_function_return(
                 VariableTracker.build(self, impl_MATCH_SEQUENCE),
@@ -5795,7 +5795,7 @@ class InstructionTranslatorBase(
     def frame_summary(self) -> traceback.FrameSummary:
         # [FUNCTION DOC] Build a FrameSummary for the current location (file, current line, function
         # name; column info from instruction positions on 3.11+) without looking up source text.
-        positions =self.current_instruction.positions
+        positions = self.current_instruction.positions
         # colno/end_colno kwargs were added to FrameSummary in 3.11
         kwargs: dict[str, Any] = {}
         if sys.version_info >= (3, 11) and positions is not None:
@@ -5812,7 +5812,7 @@ class InstructionTranslatorBase(
     def is_co_filename_from_nn_modules(self) -> bool:
         # [FUNCTION DOC] Return True if the current code's filename matches the pattern for files
         # under the torch nn modules directory.
-        filename =getattr(self.f_code, "co_filename", "<unknown>")
+        filename = getattr(self.f_code, "co_filename", "<unknown>")
         nn_modules_pattern = re.compile(r".*torch/nn/modules.*")
         return nn_modules_pattern.match(filename) is not None
 
@@ -5820,7 +5820,7 @@ class InstructionTranslatorBase(
         # [FUNCTION DOC] Install a weak reference to value as an output-graph global (name derived from
         # prefix and the object's id), install a guard that the referent is still alive, and
         # return the global's name.
-        global_name =self.output.install_global_by_id(prefix, weakref.ref(value))
+        global_name = self.output.install_global_by_id(prefix, weakref.ref(value))
         install_guard(
             GlobalWeakRefSource(global_name).make_guard(GuardBuilder.WEAKREF_ALIVE)
         )
@@ -6221,7 +6221,7 @@ class InstructionTranslator(InstructionTranslatorBase):
     def set_current_tx(self) -> Any:
         # [FUNCTION DOC] Context manager: make self the thread-local current translator, restoring the
         # prior one (or removing the attribute) on exit.
-        prior =getattr(tls, "current_tx", None)
+        prior = getattr(tls, "current_tx", None)
         tls.current_tx = self
         try:
             yield
@@ -7157,7 +7157,7 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
         # import source and attribute source; otherwise installs the globals dict as an unnamed
         # scope global and uses a dict item source. Sources inside stdlib modules are wrapped to
         # skip guards. Variables are built eagerly (not lazily) since a setattr may follow.
-        registered_module =_registered_module_for_globals(
+        registered_module = _registered_module_for_globals(
             self.f_globals.get("__name__"), self.f_globals
         )
         if registered_module is not None:

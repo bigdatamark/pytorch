@@ -1735,7 +1735,7 @@ def get_fail_callback(callback: ConvertFrameProtocol) -> ConvertFrameProtocol:
     # original callback with the frame-compile function patched to raise a runtime error,
     # so any attempt to compile nested code under a fullgraph-compiled region fails loudly.
     # Mutates the callback by attaching the cached wrapper. Called from the C++ eval-frame code.
-    fail_callback =getattr(callback, "_dynamo_fail_callback", None)
+    fail_callback = getattr(callback, "_dynamo_fail_callback", None)
     if fail_callback is not None:
         return fail_callback
 

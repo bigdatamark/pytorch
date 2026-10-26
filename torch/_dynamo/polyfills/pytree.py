@@ -1,14 +1,5 @@
 # Owner(s): ["module: pytree"]
 
-# [MODULE DOC] Pure-Python Dynamo polyfills for the optree C++ pytree API, so Dynamo can
-# trace torch.utils._cxx_pytree. Defines a Python PyTreeSpec analog and substitutes (via
-# substitute_in_graph) optree's tree_is_leaf, tree_iter, tree_leaves, tree_flatten,
-# tree_flatten_with_path, tree_structure, tree_unflatten, treespec_leaf/tuple/dict, the
-# namedtuple/structseq helpers, and the flatten/unflatten callbacks for None and dict.
-# Import-time side effects: imports optree and the C++ pytree extension, registers all
-# substitutions, injects the namedtuple/structseq helper substitutes into module globals,
-# and raises AssertionError if optree has no handler for None or dict.
-
 """
 Python polyfills for torch.utils.pytree
 """

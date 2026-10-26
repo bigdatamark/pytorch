@@ -4786,7 +4786,7 @@ class GuardsStatePickler(pickle.Pickler):
     ) -> torch.nn.parallel.DistributedDataParallel:
         # [FUNCTION DOC] HELPER: Create a DDP instance without running its constructor and
         # restore only the base module state (avoiding its custom setstate).
-        ty =torch.nn.parallel.DistributedDataParallel
+        ty = torch.nn.parallel.DistributedDataParallel
         ddp = ty.__new__(ty)
         torch.nn.Module.__setstate__(ddp, state)
         return ddp

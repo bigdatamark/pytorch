@@ -42,7 +42,7 @@ class TracableCreateParameter(torch.autograd.Function):
     def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[None, torch.Tensor]:
         # [FUNCTION DOC] Returns no gradient for the source tensor and passes the
         # first incoming output gradient through to the placeholder input.
-        grad =grad_outputs[0]
+        grad = grad_outputs[0]
         return None, grad  # grad flows to placeholder
 
 

@@ -1,7 +1,3 @@
-# [MODULE DOC] Helpers to detect whether the Meta Triton automatic warp
-# specialization (autoWS) feature exists and is switched on. No import-time side
-# effects; triton is imported lazily inside the functions.
-
 """Utils for Meta Triton autoWS."""
 
 from __future__ import annotations

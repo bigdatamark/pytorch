@@ -633,7 +633,7 @@ def _diff_schema(
     # removed on struct fields count as additions or subtractions with only a default entry). The version keys are
     # ignored. Raises SchemaUpdateError if a type changes kind, a field type changes, or an enum value
     # changes; raises assertion errors for unknown kinds or duplicate keys.
-    additions ={key: src[key] for key in src.keys() - dst.keys()}
+    additions = {key: src[key] for key in src.keys() - dst.keys()}
     subtractions = {key: dst[key] for key in dst.keys() - src.keys()}
 
     common_keys = src.keys() & dst.keys()

@@ -650,6 +650,7 @@ class ExceptionVariable(VariableTracker):
     # defaulting to None/False constants) and python_stack (user stack summary at
     # first raise, used when re-raising). Custom attributes live in the side effects
     # instance dict. Subclasses add extra constructor attributes.
+    # The ExceptionVariable corresponds to the BaseException class in Python
     def __init__(
         self,
         exc_type: Any,
@@ -941,6 +942,7 @@ class StopIterationVariable(ExceptionVariable):
 class _KwargAttrExceptionVariable(ExceptionVariable):
     # [CLASS DOC] HELPER: Base for
     # exceptions whose constructor accepts keyword-only attributes that
+    # Base for exceptions whose constructor accepts keyword-only attributes that
     # default to None (e.g. NameError's `name`, AttributeError's `name`/`obj`).
     # Subclasses list the attribute names in `_kwarg_attrs`; they are popped from
     # init_kwargs, exposed via getattr, and restored on reconstruct.

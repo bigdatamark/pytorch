@@ -257,7 +257,7 @@ def insert_weight_and_bias_get_attr_node(
     # [FUNCTION DOC] HELPER: Converts the weight to a dequantized float tensor and the bias (if present) to a plain tensor
     # without dequantization, assigns each to the module under the given attribute names, and appends
     # attribute-fetch nodes for them. Returns (weight node, bias node or None). Mutates module and graph.
-    w_tensor =get_tensor_from_qtensor(w_qtensor)
+    w_tensor = get_tensor_from_qtensor(w_qtensor)
     _assign_attr(w_tensor, gm, w_attr_name)
     w_tensor_attr = gm.graph.get_attr(w_attr_name)
 

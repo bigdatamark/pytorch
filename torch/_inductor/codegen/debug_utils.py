@@ -98,7 +98,7 @@ class DebugPrinterManager:
         # The kernel filter names are read from config.
         # KNOWN ISSUE: the arg_signatures and kernel_type parameters are ignored; both
         # attributes are reset to None here and only set later by set_printer_args.
-        self.debug_printer_level =IntermediateValueDebuggingLevel(debug_printer_level)
+        self.debug_printer_level = IntermediateValueDebuggingLevel(debug_printer_level)
         self.use_array_ref = use_array_ref
         if args_to_print_or_save is None:
             args_to_print_or_save = []
@@ -253,13 +253,7 @@ class DebugPrinterManager:
         before_launch=True,
         arg_signatures: list[type] | None = None,
     ) -> None:
-        # [FUNCTION DOC] Emits lines that save each tensor arg. Args whose signature entry
-        # is present but not a torch dtype (not a tensor) are skipped. For the C++ wrapper
-        # writes a save-tensor-handle call labeled with the launch phase and kernel name.
-        # For the Python wrapper ensures a directory under the current working directory
-        # exists (creating it, a side effect at codegen time) and writes a torch save line
-        # to a file named from phase, kernel and arg.
-
+        for i, arg in enumerate(args_to_save):
             if arg_signatures is not None and not isinstance(
                 arg_signatures[i], torch_dtype
             ):

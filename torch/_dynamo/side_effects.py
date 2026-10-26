@@ -146,7 +146,7 @@ class _SideEffectReplayRegistry:
         # [FUNCTION DOC] HELPER: Returns the matching handler with the highest priority, or
         # None when no matcher accepts the context. Raises a runtime error naming the handlers
         # when the top priority is shared by more than one matching handler.
-        matches =[handler for handler in self.handlers if handler.matcher(ctx)]
+        matches = [handler for handler in self.handlers if handler.matcher(ctx)]
         if not matches:
             return None
         matches.sort(key=lambda handler: handler.priority, reverse=True)
@@ -294,12 +294,8 @@ class SideEffects:
         ]
         | None = None,
     ) -> None:
-        # [FUNCTION DOC] Creates the tracker. Stores a weak reference to output_graph and
-        # uses the given mappings and lists (or fresh empty ones) for the tracked state;
-        # the passed containers are used directly, not copied. Also initializes the ignore
-        # set, mutated sources, deferred mutation table, the dict-mutation flag and the
-        # compiled autograd final callbacks variable (none).
- = weakref.ref(output_graph)
+        super().__init__()
+        self.output_graph_weakref = weakref.ref(output_graph)
         self.id_to_variable = id_to_variable or {}
         self.store_attr_mutations = store_attr_mutations or {}
         self.attr_mutation_kinds = attr_mutation_kinds or {}
@@ -373,13 +369,7 @@ class SideEffects:
     def snapshot_attr_mutation(
         self, item: VariableTracker, name: str, value: VariableTracker
     ) -> bool:
-        # [FUNCTION DOC] Records the original and current constant value of attribute name on
-        # item in the deferred table (original kept from the first record). The original is
-        # read via the item's attribute lookup under the current translator. Returns False
-        # when the original cannot be read or is not a constant, so the caller falls back to
-        # an immediate check. Raises an error if value is not a constant or the output graph
-        # is gone.
- validation.
+        """Record an attribute mutation for deferred validation.
 
         Returns True if successfully deferred, False if we cannot read the
         original value (tp_getattro_impl raises NotImplementedError) or the

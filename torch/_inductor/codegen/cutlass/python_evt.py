@@ -577,7 +577,7 @@ class CutlassEVTCodegen(CutlassEVTOpsMixIn):
         # the handler installed, finalizes, and returns (read buffer names, written
         # buffer names, variable-to-buffer rename mapping, python source text). The source
         # defines a function named fn_name; as_standalone_function indents the return.
-        codegen =CutlassEVTCodegen(cutlass_template_node_name, removed_buffers)
+        codegen = CutlassEVTCodegen(cutlass_template_node_name, removed_buffers)
         handler = _AssignmentFormatter(codegen)
 
         with virtualized.V.set_ops_handler(handler):

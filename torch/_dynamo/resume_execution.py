@@ -87,13 +87,7 @@ def _bytecode_from_template_with_split(
     stack_index: int,
     varname_map: dict[str, Any] | None = None,
 ) -> tuple[list[Instruction], list[Instruction]]:
-    # [FUNCTION DOC] HELPER: Compiles a template function to instructions and splits them at
-    # the placeholder load of the variable named dummy. Appends a pop, shifts exception-table
-    # entry depths by stack_index, turns the dummy load and the following pop into no-ops, and
-    # returns (setup instructions up to and including the first no-op, epilogue after it).
-    # varname_map optionally renames template variables. Raises an error if the dummy load or
-    # the pop after it is missing.
-
+    template_code = bytecode_from_template(template, varname_map=varname_map)
     template_code.append(create_instruction("POP_TOP"))
 
     # adjust exception table entry depth
@@ -377,13 +371,7 @@ class ContinueExecutionCache:
     def lookup(
         cls, code: types.CodeType, lineno: int, init_offset: int, *key: Any
     ) -> types.CodeType:
-        # [FUNCTION DOC] Memoized entry point. Returns the resume code object for the given
-        # code and extra key arguments, generating it via generate on a cache miss. Mutates
-        # the class-level cache. The cache key is only the extra key tuple (lineno and
-        # init_offset are not part of it).
-        # KNOWN ISSUE: lineno and init_offset are not in the cache key, so a hit can return code
-        # generated for different values; presumably the key args determine them in practice.
-
+        if code not in cls.cache:
             cls.cache[code] = {}
         key = tuple(key)
         if key not in cls.cache[code]:
@@ -414,16 +402,7 @@ class ContinueExecutionCache:
         # the result of calling the next resume function.
         pop_nested_resume_result: bool,
     ) -> types.CodeType:
-        # [FUNCTION DOC] Generates a resume code object that restores the saved stack
-        # (nstack values plus NULLs at null_idxes), re-enters context managers (setup_fns,
-        # inactive contexts rebuilt when handle_inactive_ctx), refills NULL locals (3.12+),
-        # optionally calls the next nested resume function (popping its result when
-        # pop_nested_resume_result), and jumps to the instruction at resume_offset.
-        # Delegates to generate_based_on_original_code_object when code is itself a generated
-        # resume function. Records metadata for the new code. Raises an error for generator or
-        # coroutine code, code without the optimized flag, a missing resume offset, or leftover
-        # unprocessed hooks. init_offset is only forwarded, not used here.
-
+        if resume_offset is None:
             raise AssertionError("resume_offset must not be None")
         if code.co_flags & (
             CO_GENERATOR | CO_COROUTINE | CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR
@@ -458,13 +437,7 @@ class ContinueExecutionCache:
         def update(
             instructions: list[Instruction], code_options: dict[str, Any]
         ) -> None:
-            # [FUNCTION DOC] HELPER: Transformation callback. Saves a copy of the original
-            # instructions in meta, rewrites code_options (name, qualname, first line, args,
-            # varnames, flags, freevars), builds the prefix (stack restore, context re-entry,
-            # nested resume call, jump to target), clears line info before the target, remaps
-            # exception-table targets for re-entered contexts, and replaces the instruction
-            # list in place with prefix plus original instructions.
-
+            meta.instructions = copy.deepcopy(instructions)
 
             args = ["__nested_resume_fns", "__nested_frame_values"]
             args += [f"___stack{i}" for i in range(nstack)]
