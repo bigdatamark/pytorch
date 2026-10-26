@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Group and batch fusion passes over FX graphs (pre-grad torch level and post-grad aten level).
+# Each fusion rule is a class with match (return a hashable group key for a node or None) and fuse (merge a
+# list of independent nodes sharing a key, typically by stacking inputs, running one batched op and
+# unbinding/selecting the results). Contents: rule base classes, registries PRE_GRAD_FUSIONS and
+# POST_GRAD_FUSIONS filled by the register_fusion decorator, linear / layernorm / pointwise / math rules,
+# candidate search (BFS) and greedy independent-subset selection, and the driver group_batch_fusion_passes.
+# Import-time side effects: tries to import the fbgemm inductor lowerings to set has_fbgemm; registers all
+# rules in the registries; defines global search option defaults.
 import collections
 import logging
 import operator
@@ -71,6 +79,8 @@ graph_search_options = default_graph_search_options
 
 
 def update_stack_example_value(node, metadata, dim=0, op=torch.stack):
+    # [FUNCTION DOC] Set the example_value meta of a stack or unbind node, computed by running torch.stack or torch.unbind
+    # on the given tensor metadata and dim. Does nothing for a None node, a node without meta, or any other op.
     """
     Update the example value of the node in the graph to enable followup split cat opt.
     """
@@ -85,6 +95,8 @@ def update_stack_example_value(node, metadata, dim=0, op=torch.stack):
 
 
 def update_pointwise_example_value(pointwise_node, input, other, op):
+    # [FUNCTION DOC] Set the example_value meta of a pointwise node (add or mul only) by computing the op on the given
+    # tensors. Does nothing for a None node, a node without meta, or another op.
     """
     Update the example value of the add node in the graph to enable followup split cat opt.
     """
@@ -99,15 +111,21 @@ def update_pointwise_example_value(pointwise_node, input, other, op):
 
 
 class GroupBatchFusionBase:
+    # [CLASS DOC] Base class of all fusion rules. Holds graph_search_options (from the graph_search_options keyword or
+    # the module defaults). Subclasses implement match(node), returning a group key or None, and
+    # fuse(graph, subset), rewriting a list of independent nodes sharing a key.
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] Pop graph_search_options from the keyword arguments (defaulting to the module defaults) and store it.
         self.graph_search_options = kwargs.pop(
             "graph_search_options", default_graph_search_options
         )
 
     def match(self, node):
+        # [FUNCTION DOC] Abstract: return a group key for the node or None. Raises NotImplementedError in the base class.
         raise NotImplementedError("match called on base")
 
     def fuse(self, graph, subset):
+        # [FUNCTION DOC] Abstract: fuse the nodes in subset in graph. Raises NotImplementedError in the base class.
         raise NotImplementedError("fuse called on base")
 
 
@@ -116,7 +134,10 @@ POST_GRAD_FUSIONS: dict[str, GroupBatchFusionBase] = {}
 
 
 def register_fusion(name: str, pre_grad=True):
+    # [FUNCTION DOC] Class decorator factory: registers a fusion class under name in the pre-grad or post-grad registry
+    # (global dictionaries, mutated at import time) and returns the class unchanged.
     def decorator(fusion_cls: GroupBatchFusionBase):
+        # [FUNCTION DOC] HELPER: Do the registration and return the class.
         if pre_grad:
             PRE_GRAD_FUSIONS[name] = fusion_cls
         else:
@@ -127,6 +148,7 @@ def register_fusion(name: str, pre_grad=True):
 
 
 def list_group_batch_fusions(pre_grad=True) -> list[str]:
+    # [FUNCTION DOC] Return the list of registered fusion names for pre-grad or post-grad.
     if pre_grad:
         return list(PRE_GRAD_FUSIONS.keys())
     else:
@@ -134,6 +156,9 @@ def list_group_batch_fusions(pre_grad=True) -> list[str]:
 
 
 def decompose_stack(graph: torch.fx.GraphModule, input_tensors: list[Any]) -> Any:
+    # [FUNCTION DOC] Emulate stacking tensors in post-grad (aten) form: unsqueeze each input at dim 0 then concatenate along
+    # dim 0, setting val meta on each created node from the inputs' val meta. Returns the concatenated node.
+    # Inserts nodes at the current graph insertion point.
     unsqueezed_inputs = []
     unsqueezed_inputs_meta = []
     for input_tensor in input_tensors:
@@ -151,30 +176,39 @@ def decompose_stack(graph: torch.fx.GraphModule, input_tensors: list[Any]) -> An
 
 
 class GroupFusion(GroupBatchFusionBase):
+    # [CLASS DOC] Marker base for rules that fuse ops of arbitrary shapes in a group way (for example with fbgemm gmm).
     """
     Fuse ops in a group way, e.g, fuse mm/addmm of arbitrary input shapes with fbgemm.gmm.
     """
 
 
 class BatchFusion(GroupBatchFusionBase):
+    # [CLASS DOC] Marker base for rules that fuse ops of identical shapes in a batch way (for example with bmm).
     """
     Fuse ops in a batch way, e.g, fuse mm/addmm of same input shapes with bmm.
     """
 
 
 class BatchPointwiseOpsFusionFactory(BatchFusion):
+    # [CLASS DOC] Base for batched pointwise-op rules; stores the op being batched in the op attribute.
     def __init__(self, op, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Store the op and forward options to the base class.
         super().__init__(**kwargs)
         self.op = op
 
 
 @register_fusion("batch_linear_post_grad", pre_grad=False)
 class PostGradBatchLinearFusion(BatchFusion):
+    # [CLASS DOC] Post-grad (aten) rule batching mm and addmm nodes with identical 2D shapes into a single bmm over
+    # stacked operands, then selecting each result (adding the bias after, optionally broadcast). Group key
+    # contains m, k, n, whether a bias exists, and optionally the users' targets. Registered as
+    # batch_linear_post_grad (post-grad).
     """
     Fuse ops in a batch way in post grad (aten level).
     """
 
     def _addmm_node_can_be_fused(self, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the addmm has default beta and alpha.
         # pyre-fixme[7]: Incompatible return type
         return (
             # pyrefly: ignore [bad-return]
@@ -183,6 +217,7 @@ class PostGradBatchLinearFusion(BatchFusion):
         )
 
     def _is_input_2d(self, input: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node's val is a rank-2 tensor with static int dims.
         input_shapes = input.meta["val"].shape
         return (
             len(input_shapes) == 2
@@ -191,6 +226,7 @@ class PostGradBatchLinearFusion(BatchFusion):
         )
 
     def match(self, node: torch.fx.Node) -> tuple[str, int, int, int, bool, str] | None:
+        # [FUNCTION DOC] Return a group key for mm or fusable addmm nodes with static 2D input and weight, or None.
         if CallFunctionVarArgs(aten.mm).match(node):
             input_m, weight_m = node.args
             bias_m = None
@@ -215,6 +251,9 @@ class PostGradBatchLinearFusion(BatchFusion):
         return batch_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Fuse mm/addmm nodes: stack inputs and weights, run one bmm inserted before the last node, then for each
+        # original node insert a select of its result, plus the bias add (with optional broadcast per the search option)
+        # when a bias exists; reroute uses, copy meta, erase originals; increments the batch_linear_post_grad counter.
         batch_inputs = []
         batch_weights = []
         batch_biases = []
@@ -300,7 +339,11 @@ class PostGradBatchLinearFusion(BatchFusion):
 
 @register_fusion("group_linear", pre_grad=False)
 class GroupLinearFusion(GroupFusion):
+    # [CLASS DOC] Post-grad rule grouping mm/addmm nodes (even dims, bounded size, 2D) for the fbgemm grouped matmul op.
+    # Registered as group_linear (post-grad).
     def _addmm_node_can_be_fused(self, node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: True for an addmm with default alpha and beta, 2D operands, even dims and dims no larger than
+        # the configured group-linear maximum.
         input_shape = node.args[1].meta["val"].shape  # type: ignore[union-attr]
         weight_shape = node.args[2].meta["val"].shape  # type: ignore[union-attr]
         return (
@@ -316,6 +359,7 @@ class GroupLinearFusion(GroupFusion):
         )
 
     def _mm_node_can_be_fused(self, node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: True for an mm with 2D operands, even dims and dims no larger than the configured maximum.
         input_shape = node.args[0].meta["val"].shape  # type: ignore[union-attr]
         weight_shape = node.args[1].meta["val"].shape  # type: ignore[union-attr]
         return (
@@ -329,6 +373,7 @@ class GroupLinearFusion(GroupFusion):
         )
 
     def match(self, node: torch.fx.Node) -> tuple[str, bool] | None:
+        # [FUNCTION DOC] Return a group key for fusable mm or addmm nodes (second element states whether there is no bias), else None.
         if CallFunctionVarArgs(aten.mm.default).match(
             node
         ) and self._mm_node_can_be_fused(node):
@@ -343,6 +388,9 @@ class GroupLinearFusion(GroupFusion):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Replace the nodes with a single fbgemm gmm call (smart_fused) inserted before the first node, taking
+        # lists of inputs, weights and biases (biases None if all absent), and a getitem per original node.
+        # Raises AssertionError if a node is neither addmm nor mm. Increments the group_linear counter.
         group_inputs = []
         group_weights = []
         group_biases = []
@@ -381,15 +429,20 @@ class GroupLinearFusion(GroupFusion):
 
 
 class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
+    # [CLASS DOC] Post-grad rule batching same-shaped pointwise binary math ops (add, sub, mul, div) by stacking both
+    # operands, applying the op once and selecting each result. The op attribute holds the aten overload.
     """
     Batch pointwise math operator (e.g., add, mul) in post grad pass.
     """
 
     def __init__(self, op, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Store the op and forward options to the base class.
         super().__init__(op, **kwargs)
         self.op = op
 
     def _pointwise_node_can_be_fused(self, node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: True when both arguments are nodes with valid meta holding tensors of equal shape
+        # (scalars and symbolic values are rejected).
         # note: we only consider the case where the inputs are tensors
         # for mixed precision training, we need to make sure the inputs
         # of the aten.cat when do the stack should be the same dtype
@@ -410,6 +463,7 @@ class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
         )
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key (op name, shape, dtypes, alpha, rounding mode, optional shared select parent) or None.
         if CallFunctionVarArgs(self.op).match(
             node
         ) and self._pointwise_node_can_be_fused(node):
@@ -446,6 +500,10 @@ class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack both operands, run the op once, then select each result and replace the originals; increments the
+        # per-op batch counter.
+        # KNOWN ISSUE: alpha is forwarded only for the add overload, and rounding_mode is never forwarded, although
+        # both are part of the group key, so sub with a non-default alpha is fused without it.
         batch_inputs, batch_others = [], []
         alpha = subset[0].kwargs.get("alpha", DEFAULT_ALPHA)
         batch_inputs_meta, batch_others_meta = [], []
@@ -488,6 +546,9 @@ class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
 
 @register_fusion("batch_linear_lhs")
 class BatchLinearLHSFusion(BatchFusion):
+    # [CLASS DOC] Pre-grad rule batching linear calls sharing the same input into one mm (or addmm) with concatenated
+    # transposed weights, then splitting the output along dim 1. Skips tensor-subclass weights that cannot be
+    # concatenated. Registered as batch_linear_lhs (pre-grad).
     """
     Batch linear left-hand side fusion. This pass tries to fuse the following patterns:
 
@@ -498,6 +559,8 @@ class BatchLinearLHSFusion(BatchFusion):
     """
 
     def match(self, node: torch.fx.Node) -> tuple[str, int | None, Any] | None:
+        # [FUNCTION DOC] Return a group key (name, bias rank, shared input node) for fusable linear calls, or None. Probes
+        # concatenation on subclass weights and declines on failure.
         if CallFunctionVarArgs([torch.nn.functional.linear, torch._C._nn.linear]).match(
             node
         ) and is_linear_node_can_be_fused(node):
@@ -527,6 +590,10 @@ class BatchLinearLHSFusion(BatchFusion):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Concatenate weights (and biases), transpose, run one mm or addmm on the shared input, split the result
+        # into per-linear sections and getitem each; replace and erase the originals; sets example_value meta along the
+        # way. Raises AssertionError if the inputs differ. Increments the batch_linear_lhs counter.
+        # KNOWN ISSUE: biases are collected only for linears that have one, relying on the group key (bias rank) to keep them uniform.
         batch_nodes = []
         batch_input = None
         batch_weights, batch_weights_meta = [], []
@@ -603,6 +670,8 @@ class BatchLinearLHSFusion(BatchFusion):
 # Poor person's check for if a node in the graph mutates its input.
 # (the graph is torch IR, so we will see torch fns and python operators)
 def _is_mutable_node(tgt):
+    # [FUNCTION DOC] HELPER: Heuristic test whether a call target mutates its input: name ends with an underscore, or an
+    # in-place python operator (module _operator, name starting with i).
     if str(tgt).endswith("_"):
         # e.g. torch.mul_, torch.Tensor.mul_
         return True
@@ -617,6 +686,8 @@ def _is_mutable_node(tgt):
 
 
 def is_linear_node_can_be_fused(node: torch.fx.Node):
+    # [FUNCTION DOC] True if a linear node is fusable: valid example_value meta for node, input and weight, both input and
+    # weight rank 2, and no user is a mutating op.
     input = get_arg_value(node, 0, "input")
     weight = get_arg_value(node, 1, "weight")
     return (
@@ -634,12 +705,15 @@ def is_linear_node_can_be_fused(node: torch.fx.Node):
 
 @register_fusion("batch_linear")
 class PreGradBatchLinearFusion(BatchFusion):
+    # [CLASS DOC] Pre-grad rule batching linear calls with equal input and weight shapes into a stacked bmm (or baddbmm
+    # with unsqueezed biases), then unbind and getitem per original. Registered as batch_linear (pre-grad).
     """
     Batch linear fusion in pre grad pass.
     Fuse linear with same size with torch.baddbmm
     """
 
     def _getitem_args(self, getitem_node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: Return the first argument of a getitem call node, or None if the node is not one.
         if getitem_node.target != operator.__getitem__ or (
             getitem_node.op != "call_function"
         ):
@@ -647,6 +721,8 @@ class PreGradBatchLinearFusion(BatchFusion):
         return getitem_node.args[0]
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key (parent of getitem input, input and weight shapes, bias absent flag, users) for
+        # fusable linear calls, else None.
         if CallFunctionVarArgs([torch.nn.functional.linear, torch._C._nn.linear]).match(
             node
         ) and is_linear_node_can_be_fused(node):
@@ -670,6 +746,9 @@ class PreGradBatchLinearFusion(BatchFusion):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack inputs and weights, transpose weights, run bmm (no biases) or baddbmm (with stacked, unsqueezed
+        # biases; meta update failures, for example with dynamic shapes, are logged and skipped), unbind, replace each
+        # linear with a getitem, erase originals; increments the batch_linear counter.
         batch_nodes = []
         batch_inputs = []
         batch_weights = []
@@ -773,6 +852,8 @@ CAT_LINEAR_MAX_PARTS = 3
 
 
 def _weight_hoist_anchor(graph, weight):
+    # [FUNCTION DOC] HELPER: Choose the node after which hoisted weight slices are inserted: the weight itself, or the last
+    # leading placeholder when the weight is a placeholder.
     # Insert hoisted slices after the weight's own def, or after the last
     # placeholder when it's a lifted input (can't insert a call between placeholders).
     if weight.op == "placeholder":
@@ -787,6 +868,8 @@ def _weight_hoist_anchor(graph, weight):
 
 
 def _meta_shape(node):
+    # [FUNCTION DOC] HELPER: Return the static shape of a node as a tuple of ints from example_value or val meta, or None if
+    # the node is invalid, has no shape, or has symbolic dims.
     if not isinstance(node, torch.fx.Node) or not is_node_meta_valid(node):
         return None
     val = node.meta.get("example_value")
@@ -803,6 +886,10 @@ def _meta_shape(node):
 
 
 def match_cat_linear(node: torch.fx.Node):
+    # [FUNCTION DOC] Match linear applied to a last-dim concatenation of 2 to CAT_LINEAR_MAX_PARTS nodes. Returns
+    # (parts, weight, bias, offsets) or None. Requires: single-user cat, static shapes, cat on last dim, every
+    # piece at least the minimum width, matching weight contraction dim, output width within the maximum, and cat
+    # traffic in bytes at least the floor constant.
     """Match linear(cat([parts...], dim=-1), weight, bias).
 
     Returns (parts, weight, bias, offsets) or None. Conservative on purpose:
@@ -879,6 +966,10 @@ def match_cat_linear(node: torch.fx.Node):
 
 @register_fusion("cat_linear")
 class CatLinearFusion(BatchFusion):
+    # [CLASS DOC] Pre-grad rule rewriting linear of a concatenation into a sum of linears on contiguous column slices of
+    # the weight, avoiding materializing the concatenation. Per-node rewrite (min_fuse_set_size forced to 1; each
+    # match is its own group). State: _piece_cache maps (weight, start, end) to the sliced contiguous weight so
+    # tied weights are sliced once. Opt-in as cat_linear.
     """
     Rewrite linear(cat([x0, x1, ...], dim=-1), weight, bias) into a sum of
     per-piece linears on contiguous last-dim weight slices, so the concatenated
@@ -891,6 +982,7 @@ class CatLinearFusion(BatchFusion):
     """
 
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] Initialize with min_fuse_set_size forced to 1 and an empty weight-piece cache.
         super().__init__(**kwargs)
         self.graph_search_options = {
             **self.graph_search_options,
@@ -903,6 +995,7 @@ class CatLinearFusion(BatchFusion):
         self._piece_cache: dict = {}
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a unique-per-node group key if the node is a linear with valid meta that match_cat_linear accepts, else None. Side-effect free.
         if not CallFunctionVarArgs(
             [torch.nn.functional.linear, torch._C._nn.linear]
         ).match(node):
@@ -917,6 +1010,9 @@ class CatLinearFusion(BatchFusion):
         return ("cat_linear", node)
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] For each node, re-run the match; hoist a slice plus clone of the weight per piece (cached), emit a
+        # linear per part (bias only on the first piece), set example values, and chain the partial results with add;
+        # replace the original node and erase it; increments the cat_linear counter.
         # Slice+clone each weight once and hoist to entry, so a weight matched by
         # several cat_linears (weight-tied blocks) isn't re-sliced at every site.
         cache = self._piece_cache
@@ -996,11 +1092,16 @@ class CatLinearFusion(BatchFusion):
 
 @register_fusion("batch_layernorm")
 class BatchLayernormFusion(BatchFusion):
+    # [CLASS DOC] Pre-grad rule batching layer_norm calls with equal shapes, normalized shape and eps by stacking inputs
+    # (and weights, biases), running one layer_norm, applying weight multiplication and bias addition, then unbind and getitem.
+    # Registered as batch_layernorm.
     """
     Batch layer norm fusion in pre grad pass
     """
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key (shapes of input, weight, bias, normalized shape, eps, users) for layer_norm calls
+        # with available example values, else None.
         if CallFunctionVarArgs(torch.nn.functional.layer_norm).match(node):
             input = get_arg_value(node, 0, "input")
             weight = get_arg_value(node, 2, "weight")
@@ -1031,6 +1132,9 @@ class BatchLayernormFusion(BatchFusion):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack inputs along a negative dim derived from the normalized shape, stack weights and biases when
+        # present, run a layer_norm, apply mul by weight and add of bias as appropriate, unbind, getitem per original, and erase
+        # originals; increments the batch_layernorm counter. Raises AssertionError if the eps values differ.
         group_inputs = []
         group_shapes = []
         group_weights = []
@@ -1168,16 +1272,20 @@ class BatchLayernormFusion(BatchFusion):
 
 
 class BatchPointwiseOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
+    # [CLASS DOC] Pre-grad rule batching unary pointwise ops (such as sigmoid, relu, tanh) of equal input shape by stacking
+    # inputs, applying the op once, unbinding. The op attribute is the torch function.
     """
     Batch pointwise ops (e.g., sigmoid, relu, tanh) fusion in pre grad pass.
     We fuse it in random place, and the introduced stack node may be merged in split cat.
     """
 
     def __init__(self, op, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Store the op and forward options to the base class.
         super().__init__(op, **kwargs)
         self.op = op
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key (op name, input shape, inplace flag, optional parent target) or None.
         input = get_arg_value(node, 0, "input")
         if CallFunctionVarArgs(self.op).match(node) and is_node_meta_valid(node):
             if self.graph_search_options.get("fuse_nodes_with_same_parent", False):
@@ -1198,6 +1306,8 @@ class BatchPointwiseOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack inputs, apply the op once (relu keeps the inplace flag), unbind, getitem per original, replace and erase the originals;
+        # increments the per-op batch counter.
         batch_nodes = []
         batch_inputs = []
         batch_inputs_metadata = []
@@ -1248,16 +1358,20 @@ class BatchPointwiseOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
 
 
 class BatchPointwiseOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
+    # [CLASS DOC] Post-grad rule batching unary aten pointwise ops of equal input shape by stacking (via decompose_stack),
+    # applying the op once and selecting each result.
     """
     Batch pointwise ops (e.g., sigmoid, relu, tanh) fusion in post grad pass.
     The introduced stack node may be merged in split cat.
     """
 
     def __init__(self, op, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Store the op and forward options to the base class.
         super().__init__(op, **kwargs)
         self.op = op
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key (op name, input val shape, inplace flag, optional parent target) or None.
         input = get_arg_value(node, 0, "input")
         if CallFunctionVarArgs(self.op).match(node) and is_node_meta_valid(node):
             # for relu op, we also use the inplace to construct the key
@@ -1280,6 +1394,8 @@ class BatchPointwiseOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
         return group_key
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack inputs by unsqueeze and cat, apply the op once, select each result with aten select, replace and erase the originals;
+        # increments the per-op batch counter.
         batch_nodes = []
         batch_inputs = []
         batch_inputs_metadata = []
@@ -1309,15 +1425,20 @@ class BatchPointwiseOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
 
 
 class BatchMathOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
+    # [CLASS DOC] Pre-grad rule batching simple math ops (detach, nan_to_num, clamp, dropout) with the same input shape and
+    # extra arguments by stacking, applying the op, unbinding. Subclasses choose the op; _match_op can be overridden.
     """
     Batch simple math related ops such as nan_to_num in pre grad pass.
     """
 
     def __init__(self, op, **kwargs):
+        # [FUNCTION DOC] HELPER: Store the op and forward options to the base class.
         super().__init__(op, **kwargs)
         self.op = op
 
     def match(self, node: torch.fx.Node):
+        # [FUNCTION DOC] Return a group key built from input shape, extra args, kwargs and the first user's target, or None.
+        # KNOWN ISSUE: takes the first user of the node, which fails with StopIteration if the node has no users.
         input = get_arg_value(node, 0, "input")
         if self._match_op(node) and is_node_meta_valid(node):
             # check the input has the same shape and its users have the same target
@@ -1335,9 +1456,12 @@ class BatchMathOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
         return group_key
 
     def _match_op(self, node: torch.fx.Node) -> MatchResult:
+        # [FUNCTION DOC] HELPER: Return whether node calls the rule's op; subclasses may broaden this.
         return CallFunctionVarArgs(self.op).match(node)
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
+        # [FUNCTION DOC] Stack inputs, call the op once with the first node's extra args and kwargs, unbind, getitem per original,
+        # replace and erase the originals; increments the per-op batch counter.
         batch_nodes = []
         batch_inputs = []
         batch_inputs_metadata = []
@@ -1380,28 +1504,37 @@ class BatchMathOpsPreGradFusion(BatchPointwiseOpsFusionFactory):
 
 @register_fusion("batch_tanh")
 class BatchTanhPreGradFusion(BatchPointwiseOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for torch.tanh (registered batch_tanh).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.tanh, **kwargs)
 
 
 @register_fusion("batch_sigmoid")
 class BatchSigmoidPreGradFusion(BatchPointwiseOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for torch.sigmoid (registered batch_sigmoid).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.sigmoid, **kwargs)
 
 
 @register_fusion("batch_relu")
 class BatchReLuPreGradFusion(BatchPointwiseOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for relu (registered batch_relu).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.nn.functional.relu, **kwargs)
 
 
 @register_fusion("batch_detach")
 class BatchDetachPreGradFusion(BatchMathOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for detach (registered batch_detach); also matches the detach method.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.detach, **kwargs)
 
     def _match_op(self, node: torch.fx.Node) -> MatchResult:
+        # [FUNCTION DOC] HELPER: Match detach as either the torch function or the tensor method call.
         return CallFunctionVarArgs(torch.detach).match(node) or CallMethodVarArgs(
             "detach"
         ).match(node)
@@ -1409,81 +1542,107 @@ class BatchDetachPreGradFusion(BatchMathOpsPreGradFusion):
 
 @register_fusion("batch_nan_to_num")
 class BatchNanToNumPreGradFusion(BatchMathOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for nan_to_num (registered batch_nan_to_num).
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.nan_to_num, **kwargs)
 
 
 @register_fusion("batch_clamp")
 class BatchClampPreGradFusion(BatchMathOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for clamp (registered batch_clamp).
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.clamp, **kwargs)
 
 
 @register_fusion("batch_dropout")
 class BatchDropoutPreGradFusion(BatchMathOpsPreGradFusion):
+    # [CLASS DOC] Pre-grad batch rule for dropout (registered batch_dropout).
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(torch.nn.functional.dropout, **kwargs)
 
 
 @register_fusion("batch_aten_tanh", pre_grad=False)
 class BatchTanhPostGradFusion(BatchPointwiseOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten tanh (registered batch_aten_tanh).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.tanh.default, **kwargs)
 
 
 @register_fusion("batch_aten_sigmoid", pre_grad=False)
 class BatchSigmoidPostGradFusion(BatchPointwiseOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten sigmoid (registered batch_aten_sigmoid).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.sigmoid.default, **kwargs)
 
 
 @register_fusion("batch_aten_relu", pre_grad=False)
 class BatchReLuPostGradFusion(BatchPointwiseOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten relu (registered batch_aten_relu).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.relu.default, **kwargs)
 
 
 @register_fusion("batch_aten_add", pre_grad=False)
 class BatchAddPostGradFusion(BatchPointwiseMathOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten add (registered batch_aten_add).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.add.Tensor, **kwargs)
 
 
 @register_fusion("batch_aten_sub", pre_grad=False)
 class BatchSubPostGradFusion(BatchPointwiseMathOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten sub (registered batch_aten_sub).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.sub.Tensor, **kwargs)
 
 
 @register_fusion("batch_aten_div", pre_grad=False)
 class BatchDivPostGradFusion(BatchPointwiseMathOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten div (registered batch_aten_div).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.div.Tensor, **kwargs)
 
 
 @register_fusion("batch_aten_mul", pre_grad=False)
 class BatchMulPostGradFusion(BatchPointwiseMathOpsPostGradFusion):
+    # [CLASS DOC] Post-grad batch rule for aten mul (registered batch_aten_mul).
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Fix the batched op for this rule and forward options to the parent class.
         super().__init__(aten.mul.Tensor, **kwargs)
 
 
 class _OrderedSet:
+    # [CLASS DOC] HELPER: Minimal insertion-ordered set backed by an ordered mapping; supports membership, length, append and iteration in insertion order.
     def __init__(self, param=None) -> None:
+        # [FUNCTION DOC] HELPER: Create from an optional iterable (empty/None gives an empty set).
         if param:
             self.rep = OrderedDict(dict.fromkeys(param))
         else:
             self.rep = OrderedDict()
 
     def __contains__(self, o) -> bool:
+        # [FUNCTION DOC] HELPER: Membership test.
         return o in self.rep
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] HELPER: Number of elements.
         return self.rep.__len__()
 
     def append(self, o):
+        # [FUNCTION DOC] HELPER: Add an element, keeping first-insertion order.
         self.rep[o] = None
 
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Iterate elements in insertion order.
         return self.rep.keys().__iter__()
 
 
@@ -1491,6 +1650,11 @@ def find_independent_subset_greedy(
     node_list: Iterable[torch.fx.Node],
     graph_search_options: dict[str, Any],
 ) -> Iterator[Iterable[torch.fx.Node]]:
+    # [FUNCTION DOC] Generator yielding lists of mutually independent nodes (none depends on another in the same list),
+    # preserving input order, from the candidate nodes. Repeats rounds over the leftover nodes. Lists are capped
+    # at max_fuse_set_size and only yielded if at least min_fuse_set_size long (both from the search options).
+    # Dependency sets are cached between rounds and invalidated when their members are yielded. The caller may
+    # mutate only the returned nodes during iteration.
     """
     Yields a list of subsets of `node_list` where no element in the subset
     depends on any other element in the subset. This results in a set of
@@ -1512,6 +1676,7 @@ def find_independent_subset_greedy(
     # Compute all the children of `node` which are members of
     # `interesting_nodes`.
     def find_dependent_nodes(node, interesting_nodes):
+        # [FUNCTION DOC] HELPER: Return the set of interesting nodes that node transitively depends on (walk over input nodes).
         visited_node_set = OrderedSet[torch.fx.Node]()
         dep_set = OrderedSet[torch.fx.Node]()
 
@@ -1574,6 +1739,9 @@ def get_fusion_candidates(
     root_node: torch.fx.Node,
     fused_set: OrderedSet[torch.fx.Node],
 ) -> collections.defaultdict[Any, list[torch.fx.Node]]:
+    # [FUNCTION DOC] Breadth-first search backward from root_node's inputs, up to the max_fuse_search_depth option, asking
+    # the rule to match each node; returns a mapping from group key to the list of matching nodes. Nodes already
+    # fused are skipped, matching nodes are not expanded further, and a root in SEARCH_EXCLUSIONS (getitem) yields an empty mapping.
     """
     Search fusion candidates for a specific rule using BFS starting from the root node.
     We only search the subgraph within graph_search_options["max_fuse_search_depth"].
@@ -1615,6 +1783,10 @@ def get_fusion_candidates(
 
 
 def apply_group_batch_fusion(graph: torch.fx.GraphModule, rule: GroupBatchFusionBase):
+    # [FUNCTION DOC] Apply one fusion rule to the whole graph: sort topologically, walk nodes in reverse, collect candidates
+    # per root, and for each group of at least min_fuse_set_size nodes fuse each independent subset, recording fused nodes.
+    # If anything fused, recompile the owning module and emit a structured trace artifact with the readable graph
+    # (named optimus_<RuleClass>, or cff_ prefix for MTIA rules). Mutates the graph.
     stable_topological_sort(graph)  # type: ignore[arg-type]
     fused_set = OrderedSet[torch.fx.Node]()
     log_to_scuba = False
@@ -1664,6 +1836,10 @@ def apply_group_batch_fusion(graph: torch.fx.GraphModule, rule: GroupBatchFusion
 
 
 def generate_fusion_from_config(config_options: dict[str, Any], pre_grad=True):
+    # [FUNCTION DOC] Instantiate fusion rules from a config mapping of name to options. Names not in the registries are
+    # skipped (they belong to pattern_matcher passes). Options are merged over the global search options, ignoring a
+    # devices key. Returns the list of rule instances.
+    # KNOWN ISSUE: a name registered only in the other registry (pre vs post grad) raises KeyError.
     fusions: list[GroupBatchFusionBase] = []
     for name, options in config_options.items():
         # we skip all patterns from pattern_matcher passes (e.g., split_cat)
@@ -1679,6 +1855,10 @@ def generate_fusion_from_config(config_options: dict[str, Any], pre_grad=True):
 def group_batch_fusion_passes(
     graph: torch.fx.Graph, pre_grad=True, fusion_options=None
 ):
+    # [FUNCTION DOC] Driver: build fusion rules and apply each in order via apply_group_batch_fusion, each under a
+    # graph transform observer. Pre-grad uses fusion_options or the pre_grad_fusion_options config. Post-grad
+    # splits post_grad_fusion_options into rules that require fbgemm (applied only if fbgemm is present, and
+    # not excluded) and the rest. Mutates the graph; returns nothing.
     fusions: list[GroupBatchFusionBase] = []
     # we keep all current pre grad fusions to keep
     # current implementation, will remove this later

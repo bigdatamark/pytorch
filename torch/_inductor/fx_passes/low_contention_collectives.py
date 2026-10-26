@@ -1,3 +1,8 @@
+# [MODULE DOC] Graph pass that swaps FSDP all-gather / reduce-scatter collectives for symmetric-memory
+# copy-engine "low contention" variants, to reduce SM and NVLink contention with overlapping compute.
+# Main entry: replace_collectives_with_low_contention; the rest are helpers that classify collectives,
+# filter by size and overlap, and locate the matching wait node.
+# Import-time side effects: only creates a module logger.
 from __future__ import annotations
 
 import logging
@@ -11,6 +16,9 @@ log = logging.getLogger(__name__)
 
 
 def _get_collective_info(node):
+    # [FUNCTION DOC] HELPER: Classify a node as an all-gather or reduce-scatter functional collective.
+    # Returns a pair (is_all_gather, group_name) or None if the node is neither. Imports bucketing and
+    # overlap_scheduling helpers lazily.
     """Return (is_ag, group_name) if node is an AG/RS collective, else None."""
     from torch._inductor.fx_passes.bucketing import (
         is_all_gather_into_tensor,
@@ -28,6 +36,12 @@ def _get_collective_info(node):
 def replace_collectives_with_low_contention(
     graph: torch.fx.Graph,
 ) -> None:
+    # [FUNCTION DOC] Rewrite, in place, eligible all-gather and reduce-scatter nodes of the graph to symm_mem
+    # low-contention ops. Collects collectives, drops those whose process group cannot be enabled for symmetric
+    # memory, then skips ones that are too small (per-rank bytes below the configured minimum), lack compute-bound
+    # overlap, or overlap collectives of other groups (the last two checks are bypassed by the skip-overlap config).
+    # For all-gather the target op is chosen (optionally the multicast copy-engine variant); a node is skipped if
+    # no out-variant replacement exists. Mutates the graph (replaces and erases nodes); returns nothing; logs counts.
     """Replace FSDP collectives with copy-engine symm_mem variants."""
     symm_mem = torch.ops.symm_mem
 
@@ -142,6 +156,9 @@ def replace_collectives_with_low_contention(
 
 
 def _enable_symm_mem(group_name):
+    # [FUNCTION DOC] HELPER: Ensure symmetric memory is enabled for a process group name. Returns True if already
+    # enabled or enabling succeeds (FutureWarning suppressed); returns False, logging at debug level, if enabling
+    # raises TypeError, RuntimeError or KeyError.
     """Try to enable symmetric memory for a group. Returns True on success."""
     from torch.distributed._symmetric_memory import (
         enable_symm_mem_for_group,
@@ -161,6 +178,8 @@ def _enable_symm_mem(group_name):
 
 
 def _has_multicast_support(device_index: int) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether the given CUDA device index supports multicast in symmetric memory.
+    # Any exception (for example missing bindings) is swallowed and yields False.
     try:
         from torch._C._autograd import DeviceType
         from torch._C._distributed_c10d import _SymmetricMemory
@@ -177,6 +196,9 @@ def _select_low_contention_all_gather_target(
     input_node,
     use_ag_ce_multicast=False,
 ):
+    # [FUNCTION DOC] HELPER: Pick the symm_mem all-gather op to use. Returns the plain low-contention all-gather
+    # unless multicast copy-engine use is requested and the device (taken from the input node's fake value if it is a
+    # CUDA tensor, else the current CUDA device) supports multicast; otherwise logs and falls back to the plain op.
     if not use_ag_ce_multicast:
         return symm_mem._low_contention_all_gather.default
 
@@ -206,6 +228,11 @@ def _replace_collective(
     group_name,
     target=None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Replace one collective node with the chosen symm_mem op. Returns False (no change)
+    # for all-gather with no target, or for an existing out-variant all-gather when the target is not the multicast
+    # variant (the plain one has no out form). Reduce-scatter always uses the low-contention reduce-scatter taking
+    # the reduce op. The new node is inserted before the old one, inherits its meta, takes over all uses, and the
+    # old node is erased. Returns True on replacement.
     input_node = node.args[0]
     if is_ag:
         if target is None:
@@ -234,6 +261,9 @@ def _replace_collective(
 
 
 def _get_per_rank_bytes(node, is_ag):
+    # [FUNCTION DOC] HELPER: Compute per-rank message size in bytes from the input's fake tensor value. For
+    # all-gather this is the input size; for reduce-scatter it is the input size divided by the group size (third
+    # argument, must be a positive int). Returns None if the size cannot be determined.
     """Return per-rank message bytes for a collective, or None if unknown."""
     input_val = node.args[0].meta.get("val") if node.args else None
     if not isinstance(input_val, torch.Tensor):
@@ -249,6 +279,9 @@ def _get_per_rank_bytes(node, is_ag):
 
 
 def _is_compute_or_contains_compute(node, graph_module):
+    # [FUNCTION DOC] HELPER: Return True if the node is a compute node, or is a ControlDeps call whose
+    # subgraph (a get_attr second argument resolving to a GraphModule on graph_module) contains a compute node.
+    # Raises AssertionError if the get_attr target is not a string.
     """Check if a node is compute, including inside control_deps subgraphs."""
     from torch._inductor.fx_passes.overlap_scheduling import is_compute_node
 
@@ -272,6 +305,8 @@ def _is_compute_or_contains_compute(node, graph_module):
 
 
 def _has_compute_bound_overlap(start_node, graph):
+    # [FUNCTION DOC] HELPER: Return True if any compute node (including inside control-deps subgraphs) appears
+    # in graph order strictly between the collective and its wait node. Returns False if no wait is found.
     """Check if compute-bound ops exist between collective start and wait."""
     wait_node = _find_wait_for_collective(start_node)
     if wait_node is None:
@@ -291,6 +326,8 @@ def _has_compute_bound_overlap(start_node, graph):
 
 
 def _has_other_group_collectives(start_node, group_name, graph):
+    # [FUNCTION DOC] HELPER: Return True if a collective of a different process group lies in graph order
+    # between the start node and its wait node (NVLink contention). Returns False if no wait is found.
     """Check if other groups' collectives overlap, competing for NVLink."""
     wait_node = _find_wait_for_collective(start_node)
     if wait_node is None:
@@ -320,6 +357,8 @@ def _has_other_group_collectives(start_node, group_name, graph):
 
 
 def _is_wait_tensor(node):
+    # [FUNCTION DOC] HELPER: Return True if the node is a call_function that is the functional wait_tensor op,
+    # or whose name contains wait_tensor (covers the public namespace and ControlDeps-wrapped waits).
     """Check if node is a wait_tensor op (direct or wrapped in ControlDeps)."""
     if node.op != "call_function":
         return False
@@ -331,6 +370,10 @@ def _is_wait_tensor(node):
 
 
 def _find_wait_for_collective(start_node):
+    # [FUNCTION DOC] HELPER: Find the wait node for a collective start node, or None. Looks first at direct
+    # users, then, for out-variant all-gather / reduce-scatter, at users of the out buffer keyword argument.
+    # KNOWN ISSUE: the docstring lists a ControlDeps-wrapped pattern, handled only through the name match in
+    # the wait check, and only when the wrapper is a direct user.
     """Find the wait_tensor node for a collective.
 
     Handles multiple graph patterns:
