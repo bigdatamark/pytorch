@@ -1,3 +1,8 @@
+# [MODULE DOC] Inductor scheduler passes that reorder communication (collective) and wait nodes relative to compute to
+# improve compute/communication overlap while tracking peak memory. Contains simple greedy passes (sink waits, raise comms),
+# iterative peak-memory-preserving reordering and sinking passes built on a doubly linked list of scheduler nodes, runtime
+# estimate alignment across ranks, overlap-scheduling helpers, and exposed-communication-time estimators.
+# Import-time side effects: creates module logger and an overlap artifact logger.
 # mypy: allow-untyped-defs
 # pyre-strict
 from __future__ import annotations
@@ -42,6 +47,10 @@ if TYPE_CHECKING:
 def align_runtime_estimations_across_all_distributed_ranks(
     snodes: list[BaseSchedulerNode],
 ):
+    # [FUNCTION DOC] Make per-node runtime estimates identical on all distributed ranks. Gathers each rank's list of estimated runtimes with
+    # an all-gather of objects over the default group, then sets every node's override_estimated_runtime to the per-index median.
+    # If ranks disagree on the number of nodes, logs a warning and instead keeps each rank's own estimate as the override.
+    # Requires an initialized process group. Mutates the nodes; returns nothing.
     runtime_estimations = [snode.get_estimated_runtime() for snode in snodes]
 
     import torch.distributed as dist
@@ -76,6 +85,7 @@ def align_runtime_estimations_across_all_distributed_ranks(
 
 
 def sink_waits(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Greedily schedule waits as late as possible via the communication scheduler with only wait sinking enabled. Returns the new node order.
     """
     Greedily schedules waits as late as possible.
     """
@@ -85,6 +95,7 @@ def sink_waits(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
 
 def raise_comms(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Greedily schedule collectives as early as possible via the communication scheduler with only comm raising enabled. Returns the new node order.
     """
     Greedily schedules comms as early as possible.
     """
@@ -96,6 +107,8 @@ def raise_comms(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 def reorder_compute_for_overlap(
     snodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Run the communication scheduler with comm raising, wait sinking and compute reordering for overlap all enabled; returns the new node order.
+    # The docstring describes the per-collective overlap procedure.
     """
     This achieves the following overall scheduling procedure:
         Step 1: Given that we've currently scheduled comm N, we now schedule all compute nodes
@@ -115,6 +128,8 @@ def reorder_compute_for_overlap(
 def reorder_communication_preserving_peak_memory(
     snodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Move collectives earlier relative to compute (never reordering collectives among themselves) without exceeding the starting peak
+    # memory. Delegates to the internal implementation and returns only the reordered node list (per-node stats are discarded).
     """
     Reorders communication ops relative to computation ops to improve communication-compute overlapping and hide comm
     latency.  Stops moving a particular op if it reaches a point that would have increased the peak memory footprint.
@@ -152,6 +167,9 @@ def reorder_communication_preserving_peak_memory(
 
 @dataclass
 class ReorderInfo:
+    # [CLASS DOC] Dataclass holding debug statistics about how one scheduler node was reordered: limiting factor text, number of moves,
+    # grouped node count and info, communication and compute time, exposed time before and after, and overlap description string.
+    # All fields have defaults; the improvement property gives the reduction in exposed time.
     """
     Debug info describing how an individual snode was reordered
     """
@@ -168,10 +186,13 @@ class ReorderInfo:
 
     @property
     def improvement(self):
+        # [FUNCTION DOC] Property: exposed communication time saved, i.e. initial exposed minus final exposed.
         return self.initial_exposed - self.final_exposed
 
 
 def is_gemm_like(node: IRNode | Operation | None) -> bool:
+    # [FUNCTION DOC] Return True if the node is a flash-attention fallback op or has a python kernel name referring to extern kernels (a GEMM-like call).
+    # Returns False for a missing node or anything else.
     if node is None:
         return False
 
@@ -189,6 +210,7 @@ def is_gemm_like(node: IRNode | Operation | None) -> bool:
 
 
 def contains_gemm_like(snode: BaseSchedulerNode) -> bool:
+    # [FUNCTION DOC] Return True if the scheduler node (or, for a grouped node, any member recursively) is GEMM-like.
     from torch._inductor.scheduler import GroupedSchedulerNode
 
     if isinstance(snode, GroupedSchedulerNode):
@@ -198,6 +220,7 @@ def contains_gemm_like(snode: BaseSchedulerNode) -> bool:
 
 
 def _temp_group_visit_leaves(snode: BaseSchedulerNode, fn):
+    # [FUNCTION DOC] HELPER: Apply fn to each member of a temporarily grouped scheduler node, or to the node itself if it is not a temp group.
     from torch._inductor.scheduler import GroupedSchedulerNode
 
     if isinstance(snode, GroupedSchedulerNode) and snode.temp_grouping:
@@ -208,6 +231,7 @@ def _temp_group_visit_leaves(snode: BaseSchedulerNode, fn):
 
 
 def _group_name(snode, with_bufs=False) -> str:
+    # [FUNCTION DOC] HELPER: Build a name for a group node by joining its members' names with underscores; optionally appends the group's buffer-name list after each member name.
     ret = ""
     for n in snode.snodes:
         if ret:
@@ -219,14 +243,20 @@ def _group_name(snode, with_bufs=False) -> str:
 
 
 def _is_fake_dep(d):
+    # [FUNCTION DOC] HELPER: Return True if the dependency is a weak dependency flagged as fake.
     return isinstance(d, WeakDep) and d.is_fake
 
 
 def _group_names(gns: list[BaseSchedulerNode]) -> str:
+    # [FUNCTION DOC] HELPER: Join the names of the given nodes with a tilde separator.
     return "~".join([gn.get_name() for gn in gns])
 
 
 def _initialize_memory_tracking(snodes, graph_inputs=None, graph_outputs=None):
+    # [FUNCTION DOC] HELPER: Compute initial memory tracking state. Defaults graph inputs and outputs from the current graph, finds freeable input buffers,
+    # estimates peak memory with per-node current memory, alloc/free info and last-use mapping, adds a sentinel entry for the None node with zero memory,
+    # and builds the candidate buffer map. Returns a six-tuple: peak memory, current-memory mapping, alloc/free mapping, buffer-to-last-use-node mapping,
+    # freeable input buffer mapping, and candidate buffer map.
     """Initialize memory tracking data structures"""
     if graph_inputs is None:
         graph_inputs = OrderedSet(V.graph.graph_inputs.keys())
@@ -263,6 +293,7 @@ def _initialize_double_linked_list(
     dict[BaseSchedulerNode, BaseSchedulerNode | None],
     BaseSchedulerNode,
 ]:
+    # [FUNCTION DOC] HELPER: Build previous and next pointer mappings for the node list (None at the ends) and return them together with the head node.
     """Create double-linked list structure from snodes"""
     _prev = {}
     _next = {}
@@ -276,6 +307,8 @@ def _initialize_double_linked_list(
 def _build_candidate_buffer_map(
     buf_to_snode_last_use: dict,
 ) -> dict[BaseSchedulerNode, OrderedSet]:
+    # [FUNCTION DOC] HELPER: Build an inverted index from each node to the set of buffers that list that node among their successor nodes, to avoid scanning all buffers.
+    # Computed once because buffer successors do not change during reordering.
     """
     Build inverted index: node -> set of buffers where node appears in successors.
 
@@ -300,6 +333,7 @@ def _build_candidate_buffer_map(
 def _precompute_node_output_sets(
     snodes: list[BaseSchedulerNode],
 ) -> dict[BaseSchedulerNode, OrderedSet[str]]:
+    # [FUNCTION DOC] HELPER: Precompute, for every node, the set of names of its output buffers.
     """
     Pre-compute output name sets for all nodes.
 
@@ -315,6 +349,7 @@ def _precompute_node_output_sets(
 
 
 def _op_runtime_estimate_mult(snode):
+    # [FUNCTION DOC] HELPER: Return the configured runtime-estimate multiplier: the comm multiplier for nodes containing a collective, else the non-comm multiplier.
     # Apply multipliers for faster experimentation.
     # TODO(ivankobzarev): Remove after confirmation that runtime estimations are correct.
     if contains_collective(snode):
@@ -324,6 +359,8 @@ def _op_runtime_estimate_mult(snode):
 
 
 def is_async_collective(snode):
+    # [FUNCTION DOC] Return False for nodes whose python kernel name is the DTensor shard-dim all-to-all (treated as synchronous compute); True otherwise.
+    # Intended as a filter on nodes already known to contain a collective.
     """
     Filtering out ops that contain Collective and Wait inside and considered as Collectives.
     See contains_collective function.
@@ -337,6 +374,7 @@ def is_async_collective(snode):
 
 
 def contains_async_collective(snode):
+    # [FUNCTION DOC] Return True if the node contains a collective that is asynchronous according to is_async_collective.
     return contains_collective(snode, is_async_collective)
 
 
@@ -345,6 +383,8 @@ def _group_nodes_from_linked_list(
     tail: BaseSchedulerNode | None,
     next_dict: dict[BaseSchedulerNode, BaseSchedulerNode | None],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] HELPER: Walk the next pointers from head until tail (inclusive) and return the visited non-None nodes as a list.
+    # Never terminates if tail is not reachable from head (an indexing error occurs when the chain ends first).
     """
     Traverse doubly-linked list from head to tail and return nodes as a list.
 
@@ -373,6 +413,7 @@ def _is_corresponding_collective_wait(
     node_output_sets: dict[BaseSchedulerNode, frozenset[str]],
     node_dep_sets: dict[BaseSchedulerNode, frozenset[str]],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the wait node's unmet dependencies intersect the collective node's outputs, using precomputed sets.
     """
     Check if a wait node corresponds to a given collective node.
     Uses pre-computed sets for O(1) lookup.
@@ -389,6 +430,11 @@ def _coll_exposed_communication_time(
     node_output_sets: dict[BaseSchedulerNode, frozenset[str]],
     node_dep_sets: dict[BaseSchedulerNode, frozenset[str]],
 ) -> tuple[float, float, str]:
+    # [FUNCTION DOC] HELPER: Estimate overlap for a collective by scanning forward along the linked list from it. Returns the collective's runtime, the accumulated
+    # compute time of nodes that could overlap it, and a descriptive string. Stops at the first node depending on the collective's outputs, at a
+    # synchronous collective, or at a wait matching a collective found along the way; subsequent async collectives are skipped over without counting.
+    # KNOWN ISSUE: the loop over collectives_found ignores its loop variable and always tests the original collective_snode, so it is just a repeated
+    # test of the same condition (true whenever any collective was found and the current wait matches the starting collective).
     """
     Calculate exposed communication time by iterating directly over linked list.
     Avoids O(N) list construction for each call.
@@ -430,6 +476,7 @@ def _coll_exposed_communication_time(
         comp_time_before = comp_time
 
         def accumulate_time(_snode: BaseSchedulerNode) -> None:
+            # [FUNCTION DOC] HELPER: Nested accumulator: add the node's estimated runtime to the enclosing compute time total.
             nonlocal comp_time
             comp_time += runtimes[_snode]
 
@@ -450,6 +497,9 @@ def _wait_exposed_communication_time(
     node_output_sets: dict[BaseSchedulerNode, frozenset[str]],
     node_dep_sets: dict[BaseSchedulerNode, frozenset[str]],
 ) -> tuple[float, float, str]:
+    # [FUNCTION DOC] HELPER: Estimate overlap for a wait node by scanning backward along the linked list to find its collective. Returns the collective runtime,
+    # accumulated compute time between them, and a descriptive string. Resets accumulated compute time when passing a synchronous collective or an
+    # async collective whose wait was already seen; stops when the matching collective is found.
     """
     Calculate exposed communication time for a wait operation by iterating
     directly over linked list backwards. Avoids O(N) list construction.
@@ -490,6 +540,7 @@ def _wait_exposed_communication_time(
         comp_time_before = comp_time
 
         def accumulate_time(_snode: BaseSchedulerNode) -> None:
+            # [FUNCTION DOC] HELPER: Nested accumulator: add the node's estimated runtime to the enclosing compute time total.
             nonlocal comp_time
             comp_time += runtimes[_snode]
 
@@ -510,6 +561,8 @@ def _perform_double_linked_list_swap(
     next_dict: dict[BaseSchedulerNode, BaseSchedulerNode | None],
     head: BaseSchedulerNode,
 ) -> BaseSchedulerNode:
+    # [FUNCTION DOC] HELPER: Splice candidate after the group in a doubly linked list by rewiring the previous and next mappings (mutates them).
+    # Returns the new head, which is the group head if the candidate was the head, else the unchanged head.
     """
     Swap positions of candidate and group in doubly-linked list.
 
@@ -561,6 +614,10 @@ def _calculate_potential_peak_memory_reorder(
     group_n_to_bufs_after_swap_dealloc_by_candidate: dict,
     curr_memory: dict,
 ) -> tuple[int, dict[BaseSchedulerNode, int]]:
+    # [FUNCTION DOC] HELPER: Compute the peak memory that would result from moving candidate after the group, without mutating state.
+    # If no buffer last-use moves to the candidate, uses a closed-form maximum; otherwise walks the group nodes shifting their post-alloc memory
+    # by the candidate's negated delta and adding freed sizes as they move to the candidate. Returns the potential peak and a mapping of
+    # new post-alloc memory values to apply on commit.
     """
     Calculate potential peak memory after swapping candidate with group (reorder version).
 
@@ -630,6 +687,8 @@ def _update_memory_tracking_after_swap_reorder(
     buf_to_snode_last_use: dict,
     snodes_allocfree: dict,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Apply the memory bookkeeping for a committed reorder swap. Mutates the current-memory mapping, the buffer-to-last-use mapping (buffers whose
+    # last use moves to the candidate) and the alloc/free mapping (free sizes move from group nodes to the candidate).
     """
     Update memory tracking structures after swap (reorder version).
 
@@ -701,6 +760,8 @@ def _find_buffers_with_changed_last_use(
     buf_to_snode_last_use: dict,
     candidate_buffer_map: dict[BaseSchedulerNode, OrderedSet],
 ) -> dict[BaseSchedulerNode, list[FreeableInputBuffer | Any]]:
+    # [FUNCTION DOC] HELPER: After a candidate is moved past the group, find buffers that the candidate uses and whose current last user is a group node.
+    # Returns a mapping from group node to the list of such buffers, using the candidate buffer map to avoid scanning all buffers.
     """
     Find buffers whose last use will change after swapping candidate with group.
 
@@ -737,6 +798,8 @@ def _find_buffers_with_changed_last_use(
 def _is_node_groupable_for_reorder(
     candidate: BaseSchedulerNode,
 ) -> tuple[bool, str | None]:
+    # [FUNCTION DOC] HELPER: Decide whether a node may be grouped with the collective being moved. Returns (True, None) or (False, reason). Rejects nodes containing async
+    # collectives unless grouping with collectives is configured, and rejects GEMM-like nodes unless runtime estimates are used.
     """
     Check if a candidate node can be grouped with collective during reordering.
 
@@ -773,6 +836,9 @@ def _format_and_log_reordering_stats(
     name_to_freeable_input_buf: dict,
     graph_outputs: OrderedSet[str],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] HELPER: Compute per-node improvements and totals from reorder stats, build a log table (using tabulate if importable), traverse the linked list to
+    # produce the final node order, verify its length equals the original count (raises an error otherwise), recompute peak memory and log results.
+    # Returns the final node list.
     """
     Format reordering statistics, log them, and return final node list.
 
@@ -871,6 +937,14 @@ def _format_and_log_reordering_stats(
 def _reorder_communication_preserving_peak_memory_internal(
     snodes: list[BaseSchedulerNode],
 ) -> tuple[list[BaseSchedulerNode], dict[BaseSchedulerNode, ReorderInfo]]:
+    # [FUNCTION DOC] HELPER: Core of the peak-memory-preserving communication reorder pass; also returns per-node debug info. Returns the unchanged list and an empty mapping
+    # if no node contains a collective. Otherwise builds memory tracking, runtime estimates (scaled by the multipliers), precomputed output and dependency sets
+    # and a doubly linked list, then walks left to right over async collectives. For each, it repeatedly tries to move the collective earlier past the preceding
+    # candidate node, growing a group (collective plus nodes it depends on) when the candidate produces data the group needs, and stopping on: runtime-estimate
+    # saturation, collective ordering, ungroupable data dependency, an increase in exposed time, or the peak memory budget. Each accepted swap updates the list,
+    # exposed-time stats and memory bookkeeping, and optionally cross-checks them against a full recompute (stopping on mismatch).
+    # Returns the final node order (with a formatted stats log when verbose logging is on) and the mapping of collective node to ReorderInfo.
+    # KNOWN ISSUE: the comment about avoiding quadratic time is stale; the debug limit on processed collectives is the only related control here.
     """
     Internal testing helper that also returns debug info.
     Returns:
@@ -1218,6 +1292,10 @@ def _schedule_for_comm(
     sink_waits: bool,
     reorder_for_overlap: bool,
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] HELPER: Greedy list scheduler for comm objectives. Scores each node by (lowest index of a collective it blocks, 1 if it is a wait, original position); raise_comms
+    # uses the first score, sink_waits the second, with the original index breaking ties. Nodes become ready when their unmet dependencies are all scheduled and are
+    # popped from a min-heap by score. With reorder_for_overlap, after each collective is scheduled, ready non-collective non-wait nodes are scheduled until the
+    # collective's estimated cost is consumed. Returns the scheduled order; raises an assertion error if any node is left with unmet dependencies.
     """
     Schedule `snodes` for various comm optimization objectives.
 
@@ -1278,7 +1356,10 @@ def _schedule_for_comm(
             scores_1[snode.get_name()] = 1
 
     class Runnable:
+    # [CLASS DOC] HELPER: Heap entry wrapping a ready scheduler node with its precomputed (comm, wait, original index) score tuple;
+    # ordering compares scores only.
         def __init__(self, snode) -> None:
+        # [FUNCTION DOC] HELPER: Store the node and compute its score tuple from the score tables of the fused node owning its first operation name.
             self.snode = snode
             name = next(iter(snode.get_operation_names()))
             fused_name = name_to_fused_node[name].get_name()
@@ -1289,6 +1370,7 @@ def _schedule_for_comm(
             )
 
         def __lt__(self, other):
+        # [FUNCTION DOC] HELPER: Order by score tuple so the heap pops the best-ranked node first.
             return self.score < other.score
 
     unmet_deps: dict[BaseSchedulerNode, OrderedSet[str]] = {
@@ -1309,6 +1391,8 @@ def _schedule_for_comm(
     scheduled = []
 
     def schedule(snode):
+    # [FUNCTION DOC] HELPER: Append the node to the schedule and, for each buffer it produces, remove that dependency from its users, pushing newly unblocked users onto the ready heap.
+    # KNOWN ISSUE: the inner loop variable reuses the parameter name, shadowing the scheduled node (harmless since it is not used afterwards).
         """
         Schedules `snode` and put all unblocked nodes onto the ready queue.
         """
@@ -1320,6 +1404,7 @@ def _schedule_for_comm(
                     heapq.heappush(ready, Runnable(snode))
 
     def get_overlapping_candidate():
+    # [FUNCTION DOC] HELPER: Return the ready entry with the best score that contains neither a collective nor a wait, or None if there is none.
         """
         Return the next node in the ready queue that's neither a collective or
         a wait.
@@ -1334,6 +1419,8 @@ def _schedule_for_comm(
         return min(candidates, key=lambda x: x.score)
 
     def schedule_collective_for_overlap(snode):
+    # [FUNCTION DOC] HELPER: Schedule a collective, then keep scheduling ready compute nodes (removing them from the ready list) until the collective's estimated cost is used up,
+    # and restore the heap invariant. Raises an assertion error if the node has no collective.
         """
         Schedules collective node `snode`, along with one or more compute nodes
         to overlap with it. The strategy is described in the comment of
@@ -1373,6 +1460,9 @@ def _schedule_for_comm(
 def decide_global_ordering_of_comms(
     nodes: list[BaseSchedulerNode], name_to_buf, name_to_fused_node
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Enforce the input graph's order of collectives by adding fake weak dependencies from each collective's buffers onto the next collective.
+    # Returns the node list unchanged if torch.distributed is unavailable. Mutates the collective nodes' dependencies; the order of the returned list is not changed.
+    # The name_to_buf and name_to_fused_node arguments are unused.
     """
     Decide global ordering of comms, by just enforcing the ordering that's in the input graph
     (might not be the same ordering as the eager mode program).
@@ -1396,6 +1486,8 @@ def decide_global_ordering_of_comms(
 
 @dataclass
 class SinkWaitInfo:
+    # [CLASS DOC] Dataclass with debug statistics for how one wait node was sunk: grouped node count and info, moves and move info, limiting factor,
+    # comm and compute time, exposed time before and after, and overlap description. All fields default; improvement is the reduction in exposed time.
     grouped: int = 0
     grouped_info: str = ""
     moves: int = 0
@@ -1409,12 +1501,15 @@ class SinkWaitInfo:
 
     @property
     def improvement(self):
+        # [FUNCTION DOC] Property: exposed communication time saved, initial exposed minus final exposed.
         return self.initial_exposed - self.final_exposed
 
 
 def _is_node_groupable_for_sink_waits(
     candidate: BaseSchedulerNode,
 ) -> tuple[bool, str | None]:
+    # [FUNCTION DOC] HELPER: Decide whether a node may be grouped with a wait being sunk (sink_waits goes right to left). Returns (True, None) or (False, reason).
+    # Rejects nodes with waits or async collectives; without runtime estimates also rejects any collective and GEMM-like nodes.
     """
     Check if a candidate node can be grouped during sink_waits pass.
 
@@ -1466,6 +1561,9 @@ def _update_memory_tracking_after_swap_sink_waits(
     curr_memory: dict,
     snodes_allocfree: dict,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Apply memory bookkeeping after a sink_waits swap. Without changed buffer deallocation, the candidate's current memory is recomputed from the memory before the group
+    # and group nodes shift by the candidate delta; otherwise cached post-alloc values and free-size deltas are applied to the candidate and group nodes.
+    # Mutates the current-memory and alloc/free mappings.
     """
     Update memory tracking structures after swap (sink_waits version).
 
@@ -1519,6 +1617,8 @@ def _calculate_potential_peak_memory_sink_waits(
     curr_memory: dict,
     snodes_allocfree: dict,
 ) -> tuple[int, dict[BaseSchedulerNode, int], dict[BaseSchedulerNode, int]]:
+    # [FUNCTION DOC] HELPER: Compute (without mutating) the peak memory after moving the candidate before the group in the sink_waits pass. Returns the potential peak, a mapping of
+    # new post-alloc memory per node, and a mapping of free-size changes per node (the candidate gives up frees of buffers whose last use moves to group nodes).
     """
     Calculate potential peak memory after swapping candidate with group (sink_waits version).
 
@@ -1586,6 +1686,8 @@ def _perform_double_linked_list_swap_sink_waits(
     next_dict: dict[BaseSchedulerNode, BaseSchedulerNode | None],
     head: BaseSchedulerNode,
 ) -> BaseSchedulerNode:
+    # [FUNCTION DOC] HELPER: Splice the candidate before the group in the doubly linked list for the sink_waits pass (candidate moves left past the group) by rewiring the
+    # previous and next mappings in place. Returns the possibly updated head.
     """
     Swap positions of candidate and group in doubly-linked list (sink_waits version).
 
@@ -1636,6 +1738,10 @@ def _format_and_log_sink_waits_stats(
     name_to_freeable_input_buf: dict,
     graph_outputs: OrderedSet[str],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] HELPER: Format sink_waits statistics: builds a table (tabulate if importable, else plain text) of per-wait exposed-time stats, logs it, rebuilds the final node list
+    # from the linked list (raises an assertion error if the count differs from the original), recomputes peak memory, appends before/after peak lines and emits
+    # a structured trace artifact. Returns the final node list.
+    # KNOWN ISSUE: the overlap log is emitted before the peak-memory lines are appended, so those lines appear only in the trace artifact.
     """
     Format sink_waits statistics, log them, and return final node list.
 
@@ -1726,6 +1832,8 @@ def _find_buffers_with_changed_last_use_sink_waits(
     buf_to_snode_last_use: dict,
     candidate_buffer_map: dict[BaseSchedulerNode, OrderedSet],
 ) -> dict[BaseSchedulerNode, list[FreeableInputBuffer | Any]]:
+    # [FUNCTION DOC] HELPER: Sink_waits version of the changed-last-use search: for buffers whose current last user is the candidate and that have group nodes among their successors,
+    # record the last such group node (in group order) as the new deallocator. Returns a mapping from group node to buffers whose release moves to it.
     """
     Find buffers whose last use will change after swapping in sink_waits pass.
 
@@ -1778,6 +1886,11 @@ def _find_buffers_with_changed_last_use_sink_waits(
 def _sink_waits_iterative_internal(
     snodes: list[BaseSchedulerNode],
 ) -> tuple[list[BaseSchedulerNode], dict[BaseSchedulerNode, SinkWaitInfo]]:
+    # [FUNCTION DOC] HELPER: Core of the iterative wait-sinking pass. Returns the node order and a mapping from wait node to SinkWaitInfo; empty input is returned unchanged.
+    # Walks the linked list right to left over not-yet-processed wait nodes. For each wait it tries to move the next node ahead of it, growing a group when the next node
+    # depends on the group's outputs or both contain collectives (if the next node is groupable), and stops on: runtime-estimate saturation, async collective neighbour,
+    # collective ordering, ungroupable data dependency, an increase in exposed time of another wait or of grouped collectives, or the peak memory budget.
+    # Accepted swaps update the list, exposed-time stats and memory bookkeeping, with optional full recompute cross-check. Formats a log table if verbose logging is configured.
     original_snodes_num = len(snodes)
     if original_snodes_num == 0:
         return snodes, {}
@@ -2113,6 +2226,8 @@ def _sink_waits_iterative_internal(
 
 
 def sink_waits_iterative(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Public pass: iteratively sink every wait node later in the schedule while keeping peak memory within the configured budget and, optionally, until the
+    # matching collective is unexposed per runtime estimates. Returns the reordered node list; the docstring documents the related config options.
     """
     Similarly to reorder_communication_preserving_peak_memory this pass will try to iteratively
     push Wait nodes later, recomputing estimated peak memory before each swap,
@@ -2139,6 +2254,9 @@ def sink_waits_iterative(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerN
 
 
 def estimate_op_runtime(snode: BaseSchedulerNode) -> float:
+    # [FUNCTION DOC] Return the estimated runtime of a scheduler node, from the node's own estimate when the config is the default, otherwise from the configured callable
+    # (raises an assertion error if the config value is not callable).
+    # KNOWN ISSUE: the docstring says milliseconds but the value comes from get_estimated_runtime, which other code in this module formats as nanoseconds.
     """
     Returns estimated op runtime in milliseconds (ms)
     """
@@ -2152,6 +2270,9 @@ def estimate_op_runtime(snode: BaseSchedulerNode) -> float:
 
 
 def node_summary(snode):
+    # [FUNCTION DOC] Build a one-line-per-node human-readable summary: for a single node, its class name, kernel and in/out buffer names for extern or collective kernels,
+    # output sizes and strides, node name and estimated runtime in ns; for fused, foreach or grouped nodes, the class name followed by the recursive summaries of members.
+    # Tolerates nodes without a name by using an empty name. Pure; used for logging.
     snodes = snode.get_nodes()
     if len(snodes) == 1:
         detail = ""
@@ -2183,6 +2304,9 @@ def node_summary(snode):
 
 
 def visualize_overlap(order):
+    # [FUNCTION DOC] Debug visualization: logs, via the overlap logger at debug level, each step of the schedule order with indentation marking compute overlapped with a running
+    # collective, and a final total estimated runtime in ms in which collectives and exposed compute count but overlapped compute does not. Returns nothing.
+    # KNOWN ISSUE: the runtime model ignores streams and several outstanding collectives; the final division treats the estimates as nanoseconds.
     # TODO - this function probably doesn't do a very good job estimating the runtime because it doesn't carefully model
     # streams and overlap. For now its mostly useful as a debug visualization.
 
@@ -2190,6 +2314,7 @@ def visualize_overlap(order):
     cur_comm_node = None
 
     def step_log(step, msg):
+        # [FUNCTION DOC] HELPER: Log one step number and message at debug level on the overlap logger.
         overlap_log.debug(f"{step:>6}: {msg}")
 
     for step, snode in enumerate(order):
@@ -2221,6 +2346,10 @@ def visualize_overlap(order):
 def simple_overlap(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """Move collectives earlier and waits later via adjacent swaps.
     Each swap is safe: no collective reordering, no memory regression."""
+    # [FUNCTION DOC] Simple peak-memory-safe overlap pass using adjacent swaps. Phase one moves each async collective earlier past predecessors until one produces data it needs,
+    # is itself an async collective, or a swap would raise peak memory above the initial peak; phase two moves each wait later (processing waits in reverse order)
+    # past successors until one depends on its outputs, is a wait, or a swap would exceed the peak. Returns the new order (the input list if fewer than two nodes or
+    # no collectives and waits). Logs a summary at info level when anything moved.
     if len(snodes) < 2:
         return snodes
 
@@ -2256,6 +2385,8 @@ def simple_overlap(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         *,
         sink_wait: bool,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Try to swap one candidate node with an adjacent single group node. Computes the potential peak (sink-wait or reorder variant), refuses (returns False) if it would
+        # exceed the initial peak memory, otherwise performs the linked list swap, updates the memory tracking and returns True. Mutates the enclosing head via nonlocal.
         nonlocal _head
 
         group_nodes = [group_node]
@@ -2388,6 +2519,8 @@ def simple_overlap(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 def reorder_compute_and_comm_for_overlap(
     snodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Run the configured sequence of overlap passes over the node order. Each entry in the config list is a callable or the name of a pass defined in this module;
+    # each pass receives the previous pass's order. Raises an assertion error if an entry is not callable. Returns the final order.
     order = snodes
     # pyrefly: ignore [bad-assignment]
     for p in config.reorder_for_compute_comm_overlap_passes:

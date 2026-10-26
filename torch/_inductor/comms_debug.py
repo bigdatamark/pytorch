@@ -1,3 +1,6 @@
+# [MODULE DOC] Debug helper for the iterative memory recomputation used by Inductor comm-reordering passes.
+# Contains one function that cross-checks incremental memory estimates against a full recompute.
+# No import-time side effects beyond imports.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -29,6 +32,13 @@ def _debug_iterative_memory_recompute(
         BaseSchedulerNode, list[FreeableInputBuffer | SchedulerBuffer]
     ],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Recompute peak and per-node memory from scratch for the given node order and compare with the incrementally
+    # maintained values (peak memory, candidate current memory, and each group node's current memory).
+    # On any mismatch it builds a detailed report (candidate, group, peak location, all nodes), prints it to stdout and emits it as a
+    # structured trace artifact named with the tlparse name plus an error suffix. Returns True if a mismatch was found, else False.
+    # KNOWN ISSUE: the 'ITER_allocfree' lines print the same freshly recomputed allocfree mapping as 'ESTM_allocfree' because the
+    # mapping argument is overwritten by the recompute, so these two values are never distinct; only the candidate's iterative value is saved beforehand.
+    # KNOWN ISSUE: the peak-memory check only flags a recomputed peak above the stored peak, not below.
     iterative_recompute_error = False
     candidate_allocfree = snodes_allocfree[candidate]
     est_peak_memory, snodes_curr_memory, snodes_allocfree, _ = (
