@@ -1,3 +1,7 @@
+# # [MODULE DOC] Applies chunking to a graph whose nodes already carry chunking metadata: moves the
+# # chunked region into per-chunk-size subgraphs invoked once per chunk via the invoke_subgraph higher-order
+# # op, accumulates or concatenates their outputs, and rebuilds the parent graph module.
+# # Main contents: ChunkingApplier, fake_tensor_prop, is_chunking_subgraph_input. Import-time: logger only.
 import copy
 import logging
 import operator
@@ -19,6 +23,8 @@ prims = torch.ops.prims
 
 
 def _factory_args(fake_tensor: Tensor) -> dict[str, Any]:
+    # # [FUNCTION DOC] HELPER: Returns keyword arguments (device and dtype) for creating a tensor like the
+    # # given fake tensor.
     return {
         "device": fake_tensor.device,
         "dtype": fake_tensor.dtype,
@@ -26,6 +32,9 @@ def _factory_args(fake_tensor: Tensor) -> dict[str, Any]:
 
 
 def fake_tensor_prop(gm: GraphModule) -> None:
+    # # [FUNCTION DOC] Re-runs fake tensor propagation over a graph module so every node gets an up-to-date
+    # # value in its metadata. Uses each placeholder's fake tensor when present, else the node itself, and the
+    # # fake mode detected from those inputs. Mutates node metadata.
     inputs = []
     for node in gm.graph.find_nodes(op="placeholder", sort=False):
         fake_tensor = get_fake_tensor_from_node_arg(node)
@@ -39,6 +48,8 @@ def fake_tensor_prop(gm: GraphModule) -> None:
 
 
 def is_chunking_subgraph_input(node: Node) -> bool:
+    # # [FUNCTION DOC] Returns true if the node has chunking meta, is not a tangent, and is either a placeholder
+    # # or consumes at least one node lacking chunking meta (so it enters the chunking subgraph from outside).
     meta = get_chunking_meta(node)
     if meta is None or is_tangent_node(node):
         return False
@@ -48,12 +59,21 @@ def is_chunking_subgraph_input(node: Node) -> bool:
 
 
 class ChunkingApplier:
+    # # [CLASS DOC] Transforms a graph module by running its chunked region as subgraphs. Constructed with a
+    # # parent graph module and chunk count. State: reordered copy of the graph (parent_graph), subgraph input /
+    # # body / output node lists, tangent overrides (tangent node to all-ones node), chunked input slices,
+    # # per-chunk-size sizes and subgraph attribute names, accumulators for outputs that must be summed, and
+    # # lists of output chunks to concatenate. Method apply orchestrates the whole transformation.
     """
     A class that chunks the graph assuming chunking metadata has already
     been attached to the nodes in the chunking subgraph.
     """
 
     def __init__(self, parent_gm: GraphModule, num_chunk: int):
+        # # [FUNCTION DOC] Reorders the graph so chunked nodes are contiguous, categorizes subgraph nodes and
+        # # initializes bookkeeping: for each subgraph output with a chunk dimension prepares a list of chunks to
+        # # concatenate, otherwise reserves an accumulator slot. Raises AssertionError if an output lacks meta or
+        # # the body is empty.
         self.gm = parent_gm
         self.parent_graph = reorder_nodes(self.gm.graph)
         # From this point on self.parent_graph is not equal to self.gm.graph
@@ -93,6 +113,9 @@ class ChunkingApplier:
         self.chunk_size_to_gm_attr: dict[int, str] = {}
 
     def _categorize_subgraph_nodes(self) -> None:
+        # # [FUNCTION DOC] HELPER: Walks parent graph nodes with chunking meta. Tangents are recorded as overridden
+        # # (value filled later). Other nodes are classified as input (enters from unchunked nodes), output (has users
+        # # without meta) or body. Raises AssertionError if the body ends up empty.
         """
         For each chunked node, decide if it's an input/body/output node of the
         chunking subgraph.
@@ -140,6 +163,10 @@ class ChunkingApplier:
             raise AssertionError("expected non-empty subgraph body")
 
     def replace_tangent_to_one(self) -> None:
+        # # [FUNCTION DOC] For each recorded tangent, creates a full tensor of ones with its shape, dtype and device,
+        # # copies metadata, redirects all uses of the tangent to it and stores it in the override map.
+        # # KNOWN ISSUE: the name string lacks an f-string prefix, so every ones node gets the literal text with
+        # # braces rather than its index; the loop index is otherwise unused.
         for idx, node in enumerate(self.overriden_tangent):
             if not is_tangent_node(node):
                 raise AssertionError(f"expected tangent node, got {node}")
@@ -156,6 +183,12 @@ class ChunkingApplier:
             self.overriden_tangent[node] = one
 
     def chunk_subgraph_input(self) -> None:
+        # # [FUNCTION DOC] For each subgraph input with a chunk dimension, adds a chunk operation along that
+        # # dimension plus one element extraction per chunk, appended to the chunked input list. Inputs without
+        # # a chunk dimension are left alone. On the first chunked input computes the list of chunk sizes by
+        # # chunking its fake value. AssertionError if an input lacks meta.
+        # # KNOWN ISSUE: the chunk operation may yield fewer pieces than num_chunk (for small sizes), but later
+        # # code indexes chunk sizes for each of num_chunk chunks.
         """
         Chunk subgraph inputs if necessary. Note that not every subgraph
         input needs to be chunked.
@@ -187,6 +220,9 @@ class ChunkingApplier:
                 self.chunk_sizes = [t.size(0) for t in tensors]
 
     def create_accumulators(self) -> None:
+        # # [FUNCTION DOC] Creates a zero-filled full tensor accumulator for each output that needs summing.
+        # # Uses float32, except keeps the original dtype for single-element tensors (avoiding addmm dtype
+        # # mismatch). Stores the node in the accumulators map and gives it fake-value metadata.
         for node in self.accumulators:
             # use fp32 for accumulators
             fake_tensor = node.meta["val"]
@@ -209,6 +245,12 @@ class ChunkingApplier:
             self.accumulators[node] = accum
 
     def build_subgraph(self, chunk_size: int) -> GraphModule:
+        # # [FUNCTION DOC] Builds a graph module for one chunk size. Creates placeholders for subgraph inputs,
+        # # overridden tangents and accumulators (chunked inputs get their fake size reduced along the chunk dim).
+        # # Copies body and output nodes, rewriting full, expand and view nodes with a chunk dimension to use the
+        # # chunk size in their shape. Then adds each accumulator to its output, outputs all subgraph outputs as a
+        # # tuple, removes dead code, lints, wraps in a graph module and runs fake tensor propagation.
+        # # Raises AssertionError on unset tangents/accumulators or placeholders inside the body.
         """
         Build a subgraph for the given chunk size.
         The last chunk can be smaller and a new subgraph will be created
@@ -218,6 +260,8 @@ class ChunkingApplier:
         env: dict[Node, Node] = {}
 
         def _create_placeholder_node(input_node: Node) -> Node:
+            # # [FUNCTION DOC] HELPER: Creates a placeholder in the new graph named after the input node, with fake
+            # # metadata sliced to the chunk size along the chunk dim when the node is chunked. Returns the placeholder.
             new_node = new_graph.placeholder(input_node.name)
             fake_tensor = input_node.meta["val"]
             chunking_meta = get_chunking_meta(input_node)
@@ -331,6 +375,9 @@ class ChunkingApplier:
         return sub_gm
 
     def build_subgraphs(self) -> None:
+        # # [FUNCTION DOC] Builds one subgraph per distinct chunk size, registers each on the graph module under a
+        # # numbered attribute name, and marks it so the chunker never processes it again. Raises AssertionError if
+        # # chunk sizes are not computed.
         if self.chunk_sizes is None:
             raise AssertionError("expected chunk_sizes to be set")
         for chunk_size in self.chunk_sizes:
@@ -347,6 +394,10 @@ class ChunkingApplier:
             sub_gm.meta["produced_by_chunker"] = True
 
     def call_subgraph_for_each_chunk(self) -> None:
+        # # [FUNCTION DOC] For each chunk, emits a call of the subgraph (picked by that chunk's size) with the chunked
+        # # input slice or original input, the overridden tangents and the current accumulators. Extracts each
+        # # output, appends it to the chunks to concatenate, and updates accumulators to the latest outputs so
+        # # they thread through successive calls. Raises AssertionError on missing sizes, metas or accumulators.
         for chunk_id in range(self.num_chunk):
             if self.chunk_sizes is None:
                 raise AssertionError("expected chunk_sizes to be set")
@@ -391,6 +442,10 @@ class ChunkingApplier:
                 self.accumulators[orig_node] = output_node_dict[orig_node]
 
     def recover_to_unchunked_nodes(self) -> None:
+        # # [FUNCTION DOC] For each subgraph output, builds the unchunked replacement: concatenation of chunks along
+        # # the chunk dim, or the final accumulator if a sum is needed, else the node itself; then multiplies by
+        # # scale_by if set and converts back to the original dtype for summed non-float32 outputs. Redirects all
+        # # uses of the original node to the result. AssertionError if meta is missing or nothing was replaced.
         """
         Recover the node from chunks and do the replacement.
         """
@@ -429,6 +484,8 @@ class ChunkingApplier:
             node.replace_all_uses_with(recovered)
 
     def erase_original_nodes(self) -> None:
+        # # [FUNCTION DOC] Erases the original body and output nodes from the parent graph in reverse order
+        # # (users first), skipping placeholders.
         # Traverse reversely to erase user first
         for node in reversed(tuple(self.subgraph_body + self.subgraph_output)):
             if node.op == "placeholder":
@@ -437,6 +494,10 @@ class ChunkingApplier:
             self.parent_graph.erase_node(node)
 
     def apply(self) -> GraphModule:
+        # # [FUNCTION DOC] Runs the full transformation at the position before the first body node: override tangents,
+        # # chunk inputs, create accumulators, build subgraphs, call them per chunk, recover unchunked outputs and
+        # # erase originals. Then builds a new graph module from the parent graph, runs fake tensor propagation
+        # # (prints readable code in debug mode) and returns it.
         with self.parent_graph.inserting_before(self.subgraph_body[0]):
             self.replace_tangent_to_one()
             self.chunk_subgraph_input()

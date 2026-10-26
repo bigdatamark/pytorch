@@ -1,3 +1,6 @@
+# # [MODULE DOC] Entry point of the auto chunker: splits tensors along the batch dimension for ops that
+# # greatly amplify tensor size, propagating chunking through the joint graph and rebuilding it.
+# # Exposes decide_num_chunks and chunk; creates a module logger for the auto_chunker artifact.
 import dataclasses
 import functools
 import itertools
@@ -29,6 +32,7 @@ log = torch._logging.getArtifactLogger(__name__, "auto_chunker")
 
 
 def decide_num_chunks(gm: GraphModule) -> int:
+    # # [FUNCTION DOC] Placeholder heuristic returning a fixed chunk count of 8 regardless of the graph.
     # TODO: this is just a placeholder for now.
     # We should either create heuristics or do autotuning to
     # decide the number of chunks.
@@ -36,6 +40,11 @@ def decide_num_chunks(gm: GraphModule) -> int:
 
 
 def chunk(gm: GraphModule) -> GraphModule:
+    # # [FUNCTION DOC] Chunks a joint forward/backward graph module. Raises CantChunk when cpp wrapper is on,
+    # # when no amplifier node is found, when it has symbolic shapes, or when chunk metadata does not
+    # # reach the tangents. Returns the input unchanged if it was produced by the chunker or has no tangent
+    # # nodes. Otherwise propagates chunking from the amplifier, picks the chunk count (config value or
+    # # heuristic), applies the transformation, bumps a metric counter and returns the new graph module.
     """
     Chunk input tensors for operations that amplify the tensor size significantly.
     The chunking operation is propagated thru the fx graph until a point we should

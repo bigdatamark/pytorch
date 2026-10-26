@@ -1,3 +1,9 @@
+# [MODULE DOC] ConfigFuzzer: searches the config state space of a config module (e.g. Inductor) for
+# failures. Provides type-driven value sampling (SamplingMethod, TypeExemplars, type overrides), per-module
+# default configs with disabled entries, a Status enum, a ResultType store, the ConfigFuzzer driver with
+# n-tuple and random-bisection strategies, and an HTML visualizer for pairwise results.
+# Import-time side effects: probes for the halide package to choose CUDA backends, and builds exemplar
+# objects (dummy pass, empty graph, scheduler node) for special types.
 import importlib
 import itertools
 import logging
@@ -25,6 +31,7 @@ log = logging.getLogger(__name__)
 
 
 def is_type(type_hint, comp_type) -> bool:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Returns true if the hint is the given type or has it as its generic origin.
     """
     Determines if type_hint is comp_type. There are some type annotations that this doesn't work for.
     I think it's because some Type annotations are Type Objects and some are Special Forms, but not sure.
@@ -35,6 +42,7 @@ def is_type(type_hint, comp_type) -> bool:  # type: ignore[no-untyped-def]
 
 
 def is_optional_type(type_hint) -> bool:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Returns true if the hint is a union type that includes the none type.
     """
     Special case of is_type.
     """
@@ -48,6 +56,9 @@ def is_optional_type(type_hint) -> bool:  # type: ignore[no-untyped-def]
 
 
 def is_callable_type(type_hint) -> bool:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Returns true if the hint's name attribute is Callable.
+    # KNOWN ISSUE: raises AttributeError for hints without a name attribute (e.g. some generic aliases);
+    # callers rely on earlier branches for most such hints.
     """
     Special Case of is_type.
     """
@@ -55,18 +66,23 @@ def is_callable_type(type_hint) -> bool:  # type: ignore[no-untyped-def]
 
 
 class DummyPass(CustomGraphPass):
+    # [CLASS DOC] HELPER: Placeholder custom graph pass used as an exemplar value; does nothing.
     """
     A Dummy pass to be used by ConfigFuzzer
     """
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing and returns none.
         return None
 
     def uuid(self) -> Any | None:
+        # [FUNCTION DOC] HELPER: Returns none (no cache identity).
         return None
 
 
 class DummyPartitionerFn(CustomPartitionerFn):
+    # [CLASS DOC] HELPER: Placeholder custom partitioner used as an exemplar; delegates to the standard
+    # min-cut rematerialization partitioner.
     """
     A Dummy partitioner function to be used by ConfigFuzzer
     """
@@ -74,9 +90,12 @@ class DummyPartitionerFn(CustomPartitionerFn):
     def __call__(
         self, gm: torch.fx.GraphModule, joint_inputs: Sequence[object], **kwargs: Any
     ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+        # [FUNCTION DOC] HELPER: Partitions the joint graph with the min-cut rematerialization partitioner and
+        # returns the resulting pair of graph modules (forward, backward).
         return min_cut_rematerialization_partition(gm, joint_inputs, **kwargs)
 
     def uuid(self) -> Any | None:
+        # [FUNCTION DOC] HELPER: Returns none (no cache identity).
         return None
 
 
@@ -84,6 +103,8 @@ T = TypeVar("T")
 
 
 class TypeExemplars:
+    # [CLASS DOC] Registry mapping class names to ready-made example instances for config types that cannot
+    # be generated from primitives. Class attribute TYPE_EXEMPLARS holds the mapping; methods are static.
     """
     This class returns examples of a Type, given its class name.
     """
@@ -97,6 +118,7 @@ class TypeExemplars:
 
     @staticmethod
     def example(t: type[T]) -> T | None:
+        # [FUNCTION DOC] Returns the registered example instance for the class (by name) or none.
         """
         Return an example of a class.
         """
@@ -105,10 +127,12 @@ class TypeExemplars:
 
     @staticmethod
     def contains(t: type[T]) -> bool:
+        # [FUNCTION DOC] Returns true if an example is registered for the class (by name).
         return t.__name__ in TypeExemplars.TYPE_EXEMPLARS
 
 
 def check_halide_import() -> bool:
+    # [FUNCTION DOC] Returns true if the halide module can be imported, false if it is not installed.
     """checks if we have halide available"""
     try:
         importlib.import_module("halide")
@@ -124,6 +148,9 @@ else:
 
 
 class Status(Enum):
+    # [CLASS DOC] Enum of outcomes for testing one config: skipped, passed, failed to compile, failed running
+    # compiled code with an exception, failed running eager with an exception, or failed by returning a falsy
+    # result.
     """
     The Status return value enum for Config Fuzzer
     """
@@ -143,6 +170,7 @@ class Status(Enum):
     FAILED_RUN_RETURN = "failed_run_return"
 
     def failing(self) -> bool:
+        # [FUNCTION DOC] Returns true for any of the four failure statuses, false for passed or skipped.
         """
         Convenience method to check whether these status represent failure.
         """
@@ -198,6 +226,9 @@ SamplingType = Callable[[str, type[Any], Any], Any]
 
 
 class SamplingMethod(Enum):
+    # [CLASS DOC] Enum of strategies for assigning values to config type annotations: TOGGLE picks a value
+    # different from the default, RANDOM picks any valid value. dispatch turns a strategy into a sampling
+    # function taking field name, type hint and default.
     """
     This class handles the process of assigning concrete values to type annotations. So a type annotation of
     ```python
@@ -214,6 +245,13 @@ class SamplingMethod(Enum):
     def _generate_value_for_type(
         random_sample: bool, field_name: str, type_hint: type[Any], default: Any
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Generates a value for a type hint. A per-field-name override list takes precedence
+        # (random pick). Otherwise handles bool (random or negated default), int (0..1000), float, str (random
+        # printable text), list/set/ordered set (1-3 elements recursively), dict (0-3 entries), unions (random member
+        # or one not matching the default), tuple (per element), literal (random, or a different one in toggle mode),
+        # optional, none, callable (returns a dummy function producing a value of the return type), op overload,
+        # exemplar types and any. Raises ValueError for empty union/literal/optional/callable args or unknown types.
+        # KNOWN ISSUE: the set and ordered-set branches build a list from the default, failing if default is none.
         """
         Generates a value of a type based on the setting.
         """
@@ -366,6 +404,8 @@ class SamplingMethod(Enum):
 
             @wraps(lambda *args, **kwargs: None)
             def dummy_function(*args, **kwargs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Dummy callable accepting any arguments and returning a sampled value of the
+            # declared return type.
                 return SamplingMethod._generate_value_for_type(
                     random_sample, field_name, return_type, None
                 )
@@ -382,6 +422,8 @@ class SamplingMethod(Enum):
 
     @staticmethod
     def dispatch(sm: "SamplingMethod") -> SamplingType:
+        # [FUNCTION DOC] Returns the value generator function for the sampling method: random sampling for
+        # RANDOM, toggle sampling for TOGGLE. Raises ValueError for anything else.
         """
         Returns a function that will generate values from a type, based on the SamplingMethod passed in.
         """
@@ -394,6 +436,7 @@ class SamplingMethod(Enum):
 
 
 class Default:
+    # [CLASS DOC] Marker type; the single DEFAULT instance means use the config's own default value.
     """
     Singleton default object that will cause the ConfigFuzzer to always use the default value set in the config.
     """
@@ -406,6 +449,8 @@ ComboType = tuple[str, ...]
 
 
 class ResultType:
+    # [CLASS DOC] Mapping from config combinations (tuples of config names, stored sorted) to Status.
+    # Supports length, set, lookup, key iteration and counting combos that actually ran.
     """
     The mapping of the combo strings to the result status after running the config fuzzer.
     """
@@ -413,15 +458,19 @@ class ResultType:
     _vals: dict[ComboType, Status]
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a printable representation including the stored mapping.
         return f"ResultType[{self._vals}]"
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Starts with an empty mapping.
         self._vals = {}
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the number of recorded combos.
         return len(self._vals)
 
     def num_ran(self) -> int:
+        # [FUNCTION DOC] Returns the number of recorded combos whose status is not skipped.
         """
         Returns how many combos actually ran (weren't skipped).
         """
@@ -432,14 +481,17 @@ class ResultType:
         return ret
 
     def set(self, combo: ComboType, status: Status) -> None:
+        # [FUNCTION DOC] Records the status for the combo, with its names sorted for a canonical key.
         combo = tuple(sorted(combo))
         self._vals[combo] = status
 
     def lookup(self, combo: ComboType) -> Status | None:
+        # [FUNCTION DOC] Returns the status recorded for the combo (names sorted) or none.
         combo = tuple(sorted(combo))
         return self._vals.get(combo, None)
 
     def keys(self) -> KeysView[ComboType]:
+        # [FUNCTION DOC] Returns a view of all recorded combo keys.
         return self._vals.keys()
 
 
@@ -521,6 +573,13 @@ MODULE_DEFAULTS: dict[str, ConfigType] = {
 
 
 class ConfigFuzzer:
+    # [CLASS DOC] Driver that explores config combinations of a config module using a factory that builds a
+    # test function (returns true on success; exceptions count as failure). Entry points: fuzz_n_tuple (all
+    # n-combinations), bisect (random configs plus minimization of failures) and reproduce. State: seed,
+    # timeout, config module and its field table, default config mapping, sampling function and detailed
+    # error info per failed combo. Mutates the live config module while testing.
+    # KNOWN ISSUE: save_state and load_state use a results attribute that is never initialized, so saving fails
+    # unless it was set externally.
     """
     This tool makes it easy to search through config state-space with a minimal reproduction or test, either for
       debugging or just bug hunting.
@@ -590,6 +649,9 @@ class ConfigFuzzer:
         sm: SamplingMethod = SamplingMethod.TOGGLE,
         test_timeout: int = 3600,
     ):
+        # [FUNCTION DOC] Stores arguments, takes the field table from the config module and builds the sampling
+        # function from the sampling method. If no default mapping is given, uses the preset for the module's name,
+        # raising ValueError if there is none.
         """
         Args:
             config_module: The module containing the configs to fuzz
@@ -617,21 +679,26 @@ class ConfigFuzzer:
             self.default = default
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a printable description of the fuzzer's main settings.
         return (
             f"ConfigFuzzer(config_module={self.config_module}, "
             f"test_model_fn_factory={self.test_model_fn_factory}, seed={self.seed}, default={self.default})"
         )
 
     def _set_config(self, field_name: str, value: Any) -> None:
+        # [FUNCTION DOC] HELPER: Sets the named attribute on the config module (side effect on global config).
         """Set a config value in the module."""
         setattr(self.config_module, field_name, value)
 
     def _reset_configs(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets every config field back to its declared default value.
         """Reset all configs to their default values."""
         for field_name, field_obj in self.fields.items():
             self._set_config(field_name, field_obj.default)
 
     def new_config(self) -> ConfigType:
+        # [FUNCTION DOC] Returns a new mapping from the fuzzer's default config, replacing placeholder default
+        # markers with the field's real default.
         """creates a new config from the default"""
         ret = {
             name: val if val != DEFAULT else self.fields[name].default
@@ -640,6 +707,8 @@ class ConfigFuzzer:
         return ret
 
     def reproduce(self, configs: Sequence[ConfigType]) -> ResultType:
+        # [FUNCTION DOC] Re-runs each given config (overrides on top of the default config) and returns a result
+        # store with their statuses.
         """entrypoint to reproduce any failure"""
         results = ResultType()
         for conf in configs:
@@ -647,6 +716,8 @@ class ConfigFuzzer:
         return results
 
     def _reproduce_single_helper(self, conf: ConfigType, results: ResultType) -> None:
+        # [FUNCTION DOC] HELPER: Tests one config merged over the base config, printing progress and the status
+        # looked up by the config's key names. Records into results.
         print(f"Starting repro of {conf}")
         new_config = self.new_config()
         new_config.update(conf)
@@ -654,11 +725,16 @@ class ConfigFuzzer:
         print(f"Status of {conf}:\n{results.lookup(tuple(conf.keys()))}")
 
     def reproduce_single(self, config: ConfigType) -> ResultType:
+        # [FUNCTION DOC] Reproduces a single config and returns the new result store.
         results = ResultType()
         self._reproduce_single_helper(config, results)
         return results
 
     def _fuzz_helper(self, results: ResultType, combo: ComboType) -> Status:
+        # [FUNCTION DOC] HELPER: Tests one combo of config names. Returns a cached status if known. Otherwise builds a
+        # config from the default, sampling a value for each named field. The combo is skipped (recorded as skipped)
+        # if any name is already in the default config (explicitly pinned) or starts with an underscore. Else
+        # tests it and returns the status. Prints the combo.
         print(combo)
         if st := results.lookup(combo):
             # we already processed this config
@@ -683,6 +759,8 @@ class ConfigFuzzer:
         return self.test_config(results, config)
 
     def fuzz_n_tuple(self, n: int, max_combinations: int = 1000) -> ResultType:
+        # [FUNCTION DOC] Seeds the random generator and tests every n-sized combination of config fields until
+        # max_combinations non-skipped ones ran. Prints progress. Returns the result store.
         """
         Test every combination of n configs.
 
@@ -703,6 +781,8 @@ class ConfigFuzzer:
         return results
 
     def save_state(self, filename: str = "fuzzer_state.pkl") -> None:
+        # [FUNCTION DOC] Pickles the results and detailed results to a file (default name fuzzer_state file).
+        # Raises AttributeError if results was never set.
         """Save the current fuzzer state to a file"""
         with open(filename, "wb") as f:
             pickle.dump(
@@ -710,6 +790,8 @@ class ConfigFuzzer:
             )
 
     def load_state(self, filename: str = "fuzzer_state.pkl") -> None:
+        # [FUNCTION DOC] Loads results and detailed results from a pickle file into the fuzzer. Unpickling untrusted
+        # files is unsafe.
         """Load fuzzer state from a file"""
         with open(filename, "rb") as f:
             state = pickle.load(f)
@@ -717,9 +799,17 @@ class ConfigFuzzer:
             self.detailed_results = state.get("detailed_results", {})
 
     def timeout_handler(self, signum: int, frame: FrameType | None) -> None:
+        # [FUNCTION DOC] Signal handler: always raises TimeoutError signalling the test exceeded its time budget.
         raise TimeoutError("Test execution timed out")
 
     def test_config(self, results: ResultType, config: ConfigType) -> Status:
+        # [FUNCTION DOC] Runs one config: installs a timeout alarm, returns a cached status if the config's names were
+        # seen before, else resets dynamo and all configs, applies the config, runs the test function in eager
+        # mode, compiles another instance with the inductor backend and runs it. Records and returns a status:
+        # eager exception, compile failure, compiled-run exception, falsy result, or passed. On failures prints the
+        # config and traceback and stores error details. Mutates global config and signal handlers.
+        # KNOWN ISSUE: the pending alarm is never cancelled and the cache lookup uses names only, ignoring values;
+        # a stale alarm can fire after the original handler is restored.
         """
         Tests a config by calling the function produced by the factory function.
         """
@@ -732,10 +822,12 @@ class ConfigFuzzer:
             return ret
 
         def print_config() -> None:
+            # [FUNCTION DOC] HELPER: Prints each config name and value.
             for field, value in config.items():
                 print(f"{field} = {value}")
 
         def get_error_info(exc: Exception) -> dict[str, Any]:
+            # [FUNCTION DOC] HELPER: Returns a mapping with the exception text, current traceback and a copy of the config.
             return {
                 "exception": str(exc),
                 "traceback": traceback.format_exc(),
@@ -748,6 +840,8 @@ class ConfigFuzzer:
             print_traceback: bool,
             exc: Exception | None,
         ) -> Status:
+            # [FUNCTION DOC] HELPER: Restores the original signal handler, prints a message and the config, stores error
+            # details if an exception is given, optionally prints the traceback, records the status and returns it.
             signal.signal(signal.SIGALRM, original_handler)
             print(f"{message} with config combination:")
             print_config()
@@ -802,6 +896,9 @@ class ConfigFuzzer:
             return handle_return("Function succeeded", Status.PASSED, False, None)
 
     def bisect(self, num_attempts: int = 100, p: float = 0.5) -> list[ConfigType]:
+        # [FUNCTION DOC] Seeds randomness, then for each attempt builds a config adding each non-private, non-testing
+        # field with probability p using sampled values. If the config does not pass, minimizes it by bisection and
+        # collects the minimal failing config. Returns the list of minimal configs found.
         """
         Test configs and bisect to minimal failing configuration.
         """
@@ -841,11 +938,16 @@ class ConfigFuzzer:
     def _bisect_failing_config(
         self, results: ResultType, failing_config: ConfigType
     ) -> ConfigType | None:
+        # [FUNCTION DOC] HELPER: Starts bisection on the items of a failing config mapping.
         return self._bisect_failing_config_helper(results, list(failing_config.items()))
 
     def _bisect_failing_config_helper(
         self, results: ResultType, failing_config: list[tuple[str, Any]]
     ) -> ConfigType | None:
+        # [FUNCTION DOC] HELPER: Recursively shrinks a failing config (list of name/value pairs). Empty gives none; a
+        # single item is returned if it fails alone. Shuffles, tries halves, then (for 8 or more items) overlapping
+        # quarters, then dropping one item at a time, recursing into the first smaller failing subset. Returns the
+        # minimal failing mapping, or none if nothing fails.
         """
         Bisect a failing configuration to find minimal set of configs that cause failure.
 
@@ -857,6 +959,7 @@ class ConfigFuzzer:
             return None
 
         def test(x: list[tuple[str, Any]]) -> Status:
+            # [FUNCTION DOC] HELPER: Tests the pairs as a config mapping and returns the status.
             d = dict(x)
             result = self.test_config(results, d)
             return result
@@ -901,6 +1004,9 @@ class ConfigFuzzer:
 def visualize_results(
     n: int, results: ResultType, filename: str = "results.html"
 ) -> None:
+    # [FUNCTION DOC] Writes an HTML table of pairwise results (from a 2-tuple run) to a file: rows and columns
+    # are config names, cells show status class and letter (skipped, passed, eager exception, compile exception,
+    # bad return, compile failure). Raises AssertionError if n is not 2 or results are empty. Side effect: file write.
     """
     Creates an HTML document representing the results of running the fuzzer with fuzz_n_tuple, with n = 2.
     """

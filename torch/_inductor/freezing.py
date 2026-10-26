@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# # [MODULE DOC] Inductor freezing: inlines non-mutated parameters of an AOT graph as constants,
+# # runs freezing passes and constant folding, optionally discards the original module parameters
+# # (replacing them with erased meta tensors), and provides layout-enforcement passes for outputs
+# # and as_strided inputs. Import-time side effects: creates a module logger only.
 from __future__ import annotations
 
 import itertools
@@ -30,6 +34,11 @@ def replace_params_with_constants(
     flat_params: list[Any],
     fw_metadata: torch._functorch.aot_autograd.ViewAndMutationMeta,
 ) -> list[int]:
+    # # [FUNCTION DOC] Replaces placeholder inputs that correspond to parameters with constants, except
+    # # for those that are mutated in or out of the graph or that alias an output base; those indices
+    # # are preserved as inputs. Args: gm (graph module), flat_params (real parameter values),
+    # # fw_metadata (aot metadata, mutated: its static_input_indices are rewritten for the new input
+    # # numbering). Recompiles gm. Returns the list of preserved input indices, including all non-param inputs.
     """
     Replaces the parameters of a PyTorch GraphModule with constants wherever possible.
     Returns a list of indices representing the input parameters that were not converted to constants.
@@ -76,6 +85,9 @@ def freeze(
     aot_autograd_gm: torch.fx.GraphModule,
     example_inputs: list[torch._subclasses.FakeTensor],
 ) -> tuple[torch.fx.GraphModule, list[int]]:
+    # # [FUNCTION DOC] Public entry: runs the freezing pipeline with the thread-local freezing flag set.
+    # # Args: the dynamo graph module, the AOT graph module to freeze, and example inputs. Returns the
+    # # frozen graph module and the list of preserved input indices.
     """
     Inlines parameters that are not mutated into constants and optimizes the graph through constant propagation
     and other techniques. If enabled, the function also discards the original parameters of the module for memory efficiency.
@@ -100,6 +112,12 @@ def _freeze(
     aot_autograd_gm: torch.fx.GraphModule,
     example_inputs: list[torch._subclasses.FakeTensor],
 ) -> tuple[torch.fx.GraphModule, list[int]]:
+    # # [FUNCTION DOC] HELPER: Core freezing: converts views to reshapes, then if a tracing context exists
+    # # replaces params with constants (raising AssertionError if its flat params or metadata are missing);
+    # # otherwise all inputs are preserved. Then dedups via common subexpression elimination, runs freezing
+    # # passes on the preserved example inputs, constant folds, and optionally invalidates eager modules and
+    # # discards dynamo graph module params per config. Marks the module as having frozen params.
+    # # Returns the module and preserved input indices.
     # We have converted conv's weight to channels last which may meet error for .view
     # when doing fake_tensor_prop. So we need to convert view to reshape first.
     # See the details in fx_codegen_and_compile of compile_fx.py.
@@ -145,16 +163,25 @@ def _freeze(
 
 
 class ErasedTensor(torch.Tensor):
+    # # [CLASS DOC] Meta-device tensor subclass that stands in for a discarded parameter or buffer.
+    # # Records the original attribute name and a weak reference to the owning module; any dispatched
+    # # operation on it raises an error explaining parameters were freed after freezing.
     @staticmethod
     def __new__(cls, elem, name, owning_mod):
+        # # [FUNCTION DOC] Creates the tensor from the element moved to the meta device; name and module are
+        # # not used here.
         return super().__new__(cls, elem.to(device="meta"))
 
     def __init__(self, elem, name: str | None, mod) -> None:
+        # # [FUNCTION DOC] Stores the erased attribute name and a weak reference to the owning module.
         self.erased_name = name
         self.owning_mod_ref = weakref.ref(mod)
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
+        # # [FUNCTION DOC] Dispatch hook: finds erased tensors among flattened arguments (AssertionError if none)
+        # # and always raises RuntimeError saying eager module use after freezing is invalid, naming the op,
+        # # the erased parameter name and the owning module.
         erased_tensors = [
             e
             # pyrefly: ignore [bad-unpacking]
@@ -173,6 +200,10 @@ class ErasedTensor(torch.Tensor):
 
 
 def invalidate_eager_modules():
+    # # [FUNCTION DOC] Replaces direct parameters and buffers of every nn module registered in the current
+    # # tracing context with erased tensors (keeping requires-grad and a parameter marker for parameters),
+    # # freeing the real data. Mutates modules in place with python modes disabled. Requires an active
+    # # tracing context.
     with torch.utils._python_dispatch._disable_current_modes():
         for (
             mod
@@ -196,6 +227,8 @@ def invalidate_eager_modules():
 
 
 def discard_traced_gm_params(mod: torch.fx.GraphModule):
+    # # [FUNCTION DOC] Same replacement as invalidate_eager_modules but applied to one given graph module's
+    # # direct parameters and buffers only (no recursion). Mutates the module in place.
     with torch.utils._python_dispatch._disable_current_modes():
         for attr_name, tensor in list(
             itertools.chain(
@@ -213,6 +246,10 @@ def discard_traced_gm_params(mod: torch.fx.GraphModule):
 
 
 def enforce_output_layout(gm: torch.fx.GraphModule):
+    # # [FUNCTION DOC] Before each tensor output of the graph, inserts a force-stride-order op using the
+    # # output's meta strides so layout survives later optimizations; skips non-tensors and tensors that
+    # # are not non-overlapping-and-dense. Rewires only the output node's input to the new node, lints and
+    # # recompiles. Inference only.
     """
     Make sure the output node's layout does not change due to compiler optimizations
     by adding aten.as_strided nodes with the expected strides.
@@ -247,6 +284,8 @@ def enforce_output_layout(gm: torch.fx.GraphModule):
 
 
 def enforce_as_strided_input_layout(gm: torch.fx.GraphModule):
+    # # [FUNCTION DOC] For every as_strided-family node, inserts a force-stride-order op on its input using the
+    # # input's meta strides, and rewires the node to use it, then lints and recompiles the graph.
     """
     Make sure the as_strided node's input's layout does not change due to compiler
     optimizations, because the as_strided strides info depends on input tensor stride info.
@@ -273,6 +312,10 @@ def enforce_as_strided_input_layout(gm: torch.fx.GraphModule):
 
 
 def convert_conv_weights_to_channels_last(gm: torch.fx.GraphModule):
+    # # [FUNCTION DOC] For each convolution whose weight is 4-dimensional and not already channels last,
+    # # inserts a channels-last clone of the weight and rewires the conv to use it (so freezing can fold
+    # # it). Then runs the as_strided input and output layout enforcement passes. Timed under a
+    # # dynamo timer.
     """
     Convert 4d convolution weight tensor to channels last format.
 

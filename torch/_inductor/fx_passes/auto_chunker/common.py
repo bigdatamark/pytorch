@@ -1,3 +1,4 @@
+# # [MODULE DOC] Shared types for the auto chunker: the CantChunk error and the ChunkingMeta record.
 from __future__ import annotations
 
 import dataclasses
@@ -9,11 +10,15 @@ if TYPE_CHECKING:
 
 
 class CantChunk(RuntimeError):
+    # # [CLASS DOC] Raised to abort chunking when the graph cannot be chunked.
     pass
 
 
 @dataclasses.dataclass
 class ChunkingMeta:
+    # # [CLASS DOC] Per-node chunking state with fields scale_by (node whose value scales this one, or none),
+    # # chunk_dim (dimension that is chunked, or none) and need_sum (original is the sum of the chunk results).
+    # # Invariant: chunk_dim and need_sum are mutually exclusive.
     # The value of the current node having this ChunkingMeta should be scaled by the specified scalar
     # tensor in the `scale_by` field. Need this since we pretend tangent to be 1 first and
     # scale the affected tensor later. Need propagate such information
@@ -38,12 +43,14 @@ class ChunkingMeta:
     need_sum: bool = False
 
     def __post_init__(self) -> None:
+        # # [FUNCTION DOC] Validates the invariant; raises AssertionError if chunk_dim is set while need_sum is true.
         if self.chunk_dim is not None and self.need_sum:
             raise AssertionError(
                 f"Can not have both a non-None chunk_dim and a true need_sum: {self.chunk_dim}"
             )
 
     def copy(self, **kwargs: Any) -> ChunkingMeta:
+        # # [FUNCTION DOC] Returns a new ChunkingMeta with the same fields, overridden by any keyword arguments.
         meta = ChunkingMeta(**self.__dict__)
         for k, v in kwargs.items():
             setattr(meta, k, v)
@@ -53,14 +60,17 @@ class ChunkingMeta:
     def equal(
         lhs_meta: ChunkingMeta, rhs_meta: ChunkingMeta, skip_scale_by: bool = False
     ) -> bool:
+        # # [FUNCTION DOC] Static. Compares two metas for equality, optionally ignoring scale_by. Returns a bool.
         if skip_scale_by:
             lhs_meta = lhs_meta.copy(scale_by=None)
             rhs_meta = rhs_meta.copy(scale_by=None)
         return lhs_meta == rhs_meta
 
     def chunked_by_dim(self, dim: int) -> bool:
+        # # [FUNCTION DOC] Returns whether the chunked dimension equals the given dimension.
         return self.chunk_dim == dim
 
     @staticmethod
     def is_nop(meta: ChunkingMeta | None) -> bool:
+        # # [FUNCTION DOC] Static. Returns true if the meta is absent or equals a default (no-op) meta.
         return meta is None or meta == ChunkingMeta()

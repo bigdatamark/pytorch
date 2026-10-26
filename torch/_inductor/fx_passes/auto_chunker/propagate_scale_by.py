@@ -1,3 +1,7 @@
+# # [MODULE DOC] Second chunking phase: propagates the scale_by field of ChunkingMeta through ops of the
+# # chunking subgraph using per-op rules kept in a registry mapping op overloads to handlers.
+# # Import-time side effect: registers handlers for div, where, nonlinear ops, general linear-like ops,
+# # scatter with value, add/sub and fma.
 import functools
 import logging
 from collections.abc import Callable, Sequence
@@ -27,6 +31,8 @@ def _register_propagate_rule(
     aten_op: torch._ops.OpOverload | Sequence[torch._ops.OpOverload],
     handler: _HandlerType,
 ) -> _HandlerType:
+    # # [FUNCTION DOC] HELPER: Registers handler for one op overload or a list/tuple of them in the rule
+    # # registry (AssertionError if any is not an op overload). Returns the handler.
     if not isinstance(aten_op, (list, tuple)):
         aten_op = [aten_op]  # type: ignore[assignment, list-item]
 
@@ -42,10 +48,15 @@ def _register_propagate_rule(
 def register_propagate_rule(
     aten_op: torch._ops.OpOverload | Sequence[torch._ops.OpOverload],
 ) -> Callable[[_HandlerType], _HandlerType]:
+    # # [FUNCTION DOC] Decorator factory registering the decorated handler for the given op overload(s).
     return functools.partial(_register_propagate_rule, aten_op)
 
 
 def propagate_scale_by(nodes_with_chunking_meta: Sequence[Node]) -> None:
+    # # [FUNCTION DOC] For nodes (topologically sorted) with chunking meta: skips nodes whose inputs have no
+    # # meta (subgraph inputs) or no scale_by; otherwise looks up the node's rule. Raises CantChunk if no rule
+    # # exists or the rule returns false; AssertionError if only some inputs have meta. May print debug info
+    # # when debug logging is on. Rules update node metas in place.
     """
     The input is a list of nodes that have chunking metadata.
     The nodes are already sorted in topological order.
@@ -90,6 +101,9 @@ def propagate_scale_by(nodes_with_chunking_meta: Sequence[Node]) -> None:
     ]
 )
 def propagate_div(div_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for tensor division: if the numerator has a scale_by and the denominator is a
+    # # constant or has none, sets the output's scale_by to the numerator's and returns true; else false.
+    # # Raises AssertionError if the first argument is not a node.
     lhs_node, rhs_node = div_node.args[:2]
     if not isinstance(lhs_node, Node):
         raise AssertionError(f"expected lhs_node to be Node, got {type(lhs_node)}")
@@ -112,6 +126,9 @@ def propagate_div(div_node: Node) -> bool:
     ]
 )
 def propagate_where(where_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for where: succeeds only when the true branch has scale_by, the false branch has none
+    # # and is a full tensor of zero; then copies true branch scale_by to the output. Otherwise returns false.
+    # # Raises AssertionError on non-node arguments or missing metas. The condition meta is fetched but unused.
     cond_node, true_node, false_node = where_node.args
     if not isinstance(cond_node, Node):
         raise AssertionError(f"expected cond_node to be Node, got {type(cond_node)}")
@@ -150,6 +167,8 @@ def propagate_where(where_node: Node) -> bool:
     ]
 )
 def propagate_requires_no_scaling(out_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for nonlinear ops (exp, log, tanh) and equality: inputs must carry no scale_by
+    # # (AssertionError if they do); sets output scale_by to none and returns true.
     """
     For nonlinear ops (exp, log, tanh) scale_by cannot be propagated
     through since f(S*x) != S*f(x). For boolean-output ops (eq) scale_by
@@ -190,6 +209,8 @@ def propagate_requires_no_scaling(out_node: Node) -> bool:
     ]
 )
 def propagate_general_copy(out_node: Node) -> bool:
+    # # [FUNCTION DOC] Generic rule for linear-like ops: output scale_by becomes the combined scale_by from the
+    # # inputs (via get_scale_by_from_metas) or none; always returns true. AssertionError if output meta missing.
     """
     A rule that holds for multiple ops: the scale_by of the output is
     set to the only scale_by of input nodes or None if no input has scale_by
@@ -208,6 +229,8 @@ def propagate_general_copy(out_node: Node) -> bool:
 
 @register_propagate_rule(aten.scatter.value)
 def propagate_scatter_value(out_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for scatter with a scalar value: returns false unless the value equals zero,
+    # # then applies the general copy rule.
     # The backward of scatter.value always has value=0 (gradient of a constant),
     # so S * scatter(x, idx, 0) = scatter(S*x, idx, 0) holds.
     value = out_node.args[3]
@@ -223,6 +246,8 @@ def propagate_scatter_value(out_node: Node) -> bool:
     ]
 )
 def propagate_add_sub(out_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for add/sub: both node inputs must have the identical scale_by object; then the output
+    # # gets it and the rule returns true, else false. AssertionError on non-node args or missing metas.
     """
     The scale_by node of the two arguments must be the same.
     """
@@ -248,6 +273,9 @@ def propagate_add_sub(out_node: Node) -> bool:
     ]
 )
 def propagate_fma(out_node: Node) -> bool:
+    # # [FUNCTION DOC] Rule for fused multiply-add: scale_by of the product (from the two multiplicands) must be the
+    # # same object as the addend's scale_by; then sets it on the output and returns true, else false.
+    # # AssertionError on non-node args or missing metas.
     mul_lhs, mul_rhs, add_rhs = out_node.args[:3]
     if not isinstance(mul_lhs, Node):
         raise AssertionError(f"expected mul_lhs to be Node, got {type(mul_lhs)}")

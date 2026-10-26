@@ -1,3 +1,6 @@
+# # [MODULE DOC] Pre-grad pattern pass rewriting argmax of (softmax divided by exponential noise) into
+# # argmax of (logits plus Gumbel noise). Import-time side effect: registers the graph pattern with the
+# # pattern matcher under the gumbel pass dictionary.
 import operator
 
 import torch
@@ -24,6 +27,12 @@ from .pre_grad import apply_gumbel_max_trick_pass
     pass_dict=apply_gumbel_max_trick_pass,
 )
 def apply_gumbel_max_trick(match: Match, softmax, rand_exp):
+    # # [FUNCTION DOC] Pattern handler. Applies only if the config flag is on, the divisor is an in-place
+    # # exponential_ method call with rate 1.0 and a single user, its source empty node has one user, and
+    # # the dividend is a functional softmax node with one user. Then inserts nodes computing the negated
+    # # log of the noise, adds it to the softmax logits, redirects the argmax input to it and erases the
+    # # division and softmax nodes. Increments an Inductor counter. Returns nothing; leaves graph unchanged
+    # # on any failed check.
     if not torch._inductor.config.apply_gumbel_max_trick:
         return
 
