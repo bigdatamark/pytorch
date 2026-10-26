@@ -1,3 +1,7 @@
+# [MODULE DOC] Public torch.func entry points: vmap, chunk_vmap, grad and grad_and_value. These are thin
+# wrappers that validate arguments and delegate to vmap_impl / eager_transforms implementations, and
+# strip Dynamo-specific attributes from the functools-wrapped result. Import-time side effects: defines
+# module-level type variables and the tuple of Dynamo wrapper attribute names.
 # NOTE: We allow Dynamo to see this file (via torch/_dynamo/trace_rules.py) so that it can
 #       trace through functorch transforms.
 #       Currently, we can't allow Dynamo to see `eager_transforms.py`/`vmap.py` as that break a lot of thing
@@ -47,7 +51,12 @@ _DYNAMO_WRAPPER_ATTRS = (
 def _wraps_without_dynamo_attrs(
     func: Callable[..., Any],
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] HELPER: Returns a decorator that copies func's metadata onto a wrapper like
+    # functools.wraps, then removes the Dynamo/compile bookkeeping attributes listed in
+    # _DYNAMO_WRAPPER_ATTRS from the wrapper's attribute dict so they are not inherited from func.
     def inner(wrapper: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Applies wraps(func) to wrapper, pops the Dynamo attrs (ignoring missing
+        # ones) and returns the wrapper. Mutates wrapper's attribute dict.
         wrapper = functools.wraps(func)(wrapper)
         for attr in _DYNAMO_WRAPPER_ATTRS:
             wrapper.__dict__.pop(attr, None)
@@ -73,6 +82,10 @@ def vmap(
     *,
     chunk_size: int | None = None,
 ) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Public torch.func.vmap. Validates randomness (via _check_randomness_arg) and that
+    # chunk_size is None or positive (raises ValueError otherwise), then returns a wrapper that calls
+    # vmap_impl with func, in_dims, out_dims, randomness, chunk_size and the call's args/kwargs.
+    # Outside of torch.compile the wrapper gets func's metadata minus Dynamo attributes. Does not run func eagerly.
     """
     vmap is the vectorizing map; ``vmap(func)`` returns a new function that
     maps ``func`` over some dimension of the inputs. Semantically, vmap
@@ -242,6 +255,8 @@ def vmap(
         )
 
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] Batched function returned by vmap: forwards its arguments to vmap_impl together
+        # with the captured func, in_dims, out_dims, randomness and chunk_size; returns the batched result.
         # pyrefly: ignore[bad-argument-type]
         return vmap_impl(
             # pyrefly: ignore[bad-argument-type]
@@ -267,6 +282,10 @@ def chunk_vmap(
     randomness: str = "error",
     chunks: int = 2,
 ) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Older chunked vmap API (not decorated with exposed_in). Validates randomness; if
+    # chunks is 1 it simply returns vmap(func, ...). Otherwise returns a wrapper that splits batched
+    # inputs into the given number of chunks and runs the vmapped function per chunk via _chunked_vmap.
+    # Note chunks is not validated for positivity here.
     """
     chunk_vmap is the vectorizing map (vmap) using chunks of input data. It is a mix of vmap (which vectorizes
     everything) and map (which executes things sequentially). ``chunk_vmap`` vectorizes the input with number of
@@ -313,6 +332,9 @@ def chunk_vmap(
         flat_in_dims_: Iterable[int | None],
         chunks_: int,
     ) -> Iterable[Any]:
+        # [FUNCTION DOC] HELPER: For each flat argument, split it into chunks_ pieces along its in_dim, or
+        # repeat the argument chunks_ times when its in_dim is None. Then transpose so the result iterates
+        # per-chunk tuples of flat arguments (a lazy zip iterator).
         flat_args_chunks = tuple(
             t.chunk(chunks_, dim=in_dim)
             if in_dim is not None
@@ -329,6 +351,9 @@ def chunk_vmap(
 
     @_wraps_without_dynamo_attrs(func)
     def wrapped_with_chunks(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] Chunked batched function: checks out_dims is an int or pytree of ints, flattens
+        # and validates the batched inputs against in_dims, splits them into chunks, and delegates to
+        # _chunked_vmap which runs func per chunk and concatenates outputs along out_dims. kwargs are not batched.
         _check_out_dims_is_int_or_int_pytree(out_dims, func)
         _, flat_in_dims, flat_args, args_spec = _process_batched_inputs(
             in_dims, args, func
@@ -356,6 +381,10 @@ def chunk_vmap(
 def grad(
     func: Callable[_P, Any], argnums: argnums_t = 0, has_aux: bool = False
 ) -> Callable[_P, Any]:
+    # [FUNCTION DOC] Public torch.func.grad. Returns a wrapper that computes gradients of func's
+    # single-element tensor output with respect to the arguments chosen by argnums (int or tuple),
+    # optionally returning auxiliary outputs when has_aux is set. Imports eager_transforms lazily to
+    # avoid a circular import and delegates to grad_impl. Can be nested for higher-order gradients.
     """``grad`` operator helps computing gradients of ``func`` with respect to the
     input(s) specified by ``argnums``. This operator can be nested to
     compute higher-order gradients.
@@ -456,6 +485,8 @@ def grad(
     from torch.compiler import is_compiling
 
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[Any, torch.Tensor]:
+        # [FUNCTION DOC] Calls grad_impl with the captured func, argnums, has_aux and the call's args/kwargs
+        # and returns its result (gradients, plus aux if requested).
         return eager_transforms.grad_impl(func, argnums, has_aux, args, kwargs)
 
     if not is_compiling():
@@ -469,6 +500,9 @@ def grad(
 def grad_and_value(
     func: Callable[_P, Any], argnums: argnums_t = 0, has_aux: bool = False
 ) -> Callable[_P, tuple[Any, Any]]:
+    # [FUNCTION DOC] Public torch.func.grad_and_value. Like grad, but the returned wrapper yields both the
+    # gradients and the forward value (with aux outputs when has_aux). Lazily imports eager_transforms
+    # and delegates to grad_and_value_impl; strips Dynamo attributes from the wrapper when not compiling.
     """
     Returns a function to compute a tuple of the gradient and primal, or
     forward, computation.
@@ -500,6 +534,8 @@ def grad_and_value(
     from torch.compiler import is_compiling
 
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> tuple[Any, torch.Tensor]:
+        # [FUNCTION DOC] Calls grad_and_value_impl with the captured func, argnums, has_aux and the call's
+        # args/kwargs; returns the (gradients, value) pair.
         return eager_transforms.grad_and_value_impl(
             func, argnums, has_aux, args, kwargs
         )

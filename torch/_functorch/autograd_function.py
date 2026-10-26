@@ -1,3 +1,9 @@
+# [MODULE DOC] Support for torch.autograd.Function under functorch transforms (grad, jvp, vmap,
+# functionalize). Defines the custom_function_call higher-order operator with per-transform
+# dispatch rules, helpers that generate single-level or vmapped autograd.Function subclasses,
+# ctx wrapper classes, gradient reduction helpers, the autograd_function_apply higher-order
+# operator used by Dynamo, and a Dynamo tracing helper. Import-time side effects: instantiates
+# and registers the custom_function_call and autograd_function_apply operators and their py_impl rules.
 from __future__ import annotations
 
 from typing import Any, NamedTuple, TYPE_CHECKING
@@ -41,7 +47,11 @@ _R = TypeVar("_R")
 # We do this by using creating a custom HigherOrderOperator that only functorch
 # dispatches specially.
 class CustomFunctionHigherOrderOperator(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator named custom_function_call that lets functorch transforms
+    # intercept autograd.Function calls. Holds no extra state; transform-specific behavior is
+    # registered through py_impl on the single instance custom_function_call.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name custom_function_call.
         super().__init__("custom_function_call")
 
     def __call__(
@@ -50,6 +60,9 @@ class CustomFunctionHigherOrderOperator(HigherOrderOperator):
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> Any:
+        # [FUNCTION DOC] Invoke the operator on an autograd.Function class. If any functorch transform
+        # is active, dispatch through the higher-order-operator machinery (transform-specific rules);
+        # otherwise directly call the function's apply with args and kwargs. Returns the function's outputs.
         # When custom_function_call is done dispatching through functorch,
         # it should just invoke the autograd.Function. This is consistent
         # with the autograd.Function behavior of being invoked before the
@@ -109,6 +122,9 @@ def custom_function_call_grad(
     autograd_function: type[torch.autograd.Function],
     *operands: Any,
 ) -> Any:
+    # [FUNCTION DOC] Grad/Jvp rule for custom_function_call. Builds a single-level autograd.Function
+    # wrapping autograd_function for the interpreter's level and applies it to the operands with
+    # single-level autograd-function mode enabled. Returns the (wrapped) outputs.
     Generated = generate_single_level_function(interpreter, autograd_function)
     with enable_single_level_autograd_function():
         # pyrefly: ignore [missing-attribute]
@@ -120,9 +136,17 @@ def generate_single_level_function(
     interpreter: FuncTorchInterpreter,
     autograd_function: type[torch.autograd.Function],
 ) -> type[torch.autograd.function._SingleLevelFunction]:
+    # [FUNCTION DOC] Dynamically creates a _SingleLevelFunction subclass (named after the original
+    # function plus Generated) for one functorch level. Its forward unwraps inputs at that level,
+    # re-enters custom_function_call with grad mode and forward-grad enabled and the interpreter
+    # lowered, then rewraps outputs preserving identity of returned inputs. setup_context, backward and
+    # jvp delegate to the original function. Returns the new class; no global side effects.
     level = interpreter.level()
 
     def forward(*operands: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Unwrap tensor operands for this level, run the original function via
+        # custom_function_call under enabled grad modes, and wrap tensor outputs back (keeping identity of
+        # outputs that are the unwrapped inputs, needed for mark_dirty). Returns the wrapped outputs.
         unwrapped_operands = pytree.tree_map_only(
             torch.Tensor, lambda x: _unwrap_for_grad(x, level), operands
         )
@@ -136,6 +160,7 @@ def generate_single_level_function(
 
         # See NOTE [mark_dirty object identity check]
         def wrap_fn(output: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Wrap a tensor output for grad at the enclosing level.
             return _wrap_for_grad(output, level)
 
         return wrap_outputs_maintaining_identity(
@@ -143,15 +168,18 @@ def generate_single_level_function(
         )
 
     def setup_context(ctx: Any, inputs: Any, output: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Forwards to the original autograd.Function's setup_context.
         return autograd_function.setup_context(ctx, inputs, output)
 
     # backward is only used if the transform is TransformType.Grad
     def backward(ctx: Any, *grads: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Forwards to the original function's backward; returns its gradients.
         result = autograd_function.backward(ctx, *grads)
         return result
 
     # jvp is only used if the transform is TransformType.Jvp
     def jvp(ctx: Any, *tangents: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Forwards to the original function's jvp; returns output tangents.
         result = autograd_function.jvp(ctx, *tangents)
         return result
 
@@ -196,6 +224,12 @@ def wrap_outputs_maintaining_identity(
     wrap_fn: Callable[..., Any],
     out_dims: Any = NO_OUT_DIMS,
 ) -> Any:
+    # [FUNCTION DOC] Wraps the tensors in outputs using wrap_fn, except that any output that is
+    # literally (same object as) one of the unwrapped inputs is replaced by the corresponding original
+    # input, preserving identity for mark_dirty. Non-tensor outputs pass through. If out_dims is
+    # specified (vmap case) it is broadcast to the output structure and wrap_fn receives the per-output
+    # dim; raises RuntimeError if out_dims is incompatible with the output structure. Returns the outputs
+    # in their original pytree structure.
     flat_unwrapped_inputs = pytree.arg_tree_leaves(*unwrapped_inputs)
     flat_orig_inputs = pytree.arg_tree_leaves(*orig_inputs)
 
@@ -288,6 +322,8 @@ def wrap_outputs_maintaining_identity(
 
 
 class VmapInfo(NamedTuple):
+    # [CLASS DOC] Immutable record passed as the first argument to an autograd.Function's vmap
+    # staticmethod: batch_size is the size of the vmapped dimension, randomness is the vmap randomness mode string.
     batch_size: int
     randomness: str
 
@@ -295,10 +331,14 @@ class VmapInfo(NamedTuple):
 def has_overridden_vmap_rule(
     autograd_function: type[torch.autograd.Function],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the class defines its own vmap staticmethod (differs from the base
+    # torch.autograd.Function.vmap).
     return autograd_function.vmap is not torch.autograd.Function.vmap
 
 
 def validate_vmap_returns_tuple_of_two_elements(result: Any) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError unless result is a tuple of exactly two elements
+    # (output, out_dims). Returns None.
     base_error_msg = (
         "Expected the vmap staticmethod to have two returns, an output "
         "and out_dims with pytree structure compatible with the output. "
@@ -316,6 +356,10 @@ def custom_function_call_vmap(
     *operands: Any,
     **kwargs: Any,
 ) -> Any:
+    # [FUNCTION DOC] Vmap rule for custom_function_call. Raises NotImplementedError if any kwarg holds
+    # a tensor. If the function sets generate_vmap_rule, it must not also override vmap (RuntimeError
+    # on ambiguity) and the rule is auto-generated; otherwise the function must override vmap
+    # (RuntimeError if not), and the user's vmap staticmethod is run through the helper. Returns outputs.
     if any(
         isinstance(val, torch.Tensor)
         for val in torch.utils._pytree.tree_flatten(kwargs)[0]
@@ -365,6 +409,12 @@ def custom_function_call_vmap_helper(
     *operands: Any,
     **kwargs: Any,
 ) -> Any:
+    # [FUNCTION DOC] Runs a user vmap rule. Unwraps batched operands at this level to get per-operand
+    # batch dims. If no operand is batched here, lowers to the next level and calls the op unbatched.
+    # Otherwise calls vmap_function with a VmapInfo, the in_dims and unwrapped operands (levels lowered),
+    # validates it returned (output, out_dims), and rewraps outputs as batched tensors at this level
+    # (out_dim None means unbatched), preserving identity of returned inputs. op is either an
+    # autograd.Function class or a library-registered op; the latter lowers by excluding the batched dispatch key.
     current_level = interpreter.level()
     info = VmapInfo(
         batch_size=interpreter.batch_size(),
@@ -375,6 +425,8 @@ def custom_function_call_vmap_helper(
     autograd_function_case = isinstance(op, torch.autograd.function.FunctionMeta)
 
     def lower_to_next() -> Any:
+        # [FUNCTION DOC] HELPER: Returns a context manager that moves dispatch below this vmap level:
+        # the interpreter's lower guard for autograd.Function, or a guard excluding the batched dispatch key.
         if autograd_function_case:
             return interpreter.lower()
         else:
@@ -400,6 +452,7 @@ def custom_function_call_vmap_helper(
 
     # See NOTE [mark_dirty object identity check]
     def wrap_fn(output: torch.Tensor, out_dim: int | None) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns output unchanged if out_dim is None, else adds a batch dim at out_dim for the current level.
         return (
             output
             if out_dim is None
@@ -412,6 +465,9 @@ def custom_function_call_vmap_helper(
 
 
 def unpack_outputs(outputs: tuple[Any, ...]) -> tuple[Any, Any]:
+    # [FUNCTION DOC] HELPER: Splits a vmapped forward's flat result into (outputs, out_dims). The last
+    # element is out_dims; if it is a tuple the remaining elements are the outputs (as a tuple), else
+    # the outputs are the single first element.
     out_dims = outputs[-1]
     if isinstance(out_dims, tuple):
         outputs = outputs[:-1]
@@ -425,6 +481,10 @@ def custom_function_call_vmap_generate_rule(
     autograd_function: type[torch.autograd.Function],
     *operands: Any,
 ) -> Any:
+    # [FUNCTION DOC] Auto-generated vmap rule (generate_vmap_rule=True). Unwraps batched operands,
+    # builds a vmapped autograd.Function class for the observed in_dims, batch size and randomness,
+    # runs it below this level via custom_function_call, unpacks (outputs, out_dims) and wraps the
+    # outputs as batched tensors at this level.
     unwrapped_operands, in_dims = unwrap_batched(operands, interpreter.level())
     vmapped_function = vmapify_autograd_function(
         autograd_function,
@@ -448,6 +508,8 @@ def custom_function_call_functionalize(
     generate_vmap_rule: bool,
     *operands: Any,
 ) -> Any:
+    # [FUNCTION DOC] Functionalize rule for custom_function_call: not implemented; always raises RuntimeError.
+    # KNOWN ISSUE: the signature takes a generate_vmap_rule argument before operands, unlike other rules.
     raise RuntimeError("NYI: Functionalize rule for custom_function_call")
 
 
@@ -457,7 +519,14 @@ def vmapify_autograd_function(
     batch_size: int,
     randomness: str,
 ) -> type[torch.autograd.Function]:
+    # [FUNCTION DOC] Builds a new autograd.Function subclass (named Vmapped plus the original name,
+    # generate_vmap_rule set) whose forward, setup_context, backward and jvp run the original
+    # function's corresponding methods under vmap with the given in_dims, batch_size and randomness.
+    # Per-class state (input shapes, saved-tensor batch dims, out_dims) is stored on ctx keyed by the
+    # generated class id. Gradients are reduced via reductify. Returns the class.
     def forward(*operands: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the original forward under vmap; returns the outputs with out_dims
+        # appended as the last element (flattened if outputs is a tuple).
         outputs, out_dims = restore_vmap(
             autograd_function.forward, in_dims, batch_size, randomness
         )(*operands)
@@ -467,10 +536,15 @@ def vmapify_autograd_function(
             return *outputs, out_dims
 
     def setup_context(ctx: Any, inputs: Any, outputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Runs the original setup_context under vmap with a ctx wrapper that
+        # unwraps saved tensors and records their batch dims. Stores on ctx (keyed by generated class id)
+        # the input shapes, saved-tensor bdims and out_dims, creating those mappings if absent.
         outputs, out_dims = unpack_outputs(outputs)
         key = id(Generated)
 
         def inner(inputs: Any, outputs: Any) -> None:
+            # [FUNCTION DOC] HELPER: Body executed under vmap: calls the original setup_context with a
+            # saving-aware ctx wrapper and records input shapes and saved-tensor bdims on the real ctx.
             # wrapped_ctx.save_for_backward will:
             # - unwrap batchedtensors into (tensor, bdim)
             # - save_for_backward(*unwrapped_tensors)
@@ -511,9 +585,13 @@ def vmapify_autograd_function(
         ctx._pt_out_dims.update({key: out_dims})
 
     def jvp(ctx: Any, *tangents: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the original jvp under vmap using the saved tensors and their
+        # recorded batch dims, with None tangents given a None in_dim; reduces the result to out_dims
+        # and returns it with a trailing None (for the extra out_dims output).
         key = id(Generated)
 
         def jvp_no_context(saved_tensors: Any, tangents: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Calls the original jvp with a ctx whose saved_tensors are overridden.
             wrapped_ctx = CtxWithSavedTensors(ctx, saved_tensors)
             return autograd_function.jvp(wrapped_ctx, *tangents)
 
@@ -534,6 +612,9 @@ def vmapify_autograd_function(
             return *result, None
 
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the original backward under vmap. Drops the gradient for the extra
+        # out_dims output, uses the stored out_dims as grad in_dims (None where a grad is None), then
+        # reduces resulting grads to the input bdims and recorded input shapes via reductify. Returns the tuple of grads.
         key = id(Generated)
         grad_outputs_ = grad_outputs[:-1]
         grad_outputs_in_dims = ctx._pt_out_dims[key]
@@ -547,6 +628,7 @@ def vmapify_autograd_function(
         )
 
         def backward_no_context(inputs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Unpacks (saved_tensors, grad_outputs) and calls the original backward with a ctx overriding saved_tensors.
             saved_tensors, grad_outputs = inputs
             wrapped_ctx = CtxWithSavedTensors(ctx, saved_tensors)
             return autograd_function.backward(wrapped_ctx, *grad_outputs)
@@ -581,6 +663,8 @@ def vmapify_autograd_function(
 # tangents might be None, so we need to replace
 # the corresponding in_dims with None.
 def get_tangents_in_dims(input_dims: Any, tangents: tuple[Any, ...]) -> Any:
+    # [FUNCTION DOC] HELPER: Flattens input_dims and tangents, replaces the in_dim with None wherever
+    # the matching tangent is None, and returns the result in the original input_dims structure.
     flat_in_dims, spec = pytree.tree_flatten(input_dims)
     flat_tangents = pytree.arg_tree_leaves(*tangents)
     result = [
@@ -644,9 +728,14 @@ def get_tangents_in_dims(input_dims: Any, tangents: tuple[Any, ...]) -> Any:
 # Wraps a ctx object. Forwards all attr accesses to the underlying object
 # except for the attrs in _pt_attrs
 class WrappedCtx:
+    # [CLASS DOC] HELPER: Proxy around an autograd ctx. Attribute reads and writes are forwarded to the
+    # inner ctx (_pt_inner_ctx) except names in _pt_reserved_attrs, which live on the wrapper itself.
+    # Invariant: the user's ctx must not already have the reserved attribute names.
     _pt_reserved_attrs: tuple[str, ...] = ("_pt_reserved_attrs", "_pt_inner_ctx")
 
     def __init__(self, ctx: Any) -> None:
+        # [FUNCTION DOC] HELPER: Stores ctx as the inner ctx. If ctx is not itself a WrappedCtx, raises
+        # RuntimeError when it already has any reserved attribute name.
         if not isinstance(ctx, WrappedCtx):
             reserved_attrs = type(self)._pt_reserved_attrs
             for name in reserved_attrs:
@@ -660,9 +749,11 @@ class WrappedCtx:
         self._pt_inner_ctx = ctx
 
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] HELPER: Called for attributes not found on the wrapper; reads from the inner ctx.
         return getattr(self._pt_inner_ctx, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
+        # [FUNCTION DOC] HELPER: Reserved names are stored on the wrapper's own dict; all other names are set on the inner ctx.
         if name in type(self)._pt_reserved_attrs:
             self.__dict__[name] = value
             return
@@ -671,18 +762,25 @@ class WrappedCtx:
 
 # Wraps ctx to create a new ctx object that overrides saved_tensors.
 class CtxWithSavedTensors(WrappedCtx):
+    # [CLASS DOC] HELPER: ctx wrapper whose saved_tensors property returns a caller-supplied sequence
+    # (_pt_new_saved_tensors) instead of the real ctx's saved tensors; everything else is forwarded.
     _pt_reserved_attrs = ("_pt_new_saved_tensors", *WrappedCtx._pt_reserved_attrs)
 
     def __init__(self, ctx: Any, new_saved_tensors: Sequence[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Wraps ctx and records the replacement saved tensors.
         super().__init__(ctx)
         self._pt_new_saved_tensors = new_saved_tensors
 
     @property
     def saved_tensors(self) -> Sequence[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Returns the replacement saved tensors.
         return self._pt_new_saved_tensors
 
 
 class CtxCustomSave(WrappedCtx):
+    # [CLASS DOC] HELPER: ctx wrapper used in setup_context under vmap. save_for_backward and
+    # save_for_forward unwrap batched tensors at the current level, save the unwrapped tensors on the
+    # real ctx and remember their batch dims in _pt_saved_tensors_bdims (overwritten on each save call).
     _pt_reserved_attrs = (
         "_pt_saved_tensors_bdims",
         "_pt_current_level",
@@ -690,16 +788,19 @@ class CtxCustomSave(WrappedCtx):
     )
 
     def __init__(self, ctx: Any, current_level: int) -> None:
+        # [FUNCTION DOC] HELPER: Wraps ctx, with empty saved bdims and the vmap level to unwrap at.
         super().__init__(ctx)
         self._pt_saved_tensors_bdims: tuple[Any, ...] = ()
         self._pt_current_level = current_level
 
     def save_for_backward(self, *tensors: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Unwraps batched tensors, saves them for backward on the inner ctx and records their batch dims.
         unwrapped_tensors, bdims = unwrap_batched(tensors, self._pt_current_level)
         self._pt_inner_ctx.save_for_backward(*unwrapped_tensors)
         self._pt_saved_tensors_bdims = bdims
 
     def save_for_forward(self, *tensors: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Unwraps batched tensors, saves them for forward-mode AD on the inner ctx and records their batch dims.
         unwrapped_tensors, bdims = unwrap_batched(tensors, self._pt_current_level)
         self._pt_inner_ctx.save_for_forward(*unwrapped_tensors)
         self._pt_saved_tensors_bdims = bdims
@@ -712,6 +813,9 @@ def reductify(
     batch_size: int,
     target_shape_without_bdim_to_reduce_to: Any = None,
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Normalizes grad_input and both bdim arguments to tuples, then applies
+    # reductify_leaf elementwise (zipped with the optional per-input target shapes, defaulting to
+    # none). Returns a tuple of reduced gradients.
     if not isinstance(grad_input, tuple):
         grad_input = (grad_input,)
     if not isinstance(grad_input_bdim, tuple):
@@ -740,6 +844,10 @@ def reductify_leaf(
     batch_size: int,
     target_shape_without_bdim_to_reduce_to: Any = None,
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] Reconciles one gradient with its input's batch dim. None stays None; if neither is
+    # batched return as is; if only the grad is batched sum over its bdim. If the input is batched but
+    # the grad is not, expand the grad along a new dim of batch_size at the input bdim. If a target
+    # shape is given, sum the grad down to that shape under vmap; else just move the grad's bdim to the input's.
     if grad_input is None:
         return None
 
@@ -797,7 +905,10 @@ def autograd_function_forward_rewritten(
     original_forward: Callable[_P, _R],
     original_setup_context: Callable[..., Any],
 ) -> Callable[..., _R]:
+    # [FUNCTION DOC] Combines a forward without ctx and a setup_context into a single forward taking
+    # ctx first (the legacy style). Returns the combined function.
     def new_forward(ctx: Any, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Runs the original forward, then setup_context with ctx, the args tuple and the output; returns the output.
         output = original_forward(*args, **kwargs)
         original_setup_context(ctx, args, output)
         return output
@@ -806,7 +917,11 @@ def autograd_function_forward_rewritten(
 
 
 class AutogradFunctionApply(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator autograd_function_apply used by Dynamo to represent an
+    # autograd.Function as a forward graph module and a backward graph module. Stateless itself;
+    # each call builds a fresh autograd.Function template.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name autograd_function_apply.
         super().__init__("autograd_function_apply")
 
     def __call__(
@@ -816,6 +931,12 @@ class AutogradFunctionApply(HigherOrderOperator):
         *fwd_args: Any,
         **fwd_kwargs: Any,
     ) -> Any:
+        # [FUNCTION DOC] Runs fwd/bwd graph modules as a real autograd.Function. fwd_kwargs must provide
+        # non_differentiable_idx and saved_for_backward_idx (KeyError if missing) and may provide
+        # dirty_idx. Forward interprets fwd to get (output, saved_values), tagging proxies of saved
+        # values not from save_for_backward with node metadata; setup_context marks dirty and
+        # non-differentiable outputs; backward interprets bwd on grads plus saved values. Returns the
+        # outputs of applying the template to fwd_args.
         saved_values: Iterable[Any] | None = None
         dirty_idx = fwd_kwargs.get("dirty_idx", [])
         dirty_idx_set = set(dirty_idx)
@@ -823,8 +944,12 @@ class AutogradFunctionApply(HigherOrderOperator):
         saved_for_backward_idx = fwd_kwargs["saved_for_backward_idx"]
 
         class ApplyTemplate(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Per-call autograd.Function whose forward/backward execute the captured
+            # fwd and bwd graph modules; shares saved_values with the enclosing call via closure.
             @staticmethod
             def forward(*args: Any, **kwargs: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Interprets fwd on args, stores the saved values in the enclosing
+                # scope, flags proxies of non-save_for_backward saved tensors in node meta, returns output.
                 nonlocal saved_values
 
                 # The Interpreter here is required to propagate metadata
@@ -847,7 +972,9 @@ class AutogradFunctionApply(HigherOrderOperator):
 
             @staticmethod
             def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+                # [FUNCTION DOC] HELPER: Calls mark_dirty and mark_non_differentiable on ctx for the outputs at the recorded indices (when any).
                 def selected_outputs(idx: Iterable[int]) -> list[Any]:
+                    # [FUNCTION DOC] HELPER: Returns the outputs at positions in idx (a single non-sequence output counts as position 0).
                     idx_set = set(idx)
                     if isinstance(output, (tuple, list)):
                         return [x for i, x in enumerate(output) if i in idx_set]
@@ -865,6 +992,8 @@ class AutogradFunctionApply(HigherOrderOperator):
 
             @staticmethod
             def backward(ctx: Any, *grad: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Interprets bwd on the incoming grads followed by the saved
+                # values from forward; raises AssertionError if forward has not stored saved values.
                 # The Interpreter here is required to propagate metadata
                 # from the dynamo graph body to the local_map graph body.
                 # This is required for fx_traceback.annotate for work.
@@ -880,12 +1009,20 @@ autograd_function_apply = AutogradFunctionApply()
 
 
 class DynamoAutogradFunctionTraceHelper:
+    # [CLASS DOC] Namespace (no state) of static helpers that re-express parts of autograd.Function's
+    # C++ forward behavior in Python so Dynamo can trace them.
     @staticmethod
     def fwd_trace_helper(orig_fwd: Callable[_P, Any]) -> Callable[_P, Any]:
+        # [FUNCTION DOC] Wraps a forward function. The wrapper runs it under no_grad, then for each
+        # tensor output that is the same object as an input and not marked dirty on ctx (first arg),
+        # returns a view_as of it, mirroring the C++ behavior; other outputs pass through. A single
+        # tensor returns as such; otherwise a tuple.
+        # KNOWN ISSUE: per the TODO, requires_grad changes from mark_non_differentiable are not replicated.
         # autograd.Function forward does more than just running the forward method. Most
         # of this logic is in C++. Here, we rewrite that functionality in python and let
         # Dynamo trace it.
         def inner(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+            # [FUNCTION DOC] HELPER: Runs orig_fwd under no_grad and converts pass-through inputs to views as described above.
             with torch.no_grad():
                 outs = orig_fwd(*args, **kwargs)
 
@@ -893,6 +1030,7 @@ class DynamoAutogradFunctionTraceHelper:
             dirty_tensors = getattr(ctx, "dirty_tensors", None)
 
             def is_dirty_tensor(tensor: torch.Tensor) -> bool:
+                # [FUNCTION DOC] HELPER: True if tensor is (by identity) among ctx.dirty_tensors; False if ctx has none.
                 if dirty_tensors is None:
                     return False
                 return any(
@@ -902,6 +1040,7 @@ class DynamoAutogradFunctionTraceHelper:
                 )
 
             def is_tensor_arg(tensor: torch.Tensor) -> bool:
+                # [FUNCTION DOC] HELPER: True if tensor is (by identity) one of the positional args.
                 return any(
                     arg is tensor for arg in args if isinstance(arg, torch.Tensor)
                 )

@@ -1,3 +1,10 @@
+# [MODULE DOC] Main user-facing entry points of AOTAutograd: aot_function, aot_module,
+# aot_module_simplified (used by Dynamo/Inductor), the joint-graph-with-descriptors export/compile pair,
+# and the export helpers aot_export_module / aot_export_joint_simple. Orchestrates metadata collection,
+# graph capture and compilation implemented in the _aot_autograd subpackage, and re-exports many of
+# its names for backward compatibility. Contains long design notes on mutation/aliasing handling and
+# effect tokens. Import-time side effects: shadows the builtin zip with a strict-length zip, creates the
+# global AOT_COUNTER and an empty aot_autograd_decompositions table, and defines compiled_function/compiled_module aliases.
 from __future__ import annotations
 
 import contextlib
@@ -485,6 +492,16 @@ def create_aot_state(
     fake_mode: FakeTensorMode,
     shape_env: ShapeEnv | None,
 ) -> AOTState:
+    # [FUNCTION DOC] Builds the AOTState for a flat function: merges default, user and (if
+    # configured) RNG decompositions into the config, enters a set of tracing contexts on the given
+    # ExitStack (so they stay active beyond this call: timing event, no multithreaded autograd, RNG
+    # state preservation, fake mode, python dispatcher, Philox tracker, disabled saved-tensor hooks), runs
+    # functionalized forward metadata collection on duplicated fake script objects, and decides whether
+    # autograd is needed (an inference graph is used if no output requires grad and no grad-requiring
+    # input is mutated visibly). Raises AssertionError if outputs alias intermediates with subclass
+    # inputs; in export mode raises RuntimeError for input metadata mutations, mutated grad-requiring
+    # inputs when tracing the joint, subclasses, or functionalized RNG. Returns AOTState.
+    # KNOWN ISSUE: the docstring describes partitioning/compilation, which this function does not do.
     """
     Traces the forward and backward graphs of the attr:`flat_fn` to generate a
     joint graph. The joint graph is an Fx graph with Aten ops. Please refer to
@@ -558,6 +575,8 @@ def create_aot_state(
     # so we need to duplicate the fake script objects so that subsequent tracing
     # won't be affected.
     def _dup_fake_script_obj(fake_flat_args: FakifiedFlatArgs) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Returns a list of the args where each fake script object or custom class
+        # instance is replaced by a fresh fake copy of its real object; other args are passed through.
         return [
             maybe_to_fake_obj(detect_fake_mode(fake_flat_args), arg.real_obj)
             if isinstance(arg, FakeScriptObject) or is_custom_class(type(arg))
@@ -725,6 +744,12 @@ def aot_function(
     disable_functionalization: bool = False,
     _disable_torch_fn_metadata_mode: bool = False,
 ) -> Callable[_P, Any]:
+    # [FUNCTION DOC] Public (experimental) API. Returns a wrapper of fn that, on first call, flattens
+    # the args, builds fake inputs, captures the joint graph, partitions it with partition_fn and
+    # compiles forward/backward/inference graphs with the given compilers; the compiled callable and
+    # output pytree spec are cached in a closure and reused on every later call (no re-specialization or
+    # guard checking). Compilers default as in the docstring (bw/inference fall back to fw_compiler in stage 2).
+    # Side effects: consumes one AOT_COUNTER id when called. Output is unflattened to fn's structure.
     """
     Traces the forward and backward graph of :attr:`fn` using torch dispatch
     mechanism, and then compiles the generated forward and backward graphs
@@ -798,6 +823,9 @@ def aot_function(
 
     @wraps(fn)
     def returned_function(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+        # [FUNCTION DOC] HELPER: Compiled wrapper. First call compiles (fake mode, aot state, stage 1 capture,
+        # stage 2 compile inside an ExitStack) and caches the result; every call runs the cached
+        # compiled function on the flat args and unflattens the outputs to the original structure.
         nonlocal cached_res
         # Now flatten the tensor args
         flat_args = pytree.arg_tree_leaves(*args, **kwargs)
@@ -845,6 +873,11 @@ def aot_function(
 
 
 def aot_module(mod: nn.Module, *args: Any, **kwargs: Any) -> nn.Module:
+    # [FUNCTION DOC] Public (experimental) API. Asserts mod has no fake params/buffers, snapshots its
+    # named parameters and buffers (including duplicates), compiles a functional-call wrapper with
+    # aot_function (extra args/kwargs forwarded, num_params_buffers set automatically) and returns a
+    # new module whose forward calls the compiled function with the captured params/buffers plus the inputs.
+    # Parameter and buffer references are captured once; later replacement of module attributes is not seen.
     """
     Traces the forward and backward graph of :attr:`mod` using torch dispatch
     tracing mechanism. It is wrapper function, that underneath uses
@@ -875,6 +908,7 @@ def aot_module(mod: nn.Module, *args: Any, **kwargs: Any) -> nn.Module:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Calls mod functionally with the merged params and buffers mapping and the given args/kwargs.
         params_and_buffers = {**named_params, **named_buffers}
         return torch.func.functional_call(mod, params_and_buffers, args, kwargs)
 
@@ -890,11 +924,15 @@ def aot_module(mod: nn.Module, *args: Any, **kwargs: Any) -> nn.Module:
     )
 
     class AOTModule(nn.Module):
+        # [CLASS DOC] HELPER: Wrapper module returned by aot_module; keeps the original module as
+        # orig_module and forwards calls to the compiled functional version.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Stores the original module as orig_module.
             super().__init__()
             self.orig_module = mod
 
         def forward(self, *args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the compiled function with the captured params/buffers followed by args/kwargs.
             return compiled_f(
                 named_params,
                 named_buffers,
@@ -914,6 +952,10 @@ def autograd_cache_key(
     keep_inference_input_mutations: bool = False,
     disable_functionalization: bool = False,
 ):
+    # [FUNCTION DOC] Computes the AOTAutograd cache key for a graph module and example inputs without
+    # compiling: builds the AOT config via prepare_aot_config, creates a fake mode and fakified inputs,
+    # then delegates to the autograd cache key function with compiler config extras. Returns whatever
+    # that returns. Creates fake tensors; may register state in the tracing context.
     (
         _params_buffers_flat,
         _params_spec,
@@ -959,6 +1001,12 @@ def prepare_aot_config(
     list[Any],
     AOTConfig,
 ]:
+    # [FUNCTION DOC] Collects the module's parameters and buffers (keeping duplicates), prepends them to
+    # args as the full flat argument list, and creates descriptors (param/buffer) for them. If a
+    # TracingContext is active, records the flattened params/buffers and their subclass-unwrapped
+    # forms on it. Queries Dynamo metadata for argument sources and static input indices, infers
+    # dynamic shapes from any fake-mode input, and builds a fresh AOTConfig (consuming an AOT_COUNTER id).
+    # Returns (params_buffers_flat, param names, buffer names, full_args, full_args_descs, aot_config).
     # TODO: There's something a bit suspicious here; typically simplified
     # module shouldn't actually have any parameters...
     params = dict(mod.named_parameters(remove_duplicate=False))
@@ -1067,6 +1115,13 @@ def prepare_aot_module_simplified(
     PytreeThunk | None,
     list[ActInputPath],
 ]:
+    # [FUNCTION DOC] Prepares everything needed to trace a module: builds the AOT config and lifted
+    # args via prepare_aot_config, wraps the module in a functional call taking params/buffers first,
+    # and, when flatten is true, pytree-flattens inputs and kwargs (kwargs default to empty) and
+    # wraps outputs flat, returning in/out specs; when flatten is false kwargs must be None
+    # (AssertionError otherwise) and specs are None. Extends descriptors for user inputs with plain
+    # descriptors, constructs the fake mode and fakified args. Returns a 12-tuple: functional call,
+    # flat params/buffers, param names, buffer names, fake flat args, descriptors, config, fake mode, shape env, in_spec, out_spec, act input paths.
     if not flatten:
         if kwargs is not None:
             raise AssertionError("kwargs must be None when flatten=False")
@@ -1160,6 +1215,15 @@ def aot_module_simplified(
     | None = None,
     compile_region_name: str | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Compile entry point used by Dynamo-style frontends. Optionally runs pre-grad
+    # passes on a GraphModule (early, or late only after a cache miss, per the timing setting).
+    # If the forward compiler is serializable or autograd cache is forced and a local/remote cache is
+    # enabled, tries loading from AOTAutogradCache; on miss it creates the AOT state (disabling
+    # compiled autograd), captures the graph and compiles. Returns a forward that prepends the
+    # module's params/buffers to runtime args and calls the compiled function: boxed (single list,
+    # which is cleared) when mod is a GmWrapper, otherwise unboxed varargs. The result also exposes zero_grad,
+    # named_parameters, named_buffers and a serialize attribute (None if not serializable).
+    # Raises AssertionError if no compiled function is produced.
     """
     This is the simplified or low overhead version of aot_module. For frontends
     like TorchDynamo, the input functions/modules to AOT are static and have
@@ -1264,6 +1328,8 @@ def aot_module_simplified(
         # https://github.com/pytorch/pytorch/pull/122535/files#r1560096481
         @simple_wraps(compiled_fn)
         def forward(runtime_args: list[Any]) -> Any:
+            # [FUNCTION DOC] HELPER: Boxed-convention forward: builds the flat arg list from params/buffers
+            # then runtime_args, empties runtime_args in place (to release references), and calls the compiled function.
             flat_args = []
             flat_args.extend(params_buffers_flat)
             flat_args.extend(runtime_args)
@@ -1280,6 +1346,7 @@ def aot_module_simplified(
         # NB: GraphModule/nn.Module rely on the non-boxed calling convention here
         @simple_wraps(compiled_fn)
         def forward(*runtime_args: tuple[Any]) -> Any:
+            # [FUNCTION DOC] HELPER: Unboxed forward: concatenates params/buffers with the positional runtime args and calls the compiled function with that list.
             full_args = []
             full_args.extend(params_buffers_flat)
             # pyrefly: ignore[bad-argument-type]
@@ -1295,6 +1362,8 @@ def aot_module_simplified(
 
     # Add a serialize function
     def grab_serialize_fn(fn: Any) -> Callable[..., Any] | None:
+        # [FUNCTION DOC] HELPER: Walks the chain of wrapped functions and returns serialize_fn of the first
+        # SerializableCompiledFunction found, or None if there is none.
         if isinstance(fn, SerializableCompiledFunction):
             return fn.serialize_fn
         elif hasattr(fn, "__wrapped__"):
@@ -1309,7 +1378,10 @@ def aot_module_simplified(
 def boxed_nop_preserve_node_meta(
     gm: torch.fx.GraphModule, example_inputs: Sequence[InputType]
 ) -> Any:
+    # [FUNCTION DOC] Trivial boxed compiler: returns a callable (marked as boxed-call) that runs the
+    # graph module with an FX interpreter on the argument list while preserving node metadata. example_inputs is unused.
     def run(args: list[Any]) -> OutputCode:
+        # [FUNCTION DOC] HELPER: Executes the graph module on the boxed args under preserve_node_meta.
         with torch.fx.traceback.preserve_node_meta():
             return torch.fx.Interpreter(gm).boxed_run(args)
 
@@ -1330,6 +1402,11 @@ def aot_export_joint_with_descriptors(
     _record_nn_module_stack: bool = False,
     _disable_torch_fn_metadata_mode: bool = False,
 ) -> JointWithDescriptors:
+    # [FUNCTION DOC] Stage-1 export of a module's joint graph with descriptors. Prepares the module
+    # (flattened, params/buffers lifted, non-lazy backward lowering), enters compiled-autograd-disable and
+    # other tracing contexts on the caller's ExitStack (which must stay open until compilation), creates
+    # the AOT state, and captures the graph without any cache lookup. Returns a JointWithDescriptors
+    # holding the state, capture, param/buffer name lists and in/out specs. Raises AssertionError if specs are missing.
     """
     This API captures the joint graph for an nn.Module.  However, unlike
     aot_export_joint_simple or aot_export_module(trace_joint=True), the
@@ -1463,6 +1540,14 @@ def aot_compile_joint_with_descriptors(
     bw_compiler: AOTDispatchCompiler | None = boxed_nop_preserve_node_meta,
     serializable: bool = False,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Stage-2 compile of a JointWithDescriptors into a callable with the original
+    # (unflattened) calling convention. Wraps fw_compiler as serializable. If serializable is true,
+    # replaces the stored AOT config with cache info and patches functorch config (strict/bundled
+    # autograd cache, non-lazy backward lowering, bypass cache key) during compilation. Ensures a
+    # tracing context exists when a fake mode is detected, runs the stage-2 compile (mutating
+    # jd's state config when serializable), wraps results supporting serialization into a bundled
+    # serializable callable, and returns a nonstrict-traceable function that flattens args/kwargs
+    # (kwargs reordered to the stored input spec), runs the compiled function and unflattens outputs.
     """
     Companion function for aot_export_joint_with_descriptors which compiles the joint
     graph into a callable function that follows a standard calling convention.
@@ -1539,6 +1624,8 @@ def aot_compile_joint_with_descriptors(
     @simple_wraps(compiled_fn)
     @torch._dynamo.nonstrict_trace  # allow recursive compilation
     def unflattened_compiled_fn(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Flattens args and reordered kwargs into one list, calls the compiled
+        # function on it and rebuilds the original output structure from the stored output spec.
         flat_inputs = pytree.tree_flatten((args, reorder_kwargs(kwargs, jd.in_spec)))[0]
         # TODO: do I need to filter? I hope not!
         flat_outputs = compiled_fn(flat_inputs)
@@ -1563,6 +1650,13 @@ def aot_export_module(
     dynamic_shapes: bool | None = None,
     kwargs: dict[str, Any] | None = None,
 ) -> tuple[Callable[..., Any] | torch.fx.GraphModule, GraphSignature]:
+    # [FUNCTION DOC] Exports a module to a functionalized FX graph plus a GraphSignature. Params and
+    # buffers are lifted to leading graph inputs. With trace_joint, the module must return a scalar
+    # loss (selected by output_loss_index) that requires grad, other outputs must not require grad; the
+    # result is a joint graph returning forward outputs then parameter gradients (via a retraced
+    # wrapper). Without it, tracing runs under no_grad (unless pre_dispatch) for an inference graph. Raises
+    # RuntimeError if pre_dispatch is combined with trace_joint or for the loss validation failures;
+    # AssertionError for missing gradients on grad-requiring inputs.
     """
     This function takes in a module, and returns:
     (1) an FX graph that can be exported
@@ -1620,6 +1714,12 @@ def aot_export_module(
         # We don't compute gradients w.r.t. anything else: so just in case we detach()
         # and other output tensors.
         def fn_to_trace(*args: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Runs the functional call and validates the outputs for joint tracing:
+            # raises RuntimeError if output_loss_index is unset, output is not a tensor/list/tuple, any
+            # non-loss output requires grad, or the loss does not require grad or is not a scalar. Records the
+            # output count in the enclosing scope and returns the outputs as a tuple/list.
+            # KNOWN ISSUE: the error message for a missing loss index has a missing space ("trace_joint=Trueit").
+            # KNOWN ISSUE: comment says non-loss outputs are auto-detached, but the code raises instead.
             nonlocal num_fw_outs
             out = functional_call(*args)
             if output_loss_index is None:
@@ -1700,6 +1800,10 @@ We require the output marked as the loss (at index {output_loss_index}) to be a 
 
         @wraps(functional_call)
         def flattened_joint(*args: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Adapts the traced joint graph to a flat convention: calls it with the
+            # args and placeholder (None) tangents, checks that gradients line up with args (grad present
+            # exactly for tensors requiring grad; AssertionError otherwise) and returns forward outputs
+            # followed by the non-None gradients as one flat tuple.
             # The idea here is that the joint graph that AOTAutograd creates has some strict properties:
             # (1) It accepts two arguments (primals, tangents), and pytree_flattens them
             # (2) It returns a tuple of (fw_outs, gradients)
@@ -1776,6 +1880,12 @@ def aot_export_joint_simple(
     num_params_buffers: int = 0,
     decompositions: dict[OpOverload, Callable[..., Any]] | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Exports func (flat tensor args) as an FX graph with no calling-convention change:
+    # joint forward+backward when trace_joint, else an inference graph traced under no_grad. Validates
+    # and raises RuntimeError if func mutates inputs, outputs alias inputs, or inputs/outputs are not a
+    # single flat list/tuple of non-pytree leaves. Under config debug_assert it also smoke-tests the
+    # partitioned forward on fake inputs. Returns the exported graph.
+    # KNOWN ISSUE: the debug_assert branch references an undefined name fw_metadata (suppressed F821) and would raise NameError.
     """
     A simplified version of export. Used by higher order operators.
 
@@ -1897,6 +2007,11 @@ def _aot_export_function(
 ) -> tuple[
     Callable[..., Any], ViewAndMutationMeta, pytree.TreeSpec, pytree.TreeSpec | None
 ]:
+    # [FUNCTION DOC] HELPER: General export helper. Flattens func with (args, kwargs), infers
+    # dynamic_shapes when None (from a detected fake mode on the inputs or on the example values in
+    # a wrapped GraphModule's nodes), builds an export AOTConfig (no compilers/partitioner, consuming
+    # an AOT_COUNTER id), fakifies inputs, creates AOT state, captures the graph and runs the
+    # export stage 2 in an ExitStack. Returns (exported graph, ViewAndMutationMeta, input tree spec, output tree spec).
     kwargs = kwargs or {}
 
     flat_fn, out_spec = create_tree_flattened_fn(func, args, kwargs)
