@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] C++ (CPU) backend codegen for Inductor. Defines the reduction helper functions, CppOverrides
+# (elementwise ops mapped to C++ expression strings), CppVecOverrides (vectorized ops), the CppKernel /
+# CppVecKernel / CppTile2DKernel kernel classes that emit loop nests, loop/tiling bookkeeping (LoopLevel,
+# LoopNest), and CppKernelProxy / KernelGroup / CppScheduling which fuse scheduler nodes, pick vectorization
+# and parallelization strategies and produce the final C++ source wrapped for loading.
+# Import-time side effects: creates the "schedule" artifact logger and defines module level constant tables
+# (reduction type mappings, vectorizable dtypes, Python-to-C++ type names).
 import contextlib
 import dataclasses
 import functools
@@ -90,6 +97,7 @@ _IS_WINDOWS = sys.platform == "win32"
 
 @functools.cache
 def get_export_declaration():
+    # [FUNCTION DOC] HELPER: Returns the C++ export declaration string: the dllexport attribute on Windows, else an empty string. Cached.
     return "__declspec(dllexport)" if _IS_WINDOWS else ""
 
 
@@ -162,6 +170,10 @@ VECTORIZABLE_DTYPES: list[torch.dtype] = [
 
 
 def reduction_init(reduction_type, dtype):
+    # [FUNCTION DOC] Returns the C++ initial value (a Python number or C++ expression string) for a reduction accumulator.
+    # Low precision float dtypes are promoted to float32 first. sum, xor_sum, any start at 0, prod at 1; max/min/argmax/argmin
+    # use numeric_limits infinity (floats) or min/max (ints), with argmax/argmin wrapped in an IndexValue initializer
+    # (bool argmin/argmax uses float); welford types give a default constructed Welford. Raises AssertionError for unknown types.
     if dtype in DTYPE_LOWP_FP:
         # Since load promotes all half-precision inputs to float, the initial
         # constant for reduction must be promoted as well
@@ -196,6 +208,8 @@ def reduction_init(reduction_type, dtype):
 
 
 def reduction_acc_type(reduction_type, dtype):
+    # [FUNCTION DOC] Returns the C++ accumulator type name for a reduction: Welford of the computation scalar type for welford
+    # reductions, IndexValue of the scalar type (float for bool inputs) for argmin/argmax, else the plain computation scalar type.
     scalar_type = DTYPE_TO_CPP[DTYPE_TO_COMPUTATION_DTYPE[dtype]]
     if is_welford_reduction(reduction_type):
         return f"Welford<{scalar_type}>"
@@ -214,6 +228,10 @@ def reduction_combine(
     index: sympy.Expr | CSEVariable | None = None,
     src_dtype=None,
 ):
+    # [FUNCTION DOC] Builds the C++ expression string combining accumulator var with next_value for the given reduction type.
+    # helper_val enables cascade sum / welford helper variants; index is passed to argmin/argmax combine; src_dtype bool makes
+    # sum use bitwise or. welford_combine accepts a tuple (mean, m2, weight) or projects one. bool scalar argmin/argmax values
+    # are cast to float. Raises AssertionError for unsupported reduction types.
     is_bool = src_dtype == torch.bool
     if reduction_type == "sum":
         if helper_val:
@@ -260,6 +278,8 @@ def reduction_combine(
 
 
 def reduction_project(reduction_type, acc):
+    # [FUNCTION DOC] Returns the C++ expressions that extract the final result from an accumulator: a (mean, m2, weight) tuple
+    # of member accesses for welford, the index member for argmin/argmax, otherwise the accumulator itself.
     if is_welford_reduction(reduction_type):
         return f"{acc}.mean", f"{acc}.m2", f"{acc}.weight"
     elif reduction_type in ("argmin", "argmax"):
@@ -274,6 +294,10 @@ def move_code_under_inner_loop(
     loop_start: sympy.Expr,
     loop_end: sympy.Expr,
 ) -> BracesBuffer:
+    # [FUNCTION DOC] Wraps a buffer of generated C++ lines in a new C++ for loop over new_iter_var from loop_start to loop_end
+    # and returns the new BracesBuffer. Every whole-word occurrence of iter_var in each line (plain or DeferredLine, whose
+    # name is preserved) is regex-replaced by new_iter_var. Raises AssertionError if a line is neither str nor DeferredLine.
+    # Variables declared inside the moved code become scoped to the new loop.
     r"""
     f(iter_var) is transformed to f(new_iter_var) under the inner loop
       \/
@@ -328,6 +352,8 @@ def reduction_prefix_array(
     len: str | int,
     init_fn,
 ):
+    # [FUNCTION DOC] Returns an IndentedBuffer declaring an accumulator array of length len named acc_var plus "_arr" and a loop
+    # initializing each element with init_fn(reduction_type, dtype). Uses a unique_ptr array on MSVC (no VLA) and a stack array otherwise.
     """
     MSVC don't support dynamic array(VLA). So we use std::unique_ptr here.
     Ref: https://stackoverflow.com/questions/56555406/creating-dynamic-sized-array-using-msvc-c-compiler
@@ -354,6 +380,8 @@ def reduction_prefix_array(
 
 
 def replace_acc_name(buffer: IndentedBuffer, name: str, new_name: str):
+    # [FUNCTION DOC] Rewrites, in place, every whole-word occurrence of name to new_name in all lines of the buffer
+    # (handles str and DeferredLine). Mutates the buffer. Raises AssertionError on other line types.
     for i, line in enumerate(buffer._lines):
         if not (
             isinstance(
@@ -372,6 +400,8 @@ def replace_acc_name(buffer: IndentedBuffer, name: str, new_name: str):
 
 
 def replace_cascade_sum_with_add(buffer: IndentedBuffer):
+    # [FUNCTION DOC] Mutates the buffer in place: lines that assign the result of a cascade_sum_combine call are replaced by a
+    # plain accumulation of the first argument into the assigned variable. Raises AssertionError on other line types.
     """
     Replaces `acc = cascade_sum_combine(value, ...)` with `acc = acc + value;`
     """
@@ -401,6 +431,8 @@ def replace_cascade_sum_with_add(buffer: IndentedBuffer):
 
 @dataclasses.dataclass
 class ParallelDepth:
+    # [CLASS DOC] Plain dataclass holding two ints: the parallel depth (number of loop levels collapsed for parallelism)
+    # and the starting depth at which parallelism begins.
     """
     A class representing parallel depth.
     Includes the starting depth of parallelism and the depth of parallelism.
@@ -411,10 +443,17 @@ class ParallelDepth:
 
 
 class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
+    # [CLASS DOC] FusedSchedulerNode subclass representing several scheduler nodes fused at their outer loop levels.
+    # State: outer_fused_nodes (the nodes being fused) and outer_loop_fusion_depth (number of shared outer loops). The
+    # inherited node list is the flattened list of underlying nodes. Key methods: fuse, merge_outer_fusion_kernels,
+    # check_outer_fusion_loop_level_attr.
     @classmethod
     def fuse(  # type: ignore[override]
         cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode, outer_loop_fusion_depth
     ):
+        # [FUNCTION DOC] Classmethod that fuses two scheduler nodes (same scheduler; each an OuterLoopFusedSchedulerNode,
+        # SchedulerNode or FusedSchedulerNode) into a new OuterLoopFusedSchedulerNode with the given fusion depth. Existing outer
+        # fused nodes are unpacked so their members are concatenated. Raises AssertionError on mismatched scheduler or node types.
         if node1.scheduler is not node2.scheduler:
             raise AssertionError("expected node1.scheduler is node2.scheduler")
         if not (
@@ -461,6 +500,8 @@ class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
         outer_fused_nodes: list[FusedSchedulerNode | SchedulerNode],
         outer_loop_fusion_depth,
     ):
+        # [FUNCTION DOC] Stores the outer fused nodes and fusion depth, flattens all their underlying nodes (each must be a
+        # SchedulerNode or FusedSchedulerNode, else AssertionError) and initializes the FusedSchedulerNode base with them.
         self.outer_fused_nodes: list[FusedSchedulerNode | SchedulerNode] = (
             outer_fused_nodes
         )
@@ -475,11 +516,16 @@ class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
         super().__init__(scheduler, flatten_snodes)  # type: ignore[arg-type]
 
     def get_outer_nodes(self):
+        # [FUNCTION DOC] Returns the list of nodes fused at the outer level.
         return self.outer_fused_nodes
 
     def check_outer_fusion_loop_level_attr(
         self, cpp_kernel_proxy_list, outer_loop_fusion_depth
     ):
+        # [FUNCTION DOC] Decides whether the kernel proxies' loop nests can be fused at the outer loop depth. Returns False if
+        # adjacent proxies' loop levels differ in var, size, offset or steps within the depth, or if the first inner loop range
+        # is more than 300 times larger than the product of the outer ranges (so inner loops can be parallelized instead);
+        # otherwise True. Does not mutate the proxies.
         # This function ensures that the same tiling split is applied at each loop level within the outer loop fusion depth.
         # In the fusion stage, we only examine nodes with same vars and reduce.
         # However, for nodes with same vars and reduce, the loops may still have different tile splits.
@@ -492,6 +538,9 @@ class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
             loop_fusion_depth: int,
             current_checking_depth: int,
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Recursively compares loop levels of two loop nests from the current depth down through the fusion
+            # depth; returns True only if all compared levels have identical var, size, offset and steps. Raises AssertionError if
+            # loop nests are empty or too shallow.
             if not left_loop_nest.loops:
                 raise AssertionError("expected left_loop_nest.loops")
             if not right_loop_nest.loops:
@@ -576,6 +625,9 @@ class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
         self,
         cpp_kernel_proxy_list,
     ):
+        # [FUNCTION DOC] Merges the kernel proxies into the first one: builds an OuterLoopFusedKernel whose inner list holds each
+        # proxy's loop nest from the fusion depth down, truncates the first proxy's loops to the outer levels and makes it use the
+        # fused kernel. Returns that first proxy (mutated).
         kernel_group = cpp_kernel_proxy_list[0].kernel_group
         outer_loop_fused_kernel = OuterLoopFusedKernel(kernel_group)
         outer_loop_fused_kernel.inner = [
@@ -591,12 +643,18 @@ class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
 
 
 class RecordOptimizationContext:
+    # [CLASS DOC] HELPER: Context manager used while interpreting ops: on entry attaches (or reuses) an OptimizationContext in the
+    # current interpreter node's meta and records func_name as its ops name; on exit stores it back. State: func_name,
+    # current_node, opt_ctx.
     def __init__(self, func_name: str = ""):
+        # [FUNCTION DOC] HELPER: Stores func_name and initializes current_node and opt_ctx to None.
         self.func_name = func_name
         self.current_node: torch.fx.Node | None = None
         self.opt_ctx: OptimizationContext | None = None
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Requires an active V.interpreter with a current node (AssertionError otherwise), fetches or creates the
+        # node's OptimizationContext, sets its ops_name to func_name and returns self.
         if not V.interpreter:
             raise AssertionError("expected V.interpreter")
         if not V.interpreter.current_node:
@@ -615,6 +673,8 @@ class RecordOptimizationContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] HELPER: Writes the optimization context back into the current node's meta. Raises AssertionError if the context
+        # was not entered properly. Does not suppress exceptions.
         if not self.current_node:
             raise AssertionError("expected self.current_node")
         if not self.opt_ctx:
@@ -622,15 +682,20 @@ class RecordOptimizationContext:
         self.current_node.meta[OptimizationContext.key] = self.opt_ctx
 
     def get_opt_ctx(self):
+        # [FUNCTION DOC] HELPER: Returns the recorded OptimizationContext.
         return self.opt_ctx
 
     def get_fx_node(self):
+        # [FUNCTION DOC] HELPER: Returns the current fx node being interpreted; raises AssertionError if none.
         if not self.current_node:
             raise AssertionError("expected self.current_node")
         return self.current_node
 
 
 def arith_promoted(op, a, b):
+    # [FUNCTION DOC] HELPER: Returns a C++ expression string applying binary operator op to a and b in the promoted dtype.
+    # For int32/int64 the operands are cast to unsigned first to avoid signed overflow UB. Raises AssertionError if any
+    # argument is a vector CppCSEVariable.
     args = (a, b)
     if any(isinstance(arg, CppCSEVariable) and arg.is_vec for arg in args):
         raise AssertionError("Promotion of vector types is not supported")
@@ -645,22 +710,32 @@ def arith_promoted(op, a, b):
 
 
 class CppOverrides(OpOverrides):
+    # [CLASS DOC] OpOverrides subclass mapping scalar elementwise ops to C++ expression strings (mostly std:: math calls).
+    # Methods are static, take C++ operand names and return an expression string (or a CSE variable for ops needing
+    # statements such as dtype conversion and frexp). Some read testing-only bug injection config.
     """Map element-wise ops to C++"""
 
     @staticmethod
     def add(a, b):
+        # [FUNCTION DOC] Returns the C++ expression for a + b with promotion/unsigned overflow handling.
         return arith_promoted("+", a, b)
 
     @staticmethod
     def sub(a, b):
+        # [FUNCTION DOC] Returns the C++ expression for a - b with promotion/unsigned overflow handling.
         return arith_promoted("-", a, b)
 
     @staticmethod
     def mul(a, b):
+        # [FUNCTION DOC] Returns the C++ expression for a * b with promotion/unsigned overflow handling.
         return arith_promoted("*", a, b)
 
     @staticmethod
     def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+        # [FUNCTION DOC] Emits a dtype conversion of CppCSEVariable x to dtype (src_dtype defaults to x.dtype) into the kernel's
+        # compute buffer and returns the new CSE variable. When converting float to a low precision float (and
+        # emulate_precision_casts is off), also registers the reverse conversion in the CSE cache so later reloads reuse the
+        # original float value. Raises AssertionError if x is not a CppCSEVariable.
         if not isinstance(x, CppCSEVariable):
             raise AssertionError("expected isinstance(x, CppCSEVariable)")
         if src_dtype is None:
@@ -715,6 +790,8 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+        # [FUNCTION DOC] Like to_dtype but emits a rounding float-to-int conversion (round_to_int). Returns the new CSE variable;
+        # adds the same low precision cache entry as to_dtype. Raises AssertionError if x is not a CppCSEVariable.
         if not isinstance(x, CppCSEVariable):
             raise AssertionError("expected isinstance(x, CppCSEVariable)")
         if src_dtype is None:
@@ -732,6 +809,7 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype_bitcast(x, dtype, src_dtype):
+        # [FUNCTION DOC] Returns a C++ bit_cast expression reinterpreting x as dtype. Raises AssertionError if dtype has no C++ mapping.
         if dtype not in DTYPE_TO_CPP:
             raise AssertionError(f"{dtype} missing from {__name__}.DTYPE_TO_CPP")
         return f"c10::bit_cast<{DTYPE_TO_CPP[dtype]}>({x})"
@@ -739,6 +817,7 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def abs(x):
+        # [FUNCTION DOC] Returns absolute value expression; for unsigned dtypes returns x unchanged to avoid compiler warnings.
         if isinstance(x, CppCSEVariable) and x.dtype in (
             torch.uint8,
             torch.uint16,
@@ -753,57 +832,71 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sin(x):
+        # [FUNCTION DOC] Returns std::sin expression.
         return f"std::sin({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def cos(x):
+        # [FUNCTION DOC] Returns std::cos expression.
         return f"std::cos({x})"
 
     @staticmethod
     def neg(x):
+        # [FUNCTION DOC] Returns negation expression cast back to the operand's type.
         return f"decltype({x})(-{x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def exp(x):
+        # [FUNCTION DOC] Returns std::exp expression.
         # return f"Sleef_expf_u10({x})"
         return f"std::exp({x})"
 
     @staticmethod
     def exp2(x):
+        # [FUNCTION DOC] Returns std::exp2 expression.
         return f"std::exp2({x})"
 
     @staticmethod
     def expm1(x):
+        # [FUNCTION DOC] Returns std::expm1 expression.
         return f"std::expm1({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def erf(x):
+        # [FUNCTION DOC] Returns std::erf expression.
         return f"std::erf({x})"
 
     @staticmethod
     def erfc(x):
+        # [FUNCTION DOC] Returns std::erfc expression.
         return f"std::erfc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def erfinv(x):
+        # [FUNCTION DOC] Returns a calc_erfinv call expression.
         return f"calc_erfinv({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sqrt(x):
+        # [FUNCTION DOC] Returns std::sqrt expression.
         return f"std::sqrt({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def rsqrt(x):
+        # [FUNCTION DOC] Returns the expression one divided by std::sqrt of x.
+        # KNOWN ISSUE: the result is not parenthesized, so embedding it in a larger expression may change precedence.
         return f"1 / std::sqrt({x})"
 
     @staticmethod
     def log1p(x):
+        # [FUNCTION DOC] Returns std::log1p expression, unless the testing-only config injects an accuracy bug (then x plus one);
+        # raises AssertionError for an unrecognized config value.
         bug = config.cpp.inject_log1p_bug_TESTING_ONLY
         if bug == "accuracy":
             return f"{x} + decltype({x})(1)"
@@ -817,16 +910,19 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tan(x):
+        # [FUNCTION DOC] Returns std::tan expression.
         return f"std::tan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tanh(x):
+        # [FUNCTION DOC] Returns std::tanh expression.
         return f"std::tanh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def signbit(x):
+        # [FUNCTION DOC] Returns std::signbit expression, casting to float on Windows where only float is supported.
         """
         On windows std::signbit only support float type.
         Ref: https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signbit?view=msvc-170
@@ -839,117 +935,142 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def pow(a, b):
+        # [FUNCTION DOC] Returns std::pow expression.
         return f"std::pow({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def log(x):
+        # [FUNCTION DOC] Returns std::log expression.
         return f"std::log({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def round(x):
+        # [FUNCTION DOC] Returns std::nearbyint expression (round half to even).
         return f"std::nearbyint({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def floor(x):
+        # [FUNCTION DOC] Returns std::floor expression.
         return f"std::floor({x})"
 
     @staticmethod
     def floordiv(a, b):
+        # [FUNCTION DOC] Returns a floor_divide_integral call for integer operands.
         # a and b are integer type
         return f"floor_divide_integral({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ceil(x):
+        # [FUNCTION DOC] Returns std::ceil expression.
         return f"std::ceil({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def trunc(x):
+        # [FUNCTION DOC] Returns std::trunc expression.
         return f"std::trunc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def truncdiv(a, b):
+        # [FUNCTION DOC] Returns the C++ division expression (truncating for integer operands).
         # a and b are integer type
         return f"{a} / {b}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def fmod(a, b):
+        # [FUNCTION DOC] Returns std::fmod expression.
         return f"std::fmod({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isinf(x):
+        # [FUNCTION DOC] Returns std::isinf expression.
         return f"std::isinf({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isnan(x):
+        # [FUNCTION DOC] Returns std::isnan expression.
         return f"std::isnan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def lgamma(x):
+        # [FUNCTION DOC] Returns std::lgamma expression.
         return f"std::lgamma({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def acos(x):
+        # [FUNCTION DOC] Returns std::acos expression.
         return f"std::acos({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def acosh(x):
+        # [FUNCTION DOC] Returns std::acosh expression.
         return f"std::acosh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def cosh(x):
+        # [FUNCTION DOC] Returns std::cosh expression.
         return f"std::cosh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sinh(x):
+        # [FUNCTION DOC] Returns std::sinh expression.
         return f"std::sinh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def asin(x):
+        # [FUNCTION DOC] Returns std::asin expression.
         return f"std::asin({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def asinh(x):
+        # [FUNCTION DOC] Returns std::asinh expression.
         return f"std::asinh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan2(x, y):
+        # [FUNCTION DOC] Returns std::atan2 expression.
         return f"std::atan2({x}, {y})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan(x):
+        # [FUNCTION DOC] Returns std::atan expression.
         return f"std::atan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atanh(x):
+        # [FUNCTION DOC] Returns std::atanh expression.
         return f"std::atanh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def copysign(x, y):
+        # [FUNCTION DOC] Returns std::copysign expression.
         return f"std::copysign({x}, {y})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def frexp(x):
+        # [FUNCTION DOC] Emits a C++ std::frexp call into the kernel compute buffer, declaring an int32 exponent and a mantissa
+        # variable (new CSE vars). Caches both under keys derived from x and returns the cached pair if already present.
+        # Returns the tuple (mantissa, exponent).
         cache_keys = f"frexp({x})[0]", f"frexp({x})[1]"
         if all(V.kernel.cse.try_get(cache_key) is not None for cache_key in cache_keys):
             return tuple(V.kernel.cse.try_get(cache_key) for cache_key in cache_keys)
@@ -968,28 +1089,35 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def hypot(x, y):
+        # [FUNCTION DOC] Returns std::hypot expression.
         return f"std::hypot({x}, {y})"
 
     @staticmethod
     def log10(x):
+        # [FUNCTION DOC] Returns std::log10 expression.
         return f"std::log10({x})"
 
     @staticmethod
     def log2(x):
+        # [FUNCTION DOC] Returns std::log2 expression.
         return f"std::log2({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ldexp(x, n):
+        # [FUNCTION DOC] Returns std::ldexp expression.
         return f"std::ldexp({x}, {n})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def nextafter(x, y):
+        # [FUNCTION DOC] Returns std::nextafter expression.
         return f"std::nextafter({x}, {y})"
 
     @staticmethod
     def relu(x):
+        # [FUNCTION DOC] Returns the C++ relu expression (max with zero), or a deliberately broken expression for the testing-only bug
+        # injection config (compile_error, runtime_error, accuracy); raises AssertionError for an unrecognized config value.
         bug = config.cpp.inject_relu_bug_TESTING_ONLY
         if bug == "compile_error":
             return "compile error!"
@@ -1007,33 +1135,41 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def minimum(a, b):
+        # [FUNCTION DOC] Returns a NaN-propagating minimum call expression.
         return f"min_propagate_nan({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def maximum(a, b):
+        # [FUNCTION DOC] Returns a NaN-propagating maximum call expression.
         return f"max_propagate_nan({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def fmaximum(a, b):
+        # [FUNCTION DOC] Returns std::max expression (not NaN propagating, matching the fmax semantics of the op).
         return f"std::max({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def where(a, b, c):
+        # [FUNCTION DOC] Returns a C++ conditional expression selecting b where condition a holds, else c.
         return f"{a} ? {b} : {c}"
 
     @staticmethod
     def mod(a, b):
+        # [FUNCTION DOC] Returns a mod call expression (helper function defined in the C++ prelude).
         return f"mod({a}, {b})"
 
     @staticmethod
     def constant(val, dtype):
+        # [FUNCTION DOC] Returns the C++ literal for val in the C++ type of dtype.
         return value_to_cpp(val, DTYPE_TO_CPP[dtype])
 
     @staticmethod
     def index_expr(expr, dtype):
+        # [FUNCTION DOC] Renames and prints the sympy index expression, emits it into the compute buffer as a CSE variable (with
+        # bounds info) and returns it converted to dtype via the to_dtype op.
         idx_str = cexpr(V.kernel.rename_indexing(expr))
         var = V.kernel.cse.generate(
             V.kernel.compute, idx_str, bounds=get_bounds_index_expr(expr)
@@ -1042,12 +1178,16 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def value_expr(expr, dtype):
+        # [FUNCTION DOC] Same lowering as index_expr for this backend; returns the converted value.
         # C++ index_expr already emits the requested dtype, so value_expr has
         # the same lowering here.
         return CppOverrides.index_expr(expr, dtype)
 
     @staticmethod
     def masked(mask, body, other):
+        # [FUNCTION DOC] Emits the masked body as a C++ lambda into the compute buffer (the body callable is invoked with buffers
+        # swapped so its code lands in the lambda, whose result is returned). Returns a conditional expression that calls the lambda
+        # when mask is true, else other converted to the lambda's return type. Side effects: allocates a CSE variable, splices code.
         code = BracesBuffer()
 
         # Write masked operation into a lambda
@@ -1066,40 +1206,50 @@ class CppOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_and(a, b):
+        # [FUNCTION DOC] Returns the logical and expression.
         return f"{a} && {b}"
 
     @staticmethod
     def logical_not(a):
+        # [FUNCTION DOC] Returns the logical not expression.
         return f"!{a}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_or(a, b):
+        # [FUNCTION DOC] Returns the logical or expression.
         return f"{a} || {b}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_xor(a, b):
+        # [FUNCTION DOC] Returns the logical xor expression, implemented as inequality of the two operands.
         return f"{a} != {b}"
 
     @staticmethod
     def bitwise_and(a, b):
+        # [FUNCTION DOC] Returns a bitwise and expression cast back to the left operand's type.
         return f"decltype({a})({a} & {b})"
 
     @staticmethod
     def bitwise_not(a):
+        # [FUNCTION DOC] Returns a bitwise not expression cast back to the operand's type.
         return f"decltype({a})(~{a})"
 
     @staticmethod
     def bitwise_or(a, b):
+        # [FUNCTION DOC] Returns a bitwise or expression cast back to the left operand's type.
         return f"decltype({a})({a} | {b})"
 
     @staticmethod
     def bitwise_xor(a, b):
+        # [FUNCTION DOC] Returns a bitwise xor expression cast back to the left operand's type.
         return f"decltype({a})({a} ^ {b})"
 
     @staticmethod
     def bitwise_left_shift(a, b):
+        # [FUNCTION DOC] Returns an immediately invoked C++ lambda (as a BracesBuffer) doing a left shift on the unsigned
+        # representation of a; a negative or too large shift count yields zero. Uses the dtype of a for the scalar type.
         code = BracesBuffer()
         code.writeline("[&]()")
         with code.indent():
@@ -1120,6 +1270,8 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def bitwise_right_shift(a, b):
+        # [FUNCTION DOC] Returns an immediately invoked C++ lambda (as a BracesBuffer) doing a right shift of a; negative or too large
+        # shift counts are clamped to the maximum valid shift (giving sign fill or zero).
         code = BracesBuffer()
         code.writeline("[&]()")
         with code.indent():
@@ -1138,6 +1290,7 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def rand(seed: sympy.Expr, offset: sympy.Expr):
+        # [FUNCTION DOC] Returns a call expression producing a normalized random float from seed and offset.
         return f"normalized_rand_cpu({seed}, {offset})"
 
     @staticmethod
@@ -1148,6 +1301,8 @@ class CppOverrides(OpOverrides):
         tid: sympy.Expr,
         vec: sympy.Expr,
     ):
+        # [FUNCTION DOC] Eager-random hook: ignores threads_per_round, tid and vec and returns the same call expression as rand using
+        # seed and base_offset. Only a codegen fallback, not bit-matching eager CPU.
         # NOTE: This is a codegen fallback used by the C++ backend for eager random.
         # It is not intended to provide CPU parity; parity target is CUDA eager vs compiled.
         # Keep this hook to satisfy codegen paths and CI.
@@ -1155,19 +1310,23 @@ class CppOverrides(OpOverrides):
 
     @staticmethod
     def randn(seed: sympy.Expr, offset: sympy.Expr):
+        # [FUNCTION DOC] Returns a call expression producing a random normal value from seed and offset.
         return f"randn_cpu({seed}, {offset})"
 
     @staticmethod
     def randint64(seed: sympy.Expr, offset: sympy.Expr, low, high):
+        # [FUNCTION DOC] Returns a call expression producing a random 64-bit integer in the range low to high.
         return f"randint64_cpu({seed}, {offset}, {low}, {high})"
 
     @staticmethod
     def sigmoid(x):
+        # [FUNCTION DOC] Returns the sigmoid expression one over one plus exp of negative x.
         return f"decltype({x})(1) / (decltype({x})(1) + std::exp(-{x}))"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sign(x):
+        # [FUNCTION DOC] Returns an immediately invoked C++ lambda (BracesBuffer) computing the sign of x as (x greater than 0) minus (x less than 0).
         code = BracesBuffer()
         scalar_zero = f"decltype({x})(0)"
         scalar_one = f"decltype({x})(1)"
@@ -1186,6 +1345,7 @@ class CppOverrides(OpOverrides):
         value: CSEVariable,
         extra_meta: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] Not supported by the scalar C++ overrides; always raises NotImplementedError.
         raise NotImplementedError
 
 
@@ -1193,12 +1353,20 @@ CppOverrides._initialize_pointwise_overrides("cpp")
 
 
 class CppVecOverrides(CppOverrides):
+    # [CLASS DOC] CppOverrides subclass mapping ops to at::vec::Vectorized C++ code. On construction every static op (except
+    # masked, index_expr, value_expr) is wrapped so that scalar arguments are broadcast to vectors when mixed with vectors, int
+    # and float argument dtypes are promoted, and the scalar CppOverrides version is used when no argument is a vector. Ops
+    # with no vector implementation are auto-generated by looping over a temporary buffer and calling the scalar op.
     """Map element-wise ops to aten vectorization C++"""
 
     def __new__(cls, *args, **kargs):
+        # [FUNCTION DOC] Creates the instance and installs, as instance attributes, wrapped versions of the class's static op methods
+        # (excluding masked, index_expr, value_expr). The wrapper handles scalar/vector mixing, dtype promotion, broadcasting through
+        # V.kernel (must be a CppVecKernel when mixing) and scalar fallback through the parent class. Returns the instance.
         self = super().__new__(cls)
 
         def wrap(func):
+            # [FUNCTION DOC] HELPER: Returns a wrapper around the vector op func implementing the scalar/vector argument handling.
             # `CppVecKernel` generates both scalar ops and vector ops according to
             # whether the inputs are scalars or vectors while all ops in `CppVecOverrides`
             # (except for some ops explained below) assume the inputs are vectors. We wrap the ops in
@@ -1212,6 +1380,10 @@ class CppVecOverrides(CppOverrides):
             #     needs to further analyze the dependency of the index expression on
             #     the tiling itervar.
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Classifies args into scalars (ints, sympy expressions, non-vector CSE variables) and vectors. If both
+                # exist, scalar ints/expressions are materialized through the constant or index_expr ops and promoted (two-argument ops, or the
+                # value arguments of where), then non-vector CSE args are broadcast (except for the random ops). Calls func on the adjusted args
+                # when any vector exists, else calls the scalar override of the same name. Raises AssertionError if broadcasting is needed outside a CppVecKernel.
                 scalars = [
                     arg
                     for arg in args
@@ -1295,22 +1467,27 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def add(a, b):
+        # [FUNCTION DOC] Returns the vector add expression.
         return f"{a} + {b}"
 
     @staticmethod
     def sub(a, b):
+        # [FUNCTION DOC] Returns the vector subtract expression.
         return f"{a} - {b}"
 
     @staticmethod
     def mul(a, b):
+        # [FUNCTION DOC] Returns the vector multiply expression.
         return f"{a} * {b}"
 
     @staticmethod
     def truediv(a, b):
+        # [FUNCTION DOC] Returns the vector divide expression.
         return f"{a} / {b}"
 
     @staticmethod
     def abs(x):
+        # [FUNCTION DOC] Returns the vector abs expression; unsigned dtypes return the input unchanged.
         if isinstance(x, CppCSEVariable) and x.dtype in (
             torch.uint8,
             torch.uint16,
@@ -1323,42 +1500,53 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def sin(x):
+        # [FUNCTION DOC] Returns the vector sin expression.
         return f"{x}.sin()"
 
     @staticmethod
     def cos(x):
+        # [FUNCTION DOC] Returns the vector cos expression.
         return f"{x}.cos()"
 
     @staticmethod
     def exp(x):
+        # [FUNCTION DOC] Returns the vector exp expression.
         return f"{x}.exp()"
 
     @staticmethod
     def exp2(x):
+        # [FUNCTION DOC] Returns the vector exp2 expression.
         return f"{x}.exp2()"
 
     @staticmethod
     def expm1(x):
+        # [FUNCTION DOC] Returns the vector expm1 expression.
         return f"{x}.expm1()"
 
     @staticmethod
     def erf(x):
+        # [FUNCTION DOC] Returns the vector erf expression.
         return f"{x}.erf()"
 
     @staticmethod
     def erfc(x):
+        # [FUNCTION DOC] Returns the vector erfc expression.
         return f"{x}.erfc()"
 
     @staticmethod
     def erfinv(x):
+        # [FUNCTION DOC] Returns the vector erfinv expression.
         return f"{x}.erfinv()"
 
     @staticmethod
     def sqrt(x):
+        # [FUNCTION DOC] Returns the vector sqrt expression.
         return f"{x}.sqrt()"
 
     @staticmethod
     def eq(x, y):
+        # [FUNCTION DOC] Returns an equality comparison cast to the mask type for x's dtype. Raises AssertionError if the active kernel
+        # is not a CppVecKernel or x is not a typed CppCSEVariable.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1369,6 +1557,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def ne(x, y):
+        # [FUNCTION DOC] Returns an inequality expression: for bool operands both sides are unified to the same mask base type first,
+        # otherwise a mask-typed comparison. Raises AssertionError on non-vec kernel, untyped x, or mismatched bool dtypes.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1385,6 +1575,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def lt(x, y):
+        # [FUNCTION DOC] Returns a less-than comparison cast to the mask type for x's dtype (same preconditions as eq).
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1395,6 +1586,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def gt(x, y):
+        # [FUNCTION DOC] Returns a greater-than comparison cast to the mask type for x's dtype (same preconditions as eq).
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1405,6 +1597,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def le(x, y):
+        # [FUNCTION DOC] Returns a less-or-equal comparison cast to the mask type for x's dtype (same preconditions as eq).
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1415,6 +1608,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def ge(x, y):
+        # [FUNCTION DOC] Returns a greater-or-equal comparison cast to the mask type for x's dtype (same preconditions as eq).
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if not isinstance(x, CppCSEVariable):
@@ -1425,98 +1619,122 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def and_(x, y):
+        # [FUNCTION DOC] Returns the bitwise and expression.
         return f"{x} & {y}"
 
     @staticmethod
     def rsqrt(x):
+        # [FUNCTION DOC] Returns the vector rsqrt expression.
         return f"{x}.rsqrt()"
 
     @staticmethod
     def pow(a, b):
+        # [FUNCTION DOC] Returns the vector pow expression.
         return f"{a}.pow({b})"
 
     @staticmethod
     def log(x):
+        # [FUNCTION DOC] Returns the vector log expression.
         return f"{x}.log()"
 
     @staticmethod
     def round(x):
+        # [FUNCTION DOC] Returns the vector round expression.
         return f"{x}.round()"
 
     @staticmethod
     def floor(x):
+        # [FUNCTION DOC] Returns the vector floor expression.
         return f"{x}.floor()"
 
     @staticmethod
     def ceil(x):
+        # [FUNCTION DOC] Returns the vector ceil expression.
         return f"{x}.ceil()"
 
     @staticmethod
     def trunc(x):
+        # [FUNCTION DOC] Returns the vector trunc expression.
         return f"{x}.trunc()"
 
     @staticmethod
     def fmod(a, b):
+        # [FUNCTION DOC] Returns the vector fmod expression.
         return f"{a}.fmod({b})"
 
     @staticmethod
     def lgamma(x):
+        # [FUNCTION DOC] Returns the vector lgamma expression.
         return f"{x}.lgamma()"
 
     @staticmethod
     def logical_and(a, b):
+        # [FUNCTION DOC] Returns bitwise and of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} & {b}"
 
     @staticmethod
     def logical_not(a):
+        # [FUNCTION DOC] Returns the bitwise complement expression.
         return f"~{a}"
 
     @staticmethod
     def logical_or(a, b):
+        # [FUNCTION DOC] Returns bitwise or of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} | {b}"
 
     @staticmethod
     def logical_xor(a, b):
+        # [FUNCTION DOC] Returns bitwise xor of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} ^ {b}"
 
     @staticmethod
     def bitwise_and(a, b):
+        # [FUNCTION DOC] Returns bitwise and of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} & {b}"
 
     @staticmethod
     def bitwise_not(a):
+        # [FUNCTION DOC] Returns the bitwise complement expression.
         return f"~{a}"
 
     @staticmethod
     def bitwise_or(a, b):
+        # [FUNCTION DOC] Returns bitwise or of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} | {b}"
 
     @staticmethod
     def bitwise_xor(a, b):
+        # [FUNCTION DOC] Returns bitwise xor of the operands after unifying their mask types if needed.
         a, b = may_unify_binary_op_mask_type(a, b)
         return f"{a} ^ {b}"
 
     @staticmethod
     def bitwise_left_shift(a, b):
+        # [FUNCTION DOC] Returns the left shift expression.
         return f"{a} << {b}"
 
     @staticmethod
     def bitwise_right_shift(a, b):
+        # [FUNCTION DOC] Returns the right shift expression.
         return f"{a} >> {b}"
 
     @staticmethod
     def load_seed(name, offset):
+        # [FUNCTION DOC] Loads the seed value from the named buffer at offset through the active vector kernel and returns its name.
+        # Raises AssertionError if the kernel is not a CppVecKernel.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         return f"{V.kernel.load(name, offset)}"
 
     @staticmethod
     def rand(seed, offset):
+        # [FUNCTION DOC] Generates (via codegen_rand into a BracesBuffer) a vector of normalized random values, one per lane of offset,
+        # computed with the scalar random function. Raises AssertionError if the kernel is not a CppVecKernel.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         code = BracesBuffer()
@@ -1527,6 +1745,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def randn(seed, offset):
+        # [FUNCTION DOC] Generates a vector of random normal values per lane of offset using the scalar randn function. Requires a CppVecKernel.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         code = BracesBuffer()
@@ -1535,6 +1754,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def randint64(seed, offset, low, high):
+        # [FUNCTION DOC] Generates a vector of random 64-bit integers (int64 result) per lane of offset between low and high. Requires a CppVecKernel.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         code = BracesBuffer()
@@ -1543,6 +1763,9 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def remainder(a, b):
+        # [FUNCTION DOC] Vector remainder. Inputs must share a dtype (AssertionError otherwise). Integer case calls an integral
+        # remainder helper, first blending the unused lanes of b to one when the divisor has less than one full vector to avoid division
+        # by zero; float case computes a minus floordiv(a, b) times b.
         if a.dtype != b.dtype:
             raise AssertionError(
                 "remainder vec implementation expect the same inputs' dtype."
@@ -1557,10 +1780,12 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def tan(a):
+        # [FUNCTION DOC] Returns the vector tan expression.
         return f"{a}.tan()"
 
     @staticmethod
     def tanh(a):
+        # [FUNCTION DOC] Returns the vector tanh expression, or (when config use_decompose_tanh is set) a decomposition via exp: two over one plus exp of negative two a, minus one.
         if config.cpp.use_decompose_tanh:
             vec_one = f"decltype({a})(1)"
             vec_two = f"decltype({a})(2)"
@@ -1573,54 +1798,67 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def reciprocal(a):
+        # [FUNCTION DOC] Returns the vector reciprocal expression.
         return f"{a}.reciprocal()"
 
     @staticmethod
     def atan(x):
+        # [FUNCTION DOC] Returns the vector atan expression.
         return f"{x}.atan()"
 
     @staticmethod
     def acos(x):
+        # [FUNCTION DOC] Returns the vector acos expression.
         return f"{x}.acos()"
 
     @staticmethod
     def asin(x):
+        # [FUNCTION DOC] Returns the vector asin expression.
         return f"{x}.asin()"
 
     @staticmethod
     def cosh(x):
+        # [FUNCTION DOC] Returns the vector cosh expression.
         return f"{x}.cosh()"
 
     @staticmethod
     def sinh(x):
+        # [FUNCTION DOC] Returns the vector sinh expression.
         return f"{x}.sinh()"
 
     @staticmethod
     def log10(x):
+        # [FUNCTION DOC] Returns the vector log10 expression.
         return f"{x}.log10()"
 
     @staticmethod
     def log2(x):
+        # [FUNCTION DOC] Returns the vector log2 expression.
         return f"{x}.log2()"
 
     @staticmethod
     def nextafter(x, y):
+        # [FUNCTION DOC] Returns the vector nextafter expression.
         return f"{x}.nextafter({y})"
 
     @staticmethod
     def copysign(a, b):
+        # [FUNCTION DOC] Returns the vector copysign expression.
         return f"{a}.copysign({b})"
 
     @staticmethod
     def atan2(a, b):
+        # [FUNCTION DOC] Returns the vector atan2 expression.
         return f"{a}.atan2({b})"
 
     @staticmethod
     def hypot(a, b):
+        # [FUNCTION DOC] Returns the vector hypot expression.
         return f"{a}.hypot({b})"
 
     @staticmethod
     def atanh(x):
+        # [FUNCTION DOC] Returns the vector atanh expression built from the identity one half times log of (1+x)/(1-x).
         # For real x, atanh(x) = 1/2 * log((1+x)/(1-x))
         vec_one = f"decltype({x})(1)"
         vec_one_half = f"decltype({x})(0.5)"
@@ -1628,6 +1866,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def asinh(x):
+        # [FUNCTION DOC] Returns an immediately invoked C++ lambda (BracesBuffer) computing asinh in a numerically safe way for large
+        # inputs (using the reciprocal of abs(x) with two log1p terms and copysign), avoiding SLEEF overflow.
         vec_t = f"decltype({x})"
         code = BracesBuffer()
         code.writeline("[&]()")
@@ -1651,10 +1891,12 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def acosh(x):
+        # [FUNCTION DOC] Returns the vector acosh expression.
         return f"{x}.acosh()"
 
     @staticmethod
     def relu(x):
+        # [FUNCTION DOC] Returns the vector relu expression (clamp_min with zero) or a broken variant for the testing-only bug config; raises AssertionError on unknown config values.
         bug = config.cpp.inject_relu_bug_TESTING_ONLY
         if bug == "compile_error":
             return "compile error!"
@@ -1672,14 +1914,19 @@ class CppVecOverrides(CppOverrides):
     # TODO: this seems to be dead
     @staticmethod
     def sigmoid(x):
+        # [FUNCTION DOC] Returns the vector sigmoid expression using negation and exp.
+        # KNOWN ISSUE: a TODO in the source says this appears to be dead code.
         return f"decltype({x})(1)/(decltype({x})(1) + {x}.neg().exp())"
 
     @staticmethod
     def neg(x):
+        # [FUNCTION DOC] Returns the vector negation expression.
         return f"{x}.neg()"
 
     @staticmethod
     def floordiv(a, b):
+        # [FUNCTION DOC] Returns the floor division expression. Floats use a vector helper (dtypes must match, AssertionError otherwise);
+        # integers (both must be integer dtypes) use an integral helper after setting padding lanes of b to one so tail lanes cannot divide by zero.
         if is_float_dtype(a.dtype):
             if a.dtype != b.dtype:
                 raise AssertionError(
@@ -1698,6 +1945,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def truncdiv(a, b):
+        # [FUNCTION DOC] Returns the truncating integer division expression, with the divisor's lanes beyond the valid element count replaced by one.
         # a and b are integer type
         _t = f"decltype({b})"
         b = f"{_t}::set({_t}(1), {b}, {cexpr_index(V.kernel.num_elems)})"
@@ -1705,6 +1953,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def minimum(a, b):
+        # [FUNCTION DOC] Returns the minimum: for bool masks a bitwise and after unifying the mask base type, else a vector minimum call.
+        # Raises AssertionError if only one operand is bool.
         if a.dtype == torch.bool:
             if b.dtype != torch.bool:
                 raise AssertionError("expected b.dtype == torch.bool")
@@ -1715,6 +1965,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def maximum(a, b):
+        # [FUNCTION DOC] Returns the maximum: for bool masks a bitwise or after unifying the mask base type, else a vector maximum call.
+        # Raises AssertionError if only one operand is bool.
         if a.dtype == torch.bool:
             if b.dtype != torch.bool:
                 raise AssertionError("expected b.dtype == torch.bool")
@@ -1725,14 +1977,19 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def fmaximum(a, b):
+        # [FUNCTION DOC] Returns a blend expression selecting b where a is less than b, else a (vector fmax semantics).
         return f"decltype({a})::blendv({a}, {b}, {a} < {b})"
 
     @staticmethod
     def square(a):
+        # [FUNCTION DOC] Returns the product of a with itself.
         return f"{a} * {a}"
 
     @staticmethod
     def where(a, b, c):
+        # [FUNCTION DOC] Returns a vector blend of b and c controlled by mask a. For bool values the three operands are unified to a
+        # common mask base type; otherwise the mask is cast to the value type. Requires a CppVecKernel (AssertionError otherwise);
+        # bool b with non-bool c raises AssertionError.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         if b.dtype == torch.bool:
@@ -1747,6 +2004,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def sign(x):
+        # [FUNCTION DOC] Returns an immediately invoked C++ lambda (BracesBuffer) computing sign via two blends: (0 < x) minus (x < 0).
         code = BracesBuffer()
         vec_zero = f"decltype({x})(0)"
         vec_one = f"decltype({x})(1)"
@@ -1762,6 +2020,10 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+        # [FUNCTION DOC] Emits a vector dtype conversion of x to dtype into the compute buffer and returns the CSE variable; dtype
+        # must be in the supported list (AssertionError otherwise) and x a CppCSEVariable. The source dtype is always taken from x.
+        # Adds the float to lowp reverse cache entry when allowed.
+        # KNOWN ISSUE: the src_dtype argument is ignored (overwritten by x.dtype).
         if dtype not in [
             torch.bool,
             torch.float64,
@@ -1793,6 +2055,8 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+        # [FUNCTION DOC] Emits a rounding vector conversion of x to uint8, int8 or int32 (AssertionError for other dtypes or non-CppCSEVariable x)
+        # and returns the CSE variable. The src_dtype argument is overwritten by x.dtype.
         if dtype not in [
             torch.uint8,
             torch.int8,
@@ -1815,6 +2079,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def log1p(x):
+        # [FUNCTION DOC] Returns the vector log1p expression, or the accuracy-bug variant for the testing-only config; raises AssertionError for unknown config values.
         bug = config.cpp.inject_log1p_bug_TESTING_ONLY
         if bug == "accuracy":
             return f"{x} + decltype({x})(1)"
@@ -1827,6 +2092,11 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def masked(mask, body, other):
+        # [FUNCTION DOC] Vectorized masked op. Emits the body into a C++ lambda inside a masked context of the kernel (requires a
+        # CppVecKernel). The lambda result is converted to vector or mask form and the other value is vectorized the same way.
+        # If the new mask is a vector, an immediately invoked lambda returns other when the mask is all zero, else the where blend of
+        # body and other; otherwise a scalar conditional expression is used. Returns a CSE variable whose args (mask, body, other,
+        # result) are recorded for itervar and vectorization propagation.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         code = BracesBuffer()
@@ -1843,6 +2113,7 @@ class CppVecOverrides(CppOverrides):
         body_code = f"{var}()"
 
         def maskify_or_vecify(code):
+            # [FUNCTION DOC] HELPER: Wraps a C++ expression into a mask (from) object if the masked body dtype is bool, else into the vector type of that dtype.
             return (
                 f"{V.kernel._get_mask_type()}::from({code})"
                 if dtype == torch.bool
@@ -1912,6 +2183,9 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def index_expr(expr, dtype):
+        # [FUNCTION DOC] Vector index_expr. Requires a CppVecKernel. Computes the stride of the renamed index along the tiling variable:
+        # stride zero falls back to the scalar override, a constant stride emits an arange vector of the converted base, an unknown stride
+        # loads through a non-contiguous gather path. Returns the CSE variable.
         if not isinstance(V.kernel, CppVecKernel):
             raise AssertionError("expected isinstance(V.kernel, CppVecKernel)")
         index = V.kernel.rename_indexing(expr)
@@ -1937,12 +2211,16 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def value_expr(expr, dtype):
+        # [FUNCTION DOC] Same lowering as the vector index_expr.
         # C++ index_expr already emits the requested dtype, so value_expr has
         # the same lowering here.
         return CppVecOverrides.index_expr(expr, dtype)
 
     @staticmethod
     def frexp(x):
+        # [FUNCTION DOC] Vector frexp. Returns cached (mantissa, exponent) if present. Otherwise emits a lambda that stores the vector to a
+        # temporary array, loops over valid elements calling the scalar frexp, and reloads mantissa and exponent as vectors (the
+        # size is the tail size if set, else the tiling factor). Registers both CSE vars with propagation info and caches them.
         cache_keys = f"frexp({x})[0]", f"frexp({x})[1]"
         if all(V.kernel.cse.try_get(cache_key) is not None for cache_key in cache_keys):
             return tuple(V.kernel.cse.try_get(cache_key) for cache_key in cache_keys)
@@ -2000,7 +2278,12 @@ class CppVecOverrides(CppOverrides):
 
     @classmethod
     def _scalarize(cls, scalar_func):
+        # [FUNCTION DOC] HELPER: Classmethod that returns a function inner turning a scalar op implementation into a vector one: stores each
+        # vector argument to a temporary array, loops over valid elements calling scalar_func, and loads the output back as a vector (or
+        # a vec mask for isinf, isnan, signbit; output dtype from the second to last argument for to_dtype_bitcast).
         def inner(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Builds the BracesBuffer lambda for the scalarized op. Raises AssertionError if kwargs are given, the kernel
+            # is not a CppVecKernel, or a CSE argument is not a vector of the same dtype as the first argument.
             if kwargs:
                 raise AssertionError("expected not kwargs")
             kernel = V.kernel
@@ -2062,6 +2345,8 @@ class CppVecOverrides(CppOverrides):
 
     @classmethod
     def _initialize_scalarize(cls):
+        # [FUNCTION DOC] HELPER: Classmethod that, for every static method of CppOverrides without a vector override, installs a scalarized
+        # static method of the same name on this class.
         vec_vars = vars(CppVecOverrides)
         for name, method in vars(CppOverrides).items():
             if isinstance(method, staticmethod) and name not in vec_vars:
@@ -2075,8 +2360,12 @@ CppVecOverrides._initialize_scalarize()
 
 
 class CppTile2DOverrides(CppVecOverrides):
+    # [CLASS DOC] CppVecOverrides variant for the 2D tiled kernel: only index_expr and value_expr differ, transforming the index
+    # expression through the kernel's tile layout first.
     @staticmethod
     def index_expr(expr, dtype):
+        # [FUNCTION DOC] Transforms expr with the CppTile2DKernel index transform and delegates to CppVecOverrides.index_expr. Raises
+        # AssertionError if the active kernel is not a CppTile2DKernel.
         if not isinstance(V.kernel, CppTile2DKernel):
             raise AssertionError("expected isinstance(V.kernel, CppTile2DKernel)")
         expr = V.kernel.transform_indexing(expr)
@@ -2084,12 +2373,19 @@ class CppTile2DOverrides(CppVecOverrides):
 
     @staticmethod
     def value_expr(expr, dtype):
+        # [FUNCTION DOC] Same lowering as the tile index_expr.
         # C++ index_expr already emits the requested dtype, so value_expr has
         # the same lowering here.
         return CppTile2DOverrides.index_expr(expr, dtype)
 
 
 class CppKernel(Kernel):
+    # [CLASS DOC] Base scalar C++ kernel (Kernel subclass) that turns Inductor ops into C++ statements for one fused loop body.
+    # Uses CppOverrides and the C++ expression printer. State: active_ranges (itervar to the [start,end) range where this
+    # kernel is active), inner_itervars, call_ranges/ranges/itervars/reduction_depth (loop iteration space), several
+    # IndentedBuffers for reduction prefix/suffix/parallel variants, local_reduction_init/stores, preloads/poststores, three CSE
+    # caches for accumulators and helpers, num_threads, and the reduction bookkeeping lists (reduction_var_names, reduction_omp_dec).
+    # Key methods: load/store/reduction/store_reduction, set_ranges, gen_body, codegen_loops, decide_parallel_depth.
     """
     Base class for C++ kernel code generation in PyTorch Inductor.
     This class is responsible for generating C++ code from the intermediate representation.
@@ -2105,6 +2401,9 @@ class CppKernel(Kernel):
     suffix = ";"
 
     def __init__(self, args, num_threads):
+        # [FUNCTION DOC] Initializes the base Kernel with args and creates all the empty state: iteration-space fields (None or empty),
+        # the reduction and parallel-reduction buffers, accumulator and helper CSE caches, preload/poststore buffers and records
+        # the number of threads the kernel is specialized for.
         super().__init__(args)
         # Indicate when this kernel is active, for example
         # {x0, {24, 26}} -> this kernel is active when x0 >= 24 and x0 < 26
@@ -2154,6 +2453,10 @@ class CppKernel(Kernel):
         reduction_combine_fn=reduction_combine,
         reduction_init_fn=reduction_init,
     ):
+        # [FUNCTION DOC] HELPER: Registers the buffers for a multithreaded reduction of accumulator acc: a local accumulator
+        # declaration (init in each thread), a per-thread array in the parallel prefix (also queries max threads when thread count is
+        # dynamic), a store of the local value into the array slot for the thread id, and a suffix loop combining all thread slots into
+        # the accumulator. Mutates the kernel's reduction buffers.
         if config.cpp.dynamic_threads and not self.parallel_reduction_prefix:
             self.parallel_reduction_prefix.writeline(
                 "int max_threads = omp_get_max_threads();"
@@ -2187,10 +2490,14 @@ class CppKernel(Kernel):
         )
 
     def update_stores_with_parallel_reduction(self):
+        # [FUNCTION DOC] Renames, in the kernel's store buffer, each reduction accumulator to its thread-local copy (name plus "_local"). Mutates stores.
         for var_name in self.reduction_var_names:
             replace_acc_name(self.stores, var_name, f"{var_name}_local")
 
     def gen_body(self, code: BracesBuffer | None = None):
+        # [FUNCTION DOC] Assembles and returns the loop body BracesBuffer: preloads and inner loops (if the subclass defines codegen_inner_loops),
+        # then loads, compute and stores, then poststores. Each inner itervar with an active range is wrapped via move_code_under_inner_loop
+        # using a tail-named variable. Raises AssertionError if a code argument is passed (it must be None).
         if code is not None:
             raise AssertionError("expected code is None")
         code = BracesBuffer()
@@ -2213,6 +2520,8 @@ class CppKernel(Kernel):
 
     @contextlib.contextmanager
     def masked(self, mask):
+        # [FUNCTION DOC] Context manager adding a mask to loads and stores: combines the new mask with the prior one using logical and
+        # (marking the combined CSE variable bool), sets it as the current load mask, yields it, and restores the prior mask on exit.
         """Context manager to add an additional mask to loads and stores."""
         prior = self._load_mask
         if prior:
@@ -2234,12 +2543,14 @@ class CppKernel(Kernel):
     def scale_index_with_offset(
         self, index: sympy.Expr, scale=1, itervar_idx=-1, offset=0
     ):
+        # [FUNCTION DOC] Returns the index with the chosen itervar (default the innermost) replaced by itervar times scale plus offset.
         var = self.itervars[itervar_idx]
         replacement = {var: var * scale + offset}
         new_index = sympy_subs(index, replacement)
         return new_index
 
     def index_to_str(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] Returns the C++ string of the index expression after renaming its symbols to the kernel's argument names.
         """
         Convert an index expr to a string that can be used in cpp code.
         e.g. a sympy expression "s2" may actually appear as "ks1" in the cpp kernel.
@@ -2247,6 +2558,7 @@ class CppKernel(Kernel):
         return cexpr(self.rename_indexing(index))
 
     def index_indirect_depends_on(self, index: sympy.Expr, itervar: sympy.Symbol):
+        # [FUNCTION DOC] Returns True if any free symbol of the index is a CppCSEVariable (an indirect index) that depends on itervar.
         """
         Check if an index has free symbol CppCSEVariable that depends on `itervar`.
         """
@@ -2258,11 +2570,13 @@ class CppKernel(Kernel):
         )
 
     def index_depends_on(self, index: sympy.Expr, itervar: sympy.Symbol):
+        # [FUNCTION DOC] Returns True if the index directly contains itervar or depends on it through an indirect CSE variable.
         return itervar in index.free_symbols or self.index_indirect_depends_on(
             index, itervar
         )
 
     def var_ranges(self):
+        # [FUNCTION DOC] Returns a mapping from each itervar to its range.
         return dict(zip(self.itervars, self.ranges))
 
     def check_bounds(
@@ -2272,6 +2586,10 @@ class CppKernel(Kernel):
         lower: bool,
         upper: bool,
     ):
+        # [FUNCTION DOC] Emits a runtime bounds assertion for expr against size when lower and/or upper checking is requested (returns
+        # immediately if neither). The index expression is computed through index_expr either in compute (for indirect indexing or when
+        # already CSE'd) or in loads (so the assertion runs before the memory access), then an assert line using the current load
+        # mask is generated into that buffer. Temporarily swaps the compute buffer; restores it afterwards.
         if not (lower or upper):
             return
 
@@ -2308,6 +2626,8 @@ class CppKernel(Kernel):
         self.cse.generate(buffer, line, assignment=False)
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Records the buffer as an input argument, writes a load of the renamed index into the loads buffer as a CSE variable
+        # typed with the graph dtype, records args for dependency tracking and returns the variable.
         var = self.args.input(name)
         index = self.rename_indexing(index)
         line = f"{var}[{cexpr_index(index)}]"
@@ -2316,9 +2636,13 @@ class CppKernel(Kernel):
         return csevar
 
     def _use_parallel_atomic_add(self):
+        # [FUNCTION DOC] HELPER: Returns True when atomic add must be a real atomic (dynamic threads or more than one thread).
         return config.cpp.dynamic_threads or self.num_threads != 1
 
     def store(self, name, index, value, mode=None):
+        # [FUNCTION DOC] Records an output store of value to buffer name at index (name must contain "buf", else AssertionError). Mode None
+        # is plain assignment, atomic_add is a plain add or an atomic_add call with a cast to the buffer dtype depending on threading;
+        # other modes raise NotImplementedError. The line is appended to stores as a DeferredLine (removable if the buffer is removed).
         if "buf" not in name:
             raise AssertionError('expected "buf" in name')
         var = self.args.output(name)
@@ -2338,6 +2662,7 @@ class CppKernel(Kernel):
         self.stores.writeline(DeferredLine(name, line))
 
     def device_assert_async(self, cond, msg):
+        # [FUNCTION DOC] Emits a compute line that throws a C++ runtime_error with msg when cond is false.
         self.compute.writeline(
             f'({cond} ? 0 : (throw std::runtime_error("{msg}"), 0));'
         )
@@ -2350,6 +2675,8 @@ class CppKernel(Kernel):
         dtype: torch.dtype,
         init_fn,
     ):
+        # [FUNCTION DOC] HELPER: Returns a function that, given an optional size, produces the C++ initialization code of the accumulator: a scalar declaration when
+        # size is None, otherwise an accumulator array initialized in a loop.
         # Generate reduction prefix
         # If size is None, we will define and initialize a single reduction variable
         # => float tmp_acc0 = 0;
@@ -2357,6 +2684,7 @@ class CppKernel(Kernel):
         # => float tmp_acc0_arr[size];
         # => for (int i = 0; i < size; i++) tmp_acc0_arr[i] = 0;
         def inner(size: int | None = None):
+            # [FUNCTION DOC] HELPER: Produces the accumulator initialization string/buffer for the given size.
             if size is None:
                 return f"{acc_type} {acc} = {init_fn(rtype, dtype)};"
             else:
@@ -2372,10 +2700,14 @@ class CppKernel(Kernel):
         return inner
 
     def finalize_reduction_prefix(self, size: int | None = None):
+        # [FUNCTION DOC] Runs all queued prefix generators with the given size and splices the results into reduction_prefix.
         for gen_fn in self.reduction_prefix_generators:
             self.reduction_prefix.splice(gen_fn(size))
 
     def need_use_acc_helper(self, reduction_type, dtype, use_scalar):
+        # [FUNCTION DOC] Returns whether a precision-improving accumulate helper is needed: always for welford_reduce; for float sum
+        # only when the reduction size (product of call ranges from the reduction depth) is provably greater than 4096; otherwise False.
+        # KNOWN ISSUE: the use_scalar parameter is unused.
         # Check if we need accumulate helper for the reduction operation.
         # using accumulate helper generates the necessary code to improve precision for
         # sum and welford
@@ -2407,6 +2739,9 @@ class CppKernel(Kernel):
         num_threads=None,
         use_scalar=False,
     ):
+        # [FUNCTION DOC] HELPER: Returns the C++ declaration line of a WelfordHelper or CascadeSumHelper (chunk size 4096) sized to the per-thread
+        # range (helper_range divided by num_threads when given). Only welford_reduce and sum are allowed (AssertionError otherwise).
+        # Uses the scalar type or vector type for the element. A welford helper with at most one chunk is declared static.
         num_range_thread = (
             CeilDiv(helper_range, num_threads) if num_threads else helper_range
         )
@@ -2446,6 +2781,9 @@ class CppKernel(Kernel):
     def _use_acc_helper(
         self, reduction_type, acc, helper_val, helper_range, dtype, use_scalar=False
     ):
+        # [FUNCTION DOC] HELPER: Wires an accumulate helper into the reduction code: adds the helper declaration to the non-parallel prefix and
+        # to the thread-local init, and adds the final combine statements (welford combine or cascade sum final) to the corresponding
+        # non-parallel suffix and local stores. The result variable is the accumulator or its vector form.
         num_threads = (
             "max_threads" if config.cpp.dynamic_threads else parallel_num_threads()
         )
@@ -2476,6 +2814,11 @@ class CppKernel(Kernel):
             )
 
     def reduction(self, dtype, src_dtype, reduction_type, value):
+        # [FUNCTION DOC] Codegen for a reduction op. Returns a cached result if the same (src_dtype, type, value) was already reduced.
+        # Otherwise creates an accumulator, registers its prefix generator and name, and writes the update statement into stores: with
+        # a cascade/welford helper when needed, else a plain combine (argmin/argmax receive a flattened logical index computed from
+        # the itervars from the reduction depth, or the supplied index). Then sets up parallel reduction buffers, caches and returns the
+        # projected result expression(s). Side effects: marks the kernel as a reduction and mutates several buffers.
         argmax_or_argmin = reduction_type in ("argmax", "argmin")
         logical_index = None
         if argmax_or_argmin and isinstance(value, tuple):
@@ -2548,6 +2891,7 @@ class CppKernel(Kernel):
         return result
 
     def store_reduction(self, name, index, value):
+        # [FUNCTION DOC] Appends to the reduction suffix a deferred store of value into the output buffer at the renamed index.
         index = self.rename_indexing(index)
         var = self.args.output(name)
         self.reduction_suffix.writeline(
@@ -2555,6 +2899,9 @@ class CppKernel(Kernel):
         )
 
     def set_ranges(self, lengths, reduction_lengths):
+        # [FUNCTION DOC] Sets the iteration space: on the first call stores the combined call ranges, renamed ranges, new itervars and the
+        # reduction depth (number of non-reduction lengths). On later calls checks that the lengths match (AssertionError otherwise).
+        # Returns the pair (non-reduction itervars, reduction itervars).
         if self.call_ranges:
             if self.call_ranges != tuple(lengths) + tuple(reduction_lengths):
                 raise AssertionError(
@@ -2577,12 +2924,18 @@ class CppKernel(Kernel):
         )
 
     def size_hint(self):
+        # [FUNCTION DOC] Returns an optimization hint (an integer estimate) of the total iteration count from the call ranges; AssertionError if ranges are unset.
         if self.call_ranges is None:
             raise AssertionError("expected self.call_ranges is not None")
         expr = sympy_product(self.call_ranges)
         return V.graph.sizevars.optimization_hint(expr)
 
     def codegen_loops_impl(self, loop_nest, code, worksharing):
+        # [FUNCTION DOC] Emits the C++ for loops of a loop nest into code, handling OpenMP worksharing. Must be called on a CppKernelProxy
+        # (AssertionError otherwise) with call ranges set. Decides the parallel depth (via the outer fused kernel when applicable), opens a
+        # parallel region or single section, marks loops parallel, generates the loop nest recursively (including reduction prefix/suffix and
+        # local reduction init/stores around parallel reduction loops and allocation of local buffers for outer-loop fused kernels), and
+        # writes the bodies from each kernel. Mutates code, worksharing state and the loop nest.
         if not isinstance(self, CppKernelProxy):
             raise AssertionError("expected isinstance(self, CppKernelProxy)")
         threads = parallel_num_threads()
@@ -2614,7 +2967,10 @@ class CppKernel(Kernel):
                     stack.enter_context(code.indent())
 
             def gen_kernel(_loop_nest: LoopNest):
+                # [FUNCTION DOC] HELPER: Emits the innermost body: for an outer fused kernel emits each inner loop nest, otherwise emits the kernel body (after
+                # renaming stores for a parallel reduction root) with indentation.
                 def is_parallel_reduction():
+                    # [FUNCTION DOC] HELPER: True if the root loop at the parallel start depth is a parallel reduction loop.
                     if not _loop_nest.loops:
                         raise AssertionError("expected _loop_nest.loops")
                     root = _loop_nest.loops[par_depth.start_depth]
@@ -2636,6 +2992,8 @@ class CppKernel(Kernel):
                         kernel.gen_body(code)
 
             def get_reduction_prefix_suffix(kernel, parallel=False, is_suffix=False):
+                # [FUNCTION DOC] HELPER: Returns the reduction prefix or suffix buffer of the kernel (concatenating the parallel or non-parallel variant, with the
+                # suffix ordered variant-first and the prefix variant-last).
                 if is_suffix:
                     suffix = kernel.reduction_suffix
                     if parallel:
@@ -2654,6 +3012,8 @@ class CppKernel(Kernel):
             def gen_loop_with_reduction(
                 _loop_nest: LoopNest, depth: int = 0, in_reduction=False
             ):
+                # [FUNCTION DOC] HELPER: Emits one loop level; for the first reduction loop it adds the reduction prefix and suffix, and for parallel reduction
+                # loops opens a worksharing region with the local reduction init and stores. Raises AssertionError on an empty nest.
                 kernel = _loop_nest.get_kernel()
                 if not _loop_nest.loops:
                     raise AssertionError("expected _loop_nest.loops")
@@ -2689,6 +3049,7 @@ class CppKernel(Kernel):
                         )
 
             def gen_loop_at(_loop_nest: LoopNest, depth: int = 0):
+                # [FUNCTION DOC] HELPER: Emits the loop header lines of the loop at depth (skipping all output if the loop yields no lines), indents, and recurses to the next level.
                 with contextlib.ExitStack() as stack:
                     if not _loop_nest.loops:
                         raise AssertionError("expected _loop_nest.loops")
@@ -2705,6 +3066,7 @@ class CppKernel(Kernel):
                 depth: int = 0,
                 in_reduction: bool = False,
             ):
+                # [FUNCTION DOC] HELPER: Dispatches to the kernel body generation when all loop levels are consumed, else to the loop-with-reduction generation.
                 if _loop_nest.loops is None or depth == len(_loop_nest.loops):  # type: ignore[arg-type]
                     gen_kernel(_loop_nest)
                 else:
@@ -2739,17 +3101,22 @@ class CppKernel(Kernel):
             gen_loop_nest(loop_nest)
 
     def codegen_loops(self, code, worksharing):
+        # [FUNCTION DOC] Builds the LoopNest for this kernel and emits it via codegen_loops_impl.
         loop_nest = LoopNest.build(self)
         self.codegen_loops_impl(loop_nest, code, worksharing)
 
     @property
     def assert_function(self) -> str:
+        # [FUNCTION DOC] Property: name of the C++ assert macro, the AOTI check macro in AOT mode, else the torch check macro.
         if V.graph.aot_mode:
             return "AOTI_TORCH_CHECK"
         else:
             return "TORCH_CHECK"
 
     def decide_parallel_depth(self, max_parallel_depth, threads):
+        # [FUNCTION DOC] Picks how many of the outermost allowed loop levels to parallelize. Walks the candidate ranges multiplying the
+        # parallel factor until it reaches the thread count (or twice) or the remaining sequential work per thread is below the minimum
+        # chunk size config. With dynamic threads at least one level is used. Returns ParallelDepth(depth, start_depth). Raises AssertionError if ranges are unset.
         if self.call_ranges is None:
             raise AssertionError("expected self.call_ranges is not None")
         ranges = self.call_ranges[
@@ -2781,6 +3148,9 @@ class CppKernel(Kernel):
 
     @contextlib.contextmanager
     def write_to_suffix(self):
+        # [FUNCTION DOC] Context manager: temporarily replaces loads, compute, stores and CSE with fresh ones; code emitted inside is
+        # appended to the reduction suffix (loads, then compute, then stores) on exit and the previous buffers are restored.
+        # KNOWN ISSUE: the restore is not in a finally block, so an exception inside leaves the temporary buffers installed.
         prior = (self.loads, self.compute, self.stores, self.cse)
         self.loads = IndentedBuffer()
         self.compute = IndentedBuffer()
@@ -2793,9 +3163,11 @@ class CppKernel(Kernel):
         (self.loads, self.compute, self.stores, self.cse) = prior
 
     def create_cse_var(self, *args, **kwargs):
+        # [FUNCTION DOC] Creates a CppCSEVariable with the given arguments.
         return CppCSEVariable(*args, **kwargs)
 
     def get_to_dtype_expr(self, src, dtype, src_dtype, rounding=False):
+        # [FUNCTION DOC] Returns the C++ conversion expression of src to dtype; rounding int8/uint8 conversion from float/double rounds first.
         if (
             rounding
             and dtype in [torch.int8, torch.uint8]
@@ -2805,6 +3177,7 @@ class CppKernel(Kernel):
         return f"c10::convert<{DTYPE_TO_CPP[dtype]}>({src})"
 
     def cache_dtype_convert(self, dst, dst_dtype, src, src_dtype):
+        # [FUNCTION DOC] Registers in the CSE cache that the converted expression of src to dst_dtype maps to variable dst (so a reverse conversion is not recomputed).
         expr = self.get_to_dtype_expr(src, dst_dtype, src_dtype)
         self.cse.put(expr, dst)
 
@@ -2814,6 +3187,10 @@ class CppKernel(Kernel):
         prefix: str | None = None,
         var: sympy.Symbol | None = None,
     ):
+        # [FUNCTION DOC] Writes an if line limiting execution to the kernel's active ranges (for all vars or one var) and returns True; returns False if there
+        # are no conditions or a range is empty, and True without writing when there are no active ranges. A full range on a non-first itervar of
+        # a plain scalar kernel collapses its upper bound to one. Raises AssertionError if var is not an active var.
+        # KNOWN ISSUE: the check on the itervar position treats position zero as absent because of a truthiness test.
         if prefix is None:
             prefix = ""
         if not self.active_ranges:
@@ -2821,6 +3198,7 @@ class CppKernel(Kernel):
         conditions = []
 
         def gen(start, end, var):
+            # [FUNCTION DOC] HELPER: Appends the lower and upper bound conditions for var to the conditions list; returns False if the range is empty (start equals end).
             if start == end:
                 return False
             var_id = None
@@ -2861,6 +3239,10 @@ class CppKernel(Kernel):
 
 
 class CppVecKernel(CppKernel):
+    # [CLASS DOC] Vectorized C++ kernel using at::vec types. Uses CppVecOverrides. State: vec_isa (selected ISA, required), tiling_factor
+    # (lanes processed per iteration, must be positive), tiling_idx (which itervar is tiled), tail_size (partial vector size, or None) and
+    # num_elems (tail size or tiling factor). Provides vector load/store (contiguous, broadcast, gather/scatter), masked access,
+    # vector reductions and tail handling.
     overrides = CppVecOverrides  # type: ignore[assignment]
 
     def __init__(
@@ -2871,6 +3253,7 @@ class CppVecKernel(CppKernel):
         tiling_idx,
         tail_size=None,
     ):
+        # [FUNCTION DOC] Initializes the scalar base, picks the CPU vector ISA (AssertionError if unavailable or tiling_factor not positive) and stores tiling info and element count.
         super().__init__(args, num_threads)
         self.vec_isa = cpu_vec_isa.pick_vec_isa()
         if not self.vec_isa:
@@ -2883,6 +3266,8 @@ class CppVecKernel(CppKernel):
         self.num_elems = tail_size if tail_size else tiling_factor
 
     def _try_get_const_stride(self, index: sympy.Expr, itervar: sympy.Symbol):
+        # [FUNCTION DOC] HELPER: Returns the constant stride of the index along itervar over the vector range as a number, or None if the index depends on itervar
+        # through indirect indexing, uses an indirect vector variable, or the stride is not a number.
         if self.index_indirect_depends_on(index, itervar):
             return None
         for indirect_var in (
@@ -2900,6 +3285,7 @@ class CppVecKernel(CppKernel):
         return stride if stride.is_number else None
 
     def _get_num_vectors(self, dtype: torch.dtype) -> int:
+        # [FUNCTION DOC] HELPER: Returns how many native vectors are needed to hold the tiling factor elements of dtype (rounded up, at least one).
         num_vectors = math.ceil(
             self.tiling_factor * dtype.itemsize * 8 / self.vec_isa.bit_width()
         )
@@ -2908,11 +3294,13 @@ class CppVecKernel(CppKernel):
         return num_vectors
 
     def _get_raw_num_vectors(self, dtype: torch.dtype) -> float:
+        # [FUNCTION DOC] HELPER: Returns the possibly fractional number of native vectors used by tiling factor elements of dtype (below one means lanes are not fully used).
         # This utility function is used to check if the vector lanes has been
         # fully utilized. For example, uint8 will only use 1/4 of the vector lanes.
         return self.tiling_factor * dtype.itemsize * 8 / self.vec_isa.bit_width()
 
     def _get_vec_type(self, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ vector type for dtype: Vectorized for one native vector, VectorizedN otherwise.
         num_vectors = self._get_num_vectors(dtype)
         if num_vectors == 1:
             return f"at::vec::Vectorized<{DTYPE_TO_CPP[dtype]}>"
@@ -2920,12 +3308,14 @@ class CppVecKernel(CppKernel):
             return f"at::vec::VectorizedN<{DTYPE_TO_CPP[dtype]},{num_vectors}>"
 
     def _get_mask_type(self, dtype: torch.dtype = torch.float) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ VecMask type name for dtype (default float); the empty string for bool.
         if dtype == torch.bool:
             return ""
         num_vectors = self._get_num_vectors(dtype)
         return f"at::vec::VecMask<{DTYPE_TO_CPP[dtype]},{num_vectors}>"
 
     def _get_mask_cast(self, mask: CppCSEVariable, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] HELPER: Returns an expression casting a bool mask variable to a mask of the vector layout of dtype. Raises AssertionError if mask is not bool.
         if mask.dtype != torch.bool:
             raise AssertionError(repr(mask))
         num_vectors = self._get_num_vectors(dtype)
@@ -2938,6 +3328,8 @@ class CppVecKernel(CppKernel):
         dtype: torch.dtype,
         load_mask: CppCSEVariable | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Returns the C++ expression loading a vector of dtype from var at index: a mask conversion for bool, a masked load when
+        # load_mask is given (scalar masks are converted to a float mask first), or an unaligned vector load of num_elems elements.
         """
         Get a load line str that loads a vector from `var` at `index` of type `dtype`.
         If `load_mask` is not None, we do a masked load accordingly.
@@ -2977,6 +3369,12 @@ class CppVecKernel(CppKernel):
         store_value: str | CppCSEVariable | None = None,
         accu_store: bool = False,
     ) -> CppCSEVariable | None:
+        # [FUNCTION DOC] HELPER: Generates a C++ lambda that loads a vector from (or stores a vector to) a non-contiguous address. It uses a
+        # temporary aligned array and an inner unrolled loop over the valid elements, with the tiling itervar replaced by an inner loop variable
+        # and indirect vector index variables converted to arrays indexed by that variable. When var is None the index expression itself is
+        # loaded. A load mask is applied per element. Stores (store_value given, optionally accumulating) are spliced into buffer (default loads)
+        # and None is returned; loads return a new vector CSE variable. Raises AssertionError for a store without var, accumulate without a value,
+        # a store combined with a load mask, or a non-CppCSEVariable mask.
         """
         Load or store a vector in a non-contiguous way. The vector is initialized from an array that is
         filled in an inner loop over the tiling factor.
@@ -3002,18 +3400,21 @@ class CppVecKernel(CppKernel):
             buffer = self.loads
 
         def get_result_size(dtype: torch.dtype) -> int:
+            # [FUNCTION DOC] HELPER: Returns the number of array elements for the valid lanes, scaled for dtypes narrower than 4 bytes (they are widened to 32-bit slots).
             if dtype.itemsize < 4:
                 return self.num_elems * (4 // dtype.itemsize)
             else:
                 return self.num_elems
 
         def get_tiling_size(dtype: torch.dtype) -> int:
+            # [FUNCTION DOC] HELPER: Returns the temporary array size for the tiling factor, scaled for dtypes narrower than 4 bytes.
             if dtype.itemsize < 4:
                 return self.tiling_factor * (4 // dtype.itemsize)
             else:
                 return self.tiling_factor
 
         def vec_to_array(vec_var: CppCSEVariable) -> CppCSEVariable:
+            # [FUNCTION DOC] HELPER: Emits a lambda that stores the vector CSE variable (bool treated as float) into a temporary aligned array and returns it; yields the new CSE variable. Raises AssertionError if vec_var is not a typed vector.
             if not vec_var.is_vec:
                 raise AssertionError("expected vec_var.is_vec")
             code = BracesBuffer()
@@ -3123,6 +3524,9 @@ class CppVecKernel(CppKernel):
             return csevar
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Vector load. Uses the stride of the index along the tiling variable: zero loads a scalar via the parent class (broadcast lazily),
+        # one loads contiguously with a vector load (honouring the load mask), anything else uses the non-contiguous gather path. Returns a vector CSE variable
+        # (or the scalar one for stride zero) with load dependency info recorded.
         var = self.args.input(name)
         index = self.rename_indexing(index)
         dtype = V.graph.get_dtype(name)
@@ -3151,6 +3555,9 @@ class CppVecKernel(CppKernel):
         dtype: torch.dtype,
         accu_store: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Returns an IndentedBuffer with the C++ statement(s) storing the vector value at var plus index. Contiguous (stride one) stores
+        # use vector store (with the element count unless full-float without tail), optionally adding to the loaded old values for accumulation; other strides
+        # use the non-contiguous scatter path. Raises AssertionError if value is neither a string nor a vector CSE variable.
         """
         Get a store line buffer that stores `value` into `var` at `index` of `dtype`. It handles
         both contiguous and non-contiguous store cases.
@@ -3190,6 +3597,9 @@ class CppVecKernel(CppKernel):
         return code
 
     def store(self, name, index, value, mode=None):
+        # [FUNCTION DOC] Vector store into buffer name (must contain "buf"; value must be a CSE variable, scalars are broadcast first). Mode None stores
+        # the vector; atomic_add either accumulates with a plain add (single thread) or emits an atomic_add_vec call using a vector index from index_expr
+        # (with the tail size if any); other modes raise NotImplementedError. Lines are appended to stores as DeferredLine.
         if "buf" not in name:
             raise AssertionError('expected "buf" in name')
         if not isinstance(value, CppCSEVariable):
@@ -3235,9 +3645,17 @@ class CppVecKernel(CppKernel):
             raise NotImplementedError(f"store mode={mode}")
 
     def _adjust_argreduce_index(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Hook for subclasses to adjust the index used by argmin/argmax; returns the index unchanged.
         return index
 
     def reduction(self, dtype, src_dtype, reduction_type, value):
+        # [FUNCTION DOC] Vectorized reduction codegen. Requires a vectorizable reduction type (AssertionError otherwise). Broadcasts a scalar value, returns
+        # a cached result if available, and otherwise creates a scalar accumulator and a vector accumulator (plus a masked vector accumulator when a precision
+        # helper is used), registers their prefix generators, and writes the vector combine statement into stores (with welford/cascade helpers and masked
+        # tail helpers when needed, or with an index for argmin/argmax). Sets up parallel reduction buffers for each accumulator. The final value is computed in the
+        # reduction suffix: a horizontal reduction (tiling index inside the reduction dims) folds the vector accumulator to the scalar accumulator, otherwise the
+        # vector accumulator itself (merged with its masked copy for welford or helper sums) is the result. Returns the projected result and caches it.
+        # KNOWN ISSUE: the branches that emit the vector combine statement for sum and for other helper reductions are identical, and a local vec type name is assigned but unused.
         """
         Perform vectorized reduction operation.
 
@@ -3510,6 +3928,9 @@ class CppVecKernel(CppKernel):
         return result
 
     def store_reduction(self, name, index, value):
+        # [FUNCTION DOC] Emits into the reduction suffix the store of a reduction result: a horizontal reduction stores the scalar value cast to the output
+        # dtype; a vertical reduction converts the vector to the output dtype if it differs from the computation dtype (float for lower-precision floats) and
+        # then stores it with the vector store line. Lines are wrapped as DeferredLine for the output buffer.
         index = self.rename_indexing(index)
         var = self.args.output(name)
         out_dtype = V.graph.get_dtype(name)
@@ -3549,6 +3970,8 @@ class CppVecKernel(CppKernel):
         self.reduction_suffix.splice(code.map(lambda x: DeferredLine(name, x)))
 
     def broadcast(self, scalar_var: CppCSEVariable) -> CppCSEVariable:
+        # [FUNCTION DOC] Broadcasts a scalar CSE variable into a vector (a mask for bool, a Vectorized value otherwise) emitted in the compute buffer; the new
+        # variable keeps the scalar's dtype and dependent itervars and is flagged as a vector. Raises AssertionError if the input is already a vector or has no dtype.
         if scalar_var.is_vec:
             raise AssertionError("expected not scalar_var.is_vec")
         if scalar_var.dtype == torch.bool:
@@ -3570,6 +3993,7 @@ class CppVecKernel(CppKernel):
         return vec_var
 
     def arange(self, index: CppCSEVariable, stride: sympy.Symbol) -> CppCSEVariable:
+        # [FUNCTION DOC] Emits a vector arange starting at the scalar index variable with the given stride and returns the new vector CSE variable (index dtype). Raises AssertionError if index is a vector or has no dtype.
         if index.is_vec:
             raise AssertionError("expected not index.is_vec")
         if index.dtype is None:
@@ -3585,6 +4009,9 @@ class CppVecKernel(CppKernel):
         return csevar
 
     def reduction_init_vec(self, reduction_type, dtype):
+        # [FUNCTION DOC] Returns the C++ initial value of a vector accumulator: a Welford of vectors, an IndexValueVec holding infinity/min/max for
+        # argmin/argmax (float used for bool), a zero mask for any, a mask initializer for bool (only min, max, sum allowed, else AssertionError),
+        # otherwise a broadcast of the scalar init value.
         scalar_type = DTYPE_TO_COMPUTATION_DTYPE[dtype]
         vec_type = self._get_vec_type(scalar_type)
 
@@ -3622,6 +4049,8 @@ class CppVecKernel(CppKernel):
         return vec_init
 
     def reduction_acc_type_vec(self, reduction_type, dtype):
+        # [FUNCTION DOC] Returns the C++ vector accumulator type name: Welford of vectors, IndexValueVec (with source and index vector counts; float for bool),
+        # a mask type for bool (min, max, any, sum only, else AssertionError), or the vector type of the computation dtype.
         scalar_type = DTYPE_TO_COMPUTATION_DTYPE[dtype]
         vec_type = self._get_vec_type(scalar_type)
         if is_welford_reduction(reduction_type):
@@ -3653,6 +4082,10 @@ class CppVecKernel(CppKernel):
         horizontal_reduction: bool | None = None,
         src_dtype: torch.dtype | None = torch.float32,
     ):
+        # [FUNCTION DOC] Returns the C++ expression combining the vector accumulator var with next_value for a reduction type. Handles max/min/sum/prod/xor_sum/
+        # welford (with optional helper and tail-masked variants when a tail size is set), argmin/argmax (with template arguments for index vector/horizontal flags and
+        # bool converted to float), and any. Bool sums/max use bitwise or, min uses bitwise and. Raises NotImplementedError for other reduction types and
+        # AssertionError for inconsistent arguments.
         """Emit the C++ expression for combining vector reduction values."""
         is_bool = src_dtype == torch.bool
         if reduction_type == "max":
@@ -3767,6 +4200,9 @@ class CppVecKernel(CppKernel):
             raise NotImplementedError
 
     def indirect_assert(self, var, lower, upper, mask=None):
+        # [FUNCTION DOC] Builds a bounds-check assertion call string for index var. Scalars delegate to the parent (vector masks are reduced with all_masked).
+        # For vectors builds the in-range condition against vectorized bounds as a mask, combines with the optional load mask (so masked-off lanes pass), applies
+        # the tail size, requires all lanes pass and returns the assert macro call with an out-of-bounds message. Raises AssertionError for untyped or non-CSE var or when neither bound is given.
         if not isinstance(var, CppCSEVariable):
             raise AssertionError("expected isinstance(var, CppCSEVariable)")
         if var.dtype is None:
@@ -3807,6 +4243,9 @@ class CppVecKernel(CppKernel):
         return f'{self.assert_function}({cond}, "index out of bounds: {cond_print}")'
 
     def get_to_dtype_expr(self, src, dtype, src_dtype, rounding=False):
+        # [FUNCTION DOC] Returns the conversion expression of src to dtype. Scalars use the parent. Vectors use mask construction for numeric-to-bool, the mask to
+        # vector conversion for bool-to-numeric, and the vec convert (rounding convert for float to int8/uint8 with rounding) otherwise, including template
+        # arguments for multi-vector types. Same dtype yields the parenthesized source. Raises AssertionError if src is not a CppCSEVariable.
         if not isinstance(src, CppCSEVariable):
             raise AssertionError("expected isinstance(src, CppCSEVariable)")
         if not src.is_vec:
@@ -3841,6 +4280,10 @@ class CppVecKernel(CppKernel):
 
 
 class CppTile2DKernel(CppVecKernel):
+    # [CLASS DOC] CppVecKernel variant that vectorizes two loop levels (2D tiles): the innermost level and one outer level (outer_idx). When an
+    # outer-level contiguous access is detected, the tile is transposed into a temporary tile array (into the preloads buffer) and results are
+    # transposed back after the kernel inner loop (into poststores). State: tiling_indices, inner/outer tail sizes and element counts, outer_idx,
+    # inner_is_tiling_idx (which loop is the vector loop). Uses CppTile2DOverrides.
     """
     A vector kernel that handles the 2d tiles with the tile size defined in `tiling_factor` on
     the inner-most loop level and one of the outer loop level (`outer_tiling_idx`). When the data
@@ -3882,6 +4325,8 @@ class CppTile2DKernel(CppVecKernel):
         inner_tail_size=None,
         outer_tail_size=None,
     ):
+        # [FUNCTION DOC] Initializes the vector kernel with the innermost tiling index (the second of tiling_indices) and the inner tail size, and records the
+        # tiling indices, inner/outer tail sizes and element counts (the tail size if set else the tiling factor).
         super().__init__(
             args,
             num_threads,
@@ -3897,9 +4342,12 @@ class CppTile2DKernel(CppVecKernel):
         self.inner_is_tiling_idx = True
 
     def inner_itervar(self):
+        # [FUNCTION DOC] Returns the symbol for the inner loop variable (outer itervar name plus an inner suffix) used by the kernel's inner loop.
         return sympy_index_symbol(f"{self.itervars[self.outer_idx]}_inner")
 
     def need_vec_transpose(self, index):
+        # [FUNCTION DOC] Returns True if the index access needs a transposed tile: no load mask, no indirect indexing, stride one along the outer variable, and no
+        # dependence of the inner stride on either loop variable while the index uses the inner variable.
         outer_var = self.itervars[self.outer_idx]
         inner_var = self.itervars[self.tiling_idx]
         # Indirect indexing (SymT.TMP) variables are declared inside the inner
@@ -3919,6 +4367,9 @@ class CppTile2DKernel(CppVecKernel):
     def gen_transposed_tile_load_store(
         self, name, var, index, is_store, store_mode=None
     ):
+        # [FUNCTION DOC] Generates the transposed tile access for buffer name. Builds a transpose call (static or dynamic sizes depending on whether tile
+        # dimensions are numbers; atomic flag for atomic_add stores), allocates an aligned tile array in the preloads buffer, and either records the load in
+        # preloads (reusing a cached tile for identical loads) or records the store in poststores. Returns the tile variable name.
         # transposed tile load/store outside the kernel inner loop
         dtype = V.graph.get_dtype(name)
         factor = self.tiling_factor
@@ -3977,6 +4428,8 @@ class CppTile2DKernel(CppVecKernel):
         return tile_var
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Tile load: if a transpose is needed, loads the transposed tile before the inner loop and loads a vector from the tile row for the current
+        # inner iteration (vector CSE variable returned); otherwise transforms the index with the inner loop variable and delegates to the vector load.
         var = self.args.input(name)
         index = self.rename_indexing(index)
 
@@ -4000,6 +4453,9 @@ class CppTile2DKernel(CppVecKernel):
             return super().load(name, new_index)
 
     def store(self, name, index, value, mode=None):
+        # [FUNCTION DOC] Tile store: requires "buf" in name and a CSE variable value (scalars are broadcast, AssertionError otherwise). If a transpose is needed,
+        # stores the vector into the tile row (with element count for tails and narrow dtypes) and queues the transposed copy-out in poststores. Otherwise delegates to the vector store with the transformed index
+        # (parallel atomic add keeps the untransformed index because index_expr transforms it again).
         if "buf" not in name:
             raise AssertionError('expected "buf" in name')
         if not isinstance(value, CppCSEVariable):
@@ -4035,6 +4491,7 @@ class CppTile2DKernel(CppVecKernel):
             super().store(name, new_index, value, mode)
 
     def codegen_inner_loops(self, code):
+        # [FUNCTION DOC] Writes the C++ for header of the kernel inner loop; its bound is the outer tile element count when the inner loop is the tiling one, else the inner element count.
         inner = self.inner_itervar()
         if self.inner_is_tiling_idx:
             code.writeline(
@@ -4046,6 +4503,8 @@ class CppTile2DKernel(CppVecKernel):
             )
 
     def set_ranges(self, group, reduction_group):
+        # [FUNCTION DOC] Sets ranges via the parent, then chooses which tiling index is the outer and the vector one (the reduction loop is handled as the tail loop),
+        # sets the tail size, element count and inner_is_tiling_idx flag accordingly, and returns the itervars pair from the parent.
         vars = super().set_ranges(group, reduction_group)
         # do vertical reduction as the tail loop
         self.outer_idx, self.tiling_idx = (
@@ -4064,6 +4523,7 @@ class CppTile2DKernel(CppVecKernel):
         return vars
 
     def transform_indexing(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Rewrites an index by replacing the outer itervar with outer itervar plus the inner loop variable.
         return self.scale_index_with_offset(
             index,
             itervar_idx=self.outer_idx,
@@ -4071,10 +4531,16 @@ class CppTile2DKernel(CppVecKernel):
         )
 
     def _adjust_argreduce_index(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Applies the tile index transformation to the argmin/argmax index.
         return self.transform_indexing(index)
 
 
 def get_loop_body_lowp_fp(_body: LoopBody) -> tuple[torch.dtype | None, bool]:
+    # [FUNCTION DOC] Scans all fx nodes of a LoopBody (root block and subblocks, skipping placeholders and index/value expressions) and returns a pair
+    # (low precision dtype or None, use_fp32 flag). The flag is True if any op other than load/store/abs/neg/output is present, a node lacks
+    # optimization context metadata, or its dtype is not bf16/fp16; the dtype is the first bf16/fp16 seen (a warning is issued when both appear).
+    # Raises AssertionError if a node with metadata lacks the OptimizationContext entry.
+    # KNOWN ISSUE: the docstring says None and True are returned otherwise, but the dtype may be non-None while the flag is True.
     """
     Returns the low precision data type (torch.float16/torch.bfloat16) contained in the nodes
     and if all the nodes can codegen with this data type without converting to float.
@@ -4124,6 +4590,9 @@ def get_loop_body_lowp_fp(_body: LoopBody) -> tuple[torch.dtype | None, bool]:
 
 @dataclasses.dataclass
 class KernelOpStats:
+    # [CLASS DOC] Dataclass of op statistics gathered during tiling selection: op_counter (op name to count), non_contig_indexing_op_counter (op name to
+    # count of non-contiguous accesses), mask_op_count, and the class constant OVERHEAD_RATIO_THRESHOLD (0.12) above which vectorization or tail
+    # vectorization is considered unprofitable.
     """Op statistics collected during tiling selection."""
 
     # Ratio of non-contiguous/mask ops to total ops above which vectorization
@@ -4139,6 +4608,7 @@ class KernelOpStats:
 
 
 class TilingSelect:
+    # [CLASS DOC] Heuristic that selects the vectorization tiling factors and tiling loop indices for a group of loop bodies; stateless. Entry point select_tiling.
     """
     Implement the heuristic to select the tiling factors and tiling indices.
     In the future, we can implement advanced heuristic in a subclass.
@@ -4149,6 +4619,12 @@ class TilingSelect:
         fn_list,
         var_sizes_list,
     ) -> tuple[list[int], list[int], KernelOpStats]:
+        # [FUNCTION DOC] Returns (tiling_factors, tiling_indices, KernelOpStats) for the given functions and variable sizes. Returns empty lists if any dtype is not
+        # vectorizable. Picks the compute dtype (the shared bf16/fp16 type or float), derives the tiling factor from the CPU ISA, chooses indices with
+        # _select_tiling_indices, and, if tiling heuristics are enabled, counts ops and non-contiguous index accesses and disables vectorization when
+        # there are too many non-contiguous ops (35 or a ratio above the threshold) or when a small pure-pointwise inner loop has few ops. For low precision dtypes
+        # the factor is halved when the loop range is shorter than the vector. Returns one or two factors matching the number of indices.
+        # Raises AssertionError if no dtypes are found. May add a size guard through the sizevars when ranges are dynamic.
         # TODO(jgong5): support alternative tiling factors and data types
         loop_bodies = _get_loop_body(fn_list)
         all_dtypes = _get_dtype_from_loopbodies(loop_bodies)
@@ -4184,6 +4660,7 @@ class TilingSelect:
                     tiling_factor,
                     tiling_indices,
                 ):
+                    # [FUNCTION DOC] HELPER: Returns the numeric stride of index along the first tiling itervar over the vector range, or None if not a number.
                     itervar = itervars[tiling_indices[0]]
                     stride = stride_at_vec_range(index, itervar, tiling_factor)
                     return stride if stride.is_number else None
@@ -4191,6 +4668,7 @@ class TilingSelect:
                 def _update_negative_op_count(
                     node_name, non_contig_indexing_op_counter
                 ):
+                    # [FUNCTION DOC] HELPER: Increments the count of node_name in the non-contiguous op counter.
                     if node_name not in non_contig_indexing_op_counter:
                         non_contig_indexing_op_counter[node_name] = 1
                     else:
@@ -4200,6 +4678,7 @@ class TilingSelect:
                     itervars,
                     tiling_indices,
                 ):
+                    # [FUNCTION DOC] HELPER: True if there is exactly one tiling index and it (after resolving negatives) points to an existing itervar.
                     return (
                         len(tiling_indices) == 1
                         and len(itervars) > 0
@@ -4334,6 +4813,9 @@ class TilingSelect:
         var_sizes_list,
         tiling_factor,
     ):
+        # [FUNCTION DOC] HELPER: Chooses the loop indices to vectorize from the read/write indices of the functions. Classifies each loop variable by its stride: contiguous
+        # (stride one), constant non-unit stride, or other. With no contiguous var returns the innermost index; with variables that are only contiguous returns the largest;
+        # if two contiguous variables exist and the innermost has constant stride elsewhere returns both (2D tiling); otherwise returns the most frequently contiguous one.
         all_index = []
         for fn, var_sizes in zip(fn_list, var_sizes_list):
             rw = dependencies.extract_read_writes(fn, *var_sizes)
@@ -4378,6 +4860,9 @@ class TilingSelect:
 
 
 class CppKernelProxy(CppKernel):
+    # [CLASS DOC] CppKernel that aggregates several concrete kernels (scalar, vectorized, tile2d and their tail variants) generated from the same fused
+    # loop body. State: kernel_group, loop_nest (set after codegen), kernels (list in main-then-tail order), picked_vec_isa. The class attributes kernel_cls,
+    # vec_kernel_cls and tile2d_kernel_cls let subclasses swap the kernel implementations. It builds the combined reduction buffers and emits loops and bodies.
     # Subclass CppKernel, CppVecKernel, etc., to customize code generation.
     # Override CppOverrides or CppVecOverrides to emit custom ops.
     # Earlier, this meant copying codegen_functions() to use your subclasses.
@@ -4389,6 +4874,7 @@ class CppKernelProxy(CppKernel):
     tile2d_kernel_cls: type[CppTile2DKernel] = CppTile2DKernel
 
     def __init__(self, kernel_group):
+        # [FUNCTION DOC] Initializes the base kernel with the group's args and thread count; stores the kernel group, an unset loop nest and call ranges, the picked vector ISA and an empty kernel list.
         super().__init__(kernel_group.args, kernel_group.ws.num_threads)
         self.kernel_group = kernel_group
         self.loop_nest = None
@@ -4397,6 +4883,7 @@ class CppKernelProxy(CppKernel):
         self.kernels: list[CppKernel] = []
 
     def data_type_propagation(self, nodes):
+        # [FUNCTION DOC] Runs dtype propagation on each scheduler node; raises AssertionError if a node is not a SchedulerNode.
         for _node in nodes:
             if not isinstance(_node, SchedulerNode):
                 raise AssertionError("expected isinstance(_node, SchedulerNode)")
@@ -4404,6 +4891,7 @@ class CppKernelProxy(CppKernel):
 
     # Check if all the nodes of a given fx graph can support BF16/FP16
     def is_lowp_fp_scheduler(self, scheduler_node: SchedulerNode):
+        # [FUNCTION DOC] Returns True if every op of the scheduler node can run directly in bf16/fp16 (non-LoopBody bodies count as True): propagates dtypes, then requires a low precision dtype and no float32 fallback.
         if not isinstance(scheduler_node._body, LoopBody):
             return True
         # Propagate the dtype to check if all the fx node is bf16/fp16
@@ -4414,8 +4902,13 @@ class CppKernelProxy(CppKernel):
         )
 
     def legalize_lowp_fp_dtype_loopbody(self, loop_body: LoopBody):
+        # [FUNCTION DOC] Rewrites the fx graphs of a LoopBody (root block and subblocks) in place so computation happens in float32 for bf16/fp16 data: inserts
+        # to_dtype conversions after loads/index values and before stores, retargets reductions, constants and to_dtype/bitcast nodes to float where needed, then removes redundant
+        # consecutive to_dtype nodes. Updates the cpp to_dtype counter metric.
         def add_to_dtype(sub_graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Inserts the needed float conversions into one fx graph (see legalize_lowp_fp_dtype_loopbody); records legalized to_dtype nodes for elimination, then calls the elimination step.
             def get_input_dtype(node: torch.fx.Node) -> torch.dtype | None:
+                # [FUNCTION DOC] HELPER: Returns the low precision input dtype a node consumes (store buffer dtype, bitcast source, to_dtype source) or None.
                 """Get input dtype for nodes that may consumes lowp fp dt"""
                 if node.target == "store":
                     return V.graph.get_dtype(node.args[1])  # type: ignore[arg-type]
@@ -4430,6 +4923,7 @@ class CppKernelProxy(CppKernel):
                     return None
 
             def get_output_dtype(node: torch.fx.Node) -> torch.dtype | None:
+                # [FUNCTION DOC] HELPER: Returns the dtype a node produces (load buffer dtype, to_dtype/constant/index_expr target, bitcast target) or None. Raises AssertionError for a malformed load node.
                 """Get output dtype for nodes that may produce lowp fp dt"""
                 if node.target == "load":
                     if len(node.args) != 3:
@@ -4448,12 +4942,14 @@ class CppKernelProxy(CppKernel):
                     return None
 
             def is_lowp_fp_source(node: torch.fx.Node, dt: torch.dtype):
+                # [FUNCTION DOC] HELPER: True if the node outputs the low precision dtype dt (dt must be bf16/fp16, else AssertionError).
                 """Check if the given node produces output with expected low precision floating point data type."""
                 if dt not in DTYPE_LOWP_FP:
                     raise AssertionError("expected dt in DTYPE_LOWP_FP")
                 return get_output_dtype(node) == dt
 
             def is_lowp_fp_sink(node: torch.fx.Node, dt: torch.dtype):
+                # [FUNCTION DOC] HELPER: True if the node accepts input of low precision dtype dt; a to_dtype without a recorded source accepts any dtype.
                 """Check if the given node accept input with expected low precision floating point data type."""
                 if dt not in DTYPE_LOWP_FP:
                     raise AssertionError("expected dt in DTYPE_LOWP_FP")
@@ -4466,6 +4962,7 @@ class CppKernelProxy(CppKernel):
                     return False
 
             def is_lowp_fp_source_no_promote(node: torch.fx.Node, dt: torch.dtype):
+                # [FUNCTION DOC] HELPER: True if the node is a low precision source whose users all accept the low precision dtype directly.
                 """Check if the node is a lowp fp sources which are all directly fed to ops that accepts lowp fp input
                 thus no need to promote to float
                 """
@@ -4604,7 +5101,9 @@ class CppKernelProxy(CppKernel):
                                 metrics.cpp_to_dtype_count += 1
 
             def eliminate_to_dtype(sub_graph: torch.fx.Graph):
+                # [FUNCTION DOC] HELPER: Removes redundant to_dtype nodes from the graph by delegating to _eliminate_duplicate_to_node.
                 def _eliminate_duplicate_to_node(sub_graph: torch.fx.Graph):
+                    # [FUNCTION DOC] HELPER: Erases a to_dtype node whose users are all to_dtype nodes converting to the same dtype (or low precision users for nodes legalized earlier), rewiring uses to its input; lints the graph afterwards if it has no owning module.
                     # Eliminate the redundant to_dtype node. Let's consider a pattern as follows:
                     #   graph():
                     #     %to_dtype1 = call_method[target=to_dtype](args = (%ops, %input, torch.float), kwargs = {})
@@ -4612,6 +5111,7 @@ class CppKernelProxy(CppKernel):
                     # Regarding the first to_dtype, it is redundant because the second to_type also converts to the
                     # torch.float. Hence, we remove the first to_type
                     def _used_by_to(to_node: torch.fx.Node):
+                        # [FUNCTION DOC] HELPER: True if every user of the node is a to_dtype node.
                         return all(usr.target == "to_dtype" for usr in to_node.users)
 
                     all_to_nodes = [
@@ -4654,6 +5154,8 @@ class CppKernelProxy(CppKernel):
             add_to_dtype(sub_block.graph)
 
     def legalize_lowp_fp_dtype(self, nodes):
+        # [FUNCTION DOC] Legalizes low precision dtypes for scheduler nodes: if all nodes can run natively in bf16/fp16, only validates that loads and stores carry a low precision
+        # dtype and returns; otherwise applies the loop body legalization to each node that is not a memory copy. Raises AssertionError if nodes are not SchedulerNodes with LoopBody bodies or metadata is missing.
         if all(
             isinstance(_node, SchedulerNode) and self.is_lowp_fp_scheduler(_node)
             for _node in nodes
@@ -4693,6 +5195,11 @@ class CppKernelProxy(CppKernel):
                 self.legalize_lowp_fp_dtype_loopbody(body)
 
     def codegen_functions(self, fn_list, var_sizes_list):
+        # [FUNCTION DOC] Core codegen for the proxy: generates the scalar kernel from the functions and variable sizes (checking equal list lengths, raising AssertionError otherwise),
+        # builds the loop nest, and if a vector ISA exists selects tiling. Depending on the tiling it produces a vector kernel plus a tail kernel (vector tail when worthwhile
+        # and enabled, else the scalar kernel handles the tail via inner itervars), or a 2D tile kernel plus up to three tail kernels, and sets each kernel's active ranges.
+        # Records the kernel list, aggregates the reduction buffers and attaches itself as the loop nest's kernel. Side effects: updates graph removed/inplaced buffer sets,
+        # generated kernel metrics and temporarily disables inplace buffers while building the extra kernels.
         """Generate scalar and vectorized C++ kernels with tiling for the given functions."""
         if len(fn_list) != len(var_sizes_list):
             raise AssertionError("expected len(fn_list) == len(var_sizes_list)")
@@ -4702,6 +5209,7 @@ class CppKernelProxy(CppKernel):
         self.set_ranges(group, reduction_group)
 
         def codegen_kernel(cls, *args):
+            # [FUNCTION DOC] HELPER: Creates a kernel of the given class through the kernel group, runs the functions in it, adjusts the kernel count metric (so only proxies are counted) and returns the kernel.
             with kernel_group.new_kernel(cls, *args) as kernel:
                 # Ugly hack to maintain the metrics kernel count since
                 # we only count in CppKernelProxy, not those contained in it
@@ -4712,6 +5220,7 @@ class CppKernelProxy(CppKernel):
                 return kernel
 
         def run(kernel):
+            # [FUNCTION DOC] HELPER: Sets the kernel's ranges and calls each function in order with the iteration variables; functions with a smaller (pointwise suffix) group are generated inside the kernel's suffix writer and no main function may follow them. Raises AssertionError for unexpected group shapes.
             vars, reduction_vars = kernel.set_ranges(group, reduction_group)
             in_suffix = False
             for fn, var_sizes in zip(fn_list, var_sizes_list):
@@ -4760,6 +5269,7 @@ class CppKernelProxy(CppKernel):
             )
 
             def _tail_vec_worthwhile(tail_size, tiling_factor) -> bool:
+                # [FUNCTION DOC] HELPER: Decides whether a tail should be vectorized: when mask and non-contiguous op overhead is high, only if the tail is more than half the tiling factor; otherwise always True.
                 # Tail vectorization has non-trivial mask/cast/blend overhead.
                 # Only vectorize tail when it is large enough to amortize overhead.
                 op_num = sum(tiling_stats.op_counter.values())
@@ -4919,12 +5429,15 @@ class CppKernelProxy(CppKernel):
             self.loop_nest.set_kernel(self)
 
     def codegen_loop_bodies(self, loop_bodies, var_sizes_list):
+        # [FUNCTION DOC] Legalizes low precision types and propagates dtypes for each loop body, then generates code via codegen_functions.
         for body in loop_bodies:
             self.legalize_lowp_fp_dtype_loopbody(body)
             DataTypePropagation.propagate_loopbody(body)
         self.codegen_functions(loop_bodies, var_sizes_list)
 
     def codegen_nodes(self, nodes: list[SchedulerNode]):
+        # [FUNCTION DOC] Codegen entry for scheduler nodes (at least one required, else AssertionError): legalizes bf16/fp16, propagates dtypes, wraps each node into a function that decides in-place update,
+        # marks the node run and generates its code (or just evaluates the body when the active kernel is a null handler), localizes the functions if a local buffer context is active, and calls codegen_functions.
         # Legalize BF16 node by adding to_dtype explicitly
         self.legalize_lowp_fp_dtype(nodes)
         self.data_type_propagation(nodes)
@@ -4932,6 +5445,7 @@ class CppKernelProxy(CppKernel):
             raise AssertionError("expected len(nodes) >= 1")
 
         def fn(node, *index_vars):
+            # [FUNCTION DOC] HELPER: Per node callback: decides in-place update, marks the node as run, and either evaluates the body (null kernel handler) or generates node code with the index variables.
             node.decide_inplace_update()
             node.mark_run()
             if isinstance(V.kernel, NullKernelHandler):
@@ -4947,6 +5461,7 @@ class CppKernelProxy(CppKernel):
         ):
 
             def wrap_fn(fn):
+                # [FUNCTION DOC] HELPER: Wraps a function with the local buffer context's localization and remembers the original function.
                 wrapped_fn = V.local_buffer_context.localize_function(
                     fn,
                 )
@@ -4959,13 +5474,16 @@ class CppKernelProxy(CppKernel):
         self.codegen_functions(fn_list, var_sizes_list)
 
     def codegen_loops(self, code, worksharing):
+        # [FUNCTION DOC] Emits the loops using the stored loop nest through the shared implementation.
         self.codegen_loops_impl(self.loop_nest, code, worksharing)
 
     def update_stores_with_parallel_reduction(self):
+        # [FUNCTION DOC] Forwards the parallel reduction store renaming to every contained kernel.
         for kernel in self.kernels:
             kernel.update_stores_with_parallel_reduction()
 
     def gen_body(self, code: BracesBuffer | None = None):
+        # [FUNCTION DOC] Emits the body of every kernel into code (code is required, else AssertionError), each guarded by its active-range condition: the first uses a likely hint, subsequent ones an unlikely hint.
         if code is None:
             raise AssertionError("expected code is not None")
         if_prefix = "C10_LIKELY"
@@ -4979,6 +5497,8 @@ class CppKernelProxy(CppKernel):
     def aggregate_reduction_buffers(
         self, inner_loop_reduction_outer_not: bool, outer_loop: Optional["LoopLevel"]
     ):
+        # [FUNCTION DOC] Combines the reduction buffers of the contained kernels into the proxy's buffers. If the inner loop is a reduction but the outer tiled loop is not, uses a special
+        # aggregation (prefix from the tail scalar kernel extended to arrays plus main kernel prefix; suffix guarded by main/tail ranges, with the tail suffix moved under an inner loop and accumulator names turned into array slots); otherwise takes the main kernel's prefix and suffix. Always merges the parallel and non-parallel buffers and local reduction init/stores of the main kernel.
         """
         CppKernel/CppVecKernel/CppTile2dKernel have reduction buffers themselves.
         Here, we decide how to aggregate them together and place new reduction buffers
@@ -4986,6 +5506,7 @@ class CppKernelProxy(CppKernel):
         """
 
         def aggregate_reduction_prefix_suffix(outer_loop: "LoopLevel"):
+            # [FUNCTION DOC] HELPER: Builds the combined prefix and suffix for the main (vector) and tail kernels under an outer tiled loop; requires at least two kernels and a vector main kernel (AssertionError otherwise).
             if len(self.kernels) < 2:
                 raise AssertionError("expected len(self.kernels) >= 2")
             main_loop_kernel = self.kernels[0]
@@ -5070,11 +5591,15 @@ class CppKernelProxy(CppKernel):
 
 
 class OuterLoopFusedKernel(CppKernel):
+    # [CLASS DOC] CppKernel representing several loop nests fused under shared outer loops. State: inner, the list of LoopNest objects fused inside.
     def __init__(self, kernel_group):
+        # [FUNCTION DOC] Initializes the base kernel from the group's args and thread count, and an empty list of inner loop nests.
         super().__init__(kernel_group.args, kernel_group.ws.num_threads)
         self.inner: list[LoopNest] = []
 
     def decide_parallel_depth(self, max_parallel_depth, threads):
+        # [FUNCTION DOC] Decides the parallel depth for the fused outer loops: asks each inner kernel (all must have call ranges, else AssertionError) for its own parallel depth
+        # over the remaining levels from the start depth, and returns a ParallelDepth with the smaller of the allowed maximum and the largest value requested by any inner kernel.
         kernels_parallel_depth = []
         nested_kernels: list[CppKernel] = [
             loop_nest.get_kernel() for loop_nest in self.inner
@@ -5106,12 +5631,16 @@ class OuterLoopFusedKernel(CppKernel):
 
 
 class ReasonFusedNodes(Enum):
+    # [CLASS DOC] Enum of the reasons two scheduler nodes can be fused: identical vars and reduction ranges, a reduction whose vars equal the other node's vars plus reduction ranges, or compatible pointwise ranges that can be reshaped to match.
     SAME_VARS_REDUCE = "same_vars_reduce"
     COMPATIBLE_REDUCTION = "compatible_reduction"
     COMPATIBLE_RANGES_NO_REDUCTION = "compatible_ranges_no_reduction"
 
 
 class CppScheduling(BaseScheduling):
+    # [CLASS DOC] BaseScheduling implementation for the CPU C++ backend. Holds a KernelGroup accumulating generated loops for the current kernel, a flush-readiness flag and
+    # class attributes: kernel_proxy_cls (customization point), MAX_FUSED_KERNEL_ARGS_NUM (500, a conservative limit under the ctypes argument limit) and backend_features
+    # (inplace buffers, reduce to single element). Decides fusion legality and priority, generates kernels for fused nodes and C++ templates, defines kernels in the wrapper code and flushes the group.
     # Subclass CppKernelProxy to customize codegen without copying codegen_node().
     # Use kernel_proxy_cls to inject custom proxies in CppScheduling subclasses.
     # Avoid duplicating codegen_node() just to swap in a custom kernel proxy class.
@@ -5129,24 +5658,31 @@ class CppScheduling(BaseScheduling):
 
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
+        # [FUNCTION DOC] Classmethod returning the set of backend features this scheduling supports.
         return cls.backend_features
 
     def __init__(self, scheduler):
+        # [FUNCTION DOC] Initializes the base scheduling; if a scheduler is given creates a fresh kernel group; marks the group as not ready to flush.
         super().__init__(scheduler)
         if scheduler:
             self.reset_kernel_group()
         self._ready_to_flush = False
 
     def _set_flush_status(self, status: bool):
+        # [FUNCTION DOC] HELPER: Sets whether the pending kernel group should be flushed.
         self._ready_to_flush = status
 
     def group_fn(self, sizes):
+        # [FUNCTION DOC] Returns the sizes with every dimension simplified through the graph's sizevars, as nested tuples.
         return tuple(tuple(map(V.graph.sizevars.simplify, s)) for s in sizes)
 
     def reset_kernel_group(self):
+        # [FUNCTION DOC] Replaces the kernel group with a new empty KernelGroup.
         self.kernel_group = KernelGroup()
 
     def _get_indexing_ranges_exprs(self, node) -> ir.ExtraIndexingConstraints:
+        # [FUNCTION DOC] HELPER: Returns the extra indexing constraints (variable ranges and the set of indexing expressions) of a scheduler node. For a fused node, requires all member nodes to have identical var ranges (AssertionError otherwise)
+        # and unions the expressions; for a single node it must be a SchedulerNode over a ComputedBuffer (AssertionError otherwise) and uses the default loop body.
         if isinstance(node, FusedSchedulerNode):
             if len(node.snodes) <= 0:
                 raise AssertionError(node.snodes)
@@ -5174,6 +5710,7 @@ class CppScheduling(BaseScheduling):
         )
 
     def _snapshot_node_loop_states(self, node):
+        # [FUNCTION DOC] HELPER: Returns a list of (SchedulerNode, saved loop state) pairs for a SchedulerNode or each member of a FusedSchedulerNode (AssertionError for other types) so the state can be restored later.
         if isinstance(node, SchedulerNode):
             return [(node, node.snapshot_loop_state())]
 
@@ -5187,6 +5724,8 @@ class CppScheduling(BaseScheduling):
         return snapshots
 
     def _align_compatible_range_nodes(self, node1, node2):
+        # [FUNCTION DOC] HELPER: Tries to make two reduction-free nodes with different loop dimensionality use the same loop variables: recomputes the sizes and body of the node with fewer vars using the other's indexing
+        # constraints and, if still different, recomputes the other the same way. Mutates the nodes. Returns True if the resulting vars are equal. Raises AssertionError for unexpected node types or if either node has reductions.
         if not isinstance(node1, (SchedulerNode, FusedSchedulerNode)):
             raise AssertionError(
                 "expected isinstance(node1, (SchedulerNode, FusedSchedulerNode))"
@@ -5240,6 +5779,8 @@ class CppScheduling(BaseScheduling):
         return vars1 == vars2
 
     def fuse(self, node1, node2):
+        # [FUNCTION DOC] Creates the fused node for two nodes: foreach nodes become foreach fused nodes; a template with a non-template becomes a fused node (two templates raise AssertionError); compatible-range pointwise nodes are aligned (AssertionError if alignment fails) and fused; vertically
+        # fusable nodes become an outer-loop fused node with the computed depth; everything else a plain fused node.
         if node1.is_foreach() or node2.is_foreach():
             return ForeachKernelSchedulerNode.fuse(node1, node2)
         elif node1.is_template():
@@ -5267,6 +5808,7 @@ class CppScheduling(BaseScheduling):
                 return FusedSchedulerNode.fuse(node1, node2)
 
     def _why_fuse_nodes(self, node1, node2) -> ReasonFusedNodes | None:
+        # [FUNCTION DOC] HELPER: Returns why two nodes can be fused (same vars and reduction, reduction compatible with the other's vars, or compatible ranges) as a ReasonFusedNodes value, or None if not fusable.
         _, (vars1, reduce1) = node1.group
         _, (vars2, reduce2) = node2.group
 
@@ -5280,6 +5822,7 @@ class CppScheduling(BaseScheduling):
         return None
 
     def _can_fuse_nodes_with_compatible_ranges(self, node1, node2):
+        # [FUNCTION DOC] HELPER: Checks whether two reduction-free nodes with equal total element count where one is one-dimensional have equal underlying buffer sizes so their loops can be aligned. Rejects fused nodes needing recomputation, templates and ranges mismatches; otherwise tentatively aligns them and always restores the saved loop states before returning the alignment result.
         # Here we try to fuse SchedulerNode/FusedSchedulerNode with compatible ranges
         # e.g. (s0, s1, s2) and (s0 * s1 * s2)
         _, (vars1, reduce1) = node1.group
@@ -5355,6 +5898,7 @@ class CppScheduling(BaseScheduling):
                 node.restore_loop_state(state)
 
     def _can_fuse_horizontal_impl(self, node1, node2):
+        # [FUNCTION DOC] HELPER: Horizontal fusion legality ignoring size limits: nodes must be (fused) scheduler nodes (AssertionError for unexpected types), neither an outer-loop fused nor an extern kernel node, and fusable per _why_fuse_nodes.
         if not (
             isinstance(
                 node1, (FusedSchedulerNode, SchedulerNode, ExternKernelSchedulerNode)
@@ -5375,6 +5919,7 @@ class CppScheduling(BaseScheduling):
         return self._why_fuse_nodes(node1, node2) is not None
 
     def can_fuse_horizontal(self, node1, node2):
+        # [FUNCTION DOC] Returns whether two nodes can be fused side by side: not templates, within the maximum horizontal fusion size from config, and legal per the implementation helper.
         if node1.is_template() or node2.is_template():
             return False
         if (
@@ -5388,6 +5933,7 @@ class CppScheduling(BaseScheduling):
     def can_fuse_multi_outputs_template(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Returns True if node1 is a template with multi-output layout and node2 is the MultiOutput node reading exactly that template buffer.
         if template_buf := node1.get_template_node():
             return (
                 isinstance(template_buf.layout, ir.MultiOutputLayout)
@@ -5398,6 +5944,7 @@ class CppScheduling(BaseScheduling):
         return False
 
     def _get_outer_loop_fusion_depth(self, node1, node2):
+        # [FUNCTION DOC] HELPER: Computes the number of outer loops two nodes can share when fused vertically (0 means disabled). Disabled for unsupported node types, reduction-only pairs, or mismatched depths of existing outer-loop fused nodes; otherwise the number of equal leading loop vars (the minimum length of the two), requiring consistency with an existing outer-loop fused node's depth.
         DISABLE_OUTER_LOOP_FUSION = 0
         if not all(
             type(node)
@@ -5458,6 +6005,7 @@ class CppScheduling(BaseScheduling):
         return DISABLE_OUTER_LOOP_FUSION
 
     def can_fuse_vertical_outer_loop(self, node1, node2):
+        # [FUNCTION DOC] Returns a truthy value if two non-template nodes can be fused vertically by sharing outer loops: node2 depends on node1, they could not simply be fused horizontally with a non-reduction first node, and a positive outer fusion depth exists.
         return (
             not node1.is_template()
             and not node2.is_template()
@@ -5470,6 +6018,7 @@ class CppScheduling(BaseScheduling):
         )
 
     def get_fusion_pair_priority(self, node1, node2):
+        # [FUNCTION DOC] Returns 1 (lower priority) for pairs fused by outer loop fusion, else 0.
         if self.can_fuse_vertical_outer_loop(node1, node2):
             # Outer loop fusion with lower priority
             return 1
@@ -5477,6 +6026,7 @@ class CppScheduling(BaseScheduling):
             return 0
 
     def can_fuse_vertical(self, node1, node2):
+        # [FUNCTION DOC] Returns whether node2 can be fused after node1 (producer to consumer). Not allowed if node2 is a template; if node1 is a template requires template epilogue support and a non-reduction node2; otherwise allowed via horizontal-style fusion of a non-reduction node1 or outer loop fusion.
         if node2.is_template():
             # TODO(jgong5): support pre-op fusion with template
             return False
@@ -5490,6 +6040,9 @@ class CppScheduling(BaseScheduling):
         ) or self.can_fuse_vertical_outer_loop(node1, node2)
 
     def try_loop_split(self, nodes: list[SchedulerNode]):
+        # [FUNCTION DOC] Optional optimization on the list of scheduler nodes (returned, mutated in place when applied): when the indexing expressions contain a single integer floor division (divisor above 8) of a loop variable that is contiguous in all other accesses,
+        # splits that loop into two (quotient and divisor dimensions) to remove the division and non-contiguous loads. Skipped for nodes with reductions or modular indexing, several distinct divisions, or incompatible sizes. Recomputes size/body for every node with the
+        # new loop structure and restores the original loop state if the nodes end with different loop groups.
         """
         Apply loop split optimization.
         When one of the indexing_exprs contains a division, we eliminate the division by splitting the loop
@@ -5582,6 +6135,7 @@ class CppScheduling(BaseScheduling):
                 return nodes
 
         def loop_split(sizes, body, vars):
+            # [FUNCTION DOC] HELPER: Callback for recomputing a node's sizes and body: splits the index dimension of the split variable into (size divided by split number, split number), builds new index variables and a new LoopBody that substitutes the combined expression; returns the new sizes, body and variables.
             index_size, reduce_size = sizes
             index_vars, reduce_vars = vars
             split_idx = index_vars.index(split_var)
@@ -5646,6 +6200,8 @@ class CppScheduling(BaseScheduling):
         self,
         node: OuterLoopFusedSchedulerNode,
     ):
+        # [FUNCTION DOC] Generates code for an outer-loop fused node (AssertionError otherwise). First tries fusion with local buffers (temporary per-outer-iteration buffers); if that is not possible resets the vector kernel count metric and generates each member node as a separate kernel
+        # with in-place buffers disabled. Side effects: appends to the kernel group, updates metrics and graph removed-buffer state.
         """
         Generate the code for the outer loop fused scheduler node.
         1. Codegen with fused outer loop: depends on the analysis of
@@ -5662,6 +6218,8 @@ class CppScheduling(BaseScheduling):
             )
 
         def try_outer_loop_fusion_with_local_buf(node: OuterLoopFusedSchedulerNode):
+            # [FUNCTION DOC] HELPER: Attempts fusion of the outer loops: finds buffers whose producer and all users are inside the fused node, contiguous, and one-dimension-reduced, and turns them into shared local buffers (reusing buffers when layouts match and lifetimes allow), then generates a kernel proxy per member node
+            # under a LocalBufferContext. Falls back (returns False after restoring removed buffers) if an outer loop is tiled or the loop level attributes mismatch; otherwise merges the proxies into one outer fused kernel, finalizes it and returns True.
             """
             Codegen code with fused outer loop and local Buffer.
             """
@@ -5673,6 +6231,7 @@ class CppScheduling(BaseScheduling):
             nodes_list.clear()
 
             def get_call_ranges(node: BaseSchedulerNode):
+                # [FUNCTION DOC] HELPER: Returns the combined loop ranges (non-reduction followed by reduction ranges) of the node's scheduler nodes, taking the group of a reduction node when any. AssertionError for unsupported node types.
                 if not isinstance(node, (SchedulerNode, FusedSchedulerNode)):
                     raise AssertionError(
                         "expected isinstance(node, (SchedulerNode, FusedSchedulerNode))"
@@ -5724,6 +6283,7 @@ class CppScheduling(BaseScheduling):
                         )
 
                         def is_all_write_read_contiguous():
+                            # [FUNCTION DOC] HELPER: True if the scheduler node's write index and all its users' read indices are the plain contiguous (row-major) linear index of the node's loop variables.
                             contiguous_index_expr = 0
                             stride = 1
                             for var, range in reversed(
@@ -5738,6 +6298,7 @@ class CppScheduling(BaseScheduling):
                             )
 
                             def is_contiguous_index(x):
+                                # [FUNCTION DOC] HELPER: True if the expression equals the contiguous linear index.
                                 return x == contiguous_index_expr
 
                             return is_contiguous_index(write_index_expr) and all(
@@ -5772,6 +6333,7 @@ class CppScheduling(BaseScheduling):
                         )
 
                         def try_share_local_buffer(local_buffer_layout, local_buffers):
+                            # [FUNCTION DOC] HELPER: Returns an existing local buffer with the same layout whose global buffers have all their users already visited (so it can be reused), or None.
                             for local_buf in local_buffers:
                                 if local_buffer_layout == local_buf.layout and all(
                                     all(
@@ -5827,6 +6389,7 @@ class CppScheduling(BaseScheduling):
                     nodes_list.append(_node.get_nodes())  # type: ignore[arg-type]
 
                 def fallback_without_local_buffers() -> Literal[False]:
+                    # [FUNCTION DOC] HELPER: Undoes the removed-buffer marks made by the local buffer scope and returns False to signal fallback.
                     for removed_buffer in scope.removed_buffers:
                         # Restore the removed buffers by this context before
                         # fallback to codegen without using Local Buffer.
@@ -5837,6 +6400,7 @@ class CppScheduling(BaseScheduling):
                 # outer loop is tiled, one local buffer slot would be reused for
                 # multiple outer elements in the same loop iteration.
                 def has_tiled_fused_outer_loop() -> bool:
+                    # [FUNCTION DOC] HELPER: True if any of the fused outer loops has a non-unit step (tiled), in which case local buffers cannot be used.
                     for cpp_kernel_proxy in cpp_kernel_proxy_list:
                         loop_nest = cpp_kernel_proxy.loop_nest
                         if loop_nest is None:
@@ -5895,6 +6459,7 @@ class CppScheduling(BaseScheduling):
         self,
         node: OuterLoopFusedSchedulerNode | FusedSchedulerNode | SchedulerNode,
     ):
+        # [FUNCTION DOC] Generates a C++ kernel for a pre-fused node. Outer-loop fused nodes use the dedicated path; other nodes first try loop splitting, then a kernel proxy generates the code and the kernel group finalizes it. Marks the scheduling ready to flush when the accumulated kernel argument count exceeds the maximum.
         """
         Turn a set of pre-fused nodes into a C++ kernel.
         """
@@ -5914,6 +6479,7 @@ class CppScheduling(BaseScheduling):
             self._set_flush_status(True)
 
     def is_cpp_template(self, node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] Returns True if the node is a SchedulerNode wrapping a CppTemplateBuffer.
         return isinstance(node, SchedulerNode) and isinstance(
             node.node, ir.CppTemplateBuffer
         )
@@ -5924,6 +6490,8 @@ class CppScheduling(BaseScheduling):
         epilogue_nodes: Sequence[BaseSchedulerNode],
         prologue_nodes: Sequence[BaseSchedulerNode],
     ):
+        # [FUNCTION DOC] Generates a kernel for a C++ template node with fused epilogue nodes (prologue nodes are not supported and raise AssertionError; non-scheduler epilogue nodes such as MultiOutput are dropped). Updates the inductor template/epilogue counters, makes the template kernel and renderer,
+        # renders the source with the epilogues marked run, defines the kernel, marks multi-output users as run, writes the provenance comment and kernel call, merges removed buffers into the graph and frees buffers. Raises AssertionError for malformed template nodes.
         """
         Codegen a CPP template, possibly with fused epilogues
         """
@@ -5958,6 +6526,7 @@ class CppScheduling(BaseScheduling):
         def template_buffer_has_other_users(
             template_buffer, outputs_by_name, epilogue_nodes
         ):
+            # [FUNCTION DOC] HELPER: Returns True if the template buffer has users that are not among the epilogue nodes (False when there are no epilogue nodes).
             if not epilogue_nodes:
                 return False
 
@@ -6015,15 +6584,19 @@ class CppScheduling(BaseScheduling):
         self.free_buffers_in_scheduler()
 
     def _get_scheduled_num_args(self):
+        # [FUNCTION DOC] HELPER: Returns the number of kernel arguments accumulated in the current kernel group.
         return self.kernel_group.get_num_args()
 
     def ready_to_flush(self):
+        # [FUNCTION DOC] Returns whether the pending kernel group should be flushed now.
         return self._ready_to_flush
 
     def codegen_sync(self):
+        # [FUNCTION DOC] No-op: the C++ backend needs no synchronization.
         pass
 
     def define_kernel(self, src_code, nodes, kernel_args=None):
+        # [FUNCTION DOC] Defines a kernel in the wrapper code for the source and returns its name. Identical source reuses a cached name; otherwise builds a name (optionally descriptive), substitutes name placeholders, extracts the extern C declaration, wraps the source for async compile (unless the cpp wrapper is used) and registers it with the wrapper code. Side effects: updates the wrapper's source-to-kernel map and defined kernels.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -6070,6 +6643,7 @@ class CppScheduling(BaseScheduling):
         return kernel_name
 
     def flush(self):
+        # [FUNCTION DOC] Finishes the pending kernel group: generates its source, defines and calls the kernel in the wrapper code (with optional profiling guards and provenance comment), then resets the kernel group and the flush flag.
         src_code = self.kernel_group.codegen_group()
         if src_code:
             kernel_name = self.define_kernel(
@@ -6094,6 +6668,7 @@ class CppScheduling(BaseScheduling):
         self._set_flush_status(False)
 
     def codegen_comment(self, node_schedule, kernel_name=None):
+        # [FUNCTION DOC] Records kernel provenance tracing for the scheduled nodes and writes the provenance debug handle into the wrapper code.
         # below add provenance tracing info for cpu CppKernel types
         wrapper = V.graph.wrapper_code
         debug_handle = set_kernel_post_grad_provenance_tracing(
@@ -6105,7 +6680,9 @@ class CppScheduling(BaseScheduling):
 
 
 class KernelGroup:
+    # [CLASS DOC] Accumulates the generated loop code for one C++ kernel function. State: args (KernelArgs), loops_code (BracesBuffer), ws (WorkSharing writing to loops_code, kept open through an exit stack) and scheduled_nodes. Produces the full source with codegen_group.
     def __init__(self):
+        # [FUNCTION DOC] Creates the kernel arguments, loops buffer, work sharing helper (entered on an exit stack) and empty scheduled node list.
         super().__init__()
         self.args = KernelArgs()
         self.loops_code = BracesBuffer()
@@ -6115,20 +6692,24 @@ class KernelGroup:
         self.scheduled_nodes = []
 
     def new_kernel(self, cls, *args):
+        # [FUNCTION DOC] Creates a kernel of the given class sharing the group's arguments with the configured thread count and extra arguments.
         return cls(self.args, parallel_num_threads(), *args)
 
     def finalize_kernel(self, new_kernel, nodes):
+        # [FUNCTION DOC] Records the nodes as scheduled and makes the kernel emit its loops into the group's code with the shared work sharing helper.
         self.scheduled_nodes += nodes
         code = self.loops_code
         ws = self.ws
         new_kernel.codegen_loops(code, ws)
 
     def get_num_args(self):
+        # [FUNCTION DOC] Returns the number of argument definitions of the kernel.
         arg_defs, _call_args, _arg_types = self.args.cpp_argdefs()
         args_num = len(arg_defs)
         return args_num
 
     def codegen_group(self, name=None) -> str:
+        # [FUNCTION DOC] Builds the complete C++ source of the kernel (closes the work sharing stack first; returns an empty string when no nodes are scheduled): includes, extern C function declaration with arguments (name placeholders unless name is given), an atomic integer division error flag, optional profiling handle, alias declarations, the accumulated loops, and the error check at the end.
         self.stack.close()
         if not self.scheduled_nodes:
             return ""
@@ -6183,6 +6764,7 @@ class KernelGroup:
         return code.getvalue()
 
     def call_kernel(self, wrapper, kernel_name):
+        # [FUNCTION DOC] Emits the wrapper code call to the kernel with the call arguments and argument types (not a Triton kernel).
         _, call_args, arg_types = self.args.cpp_argdefs()
         wrapper.generate_kernel_call(
             kernel_name,
@@ -6193,13 +6775,16 @@ class KernelGroup:
 
 
 class WorkSharing:
+    # [CLASS DOC] Manages OpenMP parallel region state while emitting loops. State: code (output buffer), in_parallel flag, num_threads of the open region and an exit stack that closes the region's indentation. Usable as a context manager that closes the region on exit.
     def __init__(self, code):
+        # [FUNCTION DOC] Stores the output code buffer and initializes the closed state with no thread count and an empty exit stack.
         self.code = code
         self.in_parallel = False
         self.num_threads = None
         self.stack = contextlib.ExitStack()
 
     def parallel(self, threads):
+        # [FUNCTION DOC] Opens an OpenMP parallel region for the given thread count if not already open (closing a region with a different thread count first). Writes the parallel pragma (a fixed thread count unless dynamic threading applies: no explicit thread config and the count equals the CPU count, or the dynamic config), indents and declares the thread id variable.
         if self.in_parallel and threads != self.num_threads:
             # wrong number of threads
             self.close()
@@ -6228,24 +6813,29 @@ class WorkSharing:
             )
 
     def single(self):
+        # [FUNCTION DOC] Writes a single-thread pragma if a parallel region is open; returns whether a region is open.
         if self.in_parallel:
             self.code.writeline("#pragma omp single")
         return self.in_parallel
 
     def close(self):
+        # [FUNCTION DOC] Closes the open region by unwinding indentation and marks it not parallel.
         self.stack.close()
         self.in_parallel = False
 
     def __enter__(self):
+        # [FUNCTION DOC] Enters the internal exit stack and returns self.
         self.stack.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Exits the internal exit stack, closing any open region.
         self.stack.__exit__(exc_type, exc_val, exc_tb)
 
 
 @dataclasses.dataclass
 class LoopLevel:
+    # [CLASS DOC] Dataclass describing one level of a C++ loop nest: var, size, offset, tiled_size (limit for the vectorized part, see the note on tiled size below), steps, parallel (number of collapsed parallel levels, or 0), simd_omp / simd_vec / collapsed / is_reduction flags. After construction also holds simd_nelements, the number of lanes of the picked vector ISA (0 if none).
     var: sympy.Expr | None = None
     size: sympy.Expr | None = None
     offset: sympy.Expr = sympy.S.Zero
@@ -6266,6 +6856,7 @@ class LoopLevel:
     is_reduction: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Computes simd_nelements from the picked vector ISA lazily at construction time (not at import time because ISA detection is slow).
         # Regarding the C++/OpenMP backend, `cpu_vec_isa.pick_vec_isa()` to check
         # vectorization ISA is a time-consuming and one-shot operation. It leads
         # to taking a longer time to import `codegen.cpp` package because the
@@ -6278,6 +6869,7 @@ class LoopLevel:
         self.simd_nelements: int = picked_vec_isa.nelements() if picked_vec_isa else 0
 
     def tile(self, factor):
+        # [FUNCTION DOC] Returns a new LoopLevel for the same var and size tiled by factor: steps equal factor, vector loop flag set, tiled size the size rounded down to a multiple of the factor, keeping parallel and reduction settings and not collapsed. Offset is not copied.
         sympy_factor = sympy.Integer(factor)
         loop = LoopLevel(self.var, self.size)
         loop.steps = sympy_factor
@@ -6289,6 +6881,7 @@ class LoopLevel:
         return loop
 
     def lines(self):
+        # [FUNCTION DOC] Returns the C++ loop header lines: an optional pragma line (OpenMP for with collapse and simd, simd, ivdep for non-reduction loops with GCC, or none for vector loops) and the for statement. Returns None for an empty loop when redundant loops are suppressed by config. A non-numeric step expression is guarded to become one when zero.
         offset_expr = cexpr_index(self.offset)
         size_expr = cexpr_index(self.size)
         if config.cpp.no_redundant_loops and offset_expr == size_expr:
@@ -6332,6 +6925,7 @@ class LoopLevel:
 
 @dataclasses.dataclass
 class LoopNest:
+    # [CLASS DOC] Loop nest structure: loops (list of LoopLevel or None for no loops) and the leaf kernel. Built from a kernel with build, then optionally tiled at some level (vectorization) and marked parallel. Truthy when it has loops.
     """
     A loop-nest-like structure. It is built with the `build` method
     as a loop nest and then will perform loop-tiling at some depth.
@@ -6346,6 +6940,7 @@ class LoopNest:
 
     @staticmethod
     def build(kernel: CppKernel):
+        # [FUNCTION DOC] Static method: builds a LoopNest with one LoopLevel per kernel itervar and range, marking the levels from the reduction depth as reduction loops when the kernel is a reduction. Raises AssertionError if the reduction depth is unset. The returned nest has no kernel set.
         """Build a LoopNest with the given `kernel` as the leaf"""
         itervars = kernel.itervars
         ranges = kernel.ranges
@@ -6367,10 +6962,12 @@ class LoopNest:
         return loop_nest
 
     def __bool__(self):
+        # [FUNCTION DOC] Returns True if the nest has any loops.
         return bool(self.loops)
 
     @cache_on_self
     def max_parallel_depth(self):
+        # [FUNCTION DOC] Returns (cached) the ParallelDepth allowed for this nest: the leading run of loops that are all reduction or all non-reduction, starting at depth 0. If the number of steps of the first following loop exceeds 300 times the steps of that run (and parallel reduction below a vector loop with scalar kernels is not involved) the parallel region instead starts at that loop and spans the following run of same-kind loops. No loops give depth 0.
         """
         Maximal allowed depth for parallelism: All reduction or non-reduction levels.
         When the range of the first inner loop beyond the maximum parallel depth is much
@@ -6392,6 +6989,7 @@ class LoopNest:
             max_depth += 1
 
         def get_simd_vec_depth(loops):
+            # [FUNCTION DOC] HELPER: Returns the index of the first loop level marked vectorized, or None.
             # Return the first loop level which is simd_vec
             for i, loop in enumerate(loops):
                 if loop.simd_vec:
@@ -6401,6 +6999,7 @@ class LoopNest:
         simd_vec_depth = get_simd_vec_depth(self.loops)
 
         def has_scalar_kernel(loop_nest: LoopNest):
+            # [FUNCTION DOC] HELPER: True if the nest's kernel (must be a CppKernelProxy, else AssertionError) contains any kernel that is not a vector kernel.
             if not isinstance(loop_nest.kernel, CppKernelProxy):
                 raise AssertionError(
                     "expected isinstance(loop_nest.kernel, CppKernelProxy)"
@@ -6436,6 +7035,8 @@ class LoopNest:
         return ParallelDepth(parallel_depth=max_depth, start_depth=start_depth)
 
     def mark_parallel(self, par_depth):
+        # [FUNCTION DOC] Marks the loop at the parallel start depth as parallel with the depth count (AssertionError if the depth exceeds the allowed maximum or the loops are missing/too few), counts parallel reductions in metrics, and marks the following levels as collapsed.
+        # KNOWN ISSUE: the range of collapsed levels ends at the parallel depth instead of the start depth plus the parallel depth, which differs when the start depth is nonzero.
         if par_depth.parallel_depth > self.max_parallel_depth().parallel_depth:
             raise AssertionError(
                 "Parallel depth cannot exceed the maximal allowed parallel depth"
@@ -6453,6 +7054,7 @@ class LoopNest:
             self.loops[i].collapsed = True
 
     def tile(self, depth, factor):
+        # [FUNCTION DOC] Tiles the loop at the given depth by factor (replaces the level with its tiled version) and returns the new level. Raises AssertionError if there are no loops.
         """
         Do loop-tiling at the `depth` level with `factor`.
             for (x0 = 0; x0 < x0_end; x0++)
@@ -6466,14 +7068,17 @@ class LoopNest:
         return self.loops[depth]
 
     def get_kernel(self) -> CppKernel:
+        # [FUNCTION DOC] Returns the leaf kernel; raises AssertionError if unset.
         if not self.kernel:
             raise AssertionError("expected self.kernel")
         return self.kernel
 
     def set_kernel(self, kernel):
+        # [FUNCTION DOC] Sets the leaf kernel.
         self.kernel = kernel
 
     def from_loop_level(self, level: int):
+        # [FUNCTION DOC] Returns a new LoopNest holding the loops from the given level down (None if the level equals the loop count) and the same kernel. Raises AssertionError if there are no loops or the level is too large.
         if not self.loops:
             raise AssertionError("expected self.loops")
         if len(self.loops) < level:
