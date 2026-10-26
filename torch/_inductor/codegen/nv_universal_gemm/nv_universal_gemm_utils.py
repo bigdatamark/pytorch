@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper utilities for NVIDIA Universal GEMM (NVGEMM) in Inductor.
+# Provides pickling support for the torch ScalingType/SwizzleType enums and the
+# CUTLASS ScaledOperandConstraints class (needed to ship autotune requests to a
+# subprocess pool), a mapping from torch scaling/swizzle enums to cutlass.operators
+# enums, and a lazily built cutlass-to-torch dtype mapping.
+# Import-time side effects: registers copyreg pickle reducers for the torch enum
+# types and (if cutlass.operators.metadata is importable) for ScaledOperandConstraints.
 """
 Utility functions for NVIDIA Universal GEMM.
 """
@@ -10,14 +17,21 @@ from torch.nn.functional import ScalingType, SwizzleType
 
 
 def _rebuild_scaling_type(name: str) -> Any:
+    # [FUNCTION DOC] HELPER: Unpickle hook; returns the ScalingType enum member with the given name.
+    # Raises an attribute error if the name is not a member.
     return getattr(ScalingType, name)
 
 
 def _rebuild_swizzle_type(name: str) -> Any:
+    # [FUNCTION DOC] HELPER: Unpickle hook; returns the SwizzleType enum member with the given name.
+    # Raises an attribute error if the name is not a member.
     return getattr(SwizzleType, name)
 
 
 def _register_enum_pickling() -> None:
+    # [FUNCTION DOC] HELPER: Registers copyreg reducers so ScalingType and SwizzleType members
+    # pickle as (rebuild function, member name). Mutates the global copyreg dispatch table;
+    # called once at import time. The enum classes are discovered via one sample member each.
     """Make torch.nn.functional ScalingType/SwizzleType picklable.
 
     They are pybind11 C++ enums whose class __qualname__ is `_ScalingType` /
@@ -43,12 +57,18 @@ _register_enum_pickling()
 def _rebuild_scaled_operand_constraints(
     quantized: Any, scale: Any, mode: Any, swizzle: Any
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Unpickle hook; reconstructs a ScaledOperandConstraints from its four
+    # fields (quantized, scale, mode, swizzle) by calling the constructor positionally.
+    # Imports cutlass lazily; raises ImportError if cutlass is unavailable.
     from cutlass.operators.metadata import ScaledOperandConstraints
 
     return ScaledOperandConstraints(quantized, scale, mode, swizzle)
 
 
 def _register_scaled_operand_constraints_pickling() -> None:
+    # [FUNCTION DOC] HELPER: Registers a copyreg reducer for cutlass ScaledOperandConstraints
+    # (avoids its recursive attribute lookup during default unpickling). Silently does nothing
+    # if cutlass.operators.metadata cannot be imported. Mutates the global copyreg table.
     """Avoid CUTLASS's recursive ``__getattr__`` during unpickling."""
     try:
         from cutlass.operators.metadata import ScaledOperandConstraints
@@ -70,6 +90,10 @@ _register_scaled_operand_constraints_pickling()
 def to_cutlass_scale_mode(
     scale_type: Any, swizzle_type: Any
 ) -> tuple[Any | None, Any | None]:
+    # [FUNCTION DOC] Maps a torch ScalingType and SwizzleType to the matching cutlass.operators
+    # ScaleMode and ScaleSwizzleMode. Supported scaling: blockwise 1x32 and 1x16; supported
+    # swizzle: 32_4_4 and none. Returns a pair; an unsupported input yields None in its slot.
+    # Imports cutlass lazily (ImportError if missing). No side effects.
     """
     Map PyTorch ScalingType/SwizzleType to cutlass.operators ScaleMode/ScaleSwizzleMode.
 
@@ -107,6 +131,9 @@ _CUTLASS_TO_TORCH_DTYPE: dict | None = None
 
 
 def cutlass_dtype_to_torch(cutlass_dtype: Any) -> "Any | None":
+    # [FUNCTION DOC] Returns the torch dtype for a cutlass dtype (FP4/FP8 variants, bf16, fp16,
+    # fp32), or None if unmapped. Builds and caches the mapping in the module global on first
+    # call (imports cutlass then, ImportError if missing).
     """Map a cutlass dtype to the corresponding torch dtype."""
     import torch
 

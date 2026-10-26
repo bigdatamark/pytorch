@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor scheduling backend for NVIDIA Universal GEMM (NVGEMM) kernels.
+# Contains NVGemmEpiloguePlan (a frozen description of fused epilogue nodes) and
+# NVUniversalGemmScheduling, which decides which nodes can fuse into an NVGEMM template
+# (epilogue fusion incl. grouped local reductions), generates the kernel source via the
+# buffer's kernel renderer, defines the kernel in the wrapper, and builds benchmark helpers.
+# Import-time side effects: creates the module logger and constants only.
 """
 NVIDIA Universal GEMM scheduling for PyTorch Inductor.
 """
@@ -56,6 +62,12 @@ EPILOGUE_FN_NAME = "_epilogue_fn"
 
 @dataclasses.dataclass(frozen=True)
 class NVGemmEpiloguePlan:
+    # [CLASS DOC] Immutable result of analysing a GEMM's epilogue nodes. Fields: nodes (all
+    # flattened scheduler nodes of the epilogue), reductions (grouped-reduction configs found),
+    # reduction_nodes (scheduler nodes owned by those reductions), candidate_reduction (config
+    # for the node being considered for fusion, if it is a reduction), feed_main (config when
+    # a grouped reduction feeds back into the main GEMM output). Property evt_nodes gives the
+    # nodes that are not reduction-owned.
     nodes: tuple[BaseSchedulerNode, ...]
     reductions: tuple[GemmReductionConfig, ...]
     reduction_nodes: tuple[BaseSchedulerNode, ...]
@@ -64,11 +76,18 @@ class NVGemmEpiloguePlan:
 
     @property
     def evt_nodes(self) -> list[BaseSchedulerNode]:
+        # [FUNCTION DOC] Returns the epilogue nodes (in order) that are not owned by a grouped
+        # reduction; these are the nodes translated into the elementwise epilogue function.
         owned = OrderedSet(self.reduction_nodes)
         return [node for node in self.nodes if node not in owned]
 
 
 class NVUniversalGemmScheduling(BaseScheduling):
+    # [CLASS DOC] Scheduling backend for NVGEMM template kernels; stateless (no instance
+    # attributes of its own). Delegated to by CUDACombinedScheduling. Key methods:
+    # can_fuse_vertical (epilogue fusion legality), codegen_template (kernel generation and
+    # wrapper call emission), define_kernel (register source with the wrapper),
+    # generate_kernel_code_from_nodes (benchmark source). Horizontal fusion is unsupported.
     """
     Scheduling implementation for NVIDIA Universal GEMM kernels.
 
@@ -78,10 +97,15 @@ class NVUniversalGemmScheduling(BaseScheduling):
 
     @classmethod
     def get_backend_features(cls, device) -> OrderedSet[BackendFeature]:
+        # [FUNCTION DOC] Returns an empty set: this scheduler advertises no backend features.
         return OrderedSet()
 
     @staticmethod
     def _is_nvgemm_ir_buffer(ir_node: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether an IR node is an NVGEMM buffer, directly or as a
+        # MultiTemplateBuffer. For a multi-template buffer: render kind "triton" means no,
+        # "nvgemm" means yes; otherwise, if no choice is an NVGEMM caller return False, else
+        # consult the autotune winner (errors from getting it count as False).
         """Return True if `ir_node` is an NVGEMM buffer or an MTB resolving to one.
 
         Honors finalize_as_*_caller's swap (a MultiTemplateBuffer whose render
@@ -107,6 +131,8 @@ class NVUniversalGemmScheduling(BaseScheduling):
 
     @staticmethod
     def is_nv_universal_gemm_template(node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] True if node is a plain SchedulerNode whose IR node is an NVGEMM buffer
+        # (or multi-template buffer resolving to NVGEMM).
         """Check if a node is an NVGEMM template SchedulerNode."""
         if not isinstance(node, SchedulerNode):
             return False
@@ -117,6 +143,9 @@ class NVUniversalGemmScheduling(BaseScheduling):
         ir_node: MultiTemplateBuffer,
         require_epilogue_fusion: bool = False,
     ) -> NVUniversalGemmCaller:
+        # [FUNCTION DOC] HELPER: Returns the NVGEMM caller with the lowest benchmark timing among
+        # the buffer's choice timings, optionally restricted to callers supporting epilogue
+        # fusion. Note choice_timings may force autotuning. Raises RuntimeError if none qualify.
         """Find the best NVUniversalGemmCaller from an MTB's choice timings."""
         choice_timings = ir_node.choice_timings()
         best: NVUniversalGemmCaller | None = None
@@ -138,6 +167,11 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def get_nv_gemm_buffer_from_node(
         node: BaseSchedulerNode, require_epilogue_fusion: bool = False
     ) -> NVUniversalGemmBuffer:
+        # [FUNCTION DOC] Returns the concrete NVUniversalGemmBuffer for a scheduler node. A direct
+        # buffer is returned as is. For a multi-template buffer, picks the explicitly rendered
+        # NVGEMM caller if it qualifies, else (when epilogue fusion is required) the best
+        # fusion-capable caller by timing, else the autotune winner, falling back to the best
+        # NVGEMM caller. Raises an error for a non-SchedulerNode and TypeError for other IR types.
         """Extract NVUniversalGemmBuffer from node (direct or via MultiTemplateBuffer)."""
         if not isinstance(node, SchedulerNode):
             raise AssertionError(f"expected SchedulerNode, got {type(node)}")
@@ -175,6 +209,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
 
     @staticmethod
     def is_nv_universal_gemm_fused_template(node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] True if node is a FusedSchedulerNode whose template node is an NVGEMM buffer.
         """Check if a node is a fused NVIDIA Universal GEMM template."""
         if not isinstance(node, FusedSchedulerNode):
             return False
@@ -183,6 +218,9 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Whether node2 can be fused as an epilogue after node1. node1 must be an
+        # NVGEMM template node or a fused group containing one; the legality check is delegated
+        # to _can_fuse_epilogue_impl with any epilogue nodes already fused. Otherwise False.
         if self.is_nv_universal_gemm_template(node1):
             return self._can_fuse_epilogue_impl(
                 cast(SchedulerNode, node1),
@@ -207,6 +245,7 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def _unwrap_epilogue_nodes(
         self, fused_node: FusedSchedulerNode
     ) -> list[BaseSchedulerNode]:
+        # [FUNCTION DOC] HELPER: Returns the sub-nodes of a fused node that are not NVGEMM templates.
         """Extract epilogue nodes from a fused node."""
         epilogue_nodes = []
         for node in fused_node.snodes:
@@ -218,6 +257,13 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def _grouped_reduce_config(
         cls, gemm_node: Buffer, scheduler_node: BaseSchedulerNode
     ) -> GemmReductionConfig | None:
+        # [FUNCTION DOC] HELPER: Detects whether a scheduler node (one computed buffer, or a sum
+        # reduction followed by a pointwise divide-by-group finalizer) is a grouped reduction
+        # over the 2D GEMM output. Supported: a reduction along columns (axis 1) or rows (axis 0),
+        # or a pointwise sum-like op over group row-strided reads; reduction type sum/mean/prod/
+        # max/min of identity or squared source. Verifies read names, ranges and stride/offset
+        # patterns. Returns a GemmReductionConfig (output name, group, axis, reduction type,
+        # source type) or None if any check fails. No side effects.
         nodes = scheduler_node.get_nodes()
         if len(nodes) not in (1, 2):
             return None
@@ -351,6 +397,11 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def _grouped_reduce_feeds_main_config(
         cls, gemm_node: Buffer, scheduler_node: BaseSchedulerNode
     ) -> GemmReductionConfig | None:
+        # [FUNCTION DOC] HELPER: Detects a single pointwise node that reads the GEMM output group+1
+        # times (2 to 4 groups of rows at a row stride of the column count, after one leading
+        # read) and computes a centered-mean consumer pattern, i.e. the grouped mean feeds back
+        # into the main output. Returns a mean/identity GemmReductionConfig with axis 0 named
+        # after the node, or None if the pattern does not match. No side effects.
         nodes = scheduler_node.get_nodes()
         if len(nodes) != 1 or not isinstance(nodes[0].node, ComputedBuffer):
             return None
@@ -394,6 +445,10 @@ class NVUniversalGemmScheduling(BaseScheduling):
         epilogue_nodes: Sequence[BaseSchedulerNode],
         candidate: BaseSchedulerNode | None = None,
     ) -> NVGemmEpiloguePlan:
+        # [FUNCTION DOC] HELPER: Builds an NVGemmEpiloguePlan for the given epilogue nodes: finds
+        # grouped reductions per node (recording the config produced for the candidate node),
+        # flattens all nodes, and computes the feed-main config only when there is exactly one
+        # epilogue node. No side effects.
         reductions: list[GemmReductionConfig] = []
         reduction_nodes: list[BaseSchedulerNode] = []
         candidate_reduction = None
@@ -429,6 +484,14 @@ class NVUniversalGemmScheduling(BaseScheduling):
         existing_epilogue_nodes: list[BaseSchedulerNode],
         node_to_fuse: BaseSchedulerNode,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Core legality check for fusing node_to_fuse as an epilogue of an
+        # NVGEMM template, given epilogue nodes already fused. Rejects when epilogue fusion is
+        # disabled, the variant is not (scaled) GEMM, no kernel choice supports fusion, nodes are
+        # not computed buffers, are non-pointwise (unless reductions), have mismatched size, read
+        # unresolved or non-broadcastable buffers (only matrix/row/column shapes), exceed four
+        # captured tensors for scaled epilogues, do not read the GEMM output first, alias/mutate,
+        # or are non-local reductions. Finally trial-generates the epilogue code and returns False
+        # if that raises NotImplementedError or AssertionError. Logs reasons at debug level.
         from .nv_universal_gemm import GemmVariant
 
         if not config.epilogue_fusion:
@@ -636,12 +699,15 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Always False: horizontal fusion is not supported.
         # NVIDIA Universal GEMM templates don't support horizontal fusion yet
         return False
 
     def can_fuse_reduction_epilogue(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] True if node1's template node is a buffer and node2 is a grouped reduction
+        # of its output, or one that feeds back into the main output.
         template = node1.get_template_node()
         return isinstance(template, Buffer) and (
             self._grouped_reduce_config(template, node2) is not None
@@ -651,6 +717,12 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def define_kernel(
         self, src_code: str, node_schedule, precompile_metadata=None
     ) -> str:
+        # [FUNCTION DOC] Registers kernel source with the wrapper and returns the kernel name.
+        # Reuses the name if identical source was already defined. Otherwise names it from a
+        # short hash of the source (plus descriptive fused name if configured), substitutes the
+        # name placeholder in the source, wraps it in an async_compile call (with optional
+        # precompile metadata), and emits it with a comment holding the path and origins.
+        # Side effects: updates wrapper.src_to_kernel and defines the kernel in the wrapper.
         """
         Define a NVIDIA Universal GEMM kernel by writing source code and generating wrapper.
 
@@ -707,6 +779,14 @@ class NVUniversalGemmScheduling(BaseScheduling):
         *,
         only_gen_src_code: bool = False,
     ) -> str | None:
+        # [FUNCTION DOC] Generates an NVGEMM kernel for the template node with optional fused
+        # epilogue nodes (prologue fusion is unsupported and raises). Selects the concrete GEMM
+        # buffer, builds the epilogue plan (at most one grouped reduction, else raises
+        # NotImplementedError), generates the epilogue function via the loop-IR CuteDSL codegen
+        # with a fallback to the Cutlass EVT codegen, then renders the kernel source. If
+        # only_gen_src_code, returns the source with no side effects on the graph. Otherwise
+        # marks nodes as run, updates removed buffers, defines the kernel, emits the call, and
+        # frees buffers, returning None. Epilogue kernels skip precompile metadata.
         """
         Codegen a NVIDIA Universal GEMM template with optional epilogue fusion.
 
@@ -899,6 +979,10 @@ class NVUniversalGemmScheduling(BaseScheduling):
         return None
 
     def _build_precompile_metadata(self, kernel, ctb):
+        # [FUNCTION DOC] HELPER: Builds a mapping of precompile shapes, strides, dtypes (per input
+        # and "output"), device index, CUDA device capability and max active clusters, for
+        # subprocess precompilation. Returns None if the kernel has no template input args or
+        # sizes are symbolic. Cluster lookup failures are logged and leave it None.
         """Extract shapes and dtypes from kernel inputs/output for subprocess precompilation.
 
         Only called for base (non-epilogue) kernels. Returns None if shapes are
@@ -979,7 +1063,12 @@ class NVUniversalGemmScheduling(BaseScheduling):
         benchmark_kernel: bool = False,
         hint_override: int | None = None,
     ) -> str:
-        prologue, template, epilogue = nodes[0].get_prologue_template_epilogue(
+        # [FUNCTION DOC] Produces standalone kernel source for a group of scheduler nodes (template
+        # plus epilogue) for benchmarking. Computes epilogue reads and output buffer order
+        # (logging a warning if epilogue codegen fails), generates source only with the given
+        # benchmark_kernel config patched, replaces the kernel name placeholder with a benchmark
+        # prefix, and appends benchmark helpers when benchmark_kernel is set. hint_override is unused.
+        prologue, template, epilogue =nodes[0].get_prologue_template_epilogue(
             list(nodes)
         )
 
@@ -1049,8 +1138,12 @@ class NVUniversalGemmScheduling(BaseScheduling):
         epilogue_reads: list[str],
         output_bufs: list[str] | None = None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Appends to the kernel source a generated get_args function (random
+        # strided inputs, outputs, epilogue reads and optional workspace using size hints) and a
+        # call function invoking the main benchmark kernel on the current CUDA stream. Returns
+        # the extended source.
         template_node = cast(SchedulerNode, template_node)
-        ctb: NVUniversalGemmBuffer = self.get_nv_gemm_buffer_from_node(
+        ctb:NVUniversalGemmBuffer = self.get_nv_gemm_buffer_from_node(
             template_node, require_epilogue_fusion=bool(epilogue_nodes)
         )
 
