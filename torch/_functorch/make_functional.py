@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities that turn a stateful nn.Module into a functional form whose
+# parameters and buffers are passed explicitly (make_functional, make_functional_with_buffers,
+# combine_state_for_ensemble, plus deprecated v1 helpers and functional_init variants).
+# Handles parameter tying via a name map. No import-time side effects.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -24,6 +28,8 @@ if TYPE_CHECKING:
 
 
 def raise_parameter_tying_error() -> NoReturn:
+    # [FUNCTION DOC] Always raises a RuntimeError stating that models with tied
+    # (shared) parameters are unsupported by make_functional. Takes no arguments.
     raise RuntimeError(
         "make_functional(module): we don't yet support models that "
         "do parameter tying (also sometimes known as weight sharing). "
@@ -37,6 +43,11 @@ def create_names_map(
     named_params: dict[str, Tensor] | Iterable[tuple[str, Tensor]],
     tied_named_params: dict[str, Tensor] | Iterable[tuple[str, Tensor]],
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Builds a mapping from each unique parameter name to the list of all
+    # names (including tied aliases) that refer to the same tensor. Both inputs may be
+    # mappings or iterables of name/tensor pairs. Tensors are matched by identity hash.
+    # Raises AssertionError if unique names are not a subset of all names, or a tied
+    # tensor is not among the unique tensors. Pure function, no side effects.
     """
     named_params is a dictionary of tensors: {'A': A, 'B': B}
     tied_named_params is another dictionary of tensors {'A': A, 'B': B, 'B_tied': B}
@@ -73,6 +84,11 @@ def _extract_members(
     named_members: Callable[..., Iterable[tuple[str, Tensor]]],
     subclass: Callable[[Tensor], Tensor],
 ) -> tuple[tuple[Tensor, ...], tuple[str, ...], dict[str, list[str]]]:
+    # [FUNCTION DOC] HELPER: Strips parameters or buffers out of a module in place.
+    # named_members is the module's bound named_parameters/named_buffers; subclass wraps
+    # each meta-device placeholder (Parameter for weights, identity for buffers).
+    # Every member (including tied aliases) is replaced by a meta placeholder, with tied
+    # members sharing one placeholder. Returns (unique tensors, unique names, names map).
     all_named_members = tuple(named_members(remove_duplicate=False))
     unique_named_members = tuple(named_members(remove_duplicate=True))
     names_map = create_names_map(unique_named_members, all_named_members)
@@ -105,12 +121,16 @@ def extract_weights(
     Note that this function modifies the model in place and after this
     call, mod.parameters() will be empty.
     """
+    # [FUNCTION DOC] Removes all parameters from mod in place (replacing them with meta
+    # placeholders) and returns (params tuple, names tuple, tied-names map).
     return _extract_members(mod, mod.named_parameters, nn.Parameter)
 
 
 def extract_buffers(
     mod: nn.Module,
 ) -> tuple[tuple[Tensor, ...], tuple[str, ...], dict[str, list[str]]]:
+    # [FUNCTION DOC] Same as extract_weights but for buffers: replaces each buffer in mod
+    # with a meta placeholder in place and returns (buffers, names, tied-names map).
     return _extract_members(mod, mod.named_buffers, lambda x: x)
 
 
@@ -125,6 +145,8 @@ def load_weights(
     Note that the `params` are regular Tensors (that can have history) and so are left
     as Tensors. This means that mod.parameters() will still be empty after this call.
     """
+    # [FUNCTION DOC] Sets the tensors named by names on mod to the given params, in place.
+    # If as_params is true each tensor is first wrapped in a Parameter. Returns nothing.
     accessor = NamedMemberAccessor(mod)
     if as_params:
         params = [nn.Parameter(p) for p in params]
@@ -134,6 +156,10 @@ def load_weights(
 def _swap_state(
     mod: nn.Module, names_map: dict[str, list[str]], elems: Iterable[Tensor]
 ) -> list[Tensor]:
+    # [FUNCTION DOC] HELPER: Pairs each entry of names_map with the next element of elems.
+    # For each group of aliased names, the first name is swapped (its old tensor is
+    # collected in the result list) and the remaining aliases are set to the same new
+    # tensor. Mutates mod; returns the replaced tensors, one per group.
     result: list[Tensor] = []
     accessor = NamedMemberAccessor(mod)
     for (_, attr_names), elem in zip(names_map.items(), elems):
@@ -151,6 +177,8 @@ def load_buffers(
     buffers: Sequence[Tensor],
     as_params: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Sets the named buffers on mod in place to the given tensors.
+    # KNOWN ISSUE: the as_params argument is accepted but ignored.
     accessor = NamedMemberAccessor(mod)
     accessor.set_tensors(names, buffers)
 
@@ -167,6 +195,9 @@ def load_state(
     load_state takes `weights` and `buffers` and assigns them to the model.
     This is the inverse operation of `make_functional_deprecated_v1`.
     """
+    # [FUNCTION DOC] Loads weights (and optionally buffers) back into model in place and
+    # returns the model. Raises AssertionError if a names sequence length differs from its
+    # tensors sequence length. Buffers are only loaded when non-empty.
     if len(weight_names) != len(weights):
         raise AssertionError(
             f"len(weight_names)={len(weight_names)} != len(weights)={len(weights)}"
@@ -209,6 +240,10 @@ def make_functional_deprecated_v1(
 
     To put the state back into a model, use `load_state`.
     """
+    # [FUNCTION DOC] Deprecated. Extracts the weights from model in place (model is left
+    # without parameters) and returns (weights, func, weight_names). func takes (weights,
+    # data tuple), deep-copies the model, loads the weights and calls it on the data.
+    # Raises RuntimeError if the model has buffers.
     buffers = list(model.buffers())
     if len(buffers) > 0:
         raise RuntimeError(
@@ -218,6 +253,8 @@ def make_functional_deprecated_v1(
     weights, descriptors, _ = extract_weights(model)
 
     def fun(weights: tuple[Tensor, ...], data: tuple[Any, ...]) -> Any:
+        # [FUNCTION DOC] HELPER: Runs a deep copy of the stripped model with the given
+        # weights loaded, calling it with the positional args in data; returns its output.
         mutable_model = copy.deepcopy(model)
         load_weights(mutable_model, descriptors, weights)
         return mutable_model(*data)
@@ -258,6 +295,9 @@ def make_functional_with_buffers_deprecated_v1(
 
     To put the state back into a model, use `load_state`.
     """
+    # [FUNCTION DOC] Deprecated. Extracts weights and buffers from model in place and
+    # returns (weights, buffers, func, weight_names, buffer_names). func takes (weights,
+    # buffers, data tuple), deep-copies the model, loads both and calls it on the data.
     weights, weight_descriptors, _ = extract_weights(model)
     buffers, buf_descriptors, _ = extract_buffers(model)
 
@@ -266,6 +306,8 @@ def make_functional_with_buffers_deprecated_v1(
         buffers: tuple[Tensor, ...],
         data: tuple[Any, ...],
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Runs a deep copy of the stripped model with the given
+        # weights and buffers loaded, calling it with the positional args in data.
         mutable_model = copy.deepcopy(model)
         load_weights(mutable_model, weight_descriptors, weights)
         load_buffers(mutable_model, buf_descriptors, buffers)
@@ -275,6 +317,10 @@ def make_functional_with_buffers_deprecated_v1(
 
 
 class FunctionalModuleWithBuffers(nn.Module):
+    # [CLASS DOC] Callable wrapper around a stateless (meta-placeholder) copy of a model.
+    # State: stateless_model, param_names, buffer_names, and all_names_map (parameter and
+    # buffer alias groups merged; params first). Calling it with params and buffers
+    # temporarily installs them on the model, runs forward, then restores placeholders.
     """
     This is the callable object returned by :func:`make_functional_with_buffers`.
     """
@@ -287,6 +333,8 @@ class FunctionalModuleWithBuffers(nn.Module):
         param_names_map: dict[str, list[str]],
         buffer_names_map: dict[str, list[str]],
     ) -> None:
+        # [FUNCTION DOC] Stores the stateless model and name tuples, and builds
+        # all_names_map by merging the parameter map with the buffer map.
         super().__init__()
         self.stateless_model = stateless_model
         self.param_names = param_names
@@ -299,6 +347,9 @@ class FunctionalModuleWithBuffers(nn.Module):
     def _create_from(
         model: nn.Module, disable_autograd_tracking: bool = False
     ) -> tuple[FunctionalModuleWithBuffers, tuple[Tensor, ...], tuple[Tensor, ...]]:
+        # [FUNCTION DOC] Deep-copies model, strips its params and buffers from the copy and
+        # returns (wrapper module, params, buffers). The original model is untouched. If
+        # disable_autograd_tracking is true, the params get requires_grad turned off.
         # TODO: We don't need to copy the model to create a stateless copy
         model_copy = copy.deepcopy(model)
         params, param_names, param_names_map = extract_weights(model_copy)
@@ -321,6 +372,9 @@ class FunctionalModuleWithBuffers(nn.Module):
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        # [FUNCTION DOC] Runs the model with the given params and buffers (params first, in
+        # name-map order) swapped in, passing extra args and kwargs through. Returns the
+        # model output; the placeholders are restored afterwards even if an error occurs.
         # Temporarily load the state back onto self.stateless_model
         old_state = _swap_state(
             self.stateless_model,
@@ -335,6 +389,9 @@ class FunctionalModuleWithBuffers(nn.Module):
 
 
 class FunctionalModule(nn.Module):
+    # [CLASS DOC] Callable wrapper around a stateless copy of a buffer-free model.
+    # State: stateless_model, param_names, names_map (alias groups). Calling it with
+    # params temporarily installs them, runs forward, then restores placeholders.
     """
     This is the callable object returned by :func:`make_functional`.
     """
@@ -345,6 +402,7 @@ class FunctionalModule(nn.Module):
         param_names: tuple[str, ...],
         names_map: dict[str, list[str]],
     ) -> None:
+        # [FUNCTION DOC] Stores the stateless model, parameter names and alias map.
         super().__init__()
         self.stateless_model = stateless_model
         self.param_names = param_names
@@ -354,6 +412,9 @@ class FunctionalModule(nn.Module):
     def _create_from(
         model: nn.Module, disable_autograd_tracking: bool = False
     ) -> tuple[FunctionalModule, tuple[Tensor, ...]]:
+        # [FUNCTION DOC] Deep-copies model, strips its params from the copy and returns
+        # (wrapper module, params). Original model untouched. If disable_autograd_tracking
+        # is true, the params get requires_grad turned off.
         # TODO: We don't need to copy the model to create a stateless copy
         model_copy = copy.deepcopy(model)
         params, param_names, names_map = extract_weights(model_copy)
@@ -363,6 +424,8 @@ class FunctionalModule(nn.Module):
         return FunctionalModule(model_copy, param_names, names_map), params
 
     def forward(self, params: Iterable[Tensor], *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Runs the model with the given params swapped in, passing extra args
+        # and kwargs through. Returns the output; placeholders are restored in a finally step.
         # Temporarily load the state back onto self.stateless_model
         old_state = _swap_state(self.stateless_model, self.names_map, params)
         try:
@@ -433,6 +496,9 @@ def make_functional(
             history with PyTorch autograd.
 
     """
+    # [FUNCTION DOC] Returns (FunctionalModule, params) for a model without buffers; the
+    # original model is not modified (a copy is stripped). Raises RuntimeError if the
+    # model has any buffers.
     buffers = list(model.buffers())
     if len(buffers) > 0:
         raise RuntimeError(
@@ -502,6 +568,8 @@ def make_functional_with_buffers(
             history with PyTorch autograd.
 
     """
+    # [FUNCTION DOC] Returns (FunctionalModuleWithBuffers, params, buffers) built from a
+    # copy of model; the original is not modified.
     return FunctionalModuleWithBuffers._create_from(
         model, disable_autograd_tracking=disable_autograd_tracking
     )
@@ -510,6 +578,9 @@ def make_functional_with_buffers(
 def transpose_stack(
     tuple_of_tuple_of_tensors: tuple[tuple[Tensor, ...], ...],
 ) -> tuple[Tensor, ...]:
+    # [FUNCTION DOC] Transposes a tuple (per model) of tuples (per tensor) and stacks each
+    # group along a new leading dimension, detaching the result. Returns one stacked
+    # tensor per position.
     tuple_of_tuple_of_tensors = tuple(zip(*tuple_of_tuple_of_tensors))
     results = tuple(
         torch.stack(shards).detach() for shards in tuple_of_tuple_of_tensors
@@ -557,6 +628,10 @@ def combine_state_for_ensemble(
         This API is subject to change -- we're investigating better ways to
         create ensembles and would love your feedback how to improve this.
     """
+    # [FUNCTION DOC] Makes each model functional (with buffers) and stacks their params and
+    # buffers along a new leading dimension. Returns (functional module of the first model,
+    # stacked params, stacked buffers). Raises RuntimeError if models is empty, training
+    # modes differ, or classes differ.
     if len(models) == 0:
         raise RuntimeError(
             "combine_state_for_ensemble: Expected at least one model, got 0."
@@ -584,9 +659,15 @@ def functional_init(
     ensemble_shape: tuple[()] | tuple[int, ...] = (),
     device: torch.types.Device = "cpu",
 ) -> Callable[..., tuple[tuple[Tensor, ...], Callable[..., Any], tuple[str, ...]]]:
+    # [FUNCTION DOC] Returns a factory that builds model_class instances (moved to device)
+    # and returns (weights, func, names) in the deprecated v1 form. With an empty
+    # ensemble_shape one model is built; with one element, that many models are built
+    # and their weights stacked.
     def wrapped(
         *args: Any, **kwargs: Any
     ) -> tuple[tuple[Tensor, ...], Callable[..., Any], tuple[str, ...]]:
+        # [FUNCTION DOC] HELPER: Constructs the model(s) with args and kwargs. Raises
+        # ValueError if ensemble_shape has 2+ entries or the model count is not positive.
         if len(ensemble_shape) >= 2:
             raise ValueError("NYI: ensemble_shape with more than 1 element")
         if len(ensemble_shape) == 0:
@@ -623,6 +704,8 @@ def functional_init_with_buffers(
     ]
     | tuple[tuple[Tensor, ...], Callable[..., Any], tuple[str, ...]],
 ]:
+    # [FUNCTION DOC] Like functional_init but uses the buffer-aware deprecated v1 form for
+    # ensembles, returning (weights, buffers, func, weight_names, buffer_names).
     def wrapped(
         *args: Any, **kwargs: Any
     ) -> (
@@ -635,6 +718,10 @@ def functional_init_with_buffers(
         ]
         | tuple[tuple[Tensor, ...], Callable[..., Any], tuple[str, ...]]
     ):
+        # [FUNCTION DOC] HELPER: Constructs the model(s) with args and kwargs. Raises
+        # ValueError if ensemble_shape has 2+ entries or the model count is not positive.
+        # KNOWN ISSUE: with an empty ensemble_shape it uses the buffer-less v1 function, so
+        # it returns a 3-tuple and raises RuntimeError for models that have buffers.
         if len(ensemble_shape) >= 2:
             raise ValueError("NYI: ensemble_shape with more than 1 element")
         if len(ensemble_shape) == 0:
