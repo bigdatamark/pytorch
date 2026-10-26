@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Base class for ROCm C++ kernel templates used by Inductor autotuning. Provides
+# ArgInfo (runtime argument name/type), ROCmTemplate (generates a ROCmTemplateCaller with a
+# benchmark request and kernel-render factory, plus C++ header/globals snippets). Subclasses
+# implement render. No import-time side effects besides creating a logger.
 import functools
 import itertools
 import logging
@@ -24,11 +28,17 @@ log = logging.getLogger(__name__)
 # FIXME: unify with the CUDA version
 @dataclass(frozen=True)
 class ArgInfo:
+    # [CLASS DOC] Frozen record describing one runtime kernel argument: name and C++ type string ty.
     name: str
     ty: str
 
 
 class ROCmTemplate(KernelTemplate):
+    # [CLASS DOC] Abstract base for ROCm C++ templates. State: input_nodes, output_node (a buffer
+    # named buf_out with the given layout), input_reorder, layout. Class attributes: index_counter
+    # (shared counter making unique kernel hash names) and gfx9_threads_per_warp (64).
+    # Key methods: generate (build caller), header/globals (C++ snippets), render (abstract),
+    # get_runtime_arg_info/values (hooks returning empty lists by default).
     index_counter = itertools.count()
     gfx9_threads_per_warp = 64
 
@@ -39,6 +49,8 @@ class ROCmTemplate(KernelTemplate):
         layout: Layout,
         input_reorder: list[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base template with name and stores input nodes, a fresh
+        # output buffer named buf_out using the layout, the optional input reorder list and layout.
         """
 
         Baseclass for ROCm C++ Templates, derived from KernelTemplate. Not to be instantiated directly.
@@ -60,6 +72,12 @@ class ROCmTemplate(KernelTemplate):
         self,
         **kwargs,
     ) -> ROCmTemplateCaller:
+        # [FUNCTION DOC] Renders the template once inside a ROCmTemplateKernel (with dtype lookup
+        # patched to the output node), logs the code and args, checks that the kernel's call args
+        # start with the (reordered, de-duplicated) input names followed by the output name, then
+        # builds a ROCmBenchmarkRequest (size args resolved to ints plus runtime args) and returns a
+        # ROCmTemplateCaller holding a factory that makes a kernel and render callable for epilogue fusion.
+        # Raises AssertionError on call-arg mismatch. Increments the shared index counter.
         """
         Generates the ROCm template caller object for the given GEMM template and operation. This ROCmTemplateCaller
         may be used to call and benchmark the generated ROCm kernel in a standalone manner to enable Autotuning.
@@ -126,6 +144,9 @@ class ROCmTemplate(KernelTemplate):
             template_node: ROCmTemplateBuffer,
             epilogue_nodes: Sequence[IRNode] | None = None,
         ):
+            # [FUNCTION DOC] HELPER: creates a ROCmTemplateKernel with a placeholder name and a
+            # partial of render bound to it, the template buffer node, epilogue nodes and generate kwargs.
+            # Returns the (kernel, render) pair.
             kernel = ROCmTemplateKernel(
                 kernel_name="KERNEL_NAME",
                 runtime_arg_info=self.get_runtime_arg_info(),
@@ -152,6 +173,8 @@ class ROCmTemplate(KernelTemplate):
         )
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Returns an IndentedBuffer with the standard C++ includes (exception,
+        # iostream, memory, random, vector).
         res = IndentedBuffer()
         res.splice(
             """
@@ -165,6 +188,8 @@ class ROCmTemplate(KernelTemplate):
         return res
 
     def globals(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Returns an IndentedBuffer defining the PT_EXPORT macro (default symbol
+        # visibility on GNU compilers, dllexport on Windows, empty otherwise).
         res = IndentedBuffer()
         res.splice(
             """
@@ -185,10 +210,13 @@ class ROCmTemplate(KernelTemplate):
         return res
 
     def render(self, **kwargs) -> str:
+        # [FUNCTION DOC] Abstract hook: subclasses return the kernel C++ source. Always raises NotImplementedError here.
         raise NotImplementedError
 
     def get_runtime_arg_info(self) -> list[ArgInfo]:
+        # [FUNCTION DOC] Hook returning descriptions of extra runtime kernel args; empty by default.
         return []
 
     def get_runtime_arg_values(self, **kwargs) -> list[Any]:
+        # [FUNCTION DOC] Hook returning values for the runtime kernel args; empty by default.
         return []

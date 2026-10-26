@@ -1,3 +1,6 @@
+# [MODULE DOC] Provides SegmentedTree, a generic lazy-propagation segment tree supporting
+# range updates and range summary queries with caller-supplied update and summary operations.
+# Also a small private helper for defaulting optional values. No import-time side effects.
 from collections.abc import Callable
 from typing import Generic, TypeVar
 
@@ -6,10 +9,15 @@ T = TypeVar("T")
 
 
 def _value_or(opt: T | None, default: T) -> T:
+    # [FUNCTION DOC] HELPER: returns the given value unless it is None, in which case returns the default.
     return opt if opt is not None else default
 
 
 class SegmentedTree(Generic[T]):
+    # [CLASS DOC] Segment tree over a fixed-length list with lazy range updates. State: n (element
+    # count), update_op/summary_op/identity (user operations), size (heap array length, twice the next
+    # power of two >= n, index 0 unused), tree (node summaries), lazy (pending per-node updates or None).
+    # Public API: update_range and summarize_range, both with inclusive bounds.
     def __init__(
         self,
         values: list[T],
@@ -17,6 +25,9 @@ class SegmentedTree(Generic[T]):
         summary_op: Callable[[T, T], T],
         identity_element: T,
     ):
+        # [FUNCTION DOC] Stores the operations, sizes the heap-layout arrays, fills tree with the
+        # identity and lazy with none, then builds the tree from values.
+        # Raises ValueError if values is empty.
         """
         Initialize a segment tree with the given values and operations.
 
@@ -61,6 +72,8 @@ class SegmentedTree(Generic[T]):
         self._build(values, 1, 0, self.n - 1)
 
     def _build(self, values: list[T], node: int, start: int, end: int) -> None:
+        # [FUNCTION DOC] HELPER: recursively builds the tree for the segment [start, end] at node;
+        # leaves copy the value at their index, internal nodes hold the summary of both children.
         """
         Build the segment tree recursively.
 
@@ -88,9 +101,14 @@ class SegmentedTree(Generic[T]):
         self.tree[node] = self.summary_op(self.tree[left_child], self.tree[right_child])
 
     def _children(self, node: int) -> list[int]:
+        # [FUNCTION DOC] HELPER: returns the left and right child indices of a node in heap layout.
         return [2 * node, 2 * node + 1]
 
     def _push_lazy(self, node: int, start: int, end: int) -> None:
+        # [FUNCTION DOC] HELPER: if the node has a pending lazy value, applies it to the node's
+        # summary via update_op, combines it into each child's lazy value (non-leaf only), and clears it.
+        # Mutates tree and lazy. The update is applied to the summary directly, not scaled by
+        # segment length, so update_op must be compatible with that (e.g. max/min style).
         """
         Push lazy updates down to children.
 
@@ -119,6 +137,9 @@ class SegmentedTree(Generic[T]):
     def _update_range_helper(
         self, node: int, start: int, end: int, left: int, right: int, value: T
     ) -> None:
+        # [FUNCTION DOC] HELPER: recursive range update. Pushes pending lazy value, returns on no
+        # overlap, on full overlap sets the node's lazy value and applies it, otherwise recurses into
+        # both children and recomputes the node summary. Mutates tree and lazy.
         """
         Helper method to update a range of values in the segment tree.
 
@@ -158,6 +179,9 @@ class SegmentedTree(Generic[T]):
     def _query_range_helper(
         self, node: int, start: int, end: int, left: int, right: int
     ) -> T:
+        # [FUNCTION DOC] HELPER: recursive range query. Returns the identity on no overlap, pushes
+        # pending lazy value, returns the node summary on full overlap, otherwise combines the
+        # results of both children with summary_op. May mutate tree and lazy via lazy pushes.
         """
         Helper method to query a range of values in the segment tree.
 
@@ -194,6 +218,8 @@ class SegmentedTree(Generic[T]):
         return self.summary_op(left_result, right_result)
 
     def update_range(self, start: int, end: int, value: T) -> None:
+        # [FUNCTION DOC] Applies value, via update_op, to every element in the inclusive range
+        # [start, end] lazily. Raises ValueError if start > end or either index is outside [0, n-1].
         """
         Update a range of values in the segment tree.
 
@@ -217,6 +243,8 @@ class SegmentedTree(Generic[T]):
         self._update_range_helper(1, 0, self.n - 1, start, end, value)
 
     def summarize_range(self, start: int, end: int) -> T:
+        # [FUNCTION DOC] Returns the summary_op combination of all elements in the inclusive range
+        # [start, end]. Raises ValueError if start > end or either index is outside [0, n-1].
         """
         Query a range of values in the segment tree.
 

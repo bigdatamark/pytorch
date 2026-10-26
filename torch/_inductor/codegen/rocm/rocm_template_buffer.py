@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines ROCmTemplateBuffer, the Inductor IR buffer node that represents the
+# output of a ROCm C++ template kernel and carries its workspace size and originating template.
+# No import-time side effects besides defining type variables and the class.
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 from typing_extensions import ParamSpec
@@ -10,6 +13,8 @@ _T = TypeVar("_T")
 
 
 class ROCmTemplateBuffer(TemplateBuffer):
+    # [CLASS DOC] TemplateBuffer subclass for ROCm templates. Extra state: workspace_size
+    # (bytes of global memory the kernel needs) and template (the ROCmTemplate that produced it).
     def __init__(
         self,
         layout: Layout,
@@ -18,10 +23,13 @@ class ROCmTemplateBuffer(TemplateBuffer):
         workspace_size: int,
         template: "ROCmTemplate",  # type: ignore[name-defined]  # noqa: F821
     ) -> None:
+        # [FUNCTION DOC] Initializes the base TemplateBuffer with layout, inputs and the
+        # kernel-render factory, then stores the workspace size in bytes and the template.
         super().__init__(layout, inputs, make_kernel_render)
         # Global memory (in bytes) needed for this template.
         self.workspace_size = workspace_size
         self.template = template
 
     def get_workspace_size(self) -> int:
+        # [FUNCTION DOC] Returns the workspace size in bytes, or 0 if it is unset (None).
         return self.workspace_size if self.workspace_size is not None else 0
