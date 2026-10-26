@@ -106,7 +106,6 @@ class _AsyncOutputCode(OutputCode):
     _boxed_call: bool  # Copied from the forward/output_code
 
     def __init__(
-        # [FUNCTION DOC] Store the eager function, future and callback; the boxed-call flag is copied from the eager function.
         self,
         # eager_fn is run until the future is finished.
         eager_fn: Callable[..., Any],
@@ -116,6 +115,7 @@ class _AsyncOutputCode(OutputCode):
         # this callback gets called to turn the _WireProtocolPickledOutput into an OutputCode
         callback: Callable[[_WireProtocolPickledOutput], OutputCode],
     ) -> None:
+        # [FUNCTION DOC] Store the eager function, future and callback; the boxed-call flag is copied from the eager function.
         self._eager_fn = eager_fn
         self._boxed_call = getattr(eager_fn, "_boxed_call", False)
         self._output_code = None
@@ -177,13 +177,13 @@ class _AsyncOutputCode(OutputCode):
 
     @override
     def post_compile(
-        # [FUNCTION DOC] If still running eager, save the arguments for later; otherwise forward the call to the compiled output code
-        # (AssertionError if absent).
         self,
         example_inputs: Sequence[InputType],
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] If still running eager, save the arguments for later; otherwise forward the call to the compiled output code
+        # (AssertionError if absent).
         if self._eager_fn is not None:
             self._post_compile_data = _PostCompileData(
                 example_inputs, constants, graph_kwargs
@@ -227,15 +227,15 @@ class _AsyncFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
-        # [FUNCTION DOC] Compile in-process first (inheriting the compile region name). Then try to serialize the compile for the child;
-        # if not serializable return the eager result. Otherwise start the background compile, count it, and return an _AsyncOutputCode whose callback
-        # deserializes the result, sets the region name on compiled graphs, post-processes it and returns the graph.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> OutputCode:
+        # [FUNCTION DOC] Compile in-process first (inheriting the compile region name). Then try to serialize the compile for the child;
+        # if not serializable return the eager result. Otherwise start the background compile, count it, and return an _AsyncOutputCode whose callback
+        # deserializes the result, sets the region name on compiled graphs, post-processes it and returns the graph.
         eager_compile = _InProcessFxCompile()
         eager_compile.compile_region_name = self.compile_region_name
         eager_output_code = eager_compile.codegen_and_compile(
@@ -287,7 +287,6 @@ class _ProgressiveOutputCode(OutputCode):
     _boxed_call: bool = True
 
     def __init__(
-        # [FUNCTION DOC] Store the fast output code and wrap the futures in a queue-based compilation state.
         self,
         # Fast compile that runs faster than the progressive compiles
         fast_output_code: OutputCode,
@@ -296,6 +295,7 @@ class _ProgressiveOutputCode(OutputCode):
         # Callback to convert the optimized result to OutputCode
         callback: Callable[[_WireProtocolPickledOutput], OutputCode],
     ) -> None:
+        # [FUNCTION DOC] Store the fast output code and wrap the futures in a queue-based compilation state.
         self._fast_output_code = fast_output_code
         self._optimized_output_code = None
         self._compilation_state = ProgressiveCompilationState(
@@ -357,14 +357,14 @@ class _ProgressiveOutputCode(OutputCode):
 
     @override
     def post_compile(
-        # [FUNCTION DOC] Forward post_compile to the fast output code and remember the arguments in the compilation state so they apply to
-        # optimized results later. Raises AssertionError if the fast code or state is gone.
-        # KNOWN ISSUE: fails if called after a swap, since the fast output code has been cleared by then.
         self,
         example_inputs: Sequence[InputType],
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] Forward post_compile to the fast output code and remember the arguments in the compilation state so they apply to
+        # optimized results later. Raises AssertionError if the fast code or state is gone.
+        # KNOWN ISSUE: fails if called after a swap, since the fast output code has been cleared by then.
         if self._fast_output_code is None:
             raise AssertionError("expected self._fast_output_code to be not None")
         self._fast_output_code.post_compile(example_inputs, constants, graph_kwargs)
@@ -394,12 +394,12 @@ class _ProgressiveFxCompile(FxCompile):
     _stat_optimized_runs: int = 0
 
     def __init__(
-        # [FUNCTION DOC] Store the fast compiler, optimized out-of-process compiler and progression configs.
         self,
         fast_compile: FxCompile,
         optimized_compile: _OutOfProcessFxCompile,
         progression_configs: list[dict[str, Any]],
     ) -> None:
+        # [FUNCTION DOC] Store the fast compiler, optimized out-of-process compiler and progression configs.
         self._fast_compile = fast_compile
         self._optimized_compile = optimized_compile
         self._progression_configs = progression_configs
@@ -414,16 +414,16 @@ class _ProgressiveFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
-        # [FUNCTION DOC] For each progression config, patch inductor config, count a started compile, serialize and send the compile to the child,
-        # collecting futures (skipping unserializable ones). Then run the fast compile in-process. With no futures return the fast output;
-        # otherwise return a _ProgressiveOutputCode with a callback that deserializes and post-processes results.
-        # KNOWN ISSUE: the constants captured by the callback come from the last serialized config only.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> OutputCode:
+        # [FUNCTION DOC] For each progression config, patch inductor config, count a started compile, serialize and send the compile to the child,
+        # collecting futures (skipping unserializable ones). Then run the fast compile in-process. With no futures return the fast output;
+        # otherwise return a _ProgressiveOutputCode with a callback that deserializes and post-processes results.
+        # KNOWN ISSUE: the constants captured by the callback come from the last serialized config only.
         import torch._inductor.config as inductor_config
 
         progression_futures: list[Future[_WireProtocolPickledOutput]] = []

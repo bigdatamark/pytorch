@@ -34,10 +34,10 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
     # subprocess worker pool and returns a future for the pickled result. Final class.
     @override
     def _send_to_child_async(
-        # [FUNCTION DOC] Submit the pickled input to the shared process pool, together with the current values of the
-        # inductor and triton cache directory environment variables so the child shares caches. Returns a future of the pickled output.
         self, input: _WireProtocolPickledInput
     ) -> Future[_WireProtocolPickledOutput]:
+        # [FUNCTION DOC] Submit the pickled input to the shared process pool, together with the current values of the
+        # inductor and triton cache directory environment variables so the child shares caches. Returns a future of the pickled output.
         # TODO: Do we need to copy across some kind of logging IDs? (ChromiumEventLogger)
 
         pool = self.process_pool()
@@ -68,12 +68,12 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
 
     @classmethod
     def _run_in_child_subprocess(
-        # [FUNCTION DOC] HELPER: Runs inside the child process. Clears inductor caches and resets metrics, then runs the compile
-        # via _run_in_child with the given pickled input and environment overrides and returns the pickled output.
         cls,
         pickled_input: _WireProtocolPickledInput,
         extra_env: Mapping[str, str | None] | None,
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] HELPER: Runs inside the child process. Clears inductor caches and resets metrics, then runs the compile
+        # via _run_in_child with the given pickled input and environment overrides and returns the pickled output.
         # TODO: In subprocess mode we need to clear the inductor caches.
         # The problem:
         #   1. We compile in worker A which fills stuff in tmpdir

@@ -103,9 +103,9 @@ _WORKER_TERMINATE_GRACE_SECONDS = 10.0
 
 
 def _send_msg(
-    # [FUNCTION DOC] HELPER: Write the packed header and any payload to the pipe and flush. May raise OSError such as a broken pipe.
     write_pipe: IO[bytes], msg_header: MsgHeader, job_id: int = -1, data: bytes = b""
 ) -> None:
+    # [FUNCTION DOC] HELPER: Write the packed header and any payload to the pipe and flush. May raise OSError such as a broken pipe.
     length = len(data)
     write_pipe.write(_pack_msg(msg_header, job_id, length))
     if length > 0:
@@ -185,17 +185,17 @@ class SubprocPool:
     """
 
     def __init__(
-        # [FUNCTION DOC] Create the pipes, build the sidecar command line (the compile worker main module or an internal binary) with pickler, kind,
-        # worker count, parent pid, fds and torch key, choose the log file (devnull if logging is suppressed, else the configured or default path),
-        # start the sidecar passing only its pipe ends and close those ends in the parent. Initialize locks, future tables, wait counters and
-        # an optional inactivity Timer that quiesces the pool; start the reader and health threads last.
-        # Side effects: spawns a process, opens files, enters wait counters.
         self,
         nprocs: int,
         pickler: SubprocPickler | None = None,
         kind: SubprocKind = SubprocKind.FORK,
         quiesce: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Create the pipes, build the sidecar command line (the compile worker main module or an internal binary) with pickler, kind,
+        # worker count, parent pid, fds and torch key, choose the log file (devnull if logging is suppressed, else the configured or default path),
+        # start the sidecar passing only its pipe ends and close those ends in the parent. Initialize locks, future tables, wait counters and
+        # an optional inactivity Timer that quiesces the pool; start the reader and health threads last.
+        # Side effects: spawns a process, opens files, enters wait counters.
         entry = os.path.join(os.path.dirname(__file__), "__main__.py")
         self.pickler = pickler or SubprocPickler()
         self.kind = kind
@@ -312,11 +312,11 @@ class SubprocPool:
         self.health_thread.start()
 
     def submit(
+        self, job_fn: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
+    ) -> Future[_T]:
         # [FUNCTION DOC] Submit a callable (bound with any extra args) to the sidecar. Pickles it, allocates a job id, registers a future,
         # per-job wait counter and compile id, exits quiesce state if needed and tracks the first job, then sends a JOB message.
         # Returns the future. Raises RuntimeError if the pool is closed.
-        self, job_fn: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
-    ) -> Future[_T]:
         if args or kwargs:
             # pyrefly: ignore [bad-assignment]
             job_fn = functools.partial(job_fn, *args, **kwargs)
@@ -593,7 +593,6 @@ class SubprocMain:
     """Communicates with a SubprocPool in the parent process, called by __main__.py"""
 
     def __init__(
-        # [FUNCTION DOC] Store arguments and initialize empty pool, in-flight table, locks and the watchdog stop event.
         self,
         pickler: SubprocPickler,
         kind: SubprocKind,
@@ -601,6 +600,7 @@ class SubprocMain:
         read_pipe: IO[bytes],
         write_pipe: IO[bytes],
     ) -> None:
+        # [FUNCTION DOC] Store arguments and initialize empty pool, in-flight table, locks and the watchdog stop event.
         self.pickler = pickler
         self.kind = kind
         self.read_pipe = read_pipe
@@ -793,14 +793,14 @@ class SubprocMain:
                 self._report_status(job_id, elapsed, heartbeats.get(job_id), now_ns)
 
     def _report_status(
-        # [FUNCTION DOC] HELPER: Build a status mapping with job id and elapsed seconds, add the worker phase, phase elapsed time and pid when a heartbeat exists,
-        # or mark the job queued when heartbeats are enabled but none was found, and send it as a STATUS message. Pipe errors are ignored.
         self,
         job_id: int,
         elapsed: float,
         heartbeat: tuple[int, int, int] | None,
         now_ns: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Build a status mapping with job id and elapsed seconds, add the worker phase, phase elapsed time and pid when a heartbeat exists,
+        # or mark the job queued when heartbeats are enabled but none was found, and send it as a STATUS message. Pipe errors are ignored.
         status: dict[str, Any] = {"job_id": job_id, "elapsed_s": round(elapsed, 1)}
         if heartbeat is not None:
             phase, phase_start_ns, worker_pid = heartbeat

@@ -1,3 +1,6 @@
+# [MODULE DOC] Compiler bisector: finds which torch.compile backend, subsystem and application count causes a failure, by repeatedly running a user
+# function while disabling components. Provides the backend and subsystem table, CompilerBisector, BisectionResult and a command line interface.
+# Import-time side effect: sets CompilerBisector.bisection_enabled from the environment and status file, and runs the CLI when executed as main.
 import atexit
 import collections
 import dataclasses
@@ -18,27 +21,32 @@ SUBDIR_NAME = "bisect"
 
 @dataclass
 class Subsystem:
+    # [CLASS DOC] HELPER: Dataclass describing a named component of a compile backend that the bisector can disable.
     name: str
 
 
 @dataclass
 class BisectSubsystem(Subsystem):
+    # [CLASS DOC] HELPER: Subsystem applied repeatedly during compilation (passes, lowerings); the bisector binary-searches how many applications trigger the failure.
     pass
 
 
 @dataclass
 class BinarySubsystem(Subsystem):
+    # [CLASS DOC] HELPER: Subsystem that is simply on or off; no count-based bisecting is done for it.
     pass
 
 
 @dataclass
 class ConfigChange(BinarySubsystem):
+    # [CLASS DOC] HELPER: Binary subsystem that sets one field of a config module to a given value; its name is derived from config name and field.
     name: str = field(init=False)
     config_name: str
     config_field: str
     config_value: object
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Set the name to the config name and field joined by an underscore.
         self.name = f"{self.config_name}_{self.config_field}"
 
 
@@ -77,11 +85,14 @@ subsystem_call_counter: dict[str, int] = collections.Counter()
 
 @functools.cache
 def get_env_val(env_str: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Cached read of an environment variable; returns None when unset.
+    # KNOWN ISSUE: results are cached for the process lifetime, so later environment changes are not seen.
     return os.environ.get(env_str, None)
 
 
 @dataclasses.dataclass
 class BisectionResult:
+    # [CLASS DOC] Result of a bisection: culprit backend, optional subsystem, optional number of applications needed to trigger failure, and optional debug info.
     """
     backend: torch.compile backend responsible for failure
     subsystem: optional, registered component identified for failure
@@ -96,6 +107,9 @@ class BisectionResult:
 
 
 class CompilerBisector:
+    # [CLASS DOC] Drives and queries compiler bisection. Finds the first failing backend, then the failing subsystem within it, then (for count-based subsystems)
+    # the exact application number via binary search. State lives in files under a bisect subdirectory of the cache dir (or an in-process temporary dir) and
+    # in the environment variables for backend, subsystem and max count; class attributes hold the enabled flag and in-process cache path. All methods are class methods.
     """
     This class iteratively runs torch.compile backends (eager, aot_eager, inductor) to find the
     first backend that can repro an issue.
@@ -130,6 +144,7 @@ class CompilerBisector:
     def clear_call_counter_debug_info(
         cls, backend_name: str, subsystem_name: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Truncate the call counter debug info file of the backend and subsystem.
         file_path = os.path.join(
             cls.get_dir(),
             backend_name,
@@ -139,6 +154,7 @@ class CompilerBisector:
 
     @classmethod
     def reset_counters(cls) -> None:
+        # [FUNCTION DOC] Clear the in-memory call counters and truncate debug info files for every count-based subsystem of every backend.
         subsystem_call_counter.clear()
         for backend, subsystem_list in BACKENDS.items():
             for subsystem in subsystem_list:
@@ -147,18 +163,21 @@ class CompilerBisector:
 
     @classmethod
     def get_dir(cls) -> str:
+        # [FUNCTION DOC] Return the bisect state directory: the in-process cache path if set, else the inductor cache dir, plus the bisect subdirectory.
         return f"{cache_dir() if not cls.in_process_cache else cls.in_process_cache}/{SUBDIR_NAME}"
 
     @classmethod
     def write_lines_to_file(
         cls, file_path: str, lines: list[str], *, append: bool = False
     ) -> None:
+        # [FUNCTION DOC] HELPER: Create parent directories and write the lines to the file, appending or truncating. May raise OSError.
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "a" if append else "w") as file:
             file.writelines(lines)
 
     @classmethod
     def read_lines_from_file(cls, file_path: str) -> list[str]:
+        # [FUNCTION DOC] HELPER: Return the file's lines, or an empty list if the file is missing.
         if os.path.exists(file_path):
             with open(file_path) as file:
                 return file.readlines()
@@ -168,6 +187,8 @@ class CompilerBisector:
     def update_run_state(
         cls, backend_name: str, subsystem: Subsystem, run_state: str
     ) -> None:
+        # [FUNCTION DOC] Persist the run state string for a backend and subsystem. For config-change subsystems only the test_disable state is allowed
+        # (AssertionError otherwise) and the config value file is also written.
         file_path = os.path.join(
             cls.get_dir(), backend_name, f"{subsystem.name}_run_state.txt"
         )
@@ -188,12 +209,14 @@ class CompilerBisector:
     def set_config_values(
         cls, backend: str, subsystem: str, config_data: dict[str, object]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Write the config field/value pairs for a subsystem to its config file, one per line.
         file_path = os.path.join(cls.get_dir(), backend, f"{subsystem}_config.txt")
         lines = [f"{k}={v}\n" for k, v in config_data.items()]
         cls.write_lines_to_file(file_path, lines)
 
     @classmethod
     def update_bisect_status(cls, backend_name: str, subsystem_name: str) -> None:
+        # [FUNCTION DOC] Write the active backend and subsystem to the global status file; AssertionError if subsystem name is not a string.
         if not isinstance(subsystem_name, str):
             raise AssertionError(
                 f"expected subsystem_name to be str, got {type(subsystem_name)}"
@@ -206,6 +229,7 @@ class CompilerBisector:
     def update_bisect_range(
         cls, backend_name: str, subsystem_name: str, low: int, high: int
     ) -> None:
+        # [FUNCTION DOC] Write the low and high bounds of the bisect range for a subsystem to its file; AssertionError if subsystem name is not a string.
         if not isinstance(subsystem_name, str):
             raise AssertionError(
                 f"expected subsystem_name to be str, got {type(subsystem_name)}"
@@ -220,6 +244,7 @@ class CompilerBisector:
     def add_call_counter_debug_info(
         cls, backend_name: str, subsystem_name: str, call_counter: int, debug_info: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Append a line mapping a call counter value to debug info text in the subsystem's debug file.
         file_path = os.path.join(
             cls.get_dir(), backend_name, f"{subsystem_name}_call_counter_debug_info.txt"
         )
@@ -232,6 +257,7 @@ class CompilerBisector:
     def get_call_counter_debug_info(
         cls, backend_name: str, subsystem_name: str, call_counter: int
     ) -> str | None:
+        # [FUNCTION DOC] Return the most recently recorded debug info for the given call counter value, or None if absent.
         file_path = os.path.join(
             cls.get_dir(), backend_name, f"{subsystem_name}_call_counter_debug_info.txt"
         )
@@ -244,6 +270,7 @@ class CompilerBisector:
 
     @classmethod
     def get_backend(cls) -> str | None:
+        # [FUNCTION DOC] Return the active backend from the environment variable if set, else from the status file, else None.
         """
         Returns the active backend, if any
         """
@@ -259,6 +286,7 @@ class CompilerBisector:
 
     @classmethod
     def get_subsystem(cls) -> str | None:
+        # [FUNCTION DOC] Return the active subsystem from the environment variable if set, else from the status file; None if unset or empty.
         """
         Returns the active subsystem, if any
         """
@@ -276,10 +304,13 @@ class CompilerBisector:
 
     @classmethod
     def get_subsystem_object(cls, backend_name: str, subsystem_name: str) -> Subsystem:
+        # [FUNCTION DOC] Look up the Subsystem object by name in a backend's list; raises StopIteration if not found.
         return next(obj for obj in BACKENDS[backend_name] if obj.name == subsystem_name)
 
     @classmethod
     def get_run_state(cls, backend_name: str, subsystem_name: str) -> str | None:
+        # [FUNCTION DOC] Return the stored run state (test_disable, find_max_bounds or bisect) for the subsystem, or None if no file;
+        # AssertionError on any other stored value.
         """
         Returns the current stage of bisecting, if Any
         """
@@ -302,6 +333,7 @@ class CompilerBisector:
     def get_bisect_range(
         cls, backend_name: str, subsystem_name: str
     ) -> tuple[int, int]:
+        # [FUNCTION DOC] Read the latest low and high bounds from the subsystem's range file and return them; raises RuntimeError if either is missing.
         file_path = os.path.join(
             cls.get_dir(), backend_name, f"{subsystem_name}_bisect_range.txt"
         )
@@ -327,6 +359,7 @@ class CompilerBisector:
 
     @classmethod
     def update_config_change(cls, backend: str, subsystem: ConfigChange) -> None:
+        # [FUNCTION DOC] HELPER: Write the config name, field and value of a ConfigChange subsystem to its config file.
         file_path = os.path.join(cls.get_dir(), backend, f"{subsystem.name}_config.txt")
         lines = [
             f"config_name={subsystem.config_name}\n",
@@ -337,6 +370,8 @@ class CompilerBisector:
 
     @classmethod
     def get_config_change(cls, config_name: str) -> dict[str, object] | None:
+        # [FUNCTION DOC] Return the config field/value mapping stored for the active backend and subsystem, or None if there is no active pair or no file.
+        # KNOWN ISSUE: the config_name argument is unused, and values are parsed by evaluating text from a file, which executes arbitrary code if the file is tampered with.
         backend = cls.get_backend()
         subsystem = cls.get_subsystem()
 
@@ -358,6 +393,7 @@ class CompilerBisector:
 
     @classmethod
     def delete_bisect_status(cls) -> None:
+        # [FUNCTION DOC] Remove the whole bisect state directory (in-process path if set) and print whether anything was deleted.
         # in process_cache we have created if it exists, just the subdirectory of non created dir
         dir_name = cls.in_process_cache or cls.get_dir()
         if os.path.exists(dir_name):
@@ -368,6 +404,7 @@ class CompilerBisector:
 
     @classmethod
     def get_system_counter(cls, name: str, increment: bool = True) -> int:
+        # [FUNCTION DOC] Return the current in-memory call count for a subsystem, optionally incrementing it afterwards.
         global subsystem_call_counter
         curr = subsystem_call_counter[name]
         if increment:
@@ -381,6 +418,11 @@ class CompilerBisector:
         subsystem: str,
         debug_info: Callable[[], str] | None = None,
     ) -> bool:
+        # [FUNCTION DOC] Decide whether a subsystem application should be skipped. Returns False unless bisection is enabled and the backend and subsystem match the active ones.
+        # If the max-count environment variable is set, count calls and disable those past the limit. Otherwise by run state: test_disable disables always,
+        # find_max_bounds records the total count as the upper bound and disables nothing, bisect disables calls past the range midpoint (and records debug info
+        # from the callable for calls near the end of a narrow range). Raises AssertionError on an unexpected run state.
+        # Side effects: increments counters and writes state files.
         if not cls.bisection_enabled:
             return False
 
@@ -432,6 +474,8 @@ class CompilerBisector:
     def advance_subsystem(
         cls, curr_backend: str, curr_subsystem: Subsystem
     ) -> Subsystem | None:
+        # [FUNCTION DOC] Report that disabling the current subsystem did not fix the issue and move to the next subsystem in the backend: update status and run state files
+        # and return it, or print that the backend is exhausted and return None.
         """
         Tries to move to the next subsystem within the current system.
         """
@@ -460,6 +504,7 @@ class CompilerBisector:
 
     @classmethod
     def advance_backend(cls, curr_backend: str) -> str | None:
+        # [FUNCTION DOC] Move to the next backend in the ordered table, writing status with no subsystem; returns its name or None if it was the last.
         """
         Tries Move to the next backend.
         """
@@ -481,6 +526,10 @@ class CompilerBisector:
         fn: Callable[[], bool],
         cli_interface: bool = True,
     ) -> bool:
+        # [FUNCTION DOC] Drive one subsystem through its states using fn (True means the run passed). test_disable: if the run passes, a binary subsystem is the answer,
+        # otherwise start finding the upper bound; if it fails, advance to the next subsystem (returning False when none remain). find_max_bounds: record the bound
+        # and switch to bisect; raises RuntimeError if fn passes. bisect: narrow the range by the result and return True when low equals high. In CLI mode exits the process after each step.
+        # Raises AssertionError for a non-Subsystem and RuntimeError for an unknown state.
         """
         Process the current subsystem. Returns True if the issue is found, False otherwise.
         """
@@ -549,6 +598,7 @@ class CompilerBisector:
 
     @classmethod
     def initialize_system(cls) -> None:
+        # [FUNCTION DOC] Start a bisection: write status selecting the first backend with no subsystem and print a message.
         curr_backend = next(iter(BACKENDS.keys()))
         curr_subsystem = ""
         cls.update_bisect_status(curr_backend, curr_subsystem)
@@ -558,6 +608,11 @@ class CompilerBisector:
     def do_bisect(
         cls, fn: Callable[[], bool], cli_interface: bool = False
     ) -> BisectionResult | None:
+        # [FUNCTION DOC] Run fn repeatedly (True means success) to find the culprit. Optionally adds a pre-grad-graph subsystem for inductor per test config.
+        # In non-CLI mode enables bisection with a fresh state, using a temp dir if none set, and registers cleanup at exit and when a guard object is collected.
+        # Walks backends until one fails, then its subsystems, then binary-searches; returns a BisectionResult, or None if every backend passes.
+        # In CLI mode runs a single step then exits the process.
+        # KNOWN ISSUE: the pre-grad-graph subsystem is inserted on every call when the option is on, but only removed in non-CLI cleanup, so repeated calls can duplicate it.
         """
         Run fn repeatedly attempting to bisect torch.compile. fn should return True on success and False on failure.
         """
@@ -578,6 +633,7 @@ class CompilerBisector:
                 cls.in_process_cache = tempfile.mkdtemp()
 
             def cleanup() -> None:
+                # [FUNCTION DOC] HELPER: Restore the original enabled flag, delete state, clear the in-process cache path and remove the added pre-grad-graph subsystem if present.
                 cls.bisection_enabled = bisection_enabled_orig
                 cls.delete_bisect_status()
                 cls.in_process_cache = None
@@ -588,7 +644,9 @@ class CompilerBisector:
             cleanup_handler = atexit.register(cleanup)
 
             class DisableBisect:
+                # [CLASS DOC] HELPER: Guard object whose finalizer runs cleanup and unregisters the atexit hook.
                 def __del__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Run cleanup and unregister the exit handler.
                     cleanup()
                     atexit.unregister(cleanup_handler)
 
@@ -739,6 +797,9 @@ Environment variables set for your test script:
 
 
 def command_line_usage() -> None:
+    # [FUNCTION DOC] Command line entry point. With no arguments print help and exit with status 1. Commands: end deletes state; start resets and initializes;
+    # run bisects automatically by repeatedly running a command (exit code 0 means good) with environment variables describing the backend and subsystem under test;
+    # good or bad records one manual step (ValueError if start was not called); anything else prints an error and exits 1. Exits the process for most paths.
     """Entry point for the compiler bisector command-line interface."""
     if len(sys.argv) < 2:
         print(HELP_TEXT)
@@ -768,6 +829,8 @@ def command_line_usage() -> None:
         run_cmd = sys.argv[2:]
 
         def test_function() -> bool:
+            # [FUNCTION DOC] HELPER: For run mode: build the environment with the backend and subsystem under test (and a max count of minus one for test_disable),
+            # run the user command and return True if its exit code is zero.
             # Pass bisection state to subprocess via environment variables
             env = os.environ.copy()
             backend = bisection_manager.get_backend()
@@ -812,6 +875,7 @@ def command_line_usage() -> None:
         sys.exit(1)
 
     def test_function() -> bool:
+        # [FUNCTION DOC] HELPER: For manual mode: return True when the command is good.
         return command == "good"
 
     if not bisection_manager.get_backend():
@@ -821,6 +885,7 @@ def command_line_usage() -> None:
 
 
 def get_is_bisection_enabled() -> bool:
+    # [FUNCTION DOC] Return True if a bisect backend or subsystem is active (via environment or status file).
     return (
         CompilerBisector.get_subsystem() is not None
         or CompilerBisector.get_backend() is not None

@@ -365,9 +365,9 @@ class _LoggerState:
         self.loggers = {}
 
         def filter(
-            # [FUNCTION DOC] HELPER: Type guard accepting only real loggers under torch._inductor that do not propagate; placeholders and propagating loggers are rejected.
             logger: logging.Logger | logging.PlaceHolder,
         ) -> TypeGuard[logging.Logger]:
+            # [FUNCTION DOC] HELPER: Type guard accepting only real loggers under torch._inductor that do not propagate; placeholders and propagating loggers are rejected.
             if not isinstance(logger, logging.Logger):
                 # Assume that Placeholders propagate
                 return False
@@ -406,13 +406,13 @@ class _LoggerState:
         return self.captured_logs
 
     def __exit__(
-        # [FUNCTION DOC] Remove the capture handlers; raises AssertionError if not capturing.
-        # KNOWN ISSUE: captured_logs is not reset to None afterwards, so entering the same instance again would raise.
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: types.TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Remove the capture handlers; raises AssertionError if not capturing.
+        # KNOWN ISSUE: captured_logs is not reset to None afterwards, so entering the same instance again would raise.
         if self.captured_logs is None:
             raise AssertionError("captured_logs not set on __exit__")
         self.captured_logs.remove()
@@ -485,14 +485,14 @@ class _SerializedFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
-        # [FUNCTION DOC] Serialize the compile request (falling back to an in-process compile if not possible), send it to the child, deserialize the
-        # result with the constants, tag compiled graphs with the region name, post-process, count the compile in stats and return the output code.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> OutputCode:
+        # [FUNCTION DOC] Serialize the compile request (falling back to an in-process compile if not possible), send it to the child, deserialize the
+        # result with the constants, tag compiled graphs with the region name, post-process, count the compile in stats and return the output code.
         # If this code changes it's likely _AsyncFxCompile.codegen_and_compile()
         # will also need to match.
 
@@ -520,15 +520,15 @@ class _SerializedFxCompile(FxCompile):
         return output.graph
 
     def serialize_compile(
-        # [FUNCTION DOC] Build the pickled input and constants holder for a compile. Returns None (caller should compile in-process) if the graph has
-        # uncacheable higher-order ops, triton kernel wrapper nodes, or if pickling fails (logged as a warning). Captures the tracing context,
-        # portable config, Virtualized, logging, lowering and fake mode state, and the test determinism guard when available.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> tuple[_WireProtocolPickledInput, CompiledFxGraphConstantsWithGm] | None:
+        # [FUNCTION DOC] Build the pickled input and constants holder for a compile. Returns None (caller should compile in-process) if the graph has
+        # uncacheable higher-order ops, triton kernel wrapper nodes, or if pickling fails (logged as a warning). Captures the tracing context,
+        # portable config, Virtualized, logging, lowering and fake mode state, and the test determinism guard when available.
         """
         Prepare a _WireProtocolInput to compile. If None is returned then it
         wasn't possible to serialize and we should fallback to in-process.
@@ -597,9 +597,9 @@ class _SerializedFxCompile(FxCompile):
 
     @abstractmethod
     def _send_to_child(
-        # [FUNCTION DOC] HELPER: Abstract; transfer the pickled input to the child, run the child entry point and return the pickled output.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] HELPER: Abstract; transfer the pickled input to the child, run the child entry point and return the pickled output.
         # The implementation of this should transfer `input` to the child, call
         # `_run_in_child(input)` and transfer the result back.
         ...
@@ -610,13 +610,13 @@ class _SerializedFxCompile(FxCompile):
 
     @classmethod
     def _run_in_child(
-        # [FUNCTION DOC] Child-side entry point. Under an exit stack: patch subprocess environment, record warnings, deserialize the input, apply its
-        # Virtualized, lowering, config, logger capture, determinism guard, tracing context, debug context and fake mode settings, then do an in-process
-        # compile. Returns the pickled output with metrics deltas, captured logs, warnings and shape environment.
         cls,
         pickled_input: _WireProtocolPickledInput,
         extra_env: Mapping[str, str | None] | None = None,
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] Child-side entry point. Under an exit stack: patch subprocess environment, record warnings, deserialize the input, apply its
+        # Virtualized, lowering, config, logger capture, determinism guard, tracing context, debug context and fake mode settings, then do an in-process
+        # compile. Returns the pickled output with metrics deltas, captured logs, warnings and shape environment.
         metrics = CachedMetricsHelper()
 
         with contextlib.ExitStack() as stack:
@@ -668,9 +668,9 @@ class _DebugSerdeFxCompile(_SerializedFxCompile):
     # [CLASS DOC] HELPER: Debug/test compile that serializes input and output but runs the compile in the same process.
     @override
     def _send_to_child(
-        # [FUNCTION DOC] HELPER: Run the child entry point directly in this process.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] HELPER: Run the child entry point directly in this process.
         # For debugging just serde the input and output but don't run in a
         # subprocess.
         return self._run_in_child(pickled_input)
@@ -686,9 +686,9 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
     @override
     @final
     def _send_to_child(
-        # [FUNCTION DOC] HELPER: Send asynchronously and block on the future for its result. Final.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] HELPER: Send asynchronously and block on the future for its result. Final.
         f = self._send_to_child_async(pickled_input)
 
         # For debugging: If we want to print status updates...
@@ -704,7 +704,6 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
 
     @abstractmethod
     def _send_to_child_async(
-        # [FUNCTION DOC] HELPER: Abstract; send the pickled input to the child and return a future of the pickled output.
         self, pickled_input: _WireProtocolPickledInput
     ) -> Future[_WireProtocolPickledOutput]: ...
 
@@ -774,6 +773,7 @@ class _DebugFileFxCompile(_SerializedFxCompile):
         # (the alternative branches that run or read back a result are disabled).
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] HELPER: Abstract; send the pickled input to the child and return a future of the pickled output.
         idx = _DebugFileFxCompile.file_index
         _DebugFileFxCompile.file_index += 1
 

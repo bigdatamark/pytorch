@@ -49,13 +49,13 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
     # [CLASS DOC] ProcessPoolExecutor subclass that records, in module global statistics guarded by a lock, how long
     # each submitted job waits in the queue before starting to run. Reported at exit by _queue_stats_report.
     def __init__(
-        # [FUNCTION DOC] Increment the global pool count under the lock, then construct the underlying executor
-        # with the given max_workers, multiprocessing context and initializer.
         self,
         max_workers: int | None = None,
         mp_context: BaseContext | None = None,
         initializer: Callable[[], object] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Increment the global pool count under the lock, then construct the underlying executor
+        # with the given max_workers, multiprocessing context and initializer.
         with _queue_stats_lock:
             _queue_stats.pool_count += 1
         super().__init__(max_workers, mp_context, initializer)
@@ -96,9 +96,9 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
             self._record_dequeue(f)
 
     def submit(
-        # [FUNCTION DOC] Submit a callable to the pool as the base class does, record the enqueue, and return the future.
         self, fn: Callable[_P, _R], /, *args: _P.args, **kwargs: _P.kwargs
     ) -> Future[_R]:
+        # [FUNCTION DOC] Submit a callable to the pool as the base class does, record the enqueue, and return the future.
         # pyrefly: ignore [bad-argument-type]
         f = super().submit(fn, *args, **kwargs)
         self._record_enqueue(f)

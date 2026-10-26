@@ -14,11 +14,11 @@ class Timer:
     """
 
     def __init__(
-        # [FUNCTION DOC] Store the duration and callback; no thread is started until the first record_call.
         self,
         duration: int | float,  # Duration in seconds
         call: Callable[[], None],  # Function to call when we expire
     ) -> None:
+        # [FUNCTION DOC] Store the duration and callback; no thread is started until the first record_call.
         # We don't start the background thread until we actually get an event.
         self.background_thread: Thread | None = None
         self.last_called: float | None = None
