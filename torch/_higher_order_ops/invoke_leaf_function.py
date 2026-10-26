@@ -1,3 +1,14 @@
+# [MODULE DOC] Defines the invoke_leaf_function higher-order operator, which calls a user "leaf
+# function" (opaque to the compiler) through a real implementation at runtime and a fake
+# implementation for tracing/shape propagation. Contains: module-index storage for the
+# make_fx path (negative indices) and a retriever hook for the Dynamo path; LeafModuleState
+# (module arguments flattened to index + params + buffers); helpers to flatten/unflatten args
+# with modules; mutates_args resolution; escaped-gradient detection; output wrapping and
+# validation; autograd support via a custom Function that records gradient edges and
+# replays them in backward; and dense, autograd, functionalization, proxy and fake rules.
+# Import-time side effects: registers _LeafCallable as a symbolic custom class and registers
+# implementations on the singleton invoke_leaf_function. Holds module-level mutable state
+# (_leaf_function_module_retriever, _makefx_module_storage, _makefx_next_index).
 import contextlib
 import functools
 from collections.abc import Callable, Generator, Sequence
@@ -29,6 +40,9 @@ _makefx_next_index = 0
 
 
 def store_makefx_modules(modules: list[torch.nn.Module]) -> tuple[int, ...]:
+    # [FUNCTION DOC] Registers each module in the global make_fx module storage under a fresh,
+    # decreasing negative index (first index is -1) and returns the tuple of assigned indices
+    # in input order. Mutates global state (storage mapping and the index counter).
     """Store modules for the make_fx path and return their assigned indices.
 
     Uses negative indices to avoid collisions with Dynamo's register_user_object
@@ -44,16 +58,23 @@ def store_makefx_modules(modules: list[torch.nn.Module]) -> tuple[int, ...]:
 
 
 def reset_makefx_module_storage() -> None:
+    # [FUNCTION DOC] Clears the make_fx module storage and resets the negative index counter to zero.
+    # Mutates global state; returns nothing.
     global _makefx_next_index
     _makefx_next_index = 0
     _makefx_module_storage.clear()
 
 
 class _LeafCallable(CustomClassBase):
+    # [CLASS DOC] HELPER: Opaque callable wrapper (registered as a symbolic custom class) holding one
+    # function in the attribute _fn, so functions can be passed to the HOP as non-tensor
+    # arguments. May also carry extra attributes set by callers (e.g. hook functions).
     def __init__(self, fn: Callable) -> None:
+        # [FUNCTION DOC] HELPER: Stores the wrapped function.
         self._fn = fn
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the wrapped function with the given arguments and returns its result.
         return self._fn(*args, **kwargs)
 
 
@@ -61,11 +82,16 @@ register_custom_class(_LeafCallable, typ="symbolic")
 
 
 def set_leaf_function_module_retriever(retriever: Callable[[int], Any]) -> None:
+    # [FUNCTION DOC] Installs the global callable used to map a non-negative module index to its nn.Module
+    # on the Dynamo path. Replaces any previous retriever.
     global _leaf_function_module_retriever
     _leaf_function_module_retriever = retriever
 
 
 class LeafModuleState(NamedTuple):
+    # [CLASS DOC] Pytree-friendly record standing in for an nn.Module argument: the module's index
+    # for later lookup, plus mappings of its parameter and buffer names to tensors. Its
+    # tensors become flat inputs of the HOP.
     """
     In dynamo, nn.Module arguments to leaf functions are converted to this
     pytree format (index, parameters, buffers). This structure is then
@@ -80,6 +106,10 @@ class LeafModuleState(NamedTuple):
 
 
 def convert_modules_to_states(values: Any, module_to_index: dict[int, int]) -> Any:
+    # [FUNCTION DOC] Maps over a pytree and replaces each nn.Module with a LeafModuleState holding the
+    # index looked up by module id in module_to_index (a missing id raises KeyError) and
+    # copies of the module's named parameters and buffers. Other leaves are unchanged.
+    # Returns the new pytree.
     """Replace nn.Module instances in a pytree with LeafModuleState objects.
 
     Args:
@@ -88,6 +118,7 @@ def convert_modules_to_states(values: Any, module_to_index: dict[int, int]) -> A
     """
 
     def module_to_state(val: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Converts one module to its LeafModuleState; returns other values as is.
         if isinstance(val, torch.nn.Module):
             return LeafModuleState(
                 nn_module_index=module_to_index[id(val)],
@@ -105,6 +136,12 @@ def _resolve_mutated_flat_indices(
     num_flat_args: int,
     input_spec: pytree.TreeSpec,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Turns attribute-path expressions naming mutated arguments into a sorted,
+    # comma separated string of flat-arg positions. Builds sentinel integers for each flat
+    # arg, unflattens them with input_spec, replaces module states with attribute namespaces,
+    # binds them to fn's signature, then evaluates each expression (with builtins disabled)
+    # in that namespace. Raises ValueError if an expression resolves to a non-integer leaf.
+    # Errors from signature binding or evaluation propagate.
     """Resolve mutates_args expressions to a comma-separated string of flat-arg indices.
 
     Each expression in mutates_args (e.g. "x", "model.running_mean") is evaluated
@@ -118,9 +155,11 @@ def _resolve_mutated_flat_indices(
     import inspect
 
     class _AttrDict:
+        # [CLASS DOC] HELPER: Empty attribute container used to mimic nested module attributes.
         pass
 
     def _set_nested_attr(obj: _AttrDict, fqn: str, value: Any) -> None:
+        # [FUNCTION DOC] HELPER: Sets a value at a dotted path on obj, creating intermediate namespaces.
         parts = fqn.split(".")
         for part in parts[:-1]:
             if not hasattr(obj, part):
@@ -129,6 +168,8 @@ def _resolve_mutated_flat_indices(
         setattr(obj, parts[-1], value)
 
     def _lms_to_attr_dict(val: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Converts a LeafModuleState to a nested attribute namespace of its parameter
+        # and buffer sentinels; other values are returned unchanged.
         if isinstance(val, LeafModuleState):
             target = _AttrDict()
             for fqn, sentinel in val.named_parameters.items():
@@ -167,6 +208,9 @@ def _resolve_mutated_flat_indices(
 
 @dataclass
 class GradientInfo:
+    # [CLASS DOC] Plain record of what is needed to run backward later: the autograd gradient
+    # edge, and the size, stride, dtype and device of the tensor (used to synthesize zero
+    # gradients). The edge may be None for fake-backward bookkeeping.
     """
     We need the gradient edge to trigger the autograd engine backward.
 
@@ -183,6 +227,9 @@ class GradientInfo:
 
 
 def _retrieve_module_by_index(nn_module_index: int) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Looks up an nn.Module by index. Checks make_fx storage first (RuntimeError
+    # if the stored index is non-negative), then the Dynamo retriever (RuntimeError if
+    # none is set, TypeError if it returns a non-Module). Returns the module.
     # Check make_fx storage first (used by _invoke_leaf_function_python).
     # Fall back to the Dynamo retriever (used by the compiled path).
     if nn_module_index in _makefx_module_storage:
@@ -209,6 +256,11 @@ def check_escaped_gradients(
     inputs: Sequence[Any],
     requires_grad_indices: set[int],
 ) -> None:
+    # [FUNCTION DOC] Walks the autograd graph from the outputs' grad_fn back toward the inputs' gradient
+    # nodes and raises RuntimeError if it reaches a leaf node not among the explicit inputs,
+    # meaning a captured tensor requires grad. Does nothing if no input requires grad, the
+    # dynamo config flag leaf_function_check_escaped_gradients is off, or no output has a
+    # grad_fn. Error message lists shapes and dtypes of escaped tensors when available.
     """
     Check if autograd graph depends on tensors that are not passed as explicit inputs.
 
@@ -286,11 +338,18 @@ def check_escaped_gradients(
 def unflatten_args_with_modules(
     flat_args: tuple[Any, ...], input_spec: pytree.TreeSpec
 ) -> Generator[tuple[list[Any] | tuple[Any, ...], dict[str, Any]], None, None]:
+    # [FUNCTION DOC] Context manager: unflattens flat_args into (args, kwargs) by input_spec, replaces each
+    # LeafModuleState with its real module (looked up by index) temporarily reparametrized
+    # with the state's tensors, and yields the rebuilt (args, kwargs). Reparametrization
+    # is undone on exit. Lookup errors propagate from _retrieve_module_by_index.
     args, kwargs = pytree.tree_unflatten(flat_args, input_spec)
 
     with contextlib.ExitStack() as stack:
 
         def process_module_state(state: LeafModuleState) -> torch.nn.Module:
+            # [FUNCTION DOC] HELPER: Fetches the module for the state, enters a reparametrization context
+            # (registered on the enclosing exit stack) swapping in the state's parameters and
+            # buffers, and returns the module.
             orig_module = _retrieve_module_by_index(state.nn_module_index)
             stack.enter_context(
                 _reparametrize_module(
@@ -312,7 +371,11 @@ def unflatten_args_with_modules(
 def flatten_args_with_modules(
     args_kwargs: tuple[Any, ...],
 ) -> list[Any]:
+    # [FUNCTION DOC] Replaces modules in args_kwargs with LeafModuleState records and returns the flat
+    # list of pytree leaves. The module index is a placeholder -1 here, since only the
+    # tensors and their order matter to callers.
     def expand_module(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Converts a module to a LeafModuleState with index -1; other values pass through.
         if isinstance(x, torch.nn.Module):
             return LeafModuleState(
                 nn_module_index=-1,
@@ -330,6 +393,10 @@ def make_leaf_function_wrappers(
     fake_fn: Callable[..., Any],
     captured_out_spec: list[pytree.TreeSpec | None],
 ) -> tuple[Callable[..., tuple[Any, ...]], Callable[..., tuple[Any, ...]]]:
+    # [FUNCTION DOC] Returns wrapped versions of real_fn and fake_fn that each return the flat tuple of
+    # their output leaves. The shared single-element list captured_out_spec stores the output
+    # tree spec on first call; a later differing spec raises AssertionError. Raises
+    # RuntimeError at wrap time if the list length is not one.
     """Wrap real_fn and fake_fn to flatten outputs and capture the output TreeSpec.
 
     Both wrappers share the same captured output spec: the first call (typically
@@ -342,12 +409,15 @@ def make_leaf_function_wrappers(
     """
 
     def _wrap(fn: Callable[..., Any]) -> Callable[..., tuple[Any, ...]]:
+        # [FUNCTION DOC] HELPER: Validates captured_out_spec length and returns the flattening wrapper for fn.
         if len(captured_out_spec) != 1:
             raise RuntimeError(
                 f"captured_out_spec must be a single-element list, got length {len(captured_out_spec)}"
             )
 
         def wrapper(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+            # [FUNCTION DOC] HELPER: Calls fn, flattens its output, records or checks the tree spec (mismatch
+            # raises AssertionError), and returns the leaves as a tuple.
             out = fn(*args, **kwargs)
 
             flat_out, out_spec = pytree.tree_flatten(out)
@@ -376,6 +446,11 @@ def autograd_grad_with_gradient_info(
     create_graph: bool = False,
     allow_unused: bool = False,
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC] Computes gradients of outputs w.r.t. inputs via torch.autograd.grad using stored
+    # gradient edges. Outputs without an edge/node and inputs without info are filtered out;
+    # if nothing remains, returns all None. grad_outputs are aligned to the kept outputs.
+    # Returns a tuple aligned with input_infos: None for inputs lacking info, and zeros
+    # (with the recorded size/stride/dtype/device) for kept inputs whose gradient is None.
     """
     Compute gradients using GradientInfo, it additionally handles the case
     where input and output infos are None.
@@ -449,10 +524,18 @@ def _make_forward(
     include_keys: DispatchKeySet,
     exclude_keys: DispatchKeySet,
 ) -> tuple[Callable, dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Builds a forward wrapper around fn plus a mutable state mapping. When called,
+    # forward re-applies the saved dispatch key include/exclude sets (minus the Python keys),
+    # enables grad, runs fn, runs the escaped-gradient check, and records in state the
+    # GradientInfo of every grad-requiring input and (for non-None outputs) every output with
+    # a grad_fn. It returns the outputs detached (with requires_grad preserved). Returns
+    # (forward, state) where state has keys inputs and outputs, initially None.
     state: dict[str, Any] = {"inputs": None, "outputs": None}
 
     @functools.wraps(fn)
     def forward(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: See _make_forward; runs fn under forced dispatch keys with grad enabled, fills
+        # the shared state and returns detached outputs. Raises RuntimeError on escaped gradients.
         effective_keys = include_keys
         if include_keys.has(DispatchKey.PythonDispatcher):
             effective_keys = effective_keys.remove(DispatchKey.PythonDispatcher)
@@ -511,7 +594,12 @@ def _make_forward(
 
 
 class InvokeLeafFunction(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator named "invoke_leaf_function" (supports training input mutation).
+    # Stateless; singleton instance invoke_leaf_function. Operands: real and fake callables,
+    # the input tree spec, a string of mutated flat-arg indices, then the flat tensor/other
+    # args, plus a keyword-only string of requires-grad indices. Provides schema generation.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the HOP with its name and training input mutation support.
         super().__init__("invoke_leaf_function", supports_training_input_mutation=True)
 
     def __call__(
@@ -523,6 +611,8 @@ class InvokeLeafFunction(HigherOrderOperator):
         *flat_args,
         requires_grad_indices="",
     ):
+        # [FUNCTION DOC] Dispatches the HOP unchanged with all arguments; no validation is done here. Returns
+        # the flat outputs of the selected implementation.
         """
         real_fn_callable: _LeafCallable wrapping the real function
         fake_fn_callable: _LeafCallable wrapping the fake function
@@ -552,6 +642,11 @@ class InvokeLeafFunction(HigherOrderOperator):
         *flat_args,
         requires_grad_indices="",
     ):
+        # [FUNCTION DOC] Builds the HOP schema. Parses mutated indices, runs the fake function under fake
+        # propagation (with proxy tracing disabled, cloning mutated tensors so the
+        # real ones are untouched) to learn output types, then registers each argument (marking
+        # mutated ones) and each output with a schema generator. Raises AssertionError if the
+        # fake output is neither a tuple nor None. Returns the generated schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
         from torch._higher_order_ops.utils import _maybe_fake_prop_ignore_unbacked
         from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
@@ -570,6 +665,8 @@ class InvokeLeafFunction(HigherOrderOperator):
                 schema_flat_args = flat_args
 
             def run_fake(*unfunc_flat_args):
+                # [FUNCTION DOC] HELPER: Rebuilds args/kwargs (with modules) from flat args and returns the fake
+                # function's output.
                 with unflatten_args_with_modules(unfunc_flat_args, input_spec) as (
                     args,
                     kwargs,
@@ -636,6 +733,10 @@ invoke_leaf_function = InvokeLeafFunction()
 
 
 class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd bridge for invoke_leaf_function. Forward wraps the real function to
+    # record gradient edges, calls the HOP below autograd, optionally registers a multi-grad
+    # hook, and stashes real_backward and fake_backward closures on ctx. Backward calls the
+    # HOP again with those closures (wrapped as callables) so backward is also opaque.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -646,6 +747,13 @@ class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
         mutated_arg_indices,
         *flat_args,
     ):
+        # [FUNCTION DOC] Computes the forward outputs. Captures current dispatch include/exclude sets,
+        # derives the string of grad-requiring flat-arg indices, wraps the real callable via
+        # _make_forward, defines real_backward (uses recorded GradientInfo; RuntimeError if
+        # forward state is unset) and fake_backward (empty tensors for grad-requiring inputs),
+        # then invokes the HOP under auto-dispatch-below-autograd. If the real callable carries
+        # hook functions, registers a multi-grad hook on grad-requiring inputs that invokes
+        # them through the HOP. Saves both backward closures on ctx and returns the HOP outputs.
         include_keys = torch._C._dispatch_tls_local_include_set()
         exclude_keys = torch._C._dispatch_tls_local_exclude_set()
 
@@ -660,6 +768,8 @@ class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
         )
 
         def real_backward(*grads):
+            # [FUNCTION DOC] HELPER: Runs autograd through the recorded graph using stored GradientInfo and the
+            # incoming grads; unused inputs get zeros. Raises RuntimeError if forward state is missing.
             if real_state["inputs"] is None or real_state["outputs"] is None:
                 raise RuntimeError(
                     "invoke_leaf_function backward expects inputs/outputs to be set in forward."
@@ -685,6 +795,8 @@ class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
         )
 
         def fake_backward(*grads):
+            # [FUNCTION DOC] HELPER: Returns uninitialized gradients with each grad-requiring input's recorded
+            # size, stride, dtype and device, and None for the others (used for tracing).
             return tuple(
                 torch.empty_strided(
                     info.size, info.stride, dtype=info.dtype, device=info.device
@@ -729,6 +841,8 @@ class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
                 def _multi_grad_callback(
                     grads: Sequence[torch.Tensor],
                 ) -> None:
+                    # [FUNCTION DOC] HELPER: Called once all watched input gradients are ready; invokes the HOP with
+                    # the wrapped hook functions on those gradients. Excluded from dynamo tracing.
                     _, hook_spec = pytree.tree_flatten((tuple(grads), {}))
                     invoke_leaf_function(
                         hook_real_callable,
@@ -750,6 +864,9 @@ class InvokeLeafFunctionAutogradOp(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, *grads):
+        # [FUNCTION DOC] Invokes the HOP with the saved real and fake backward closures on the incoming
+        # grads and returns None for the four non-tensor forward arguments followed by the
+        # computed input gradients.
         real_bw_callable = _LeafCallable(ctx.real_backward)
         fake_bw_callable = _LeafCallable(ctx.fake_backward)
         _, bw_input_spec = pytree.tree_flatten((grads, {}))
@@ -768,6 +885,8 @@ def invoke_leaf_function_autograd(
     *flat_args,
     requires_grad_indices="",
 ):
+    # [FUNCTION DOC] HELPER: Autograd-key rule; applies InvokeLeafFunctionAutogradOp to the arguments. The
+    # requires_grad_indices argument is ignored, since forward recomputes it.
     return InvokeLeafFunctionAutogradOp.apply(
         real_fn_callable, fake_fn_callable, input_spec, mutated_arg_indices, *flat_args
     )
@@ -776,6 +895,10 @@ def invoke_leaf_function_autograd(
 # TODO: aliasing is not allowed
 @invoke_leaf_function.py_functionalize_impl
 def invoke_leaf_function_functionalization(ctx, *all_args, **kwargs):
+    # [FUNCTION DOC] HELPER: Functionalization rule. Unwraps args and builds a HopInstance; if it can be
+    # auto-functionalized (mutations declared in the schema), delegates to the v2
+    # auto-functionalization helper. Otherwise routes the call through effect handling
+    # with the mode's token state. Aliasing is not supported.
     from torch._higher_order_ops.auto_functionalize import (
         can_auto_functionalize,
         do_auto_functionalize_v2,
@@ -800,6 +923,8 @@ def invoke_leaf_function_functionalization(ctx, *all_args, **kwargs):
 
 @invoke_leaf_function.py_impl(ProxyTorchDispatchMode)
 def invoke_leaf_function_proxy_mode(proxy_mode, *all_args, **kwargs):
+    # [FUNCTION DOC] HELPER: Proxy tracing rule: runs the HOP for real outputs, emits a call_function graph
+    # node with the unwrapped argument proxies and kwargs, and returns outputs tracked to it.
     out = invoke_leaf_function(*all_args, **kwargs)
     proxies = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, all_args)
     proxy = proxy_mode.tracer.create_proxy(
@@ -812,6 +937,9 @@ def _validate_outputs_match(
     fake_output: Any,
     real_output: Any,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Compares flattened fake and real outputs and raises RuntimeError on any
+    # difference in tree structure, leaf count, tensor-vs-non-tensor type at a position, or
+    # (for tensors) shape or dtype. Strides and values are not compared.
     """
     Validate that fake_fn and real_fn outputs have matching pytree structure,
     shapes, and dtypes.
@@ -867,6 +995,8 @@ def _validate_outputs_match(
 
 
 def _parse_mutated_arg_indices(s: str) -> set[int]:
+    # [FUNCTION DOC] HELPER: Parses a comma separated index string into a set of ints; empty pieces are
+    # skipped, a non-numeric piece raises ValueError. Also used for requires_grad indices.
     return {int(x) for x in s.split(",") if x}
 
 
@@ -875,6 +1005,8 @@ def _check_no_input_mutation(
     version_before: list[int],
     mutated_arg_indices: str = "",
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError if any tensor in flat_args has a version counter different
+    # from version_before at its position and its index is not in the declared mutated set.
     mutated_set = _parse_mutated_arg_indices(mutated_arg_indices)
     for i, arg in enumerate(flat_args):
         if isinstance(arg, torch.Tensor) and arg._version != version_before[i]:
@@ -894,11 +1026,15 @@ def invoke_leaf_function_fake(
     *flat_args,
     requires_grad_indices="",
 ):
+    # [FUNCTION DOC] HELPER: Fake tensor rule: rebuilds args/kwargs and returns the fake function's output.
     with unflatten_args_with_modules(flat_args, input_spec) as (args, kwargs):
         return fake_fn_callable(*args, **kwargs)
 
 
 def _detach_with_grad_dtype(arg):
+    # [FUNCTION DOC] HELPER: Returns non-tensors unchanged; for tensors returns a detached alias, and if
+    # the original is a leaf whose grad_dtype differs from the detached one, copies grad_dtype
+    # onto the detached tensor (detach would otherwise reset it).
     # Tensor.detach() resets grad_dtype to the tensor's own dtype, dropping
     # any caller-set grad_dtype (e.g. param.grad_dtype = torch.float32 on a
     # bf16 weight). Propagate it back so the inner autograd graph accumulates
@@ -921,6 +1057,12 @@ def invoke_leaf_function_dense(
     *flat_args,
     requires_grad_indices="",
 ):
+    # [FUNCTION DOC] HELPER: Eager rule. Records tensor versions, detaches all tensor args (keeping
+    # grad_dtype), re-enables requires_grad on those listed in requires_grad_indices, rebuilds
+    # args/kwargs with modules and calls the real function. Then raises RuntimeError on
+    # undeclared input mutation, and, if dynamo config leaf_function_validate_outputs is on,
+    # also runs the fake function and checks outputs match (RuntimeError on mismatch).
+    # Returns the real output.
     from torch._dynamo import config as dynamo_config
 
     version_before = [

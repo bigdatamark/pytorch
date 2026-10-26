@@ -1,3 +1,10 @@
+# [MODULE DOC] Defines the flex_gemm higher-order operator (FlexGEMM): a GEMM (mm, addmm, bmm or
+# baddbmm) fused with a user-supplied epilogue function, carried as a body graph plus the
+# GEMM op, its args/kwargs and backend kernel options (backend one of NVGEMM, QUACK, TRITON;
+# default TRITON). Contains the op spec tables, body-graph annotation passes, QUACK fast-math
+# decompositions, a test-oriented NVFP4 packing helper, the HOP class and its public
+# flex_gemm wrapper, plus dense, autograd (deferred not-implemented), fake, functionalization
+# and proxy-tracing rules registered at import time on the singleton flex_gemm_hop.
 # mypy: allow-untyped-defs
 import dataclasses
 from collections.abc import Callable, Mapping
@@ -24,6 +31,10 @@ from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode, track_ten
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmOpSpec:
+    # [CLASS DOC] Immutable description of a supported GEMM op: its short name, the positional
+    # indices of the two matrix operands (mat1_index, mat2_index), the expected ndim of the
+    # matrix inputs (2 for mm/addmm, 3 for bmm/baddbmm) and the positional index of the
+    # additive bias operand, or None when the op has no bias.
     """Canonical operand positions for a supported FlexGEMM op."""
 
     name: str
@@ -68,6 +79,9 @@ _PRESERVE_FLEX_GEMM_GEMM_OP = "preserve_flex_gemm_gemm_op"
 def mark_flex_gemm_body_gemm_node(
     body_graph: torch.fx.GraphModule, gemm_op: torch._ops.OpOverload
 ) -> None:
+    # [FUNCTION DOC] Sets a preservation flag in the node metadata of every call_function node in
+    # body_graph whose target equals gemm_op, so the batch-1 bmm to mm rewrite skips them.
+    # Mutates node metadata in place; returns nothing.
     """Mark body GEMMs so Inductor's batch-1 bmm rewrite keeps them matchable."""
     for node in body_graph.graph.find_nodes(op="call_function", target=gemm_op):
         node.meta[_PRESERVE_FLEX_GEMM_GEMM_OP] = True
@@ -83,6 +97,8 @@ FLEX_GEMM_BODY_GRAPH_PASSES: tuple[
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def flex_gemm_fast_math_sigmoid(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Fast-math sigmoid: computes tanh of half the input, halves it and adds one half.
+    # Integer inputs are promoted to float by the type promotion wrapper.
     """Use the tanh sigmoid identity selected by QUACK fast math."""
     return torch.tanh(x * 0.5) * 0.5 + 0.5
 
@@ -92,6 +108,8 @@ def flex_gemm_fast_math_sigmoid(x: torch.Tensor) -> torch.Tensor:
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 )
 def flex_gemm_fast_math_silu(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Fast-math SiLU: with half the input as h, returns h times tanh of h plus h, which
+    # equals x times sigmoid of x. Uses default type promotion.
     """Use the tanh SiLU identity selected by QUACK fast math."""
     half = x * 0.5
     return half * torch.tanh(half) + half
@@ -103,6 +121,9 @@ def flex_gemm_fast_math_gelu(
     *,
     fallback: Callable[..., Any],
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Fast-math GELU wrapper: if approximate is "none" it is switched to "tanh", then
+    # the fallback (the original GELU decomposition) is called with the input and the
+    # approximate mode. Returns the fallback result.
     """Select the standard tanh GELU approximation for exact GELU calls."""
     if approximate == "none":
         approximate = "tanh"
@@ -119,6 +140,10 @@ def flex_gemm_body_decomposition_table(
     kernel_options: dict[str, Any],
     decomposition_table: Mapping[torch._ops.OpOverload, Callable[..., Any]],
 ) -> dict[torch._ops.OpOverload, Callable[..., Any]] | None:
+    # [FUNCTION DOC] Returns None unless kernel_options selects the QUACK backend with fast_math set to
+    # exactly true. Otherwise returns a copy of decomposition_table updated with the fast-math
+    # sigmoid and SiLU decompositions, and, if the table already decomposes GELU, with that
+    # entry wrapped so exact GELU becomes the tanh approximation. Input table is not mutated.
     """Override composite body decompositions enabled by QUACK fast math."""
     if (
         kernel_options.get("backend") != "QUACK"
@@ -136,6 +161,13 @@ def flex_gemm_body_decomposition_table(
 
 
 def nvfp4_pack(input: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Packs each trailing pair of float32 values into one E2M1x2 (FP4) byte and
+    # returns a contiguous tensor viewed as float4_e2m1fn_x2. Raises ValueError unless the
+    # input is float32, non-scalar, with last dimension of size 2. When compiling or on fake
+    # tensors it emits inline PTX (high value first) via inline_asm_elementwise; in eager
+    # mode it emulates the round-to-nearest-even satfinite conversion with integer bit
+    # arithmetic (saturation at magnitude 6, denormal and normal ranges, sign bit), with
+    # the second element in the high nibble.
     """Pack adjacent Float32 values into E2M1x2 storage for FlexGEMM tests.
 
     This private helper lets tests spell the intended epilogue with public inline
@@ -189,13 +221,19 @@ def nvfp4_pack(input: torch.Tensor) -> torch.Tensor:
 def apply_flex_gemm_body_graph_passes(
     body_graph: torch.fx.GraphModule, gemm_op: torch._ops.OpOverload
 ) -> None:
+    # [FUNCTION DOC] Runs each registered body-graph pass in FLEX_GEMM_BODY_GRAPH_PASSES on body_graph
+    # for gemm_op, mutating the graph metadata in place.
     """Apply FlexGEMM body annotations before generic Inductor graph passes."""
     for graph_pass in FLEX_GEMM_BODY_GRAPH_PASSES:
         graph_pass(body_graph, gemm_op)
 
 
 class FlexGemm(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator named "flex_gemm". Stateless; __call__ validates and
+    # normalizes its arguments (gemm op, body function, gemm args/kwargs, kernel options)
+    # before dispatch. One singleton, flex_gemm_hop, exists.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the HigherOrderOperator with the name "flex_gemm".
         super().__init__("flex_gemm")
 
     def __call__(
@@ -206,6 +244,12 @@ class FlexGemm(HigherOrderOperator):
         gemm_kwargs: dict[str, Any],
         kernel_options: dict[str, Any],
     ) -> Any:
+        # [FUNCTION DOC] Validates and dispatches. Raises RuntimeError if gemm_op is not a supported overload,
+        # gemm_args is not a tuple or list or contains anything but tensors, symbolic numbers
+        # or plain numbers/bools, gemm_kwargs is not a dict or holds tensor values, or
+        # kernel_options is not a dict or names a backend outside NVGEMM/QUACK/TRITON.
+        # Converts gemm_args to a tuple, copies kernel_options and defaults backend to TRITON.
+        # Returns the dispatched result (the epilogue output).
         if gemm_op not in FLEX_GEMM_OP_SPECS:
             raise RuntimeError(f"unsupported GEMM op for FlexGEMM: {gemm_op}")
         if not isinstance(gemm_args, (tuple, list)):
@@ -267,6 +311,10 @@ def flex_gemm(
     gemm_kwargs: dict[str, Any] | None = None,
     kernel_options: dict[str, Any] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Public API: runs gemm_op (an overload or its torch alias such as torch.mm) on
+    # gemm_args with optional gemm_kwargs, then applies epilogue_fn to the GEMM result, as
+    # one fused HOP call configured by kernel_options. Missing kwargs/options default to empty
+    # dicts. Returns the epilogue output. Errors come from the HOP validation.
     if gemm_kwargs is None:
         gemm_kwargs = {}
     if kernel_options is None:
@@ -274,6 +322,8 @@ def flex_gemm(
     gemm_op = cast(torch._ops.OpOverload, FLEX_GEMM_OP_ALIASES.get(gemm_op, gemm_op))
 
     def body_fn(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Body of the HOP: calls the GEMM op on the positional args with the captured
+        # gemm_kwargs and passes the result to epilogue_fn, returning its output.
         # Keep the traced body positional-only; the HOP carries gemm_kwargs for lowering.
         return epilogue_fn(gemm_op(*args, **gemm_kwargs))
 
@@ -282,6 +332,8 @@ def flex_gemm(
 
 @flex_gemm_hop.py_impl(DispatchKey.CompositeExplicitAutograd)
 def flex_gemm_dense(gemm_op, body_fn, args, kwargs, kernel_options):
+    # [FUNCTION DOC] HELPER: Eager implementation: runs body_fn on args and returns its result; the
+    # other parameters are ignored.
     return body_fn(*args)
 
 
@@ -292,11 +344,15 @@ flex_gemm_hop.py_autograd_impl(
 
 @register_fake(flex_gemm_hop)
 def flex_gemm_fake_tensor_mode(gemm_op, body_fn, args, kwargs, kernel_options):
+    # [FUNCTION DOC] HELPER: Fake tensor rule: runs body_fn on args and returns its (fake) result.
     return body_fn(*args)
 
 
 @flex_gemm_hop.py_functionalize_impl
 def flex_gemm_functionalize(ctx, gemm_op, body_fn, args, kwargs, kernel_options):
+    # [FUNCTION DOC] HELPER: Functionalization rule. Unwraps the args, then under redispatch checks that
+    # body_fn neither aliases nor mutates inputs (raises on violation), re-invokes the HOP
+    # with a functionalized body and unwrapped kwargs/options, and re-wraps the outputs.
     unwrapped_args = ctx.unwrap_tensors(args)
     with ctx.redispatch_to_next():
         _check_alias_and_mutation(
@@ -320,10 +376,16 @@ def flex_gemm_functionalize(ctx, gemm_op, body_fn, args, kwargs, kernel_options)
 def flex_gemm_proxy_torch_dispatch_mode(
     proxy_mode, gemm_op, body_fn, args, kwargs, kernel_options
 ):
+    # [FUNCTION DOC] HELPER: Proxy tracing rule. When tracing is enabled: traces body_fn into a sub-graph
+    # (using a decomposition table adjusted for QUACK fast math), applies body-graph
+    # annotation passes, registers it under a unique "flex_gemm_body_graph" name, creates a
+    # call_function node with (gemm_op, graph, args, kwargs, options), and returns the real
+    # body outputs tracked to that node. When tracing is disabled, re-invokes the HOP directly.
     if proxy_mode.enable_tracing:
         flat_args = tuple(args)
 
         def tracing_body_fn(*flat_body_args):
+            # [FUNCTION DOC] HELPER: Thin wrapper that calls body_fn on the given positional args.
             return body_fn(*flat_body_args)
 
         body_graph = reenter_make_fx(

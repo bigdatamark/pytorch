@@ -1,3 +1,9 @@
+# [MODULE DOC] Defines the inline_asm_elementwise higher-order operator: an elementwise map whose
+# body is user-supplied inline PTX assembly. Eager execution goes through the CUDA Jiterator
+# (CUDA tensors only, one output, single shared input dtype, pack must be 1); under
+# torch.compile the op is lowered by Inductor to Triton inline asm. Registers dense, autograd
+# (deferred not-implemented), fake, proxy-tracing and functionalization rules on the singleton
+# inline_asm_elementwise at import time. Exports only inline_asm_elementwise.
 # mypy: allow-untyped-defs
 import functools
 import re
@@ -14,6 +20,9 @@ __all__ = ["inline_asm_elementwise"]
 
 
 class InlineAsmElementwiseOp(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator named "inline_asm_elementwise". Stateless; __call__ validates
+    # is_pure and forwards inputs plus keyword attributes (asm_str, constraints, dtype,
+    # is_pure, pack) to dispatch. A single instance is exposed as inline_asm_elementwise.
     """Execute inline PTX assembly elementwise over tensors.
 
     This is an elementwise map where the function body is inline assembly.
@@ -70,6 +79,7 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the HigherOrderOperator with the name "inline_asm_elementwise".
         super().__init__("inline_asm_elementwise")
 
     def __call__(
@@ -81,6 +91,10 @@ class InlineAsmElementwiseOp(HigherOrderOperator):
         is_pure: bool = True,
         pack: int = 1,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Runs the elementwise inline-asm op on the input tensors with the given asm string,
+        # LLVM-style constraint string, output dtype and pack factor. Raises ValueError if
+        # is_pure is false (only pure asm is supported). Always dispatches with is_pure true.
+        # Returns the output tensor produced by the active dispatch implementation.
         if not is_pure:
             raise ValueError("inline_asm_elementwise only supports is_pure=True")
         # pyrefly: ignore [missing-attribute]
@@ -98,6 +112,9 @@ inline_asm_elementwise = InlineAsmElementwiseOp()
 
 
 def _parse_constraints(constraints: str) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Splits a comma separated constraint string, strips whitespace, and counts
+    # entries starting with an equals sign as outputs and the rest as inputs. Returns the pair
+    # (number of outputs, number of inputs).
     parts = [p.strip() for p in constraints.split(",")]
     n_outputs = sum(1 for p in parts if p.startswith("="))
     n_inputs = len(parts) - n_outputs
@@ -124,6 +141,8 @@ _TRITON_ARG_RE = re.compile(r"\$(\d+)")
 
 
 def _triton_asm_to_cuda_asm(asm_str: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts Triton-style operand references (dollar sign followed by a number)
+    # to CUDA-style percent-number references and returns the new string.
     return _TRITON_ARG_RE.sub(r"%\1", asm_str)
 
 
@@ -135,6 +154,13 @@ def _get_jiterator_fn(
     input_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ):
+    # [FUNCTION DOC] HELPER: Builds (and caches per argument tuple via lru_cache) a Jiterator function
+    # that wraps the asm in a generated CUDA kernel source: one parameter per input of the
+    # input dtype's CUDA type, one result variable of the output dtype's CUDA type, and a
+    # volatile asm statement with output and input constraints taken from the constraint
+    # string (leading equals signs stripped for outputs and re-added in the code). Asm text is
+    # escaped for embedding in a C string. Raises ValueError for dtypes missing from
+    # _DTYPE_TO_CUDA_TYPE. Returns the callable from _create_jit_fn.
     from torch.cuda.jiterator import _create_jit_fn
 
     cuda_asm = _triton_asm_to_cuda_asm(asm_str)
@@ -177,6 +203,11 @@ template <typename T>
 
 
 def _inline_asm_dense(*inputs, asm_str, constraints, dtype, is_pure, pack):
+    # [FUNCTION DOC] HELPER: Eager implementation. Broadcasts the inputs, then validates: at least one
+    # input (ValueError), CUDA tensors (RuntimeError), pack equal to 1 (RuntimeError), exactly
+    # one output constraint and an input-constraint count equal to the tensor count
+    # (ValueError), and a single common input dtype (ValueError). Fetches the cached Jiterator
+    # function and returns its result on the broadcast inputs. is_pure is unused here.
     if not inputs:
         raise ValueError("inline_asm_elementwise requires at least one input tensor")
 
@@ -223,6 +254,8 @@ def _inline_asm_dense(*inputs, asm_str, constraints, dtype, is_pure, pack):
 
 @inline_asm_elementwise.py_impl(DispatchKey.CompositeExplicitAutograd)
 def _(*inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
+    # [FUNCTION DOC] HELPER: Dense dispatch rule; forwards all arguments to _inline_asm_dense and returns
+    # its result.
     return _inline_asm_dense(
         *inputs,
         asm_str=asm_str,
@@ -239,6 +272,9 @@ inline_asm_elementwise.py_autograd_impl(
 
 
 def _elementwise_output_like(*inputs, dtype):
+    # [FUNCTION DOC] HELPER: Allocates an uninitialized tensor with the broadcast shape of the inputs,
+    # the requested dtype, the first input's device, and a memory layout following the standard
+    # pointwise stride propagation permutation computed from the broadcast inputs.
     from torch._prims_common import compute_elementwise_output_logical_to_physical_perm
 
     broadcasted = torch.broadcast_tensors(*inputs)
@@ -250,11 +286,16 @@ def _elementwise_output_like(*inputs, dtype):
 
 @register_fake(inline_asm_elementwise, skip_cache=True)
 def _(*inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
+    # [FUNCTION DOC] HELPER: Fake tensor rule; returns an empty output of broadcast shape, given dtype
+    # and pointwise-propagated strides. The asm attributes are ignored.
     return _elementwise_output_like(*inputs, dtype=dtype)
 
 
 @inline_asm_elementwise.py_impl(ProxyTorchDispatchMode)
 def _(mode, *inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
+    # [FUNCTION DOC] HELPER: Proxy tracing rule. Creates a call_function graph node for the op with the
+    # unwrapped input proxies and the asm attributes as keyword arguments, evaluates the op
+    # for real outputs, and returns them tracked against the node.
     proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, inputs)
 
     out_proxy = mode.tracer.create_proxy(
@@ -284,6 +325,9 @@ def _(mode, *inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
 
 @inline_asm_elementwise.py_functionalize_impl
 def _(ctx, *inputs, asm_str, constraints, dtype, is_pure=True, pack=1):
+    # [FUNCTION DOC] HELPER: Functionalization rule. Unwraps the inputs, redispatches the op to the next
+    # level, and re-wraps the result. The is_pure argument is not forwarded (the call default
+    # of true applies, which is the only supported value).
     unwrapped_inputs = ctx.unwrap_tensors(inputs)
 
     with ctx.redispatch_to_next():
