@@ -1,3 +1,7 @@
+# [MODULE DOC] AOTAutograd analysis helpers: rewrite ViewAndMutationMeta after input de-duplication or
+# synthetic-base construction, detect overlapping aliased inputs (and register a StorageOverlap guard),
+# and build the GraphSignature for export graphs. Import-time side effect: rebinds the module-level
+# name zip to the strict (length-checked) zip from .utils.
 """
 This module is one of the analysis modules - it takes as input a function or graph
 and some preexisting properties, and returns some data that is useful for deciding
@@ -45,6 +49,13 @@ def remove_dupe_metadata(
     keep_arg_mask: list[bool],
     add_dupe_map: list[int],
 ) -> ViewAndMutationMeta:
+    # [FUNCTION DOC] Builds a new ViewAndMutationMeta with duplicate inputs removed. keep_arg_mask marks
+    # which original inputs survive; add_dupe_map maps an old input index to its post-dedup index and is
+    # used to re-point output base indices. Tangents belonging to dropped mutated inputs are filtered out
+    # (with their descriptors) and subclass tangent metadata is rebuilt as plain contiguous metadata for
+    # the kept mutated inputs. Subclass input/output metadata is reset to empty (dupes unsupported with
+    # subclasses). Raises AssertionError if the mask length mismatches, is empty, or drops the first arg,
+    # or if subclass_tangent_meta is None. Does not mutate m.
     if len(m.input_info) != len(keep_arg_mask):
         raise AssertionError(
             f"len(m.input_info)={len(m.input_info)} != len(keep_arg_mask)={len(keep_arg_mask)}"
@@ -131,6 +142,16 @@ def create_synthetic_base_metadata(
     inner_args: list[Any],
     inner_args_desc: list[AOTInput],
 ) -> tuple[ViewAndMutationMeta, list[int]]:
+    # [FUNCTION DOC] Recomputes ViewAndMutationMeta for the calling convention where aliased inputs are
+    # merged into synthetic base arguments. For each inner arg it gathers the outer args mapped to it and
+    # merges their input info: leaf-ness must agree across aliases (AssertionError otherwise); a merged
+    # base counts as data-mutated and not metadata-mutated; requires_grad is any-of; no-grad/inference
+    # mutation and inductor storage resize flags are all-of. Existing outputs get their base index remapped
+    # (and is_input outputs become alias_of_input if the input was merged); extra alias outputs are added for
+    # merged inputs that had metadata mutations. Traced tangents and descriptors are regenerated for inner
+    # args that are mutated and require grad. Returns the new metadata and the outer indices of aliased
+    # args with metadata mutations (needed by the synthetic-base epilogue). Raises AssertionError if
+    # subclass_tangent_meta is None.
     # maps inner arg indices to outer arg indices
     synthetic_base_to_indices: dict[int, list[int]] = {}
     for inner_idx in range(len(inner_args)):
@@ -327,6 +348,13 @@ def create_synthetic_base_metadata(
 def compute_overlapping_inputs(
     aot_config: AOTConfig, fwd_inputs: list[Any], aliased_input_indices: list[int]
 ) -> set[int]:
+    # [FUNCTION DOC] Given the forward inputs and the indices of inputs that alias each other, returns the
+    # subset of those indices whose tensors actually overlap in storage (computed by the C++ helper, using a
+    # symbolic fast path when any shape/stride/offset is a SymInt). Guard emission is suppressed during the
+    # computation when dynamo sources are available. Side effect: when dynamic shapes are in use, a
+    # tracing context exists, and sources are known, appends a StorageOverlap guard (overlapping vs
+    # non-overlapping sources) to the tracing context's AOTAutograd guards. In fbcode with more than 400
+    # symbolic aliased inputs and the killswitch knob on, raises UnsupportedMutationAliasingException.
     num_aliases = len(aliased_input_indices)
 
     shape_env = None
@@ -406,10 +434,14 @@ def compute_overlapping_inputs(
 
 
 def _graph_input_names(gm: torch.fx.GraphModule) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the names of all placeholder nodes of the graph, in graph order.
     return [node.name for node in gm.graph.find_nodes(op="placeholder")]
 
 
 def _graph_output_names(gm: torch.fx.GraphModule) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the name of each value returned by the graph's output node (None for
+    # entries that are not nodes, e.g. constants). Raises AssertionError if the last node is not an output
+    # node with exactly one argument.
     output_node = next(iter(reversed(gm.graph.nodes)))
     if output_node.op != "output" or len(output_node.args) != 1:
         raise AssertionError(
@@ -433,6 +465,15 @@ def create_graph_signature(
     num_user_fw_outs: int | None,
     loss_index: int | None,
 ) -> GraphSignature:
+    # [FUNCTION DOC] Builds the GraphSignature describing an export graph's inputs and outputs. Reads input
+    # and output names from the graph; user input count = graph inputs minus params, buffers and tokens.
+    # If trace_joint, outputs after the forward outputs (user outputs plus mutated inputs) are gradients,
+    # mapped in order to parameters/buffers requiring grad, then to user inputs requiring grad, and a
+    # BackwardSignature is made with the loss output name; otherwise no backward signature and the user
+    # output count is derived from the outputs minus mutated inputs and tokens. Raises AssertionError if
+    # num_user_fw_outs or loss_index is None in joint mode, or gradient counts do not match outputs.
+    # KNOWN ISSUE: gradient-to-parameter mapping enumerates params_and_buffers_flat but indexes param_names
+    # alone; this is only consistent if param_names lines up with the flat params-and-buffers list.
     # Retrieve graph input names
     graph_input_names = _graph_input_names(fx_g)
     # Retrieve graph output names

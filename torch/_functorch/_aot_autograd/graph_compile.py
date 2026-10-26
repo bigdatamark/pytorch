@@ -1,3 +1,11 @@
+# [MODULE DOC] Core AOTAutograd pipeline stages. Stage 1 (aot_stage1_graph_capture) runs pre-compile
+# wrappers and traces a joint or inference graph. Stage 2 variants either return the raw graph (export),
+# or partition the joint graph into forward/backward and compile them (autograd), or compile an
+# inference graph; each then builds the runtime callable with post-compile wrappers and optionally writes
+# an AOTAutogradCache entry. Also contains donated-buffer analysis, invoke_subgraph HOP partitioning and
+# joint-graph passes, saved-tensor-hook inlining, and structured-logging helpers. Import-time side effects:
+# rebinds zip to the strict zip, creates module loggers, a thread-local holder for saved tensor hook
+# context, and the aten alias.
 """
 Functions in this module do most of the "work" of AOTAutograd.
 An aot_dispatch_* function:
@@ -100,6 +108,9 @@ from .utils import (
 
 
 def is_opaque_node(node: Any) -> bool:
+    # [FUNCTION DOC] Returns True if node is an fx Node whose recorded value (meta "val") is a custom
+    # class object, a TorchScript object or a fake script object (e.g. a ProcessGroup); False for non-nodes
+    # or nodes without a recorded value. No side effects.
     """Check if a node contains an opaque or non-tensor value (e.g., ProcessGroup)."""
     from torch._library.fake_class_registry import FakeScriptObject
 
@@ -119,6 +130,9 @@ _thread_local = threading.local()
 
 
 def _should_save_cache(*compiled_fns: Callable[..., Any]) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether an AOTAutograd cache entry may be saved: always true when the
+    # cache bundles compiled artifacts, otherwise only if every given compiled function carries a non-None
+    # FX graph cache key attribute.
     if should_bundle_autograd_cache():
         return True
     return all(
@@ -128,6 +142,9 @@ def _should_save_cache(*compiled_fns: Callable[..., Any]) -> bool:
 
 @contextmanager
 def maybe_skip_decompose(aot_config: AOTConfig) -> Generator[AOTConfig, None, None]:
+    # [FUNCTION DOC] Context manager yielding the AOTConfig to use for graph capture. If the selective
+    # decompose config flag is on, yields a copy of aot_config with an empty decompositions table (so
+    # decomposition is deferred); otherwise yields aot_config unchanged. Does not mutate the input.
     if config.selective_decompose:
         yield dataclasses.replace(aot_config, decompositions={})
     else:
@@ -151,6 +168,9 @@ def maybe_skip_decompose(aot_config: AOTConfig) -> Generator[AOTConfig, None, No
 # Warning: This API may change without backward compatibility.
 @contextmanager
 def _saved_tensor_hook_context(state: dict[str, Any]) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager that stores state (a dict of graph info such as forward graph,
+    # backward graph and current saved node) in the thread-local slot for the duration of the block, then
+    # restores the previously stored state, or removes the slot if there was none.
     previous_state = getattr(_thread_local, "state", None)
     try:
         _thread_local.state = state
@@ -165,6 +185,8 @@ def _saved_tensor_hook_context(state: dict[str, Any]) -> Generator[None, None, N
 
 
 def _get_saved_tensor_hook_context() -> dict[str, Any] | None:
+    # [FUNCTION DOC] Returns the current thread's saved tensor hook context dict, or None when called
+    # outside of the context manager. Lets compiled pack/unpack hooks inspect graph info about a saved value.
     return getattr(_thread_local, "state", None)
 
 
@@ -183,6 +205,9 @@ DispatchReturn = tuple[Callable[..., Any], ViewAndMutationMeta]
 
 
 def _create_wrappers_for_dispatch(needs_autograd: bool) -> list[CompilerWrapper]:
+    # [FUNCTION DOC] HELPER: Returns the compiler wrappers applied to every dispatch path, in order: the
+    # input de-duplication wrapper and the synthetic-base wrapper (which traces the joint graph iff
+    # needs_autograd).
     """
     Wrappers that run on every dispatch function
     """
@@ -193,6 +218,13 @@ def aot_stage1_graph_capture(
     aot_state: AOTState,
     orig_flat_fn: FlatFn,
 ) -> AOTGraphCapture:
+    # [FUNCTION DOC] Stage 1: wraps the flat function so it also returns plain output descriptors, runs the
+    # pre-compile wrappers (dedupe, synthetic bases), and traces a graph: the joint fw/bw graph when autograd
+    # is needed and not pre-dispatch, otherwise a base (inference) graph. Mutates aot_state: flat_args,
+    # flat_args_descs and fw_metadata are replaced by the post-wrapper versions; the deterministic flag is
+    # recorded; with functionalization disabled, effect tokens in metadata are cleared. If selective
+    # decompose is configured, applies it to the traced graph afterwards. Returns an AOTGraphCapture holding
+    # wrappers, graph module, updated flat args and descriptors, and optional subclass metadata.
     # NB: flat_fn at this point coincides with the initial info from forward
     # metadata collection returning a list[Tensor].  We are now going to
     # augment the output to return a tuple[list[Tensor], list[AOTOutput]] and
@@ -202,6 +234,8 @@ def aot_stage1_graph_capture(
     # big deal
     @simple_wraps(orig_flat_fn)
     def orig_flat_fn2(*args: FxValue) -> tuple[list[FxValue], list[AOTOutput]]:
+        # [FUNCTION DOC] HELPER: Calls the original flat function and returns its outputs together with a
+        # same-typed container of plain positional output descriptors, one per output.
         out = orig_flat_fn(*args)
         out_descs: list[AOTOutput] = type(out)(  # type: ignore[assignment]
             PlainAOTOutput(i)  # type: ignore[misc]
@@ -287,6 +321,10 @@ def aot_stage1_graph_capture(
 def aot_stage2_export(
     aot_state: AOTState, aot_graph_capture: AOTGraphCapture
 ) -> DispatchReturn:
+    # [FUNCTION DOC] Stage 2 for export: runs the post-compile wrappers (which are no-ops or errors for
+    # export) and returns the raw traced fx graph module (joint or inference) with the runtime metadata.
+    # Side effects: records a compile event and updates aot_state.fw_metadata with the wrappers' result.
+    # Raises AssertionError if the wrappers did not return a GraphModule.
     graph = aot_graph_capture.graph_module
     aot_config = aot_state.aot_config
     wrappers = aot_graph_capture.wrappers
@@ -318,6 +356,8 @@ def _get_inner_meta(
     maybe_subclass_meta: SubclassMeta | None,
     fw_metadata: ViewAndMutationMeta,
 ) -> ViewAndMutationMeta:
+    # [FUNCTION DOC] HELPER: Returns the subclass metadata's inner fw_metadata when subclass metadata is
+    # present, else the given fw_metadata.
     """
     Util to get view and mutation metadata.
     """
@@ -327,6 +367,8 @@ def _get_inner_meta(
 
 
 def _apply_tensorify_python_scalars(module: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the graph module in place by running the tensorify-python-scalars pass,
+    # only if an active fake mode with a shape env is detected; otherwise does nothing.
     """
     Util to apply tensorify_python_scalars.
     """
@@ -348,6 +390,9 @@ def aot_stage2_compile(
     # pyrefly: ignore [implicit-any]
     inference_compiler: Callable | None = None,
 ) -> DispatchReturn:
+    # [FUNCTION DOC] Stage 2 dispatcher. Backward and inference compilers default to fw_compiler. If autograd
+    # is needed and not in pre-dispatch mode, delegates to the autograd stage with partition_fn and the fw/bw
+    # compilers; otherwise delegates to the inference stage. Returns (callable, ViewAndMutationMeta).
     if bw_compiler is None:
         bw_compiler = fw_compiler
     if inference_compiler is None:
@@ -374,6 +419,9 @@ def _log_inference_graph(
     fw_module: torch.fx.GraphModule,
     aot_config: AOTConfig,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: If logging is enabled, emits the functorch config as a structured trace
+    # artifact. If cache info is present, renders the forward graph to a readable string (with strides,
+    # devices, expanded def) for caching. Returns that string or None.
     """
     Log the inference graph to the structured logger.
     Return a str representation of the graph.
@@ -413,6 +461,8 @@ def _aot_stage2b_inference_compile(
     inference_compiler: Callable,
     # pyrefly: ignore [implicit-any]
 ) -> Callable:
+    # [FUNCTION DOC] HELPER: Compiles the inference graph via the shared forward-or-inference compile helper
+    # with is_inference set, and returns only the compiled callable (second element of its result).
     return _aot_stage2b_compile_forward_or_inference(
         fw_module,
         updated_flat_args,  # type: ignore[arg-type]
@@ -432,6 +482,11 @@ def aot_stage2_inference(
     # pyrefly: ignore [implicit-any]
     inference_compiler: Callable,
 ) -> DispatchReturn:
+    # [FUNCTION DOC] Stage 2 for functions without autograd: logs the inference graph, applies
+    # tensorify-python-scalars, partitions any invoke_subgraph HOP pairs (from traced autograd calls), applies
+    # tag-based rematerialization if configured, optionally logs the graph after HOP passes, compiles with the
+    # inference compiler, builds and saves a cache entry, and returns the runtime callable with metadata.
+    # Raises AssertionError if the graph is not a GraphModule. partition_fn is only used for HOP partitioning.
     """
     Handles functions that don't need autograd. Runs wrappers and compiles with
     the stage-2 inference compiler.
@@ -521,6 +576,10 @@ def _cache_inference_info(
     aot_forward_graph_str: str | None,
     wrappers: list[CompilerWrapper],
 ) -> GenericAOTAutogradResult[Any, Any] | None:
+    # [FUNCTION DOC] HELPER: Makes the metadata runtime-safe (mutating it), then, if cache info exists and
+    # saving is allowed for compiled_fw, builds an inference-only cache entry (no backward pieces, forward
+    # time since start) and saves it to the AOTAutograd cache (remote if configured). Returns the entry, or
+    # None when nothing was cached.
     make_runtime_safe(fw_metadata, maybe_subclass_meta)
 
     cache_info = aot_config.cache_info
@@ -565,6 +624,9 @@ def _aot_stage2c_make_inference_function(
     wrappers: list[CompilerWrapper],
     entry: GenericAOTAutogradResult[Any, Any] | None,
 ) -> DispatchReturn:
+    # [FUNCTION DOC] HELPER: Wraps compiled_fw as serializable when a cache entry exists, applies the runtime
+    # wrapper (non-joint, with amp disabled if autocast is currently enabled), then the post-compile wrappers,
+    # and returns the final callable and metadata.
     if entry is not None:
         compiled_fw = SerializableCompiledFunction(compiled_fw, lambda: entry)
 
@@ -591,6 +653,9 @@ def collect_fw_donated_buffer_idxs(
     bw_outs: list[FakeTensor | None],
     saved_tensors: list[FakeTensor | None],
 ) -> list[int]:
+    # [FUNCTION DOC] Returns indices (into saved_tensors) of saved tensors whose storage differs from the
+    # storage of every non-sparse fake tensor among forward inputs, user forward outputs and backward
+    # outputs; such buffers can be donated to the backward. Non-fake, sparse or None entries are never donated.
     """
     Checks if the saved tensors are donated buffers, which means a saved tensor is not
     an alias of any tensors in fw_ins, user_fw_outs, and bw_outs.
@@ -623,6 +688,10 @@ def collect_bw_donated_buffer_idxs(
     bw_module: torch.fx.GraphModule,
     fw_metadata: ViewAndMutationMeta,
 ) -> list[int]:
+    # [FUNCTION DOC] Reads recorded tensor values off the placeholders and outputs of the forward and
+    # backward graphs and returns indices of donated saved buffers, offset by the number of saved symints so
+    # they index the backward inputs. Returns an empty list if either graph has a metadata-mutation op.
+    # Raises AssertionError if num_symints_saved_for_bw is unset in fw_metadata.
     """
     Collects backward donated buffer indexes from fw_module and bw_module.
     """
@@ -678,6 +747,10 @@ def collect_bw_donated_buffer_idxs(
 
 @dataclasses.dataclass
 class InvokeSubgraphHopGraphs:
+    # [CLASS DOC] Dataclass holding per-invoke_subgraph partitioning results: a flag that partitioning is
+    # done (to avoid repeating it), the original forward input/output counts, the new forward and backward
+    # HOP graph modules, and the new counts of symint and saved nodes. Fields start unset and are filled
+    # during joint graph passes on HOPs.
     """
     A data structure to hold all the information needed to partition the
     `joint_hop_gm` and joint graph and the restitch the `new_fw_hop_gm` and
@@ -698,6 +771,11 @@ class InvokeSubgraphHopGraphs:
 def prepare_for_partitioner(
     mod: torch.fx.GraphModule, num_primals: int, num_fw_outputs: int
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Copies a joint graph (inputs: primals then tangents; outputs: grads then forward
+    # outputs) into a new graph module the partitioner accepts: placeholders are renamed to numbered
+    # primals_ and tangents_ names (first num_primals placeholders are primals), node meta is shallow-copied,
+    # and the output tuple is reordered to forward outputs first (last num_fw_outputs entries moved to the
+    # front), keeping None entries. Lints the new graph; does not modify mod.
     # min-cut partitioner requires the placeholders to have primals and
     # tangents string in the node.name. The signature of the joint graph is
     # (*primals, *tangents)
@@ -747,6 +825,12 @@ def _get_partition_fn(
     ]
     | None,
 ) -> tuple[bool, Callable[..., tuple[torch.fx.GraphModule, torch.fx.GraphModule]]]:
+    # [FUNCTION DOC] Chooses the partitioner for an invoke_subgraph forward node. If the node's custom meta has
+    # a nested region config with a partitioner (a callable, or the string names for the default or min-cut
+    # rematerialization partitioners), returns (True, Inductor's partition function bound to that raw
+    # partitioner so joint-graph passes still run). Otherwise returns (False, default_partition_fn). Raises
+    # ValueError for an unknown partitioner name and AssertionError for a non-string non-callable value or
+    # when no HOP partitioner exists and default_partition_fn is None.
     """
     Return either `default_partition_fn` or a HOP specific partition function.
 
@@ -808,6 +892,8 @@ def _get_partition_fn(
 
 
 def _has_invoke_subgraph_node(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] HELPER: Returns True if any top-level node of the graph is a call to the invoke_subgraph
+    # higher-order op, else False.
     from torch._higher_order_ops import invoke_subgraph
 
     for node in gm.graph.nodes:
@@ -826,6 +912,17 @@ def run_joint_graph_passes_on_hops(
     ]
     | None = None,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Partitions invoke_subgraph HOP pairs inside joint_gm, mutating it in place and returning
+    # it. Finds top-level forward ("fw") and backward ("bw") HOP nodes and pairs them by their call_id meta
+    # (raises AssertionError on duplicate/missing ids or unmatched bw). For each distinct bw identifier, takes
+    # the backward subgraph as the joint HOP graph, reorders it for the partitioner, runs the chosen
+    # partition function (errors from a HOP-custom partitioner are re-raised as RuntimeError), and records
+    # the new fw/bw subgraphs and counts of saved tensors and symints. Then, walking bw nodes in reverse,
+    # replaces each fw node with a call to the partitioned fw subgraph (extra outputs fetched by getitem) and
+    # each bw node with a call to the partitioned bw subgraph (operands: symints, saved tensors, tangents),
+    # propagating meta and restamping backward region config when it differs. Unpaired fw nodes sharing an
+    # identifier are rewritten to the new fw subgraph too. Finally dead code is eliminated, the graph is
+    # linted and recompiled. Returns joint_gm unchanged if there are no bw HOP nodes. joint_inputs is unused.
     """
     This pass runs the joint graph passes on the HOP graph. In torch.compile, we
     typically have many passes which work on the joint graph and then end with a
@@ -863,9 +960,11 @@ def run_joint_graph_passes_on_hops(
     )
 
     def num_outputs(mod: torch.fx.GraphModule) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of values in the module's output node.
         return len(mod.graph.find_nodes(op="output")[0].args[0])
 
     def num_inputs(mod: torch.fx.GraphModule) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of placeholder nodes in the module.
         return len(mod.graph.find_nodes(op="placeholder"))
 
     new_hop_graphs: dict[str, InvokeSubgraphHopGraphs] = defaultdict(
@@ -1091,6 +1190,8 @@ def run_joint_graph_passes_on_hops(
     already_added_new_hop_mods = set()
 
     def add_new_hop_gm(new_subgraph_mod: torch.fx.GraphModule, name: str) -> str:
+        # [FUNCTION DOC] HELPER: Registers the subgraph on joint_gm under a name prefixed with partitioned_
+        # (once per name; repeated calls reuse it) and returns that attribute name.
         new_subgraph_attr_name = f"partitioned_{name}"
         if new_subgraph_attr_name in already_added_new_hop_mods:
             return new_subgraph_attr_name
@@ -1104,6 +1205,8 @@ def run_joint_graph_passes_on_hops(
         new_call_function_node: torch.fx.Node,
         old_call_function_node: torch.fx.Node,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Gives the new call node a shallow copy of the old node's meta, then sets its
+        # recorded value to a tuple of the recorded values of the new subgraph's output entries (None kept).
         # Copy all the fields from the old call_function node. And then override
         # the `val` meta field with the outputs of new_hop_gm.
         new_call_function_node.meta = copy.copy(old_call_function_node.meta)
@@ -1301,6 +1404,9 @@ def maybe_log_graph(
     structured_log_prefix_fn: Callable[[], str],
     out_structured_logs: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] When logging is enabled in aot_config, logs the graph code at debug level on the AOT
+    # graphs logger, then either appends a prefix-plus-readable-graph string to out_structured_logs (if given)
+    # or emits it as a structured trace under the prefix name. Does nothing when logging is disabled.
     if not aot_config.enable_log:
         return
     aot_graphs_log.debug(
@@ -1316,6 +1422,7 @@ def maybe_log_graph(
     )
 
     def gm_str_fn() -> str:
+        # [FUNCTION DOC] HELPER: Returns the graph module rendered as readable code with strides and devices.
         return gm.print_readable(
             print_output=False,
             include_stride=True,
@@ -1335,11 +1442,16 @@ def maybe_log_graph(
 def create_wrap_fn(
     fn: Callable[..., Any], args: tuple[Any, ...]
 ) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+    # [FUNCTION DOC] Returns (wrapper, args) where wrapper runs fn with functionalization excluded from
+    # dispatch: arguments are converted to functional tensors, fn is called, inputs are checked for data
+    # mutation (raises AssertionError "Saved tensors hooks with inputs mutations are not allowed"), and
+    # outputs are converted back from functional tensors. args is returned unchanged.
     from torch.fx.experimental.proxy_tensor import maybe_enable_thunkify
 
     from .functional_utils import from_fun, has_data_mutation, to_fun
 
     def assert_no_mutation(t: Any) -> None:
+        # [FUNCTION DOC] HELPER: Raises AssertionError if the tensor has had a data mutation.
         if has_data_mutation(t):
             raise AssertionError(
                 "Saved tensors hooks with inputs mutations are not allowed"
@@ -1347,6 +1459,9 @@ def create_wrap_fn(
 
     @simple_wraps(fn)
     def _wrapper(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the wrapped function on functional-tensor versions of args with the
+        # Functionalize dispatch key excluded and thunkify possibly enabled; checks inputs for mutation and
+        # returns outputs converted back to regular tensors.
         with maybe_enable_thunkify():
             disable_above = torch._C._ExcludeDispatchKeyGuard(
                 torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
@@ -1364,6 +1479,8 @@ def create_wrap_fn(
 def prepare_hook_gm(
     aot_config: AOTConfig, fn: Callable[..., Any], args: tuple[Any, ...]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Traces a saved-tensor hook function into an fx graph module: wraps fn so it runs
+    # without functionalization (and rejects input mutation) and builds the graph from args using aot_config.
     from torch._functorch._aot_autograd.graph_capture import _create_graph
 
     fn, args = create_wrap_fn(fn, args)
@@ -1385,6 +1502,21 @@ def maybe_inline_graph_saved_tensors_hooks(
     aot_config: AOTConfig,
     static_input_indices: list[int],
 ) -> None:
+    # [FUNCTION DOC] Mutates fw_module and bw_module in place to inline the active autograd saved-tensor
+    # hooks when they are graph modules: the pack hook becomes an epilogue of the forward graph and the
+    # unpack hook a prologue of the backward graph. Returns without change when in a compiled autograd
+    # region, when hooks are not inlineable, or when donated-only filtering finds no donated saved values.
+    # Which saved values get hooks depends on the configured filtering mode (donated buffers only, all
+    # except static inputs, or all). For each selected tensor: the pack hook is traced and copied before the
+    # forward outputs, the backward placeholder is replaced by placeholders for the packed tensors or
+    # symints (matching names) feeding a copy of the unpack graph; non-tensor pack results are inlined as
+    # constants. Forward outputs are reordered as inner outputs, packed tensors, packed symints, original
+    # saved symints, and the graphs are linted and recompiled. inner_meta symint/no-version-check counts may
+    # be updated in donated mode; structured logs are emitted when logging is on.
+    # Raises NotImplementedError if a pack hook returns tensor subclasses, AssertionError if forward output
+    # and backward input names fail to line up.
+    # KNOWN ISSUE: the pack hook is evaluated once directly and once again via its traced graph for each
+    # saved tensor, so hooks with side effects run twice at compile time; the first result is overwritten.
     if torch._dynamo.compiled_autograd.in_compiled_autograd_region:
         return
 
@@ -1421,6 +1553,8 @@ def maybe_inline_graph_saved_tensors_hooks(
     bw_g_names = {node.name for node in bw_g.nodes}
 
     def _gen_unused_name(candidate: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns candidate, or candidate with a numeric suffix appended, such that the
+        # name is not used by any node in either the forward or backward graph.
         c = candidate
         i = 0
         while c in fw_g_names or c in bw_g_names:
@@ -1505,6 +1639,8 @@ def maybe_inline_graph_saved_tensors_hooks(
             continue
 
         def _get_extra_info() -> dict[str, Any]:
+            # [FUNCTION DOC] HELPER: Builds the hook context dict exposing the forward graph, backward graph
+            # and the current saved node to user hooks.
             return {"_fw_graph": fw_g, "_bw_graph": bw_g, "_node": saved}
 
         with _saved_tensor_hook_context(_get_extra_info()):
@@ -1621,6 +1757,8 @@ def maybe_inline_graph_saved_tensors_hooks(
         def find_saved_in_bw_inputs(
             bw_inputs: list[torch.fx.Node],
         ) -> torch.fx.Node | None:
+            # [FUNCTION DOC] HELPER: Returns the backward placeholder whose name equals the current saved
+            # node's name, or None if there is none.
             for n in bw_inputs:
                 if n.name == saved.name:  # type: ignore[union-attr]
                     return n
@@ -1736,6 +1874,8 @@ def maybe_inline_graph_saved_tensors_hooks(
     bw_s_names = [n.name for n in bw_ins_saved_syms]
 
     def _log_structured_logs() -> None:
+        # [FUNCTION DOC] HELPER: If logging is enabled, emits the accumulated log lines as one structured
+        # trace artifact.
         if not aot_config.enable_log:
             return
 
@@ -1794,6 +1934,8 @@ def _log_joint_graph(
     fx_g: torch.fx.GraphModule,
     aot_config: AOTConfig,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: When logging is enabled, logs the joint graph (debug logger and structured
+    # trace) and returns its readable string; otherwise returns None.
     """
     Log the joint graph to the structured logger.
     Return a str representation of the graph.
@@ -1831,6 +1973,9 @@ def _log_fw_bw_graphs(
     fw_metadata: ViewAndMutationMeta,
     aot_config: AOTConfig,
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: When logging is enabled, logs the functorch config, metadata, forward and
+    # backward graphs (debug logger plus structured traces, including metadata and subclass metadata
+    # artifacts) and returns (forward string, backward string); returns (None, None) when disabled.
     """
     Log the fw and bw graphs to the structured logger.
     Return str representations of the graphs.
@@ -1926,6 +2071,11 @@ def _partition_joint_graph_into_fw_bw(
     # pyrefly: ignore [implicit-any]
     partition_fn: Callable,
 ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule, int]:
+    # [FUNCTION DOC] HELPER: Splits the joint graph into forward and backward modules. Computes the number
+    # of inner forward outputs (mutated inputs, outputs, intermediate bases, rng offset outputs, effect
+    # tokens), runs HOP joint passes, applies the user joint custom pass if configured, then calls
+    # partition_fn. Side effect: records the number, index and device of graphsafe rng state placeholders on
+    # fw_metadata. Returns (fw_module, bw_module, num_inner_fwd_outputs).
     # See Note: [Partitioner handling for Subclasses, Part 1]
     # See Note: [Recomputing subclass mutation handling]
     mutated_inp_runtime_indices = compute_inner_mutated_inp_indices_from_subclass_meta(
@@ -1973,6 +2123,8 @@ def _partition_joint_graph_into_fw_bw(
 def _joint_inputs_for_forward(
     joint_inputs: list[Any] | tuple[list[Any], list[Any]],
 ) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the forward part of joint inputs: the first element if given a
+    # (primals, tangents) tuple, else the input list itself.
     return joint_inputs[0] if isinstance(joint_inputs, tuple) else joint_inputs
 
 
@@ -1984,6 +2136,10 @@ def _maybe_unlift_partitioned_effect_tokens(
     aot_config: AOTConfig,
     num_inner_fwd_outputs: int,
 ) -> tuple[int, list[Any] | tuple[list[Any], list[Any]]]:
+    # [FUNCTION DOC] HELPER: If effect-token unlifting is configured and there are forward or backward
+    # tokens, rewrites fw_module and bw_module in place to remove the token inputs/outputs, reduces the inner
+    # forward output count by the number of tokens, and drops the leading token entries from the forward
+    # joint inputs. Returns (num_inner_fwd_outputs, joint_inputs), unchanged when nothing is unlifted.
     num_tokens = len(fw_metadata.tokens)
 
     # See Note [Side-Effectful Tokens in AOTAutograd]
@@ -2010,6 +2166,13 @@ def _categorize_saved_tensors_for_backward(
     fw_metadata: ViewAndMutationMeta,
     num_inner_fwd_outputs: int,
 ) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Classifies the forward outputs beyond the inner outputs (those saved for
+    # backward) as symints, opaque objects or tensors, and records on fw_metadata and inner_meta: counts of
+    # saved symints, opaque objects and tensors saved without version counter checks, a per-tensor flag for
+    # whether the saved value is a graph input, and (fw_metadata only) the dynamic dims of saved tensors.
+    # If the donated buffer config is on, also stores donated backward buffer indices on both metadata
+    # objects. Raises AssertionError if the number of graph-input flags differs from the number of saved
+    # tensors. Returns (number of forward outputs saved for backward, number of saved symints).
     fw_outs = next(iter(fw_module.graph.find_nodes(op="output"))).args[0]
     # we only need to bookkeep the symints that are saved for bw, not any symints
     # the user forward might have returned in its own output
@@ -2145,6 +2308,11 @@ def _compute_indices_of_inps_to_detach(
     inner_meta: ViewAndMutationMeta,
     fw_metadata: ViewAndMutationMeta,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns indices of forward inputs that should be detached before entering the
+    # compiled autograd function: inputs whose backward gradient output is None, that are non-leaf tensors
+    # requiring grad, and that do not have an in-graph storage metadata mutation (see the Note above).
+    # Returns an empty list when subclass metadata is present. Raises AssertionError if the backward output
+    # count does not equal inputs plus rng offset outputs plus backward tokens.
     # TODO: we should apply the below "detach inputs if their gradients are statically known to be None"
     # optimization even if we have subclass inputs/outputs (we do not handle this today).
     # Computing which our our inputs get None gradients is a bit more complicated,
@@ -2209,6 +2377,11 @@ def _aot_stage2a_partition(
     # pyrefly: ignore [implicit-any]
     partition_fn: Callable,
 ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule, int, int, list[int], list[Any]]:
+    # [FUNCTION DOC] Stage 2a: with grad disabled and autocast disabled if it was on, partitions the joint
+    # graph into forward and backward modules, unlifts effect tokens if configured, inlines saved tensor
+    # hooks, categorizes saved values (updating metadata), and computes inputs to detach. Mutates the
+    # graphs and metadata as those helpers do. Returns (fw_module, bw_module, number of forward outputs
+    # saved for backward, number of saved symints, indices of inputs to detach, forward joint inputs).
     """
     Partition the joint graph into a forward graph and a backward graph. Returns:
     - the forward and backward graphs
@@ -2289,6 +2462,8 @@ def _aot_stage2b_fw_compile(
     fw_compiler: Callable,
     # pyrefly: ignore [implicit-any]
 ) -> tuple[list[tuple[int, ...] | None] | None, Callable]:
+    # [FUNCTION DOC] HELPER: Compiles the forward graph of the autograd path via the shared helper in
+    # non-inference mode. Returns (forward output strides, compiled forward callable).
     return _aot_stage2b_compile_forward_or_inference(
         fw_module,
         adjusted_flat_args,
@@ -2312,6 +2487,14 @@ def _aot_stage2b_bw_compile(
     bw_compiler: Callable,
     # pyrefly: ignore [implicit-any]
 ) -> tuple[AutogradLazyBackwardCompileInfo, Callable | None]:
+    # [FUNCTION DOC] Prepares and possibly eagerly compiles the backward graph with grad and autocast off.
+    # Builds example placeholder values from the graph; where the forward compiler chose different strides
+    # for saved activations, restrides the matching tensor placeholders (stride comparison avoids adding
+    # guards, and assumes different when not statically provable). If there are saved symints or non-lazy
+    # lowering is forced, compiles a deep copy of the backward now; failures are re-raised only when forced,
+    # otherwise logged as a structured artifact and a warning and the backward stays lazily compiled. In a
+    # compiled autograd region, forces recompilation of the lazy graph module. Returns the lazy backward
+    # compile info (graph, placeholders, tracing and compile contexts) and the compiled backward or None.
     """
     Compile the backward graph. Returns:
     - the placeholder list for the backward graph
@@ -2471,6 +2654,10 @@ def aot_stage2_autograd(
     # pyrefly: ignore [implicit-any]
     bw_compiler: Callable,
 ) -> DispatchReturn:
+    # [FUNCTION DOC] Stage 2 for autograd: logs and tensorifies the joint graph, partitions it into forward
+    # and backward (stage 2a), logs both, compiles the forward (recording output strides) and the backward
+    # (possibly lazily), prepares or saves the cache entry, and builds the final callable (autograd function
+    # wrapped by the post-compile wrappers). Returns (callable, fw_metadata). Records a compile event.
     """
     Autograd logic. Generates a joint graph, partitions it, manipulates the input with various wrappers,
     and returns a wrapped torch.autograd.Function with a forward and backward.
@@ -2579,6 +2766,10 @@ def _aot_stage2c_make_autograd_function(
     _indices_of_inps_to_detach: list[int],
     num_symints_saved_for_bw: int,
 ) -> DispatchReturn:
+    # [FUNCTION DOC] HELPER: Builds the runtime autograd function from the compiled forward/backward: finds the
+    # (at most one) BackwardState argument index (AssertionError if more), assembles the compile spec, runs
+    # the autograd post-compile, optionally wraps it as serializable with the cache entry, wraps it in the
+    # debug-assert wrapper if enabled, and applies the post-compile wrappers. Returns the callable.
     backward_state_indices = [
         idx for idx, x in enumerate(flat_args) if isinstance(x, BackwardState)
     ]
@@ -2644,6 +2835,12 @@ def _cache_autograd_info(
     GenericAOTAutogradResult[Any, Any] | None,
     Callable[..., Any],
 ]:
+    # [FUNCTION DOC] HELPER: Prepares caching of an autograd compile. Makes metadata runtime-safe (mutating
+    # it) and requires at most one BackwardState argument. If cache info exists, defines a saver that, when
+    # allowed for the compiled functions, builds a cache entry (graph strings, metadata, timings, guards,
+    # serialized backward module) and saves it, returning the entry. If the backward is already compiled the
+    # saver runs now and the returned saver is None. Returns (saver or None, entry or None); the saver is
+    # None with no cache info, and the entry is None until the saver runs successfully.
     backward_state_indices = [
         idx for idx, x in enumerate(flat_args) if isinstance(x, BackwardState)
     ]
@@ -2669,6 +2866,10 @@ def _cache_autograd_info(
             _fw_metadata: ViewAndMutationMeta,
             aot_config: AOTConfig,
         ) -> GenericAOTAutogradResult[Any, Any] | None:
+            # [FUNCTION DOC] HELPER: Saves an AOTAutograd cache entry for the compiled forward and given
+            # backward if cache info is present and both compiled functions can be cached (else returns
+            # None). Backward time comes from the compiled backward's recorded compile time (default 0).
+            # Side effect: writes to the local or remote cache and rebinds the enclosing entry variable.
             cache_info = aot_config.cache_info
 
             if cache_info is not None and _should_save_cache(
@@ -2747,6 +2948,14 @@ def _aot_stage2b_compile_forward_or_inference(
     num_fw_outs_saved_for_bw: int | None = None,
     # pyrefly: ignore [implicit-any]
 ) -> tuple[list[tuple[int, ...] | None] | None, Callable]:
+    # [FUNCTION DOC] Compiles a forward (autograd) or inference graph under the matching grad/autocast
+    # contexts. Runs pre-compile of the fakified-output and functionalized-rng wrappers; in forward mode
+    # with graphsafe rng states, appends cloned default-generator states to adjusted_flat_args (mutating
+    # the list); sets the tracing context's fw_metadata; optionally decomposes complex ops; invokes the
+    # compiler while capturing output strides; boxes the result; then applies post-compile wrappers
+    # (effect tokens, subclass, rng, fakified out). Returns (output strides, compiled callable). Raises
+    # ValueError if not inference and num_fw_outs_saved_for_bw is None, AssertionError if rng state index
+    # or device is missing.
     """
     Compile the forward or inference graph. Returns:
     - the output strides of the forward graph
