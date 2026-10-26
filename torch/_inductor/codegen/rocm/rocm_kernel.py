@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Kernel and autotune-choice classes for ROCm C++ template kernels: ROCmKernel,
+# ROCmTemplateKernel (signature definition and call-site generation), and ROCmTemplateCaller
+# (ChoiceCaller wrapper around a benchmark request). Creates a module-level C++ expression printer.
 import logging
 from collections.abc import Callable, Sequence
 from typing import Any, TYPE_CHECKING
@@ -25,10 +28,12 @@ cexpr = CppPrinter().doprint
 
 
 def _normalize_idx(index: int, total_length: int) -> int:
+    # [FUNCTION DOC] HELPER: Converts a possibly negative index into a non-negative one by adding total_length.
     return index if index >= 0 else index + total_length
 
 
 class ROCmKernel(Kernel):
+    # [CLASS DOC] Base class for ROCm kernels; uses the standard OpOverrides for op handling.
     """
     Baseclass for ROCm based Kernels
     """
@@ -37,6 +42,9 @@ class ROCmKernel(Kernel):
 
 
 class ROCmTemplateKernel(ROCmKernel):
+    # [CLASS DOC] Kernel object for templates written in ROCm C++. Holds the kernel name, a mapping from template
+    # argument names to IR nodes, the runtime arg descriptions and values, and the generated C function
+    # signature. Key methods: def_kernel (builds signature) and call_kernel (emits the call).
     """
     Template kernels defined by ROCm in C++.
     """
@@ -49,6 +57,8 @@ class ROCmTemplateKernel(ROCmKernel):
         runtime_arg_info: list["ArgInfo"],
         runtime_arg_values: list[Any],
     ) -> None:
+        # [FUNCTION DOC] Initializes the kernel with its name and the runtime arg info and values, with an empty
+        # named-node mapping.
         """
         Initializes a new instance of the ROCmTemplateKernel class.
 
@@ -63,6 +73,7 @@ class ROCmTemplateKernel(ROCmKernel):
         self.runtime_arg_values = runtime_arg_values
 
     def get_signature(self):
+        # [FUNCTION DOC] Returns the previously generated C function signature (fails if def_kernel has not run).
         return self.signature
 
     def def_kernel(
@@ -73,6 +84,13 @@ class ROCmTemplateKernel(ROCmKernel):
         names_str: str = "",
         input_reorder: list[int] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Template hook that registers inputs and outputs and returns the C function signature. Splits
+        # names_str into names and raises RuntimeError if the count differs from inputs plus outputs. Applies
+        # input_reorder (default identity) to map names to input nodes, skipping None nodes; outputs are mapped
+        # by position after the inputs. Records buffers in the kernel args, builds the signature from the C arg
+        # definitions, size args, runtime args and the extra stream/workspace parameters, stores and returns it.
+        # KNOWN ISSUE: a reorder of [2, 0, 1] is silently rewritten to [4, 0, 1, 2, 3], a special case for
+        # five-name templates with bias; other reorders are used as given. Mismatched lengths raise AssertionError.
         """
         Hook called from template code to generate function definition and
         needed args.
@@ -129,6 +147,12 @@ class ROCmTemplateKernel(ROCmKernel):
         name: str,
         node: "ROCmTemplateBuffer",  # type: ignore[name-defined]
     ) -> None:
+        # [FUNCTION DOC] Emits the kernel invocation through the graph's wrapper code. With cpp_wrapper it registers the
+        # kernel as initialized, substitutes the real name into the signature and uses C++ arg types; otherwise
+        # uses Python arg definitions and wraps tensors as void pointers (unspec scalars use item). Appends size
+        # args, runtime arg values, a null workspace-size pointer and a workspace pointer (allocating and
+        # freeing a workspace buffer when the node needs one, else null). Raises AssertionError if cpp_wrapper
+        # is used without a CppWrapperCpu. Side effects: writes to wrapper code.
         """
         Generates code to call the kernel through V.graph.wrapper_code.
         used from within torch._inductor.wrapper.PythonWrapperCodegen
@@ -217,6 +241,9 @@ class ROCmTemplateKernel(ROCmKernel):
 
 
 class ROCmTemplateCaller(ChoiceCaller):
+    # [CLASS DOC] ChoiceCaller for an autotuning candidate ROCm template kernel. Attributes: category, the kernel
+    # render factory, the benchmark request (bmreq), the template and info kwargs. Provides precompile,
+    # benchmark, and conversion to an output node.
     """
     ROCmTemplateCaller
 
@@ -229,6 +256,8 @@ class ROCmTemplateCaller(ChoiceCaller):
     """
 
     def __init__(
+        # [FUNCTION DOC] Initializes the base ChoiceCaller with name, input nodes and layout and stores the category,
+        # render factory, benchmark request, template and info kwargs.
         self,
         name: str,
         category: str,
@@ -249,11 +278,15 @@ class ROCmTemplateCaller(ChoiceCaller):
         self.info_kwargs = info_kwargs
 
     def precompile(self) -> None:
+        # [FUNCTION DOC] Precompiles the benchmark request; raises AssertionError if bmreq is missing.
         if self.bmreq is None:
             raise AssertionError("expected self.bmreq to be set")
         self.bmreq.precompile()
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Benchmarks the kernel on the given args with output out and returns the time as a float. Uses
+        # the profiling-based timer when the config flag is set, else the benchmark request's own timing.
+        # Raises AssertionError if bmreq is missing.
         if self.bmreq is None:
             raise AssertionError("expected self.bmreq to be set")
         if config.profile_bandwidth_with_do_bench_using_profiling:
@@ -262,12 +295,15 @@ class ROCmTemplateCaller(ChoiceCaller):
         return self.bmreq.benchmark(*args, out=out)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a debug string with the source file and info dict.
         return f"ROCmTemplateCaller(source_file={self.bmreq.source_file}, {self.info_dict()})"
 
     def call_name(self) -> str:
+        # [FUNCTION DOC] Returns the dotted call name rocm_template_kernels followed by this choice's name.
         return f"rocm_template_kernels.{self.name}"
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Returns a cache key made of the category and the benchmark request hash key.
         return "-".join(
             [
                 self.category,
@@ -276,6 +312,8 @@ class ROCmTemplateCaller(ChoiceCaller):
         )
 
     def info_dict(self) -> dict[str, PrimitiveInfoType | list[PrimitiveInfoType]]:
+        # [FUNCTION DOC] Returns a mapping for the autotune log with backend ROCm, the name, and the entries of the
+        # op's dict items from info_kwargs.
         """Information returned here is logged to the autotune log file when that is enabled."""
         return {
             "backend": "ROCm",
@@ -284,6 +322,9 @@ class ROCmTemplateCaller(ChoiceCaller):
         }
 
     def output_node(self) -> TensorBox:
+        # [FUNCTION DOC] Ensures the workspace size is known, builds a ROCmTemplateBuffer with this layout, inputs,
+        # render factory, workspace size and template, copies any ktc annotation, and returns it wrapped as a
+        # TensorBox.
         self.bmreq.update_workspace_size()
         buffer = ROCmTemplateBuffer(
             layout=self.layout,

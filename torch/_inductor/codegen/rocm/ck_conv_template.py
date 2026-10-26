@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] ROCm Composable Kernel template for grouped 2D convolution forward in Inductor autotuning.
+# Contains tensor-layout mapping helpers and CKGroupedConvFwdTemplate. Import-time: tries to import
+# ck4inductor; if missing, defines a fallback gen_conv_ops_library returning no instances.
 import copy
 import logging
 import random
@@ -25,6 +28,7 @@ if ck4inductor is not None:
 else:
 
     def gen_conv_ops_library():
+    # [FUNCTION DOC] HELPER: Fallback used when ck4inductor is unavailable; returns an empty list of conv ops.
         return []
 
 
@@ -38,6 +42,9 @@ log = logging.getLogger(__name__)
 
 
 def torch_layout_to_ck_layouts(torch_layout):
+    # [FUNCTION DOC] HELPER: Maps a torch layout to the CK triple of input, weight and output layout names. Strides
+    # decide: unit last stride gives the NCHW-style names, unit stride on the third-from-last dim gives
+    # channels-last names; otherwise returns None. Needs an active V.graph for static stride checks.
     # logically, torch tensors are always NCHW,
     # and channels-last memory layout is visible in the strides
     if V.graph.sizevars.statically_known_equals(torch_layout.stride[-1], 1):
@@ -52,6 +59,8 @@ def torch_layout_to_ck_layouts(torch_layout):
 
 
 def torch_layout_to_ck_input_layout(torch_layout):
+    # [FUNCTION DOC] HELPER: Returns the CK input layout name (NGCHW if last stride is 1, NHWGC if the
+    # channel stride is 1), else None.
     if V.graph.sizevars.statically_known_equals(torch_layout.stride[-1], 1):
         return "NGCHW"
     elif V.graph.sizevars.statically_known_equals(torch_layout.stride[-3], 1):
@@ -61,6 +70,8 @@ def torch_layout_to_ck_input_layout(torch_layout):
 
 
 def torch_layout_to_ck_weight_layout(torch_layout):
+    # [FUNCTION DOC] HELPER: Returns the CK weight layout name (GKCYX if last stride is 1, GKYXC if channels-last),
+    # else None.
     if V.graph.sizevars.statically_known_equals(torch_layout.stride[-1], 1):
         return "GKCYX"
     elif V.graph.sizevars.statically_known_equals(torch_layout.stride[-3], 1):
@@ -70,6 +81,8 @@ def torch_layout_to_ck_weight_layout(torch_layout):
 
 
 def torch_layout_to_ck_output_layout(torch_layout):
+    # [FUNCTION DOC] HELPER: Returns the CK output layout name (NGKHW if last stride is 1, NHWGK if channels-last),
+    # else None.
     if V.graph.sizevars.statically_known_equals(torch_layout.stride[-1], 1):
         return "NGKHW"
     elif V.graph.sizevars.statically_known_equals(torch_layout.stride[-3], 1):
@@ -79,6 +92,12 @@ def torch_layout_to_ck_output_layout(torch_layout):
 
 
 class CKGroupedConvFwdTemplate(CKTemplate):
+    # [CLASS DOC] Template that renders C++ for a CK grouped convolution forward (XDL CShuffle V3) kernel with an
+    # extern C entry point taking pointers, sizes, workspace size pointer, workspace and stream. Attributes:
+    # stride, padding, dilation, groups, n_spatial_dimensions. Candidate instances come from ck4inductor,
+    # filtered by dtype, layout, spatial dims, default specialization and TF32 settings.
+    # KNOWN ISSUE: the rendered kernel hardcodes two spatial dims in its argument vectors, the declared
+    # p_ds array is left uninitialized, and the generated standalone main does nothing.
     conv_template = r"""
     {{headers}}
     {{globals}}
@@ -226,6 +245,10 @@ class CKGroupedConvFwdTemplate(CKTemplate):
 """
 
     def globals(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends CKTemplate globals with C++ aliases for convolution tensor layouts, gemm pipeline
+        # and specialization enums, the output element op, and local definitions of ConvParam constructor
+        # (computing output spatial lengths) and HostTensorDescriptor accessors because generated code does not
+        # link CK's utility library. Returns the IndentedBuffer.
         res = super().globals()
         res.splice(
             """
@@ -366,6 +389,8 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         return res
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends CKTemplate header with includes for the CK grouped conv forward device op,
+        # convolution and gemm specializations and convolution host utilities. Returns the buffer.
         res = super().header()
         res.splice(
             """
@@ -393,6 +418,9 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         groups,
         n_spatial_dimensions,
     ):
+        # [FUNCTION DOC] Static helper that builds a template for the given inputs and conv parameters (stride,
+        # padding, dilation, groups, n_spatial_dimensions), generates the filtered op list, and appends a
+        # choice for each op to choices via maybe_append_choice. Mutates choices.
         template = CKGroupedConvFwdTemplate(
             input_nodes,
             layout,
@@ -420,6 +448,8 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         groups,
         n_spatial_dimensions,
     ):
+        # [FUNCTION DOC] Initializes the base template with the name ck_conv_template, input nodes and layout, and stores
+        # the convolution parameters.
         super().__init__(
             "ck_conv_template",
             input_nodes,
@@ -432,6 +462,9 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         self.n_spatial_dimensions = n_spatial_dimensions
 
     def filter_op(self, op: "CKGroupedConvFwdOp"):  # type: ignore[name-defined]
+        # [FUNCTION DOC] Returns op if it is usable for this conv, else None. Rejects ops whose element dtypes (input,
+        # weight, output) or layouts do not match the node layouts, whose spatial dimension count differs,
+        # whose forward specialization is not a default one, or that are blocked by the TF32 setting.
         metas = [
             T.get_layout()
             for T in [*self.input_nodes, self.output_node]
@@ -465,6 +498,9 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         return op
 
     def gen_ops(self):
+        # [FUNCTION DOC] Generates the library of conv ops, filters them with filter_op, and if
+        # config.rocm.ck_max_profiling_configs is set randomly samples that many (seeded with a fixed seed
+        # for determinism, which also reseeds the global random state). Logs and returns the list.
         unfiltered_instances = gen_conv_ops_library()
 
         filtered_instances = list(
@@ -489,6 +525,9 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         return chosen_instances
 
     def emit_ck_instance(self, op: "CKGroupedConvFwdOp") -> tuple[str, str]:  # type: ignore[name-defined]
+        # [FUNCTION DOC] Renders two C++ snippets for an op: a type alias definition of the CK grouped conv device
+        # operation using all non-None op fields as template params (tuples become Tuple or S sequences
+        # depending on field name), and the alias usage text. Returns (definition, type).
         # The Jinja template for generating a C++ type alias *definition* for a Universal GEMM instance
         template_definition = r"""
     // Gemm operator {{operation_name}}
@@ -526,6 +565,10 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         op: "CKGroupedConvFwdOp",  # type: ignore[name-defined]
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC] Renders the full kernel C++ source. If kwargs has template_buffer_node it replaces the output
+        # node. Takes input, weight and optional bias from input_nodes, deep-copies the op, emits the instance,
+        # defines the kernel signature with the 16 int32 size args and renders conv_template with layouts from
+        # the op and the number of D tensors (1 if bias). Returns the source string.
         template_buffer_node = kwargs.get("template_buffer_node")
         if template_buffer_node is not None:
             self.output_node = template_buffer_node
@@ -577,6 +620,9 @@ class CKGroupedConvFwdTemplate(CKTemplate):
         )
 
     def size_args(self):
+        # [FUNCTION DOC] Returns the 16 integer size args as a tuple: groups, batch, out channels, in channels, filter
+        # H and W, input H and W, strides, dilations, left pads and right pads (from node shapes and params).
+        # KNOWN ISSUE: right pads reuse the symmetric padding values, and only 2D is supported.
         x, w = self.input_nodes[0], self.input_nodes[1]
         y = self.output_node
 
@@ -613,10 +659,12 @@ class CKGroupedConvFwdTemplate(CKTemplate):
 
     @override
     def get_runtime_arg_info(self) -> list[ArgInfo]:
+        # [FUNCTION DOC] Returns an empty list: the conv template has no runtime args.
         return []
 
     @override
     def get_runtime_arg_values(self, **kwargs: Any) -> list[Any]:
+        # [FUNCTION DOC] Returns an empty list: no runtime arg values.
         """
         Helper method to retrieve runtime args from generate kwargs
         """

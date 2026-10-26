@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs, disable-error-code="attr-defined, valid-type"
+# [MODULE DOC] ROCm Composable Kernel (CK) Universal GEMM template for Inductor autotuning (mm, addmm,
+# bmm, scaled_mm with optional bias and scales). Defines InductorROCmOp (op plus kBatch split-K value),
+# a padding lookup table, layout helpers and CKGemmTemplate. Import-time: calls try_import_ck_lib to
+# obtain CK op generators (may be None when CK is not installed) and creates a logger.
 import copy
 import logging
 import math
@@ -50,10 +54,13 @@ padding_lookup = {
 
 
 def is_static_int(number):
+    # [FUNCTION DOC] HELPER: Returns True if number is a Python int or a sympy Integer (statically known size).
     return isinstance(number, (int, sympy.Integer))
 
 
 def torch_layout_to_ck_layout(torch_layout):
+    # [FUNCTION DOC] HELPER: Maps a torch layout to the CK layout name: Row if the last stride is 1, Col if the
+    # second-to-last stride is 1, else None.
     if torch_layout.stride[-1] == 1:
         return "Row"
     elif torch_layout.stride[-2] == 1:
@@ -63,6 +70,11 @@ def torch_layout_to_ck_layout(torch_layout):
 
 
 class CKGemmTemplate(CKTemplate):
+    # [CLASS DOC] Template that renders C++ for CK Universal GEMM (multi-D XDL CShuffle V3, batched or not) with
+    # extern C entry point, optional bias (Bilinear/Add epilogues), tensorwise or rowwise scaling, and an
+    # optional standalone test runner. Attributes: alpha, beta (epilogue scalars), is_batched (output has
+    # three dims). Key methods: gen_ops (candidate generation and filtering), filter_op, render, size_args.
+    # KNOWN ISSUE: batched bias strides are a FIXME (empty batch strides), so baddbmm is unsupported.
     # the JINJA template for rendering CK Universal GEMMs
     gemm_template = r"""{{version_comment}}
     {{headers}}
@@ -318,6 +330,9 @@ class CKGemmTemplate(CKTemplate):
         beta: float,
         input_reorder: list[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Determines batched mode from the output layout rank (three dims), picks the template name
+        # accordingly, initializes the base template with inputs, layout and input_reorder, and stores
+        # alpha, beta and is_batched.
         is_batched = len(layout.size) == 3
         name = "ck_batched_gemm_template" if is_batched else "ck_gemm_template"
         super().__init__(
@@ -331,6 +346,8 @@ class CKGemmTemplate(CKTemplate):
         self.is_batched = is_batched
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends the CK header with the include for the batched or non-batched multiple-D XDL
+        # CShuffle V3 device GEMM. Returns the buffer.
         res = super().header()
         if self.is_batched:
             res.splice(
@@ -351,6 +368,9 @@ class CKGemmTemplate(CKTemplate):
         return res
 
     def globals(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends CK globals with Row/Col layout aliases, pipeline and specialization aliases, and a
+        # MultiplyMultiplyAdd element-wise functor (c * d0 * d1 + d2 in float, converted to the output type).
+        # Returns the buffer.
         res = super().globals()
         res.splice(
             """
@@ -380,6 +400,8 @@ class CKGemmTemplate(CKTemplate):
         return res
 
     def inline_utils(self):
+        # [FUNCTION DOC] Returns a buffer that includes the host tensor and device memory source files, used by the
+        # standalone runner.
         res = IndentedBuffer()
         res.splice(
             """
@@ -390,6 +412,8 @@ class CKGemmTemplate(CKTemplate):
         return res
 
     def _has_padding(self, dimension, gemm_specialization):
+        # [FUNCTION DOC] HELPER: Returns True if the given GEMM specialization name pads the given dimension (M, N or K),
+        # using the padding lookup table; unknown dimensions or specializations give False.
         # Get the relevant padding map for the given dimension
         dimension_padding = padding_lookup.get(dimension, {})
 
@@ -397,6 +421,10 @@ class CKGemmTemplate(CKTemplate):
         return dimension_padding.get(gemm_specialization, False)
 
     def filter_op(self, op_info: InductorROCmOp):
+        # [FUNCTION DOC] Returns the op if it is suitable for this problem, else None. Rejects ops whose dtypes or
+        # layouts mismatch the input/output layouts, blocked by TF32 setting, or whose tile/vector sizes cannot
+        # handle the statically known M, N, K (taking padding specializations and split-K kBatch into account),
+        # contiguous-dimension vector widths, or split-K k-loop pipeline constraints. Dynamic sizes are not checked.
         """
         Determines whether a given op definition is suitable for the current
         input / output of the operation that this template implements.
@@ -496,6 +524,10 @@ class CKGemmTemplate(CKTemplate):
         return op
 
     def _check_num_k_loops(self, op, kBatch):
+        # [FUNCTION DOC] HELPER: Extra split-K validity check. For kBatch above 1 with a pipeline other than v1, computes the
+        # pipeline prefetch stages (on any failure logs and returns False) and rejects the op if the number of
+        # K loops is not greater than the prefetch stages. Returns True otherwise.
+        # KNOWN ISSUE: the failure log passes the op name method without calling it.
         # Additional splitK scenario check
         metas = [T.get_layout() for T in [*self.input_nodes]]
         X_meta = metas[0]
@@ -536,6 +568,9 @@ class CKGemmTemplate(CKTemplate):
 
     # small helper to figure out the prefetch stages on AMD
     def _prefetch_stages(self, op, a_dtype_size, b_dtype_size, warp_size: int = 64):
+        # [FUNCTION DOC] HELPER: Returns the number of pipeline prefetch stages for the op's pipeline version (v1:1, v3:2, v5:3,
+        # v4:4, v2 computed from block size, tile sizes and dtype sizes, clamped to 2..8). Raises ValueError for
+        # an unparsable or unknown version string.
         version_str = op.block_gemm_pipeline_version.split("::")[-1]
         try:
             version = int(version_str[1:])  # Assuming the format is always 'vX'
@@ -566,6 +601,10 @@ class CKGemmTemplate(CKTemplate):
         return stages
 
     def emit_ck_instance(self, op: "CKGemmOperation"):
+        # [FUNCTION DOC] Renders two C++ snippets for an op: the alias definition of the (batched or non-batched) CK
+        # device GEMM with all non-None op fields as template parameters (tuples become Tuple for ds fields, else
+        # S sequences), and the alias usage name. Characters invalid in identifiers are stripped from the op name.
+        # Returns (definition, type).
         # The Jinja template for generating a C++ type alias *definition* for a Universal GEMM instance
         struct_name = (
             "DeviceBatchedGemmMultiD_Xdl_CShuffle_V3"
@@ -612,6 +651,12 @@ class CKGemmTemplate(CKTemplate):
         op: "CKGemmOperation",
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC] Primary entry: renders the full kernel C++ source for the given op. Requires no epilogue nodes
+        # (raises AssertionError). Infers X, W, Y, bias and scales from the input count. Works on a deep copy of the
+        # op: chooses the element-wise epilogue (Bilinear, Scale, ScaleAdd, MultiplyMultiply, MultiplyMultiplyAdd
+        # or PassThrough), sets ds layouts and dtypes, shuffle dtype and vector widths, then renders the template with
+        # kernel definition, size args and ds info. Raises AssertionError for unsupported bias layout or unset
+        # epilogue. If config.rocm.generate_test_runner is set, appends a standalone runner. Returns the source.
         """
         The primary entry point for the code rendering process used in this template.
         """
@@ -863,6 +908,7 @@ class CKGemmTemplate(CKTemplate):
         return res
 
     def _is_rcr_f16(self):
+        # [FUNCTION DOC] HELPER: Returns True if X, W and Y are all F16 with row, column and row layouts respectively.
         X_meta, W_meta, Y_meta = (
             T.get_layout() for T in [*self.input_nodes, self.output_node]
         )
@@ -884,6 +930,10 @@ class CKGemmTemplate(CKTemplate):
 
     # helper to calculate a potentially optimal kBatch(es) for a problem
     def _get_kBatch(self, op):
+        # [FUNCTION DOC] HELPER: Returns a list of candidate split-K kBatch values for an op. Returns one when dimensions are
+        # dynamic or K is not large relative to the larger of M and N (config split_k_threshold); returns the
+        # configured sweep list if set; otherwise a single heuristic value based on K blocks per compute unit
+        # (power of two, clamped to 1..128). Queries the CUDA device properties.
         # we only set a higher kBatch if K > 16 * the larger of M and N
         # this is a hand-tuned heuristic to start
         metas = [T.get_layout() for T in [*self.input_nodes]]
@@ -909,6 +959,11 @@ class CKGemmTemplate(CKTemplate):
         return [kBatch]
 
     def gen_ops(self) -> list[InductorROCmOp]:
+        # [FUNCTION DOC] Builds the list of InductorROCmOp candidates. Returns an empty list if ck4inductor cannot be
+        # imported. Chooses the batched, standard or preselected (for F16 row/col/row problems) generator, pairs
+        # each op with its kBatch values, filters with filter_op, and if config.rocm.ck_max_profiling_configs is set
+        # randomly samples that many (fixed seed, which reseeds global random state). Raises AssertionError if no
+        # generator is available.
         """
         Creates a list of `CKGemmOperation` instances that match the GEMM operation this template represents.
         The instances are guaranteed to have the correct layout, dtype and dimension padding for the GEMM input arguments.
@@ -975,6 +1030,8 @@ class CKGemmTemplate(CKTemplate):
         beta=0,
         input_reorder=None,
     ):
+        # [FUNCTION DOC] Static helper that creates a CKGemmTemplate for the inputs, generates its ops and appends a
+        # choice for each op (with its kBatch) to choices via maybe_append_choice. Mutates choices.
         """
         Add Composable Kernel Universal GEMM instance choices to the auto-tuning list.
         """
@@ -994,6 +1051,10 @@ class CKGemmTemplate(CKTemplate):
             )
 
     def size_args(self):
+        # [FUNCTION DOC] Returns the integer size arguments of the problem as a tuple: M, N, K and leading dimensions of
+        # X, W, Y and bias (LDA, LDB, LDC, LDD), prefixed by the batch size when batched. LDD is zero when there
+        # is no bias or it is one-dimensional. Leading dimension uses the second-to-last stride unless the last
+        # stride is not 1.
         X = self.input_nodes[0]
         W = self.input_nodes[1]
         Bias = (

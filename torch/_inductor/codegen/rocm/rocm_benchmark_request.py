@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Benchmark request type for ROCm (CK) template kernels used during autotuning.
+# Defines ROCmBenchmarkRequest, which compiles/loads a shared library and builds a callable that runs it.
 from __future__ import annotations
 
 import functools
@@ -24,6 +26,10 @@ log = logging.getLogger(__name__)
 
 
 class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
+    # [CLASS DOC] Serializable BenchmarkRequest for a ROCm kernel built from generated C++ source. Holds the
+    # source code, cache hash key and source file, a lazily loaded DLL wrapper, and the workspace size and
+    # tensor. The workspace size is queried once by calling the kernel in size-query mode. Must not hold
+    # device tensors in its constructor state because it crosses process boundaries.
     # Important: Instances of this class have to be serializable
     # across process boundaries. Do not put CUDA Tensors in here!
 
@@ -35,6 +41,9 @@ class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         extra_args: Iterable[Any],
         source_code: str,
     ) -> None:
+        # [FUNCTION DOC] Stores the source and initial state (no DLL, zero workspace) and writes the source to the ROCm
+        # code cache as a shared library, recording the resulting hash key and source file path.
+        # Side effect: writes a file to the cache. Args mirror BenchmarkRequest plus source_code.
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, extra_args)
         self.source_code = source_code
         self.workspace_size: int = 0
@@ -46,6 +55,8 @@ class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         self.hash_key, self.source_file = ROCmCodeCache.write(self.source_code, "so")
 
     def precompile(self):
+        # [FUNCTION DOC] Compiles the source into the code cache ahead of time (shared library, plus a standalone
+        # executable if config.rocm.generate_test_runner is set). Side effect: compilation and logging.
         # Prepopulate code cache
         # may happen in separate Threadpool
         log.debug("Precompiling %s", self)
@@ -57,6 +68,11 @@ class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
     def make_run_fn(
         self, *input_tensors: torch.Tensor, out: torch.Tensor
     ) -> Callable[[], None]:
+        # [FUNCTION DOC] Loads the library, ensures the workspace size is known, and returns a zero-argument callable that
+        # runs the kernel with the given input tensors and output tensor. Allocates and zero-fills a workspace
+        # tensor on the output device when needed. Pointer args come from tensor data pointers, size args from
+        # extra_args as ints, followed by a null workspace size pointer, workspace pointer and the current
+        # stream. Side effects: loads DLL, stores self.workspace.
         self.ensure_dll_loaded()
         self.update_workspace_size()
         args = [c_void_p(tensor.data_ptr()) for tensor in list(input_tensors) + [out]]
@@ -92,6 +108,9 @@ class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         )
 
     def update_workspace_size(self) -> None:
+        # [FUNCTION DOC] Queries the kernel's required workspace size once (cached by a flag): calls the kernel with null
+        # data pointers and a size output pointer, synchronizes CUDA to surface errors, and stores the size
+        # in self.workspace_size. Number of pointers is distinct input names plus one output.
         if self._workspace_size_updated:
             return
         self.ensure_dll_loaded()
@@ -129,15 +148,19 @@ class ROCmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         self._workspace_size_updated = True
 
     def ensure_dll_loaded(self):
+        # [FUNCTION DOC] Lazily loads the compiled shared library from the code cache, setting DLL, hash_key and
+        # source_file if not yet loaded.
         if self.DLL is None:
             self.DLL, self.hash_key, self.source_file = ROCmCodeCache.load(
                 self.source_code, "so"
             )
 
     def cleanup_run_fn(self) -> None:
+        # [FUNCTION DOC] Closes the loaded DLL if any and releases the workspace tensor.
         if self.DLL is not None:
             self.DLL.close()
         self.workspace = None
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a short debug string with kernel name, source file and hash key.
         return f"{self.kernel_name=}, {self.source_file=}, {self.hash_key=}"

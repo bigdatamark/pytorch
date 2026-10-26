@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Builds the ROCm (hipcc/clang) shell command line used to compile generated CK kernels:
+# include paths, library options, compiler flags, compiler location, and the final command string.
+# Driven by torch._inductor.config.rocm settings. No import-time side effects beyond creating a logger.
 import logging
 import os
 
@@ -10,6 +13,11 @@ log = logging.getLogger(__name__)
 
 
 def _rocm_include_paths(dst_file_ext: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns absolute include directories for compilation: Composable Kernel include and
+    # library/include dirs, then the ROCm include dir (CK first so it takes priority). The CK root comes
+    # from fbcode resources, config.rocm.ck_dir, a discovered CK library (which is then cached back into
+    # config.rocm.ck_dir, with a warning if none found), or the ROCm home fallback. For dst_file_ext of exe the
+    # CK library utility source dir is appended. Side effect: may mutate config.rocm.ck_dir; logs.
     from torch.utils import cpp_extension
 
     rocm_include = (
@@ -49,6 +57,9 @@ def _rocm_include_paths(dst_file_ext: str) -> list[str]:
 
 
 def _rocm_lib_options(dst_file_ext: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns linker/runtime options: force-include of the clang HIP runtime wrapper header,
+    # library search paths for ROCm lib and hip lib, and the amdhip64 library; for exe outputs also
+    # links pthread and stdc++. Uses config.rocm.rocm_home or the cpp_extension ROCm home.
     from torch.utils import cpp_extension
 
     rocm_lib_dir = (
@@ -74,6 +85,10 @@ def _rocm_lib_options(dst_file_ext: str) -> list[str]:
 
 
 def _rocm_compiler_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns clang flags for HIP compilation: optimization level from config, HIP language,
+    # C++20, one offload-arch flag per configured arch (default native), no gpu rdc, PIC, hidden
+    # visibility and amdgpu LLVM tuning flags. Conditionally adds debug logging and -g, save-temps,
+    # kernel resource usage reports, flush-denormals and fast-math based on config.rocm flags.
     arch_list = config.rocm.arch or ["native"]
     gpu_arch_flags = [f"--offload-arch={arch}" for arch in arch_list]
     opts = [
@@ -106,6 +121,9 @@ def _rocm_compiler_options() -> list[str]:
 
 
 def rocm_compiler() -> str | None:
+    # [FUNCTION DOC] Returns the path of the ROCm clang compiler on Linux (under config.rocm.rocm_home or the
+    # ROCm home found by cpp_extension), falling back to the bare name clang if no ROCm home can be
+    # determined (OSError). Returns None on non-Linux platforms.
     if is_linux():
         if config.rocm.rocm_home:
             return os.path.realpath(
@@ -129,6 +147,10 @@ def rocm_compile_command(
     dst_file_ext: str,
     extra_args: list[str] | None = None,
 ) -> str:
+    # [FUNCTION DOC] Assembles the full compile command string. Args: src_files, dst_file, dst_file_ext (one of o, so,
+    # exe), optional extra_args. Combines compiler options, extra args, include flags and lib options,
+    # then appends -c, -shared, or the standalone-runner define depending on extension. Returns the
+    # command text. Raises NotImplementedError for other extensions.
     include_paths = _rocm_include_paths(dst_file_ext)
     lib_options = _rocm_lib_options(dst_file_ext)
     compiler_options = _rocm_compiler_options()

@@ -1,3 +1,5 @@
+# [MODULE DOC] Base template class for CK-Tile (ck_tile) code generation in the ROCm backend.
+# Defines CKTileTemplate with shared header/global emission and dtype mapping. No import-time side effects.
 import torch
 from torch._inductor.codegen.rocm.rocm_template import ROCmTemplate
 from torch._inductor.ir import IRNode
@@ -5,6 +7,8 @@ from torch._inductor.utils import IndentedBuffer
 
 
 class CKTileTemplate(ROCmTemplate):
+    # [CLASS DOC] ROCmTemplate subclass with common non-gemm-specific CK-Tile logic: a torch dtype to CK
+    # alias-name table, a size table for FP16/BF16, and C++ header/globals emission.
     """
     Base class for generating CK templates, has common, i.e. non-gemm-specific, code generation logic
     """
@@ -28,6 +32,7 @@ class CKTileTemplate(ROCmTemplate):
     }
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends the base ROCm header with the ck_tile core include. Returns the IndentedBuffer.
         res = super().header()
         res.splice(
             """
@@ -39,6 +44,8 @@ class CKTileTemplate(ROCmTemplate):
         return res
 
     def globals(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Extends the base globals with C++ aliases for ck_tile fp8, bf8, half, float and bfloat16
+        # types. Returns the IndentedBuffer.
         res = super().globals()
         res.splice(
             """
@@ -52,6 +59,10 @@ class CKTileTemplate(ROCmTemplate):
         return res
 
     def torch_type_to_ck(self, node: IRNode, ptr: str) -> str:
+        # [FUNCTION DOC] Returns a C++ cast expression casting pointer text ptr to the CK type pointer matching
+        # the dtype of node; returns ptr unchanged when node is None.
+        # KNOWN ISSUE: unmapped dtypes produce the text None in the cast; class docstring wrongly says it
+        # is the generic CK base (duplicate of CKTemplate).
         if node is None:
             return ptr
         else:

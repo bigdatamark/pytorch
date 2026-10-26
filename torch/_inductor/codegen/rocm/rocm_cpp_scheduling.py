@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Scheduler support for ROCm C++ template kernels. Defines ROCmCPPScheduling, which decides
+# fusion (none) and emits kernel definitions and calls into the wrapper code.
 import logging
 from collections.abc import Sequence
 from typing import cast, TypeGuard
@@ -16,6 +18,8 @@ log = logging.getLogger(__name__)
 
 
 class ROCmCPPScheduling(BaseScheduling):
+    # [CLASS DOC] Partial BaseScheduling for ROCm C++ (CK) template kernels, delegated to by the combined CUDA
+    # scheduling. Stateless; handles grouping, fusion decisions, kernel definition and template codegen.
     """
     Partial Scheduling implementation for ROCm C++ Kernels.
     This class is intended to be used in combination with TritonScheduling,
@@ -25,10 +29,12 @@ class ROCmCPPScheduling(BaseScheduling):
     """
 
     def group_fn(self, sizes):
+        # [FUNCTION DOC] Returns for each size list a tuple of the simplified product of its sizes.
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
     @staticmethod
     def is_rocm_cpp_template(node: BaseSchedulerNode) -> TypeGuard[SchedulerNode]:
+        # [FUNCTION DOC] Returns True if node is a SchedulerNode wrapping a ROCmTemplateBuffer.
         return isinstance(node, SchedulerNode) and isinstance(
             node.node, ROCmTemplateBuffer
         )
@@ -36,9 +42,16 @@ class ROCmCPPScheduling(BaseScheduling):
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Always returns False: ROCm C++ templates are never fused vertically here.
         return False
 
     def define_kernel(self, src_code: str, node_schedule) -> str:
+        # [FUNCTION DOC] Registers the kernel source with the wrapper and returns the kernel name. If the source was
+        # seen it reuses the name. Otherwise builds a name from a rocm prefix, optional descriptive fused name
+        # and a unique suffix, replaces the KERNEL_NAME placeholder in the source, and defines the kernel in the
+        # wrapper as an async_compile rocm call with metadata comments (path, origins). For JIT cpp wrapper
+        # (not AOT) it compiles the shared library now and records it as an external kernel lib.
+        # Side effects: mutates wrapper.src_to_kernel, kernel definitions and external libs.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -90,6 +103,10 @@ class ROCmCPPScheduling(BaseScheduling):
         prologue_nodes: Sequence[BaseSchedulerNode],
     ):
         """
+        # [FUNCTION DOC] Generates code for a ROCm template node (epilogue and prologue nodes are accepted but unused).
+        # Raises AssertionError if the node is not a scheduler node of a ROCmTemplateBuffer or if its reduction
+        # numel is not one. Renders the kernel source, defines it, emits a comment and the kernel call, then
+        # merges the kernel's removed buffers into the graph and frees buffers in the scheduler.
         Codegen a ROCm template, possibly with fused epilogues
         """
         if not self.is_rocm_cpp_template(template_node):
