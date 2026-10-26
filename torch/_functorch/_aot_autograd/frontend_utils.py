@@ -1,3 +1,9 @@
+# [MODULE DOC] Frontend helpers for AOTAutograd entry points: fakifying real
+# example inputs (process_inputs), unwrapping AsyncCollectiveTensor inputs,
+# choosing/creating the FakeTensorMode and ShapeEnv, extracting Dynamo-provided
+# param sources and static input indices, and a context manager that warns when
+# tensor attributes are assigned on a module during export.
+# Import-time side effect: creates the "cudagraph_static_inputs" artifact logger.
 from __future__ import annotations
 
 import warnings
@@ -39,6 +45,16 @@ def process_inputs(
     shape_env: ShapeEnv | None,
     ignore_shape_env: bool = False,
 ) -> tuple[FakifiedFlatArgs, list[ActInputPath]]:
+    # [FUNCTION DOC] Convert flat real inputs into fake inputs for tracing.
+    # First (when the async-collective tensor type is loaded) replaces each
+    # AsyncCollectiveTensor input, including nested in wrapper subclasses, by
+    # its waited result, mutating flat_args in place and copying Dynamo
+    # tensor_to_context entries to rebuilt tensors. Then, under fake_mode,
+    # converts each arg: ints become SymInts when a shape env is active and not
+    # exporting; script objects/custom classes become fake objects; non-tensors
+    # pass through; existing fake tensors of another mode are re-fakified;
+    # others use from_tensor with Dynamo symbolic context or static shapes.
+    # Returns (FakifiedFlatArgs, list of paths of waited async tensors).
     """Convert real tensor inputs into fake tensors for AOT autograd tracing.
 
     Called at compile time (not runtime) to produce the fake inputs that AOT
@@ -88,6 +104,9 @@ def process_inputs(
     with fake_mode:
 
         def convert(idx: int, x: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Fakify one flat arg at position idx and return it
+            # (see process_inputs for the per-type rules). Raises AssertionError if a
+            # wrapper subclass has an inner attribute that is neither Tensor nor custom class.
             nonlocal ignore_shape_env
             if shape_env is not None and not ignore_shape_env:
                 from torch._dynamo.source import ConstantSource
@@ -182,6 +201,12 @@ def _resolve_input_async_collectives(
     act_input_paths: list[ActInputPath],
     AsyncCollectiveTensor: type[AsyncCollectiveTensor],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Recursively replace AsyncCollectiveTensors in x by
+    # their waited tensors. Appends (arg index, attribute path) to act_input_paths
+    # for each one found. Wrapper subclasses with changed inner tensors are
+    # rebuilt via unflatten with the original size and stride; otherwise x is
+    # returned unchanged. Raises AssertionError on inner attrs that are not
+    # Tensor or custom class.
     """Wait on ACT inputs, recording each top-level or wrapper-subclass path."""
     if isinstance(x, AsyncCollectiveTensor):
         act_input_paths.append((idx, attr_path))
@@ -226,6 +251,9 @@ def _resolve_input_async_collectives(
 def construct_fake_mode(
     flat_args: list[Any], aot_config: AOTConfig
 ) -> tuple[FakeTensorMode, ShapeEnv | None]:
+    # [FUNCTION DOC] Reuse the fake mode detected in flat_args (and its shape env),
+    # or else create a new FakeTensorMode with a fresh ShapeEnv if
+    # aot_config.dynamic_shapes is set (otherwise no shape env). Returns (fake_mode, shape_env).
     fake_mode = detect_fake_mode(flat_args)
     if fake_mode is None:
         shape_env = ShapeEnv() if aot_config.dynamic_shapes else None
@@ -241,6 +269,15 @@ def _try_get_metadata_from_dynamo(
     full_args_num: int,
     full_args_descs: list[DifferentiableAOTInput],
 ) -> tuple[list[torch._guards.Source | None] | None, list[int]]:
+    # [FUNCTION DOC] HELPER: Extract Dynamo metadata from mod. If mod is not a
+    # GraphModule with a dynamo compile id, returns (None, empty list). If it
+    # lacks the param-name-to-source mapping (export), returns None and the
+    # indices of param/buffer descriptors. Otherwise returns a list of sources
+    # (params first, then placeholder sources) and static input indices
+    # (all params plus placeholders marked static). Logs each decision to the
+    # cudagraph static-inputs logger. Raises AssertionError on missing/duplicate/None
+    # param sources, missing placeholder source attribute, or if the source count
+    # differs from full_args_num.
     """
     Metadata is forwarded from Dynamo to AOTDispatch via special fields on GraphModule.
     We first verify that `mod` does come from Dynamo, then we handle cases where
@@ -337,6 +374,12 @@ def _try_get_metadata_from_dynamo(
 
 @contextmanager
 def _detect_attribute_assignment(mod: torch.nn.Module) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager. On entry snapshots all non-standard
+    # attributes of mod and its submodules. On exit (even on error) finds
+    # attributes where a tensor was newly assigned (compared recursively through
+    # dicts, lists and tuples), restores every snapshotted attribute, and emits
+    # a warning naming the tensor attributes that should have been registered as buffers.
+    # Side effects: mutates module __dict__ on exit; warns.
     # Do not allow assignment of tensor attributes during export unless
     # the attribute is registered as a buffer.
 
@@ -369,10 +412,12 @@ def _detect_attribute_assignment(mod: torch.nn.Module) -> Generator[None, None, 
     }
 
     def _get_attributes(mod: torch.nn.Module) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Return a mapping of the module's instance attributes excluding standard nn.Module ones.
         # return any attributes of a module that are not standard attributes
         return {k: v for k, v in mod.__dict__.items() if k not in STD_ATTRS}
 
     def _get_all_module_attributes(mod: torch.nn.Module) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Return a mapping from submodule name (empty for root) to its non-standard attributes.
         # return attributes from all modules and submodules
         result = {}
         for name, submodule in mod.named_modules():
@@ -382,6 +427,7 @@ def _detect_attribute_assignment(mod: torch.nn.Module) -> Generator[None, None, 
     def _restore_all_module_attributes(
         mod: torch.nn.Module, snapshot: dict[str, dict[str, Any]]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Write snapshotted attributes back into each submodule's __dict__ (mutates modules).
         # restore attributes to all modules and submodules
         for name, submodule in mod.named_modules():
             if name in snapshot:
@@ -402,9 +448,16 @@ def _detect_attribute_assignment(mod: torch.nn.Module) -> Generator[None, None, 
         def _collect_assigned_tensor_attributes(
             snapshot: dict[str, dict[str, Any]], new_attrs: dict[str, dict[str, Any]]
         ) -> list[str]:
+            # [FUNCTION DOC] HELPER: Compare snapshot and new attributes of every module
+            # and return dotted paths of attributes where a tensor was newly assigned.
             assigned_tensor_attributes = []
 
             def _compare_values(path: str, old_val: Any, new_val: Any) -> None:
+                # [FUNCTION DOC] HELPER: Recursively compare old and new values, appending
+                # path to the result list when the new value is a different tensor object
+                # (or a different tensor at a changed dict key / list index). Identical
+                # objects and non-tensor changes are ignored.
+                # KNOWN ISSUE: a tensor replaced by a non-tensor object is not reported.
                 """Recursively compare values, handling containers."""
                 # Same object, no change
                 if old_val is new_val:

@@ -1,3 +1,9 @@
+# [MODULE DOC] Graph capture for AOTAutograd: traces the (functionalized,
+# subclass-desugared, token-handled) user function into an FX GraphModule for
+# either the inference-only path (aot_dispatch_base_graph) or the joint
+# forward/backward path (aot_dispatch_autograd_graph), attaching descriptors to
+# graph nodes, running stream assignment passes, checking functionality, and
+# logging graphs. Import-time side effect: creates the "aot_graphs" artifact logger.
 """
 This module dispatches the graphs to either the forward-only or joint compilation
 pathways, taking into account the AOTConfig and the collected ViewAndMutationMetadata.
@@ -59,6 +65,11 @@ def _extract_tangent_source_stack_traces(
     fx_g: torch.fx.GraphModule,
     fw_metadata: ViewAndMutationMeta,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each traced tangent descriptor that is the tangent of a
+    # plain forward output, look up that output node in the graph's output tuple and
+    # record its stack trace. If at least one was found, stores the list (None for
+    # missing entries) on fw_metadata.tangent_source_stack_traces; otherwise leaves
+    # metadata untouched. Does nothing when there are no traced tangent descriptors.
     from .descriptors import PlainAOTOutput, TangentAOTInput
 
     if not fw_metadata.traced_tangents_descs:
@@ -97,6 +108,13 @@ def _create_graph(
     *,
     aot_config: AOTConfig,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Trace f on args into an FX GraphModule using make_fx under
+    # the python dispatcher and (unless disabled in aot_config) a FunctionalTensorMode.
+    # If args_descs is given, f must return (outputs, output descriptors); afterwards
+    # placeholder nodes get input descriptors in order (placeholders named for backward
+    # tokens get BackwardTokenAOTInput instead) and the output node gets the flattened
+    # output descriptors, stored in node meta. Raises AssertionError if there are more
+    # non-token placeholders than descriptors or f is entered twice.
     # FunctionalTensorMode must be enabled here.
     # See Note [Accessing .grad_fn on FunctionalTensor]
     out_descs = None
@@ -107,6 +125,9 @@ def _create_graph(
 
         @simple_wraps(f)
         def inner_f(*args: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Call f, capture its output descriptors in the
+            # enclosing out_descs variable, and return only the outputs. Raises
+            # AssertionError if called more than once during tracing.
             nonlocal out_descs
             if out_descs is not None:
                 raise AssertionError("out_descs must be None")
@@ -186,6 +207,8 @@ def _create_graph(
 
 # TODO: Refactor the following code so detach() persists item_memo
 def _detach_and_copy_item_memo(t: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return a detached alias of t, carrying over its cached
+    # item memo attribute (if present) so symbolic scalar caching survives detach.
     detached_t = t.detach()
     if hasattr(t, "item_memo"):
         # pyrefly: ignore[missing-attribute]
@@ -195,6 +218,9 @@ def _detach_and_copy_item_memo(t: torch.Tensor) -> torch.Tensor:
 
 @dataclasses.dataclass
 class _GraphCaptureTracingResult:
+    # [CLASS DOC] HELPER: Result bundle of _prepare_graph_capture_tracing: the wrapped
+    # function to trace, its flat (subclass-desugared) args and their descriptors, and
+    # the subclass metadata (None when no subclasses were involved).
     fn_to_trace: Callable[..., Any]
     flat_args: Any
     flat_args_descs: Any
@@ -202,11 +228,15 @@ class _GraphCaptureTracingResult:
 
 
 def _detach_traced_inputs(flat_args: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Return a copy of the nested structure flat_args with every
+    # tensor replaced by a detached alias (preserving item memo when a fake mode is
+    # active), so later tracing-time metadata mutation does not affect the saved inputs.
     if detect_fake_mode():
         detach_tensor = _detach_and_copy_item_memo
     else:
 
         def detach_tensor(t: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Plain detach of one tensor.
             return t.detach()
 
     return pytree.tree_map_only(torch.Tensor, detach_tensor, flat_args)
@@ -223,6 +253,13 @@ def _prepare_graph_capture_tracing(
     trace_joint: bool,
     joint_fn_handle: Any | None = None,
 ) -> _GraphCaptureTracingResult:
+    # [FUNCTION DOC] HELPER: Apply the tracing wrappers in order to fn_to_trace: (1)
+    # functionalization (skipped if disabled), (2) tensor subclass desugaring into plain
+    # tensors, (3) effect token handling (skipped if functionalization disabled).
+    # Args/descriptors are transformed in step. trace_joint says whether the function
+    # has joint forward/backward structure; joint_fn_handle is passed to
+    # functionalization. Returns a _GraphCaptureTracingResult with the final function,
+    # args, descriptors and subclass metadata.
     if aot_config.disable_functionalization:
         updated_flat_args, updated_flat_args_descs = flat_args, flat_args_descs
     else:
@@ -275,6 +312,9 @@ def _create_graph_and_save_traced_inputs(
     *,
     aot_config: AOTConfig,
 ) -> tuple[torch.fx.GraphModule, Any]:
+    # [FUNCTION DOC] HELPER: Snapshot detached aliases of flat_args (taken before
+    # tracing, since tracing may mutate input metadata), then trace the graph with
+    # _create_graph. Returns (graph module, saved detached args).
     saved_flat_args = _detach_traced_inputs(flat_args)
     return (
         _create_graph(fn_to_trace, flat_args, flat_args_descs, aot_config=aot_config),
@@ -290,6 +330,17 @@ def aot_dispatch_base_graph(
     *,
     fw_metadata: ViewAndMutationMeta,
 ) -> tuple[torch.fx.GraphModule, list[FxValue], list[AOTInput], SubclassMeta | None]:
+    # [FUNCTION DOC] Capture the inference (forward-only) graph. Wraps flat_fn so input
+    # mutations become outputs, applies functionalization/subclass/token wrappers, and
+    # traces it. In non-strict export, temporarily hooks module buffer assignments, then
+    # marks assigned buffers as mutated in fw_metadata (mutating its input_info and
+    # mutated-input count) and appends their nodes as extra graph outputs. Then verifies
+    # the graph is functional (consistent copy counts before/after DCE), runs stream
+    # copy/sync passes, populates stream indices in fw_metadata, eliminates dead code,
+    # optionally unlifts effect tokens (dropping those leading args), and logs graphs and
+    # metadata. Returns (forward module, saved flat args, their descriptors, subclass
+    # meta or None). Raises AssertionError on copy count mismatch or subclass inputs
+    # under export.
     # aot_dispatch_base requires functionalization, but doesn't need to handle as many cases as the autograd case.
     # The cases that aot_dispatch_base doesn't need to handle include:
     # - outputs that are aliases of graph intermediates
@@ -483,6 +534,16 @@ def aot_dispatch_autograd_graph(
     tuple[list[AOTInput], list[AOTInput]],
     SubclassMeta | None,
 ]:
+    # [FUNCTION DOC] Capture the joint forward+backward graph for training. Builds the
+    # autograd-prepared function and joint function from flat_fn, wraps with
+    # functionalization/subclass/token handling over inputs (flat_args, traced tangents),
+    # traces to an FX module, asserts no fake params/buffers, copies forward metadata to
+    # backward nodes, runs stream assignment/sync/control-dependency passes, records
+    # stream indices and tangent source stack traces into fw_metadata (mutation), DCEs,
+    # checks functionality (unless disabled) and recompiles. Returns (joint graph, saved
+    # detached (primals, tangents) inputs, their descriptors, subclass meta or None).
+    # Raises AssertionError if subclass inputs are used under export.
+    # KNOWN ISSUE: returned descriptors are the updated ones rather than a saved copy; harmless as descriptors are immutable.
     # NB: flat_fn here is the original user function (as far as
     # aot_module_simplified is concerned)
 

@@ -1,3 +1,8 @@
+# [MODULE DOC] Public helper queries over joint FX graphs produced by AOTAutograd
+# (nodes carry a descriptor in node meta under the desc key): pair inputs with their
+# grad outputs, outputs with their tangent inputs, and collect param/buffer/plain
+# nodes (by FQN or in feed order). Subclass-desugared descriptors are rejected with
+# RuntimeError. Does not work on generic FX graphs. No import-time side effects.
 """
 This module contains utility functions for working with joint FX graphs with descriptors
 that are produced by AOTAutograd.  They will NOT work on generic FX graphs.  See also
@@ -28,6 +33,9 @@ from .descriptors import (
 def _raise_autograd_subclass_not_implemented(
     n: fx.Node, desc: AOTInput | AOTOutput
 ) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError explaining that desugared
+    # subclass descriptors (found at node n with descriptor desc) are unsupported by
+    # primal/tangent/grad matching helpers. Never returns.
     raise RuntimeError(
         "Subclasses are currently not supported by this function, but a desugared subclass input "
         f"was found at {n} ({desc}).  The problem is "
@@ -44,6 +52,12 @@ def _raise_autograd_subclass_not_implemented(
 def get_all_input_and_grad_nodes(
     g: fx.Graph,
 ) -> dict[DifferentiableAOTInput, tuple[fx.Node, fx.Node | None]]:
+    # [FUNCTION DOC] Walk graph g and build a mapping from each differentiable input
+    # descriptor (placeholder desc) to (placeholder node, grad output node or None).
+    # Grad nodes come from output entries whose descriptor is a grad of that input.
+    # Non-differentiable placeholders are skipped. Raises RuntimeError on subclass
+    # input/output descriptors, AssertionError if the output node lacks a desc or a
+    # grad is assigned twice; a grad for an unseen input would raise a lookup error.
     """
     Given a joint graph with descriptors (meta['desc'] on placeholders and
     output), returns the node for every input and its corresponding grad
@@ -100,6 +114,12 @@ def get_all_input_and_grad_nodes(
 def get_all_output_and_tangent_nodes(
     g: fx.Graph,
 ) -> dict[DifferentiableAOTOutput, tuple[fx.Node, fx.Node | None]]:
+    # [FUNCTION DOC] Walk graph g and build a mapping from each differentiable output
+    # descriptor to (output node, tangent placeholder node or None), pairing via
+    # tangent placeholders' output descriptor. Raises RuntimeError on subclass
+    # descriptors, AssertionError if a tangent is assigned twice.
+    # KNOWN ISSUE: the docstring says tangents are used in forward-mode autodiff, but
+    # tangent inputs here are the backward-pass incoming gradients of the joint graph.
     """Get all output nodes and their corresponding tangent nodes from a joint graph.
 
     Similar to get_all_input_and_grad_nodes, but returns output nodes paired with
@@ -154,6 +174,8 @@ def get_all_output_and_tangent_nodes(
 def get_param_and_grad_nodes(
     graph: fx.Graph,
 ) -> dict[ParamAOTInput, tuple[fx.Node, fx.Node | None]]:
+    # [FUNCTION DOC] Return the subset of get_all_input_and_grad_nodes results whose
+    # descriptor is a parameter descriptor (parameter node, grad node or None).
     """Get parameter nodes and their corresponding gradient nodes from a joint graph.
 
     Args:
@@ -174,6 +196,8 @@ def get_param_and_grad_nodes(
 def get_plain_input_and_grad_nodes(
     graph: fx.Graph,
 ) -> dict[PlainAOTInput, tuple[fx.Node, fx.Node | None]]:
+    # [FUNCTION DOC] Return the subset of get_all_input_and_grad_nodes results whose
+    # descriptor is a plain-input descriptor (input node, grad node or None).
     """Get plain input nodes and their corresponding gradient nodes from a joint graph.
 
     Args:
@@ -194,6 +218,8 @@ def get_plain_input_and_grad_nodes(
 def get_plain_output_and_tangent_nodes(
     graph: fx.Graph,
 ) -> dict[PlainAOTOutput, tuple[fx.Node, fx.Node | None]]:
+    # [FUNCTION DOC] Return the subset of get_all_output_and_tangent_nodes results whose
+    # descriptor is a plain-output descriptor (output node, tangent node or None).
     """Get plain output nodes and their corresponding tangent nodes from a joint graph.
 
     Args:
@@ -214,6 +240,8 @@ def get_plain_output_and_tangent_nodes(
 def _raise_fqn_subclass_not_implemented(
     n: fx.Node, desc: AOTInput | AOTOutput
 ) -> NoReturn:
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError explaining that a desugared
+    # subclass at node n (descriptor desc) has no unique FQN-to-tensor mapping. Never returns.
     raise RuntimeError(
         "Subclasses are currently not supported by this function, but a desugared subclass input "
         f"was found at {n} ({desc}).  The problem is "
@@ -228,6 +256,8 @@ def _raise_fqn_subclass_not_implemented(
 
 
 def get_named_param_nodes(graph: fx.Graph) -> dict[str, fx.Node]:
+    # [FUNCTION DOC] Return a mapping from parameter FQN to its placeholder node, in
+    # graph order. Raises RuntimeError if any placeholder is a subclass attribute descriptor.
     """Get parameter nodes mapped by their fully qualified names.
 
     This function traverses the graph to find all parameter input nodes and
@@ -256,6 +286,8 @@ def get_named_param_nodes(graph: fx.Graph) -> dict[str, fx.Node]:
 
 
 def get_named_buffer_nodes(graph: fx.Graph) -> dict[str, fx.Node]:
+    # [FUNCTION DOC] Return a mapping from buffer FQN to its placeholder node, in
+    # graph order. Raises RuntimeError if any placeholder is a subclass attribute descriptor.
     """Get buffer nodes mapped by their fully qualified names.
 
     This function traverses the graph to find all buffer input nodes and
@@ -284,6 +316,8 @@ def get_named_buffer_nodes(graph: fx.Graph) -> dict[str, fx.Node]:
 
 
 def get_param_nodes(graph: fx.Graph) -> list[fx.Node]:
+    # [FUNCTION DOC] Return parameter placeholder nodes as a list in graph (feed) order;
+    # RuntimeError on subclass descriptors.
     """Get all parameter nodes from a graph as a list.
 
     You can rely on this providing the correct order of parameters you need
@@ -305,6 +339,8 @@ def get_param_nodes(graph: fx.Graph) -> list[fx.Node]:
 
 
 def get_buffer_nodes(graph: fx.Graph) -> list[fx.Node]:
+    # [FUNCTION DOC] Return buffer placeholder nodes as a list in graph (feed) order;
+    # RuntimeError on subclass descriptors.
     """Get all buffer nodes from a graph as a list.
 
     You can rely on this providing the correct order of buffers you need

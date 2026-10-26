@@ -1,3 +1,11 @@
+# [MODULE DOC] Defines the AOTInput / AOTOutput descriptor hierarchy: frozen
+# dataclasses that describe the semantic origin of each input and the semantic
+# destination of each output of the FX graphs AOTAutograd produces (plain args,
+# params, buffers, tangents, grads, subclass pieces, RNG state, effect tokens,
+# view/synthetic bases, mutations, saved-for-backward values).
+# Each descriptor exposes expr() (a human-readable path string) and some expose
+# classification predicates (is_param, is_buffer, is_tangent, is_grad).
+# No import-time side effects beyond class definitions; only dataclasses is imported.
 """
 AOTAutograd descriptors are a path-like data structure (similar to pytree
 paths and sources) that describe the semantic meaning of an input/output to FX
@@ -326,20 +334,31 @@ import dataclasses
 
 @dataclasses.dataclass(frozen=True)
 class AOTInput:
+    # [CLASS DOC] Abstract base of all input descriptors. Immutable (frozen
+    # dataclass), hashable, no fields of its own. Subclasses implement expr()
+    # and override the is_* predicates when they represent params/buffers/tangents.
     """Describes where an input from an AOTAutograd produced FX graph comes from"""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a human-readable path string for this input.
+        # Abstract: always raises NotImplementedError in the base class.
         raise NotImplementedError("Subclasses must implement expr()")
 
     def is_param(self) -> bool:
+        # [FUNCTION DOC] Return whether this input is (or derives from) a parameter.
+        # Base default is False.
         """True if this input is a parameter or derived from a parameter (e.g., subclass attr)"""
         return False
 
     def is_buffer(self) -> bool:
+        # [FUNCTION DOC] Return whether this input is (or derives from) a buffer.
+        # Base default is False.
         """True if this input is a buffer or derived from a buffer (e.g., subclass attr)"""
         return False
 
     def is_tangent(self) -> bool:
+        # [FUNCTION DOC] Return whether this input is (or derives from) a tangent.
+        # Base default is False.
         """True if this input is a tangent or derived from a tangent (e.g., subclass attr)"""
         return False
 
@@ -350,24 +369,34 @@ class AOTInput:
 
 @dataclasses.dataclass(frozen=True)
 class DifferentiableAOTInput(AOTInput):
+    # [CLASS DOC] Marker subclass for tensor inputs that may be wrapped by
+    # GradAOTOutput (i.e. have a gradient). No added state or behavior.
     """A subclass that classifies AOTInput that can be wrapped by GradAOTOutput"""
 
 
 @dataclasses.dataclass(frozen=True)
 class AOTOutput:
+    # [CLASS DOC] Abstract base of all output descriptors. Immutable, hashable.
+    # Subclasses implement expr(); is_grad() marks gradient outputs.
     """Describes where an output from an AOTAutograd produced FX graph will
     eventually be bundled into the final output"""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a human-readable path string for this output.
+        # Abstract: always raises NotImplementedError in the base class.
         raise NotImplementedError("Subclasses must implement expr()")
 
     def is_grad(self) -> bool:
+        # [FUNCTION DOC] Return whether this output is (or derives from) a gradient.
+        # Base default is False.
         """True if this output is a grad or derived from a grad (e.g., subclass attr)"""
         return False
 
 
 @dataclasses.dataclass(frozen=True)
 class DifferentiableAOTOutput(AOTOutput):
+    # [CLASS DOC] Marker subclass for tensor outputs that may be wrapped by
+    # TangentAOTInput. No added state or behavior.
     """A subclass that classifies AOTOutput that can be wrapped by TangentAOTInput"""
 
 
@@ -380,38 +409,50 @@ class DifferentiableAOTOutput(AOTOutput):
 
 @dataclasses.dataclass(frozen=True)
 class ParamAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for a module parameter input; field target is the
+    # parameter's fully qualified name.
     """The input is a parameter, whose FQN is target"""
 
     target: str
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a string naming a get-parameter lookup of the target FQN.
         return f"self.get_parameter({self.target!r})"
 
     def is_param(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
     def is_buffer(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
 
 @dataclasses.dataclass(frozen=True)
 class BufferAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for a module buffer input; field target is the
+    # buffer's fully qualified name.
     """The input is a buffer, whose FQN is target"""
 
     target: str
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a string naming a get-buffer lookup of the target FQN.
         return f"self.get_buffer({self.target!r})"
 
     def is_param(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
     def is_buffer(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
 
 @dataclasses.dataclass(frozen=True)
 class DummyAOTInput(AOTInput):
+    # [CLASS DOC] Placeholder input descriptor used when descriptor processing
+    # is irrelevant; field idx is an arbitrary index.
     """In some circumstances, we want to call into a function that expects AOTInput, but
     we don't actually care about that logic (most typically, because some code is being used
     for both compile-time and run-time; AOTInput processing is not needed in this situation.
@@ -421,11 +462,14 @@ class DummyAOTInput(AOTInput):
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a placeholder name made of "__dummy" and idx.
         return f"__dummy{self.idx}"
 
 
 @dataclasses.dataclass(frozen=True)
 class PlainAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for a positional input of the original flat
+    # callable; field idx is the position.
     """The input is a plain input, corresponding to a particular positional index.
 
     Note that AOTInput is always relative to a function with a *flat* calling convention,
@@ -437,11 +481,14 @@ class PlainAOTInput(DifferentiableAOTInput):
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a string indexing the original args at idx.
         return f"args[{self.idx}]"
 
 
 @dataclasses.dataclass(frozen=True)
 class SubclassGetAttrAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor for an inner tensor attribute (attr) of a tensor
+    # subclass input described by base. Predicates delegate to base.
     """Subclass inputs get unpacked into their constituent pieces before going into an FX
     graph.  This tells you which particular attribute of the subclass this particular
     input corresponds to (of the 'base' originally subclass argument.)
@@ -451,42 +498,54 @@ class SubclassGetAttrAOTInput(AOTInput):
     attr: str
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by an attribute access of attr.
         return f"{self.base.expr()}.{self.attr}"
 
     def is_param(self) -> bool:
+        # [FUNCTION DOC] Delegate to the base descriptor.
         return self.base.is_param()
 
     def is_buffer(self) -> bool:
+        # [FUNCTION DOC] Delegate to the base descriptor.
         return self.base.is_buffer()
 
     def is_tangent(self) -> bool:
+        # [FUNCTION DOC] Delegate to the base descriptor.
         return self.base.is_tangent()
 
 
 @dataclasses.dataclass(frozen=True)
 class SubclassSizeAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor for the outer size SymInt at dimension idx of a
+    # subclass input described by base.
     """Which subclass this particular outer size SymInt input (at dim idx) came from."""
 
     base: AOTInput
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by a size query at dim idx.
         return f"{self.base.expr()}.size({self.idx})"
 
 
 @dataclasses.dataclass(frozen=True)
 class SubclassStrideAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor for the outer stride SymInt at dimension idx of a
+    # subclass input described by base.
     """Which subclass this particular outer stride SymInt input (at dim idx) came from."""
 
     base: AOTInput
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by a stride query at dim idx.
         return f"{self.base.expr()}.stride({self.idx})"
 
 
 @dataclasses.dataclass(frozen=True)
 class ViewBaseAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for the shared autograd view base that replaces
+    # several aliasing view inputs; base_of names one of the replaced inputs.
     """
     When multiple differentiable inputs are views of the same input, AOTAutograd will replace all of these
     views with a single input representing the base.  If this is undesirable, you can clone the views
@@ -498,11 +557,14 @@ class ViewBaseAOTInput(DifferentiableAOTInput):
     base_of: AOTInput
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base_of expression followed by a base-attribute access.
         return f"{self.base_of.expr()}._base"
 
 
 @dataclasses.dataclass(frozen=True)
 class SyntheticBaseAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for a synthetic base built when aliasing inputs
+    # had no differentiable view; base_of names one of the replaced inputs.
     """This is similar to ViewBaseAOTInput, but this happens when none of the views were differentiable, so
     we weren't able to get our hands on the true original view and constructed a synthetic one instead
     for the sake of autograd.
@@ -511,58 +573,71 @@ class SyntheticBaseAOTInput(DifferentiableAOTInput):
     base_of: AOTInput
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a make-synthetic-base call string wrapping the base_of expression.
         return f"__make_synthetic_base({self.base_of.expr()})"
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxForwardSeedAOTInput(AOTInput):
+    # [CLASS DOC] Singleton-style descriptor (no fields) for the Philox RNG seed input of the forward graph.
     """The seed for functionalized Philox RNG calls, specifically for forward graph."""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the forward Philox seed.
         return "__philox_forward_seed"
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxForwardBaseOffsetAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor (no fields) for the Philox RNG base offset input of the forward graph.
     """The offset for functionalized Philox RNG calls, specifically for forward graph."""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the forward Philox base offset.
         return "__philox_forward_base_offset"
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxBackwardSeedAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor (no fields) for the Philox RNG seed input of the backward graph.
     """The seed for functionalized Philox RNG calls, specifically for backward graph."""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the backward Philox seed.
         return "__philox_backward_seed"
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxBackwardBaseOffsetAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor (no fields) for the Philox RNG base offset input of the backward graph.
     """The offset for functionalized Philox RNG calls, specifically for backward graph."""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the backward Philox base offset.
         return "__philox_backward_base_offset"
 
 
 @dataclasses.dataclass(frozen=True)
 class ForwardTokenAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor for the idx-th effect (world) token input of the forward graph.
     """The world token which is threaded through side-effectful operations"""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__forward_token" followed by idx.
         return f"__forward_token{self.idx}"
 
 
 @dataclasses.dataclass(frozen=True)
 class BackwardTokenAOTInput(AOTInput):
+    # [CLASS DOC] Descriptor for the idx-th effect (world) token input of the backward graph.
     """The world token which is threaded through side-effectful operations, for backwards"""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__backward_token" followed by idx.
         return f"__backward_token{self.idx}"
 
 
@@ -573,20 +648,26 @@ class BackwardTokenAOTInput(AOTInput):
 # don't support double backwards.
 @dataclasses.dataclass(frozen=True)
 class TangentAOTInput(DifferentiableAOTInput):
+    # [CLASS DOC] Descriptor for the tangent (incoming gradient) input of the
+    # joint graph; field output is the DifferentiableAOTOutput it is the tangent of.
     """An input to the joint graph representing the tangent of an output."""
 
     output: DifferentiableAOTOutput
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate construction: raises AssertionError if output is
+        # not a DifferentiableAOTOutput.
         if not isinstance(self.output, DifferentiableAOTOutput):
             raise AssertionError(
                 f"expected output to be DifferentiableAOTOutput, got {type(self.output)}"
             )
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return an output-tangent call string wrapping the output expression.
         return f"__output_tangent({self.output.expr()})"
 
     def is_tangent(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
 
@@ -599,32 +680,40 @@ class TangentAOTInput(DifferentiableAOTInput):
 
 @dataclasses.dataclass(frozen=True)
 class PlainAOTOutput(DifferentiableAOTOutput):
+    # [CLASS DOC] Descriptor for the idx-th output of the original flat callable.
     """A plain tensor output at position idx of the output tuple"""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a string indexing the output tuple at idx.
         return f"output[{self.idx}]"
 
 
 @dataclasses.dataclass(frozen=True)
 class InputMutationAOTOutput(DifferentiableAOTOutput):
+    # [CLASS DOC] Descriptor for the new value of a mutated input (mutated_input),
+    # returned from the graph so autograd can differentiate through the mutation.
     """The mutated value of an input tensor, returned so we can appropriately propagate autograd."""
 
     mutated_input: AOTInput
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return an input-mutation call string wrapping the mutated input expression.
         return f"__input_mutation({self.mutated_input.expr()})"
 
 
 @dataclasses.dataclass(frozen=True)
 class IntermediateBaseAOTOutput(DifferentiableAOTOutput):
+    # [CLASS DOC] Descriptor for the shared intermediate base returned in place
+    # of several aliasing outputs; base_of names one contributing output.
     """An intermediate base of multiple outputs which alias each other.  We only report ONE of
     the outputs that contributed to this base"""
 
     base_of: "AOTOutput"
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return an intermediate-base call string wrapping the base_of expression.
         return f"__intermediate_base({self.base_of.expr()})"
 
 
@@ -632,9 +721,12 @@ class IntermediateBaseAOTOutput(DifferentiableAOTOutput):
 # these BEFORE autograd is handled
 @dataclasses.dataclass(frozen=True)
 class MetadataMutationAOTOutput(DifferentiableAOTOutput):
+    # [CLASS DOC] Descriptor for an aliased argument whose metadata was mutated
+    # (synthetic-base handling); field idx identifies which one.
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__aliased_arg_with_metadata_mutation" followed by idx.
         return f"__aliased_arg_with_metadata_mutation{self.idx}"
 
 
@@ -643,56 +735,71 @@ class MetadataMutationAOTOutput(DifferentiableAOTOutput):
 # don't support double backwards.
 @dataclasses.dataclass(frozen=True)
 class GradAOTOutput(DifferentiableAOTOutput):
+    # [CLASS DOC] Descriptor for the gradient output of the joint graph; field
+    # grad_of is the DifferentiableAOTInput the gradient is for.
     """An output representing the computed gradient for a differentiable input, in the joint graph"""
 
     grad_of: DifferentiableAOTInput
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate construction: raises AssertionError if grad_of is
+        # not a DifferentiableAOTInput.
         if not isinstance(self.grad_of, DifferentiableAOTInput):
             raise AssertionError(
                 f"expected grad_of to be DifferentiableAOTInput, got {type(self.grad_of)}"
             )
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a grad call string wrapping the grad_of expression.
         return f"__grad({self.grad_of.expr()})"
 
     def is_grad(self) -> bool:
+        # [FUNCTION DOC] Always True.
         return True
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxUpdatedForwardOffsetAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor (no fields) for the updated Philox RNG offset returned by the forward graph.
     """The final offset from the functionalized RNG calls, forward only"""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the updated forward offset.
         return "__philox_updated_forward_offset"
 
 
 @dataclasses.dataclass(frozen=True)
 class PhiloxUpdatedBackwardOffsetAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor (no fields) for the updated Philox RNG offset returned by the backward graph.
     """The final offset from the functionalized RNG calls, backward only"""
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the constant name of the updated backward offset.
         return "__philox_updated_backward_offset"
 
 
 @dataclasses.dataclass(frozen=True)
 class ForwardTokenAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for the idx-th effect token output of the forward graph.
     """The world token output for side-effectful calls, returned so we cannot DCE it, forward only"""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__forward_token" followed by idx.
+        # KNOWN ISSUE: identical string to ForwardTokenAOTInput.expr, so input and output are not distinguishable by expr alone.
         return f"__forward_token{self.idx}"
 
 
 @dataclasses.dataclass(frozen=True)
 class BackwardTokenAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for the idx-th effect token output of the backward graph.
     """The world token output for side-effectful calls, returned so we cannot DCE it, backward only"""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__backward_token" followed by idx.
         return f"__backward_token{self.idx}"
 
 
@@ -702,56 +809,71 @@ class BackwardTokenAOTOutput(AOTOutput):
 # descriptors for both.
 @dataclasses.dataclass(frozen=True)
 class SubclassGetAttrAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for an output that will be repacked as inner
+    # tensor attribute attr of a subclass output described by base.
     """This output will be bundled into a subclass at this location"""
 
     base: AOTOutput
     attr: str
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by an attribute access of attr.
         return f"{self.base.expr()}.{self.attr}"
 
     def is_grad(self) -> bool:
+        # [FUNCTION DOC] Delegate to the base descriptor.
         return self.base.is_grad()
 
 
 @dataclasses.dataclass(frozen=True)
 class SubclassSizeAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for an output size value at dimension idx that will
+    # be repacked into the subclass described by base.
     """This output size will be bundled into a subclass at this location"""
 
     base: AOTOutput
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by a size query at dim idx.
         return f"{self.base.expr()}.size({self.idx})"
 
 
 @dataclasses.dataclass(frozen=True)
 class SubclassStrideAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for an output stride value at dimension idx that
+    # will be repacked into the subclass described by base.
     """This output stride will be bundled into a subclass at this location"""
 
     base: AOTOutput
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return the base expression followed by a stride query at dim idx.
         return f"{self.base.expr()}.stride({self.idx})"
 
 
 @dataclasses.dataclass(frozen=True)
 class DummyAOTOutput(AOTOutput):
+    # [CLASS DOC] Placeholder output descriptor used when descriptor
+    # propagation is irrelevant; field idx is an arbitrary index.
     """For cases when you don't actually care about descriptor propagation, do not use under normal
     circumstances."""
 
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return a placeholder name made of "__dummy" and idx.
         return f"__dummy{self.idx}"
 
 
 @dataclasses.dataclass(frozen=True)
 class SavedForBackwardsAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for the idx-th activation saved for backward (a forward graph output).
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__saved_for_backwards_" followed by idx.
         return f"__saved_for_backwards_{self.idx}"
 
 
@@ -776,7 +898,11 @@ class SavedForBackwardsAOTOutput(AOTOutput):
 #   This is done by stashing this activation on the ctx object directly
 @dataclasses.dataclass(frozen=True)
 class SavedForBackwardsNoVcCheckAOTOutput(AOTOutput):
+    # [CLASS DOC] Descriptor for the idx-th forward-graph activation that must be
+    # stashed directly on the autograd ctx (no save_for_backward, so no version
+    # counter check at backward time), matching eager custom Function behavior.
     idx: int
 
     def expr(self) -> str:
+        # [FUNCTION DOC] Return "__saved_for_backwards_no_vc_check_" followed by idx.
         return f"__saved_for_backwards_no_vc_check_{self.idx}"

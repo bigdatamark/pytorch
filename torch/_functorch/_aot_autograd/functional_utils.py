@@ -1,3 +1,9 @@
+# [MODULE DOC] Functionalization utilities for AOTAutograd: converting tensors
+# (including nested wrapper subclasses) to/from FunctionalTensor, detecting data,
+# metadata, storage and resize mutations on functionalized inputs, regenerating
+# aliases/views from a base tensor (gen_alias_from_base, ViewMetaSequence),
+# comparing tensor metadata, and validating/annotating functional FX graphs.
+# Import-time side effect: creates the "aot_joint_graph" artifact logger.
 """
 This file contains utilities related to functionalization in AOTAutograd:
 1. converting to/from functional tensors
@@ -31,6 +37,10 @@ aot_joint_log = getArtifactLogger(__name__, "aot_joint_graph")
 
 
 def to_fun(t: object) -> Any:
+    # [FUNCTION DOC] Wrap a tensor in a FunctionalTensor. Wrapper subclasses are
+    # handled by recursively converting their inner tensors (functional wrapper goes
+    # at the bottom) and copying autograd metadata to the new subclass instance.
+    # Non-tensors are returned unchanged.
     if isinstance(t, Tensor):
         if is_traceable_wrapper_subclass(t):
             # See Note [Functionalization always runs last]
@@ -47,6 +57,9 @@ def to_fun(t: object) -> Any:
 
 
 def sync_functional_tensor(t: torch.Tensor) -> None:
+    # [FUNCTION DOC] Flush pending functionalization updates on t (side effect via
+    # the sync primitive). For wrapper subclasses, recurses into inner tensors
+    # and skips custom-class attributes; raises AssertionError on any other attribute type.
     if is_traceable_wrapper_subclass(t):
         attrs, _ctx = t.__tensor_flatten__()  # type: ignore[attr-defined]
         for attr in attrs:
@@ -66,6 +79,10 @@ def sync_functional_tensor(t: torch.Tensor) -> None:
 # When subclasses are involved, t here will usually look something like:
 # SubclassA(SubclassB(FunctionalTensor(_to_fun_tensor(FakeTensor))))
 def from_fun(t: object) -> object:
+    # [FUNCTION DOC] Inverse of to_fun. Wrapper subclasses are rebuilt with inner
+    # tensors converted recursively (autograd metadata mirrored). A FunctionalTensor is
+    # synced and replaced by its underlying non-functional tensor. Other inputs are
+    # returned unchanged; raises AssertionError if a plain tensor is unexpectedly functional.
     if isinstance(t, Tensor) and is_traceable_wrapper_subclass(t):
         # See Note [Functionalization always runs last]
         # This means that if we want to "functionalize" a subclass, we need to ensure that the functional wrapper
@@ -86,6 +103,9 @@ def from_fun(t: object) -> object:
 
 
 def is_fun(t: object) -> TypeGuard[FunctionalTensor | Tensor]:
+    # [FUNCTION DOC] Return whether t is functional. For wrapper subclasses, true iff
+    # inner tensors are functional (False if there are none). Raises AssertionError if
+    # inner tensors are a mix of functional and non-functional, or of unexpected attr types.
     if isinstance(t, Tensor) and is_traceable_wrapper_subclass(t):
         # See Note [Functionalization always runs last]
         # This means that if we want to "functionalize" a subclass, we need to ensure that the functional wrapper
@@ -119,6 +139,9 @@ def is_fun(t: object) -> TypeGuard[FunctionalTensor | Tensor]:
 # (2) A traceable tensor subclass that holds a FunctionalTensor
 # (3) Not a tensor
 def has_data_mutation(t: object) -> bool:
+    # [FUNCTION DOC] Return whether t had its data mutated during functionalization.
+    # Subclasses: true if any inner tensor was. Plain tensors must be FunctionalTensors
+    # (else AssertionError); non-tensors give False.
     if is_traceable_wrapper_subclass(t):
         attrs, _ = t.__tensor_flatten__()
         # A tensor subclass was updated if any of its inner elements were updated
@@ -143,6 +166,9 @@ def has_data_mutation(t: object) -> bool:
 
 
 def are_all_mutations_hidden_from_autograd(t: object) -> bool:
+    # [FUNCTION DOC] Return whether every mutation of t was hidden from autograd.
+    # Subclasses: true only if all inner tensors satisfy it. Plain tensors must be
+    # FunctionalTensors (else AssertionError). Non-tensors give False.
     if is_traceable_wrapper_subclass(t):
         attrs, _ = t.__tensor_flatten__()
         # If all inner elements are mutations hidden from autograd, then it is a mutation hidden from autograd.
@@ -167,6 +193,9 @@ def are_all_mutations_hidden_from_autograd(t: object) -> bool:
 
 
 def are_all_mutations_under_no_grad_or_inference_mode(t: torch.Tensor) -> bool:
+    # [FUNCTION DOC] Return whether every mutation of t happened under no-grad or
+    # inference mode. Subclasses: all inner tensors must satisfy it. Plain tensors must
+    # be FunctionalTensors, else AssertionError (including for non-tensors).
     if is_traceable_wrapper_subclass(t):
         attrs, _ = t.__tensor_flatten__()
         for attr in attrs:
@@ -190,6 +219,10 @@ def are_all_mutations_under_no_grad_or_inference_mode(t: torch.Tensor) -> bool:
 
 
 def was_inductor_storage_resized(t: object) -> bool:
+    # [FUNCTION DOC] Return whether Inductor-style storage resizing happened on t.
+    # Subclasses never return True: if any inner tensor was resized, raises RuntimeError
+    # (unsupported); otherwise False. Non-tensors give False; plain tensors must be
+    # FunctionalTensors (else AssertionError).
     if is_traceable_wrapper_subclass(t):
         attrs, _ = t.__tensor_flatten__()
         for attr in attrs:
@@ -215,6 +248,9 @@ def was_inductor_storage_resized(t: object) -> bool:
 
 
 def was_shallow_copy_data(t: object) -> bool:
+    # [FUNCTION DOC] Return whether a shallow-copy-data operation was applied to t.
+    # Always False for subclasses and non-tensors; plain tensors must be
+    # FunctionalTensors (else AssertionError).
     if is_traceable_wrapper_subclass(t):
         return False
     if not isinstance(t, torch.Tensor):
@@ -235,6 +271,13 @@ def was_shallow_copy_data(t: object) -> bool:
 def has_metadata_mutation(
     f_arg: object, arg: object, *, check_only_storage_mutation: bool
 ) -> bool:
+    # [FUNCTION DOC] Return whether the functionalized input f_arg had a metadata
+    # mutation relative to the original fake tensor arg. Subclasses recurse over inner
+    # tensors. For plain tensors: detects storage replacement (a set_ whose result has a
+    # different storage); if check_only_storage_mutation returns just that, otherwise
+    # also true when a metadata mutation was recorded AND size, stride or storage offset
+    # actually differ. Raises AssertionError on type mismatches (f_arg not functional,
+    # arg not fake, non-tensor f_arg with tensor arg).
     if is_traceable_wrapper_subclass(f_arg):
         attrs, _ = f_arg.__tensor_flatten__()
         # A tensor subclass was updated if any of its inner elements were updated
@@ -320,10 +363,22 @@ def gen_alias_from_base(
     *,
     replay_views: bool,
 ) -> Tensor:
+    # [FUNCTION DOC] Reconstruct an alias of aliased_base_tensor that matches the
+    # shape/stride/dtype/requires_grad of target_meta_tensor. Strategy in order:
+    # (1) if replay_views and a ViewMeta sequence without symbolic inputs is given,
+    # replay it on the base (AssertionError if the resulting shape is wrong);
+    # (2) if the target has a _base, re-create its view function on the base (reshaping
+    # the base with as_strided first if needed), accepted only if shape matches;
+    # (3) fall back to an as_strided view (via real/complex view if complexness differs,
+    # adjusting the storage offset when the base is on a different storage), then a
+    # dtype view if dtype differs. requires_grad is patched by detaching or enabling it.
+    # Returns the new tensor; does not mutate the base.
     # Patch the correct requires_grad field of the output tensor, depending on whether:
     # (i) the reconstructed output (out) was came from a tensor that requires grad or not;
     # and (ii) the concrete returned output does require grad or not.
     def patch_requires_grad(out: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Detach out if the base requires grad but the target does
+        # not; enable requires_grad in place if the reverse; returns the tensor.
         if aliased_base_tensor.requires_grad and not target_requires_grad:
             out = out.detach()
         elif not aliased_base_tensor.requires_grad and target_requires_grad:
@@ -420,6 +475,9 @@ def gen_alias_from_base(
 
 
 def has_same_metadata(t1: Tensor, t2: Tensor) -> bool:
+    # [FUNCTION DOC] Return whether two tensors have equal size, layout, conj bit and
+    # neg bit, and (unless t1 is sparse) equal stride and storage offset. Symbolic
+    # comparisons are evaluated with guard_or_false, so undecidable ones count as unequal.
     return (
         guard_or_false(sym_eq(t1.size(), t2.size()))
         and guard_or_false(t1.layout == t2.layout)
@@ -437,6 +495,9 @@ def has_same_metadata(t1: Tensor, t2: Tensor) -> bool:
 
 @dataclass(frozen=True)
 class MetadataKey:
+    # [CLASS DOC] Immutable hashable summary of the tensor metadata compared by
+    # has_same_metadata: size, layout, sparse flag, stride and storage offset (None
+    # when sparse), conj and neg bits. Symbolic ints are wrapped for expression equality.
     """
     This should be equal whenever has_same_metadata would return True
     """
@@ -452,6 +513,7 @@ class MetadataKey:
 
     @staticmethod
     def make(t: Tensor) -> MetadataKey:
+        # [FUNCTION DOC] Build a MetadataKey from tensor t (static factory).
         is_sparse = is_sparse_any(t)
         return MetadataKey(
             size=tuple(SymIntEqByExpr(s) for s in t.size()),
@@ -481,18 +543,28 @@ class MetadataKey:
 #
 # i.e. a parenthesized list of view operations within that ViewMeta sequence.
 class ViewMetaSequence:
+    # [CLASS DOC] Records the sequence of view operations (ViewMeta) that produced a
+    # functional tensor from its base, plus the resulting MetadataKey. Attributes:
+    # sequence (list of ViewMeta) and metadata. Equality compares only the end metadata,
+    # since equivalent sequences may differ after synthetic-base creation.
     def __init__(self, tensor: FunctionalTensor) -> None:
+        # [FUNCTION DOC] Capture the ViewMeta sequence of tensor.elem and the metadata of
+        # tensor. Raises AssertionError if tensor.elem is not a functional tensor.
         if not torch._is_functional_tensor(tensor.elem):
             raise AssertionError("expected tensor.elem to be a functional tensor")
         self.sequence = _functionalization.get_view_meta_sequence(tensor.elem)
         self.metadata = MetadataKey.make(tensor)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a string listing each view op type name with its suffix stripped.
         suffix = len("_ViewMeta")
         types = ", ".join(type(vm).__name__[:-suffix] for vm in self.sequence)
         return f"ViewMetaSequence({types})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal to None (treated as unknown/wildcard) and to any
+        # ViewMetaSequence with equal metadata; NotImplemented for other types.
+        # KNOWN ISSUE: defines equality without a matching hash, and equality with None is not symmetric.
         # If other is None, then it probably means that we weren't able to recreate
         # the ViewMeta sequence. One example is when we update the view metadata by
         # calling: create_synthetic_base_metadata.
@@ -509,6 +581,8 @@ class ViewMetaSequence:
     def _from_parts(
         cls, sequence: list[_functionalization.ViewMeta], metadata: MetadataKey
     ) -> ViewMetaSequence:
+        # [FUNCTION DOC] HELPER: Alternate constructor that builds an instance directly
+        # from a ViewMeta list and MetadataKey, skipping the FunctionalTensor-based init.
         # Rebuild a ViewMetaSequence directly from its parts, bypassing the
         # FunctionalTensor-based __init__. This lets the recipe be reconstructed from
         # plain values rather than from a live FunctionalTensor or an embedded pickle.
@@ -535,6 +609,10 @@ class ViewMetaSequence:
 # a brand new subclass instance: we are calling __tensor_unflatten__, and going
 # from Subclass(FakeTensor) to Subclass(FunctionalTensor(FakeTensor))
 def was_tensor_updated(arg: torch.Tensor, new_arg: torch.Tensor) -> bool:
+    # [FUNCTION DOC] Return whether new_arg is a different object from arg, i.e. the
+    # input was replaced by functionalization. For wrapper subclasses, compares inner
+    # tensors recursively. Raises AssertionError if new_arg is not a wrapper subclass
+    # when arg is, if flattened attr lists differ, or on unexpected attr types.
     if is_traceable_wrapper_subclass(arg):
         if not is_traceable_wrapper_subclass(new_arg):
             raise AssertionError(
@@ -569,6 +647,9 @@ def was_tensor_updated(arg: torch.Tensor, new_arg: torch.Tensor) -> bool:
 # we can detect whether or not an input was mutated by checking to see if the inner tensor has changed,
 # but shares storage with the old input
 def was_tensor_metadata_updated(arg: Any, new_arg: Any) -> bool:
+    # [FUNCTION DOC] Return whether new_arg is a different tensor object that shares
+    # storage with arg (i.e. a metadata-only update). Subclasses recurse over inner
+    # tensors; raises AssertionError on mismatched subclass-ness, attr lists, or attr types.
     if is_traceable_wrapper_subclass(arg):
         if not is_traceable_wrapper_subclass(new_arg):
             raise AssertionError(
@@ -599,6 +680,11 @@ def was_tensor_metadata_updated(arg: Any, new_arg: Any) -> bool:
 
 # Returns the number of detected copy_
 def _is_functional_graph(fx_g: torch.fx.Graph) -> tuple[str | None, int]:
+    # [FUNCTION DOC] HELPER: Scan the graph for non-functional ops. Allowed mutating ops
+    # are copy_, set_ (source tensor), shallow_copy_data_ and fsdp copy_ if registered;
+    # they should only target placeholders (except buffer-donor cases) and are counted.
+    # Any other op with a mutable schema is an error. Returns (error message or None,
+    # count of allowed mutations). Only the last error found is reported.
     allowed_mutation_ops = [
         torch.ops.aten.copy_.default,
         torch.ops.aten.set_.source_Tensor,
@@ -632,6 +718,9 @@ def _is_functional_graph(fx_g: torch.fx.Graph) -> tuple[str | None, int]:
 
 
 def assert_functional_graph(fx_g: torch.fx.Graph) -> int:
+    # [FUNCTION DOC] Verify the graph is functional (apart from input mutations).
+    # Returns the number of allowed input-mutation ops; raises AssertionError with the
+    # description from _is_functional_graph otherwise.
     error, mutation_count = _is_functional_graph(fx_g)
     if error is not None:
         raise AssertionError(error)
@@ -639,6 +728,10 @@ def assert_functional_graph(fx_g: torch.fx.Graph) -> int:
 
 
 def propagate_input_mutation_stacktraces(fx_g: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] For each in-place copy into a graph input, copy the stack trace
+    # metadata from the source node of the copy onto the copy node (mutates node meta).
+    # Raises AssertionError if a copy targets a non-placeholder (excluding buffer-donor
+    # cases) or targets the same input twice.
     placeholders = set()
     for n in fx_g.nodes:
         if n.op == "placeholder":
@@ -670,6 +763,11 @@ def _check_if_mutation_can_be_in_graph(
     mutation_inductor_storage_resize: bool,
     requires_grad: bool,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether an input mutation can stay in the graph.
+    # Requires keep_input_mutations and a data/storage-metadata/resize mutation that
+    # is either free of metadata mutation and requires_grad, hidden from autograd, or
+    # under no-grad/inference mode. Raises AssertionError if the input has a set_ or
+    # resize mutation but the result would be False. Returns the boolean decision.
     if keep_input_mutations:
         in_graph = (
             mutates_data or mutates_storage_metadata or mutation_inductor_storage_resize
