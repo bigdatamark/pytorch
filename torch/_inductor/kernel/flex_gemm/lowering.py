@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Lowering of the FlexGEMM higher-order op in Inductor. Registers a
+# lowering for the flex_gemm HOP (import-time side effect via register_lowering) that
+# dispatches by backend: NVGEMM (decompose addmm/baddbmm then lower with NVGEMM
+# autotuning), QUACK (generated CuTeDSL epilogue template via lower_quack_flex_gemm), or
+# ordinary subgraph lowering. Also holds helpers for captured epilogue args, aux
+# outputs, config-key selection and output ordering.
+# KNOWN ISSUE: the module docstring is stale: it implies only non-QUACK requests are
+#     handled by ordinary lowering and says it will be fixed later, but an NVGEMM branch
+#     also exists.
 """Lower FlexGEMM HOP bodies and connect epilogue analysis to backend templates.
 
 ``flex_gemm_lowering`` is the main entry point. Non-QUACK
@@ -56,6 +65,11 @@ if TYPE_CHECKING:
 
 
 def decompose_nvgemm_additive_gemm(graph_module: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] Rewrite addmm and baddbmm nodes in the graph module in place into
+    # mm/bmm plus optional scalar multiply by alpha, bias scaling by beta and an add of
+    # the bias (skipped when beta is zero). Copies node meta to the replacement,
+    # replaces uses, erases the old node, and when anything changed removes dead code,
+    # lints and recompiles the module. Mutates the graph; returns None.
     graph = graph_module.graph
     changed = False
     for node in list(graph.nodes):
@@ -93,6 +107,8 @@ def decompose_nvgemm_additive_gemm(graph_module: torch.fx.GraphModule) -> None:
 def flex_gemm_tensor_placeholders(
     graph_module: torch.fx.GraphModule,
 ) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] Return all placeholder nodes whose fake value is a tensor
+    # (scalar/SymInt placeholders are excluded) in graph order.
     """Return placeholders QuACK can bind as tensor epilogue arguments.
 
     FlexGEMM identifies the GEMM A/B inputs from the mm node, then treats the
@@ -110,6 +126,8 @@ def flex_gemm_tensor_placeholders(
 def flex_gemm_epilogue_arg_placeholders(
     graph_module: torch.fx.GraphModule, gemm_fx_node: torch.fx.Node
 ) -> tuple[torch.fx.Node, ...]:
+    # [FUNCTION DOC] Return the tensor placeholders not used as arguments of the GEMM
+    # node, i.e. captured epilogue tensors, as a tuple in graph order.
     """Find tensor inputs captured by epilogue loads, excluding GEMM operands."""
     gemm_placeholders = OrderedSet(
         arg
@@ -128,6 +146,10 @@ def infer_flex_gemm_epilogue_arg_kinds(
     epilogue_args: list[IRNode],
     output_size: list[Any],
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] Classify each captured epilogue tensor by size relative to the
+    # output: scalar (1x1), tile (same as output), row (1xN) or col (Mx1). Returns a
+    # tuple of kind strings (empty if no args). Raises NotImplementedError if captured
+    # args exist with a non-mm op or an arg size matches none of the broadcasts.
     """Classify realized captured epilogue tensors for static wrapper kwargs."""
     if not epilogue_args:
         return ()
@@ -160,6 +182,10 @@ def validate_flex_gemm_aux_outputs(
     aux_outputs: tuple[torch.fx.Node, ...],
     output_size: list[Any],
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Validate aux outputs of a multi-output epilogue and return their
+    # fake tensor metadata as a tuple (empty if none). Raises NotImplementedError for
+    # non-mm ops, missing metadata, or an aux whose shape is not statically equal to the
+    # output (distinguishing partial-reduction shapes from other contract violations).
     """Validate QUACK aux-output support and return fake tensor metadata."""
     if not aux_outputs:
         return ()
@@ -186,6 +212,8 @@ def validate_flex_gemm_aux_outputs(
 def allocate_flex_gemm_aux_outs(
     aux_metas: tuple[Any, ...], mat1: TensorBox
 ) -> tuple[TensorBox, ...]:
+    # [FUNCTION DOC] Allocate one strided buffer per aux metadata entry, with its shape,
+    # strides and dtype, on mat1's device. Returns a tuple of TensorBox.
     """Allocate same-shape aux output buffers beside the main GEMM output."""
     return tuple(
         empty_strided(
@@ -199,6 +227,10 @@ def allocate_flex_gemm_aux_outs(
 
 
 def flex_gemm_ordered_outputs(result, aux_outs, local_reduce_outs, local_reduce_index):
+    # [FUNCTION DOC] Assemble user-visible outputs as a tuple: main result first, then
+    # aux outputs with the single local-reduce output inserted at local_reduce_index
+    # (appended last if index is None; absent if there is no local-reduce output).
+    # Raises AssertionError if more than one local-reduce output is given.
     """Return generated outputs in the user-visible tuple order."""
     match local_reduce_outs, local_reduce_index:
         case (), _:
@@ -217,6 +249,9 @@ def flex_gemm_ordered_outputs(result, aux_outs, local_reduce_outs, local_reduce_
 
 
 def flex_gemm_local_reduce_metas(local_reduce) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Return a one-element tuple with the fake value of the compressed
+    # local-reduce store node, or an empty tuple when there is no local-reduce plan or
+    # no store.
     """Return metadata for the optional compressed local-reduce output."""
     if local_reduce is None or local_reduce.store is None:
         return ()
@@ -224,6 +259,10 @@ def flex_gemm_local_reduce_metas(local_reduce) -> tuple[Any, ...]:
 
 
 def flex_gemm_autotune_view_input(node: ir.ReinterpretView) -> torch.Tensor:
+    # [FUNCTION DOC] Build a real example tensor for benchmarking a reinterpreted view
+    # input: take the benchmark example value for the node, find its base, and re-view
+    # it with the node's size, stride and offset (optimization hints for symbolic
+    # values). Returns the strided tensor.
     """Rebuild a logical view for Python-backed template benchmarks."""
     from torch._inductor.select_algorithm import (
         AlgorithmSelectorCache,
@@ -248,6 +287,9 @@ def filter_gemm_configs(
     explicit_error: str,
     inferred_error: str,
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Return the configs satisfying predicate as a tuple. Raises
+    # NotImplementedError with explicit_error if none remain and an explicit config was
+    # given, otherwise with inferred_error.
     """Filter configs while preserving explicit and inferred failure diagnostics."""
     supported = tuple(config for config in configs if predicate(config))
     if supported:
@@ -266,6 +308,14 @@ def flex_gemm_config_keys(
     output_contraction: FlexGemmOutputContraction | None = None,
     explicit_config: dict[str, Any] | None = None,
 ) -> tuple[tuple[Any, ...], ...]:
+    # [FUNCTION DOC] Select QuACK config keys. If an output contraction is present,
+    # validate it against the device compute capability and require a static physical N
+    # (NotImplementedError otherwise). Candidates come from the device defaults or from
+    # the explicit config. When not tuned, return the default key alone if it satisfies
+    # all grouped-geometry and contraction constraints. Otherwise filter candidates by
+    # the contraction and each geometry (raising NotImplementedError with explicit or
+    # inferred messages when none remain) and return all matching keys if tuned, else
+    # the first one.
     """Select QuACK config keys after applying grouped-layout config constraints.
 
     Every grouped geometry constrains the config the same way, whether it backs
@@ -349,6 +399,16 @@ def flex_gemm_config_keys(
 
 
 def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
+    # [FUNCTION DOC] Lower a FlexGEMM HOP body through the QuACK template. Validates the
+    # op and kernel options (allowed: backend, tuned, fast_math, config; fast_math bool,
+    # config dict) and GEMM kwargs (alpha, beta static scalars), locates the single GEMM
+    # node and operands, binds captured epilogue tensors, analyzes the epilogue, builds
+    # the output layout (with 16-byte aligned outer stride for output contractions),
+    # allocates aux and local-reduce outputs (as mutated template inputs), generates the
+    # epilogue source, selects config keys, builds one template choice per key,
+    # autotunes, applies a dtype view on the result if storage dtype differs, and logs
+    # artifacts along the way. Returns the outputs tuple in user order. Raises
+    # NotImplementedError for any unsupported combination.
     """Lower FlexGEMM through the generated QUACK CuTeDSL template.
 
     The current pipeline is:
@@ -698,6 +758,10 @@ def lower_quack_flex_gemm(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
 
 @register_lowering(flex_gemm_hop, type_promotion_kind=None)
 def flex_gemm_lowering(gemm_op, subgraph, args, gemm_kwargs, kernel_options):
+    # [FUNCTION DOC] Registered lowering for the flex_gemm HOP. Backend (kernel option,
+    # default TRITON) NVGEMM: decompose additive GEMMs and lower the body with max-
+    # autotune restricted to NVGEMM; QUACK: call lower_quack_flex_gemm; anything else:
+    # lower the body subgraph normally. Returns the lowered outputs.
     """Dispatch FlexGEMM to ordinary Inductor lowering or the QUACK template."""
     backend = kernel_options.get("backend", "TRITON")
     if backend == "NVGEMM":

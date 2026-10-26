@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Analysis and code generation for the FlexGEMM epilogue FX graph. Provides
+# the analysis entry point (finds the single GEMM node, classifies main/aux/local-reduce
+# outputs, plans output contractions over grouped N columns) and the emitter that lowers
+# each FX node to CuTeDSL source text plus optional physical reduction combine/finalize
+# callbacks. Import-time effects: only defines aliases to gemm_epilogue_analysis types;
+# no registration.
 """Analyze FlexGEMM epilogue FX graphs and materialize CuTeDSL source.
 
 ``analyze_flex_gemm_epilogue`` indexes FX dependencies, identifies nodes that
@@ -95,6 +101,9 @@ FlexGemmOutputLocalReducePlan = _epilogue_analysis.GemmOutputLocalReducePlan
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmOutputPlan(_epilogue_analysis.GemmOutputPlan):
+    # [CLASS DOC] Frozen output plan extending the base GemmOutputPlan with
+    # output_contraction (grouped-column contraction descriptor or None) and
+    # output_storage (the physical node under a terminal dtype view, or None).
     """Extend output planning with contraction and terminal storage metadata."""
 
     output_contraction: FlexGemmOutputContraction | None = None
@@ -105,10 +114,15 @@ FlexGemmCuteDSLKernel = GemmEpilogueCuteDSLKernel
 
 
 class FlexGemmCuteDSLOpOverrides(GemmEpilogueCuteDSLOpOverrides):
+    # [CLASS DOC] CuTeDSL op overrides for FlexGEMM; differs from the base only in
+    # clamp, clamp_min and clamp_max, which emit max/min calls that propagate NaN.
     """Add FlexGEMM-specific NaN-propagating clamp semantics."""
 
     @staticmethod
     def clamp(x: Any, min: Any = None, max: Any = None) -> Any:
+        # [FUNCTION DOC] Clamp x to optional lower bound min and upper bound max by
+        # chaining clamp_min then clamp_max; either bound may be None (skipped). Returns
+        # the resulting CuTeDSL value; no side effects.
         result = x
         if min is not None:
             result = FlexGemmCuteDSLOpOverrides.clamp_min(result, min)
@@ -118,6 +132,8 @@ class FlexGemmCuteDSLOpOverrides(GemmEpilogueCuteDSLOpOverrides):
 
     @staticmethod
     def clamp_min(x: Any, min: Any) -> Any:
+        # [FUNCTION DOC] Elementwise maximum of x and min using the base binary-op
+        # helper with a NaN-propagating math max template. Returns the generated value.
         return GemmEpilogueCuteDSLOpOverrides._apply_binary_op(
             x,
             min,
@@ -127,6 +143,8 @@ class FlexGemmCuteDSLOpOverrides(GemmEpilogueCuteDSLOpOverrides):
 
     @staticmethod
     def clamp_max(x: Any, max: Any) -> Any:
+        # [FUNCTION DOC] Elementwise minimum of x and max using the base binary-op
+        # helper with a NaN-propagating math min template. Returns the generated value.
         return GemmEpilogueCuteDSLOpOverrides._apply_binary_op(
             x,
             max,
@@ -140,6 +158,13 @@ def tuple_output_plan(
     aux_outputs: tuple[Any, ...],
     analysis: FlexGemmLocalReduceAnalysis,
 ) -> FlexGemmOutputPlan:
+    # [FUNCTION DOC] Build the output plan for an epilogue returning a main output plus
+    # aux outputs. Raises NotImplementedError if any output is not an FX node, if more
+    # than one aux output is a compressed local-reduce store, or if a feed-main
+    # reduction and a compressed aux reduce different physical values. A compressed aux
+    # match becomes the plan's local_reduce (merged with a common feed-main match, which
+    # then feeds the main output) and is removed from the aux list; otherwise a feed-
+    # main-only plan or a plain plan is returned.
     """Classify multi-output epilogues after checking local-reduce consumers."""
     if not isinstance(output, torch.fx.Node) or not all(
         isinstance(aux_output, torch.fx.Node) for aux_output in aux_outputs
@@ -190,6 +215,11 @@ def output_plan(
     graph_module: torch.fx.GraphModule,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> FlexGemmOutputPlan:
+    # [FUNCTION DOC] Classify the graph's single output node into a FlexGemmOutputPlan
+    # using the shared local-reduce analysis. A tuple of one element is unwrapped;
+    # longer tuples are delegated to tuple_output_plan. Raises NotImplementedError if
+    # there is not exactly one output node or the output is not a tensor node. Returns a
+    # plain plan unless a feed-main reduction applies.
     """Classify output consumers from one shared local-reduce analysis."""
     output_nodes = [node for node in graph_module.graph.nodes if node.op == "output"]
     if len(output_nodes) != 1:
@@ -216,6 +246,11 @@ def output_plan(
 def bind_terminal_output_storage(
     graph: FlexGemmEpilogueGraph, outputs: FlexGemmOutputPlan
 ) -> FlexGemmOutputPlan:
+    # [FUNCTION DOC] If the main output is a normalized dtype view, verify its source
+    # has the same dtype size, shape and strides as the view result and record the
+    # source as output_storage in a copy of the plan; otherwise return the plan
+    # unchanged. Raises NotImplementedError when the view is not a pure same-width
+    # reinterpretation (or metadata is missing).
     """Record the physical value beneath a terminal same-width dtype view."""
     normalized = graph.normalized_nodes.get(outputs.output)
     if not isinstance(normalized, NormalizedDtypeView):
@@ -238,6 +273,10 @@ def bind_terminal_output_storage(
 
 @dataclasses.dataclass(frozen=True)
 class OutputContractionUse:
+    # [CLASS DOC] Frozen record of one matched use of grouped GEMM columns in the main
+    # output: source node, group count, whether access is chunked (split/select over
+    # groups) rather than interleaved, the group indices consumed, and an optional node
+    # to register as a grouped layout.
     """Describe one supported use of grouped GEMM values in the main output."""
 
     source: torch.fx.Node
@@ -249,6 +288,9 @@ class OutputContractionUse:
 
 @dataclasses.dataclass(frozen=True)
 class OutputContractionPlan:
+    # [CLASS DOC] Frozen staged output contraction: the contraction descriptor, the
+    # mapping from select nodes to their group index, and grouped layouts to register.
+    # Nothing is applied to the analysis until commit is called.
     """Stage one complete output contraction until analysis commits it."""
 
     contraction: FlexGemmOutputContraction
@@ -260,6 +302,11 @@ class OutputContractionPlan:
         outputs: FlexGemmOutputPlan,
         local_reduce: FlexGemmLocalReduceAnalysis,
     ) -> FlexGemmOutputPlan:
+        # [FUNCTION DOC] Validate and install the staged contraction. Raises
+        # NotImplementedError if the plan already has aux outputs or a local reduce, or
+        # if a chunked contraction output depends on any matched reduction. Side effect:
+        # merges the staged grouped layouts into local_reduce.grouped_tensors. Returns a
+        # copy of outputs with output_contraction set.
         """Validate composition and install this output contraction."""
         if outputs.aux_outputs or outputs.local_reduce is not None:
             raise NotImplementedError(FLEX_GEMM_OUTPUT_CONTRACTION_COMPOSITION_ERROR)
@@ -277,6 +324,10 @@ def canonical_output_contraction_source(
     gemm: torch.fx.Node,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] Starting at a contraction use's source, walk back through shape-
+    # preserving pointwise nodes that have exactly one input depending on the GEMM,
+    # stopping at the GEMM or when the chain is ambiguous. Returns the canonical node
+    # used to compare provenance across uses.
     """Find one contraction use's GEMM provenance through pointwise wrappers."""
     while node is not gemm and is_shape_preserving_pointwise_node(node):
         inputs = [
@@ -296,6 +347,12 @@ def match_output_contraction_use(
     gemm_shape: tuple[Any, ...] | None,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> OutputContractionUse | None:
+    # [FUNCTION DOC] Try to match a node as one supported use of grouped GEMM values.
+    # Two forms: a getitem of a split along the last dimension of a 2D GEMM-shaped
+    # tensor (chunked, group = columns / split size), or a select over a 3D view of the
+    # GEMM output, either on dim 1 (chunked) or on the last dim of an already grouped
+    # axis-1 layout (not chunked). Returns an OutputContractionUse, or None when shapes,
+    # dims or sizes do not fit (group must exceed 1).
     """Match one supported use of grouped GEMM values in the main output."""
     if gemm_shape is None:
         return None
@@ -377,6 +434,10 @@ def collect_output_contraction_uses(
     gemm: torch.fx.Node,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> list[tuple[torch.fx.Node, OutputContractionUse]] | None:
+    # [FUNCTION DOC] Depth-first walk from the main output over FX inputs, collecting
+    # (node, use) pairs for matched contraction uses without mutating analysis state.
+    # Returns None if the GEMM or a GEMM-dependent grouped tensor is reached outside a
+    # matched use, or if no use is found.
     """Collect contraction uses without mutating analysis state."""
     gemm_shape = tensor_meta_shape(gemm)
     uses: list[tuple[torch.fx.Node, OutputContractionUse]] = []
@@ -405,6 +466,12 @@ def build_output_contraction_plan(
     gemm: torch.fx.Node,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> OutputContractionPlan | None:
+    # [FUNCTION DOC] Build an OutputContractionPlan if all collected uses share one
+    # canonical source, group count and chunked flag, cover every group index exactly
+    # (negative indices are normalized), and the output shape equals GEMM rows by
+    # columns divided by group. Returns None when any condition fails; raises
+    # NotImplementedError if the covering uses produce an output of the wrong static
+    # shape. Pure with respect to analysis state.
     """Build a plan when all grouped GEMM values form one output contraction."""
     collected = collect_output_contraction_uses(output, gemm, local_reduce)
     if collected is None:
@@ -453,6 +520,10 @@ def validate_shape_preserving_main_output(
     gemm: torch.fx.Node,
     local_reduce: FlexGemmLocalReduceAnalysis,
 ) -> None:
+    # [FUNCTION DOC] Check a non-contraction main output. Raises NotImplementedError if
+    # any select over an axis-1 grouped tensor remains (incomplete contraction) or if
+    # the output shape is unknown or not statically equal to the GEMM shape. Returns
+    # nothing.
     """Reject incomplete grouped selects and other shape-changing main outputs."""
     # TODO: Consider DCE before analysis if dead grouped selects become common.
     if any(
@@ -476,6 +547,11 @@ def validate_shape_preserving_main_output(
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmEpilogueAnalysis:
+    # [CLASS DOC] Frozen result of analysis shared by config selection, lowering and
+    # emission: the GEMM node, the output plan, the local-reduce analysis, and select-
+    # node to group-index mapping from the committed contraction (empty if none). Build
+    # with from_graph_module; properties expose required grouped geometries and the
+    # reduction plan.
     """Bundle the immutable analysis consumed by FlexGEMM lowering and emission.
 
     Attributes:
@@ -496,6 +572,10 @@ class FlexGemmEpilogueAnalysis:
     def from_graph_module(
         cls, graph_module: torch.fx.GraphModule, gemm: torch.fx.Node
     ) -> "FlexGemmEpilogueAnalysis":
+        # [FUNCTION DOC] Run local-reduce analysis on the graph, classify outputs, bind
+        # terminal dtype-view storage, then either commit an output contraction plan or
+        # validate that the main output preserves the GEMM shape. Returns the assembled
+        # analysis; propagates NotImplementedError from the steps.
         """Analyze grouped values and classify logical output consumers."""
         local_reduce = FlexGemmLocalReduceAnalysis.from_graph_module(graph_module)
         outputs = bind_terminal_output_storage(
@@ -514,6 +594,10 @@ class FlexGemmEpilogueAnalysis:
 
     @property
     def required_geometries(self) -> tuple[FlexGemmLocalReduceGeometry, ...]:
+        # [FUNCTION DOC] Collect the distinct grouped geometries that constrain kernel
+        # configuration: those of all matches, of the output local-reduce plan if any,
+        # and an axis-1 geometry for the output contraction if any. Returns them as a
+        # tuple.
         """Return every grouped geometry that constrains kernel configuration."""
         geometries = OrderedSet(
             match.geometry for match in self.local_reduce.matches.values()
@@ -531,6 +615,8 @@ class FlexGemmEpilogueAnalysis:
 
     @property
     def reduction_plan(self) -> GemmReductionPlan | None:
+        # [FUNCTION DOC] Return the backend-neutral reduction plan from the output plan
+        # (may be None).
         """Return the backend-neutral reduction plan produced by FX analysis."""
         return self.outputs.reduction_plan
 
@@ -539,6 +625,11 @@ def analyze_flex_gemm_epilogue(
     graph_module: torch.fx.GraphModule,
     gemm: torch.fx.Node,
 ) -> FlexGemmEpilogueAnalysis:
+    # [FUNCTION DOC] Analysis entry point called by FlexGEMM lowering: delegate to
+    # FlexGemmEpilogueAnalysis.from_graph_module for the given body graph module and
+    # GEMM node. Returns the immutable analysis used by later phases and by the
+    # materialization step.
+    # KNOWN ISSUE: docstring omits the gemm argument.
     """Analyze FlexGEMM body for output planning and epilogue code generation.
 
     This is the analysis entry point called by FlexGEMM lowering. It builds a
@@ -558,6 +649,8 @@ def analyze_flex_gemm_epilogue(
 def gemm_node(
     graph_module: torch.fx.GraphModule, gemm_op: torch._ops.OpOverload
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] Return the unique call_function node whose target is gemm_op in the
+    # graph. Raises NotImplementedError unless exactly one such node exists.
     gemm_nodes = [
         node
         for node in graph_module.graph.nodes
@@ -570,6 +663,14 @@ def gemm_node(
 
 class FlexGemmEpilogueEmitter:
     """Visit an analyzed FlexGEMM FX graph and emit its CuTeDSL epilogue.
+    # [CLASS DOC] Visitor that lowers an analyzed FlexGEMM FX graph into CuTeDSL
+    # epilogue source. It owns all mutable emission state: env (FX node to generated
+    # value, seeded with the accumulator for the GEMM), grouped layouts, active grouped
+    # layouts, store_sources (compressed local-reduce store expressions),
+    # physical_reductions (combine/finalize callbacks), and the feed_main / aux /
+    # feed_main_input nodes derived from the output local-reduce plan. Key methods:
+    # lower_graph (topological traversal), lower_call_function (ordered handlers),
+    # render (source text), materialize (full pipeline under virtualized handlers).
 
     The analysis dataclasses flow into each other as follows:
 
@@ -612,6 +713,13 @@ class FlexGemmEpilogueEmitter:
         *,
         fast_math: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize emission state from the analysis: copy grouped
+        # tensor geometry into emitter layouts, compute active layouts from required
+        # geometries, create the kernel and the environment with the accumulator
+        # variable. If the output plan is a feed-main local reduce, record the reduction
+        # node, its input and the optional aux store node (raises AssertionError if the
+        # node is not a normalized reduction); if only a store is planned, record the
+        # aux node.
         self.graph_module = graph_module
         self.epilogue_arg_placeholders = epilogue_arg_placeholders
         self.fast_math = fast_math
@@ -661,6 +769,10 @@ class FlexGemmEpilogueEmitter:
                 pass
 
     def bind_epilogue_args(self) -> None:
+        # [FUNCTION DOC] For each captured tensor placeholder create a named aux
+        # parameter variable in env (bool is stored as uint8) and, when the logical
+        # compute dtype differs from the physical dtype, wrap it in a conversion. Marks
+        # variables scalar-valued when an output contraction is active. Mutates env.
         """Bind captured tensor placeholders to generated CuTeDSL parameters."""
         for index, node in enumerate(self.epilogue_arg_placeholders):
             epilogue_arg_meta = node.meta["val"]
@@ -683,6 +795,10 @@ class FlexGemmEpilogueEmitter:
                 )
 
     def bind_reduction(self, node: torch.fx.Node, lowered_reduce: Any) -> None:
+        # [FUNCTION DOC] Store the lowered reduction for node in env. If node is the
+        # feed-main reduction, instead bind it to the feed-main argument variable (same
+        # dtype and shape) and inherit the grouped layout of its input; the generated
+        # reduction is discarded.
         """Bind a generated reduction or replace it with the feed-main parameter."""
         if self.feed_main is not None and node is self.feed_main:
             self.env[node] = CuteDSLCSEVariable(
@@ -697,6 +813,12 @@ class FlexGemmEpilogueEmitter:
         self.env[node] = lowered_reduce
 
     def lower_compact_inline_asm(self, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] Special case for an inline asm elementwise call applied to a
+        # compact (reduced) value, directly or through one shape-preserving pointwise
+        # node. Applies the call to the compact value, then broadcasts it back and
+        # records the result in store_sources. Returns True if handled (env updated);
+        # False when not applicable (feed-main active, wrong op, multiple tensor inputs,
+        # no reduction source, or no grouped layout).
         """Apply inline asm before broadcasting a compact reduction value."""
         if (
             self.feed_main is not None
@@ -753,6 +875,10 @@ class FlexGemmEpilogueEmitter:
         return True
 
     def lower_pointwise_store(self, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] Lower a shape-preserving pointwise node that consumes a
+        # compressed store value by substituting store expressions for its arguments.
+        # Updates env and store_sources and returns True; returns False when feed-main
+        # is active, the node is not pointwise, or no input is in store_sources.
         """Lower pointwise expressions that consume a compressed store value."""
         if (
             self.feed_main is not None
@@ -776,11 +902,18 @@ class FlexGemmEpilogueEmitter:
         return True
 
     def propagate_physical_reduction(self, node: torch.fx.Node, source: Any) -> None:
+        # [FUNCTION DOC] HELPER: If source has a physical reduction recorded, record the
+        # same one for node so shape-only wrappers keep provenance. Mutates
+        # physical_reductions.
         """Preserve physical callback provenance through shape-only wrappers."""
         if isinstance(source, torch.fx.Node) and source in self.physical_reductions:
             self.physical_reductions[node] = self.physical_reductions[source]
 
     def physical_finalize_arg(self, value: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Recursively convert a value into finalizer text: nodes
+        # with a physical reduction become that reduction's finalize expression, tuples
+        # and lists are converted elementwise (same type), anything else goes through
+        # the normal argument conversion.
         """Replace physical reduction inputs with their generated value expression."""
         if isinstance(value, torch.fx.Node) and value in self.physical_reductions:
             return self.physical_reductions[value].finalize_expr
@@ -789,6 +922,12 @@ class FlexGemmEpilogueEmitter:
         return _cute_arg(value, self.env)
 
     def compose_physical_finalize(self, node: torch.fx.Node) -> Any | None:
+        # [FUNCTION DOC] Fold a pointwise node that consumes a physical reduction into
+        # that reduction's finalizer. Returns None if no input is a physical reduction;
+        # raises NotImplementedError if several distinct ones are consumed or the
+        # combined expression is not a string. Side effects: copies the base store
+        # source to node and records an updated physical reduction. Returns the new
+        # finalize expression.
         """Fold a pointwise consumer into one generated physical finalizer."""
         physical_inputs = list(
             OrderedSet(
@@ -816,6 +955,14 @@ class FlexGemmEpilogueEmitter:
         return finalize_expr
 
     def lower_call_function(self, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Lower one call_function node. Order: full-scalar constants;
+        # then handlers by normalized kind (terminal dtype view, squeeze, grouped split,
+        # contraction select, getitem, online softmax prepare, view/reshape, reduction,
+        # unsupported reduction); then physical finalizer composition, compact inline
+        # asm, compressed pointwise store; finally the generic CuTeDSL call. Writes the
+        # result into env. Raises NotImplementedError for dtype views that are not
+        # terminal main outputs, unsupported reductions, or pointwise use of a physical
+        # reduction when there is no aux store.
         """Lower one call_function node using the ordered FlexGEMM handlers."""
         lowered = lower_full_scalar(node)
         if lowered is not None:
@@ -922,6 +1069,10 @@ class FlexGemmEpilogueEmitter:
         self.env[node] = _cute_call(node, node_args, node_kwargs)
 
     def lower_graph(self) -> None:
+        # [FUNCTION DOC] Lower all nodes in FX order, skipping the GEMM, placeholders,
+        # outputs and nodes whose value is an integer or symbolic int. Each node is
+        # lowered with it set as the current node. Raises NotImplementedError for non
+        # call_function nodes.
         """Lower body nodes in FX topological order."""
         for node in self.graph_module.graph.nodes:
             if node is self.gemm or node.op in ("placeholder", "output"):
@@ -939,6 +1090,9 @@ class FlexGemmEpilogueEmitter:
     def aux_result(
         aux: torch.fx.Node | None, store_sources: dict[torch.fx.Node, Any]
     ) -> Any | None:
+        # [FUNCTION DOC] Return the compressed aux expression for aux from
+        # store_sources, or None if aux is None. Raises NotImplementedError if an aux
+        # was planned but no TensorSSA store expression exists.
         """Return the compressed-aux expression or reject missing TensorSSA."""
         if aux is None:
             return None
@@ -948,6 +1102,13 @@ class FlexGemmEpilogueEmitter:
         return result
 
     def render(self) -> tuple[str, str]:
+        # [FUNCTION DOC] Produce the final generated source. Builds the function body
+        # from kernel lines, parameter list (acc, aux params, optional feed-main arg),
+        # and a return of the main output (a tuple when aux outputs or a compressed aux
+        # exist). Computes a short sha256-based name from inline asm key, fast-math
+        # flag, graph code, body and result, and when a physical reduction exists emits
+        # combine and finalize jit helper functions with fixed cache keys. Returns
+        # (function name, full source text including imports).
         """Render the generated epilogue and physical callback source."""
         from torch._inductor.codegen.cutedsl._inline_asm import inline_asm_cache_key
 
@@ -1021,6 +1182,9 @@ class FlexGemmEpilogueEmitter:
 
     def materialize(self) -> tuple[str, str]:
         """Lower and render this epilogue under the CuTeDSL virtualized handlers."""
+        # [FUNCTION DOC] Run the full pipeline: with the kernel and CuTeDSL op overrides
+        # installed as virtualized handlers (and the fast-math setting applied), bind
+        # epilogue args and lower the graph, then render. Returns (name, source).
         with (
             V.set_kernel_handler(self.kernel),
             V.set_ops_handler(FlexGemmCuteDSLOpOverrides()),
@@ -1038,6 +1202,11 @@ def materialize_flex_gemm_epilogue(
     *,
     fast_math: bool = False,
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] Code-generation entry point: construct a FlexGemmEpilogueEmitter
+    # and materialize it. Args are the graph module, the analysis, captured tensor
+    # placeholders exposed as aux parameters, and the fast_math flag. Returns (epilogue
+    # function name, CuTeDSL source).
+    # KNOWN ISSUE: docstring mentions a gemm_op argument that does not exist.
     """Materialize an analyzed FlexGEMM body as generated CuTeDSL source.
 
     This is the code-generation entry point called by FlexGEMM lowering after

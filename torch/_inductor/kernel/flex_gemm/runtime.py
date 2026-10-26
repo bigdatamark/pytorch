@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Runtime (eager) side of FlexGEMM on the QuACK backend: validation helpers
+# for operands, layouts and captured epilogue tensors, runtime plan dataclasses for aux
+# outputs, local reductions and output contractions, callback registration, the dispatch
+# into the vendored QuACK gemm_act kernel, and the public gemm_epilogue entry point that
+# the generated wrapper calls. No import-time side effects beyond definitions and the
+# swapped-kind table.
 from __future__ import annotations
 
 import contextlib
@@ -44,6 +50,8 @@ _SWAPPED_ARG_KIND = {"row": "col", "col": "row", "tile": "tile", "scalar": "scal
 
 
 def inductor_quack_cache_dir() -> str:
+    # [FUNCTION DOC] Return the Inductor cache directory joined with a quack
+    # subdirectory; used as the cache root for generated FlexGEMM work. No I/O.
     """Return the Inductor-owned QuACK cache root for generated FlexGEMM."""
     return os.path.join(cache_dir(), "quack")
 
@@ -51,6 +59,9 @@ def inductor_quack_cache_dir() -> str:
 def check_matrix(
     name: str, tensor: torch.Tensor, expected_ndim: int | None = None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validate a matrix operand: raises RuntimeError if
+    # expected_ndim is given and differs or the tensor is not CUDA, and
+    # NotImplementedError if its rank is not 2 or 3.
     """Require a CUDA matrix operand with optional generated-op rank checking."""
     if expected_ndim is not None and tensor.ndim != expected_ndim:
         raise RuntimeError(
@@ -63,6 +74,8 @@ def check_matrix(
 
 
 def check_same_device(a: torch.Tensor, b: torch.Tensor, *rest: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError unless all given tensors are on the same
+    # device as the first.
     """Require all runtime tensors to live on the same CUDA device."""
     device = a.device
     if b.device != device or any(tensor.device != device for tensor in rest):
@@ -72,6 +85,8 @@ def check_same_device(a: torch.Tensor, b: torch.Tensor, *rest: torch.Tensor) -> 
 def check_broadcast_shape(
     name: str, shape: torch.Size, expected_shape: tuple[int, ...]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError unless the given shape can be expanded
+    # (broadcast) to the expected shape.
     """Require a tensor shape to broadcast exactly to the GEMM output shape."""
     if not is_expandable_to(tuple(shape), expected_shape):
         raise RuntimeError(
@@ -80,6 +95,8 @@ def check_broadcast_shape(
 
 
 def check_matrix_major_layout(name: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Raise NotImplementedError unless the tensor has unit stride
+    # in its last or second-to-last dimension (row- or column-major).
     """Require row-major or column-major dense matrix strides."""
     if tensor.stride(-1) != 1 and tensor.stride(-2) != 1:
         raise NotImplementedError(
@@ -88,12 +105,16 @@ def check_matrix_major_layout(name: str, tensor: torch.Tensor) -> None:
 
 
 def check_matrix_row_major_layout(name: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Raise NotImplementedError unless the tensor's last
+    # dimension has unit stride.
     """Require last-dim-contiguous matrix strides for QuACK-written aux storage."""
     if tensor.stride(-1) != 1:
         raise NotImplementedError(f"FlexGEMM requires {name} to be row-major")
 
 
 def check_epilogue_arg_kinds(epilogue_arg_kinds: tuple[str, ...]) -> None:
+    # [FUNCTION DOC] HELPER: Raise NotImplementedError if any declared kind is not one
+    # of tile, row, col or scalar.
     """Require each epilogue arg kind to be row, col, tile, or scalar."""
     for kind in epilogue_arg_kinds:
         if kind not in ("tile", "row", "col", "scalar"):
@@ -103,6 +124,9 @@ def check_epilogue_arg_kinds(epilogue_arg_kinds: tuple[str, ...]) -> None:
 
 
 def infer_epilogue_arg_kind(a: torch.Tensor, b: torch.Tensor, arg: torch.Tensor) -> str:
+    # [FUNCTION DOC] HELPER: Infer a captured tensor's kind from its 2-D shape relative
+    # to the output (rows of a by columns of b): scalar for 1x1, tile for full, row for
+    # 1xN, col for Mx1, checked in that order. Raises NotImplementedError otherwise.
     """Infer a captured epilogue tensor's broadcast kind from its shape."""
     m, n = a.shape[-2], b.shape[-1]
     if tuple(arg.shape) == (1, 1):
@@ -125,6 +149,8 @@ def validate_epilogue_arg_shape(
     arg: torch.Tensor,
     kind: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError unless the captured tensor's shape
+    # equals the shape its declared kind requires for the output.
     """Require a captured epilogue tensor shape to match its declared kind."""
     m, n = a.shape[-2], b.shape[-1]
     expected_shapes = {
@@ -146,6 +172,10 @@ def resolve_epilogue_arg_kinds(
     epilogue_args: tuple[torch.Tensor, ...],
     epilogue_arg_kinds: tuple[str, ...],
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Return the epilogue arg kinds to use. Raises RuntimeError
+    # if declared kinds differ in count from the args or fail shape validation, and
+    # NotImplementedError for unknown kinds. If no kinds were declared, infer each from
+    # the tensor shapes.
     """Validate declared epilogue arg kinds or infer them from tensor shapes."""
     if epilogue_arg_kinds and len(epilogue_arg_kinds) != len(epilogue_args):
         raise RuntimeError("epilogue_arg_kinds must match epilogue_args length")
@@ -162,6 +192,8 @@ def resolve_epilogue_arg_kinds(
 # a 1-bit logical type. Keep the manual uint8 storage view
 # see https://github.com/NVIDIA/cutlass/issues/3348 for details
 def quack_epilogue_arg(arg: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the tensor viewed as uint8 if it is bool (QuACK's
+    # physical ABI), otherwise unchanged.
     """Adapt logical epilogue tensors to QuACK's physical tensor ABI."""
     return arg.view(torch.uint8) if arg.dtype is torch.bool else arg
 
@@ -175,6 +207,10 @@ def split_epilogue_args(
     tuple[torch.Tensor, ...],
     tuple[torch.Tensor, ...],
 ]:
+    # [FUNCTION DOC] HELPER: Partition epilogue tensors by kind into four tuples (row,
+    # col, tile, scalar). Bool tensors become uint8 views; col tensors are reshaped to a
+    # leading-batch vector, tile tensors get a leading batch dim, scalars are flattened
+    # to one element. Returns the four tuples in that order.
     """Group epilogue tensors into QuACK row, col, tile, and scalar argument lists."""
     row_args = []
     col_args = []
@@ -197,6 +233,9 @@ def split_epilogue_args(
 def normalize_c(
     C: torch.Tensor | None, expected_shape: tuple[int, ...], beta: float
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] Return the C tensor QuACK should read: None if C is None or beta is
+    # zero; otherwise C broadcast to the expected shape, after checking broadcastability
+    # (RuntimeError), CUDA rank and major-layout (NotImplementedError).
     """Return the effective C tensor that QuACK should read for alpha/beta GEMMs."""
     if C is None:
         return None
@@ -211,6 +250,10 @@ def normalize_c(
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmRuntimeLocalReducePlan:
+    # [CLASS DOC] Frozen runtime plan for one local reduction: its geometry (group,
+    # axis), an optional compressed output tensor, optional physical callbacks (combine
+    # and finalize functions), and whether the reduction feeds the main output.
+    # Invariants checked at construction; group and axis expose geometry fields.
     """Runtime plan for one local reduction and its output/feed-main consumers."""
 
     geometry: FlexGemmLocalReduceGeometry
@@ -219,6 +262,10 @@ class FlexGemmRuntimeLocalReducePlan:
     feeds_main: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate the plan. Raises RuntimeError if there is no output
+        # tensor and it does not feed main, if a feed-main plan lacks callbacks (also
+        # checks the feed-main capability for this axis and group), or if a non-feed-
+        # main plan whose geometry needs physical callbacks lacks them.
         """Reject plans without the output/callback state required by their consumer."""
         if self.out is None and not self.feeds_main:
             raise RuntimeError(LOCAL_REDUCE_RUNTIME_OUT_ERROR)
@@ -231,15 +278,20 @@ class FlexGemmRuntimeLocalReducePlan:
 
     @property
     def group(self) -> int:
+        # [FUNCTION DOC] Property: group size from the geometry.
         return self.geometry.group
 
     @property
     def axis(self) -> int:
+        # [FUNCTION DOC] Property: reduction axis from the geometry.
         return self.geometry.axis
 
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmRuntimeOutputPlan:
+    # [CLASS DOC] Frozen bundle of all user-visible output consumers for the generated
+    # runtime ABI: aux output tensors, an optional local-reduce plan, and an optional
+    # output contraction. A contraction cannot coexist with the other two.
     """Bundle all user-visible output consumers into one generated ABI value."""
 
     aux_outs: tuple[torch.Tensor, ...] = ()
@@ -247,12 +299,17 @@ class FlexGemmRuntimeOutputPlan:
     output_contraction: FlexGemmOutputContraction | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raise NotImplementedError if an output contraction is combined
+        # with aux outputs or a local reduce.
         if self.output_contraction is not None and (
             self.aux_outs or self.local_reduce is not None
         ):
             raise NotImplementedError(FLEX_GEMM_OUTPUT_CONTRACTION_COMPOSITION_ERROR)
 
     def output_shape(self, physical_shape: tuple[int, ...]) -> tuple[int, ...]:
+        # [FUNCTION DOC] Return the logical output shape: the physical shape unchanged
+        # without a contraction, otherwise the last dim divided by the contraction
+        # group. Raises RuntimeError if the last dim is not divisible by the group.
         """Return the logical shape after applying the output contraction."""
         if self.output_contraction is None:
             return physical_shape
@@ -272,6 +329,10 @@ def validate_runtime_local_reduce(
     alpha: float,
     beta: float,
 ) -> None:
+    # [FUNCTION DOC] Validate a local-reduce plan at runtime (no-op for None): dense 2-D
+    # mm only, selected dim divisible by group, no effective C or non-default
+    # alpha/beta, and, if there is an output tensor, that it is CUDA, row-major and has
+    # the expected compressed shape. Raises via the validators.
     """Validate local-reduce runtime tensor shapes and unsupported consumers."""
     if plan is None:
         return
@@ -290,6 +351,9 @@ def validate_runtime_local_reduce(
 
 
 def local_reduce_callback_key(callback: Any, fallback_key: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the callback's cache key (calling it if callable)
+    # when it defines one, else the fallback key. Raises RuntimeError if the key is not
+    # a string.
     """Use a generated callback cache key when present, otherwise its caller key."""
     cache_key = getattr(callback, "__cache_key__", None)
     if cache_key is None:
@@ -304,6 +368,10 @@ def register_runtime_local_reduce_callbacks(
     local_reduce: FlexGemmRuntimeLocalReducePlan | None,
     epilogue_key: str,
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] Register generated combine/finalize callbacks with QuACK under
+    # cache keys derived from the callbacks or from the epilogue key plus suffixes. Side
+    # effect: updates the QuACK local-reduce function registry. Returns (combine key,
+    # finalize key), or (None, None) when there are no callbacks.
     """Register generated physical callbacks and return QuACK registry keys."""
     if local_reduce is None or local_reduce.callbacks is None:
         return None, None
@@ -330,6 +398,9 @@ def local_reduce_gemm_act_kwargs(
     local_reduce_out: torch.Tensor | None,
     callback_keys: tuple[str | None, str | None],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Build the keyword arguments for QuACK gemm_act describing
+    # the local reduction (output presence, feeds-main flag, output tensor, group, axis,
+    # callback keys). Returns an empty mapping when there is no plan.
     """Map a concrete runtime plan onto QuACK's public local-reduce kwargs."""
     if local_reduce is None:
         return {}
@@ -363,6 +434,15 @@ def dispatch_gemm_act(
     config,
     device_capacity_override: tuple[int, int] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Call the vendored QuACK gemm_act for one dense GEMM. Uses b
+    # transposed as QuACK's B operand, applies swap_ab if configured (swaps operands,
+    # transposes out/C/aux views and tile args, exchanges row/col args and kinds; raises
+    # NotImplementedError when combined with an output contraction or a local reduce),
+    # adds a leading batch dim to 2-D operands, views aux outputs as QuACK ABI types,
+    # and passes tile config, epilogue key, arg groups, local-reduce kwargs, contraction
+    # group and layout, alpha, beta and device-capacity override. With aux outputs the
+    # main result is D and aux go to PostAct; otherwise out is PostAct. Writes results
+    # in place; returns None.
     """Dispatch one dense FlexGEMM call to the vendored QuACK GEMM kernel.
 
     ``config.swap_ab`` dispatches the transposed problem (only the tile schedule
@@ -482,6 +562,17 @@ def gemm_epilogue(
     stream: int | None = None,
     quack_cache_dir: str | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Public runtime entry: run a dense (2-D or 3-D) GEMM with a CuTeDSL
+    # epilogue through QuACK. Validates operands (CUDA, layouts, shape compatibility,
+    # matching batch), output contraction constraints (device capability, B layout, 2-D,
+    # no C and default alpha/beta), out shape and dtype, aux outputs (2-D mm only, no
+    # C/alpha/beta, matching shape), local-reduce plan, and captured args (not batched,
+    # no C, default alpha/beta, same device, valid kinds). Registers the epilogue and
+    # callbacks, allocates out if missing, resolves the config (explicit key or first
+    # device candidate; contraction-compatible choice when needed, NotImplementedError
+    # if unsupported), then dispatches on the given CUDA stream and cache directory.
+    # Returns the main output tensor. Raises RuntimeError for shape/device/dtype errors
+    # and NotImplementedError for unsupported combinations.
     """Run a dense GEMM through QuACK with a CuTeDSL epilogue.
 
     Args:

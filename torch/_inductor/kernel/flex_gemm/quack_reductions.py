@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers that lower FlexGEMM grouped local reductions into QuACK/CuTeDSL
+# epilogue text. Defines the grouped TensorSSA layout (M or N groups), the physical
+# reduction callback record, FX-to-CuTeDSL argument and call translation,
+# shape/pointwise predicates, and per-node lowering functions (view/reshape, grouped
+# split/select, squeeze, getitem, online softmax preparation, reductions). Main caller
+# is the emitter in fx_cutedsl_codegen. No import-time side effects beyond definitions.
 """Lower FlexGEMM grouped local reductions into QuACK/CuTeDSL epilogues.
 
 FlexGEMM recognizes a narrow local-reduction contract inside the GEMM output
@@ -52,9 +58,15 @@ from torch.utils._ordered_set import OrderedSet
 
 @dataclasses.dataclass(frozen=True)
 class GroupedTensorSSALayout(GemmReductionGeometry):
+    # [CLASS DOC] Frozen grouped M/N TensorSSA layout (extends GemmReductionGeometry,
+    # which supplies group, axis, group_size and the physical-callback predicates). Its
+    # methods produce CuTeDSL shape/size expression text for reshaping a fragment into
+    # groups and for keepdim results, and the reduction profile for the axis.
     """Describe a grouped M/N TensorSSA view inside the generated epilogue."""
 
     def fragment_group_size_expr(self, source: Any) -> str:
+        # [FUNCTION DOC] Return expression text for the group size usable in the current
+        # fragment: the configured group size capped by the first-mode size of source.
         """Return the local group size available in this epilogue fragment."""
         return (
             f"cutlass.const_expr(min({self.group_size}, "
@@ -62,6 +74,8 @@ class GroupedTensorSSALayout(GemmReductionGeometry):
         )
 
     def fragment_repeat_expr(self, source: Any) -> str:
+        # [FUNCTION DOC] Return expression text for how many repeats of the capped group
+        # cover the fragment's first mode of source.
         """Return the repeat count needed to cover the current epilogue fragment."""
         return (
             f"cutlass.const_expr(cute.size({source}.shape, mode=[0]) "
@@ -69,6 +83,9 @@ class GroupedTensorSSALayout(GemmReductionGeometry):
         )
 
     def tensorssa_shape(self, source: Any) -> str:
+        # [FUNCTION DOC] Return the grouped TensorSSA shape text for source: group
+        # dimension in the second nested slot for axis 1 (N groups), first slot
+        # otherwise (M groups), with the repeat count in the third slot.
         fragment_group_size = self.fragment_group_size_expr(source)
         repeats = self.fragment_repeat_expr(source)
         if self.axis == 1:
@@ -76,20 +93,29 @@ class GroupedTensorSSALayout(GemmReductionGeometry):
         return f"(({fragment_group_size}, 1, {repeats}), 1, 1)"
 
     def keepdim_shape(self, source: Any) -> str:
+        # [FUNCTION DOC] Return the keepdim shape text (group dimension collapsed to 1,
+        # repeats kept) for source.
         return f"((1, 1, {self.fragment_repeat_expr(source)}), 1, 1)"
 
     @property
     def needs_physical_combine(self) -> bool:
+        # [FUNCTION DOC] Property: alias of needs_physical_callbacks, true when the
+        # reduction must be finished by QuACK physical combine/finalize callbacks.
         return self.needs_physical_callbacks
 
     @property
     def reduction_profile(self) -> str:
+        # [FUNCTION DOC] Property: reduction profile text marking which nested mode is
+        # reduced, the second slot for axis 1 and the first slot otherwise.
         if self.axis == 1:
             return "((None, 1, None), 1, 1)"
         return "((1, None, None), 1, 1)"
 
 
 def _cute_op_name(target: Any) -> str | None:
+    # [FUNCTION DOC] HELPER: Derive the op name for an FX call target: overload packet
+    # name, string as given, or callable's name, else None. The name div is mapped to
+    # truediv.
     if isinstance(target, torch._ops.OpOverload):
         op_name = target.overloadpacket.__name__
     elif isinstance(target, str):
@@ -101,6 +127,9 @@ def _cute_op_name(target: Any) -> str | None:
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmPhysicalReduction:
+    # [CLASS DOC] Frozen description of a QuACK physical reduction: combine_expr is the
+    # generated combine expression for two partial values and finalize_expr (default:
+    # identity on the value) is applied to the combined result.
     """Describe QuACK's physical combine/finalize callback for local reductions."""
 
     combine_expr: str
@@ -120,6 +149,11 @@ FLEX_GEMM_POINTWISE_OP_NAMES = frozenset(
 
 
 def _cute_arg(value: Any, env: dict[torch.fx.Node, Any]) -> Any:
+    # [FUNCTION DOC] HELPER: Convert an FX argument to a CuTeDSL value. Nodes are looked
+    # up in env (NotImplementedError if absent); non-finite floats become source text
+    # for nan or +/-inf; ints, floats, bools, strings and torch
+    # dtype/device/layout/memory_format pass through; tuples and lists convert
+    # recursively keeping their type; anything else raises NotImplementedError.
     """Translate FX node references and constants into CuTeDSL epilogue values."""
     if isinstance(value, torch.fx.Node):
         if value in env:
@@ -153,6 +187,9 @@ def _cute_arg(value: Any, env: dict[torch.fx.Node, Any]) -> Any:
 def _generate_like(
     kernel: Any, expr: str, ref: Any, shape_ref: Any | None = None
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Emit expr into the kernel body through its CSE with dtype
+    # taken from ref and shape from shape_ref (default ref). Returns the new CSE
+    # variable.
     """Emit CuTeDSL while preserving dtype and shape metadata from references."""
     if shape_ref is None:
         shape_ref = ref
@@ -167,6 +204,9 @@ def _generate_like(
 def _keepdim_and_broadcast(
     kernel: Any, reduced: Any, layout: GroupedTensorSSALayout, source: Any
 ) -> tuple[Any, Any]:
+    # [FUNCTION DOC] HELPER: Emit two values for a grouped reduction result: the reduced
+    # value reshaped to the keepdim shape, and that value broadcast to the shape of
+    # source. Returns (keepdim value, broadcast value). Writes lines to the kernel body.
     """Materialize keepdim and store-shaped forms of a grouped reduction."""
     keepdim_source = _generate_like(
         kernel, f"{reduced}.reshape({layout.keepdim_shape(source)})", reduced
@@ -181,6 +221,12 @@ def _cute_call(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Lower one FX call by invoking the same-named method on the
+    # active ops handler. For inline asm elementwise it renames the asm_str keyword, and
+    # adds input dtypes and per-input scalar flags derived from node tensor metadata
+    # (NotImplementedError if an input lacks tensor metadata). Raises
+    # NotImplementedError for unknown op names or missing handler methods. Returns the
+    # handler result.
     """Lower one FX call through the active CuTeDSL operations handler."""
     target = node.target
     op_name = _cute_op_name(target)
@@ -219,6 +265,9 @@ def _cute_call(
 def _local_reduce_store_arg(
     value: Any, env: dict[torch.fx.Node, Any], sources: dict[torch.fx.Node, Any]
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Convert a value for use in a compressed-store pointwise
+    # expression: nodes with a store source use it, tuples and lists recurse, everything
+    # else uses the normal argument conversion.
     if isinstance(value, torch.fx.Node) and value in sources:
         return sources[value]
     if isinstance(value, (tuple, list)):
@@ -229,6 +278,8 @@ def _local_reduce_store_arg(
 
 
 def tensor_meta_shape(node: torch.fx.Node) -> tuple[Any, ...] | None:
+    # [FUNCTION DOC] Return the node's tensor shape from fake-value metadata as a tuple,
+    # or None if the value is not a tensor.
     """Return fake-tensor shape metadata when the FX value is tensor-like."""
     meta = node.meta.get("val")
     if isinstance(meta, torch.Tensor):
@@ -237,6 +288,10 @@ def tensor_meta_shape(node: torch.fx.Node) -> tuple[Any, ...] | None:
 
 
 def node_preserves_tensor_shapes(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Return True if a pointwise node keeps the shape of at least one
+    # tensor input equal to its output and every other tensor input broadcasts to
+    # exactly the output shape (shapes compared as strings). False when the output has
+    # no tensor shape or a broadcast fails or widens an input.
     """Reject pointwise broadcasts that cannot preserve a grouped TensorSSA input."""
     output_shape = tensor_meta_shape(node)
     if output_shape is None:
@@ -261,6 +316,8 @@ def node_preserves_tensor_shapes(node: torch.fx.Node) -> bool:
 
 
 def is_pointwise_node(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Return True for call_function nodes that are tagged pointwise or
+    # whose op name is in the FlexGEMM extra pointwise set.
     if node.op != "call_function":
         return False
     return (
@@ -270,6 +327,8 @@ def is_pointwise_node(node: torch.fx.Node) -> bool:
 
 
 def is_shape_preserving_pointwise_node(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Return True if the node is pointwise and preserves its tensor
+    # shapes.
     return is_pointwise_node(node) and node_preserves_tensor_shapes(node)
 
 
@@ -283,6 +342,11 @@ def lower_view_or_reshape(
     local_reduce_store_sources: dict[torch.fx.Node, Any],
     preserve_value_layout: bool = False,
 ) -> Any | None:
+    # [FUNCTION DOC] Lower an analyzed view or reshape. If the source has a store
+    # source, propagate it to node and forward the source value. If node has a grouped
+    # layout that is active and not preserve_value_layout, emit a reshape to the grouped
+    # shape; if inactive or preserved, forward the source unchanged. If only the source
+    # is grouped, forward the source. Otherwise return None (not handled).
     """Emit an analyzed view using grouped provenance."""
     source_node = normalized.source
     if source_node in local_reduce_store_sources:
@@ -310,6 +374,9 @@ def lower_grouped_n_split(
     kernel: Any,
     grouped_tensors: dict[torch.fx.Node, GroupedTensorSSALayout],
 ) -> tuple[Any, ...] | None:
+    # [FUNCTION DOC] Lower a split whose node has an axis-1 grouped layout: reshape the
+    # source to the grouped shape and return a tuple of per-group slices (one per group
+    # index). Returns None if the node has no layout or the axis is not 1.
     """Split an analyzed output contraction into grouped TensorSSA values."""
     layout = grouped_tensors.get(node)
     if layout is None or layout.axis != 1:
@@ -334,6 +401,9 @@ def lower_grouped_n_select(
     env: dict[torch.fx.Node, Any],
     kernel: Any,
 ) -> Any:
+    # [FUNCTION DOC] Emit one slice of the source selecting the given group index in the
+    # grouped axis-1 layout and return the generated value. Assumes analysis already
+    # validated the index.
     """Select one analysis-validated output-contraction group value."""
     source = _cute_arg(normalized.source, env)
     return _generate_like(
@@ -344,6 +414,9 @@ def lower_grouped_n_select(
 
 
 def lower_full_scalar(node: torch.fx.Node) -> Any | None:
+    # [FUNCTION DOC] Return the constant of an aten full call that builds a scalar
+    # (empty shape) from a bool, int or float fill value; return None in every other
+    # case.
     if node.op != "call_function" or node.target is not torch.ops.aten.full.default:
         return None
     shape = normalize_shape(node.args[0])
@@ -359,6 +432,8 @@ def lower_squeeze(
     env: dict[torch.fx.Node, Any],
     local_reduce_store_sources: dict[torch.fx.Node, Any],
 ) -> Any | None:
+    # [FUNCTION DOC] Forward a squeeze as an alias of its source value, copying any
+    # store source to node. Returns None if the source has not been lowered into env.
     """Forward an analyzed squeeze alias."""
     source_node = normalized.source
     if source_node not in env:
@@ -374,6 +449,9 @@ def lower_getitem(
     env: dict[torch.fx.Node, Any],
     local_reduce_store_sources: dict[torch.fx.Node, Any],
 ) -> Any | None:
+    # [FUNCTION DOC] Lower getitem on a lowered tuple or list value: return the element
+    # (also propagating the indexed store source if the source has one). Returns None if
+    # the source is not a sequence or the index is out of range.
     """Index an analyzed aggregate value."""
     source_node, index = normalized.source, normalized.index
     source = _cute_arg(source_node, env)
@@ -394,6 +472,11 @@ def lower_prepare_softmax_online(
     grouped_tensors: dict[torch.fx.Node, GroupedTensorSSALayout],
     local_reduce_store_sources: dict[torch.fx.Node, Any],
 ) -> Any:
+    # [FUNCTION DOC] Lower online softmax preparation over a grouped tensor: emit a max
+    # reduction, a broadcast of it, the centered values, their exponential, a sum
+    # reduction and its broadcast. Records and returns the pair (max, sum) of broadcast
+    # values as the node's store sources. Raises NotImplementedError if the input is not
+    # grouped, needs physical callbacks, or the reduced dim is not the grouped dim.
     """Lower analyzed online-softmax preparation."""
     input_node, dim = normalized.source, normalized.dim
     if input_node not in grouped_tensors:
@@ -437,6 +520,14 @@ def lower_tensorssa_reduce(
     local_reduce_store_sources: dict[torch.fx.Node, Any],
     local_reduce_physical_reductions: dict[torch.fx.Node, FlexGemmPhysicalReduction],
 ) -> Any:
+    # [FUNCTION DOC] Lower an analyzed sum/max/min/mean style reduction over a grouped
+    # tensor. Raises NotImplementedError for an explicit dtype, an ungrouped input, or a
+    # dim that is not the grouped one. When physical callbacks are needed, records a
+    # physical reduction (mean finalizes by dividing by the group size); for axis 0 (M
+    # groups) it returns the unreduced source and records it as the store source.
+    # Otherwise emits an in-fragment reduce (mean divides by the group size), records
+    # the broadcast store source and returns the keepdim form if keepdim else the
+    # reduced value.
     """Lower an analyzed reduction while deferring physical finalization."""
     input_node = normalized.source
     dim = normalized.dim

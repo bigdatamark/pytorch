@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] CuTeDSL template plumbing for the FlexGEMM QuACK epilogue. Defines config
+# dataclasses (local-reduce, output indices, overall epilogue config), a kernel class
+# that renders a generated Python module (main entry plus a compile-only precompile hook
+# calling the runtime gemm_epilogue), a caller class that precompiles via the async
+# compile pool, and the module-level flex_gemm_epilogue_template instance used by
+# lowering. Import-time side effect: creates the template instance.
 import dataclasses
 import logging
 from typing_extensions import override
@@ -30,6 +36,10 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmEpilogueLocalReduceConfig:
+    # [CLASS DOC] Frozen template-time local-reduce metadata: grouped geometry, the
+    # template input index of the compressed output (or None), and whether the reduction
+    # feeds the main output. Properties expose group, axis and whether physical
+    # callbacks are needed.
     """Template-time local-reduce metadata for output and/or feed-main consumers."""
 
     geometry: FlexGemmLocalReduceGeometry
@@ -42,6 +52,9 @@ class FlexGemmEpilogueLocalReduceConfig:
         local_reduce: GemmOutputLocalReducePlan | None,
         out_index: int | None,
     ) -> "FlexGemmEpilogueLocalReduceConfig | None":
+        # [FUNCTION DOC] Build a config from an analyzed output local-reduce plan and
+        # the template input index of its output; returns None when there is no plan.
+        # Copies the match geometry and the feeds-main flag.
         """Bind analyzed local-reduction consumers to FlexGEMM's runtime ABI."""
         if local_reduce is None:
             return None
@@ -56,19 +69,26 @@ class FlexGemmEpilogueLocalReduceConfig:
 
     @property
     def group(self) -> int:
+        # [FUNCTION DOC] Property: group size from the geometry.
         return self.geometry.group
 
     @property
     def axis(self) -> int:
+        # [FUNCTION DOC] Property: reduction axis from the geometry.
         return self.geometry.axis
 
     @property
     def needs_physical_callbacks(self) -> bool:
+        # [FUNCTION DOC] Property: whether the geometry requires physical
+        # combine/finalize callbacks.
         return self.geometry.needs_physical_callbacks
 
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmEpilogueOutputConfig:
+    # [CLASS DOC] Frozen record of template input indices of aux outputs plus the
+    # optional local-reduce config and output contraction describing all user-visible
+    # outputs.
     """Template input indices and plans for all user-visible outputs."""
 
     aux_out_indices: tuple[int, ...] = ()
@@ -78,6 +98,10 @@ class FlexGemmEpilogueOutputConfig:
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmEpilogueConfig:
+    # [CLASS DOC] Frozen per-choice configuration for rendering one QuACK epilogue
+    # template: generated epilogue name and source, GEMM op spec, alpha and beta,
+    # selected QuACK config key, template input indices and kinds of captured epilogue
+    # tensors, and the outputs config (defaults to empty).
     """Metadata needed to render one Inductor-owned QuACK GEMM epilogue choice.
 
     Attributes:
@@ -106,10 +130,24 @@ class FlexGemmEpilogueConfig:
 
 
 class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
+    # [CLASS DOC] Template kernel that renders the complete generated module text for a
+    # FlexGEMM epilogue choice, including a compile-only precompile hook; overrides
+    # render of the CuTeDSL template kernel and builds call text through private
+    # helpers.
     """Render generated FlexGEMM epilogue modules with a compile-only hook."""
 
     @override
     def render(self, template, **kwargs):
+        # [FUNCTION DOC] Render the generated module. Requires a config keyword
+        # (RuntimeError on any other option). Registers every template input as a
+        # numbered kernel argument, registers the output, assembles the parameter list
+        # (inputs, any extra args, stream, device capacity override, quack cache dir),
+        # builds the call to the runtime gemm_epilogue with GEMM operands, epilogue and
+        # output-plan kwargs, out buffer, expected rank, and the config key flagged as
+        # lowering-validated. Emits imports, the epilogue source, a main function and a
+        # precompile function that creates empty strided tensors from metadata and calls
+        # main in compile-only mode. Side effect: sets internal input-arg state on the
+        # kernel. Returns a PartialRender of the code with the kernel's render hooks.
         config = kwargs.pop("config")
         if kwargs:
             raise RuntimeError(f"unexpected FlexGEMM epilogue options: {kwargs}")
@@ -223,6 +261,9 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
     def _gemm_call_args(
         self, input_args: list[str], config: FlexGemmEpilogueConfig
     ) -> tuple[list[str], str]:
+        # [FUNCTION DOC] HELPER: Return the positional GEMM operand names (mat1, mat2)
+        # and, if the op has a bias input, a keyword text passing C, alpha and beta;
+        # otherwise an empty text.
         """Return positional GEMM operands and scalar/bias kwargs for runtime dispatch."""
         op = config.gemm_op
         call_args = [input_args[op.mat1_index], input_args[op.mat2_index]]
@@ -233,6 +274,8 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
         )
 
     def _local_reduce_callbacks(self, epilogue_name: str) -> str:
+        # [FUNCTION DOC] HELPER: Return source text constructing the callbacks object
+        # from the combine and finalize function names derived from the epilogue name.
         """Render generated physical reducer callbacks for runtime registration."""
         combine_name = f"{epilogue_name}{LOCAL_REDUCE_COMBINE_FN_SUFFIX}"
         finalize_name = f"{epilogue_name}{LOCAL_REDUCE_FINALIZE_FN_SUFFIX}"
@@ -244,6 +287,8 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
     def _local_reduce_geometry(
         self, local_reduce: FlexGemmEpilogueLocalReduceConfig
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return source text constructing the local-reduce
+        # geometry (group and axis).
         """Render the shared grouped M/N local-reduce geometry."""
         return (
             "FlexGemmLocalReduceGeometry("
@@ -256,6 +301,10 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
         local_reduce: FlexGemmEpilogueLocalReduceConfig | None,
         epilogue_name: str,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return source text constructing a runtime local-reduce
+        # plan (geometry, optional output argument, feeds-main flag, callbacks when
+        # feeding main or when physical callbacks are needed), or the text for none when
+        # the config is None.
         """Render one structural local-reduce plan for runtime dispatch."""
         if local_reduce is None:
             return "None"
@@ -272,6 +321,9 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
     def _output_plan_expr(
         self, input_args: list[str], config: FlexGemmEpilogueConfig
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return source text constructing the runtime output plan
+        # from aux output arguments, the local-reduce expression and the output
+        # contraction (group and chunked), using none for absent parts.
         """Render all output consumers into one runtime ABI value."""
         outputs = config.outputs
         aux_outs = tuple(input_args[index] for index in outputs.aux_out_indices)
@@ -295,6 +347,9 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
     def _epilogue_kwargs(
         self, input_args: list[str], config: FlexGemmEpilogueConfig
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return extra keyword-argument text only for non-default
+        # features: captured epilogue args with their kinds, and an output plan when aux
+        # outputs, a local reduce or a contraction exist; empty text otherwise.
         """Render only values that differ from the runtime ABI defaults."""
         epilogue_args = [input_args[index] for index in config.epilogue_arg_indices]
         kwargs: list[str] = []
@@ -314,7 +369,13 @@ class FlexGemmEpilogueKernel(CuteDSLTemplateKernel):
 
 
 class FlexGemmEpilogueCaller(CuteDSLTemplateCaller):
+    # [CLASS DOC] Template caller specialized for FlexGEMM; adds precompilation of the
+    # generated module's QuACK objects using tensor metadata from the benchmark request.
     def precompile(self) -> None:
+        # [FUNCTION DOC] Precompile the generated module in the async compile process
+        # pool if one is available (waits for the pool to be ready first). Does nothing
+        # when metadata is unavailable (dynamic shapes) or no process pool is used.
+        # Blocks until the compile finishes; side effect: warms the QuACK cache.
         """Warm the generated FlexGEMM epilogue module's QuACK object cache."""
         metadata = self.precompile_metadata()
         if metadata is None:
@@ -332,6 +393,11 @@ class FlexGemmEpilogueCaller(CuteDSLTemplateCaller):
         ).result()
 
     def precompile_metadata(self) -> dict[str, object] | None:
+        # [FUNCTION DOC] Build the mapping passed to the generated precompile hook: per-
+        # tensor shapes, strides and dtype names for inputs (named by position) and the
+        # output, device index, device capability (if CUDA is available) and the QuACK
+        # cache dir. If any size or stride is symbolic, increments a counter, logs at
+        # debug level and returns None.
         """Build the generated FlexGEMM precompile hook's tensor metadata."""
         precompile_shapes = {}
         precompile_strides = {}
@@ -369,10 +435,15 @@ class FlexGemmEpilogueCaller(CuteDSLTemplateCaller):
 
 
 class FlexGemmEpilogueTemplate(CuteDSLTemplate):
+    # [CLASS DOC] CuTeDSL template for FlexGEMM epilogues; uses the
+    # FlexGemmEpilogueKernel and FlexGemmEpilogueCaller classes and has an empty source
+    # because the kernel renders the module itself.
     kernel_type = FlexGemmEpilogueKernel
     caller_type = FlexGemmEpilogueCaller
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize the template under the name flex_gemm_epilogue with
+        # empty source.
         super().__init__("flex_gemm_epilogue", source="")
 
 
