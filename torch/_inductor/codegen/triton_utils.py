@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers for Triton kernel codegen in Inductor: map kernel argument objects to Triton
+# signature type strings, build the signature metadata mapping, compute alignment / equal-to-1 /
+# 2GB-pointer-range attribute descriptors, and pick tile hints. Reads the current graph through
+# the virtualized V handle. No import-time side effects beyond imports.
 from typing import Any
 
 import sympy
@@ -27,6 +31,9 @@ from .common import (
 
 
 def should_unwrap_unspec_arg(name: str):
+    # [FUNCTION DOC] Decide whether an unspecialized 0-d tensor argument named name should be passed
+    # to the kernel as a scalar. Returns False if the name is not an unspec arg; True on any
+    # non-CPU device; on CPU True only when the buffer is not in the graph's mutated buffers.
     if V.graph.is_unspec_arg(name):
         # Unwrap on all devices except CPU
         if V.graph.get_current_device_or_throw().type != "cpu":
@@ -43,6 +50,10 @@ def use_uint8_triton_storage_for_cuda_float8_e4m3fn(
     *,
     device: torch.device | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if a float8_e4m3fn pointer argument should be typed as raw uint8
+    # storage in the Triton signature. Requires CUDA (not HIP), dtype float8_e4m3fn, an input
+    # pointer name (when arg_name is given) and compute capability below 89. The device defaults
+    # to the current graph device; if there is no graph device, returns False.
     # Triton rejects fp8e4nv pointer types before sm89, but eager CUDA can
     # still dequantize float8_e4m3fn values by treating storage as raw bytes.
     if dtype != torch.float8_e4m3fn or torch.version.hip is not None:
@@ -63,6 +74,14 @@ def use_uint8_triton_storage_for_cuda_float8_e4m3fn(
 
 
 def signature_of(arg: KernelArgType, *, size_dtype: str | None) -> str:
+    # [FUNCTION DOC] Return the Triton signature type string for one kernel argument.
+    # Tensors give pointer types (scalars if unwrapped unspec args, uint8 pointer for fp8 on old
+    # GPUs); size args give constexpr, fp32/fp64, i1, i32 or i64 depending on value and size_dtype
+    # (when size_dtype is None, i32 is chosen if provably fitting and a guard is added to the graph
+    # sizevars); workspace args use their dtype; TMA descriptors give nvTmaDesc or a tensordesc
+    # string; constexpr args give constexpr.
+    # Raises NotImplementedError for an unknown size_dtype or argument type, and AssertionError for
+    # a TMA descriptor with missing block_shape/dtype or unexpected api_type.
     if isinstance(arg, TensorArg):
         typ = _type_of(arg.dtype)
         if should_unwrap_unspec_arg(arg.buffer):
@@ -148,6 +167,7 @@ def signature_of(arg: KernelArgType, *, size_dtype: str | None) -> str:
 
 
 def non_constexpr_signature(signature):
+    # [FUNCTION DOC] Return a new list of the signature entries that are not ConstexprArg, in order.
     new_signature = []
     for arg in signature:
         if not isinstance(arg, ConstexprArg):
@@ -157,6 +177,8 @@ def non_constexpr_signature(signature):
 
 
 def select_tile_hint(size_hints, signature):
+    # [FUNCTION DOC] Choose a TileHint for a pointwise kernel: None unless there are exactly two size
+    # hints; SQUARE if the signature has four non-constexpr args, otherwise DEFAULT.
     """Pick TileHint.SQUARE vs TileHint.DEFAULT for 2D pointwise; None for 1D.
 
     SQUARE applies when the kernel has exactly 2 size hints and 4 non-constexpr
@@ -179,10 +201,15 @@ def signature_to_meta(
     indices: list[int] | None = None,
     is_template: bool = False,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Build the mapping from argument name (taken from argdefs at the given indices,
+    # default all) to its Triton signature type string via signature_of. is_template disables the
+    # forced 64-bit dtype for symbolic size args. Pure apart from reading graph state.
     if indices is None:
         indices = list(range(len(signature)))
 
     def _decide_tl_dtype(arg):
+        # [FUNCTION DOC] HELPER: Return the size dtype for one arg: 64-bit for size args named with
+        # the ks prefix when block pointers are off and not a template, else the given size_dtype.
         # Even if the ks0 symbol itself is within tl.int32 range, it's
         # risky to use tl.int32 dtype since we may have ks0*ks1 later
         # for kernels like torch.mean when dynamic shape is enabled.
@@ -210,6 +237,9 @@ def signature_to_meta(
 
 
 def _get_buffer_layout(buf_name: str) -> "torch._inductor.ir.Layout":
+    # [FUNCTION DOC] HELPER: Look up the layout of buf_name from the scheduler if one exists, else from
+    # the graph buffer; if no buffer is found it must be the current kernel's output node, whose layout
+    # is returned. Raises AssertionError if that name does not match.
     """Get the layout for a buffer, handling both scheduler buffers and graph inputs."""
     if V.graph.scheduler:
         layout = V.graph.scheduler.get_buffer_layout(buf_name)
@@ -228,6 +258,9 @@ def _get_buffer_layout(buf_name: str) -> "torch._inductor.ir.Layout":
 
 
 def is_unaligned_buffer_name(buf_name: str) -> bool:
+    # [FUNCTION DOC] Return True if the named buffer may be unaligned: True if recorded in the graph's
+    # unaligned buffers; False for graph inputs and constants not so recorded; otherwise True only for
+    # a non-owning layout whose alignment cannot be guarded.
     if buf_name in V.graph.unaligned_buffers:
         return True
 
@@ -249,10 +282,13 @@ def is_unaligned_buffer_name(buf_name: str) -> bool:
 
 
 def is_unaligned_buffer(arg: TensorArg):
+    # [FUNCTION DOC] Return whether the buffer behind a tensor argument may be unaligned.
     return is_unaligned_buffer_name(arg.buffer)
 
 
 def _arg_equals_1(arg: KernelArgType) -> bool:
+    # [FUNCTION DOC] HELPER: True if arg is a size arg with an integer expression statically known
+    # to equal 1.
     return (
         isinstance(arg, SizeArg)
         and isinstance(arg.expr, (int, sympy.Integer))
@@ -265,6 +301,8 @@ def equal_1_arg_indices(
     *,
     indices: list[int] | None = None,
 ) -> tuple[int, ...]:
+    # [FUNCTION DOC] Return the tuple of indices (from indices, default positions in args) whose
+    # argument is a size arg statically equal to 1.
     if indices is None:
         indices = list(range(len(args)))
 
@@ -274,6 +312,9 @@ def equal_1_arg_indices(
 
 
 def _is_tensor_within_2gb(arg: TensorArg) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the tensor's storage size in bytes is statically known to
+    # be at most 2**31 - 1. Uses the graph input layout when available, else the buffer layout. Any
+    # exception during analysis is swallowed and yields False.
     """Check if a tensor argument's storage is provably within 2GB.
 
     Mirrors HIPBackend.is_within_2gb() but uses compile-time symbolic analysis
@@ -305,10 +346,19 @@ def config_of(
     pointer_range_override: tuple[int, ...] | None = None,
     skip_cpp_wrapper_input_tensor_alignment: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Build the Triton attribute descriptor (AttrsDescriptorWrapper) for kernel args:
+    # indices divisible by 16 (only if config divisible_by_16), indices equal to 1, and on HIP the
+    # indices of tensors provably within 2GB (or pointer_range_override if given). With
+    # skip_cpp_wrapper_input_tensor_alignment, graph-input tensors not listed in inputs_to_check are
+    # treated as aligned-checkable only under cpp wrapper non-AOT mode.
     if indices is None:
         indices = list(range(len(args)))
 
     def is_aligned(x: KernelArgType, alignment: int, include_tensor: bool) -> bool:
+        # [FUNCTION DOC] HELPER: True if arg x is known to be a multiple of alignment: tensors by byte
+        # offset and buffer alignment (only if include_tensor), size args by static divisibility
+        # (False for None/float/bool/load_seed_offset), workspaces always, TMA/constexpr never.
+        # Raises NotImplementedError for unknown arg types.
         """
         Roughly follow triton code here:
         https://github.com/triton-lang/triton/blob/5282ed890d453e10b9ee30076ef89115dd197761/python/triton/runtime/jit.py#L208-L222
@@ -340,6 +390,8 @@ def config_of(
         raise NotImplementedError(f"unhandled {type(x)}: {x}")
 
     def include_tensor_alignment(arg: KernelArgType) -> bool:
+        # [FUNCTION DOC] HELPER: Whether tensor alignment should be considered for arg; False only for
+        # non-checked graph inputs under cpp wrapper (non-AOT) when skipping is requested.
         if (
             not skip_cpp_wrapper_input_tensor_alignment
             or not V.graph.cpp_wrapper

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines TritonSplitScanKernel, a Triton kernel variant that implements scans
+# whose reduction dimension is split across multiple programs using a decoupled look-back
+# algorithm over a zero-filled global workspace. No import-time side effects.
 import functools
 
 import sympy
@@ -18,6 +21,10 @@ from ..utils import sympy_product, upcast_compute_type
 
 
 class TritonSplitScanKernel(TritonKernel):
+    # [CLASS DOC] TritonKernel subclass for scans split over many programs: tiling is (x, r0_) or
+    # (y, x, r0_) with grid dims 0 for r0_, 1 for x, 2 for y; no_x_dim is always True; persistent and
+    # cooperative reductions are disabled; reductions are unsupported (only scan). Uses heuristic
+    # "split_scan" and SplitScanGrid. Needs a zero-filled workspace for cross-block communication.
     """Generates a triton kernel that supports ops.scan calls while also splitting
     the reduction dimension over multiple triton programs.
 
@@ -40,6 +47,8 @@ class TritonSplitScanKernel(TritonKernel):
         fixed_config=None,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC] Construct the kernel from a tiling mapping; forwards extra kwargs to the base
+        # class and sets no_x_dim. Raises AssertionError if pid_cache or fixed_config is supplied.
         if pid_cache is not None:
             raise AssertionError("not supported")
         if fixed_config is not None:
@@ -51,12 +60,17 @@ class TritonSplitScanKernel(TritonKernel):
         self.no_x_dim = True
 
     def should_use_persistent_reduction(self) -> bool:
+        # [FUNCTION DOC] Always False: split scans never use persistent reductions.
         return False
 
     def should_use_cooperative_reduction(self) -> bool:
+        # [FUNCTION DOC] Always False: split scans never use cooperative reductions.
         return False
 
     def initialize_range_tree(self, pid_cache):
+        # [FUNCTION DOC] Create the range trees (IterationRangesRoot, appended to self.range_trees) for
+        # the active suffix of the prefixes y, x, r0_ matching the numels; r0_ gets grid dim 0 and tensor
+        # dim 0, x grid dim 1, y grid dim 2; no loops, no z dim. Raises AssertionError if more than 3 numels.
         prefixes = ["y", "x", "r0_"]
         if len(self.numels) > len(prefixes):
             raise AssertionError("z dimension not supported for split scan")
@@ -83,9 +97,18 @@ class TritonSplitScanKernel(TritonKernel):
             )
 
     def reduction(self, dtype, src_dtype, reduction_type, value):
+        # [FUNCTION DOC] Unsupported: always raises NotImplementedError.
         raise NotImplementedError("NYI TritonSplitDimKernel reductions")
 
     def scan(self, dtypes, combine_fn, values):
+        # [FUNCTION DOC] Emit Triton code for an inclusive scan over a single value with a combine
+        # function. Allocates a zero-filled workspace sized from max block count (pointwise numel times
+        # ceil-div of reduction numel by config min_split_scan_rblock); scratch element type is uint32
+        # for dtypes up to 16 bits else uint64, with 3 elements per block for 64-bit values. Emits
+        # a per-block reduce, a decoupled look-back exclusive scan (64-bit or <=32-bit helper), a block
+        # scan, combines them, and selects the plain block scan for the first block. Returns a one-tuple
+        # with the result variable. Raises AssertionError if tiling is not 2D, if used inside a masked
+        # region, or on unexpected scan dim or bit width; mutates self.args, self.compute and the CSE.
         """
         Perform an associative scan on 'values'.
         """
@@ -222,7 +245,9 @@ class TritonSplitScanKernel(TritonKernel):
         )
 
     def _get_heuristic(self):
+        # [FUNCTION DOC] HELPER: Return the autotune heuristic name, "split_scan".
         return "split_scan"
 
     def _get_grid_type(self) -> type[SplitScanGrid]:
+        # [FUNCTION DOC] HELPER: Return the grid class SplitScanGrid used to launch this kernel.
         return SplitScanGrid

@@ -1,3 +1,10 @@
+# [MODULE DOC] Combo kernels for Inductor Triton codegen: fuses several independent sub-kernels
+# (pointwise/reduction) into one Triton kernel launch, dispatching program ids to sub-kernels
+# sequentially, round-robin, or via a flattened per-subkernel grid. Contains the horizontal
+# partitioning logic (with a replaceable custom algorithm), small dataclasses for codegen state,
+# and the ComboKernel class that generates code, heuristics decorator and call sites.
+# Import-time side effects: creates a module logger and a Python printer, and defines a module
+# level default partition algorithm that can be replaced via the setter function.
 import io
 import itertools
 import logging
@@ -75,12 +82,15 @@ BLOCK_UTILIZATION = 0.8
 
 
 def _size_hint(expr: Any) -> int:
+    # [FUNCTION DOC] HELPER: Integer optimization hint of a size expression (fallback 1 if unbacked).
     return V.graph.sizevars.optimization_hint(expr, fallback=1)
 
 
 def _node_partition_log_context(
     node: BaseSchedulerNode, node_info_map: dict[BaseSchedulerNode, NodeInfo]
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] HELPER: Build a hashable summary of a node for log de-duplication: reduction flag,
+    # persistent-reduction flag, sorted (dimension, hinted numel) pairs, and hinted numel and rnumel.
     node_info = node_info_map[node]
     tiling_hints = tuple(
         (str(dim), _size_hint(numel))
@@ -102,6 +112,7 @@ def _partition_separation_log_context(
     companion_nodes: list[BaseSchedulerNode],
     node_info_map: dict[BaseSchedulerNode, NodeInfo],
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    # [FUNCTION DOC] HELPER: Pair of per-node summary tuples for separated nodes and companion nodes.
     return (
         tuple(_node_partition_log_context(n, node_info_map) for n in separated_nodes),
         tuple(_node_partition_log_context(n, node_info_map) for n in companion_nodes),
@@ -114,6 +125,8 @@ def _log_partition_separation(
     companion_nodes: list[BaseSchedulerNode],
     node_info_map: dict[BaseSchedulerNode, NodeInfo],
 ) -> None:
+    # [FUNCTION DOC] HELPER: When debug logging is enabled, log the message with the separated node
+    # count once per distinct partition context (de-duplicated via a cached helper).
     if log.isEnabledFor(logging.DEBUG):
         _log_partition_separation_once(
             log_message,
@@ -132,6 +145,8 @@ def _log_partition_separation_once(
     num_nodes: int,
     partition_context: tuple[tuple[Any, ...], tuple[Any, ...]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emit the debug log line; cached on all arguments (cleared on fresh cache)
+    # so equivalent recompiles log only once. partition_context only serves as a cache key.
     log.debug(
         log_message,
         num_nodes,
@@ -143,6 +158,14 @@ def _default_custom_combo_kernel_horizontal_partition(
     triton_scheduling: SIMDScheduling,
     node_info_map: dict[BaseSchedulerNode, NodeInfo],
 ) -> list[list[BaseSchedulerNode]]:
+    # [FUNCTION DOC] Default horizontal partition: for each tiling dimensionality from 2 up to the
+    # maximum, group nodes with that many tile dims, then split into non-reduction, short-reduction
+    # (rnumel up to 2048) and long-reduction groups; very large reductions (numel*rnumel above
+    # LARGE_NUMELS) and large 2D pointwise nodes (x numel above LARGE_NUMELS) each become their own
+    # singleton partitions. Nodes with a single tile dim are not placed in any partition.
+    # Raises AssertionError on empty input or if the partitioned count differs from the input count.
+    # KNOWN ISSUE: the final count check fails if any node has fewer than 2 tile dims, since the
+    # loop starts at 2; also the long-reduction log is emitted but long reductions stay a group.
     """Horizontally partition the given list of nodes into a list of list of nodes where each sublist
     represents a partition. Nodes in different partitions are implemented in different combo kernels.
     Nodes in the same partition are likely to be implemented
@@ -263,6 +286,8 @@ def set_custom_combo_kernel_horizontal_partition(
         list[list[BaseSchedulerNode]],
     ],
 ) -> None:
+    # [FUNCTION DOC] Replace the module-level horizontal partition algorithm (a callable taking nodes,
+    # scheduling and node info map, returning a list of node lists). Mutates global state; no return.
     """Sets the algorithm used to partition nodes into horizontal partitions. Nodes in different partitions
     are implemented in different combo kernels. Nodes in the same partition are likely to be implemented
     in the same combo kernel, but subject to subsequent restrictions like CUDA limits for number of args.
@@ -277,23 +302,30 @@ def set_custom_combo_kernel_horizontal_partition(
 
 @dataclass
 class PartitionState:
+    # [CLASS DOC] HELPER: Mutable accumulator for greedy partitioning: finished partitions, the
+    # partition being built, and its running read/write argument count.
     partitions: list[list[BaseSchedulerNode]]
     cur_partition: list[BaseSchedulerNode]
     cur_count: int
 
     def finalize(self) -> None:
+        # [FUNCTION DOC] HELPER: Append the in-progress partition to the finished list if non-empty.
         if self.cur_partition:
             self.partitions.append(self.cur_partition)
 
 
 @dataclass
 class SubKernelSetup:
+    # [CLASS DOC] HELPER: Result of static numel setup for one sub-kernel: block/numel names that need
+    # a per-subkernel suffix, and the names of variables assigned in the setup code.
     uniquify_block_sizes: list[str]
     lhs_names: list[str]
 
 
 @dataclass
 class SubKernelCode:
+    # [CLASS DOC] HELPER: Generated code of one sub-kernel: setup lines, body lines, and the names
+    # assigned by the setup code.
     setup: IndentedBuffer
     body: IndentedBuffer
     setup_lhs_names: list[str]
@@ -301,6 +333,8 @@ class SubKernelCode:
 
 @dataclass
 class NoinlineSubKernelCall:
+    # [CLASS DOC] HELPER: Description of a call to a noinline sub-kernel device function: parameter
+    # definitions, call argument expressions, and a key used to de-duplicate identical functions.
     params: list[ArgName]
     call_args: list[str]
     signature_key: tuple[Any, ...]
@@ -308,6 +342,8 @@ class NoinlineSubKernelCall:
 
 @dataclass
 class SharedBody:
+    # [CLASS DOC] HELPER: A single body shared by all sub-kernels: its code, placeholder variable
+    # names, per-subkernel actual pointer args bound to the placeholders, and setup-assigned names.
     body: IndentedBuffer
     placeholder_names: list[str]
     args_by_subkernel: list[list[str]]
@@ -316,12 +352,19 @@ class SharedBody:
 
 @dataclass
 class ComboLaunchConfig:
+    # [CLASS DOC] HELPER: A winning launch configuration: backend kwargs, warp count and stage count.
     kwargs: dict[str, int]
     num_warps: int
     num_stages: int
 
 
 class ComboKernel(Kernel):
+    # [CLASS DOC] Kernel that owns a list of TritonKernel sub-kernels and emits one Triton kernel that
+    # dispatches program ids to them. State: sub_kernels, per-subkernel x numels / min x blocks / y
+    # trees, block_args, dynamic_shape_args, the chosen dispatch_class, autotune-related options
+    # (enable_autotune, mixed_sizes, per_subkernel_blocks, stitched configs, launch candidates),
+    # default block sizes used when not autotuning, and noinline call descriptions. Key methods:
+    # horizontal_partition (static), create_sub_kernel, codegen_kernel, call_kernel, jit_line.
     """
     A kernel that combines multiple sub-kernels into a single fused kernel.
     """
@@ -332,6 +375,9 @@ class ComboKernel(Kernel):
         node_rw_count: int,
         node_info: BaseSchedulerNode,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Greedily add a node to the current partition; if its read/write count
+        # would exceed config combo_kernel_max_num_args, push the current partition to the finished list
+        # and start a new one with this node. Mutates partition_state.
         if partition_state.cur_count + node_rw_count > config.combo_kernel_max_num_args:
             partition_state.partitions.append(partition_state.cur_partition)
             partition_state.cur_partition = [node_info]
@@ -347,6 +393,11 @@ class ComboKernel(Kernel):
         node_info_map: dict[BaseSchedulerNode, NodeInfo],
         custom_algorithm: bool,
     ) -> list[list[BaseSchedulerNode]]:
+        # [FUNCTION DOC] HELPER: Split nodes into partitions bounded by the max arg count. Nodes with
+        # two reduction trees (r0_ and r1_) or a z dimension get singleton partitions. Others are grouped
+        # by tile dimension count (by y numel for 3D when mixed sizes are not allowed). Mixed sizes are
+        # allowed if config combo_kernel_allow_mixed_sizes is above 1, or equal to 1 with a custom algorithm.
+        # Raises AssertionError for empty input, fewer than 2 tile dims, or 3+ dims where not allowed.
         """Generates a list of lists of node info tuples which consist of (fused_nodes, tiling, numel, rnumel)
         for each subkernel node where each sublist is guaranteed to not exceed CUDA limits for number of args
         (read/writes) and to have the same 2D or 1D blocking strategy."""
@@ -413,6 +464,9 @@ class ComboKernel(Kernel):
         node_info_map: dict[BaseSchedulerNode, NodeInfo],
         custom_algorithm: bool = False,
     ) -> list[list[BaseSchedulerNode]]:
+        # [FUNCTION DOC] Return the final list of node groups, each forming one ComboKernel. First applies
+        # the module-level custom partition algorithm if custom_algorithm is True (else treats all nodes
+        # as one raw partition), then splits each raw partition by the argument-count and dimension rules.
         """Generates a list of lists of node info tuples which consist of (fused_nodes, tiling, numel, rnum)
         for each subkernel node where each sublist forms a ComboKernel. It horizontally partitions nodes into
         sublists in the following way:
@@ -441,6 +495,9 @@ class ComboKernel(Kernel):
         return all_partitions
 
     class SequentialDispatch:
+        # [CLASS DOC] Dispatch strategy that assigns consecutive program id ranges to each sub-kernel in
+        # order (cumulative x-block counts). Uses SequentialComboKernelGrid as grid_expr. Stateless;
+        # all methods are classmethods that emit code into an IndentedBuffer.
         """
         The dispatcher which dispatches the subkernels in a sequential manner:
         the blocks are first dispatched to the 1st subkernel (until it is filled),
@@ -457,6 +514,9 @@ class ComboKernel(Kernel):
         def codegen_pid_range(
             cls, kernel: "ComboKernel", num: int, code: IndentedBuffer
         ) -> None:
+            # [FUNCTION DOC] Emit the branch header for sub-kernel num: the first emits the cumulative
+            # block count computations and an if on pid below that count with pid_offset equal to pid;
+            # later ones emit an elif with pid_offset equal to pid minus the previous cumulative count.
             if num == 0:
                 cls._calculate_xblocks(kernel, code)
                 code.splice(f"if pid < num_xblocks_{num}:")
@@ -471,6 +531,9 @@ class ComboKernel(Kernel):
         def _calculate_xblocks(
             cls, kernel: "ComboKernel", code: IndentedBuffer
         ) -> None:
+            # [FUNCTION DOC] HELPER: Emit cumulative x-block count assignments num_xblocks_i. A sub-kernel
+            # with a positive (or string not starting with a minus sign) x numel contributes ceiling
+            # division by XBLOCK; one without an x dim contributes its fixed minimum block count.
             x_numels_list = kernel.x_numels_list
             for i in range(len(x_numels_list)):
                 xnumels, no_x_dim = (
@@ -492,6 +555,9 @@ class ComboKernel(Kernel):
                     code.splice(f"num_xblocks_{i} = num_xblocks_{i - 1} + {xblock_str}")
 
     class SequentialFlattenGridDispatch:
+        # [CLASS DOC] Dispatch strategy with a single flattened program id: each sub-kernel owns a range
+        # of x*y blocks computed from its own block sizes, and x/y offsets are derived from the local
+        # pid. Uses SequentialFlattenComboKernelGrid. Used with per-subkernel block sizes.
         """
         Flattened grid dispatch for per-subkernel blocks.
         Uses flattened grid (sum of x*y blocks, 1, 1) and computes
@@ -504,6 +570,9 @@ class ComboKernel(Kernel):
         def codegen_pid_range(
             cls, kernel: "ComboKernel", num: int, code: IndentedBuffer
         ) -> None:
+            # [FUNCTION DOC] Emit the branch header for sub-kernel num (if/elif on cumulative block count,
+            # computing totals first for num 0), then local_pid, then x_pid_offset and, when the sub-kernel
+            # has a y tree, y_pid_offset via modulo and floor division by its x block count.
             if num == 0:
                 cls._calculate_total_blocks(kernel, code)
                 code.splice(f"if pid < num_blocks_{num}:")
@@ -528,6 +597,8 @@ class ComboKernel(Kernel):
         def _calculate_total_blocks(
             cls, kernel: "ComboKernel", code: IndentedBuffer
         ) -> None:
+            # [FUNCTION DOC] HELPER: Emit per-subkernel x_blocks_i (and y_blocks_i when a y tree exists;
+            # ynumel is static or named ynumel_i) and cumulative num_blocks_i assignments.
             """
             Calculate total blocks for each subkernel (x_blocks * y_blocks)
             and cumulative block counts for dispatch boundaries.
@@ -563,6 +634,8 @@ class ComboKernel(Kernel):
                 )
 
     class RoundRobinDispatch:
+        # [CLASS DOC] Dispatch strategy interleaving program ids across sub-kernels: sub-kernel k gets
+        # pids whose remainder by the kernel count equals k. Uses RoundRobinComboKernelGrid.
         """
         The dispatcher which dispatches the subkernels in a round robin manner:
         the blocks are interleavedly dispatched to each subkernel to execute them
@@ -579,6 +652,8 @@ class ComboKernel(Kernel):
         def codegen_pid_range(
             cls, kernel: "ComboKernel", num: int, code: IndentedBuffer
         ) -> None:
+            # [FUNCTION DOC] Emit an if/elif testing pid modulo the sub-kernel count against num, and set
+            # pid_offset to pid floor-divided by the sub-kernel count.
             num_kernels = len(kernel.sub_kernels)
             if num == 0:
                 cond = "if"
@@ -595,6 +670,9 @@ class ComboKernel(Kernel):
         mixed_sizes: bool = False,
         per_subkernel_blocks: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize an empty combo kernel for the given TritonKernel class. Flags choose
+        # autotuning, mixed-size handling and per-subkernel block sizes. Sets up empty per-subkernel
+        # lists, default block sizes (1D, 2D, reduction), warps, and the unset dispatch class.
         super().__init__()
         self.triton_kernel_cls = triton_kernel_cls
         self.sub_kernels: list[TritonKernel] = []
@@ -632,6 +710,7 @@ class ComboKernel(Kernel):
 
     @property
     def bake_blocks(self) -> bool:
+        # [FUNCTION DOC] True when autotuning is disabled, meaning default block sizes must be fixed.
         """Whether autotuning is disabled and default block values are required.
 
         Legacy combo kernels bake these values into the kernel body. Per-subkernel
@@ -640,6 +719,9 @@ class ComboKernel(Kernel):
         return not self.enable_autotune
 
     def create_sub_kernel(self, triton_kernel: TritonKernel) -> TritonKernel:
+        # [FUNCTION DOC] Register triton_kernel as a sub-kernel and return it. Decrements the global
+        # generated-kernel metric (the combo counts as one). Unless per-subkernel blocks are used, the
+        # sub-kernel shares this kernel's args, iteration var counter and CSE iter buffer ids.
         sub_kernel = triton_kernel
         # pyrefly: ignore [bad-assignment]
         metrics.generated_kernel_count -= 1
@@ -659,6 +741,9 @@ class ComboKernel(Kernel):
         tiling_scores: dict[str, sympy.Expr] | None = None,
         per_subkernel_blocks: bool = False,
     ) -> TritonKernel:
+        # [FUNCTION DOC] Build a TritonKernel configured as a combo member: program ids are mapped to
+        # pid_offset (or x_pid_offset and y_pid_offset when per-subkernel blocks), cooperative reduction
+        # is disabled, and feature-required overrides are applied to the keyword arguments.
         """
         Only allow optimize_mask=True when 1) sequential dispatch is used,
         2) numels except x dimension are the same for each sub kernel.
@@ -688,6 +773,11 @@ class ComboKernel(Kernel):
     def codegen_static_numels_sub_kernel(
         self, code: IndentedBuffer, sub_kernel: TritonKernel, num: int
     ) -> SubKernelSetup:
+        # [FUNCTION DOC] Write constant numel assignments (static sizes), constexpr persistent reduction
+        # block sizes, and constexpr XBLOCK equal to 1 for no-x-dim sub-kernels into code. Records the
+        # grid entries (static ints or numel_<num> names for non-reduction trees) in self.grids and
+        # returns names to uniquify per sub-kernel and the assigned variable names.
+        # Raises AssertionError if a dynamic numel is missing from dynamic_shape_args.
         """
         We get a small speedup from hard coding numels if they are static.
 
@@ -752,6 +842,10 @@ class ComboKernel(Kernel):
         )
 
     def min_x_blocks_sub_kernel(self, sub_kernel: TritonKernel, num: int) -> None:
+        # [FUNCTION DOC] Append to min_x_blocks_list and x_numels_list for this sub-kernel: x numel is an
+        # int when static, else the name xnumel_<num>. For no-x-dim kernels the numel is the minimum block
+        # count and the x_numels entry is its negation (a leading minus sign for names); otherwise
+        # min blocks is 0.
         """
         Kernels with no_x_dim being true has no tunable XBLOCK. They have a fixed number of X blocks.
         Grid calculation needs to make sure that they are assigned with enough number of blocks.
@@ -783,6 +877,9 @@ class ComboKernel(Kernel):
         self.x_numels_list.append(x_numels)
 
     def select_heuristics(self, sub_kernel: TritonKernel) -> tuple[str, dict[str, int]]:
+        # [FUNCTION DOC] Return the heuristic name (persistent_reduction, reduction or pointwise) and the
+        # size hints (power-of-two rounded hints per prefix, skipping reduction prefixes when not inside a
+        # reduction). Raises AssertionError if persistent reduction is set outside a reduction.
         size_hints = {
             prefix: next_power_of_2(V.graph.sizevars.optimization_hint(numel))
             for prefix, numel in sub_kernel.numels.items()
@@ -803,6 +900,14 @@ class ComboKernel(Kernel):
     def select_combo_heuristics(
         self, heuristics_list: list[str], size_hints_list: list[dict[str, int]]
     ) -> tuple[str, dict[str, int], TritonKernel]:
+        # [FUNCTION DOC] Pick the heuristic, size hints and representative sub-kernel for the combo:
+        # "foreach" when not autotuning and no stitched config; else the reduction sub-kernel with the
+        # largest x hint; else the largest pointwise (possibly "pointwise_with_reduction" and x hint
+        # capped at 128 when 4+ non-pointwise members exist, which mutates that hint dict); else the
+        # persistent reduction with the largest reduction hint. Raises AssertionError if pointwise
+        # is mixed with reduction.
+        # KNOWN ISSUE: the pointwise branch only runs when no plain "reduction" exists, so the
+        # pointwise-and-reduction assertion there is unreachable in practice.
         if not self.enable_autotune and self.no_bench_stitched_config is None:
             return "foreach", size_hints_list[0], self.sub_kernels[0]
         if "reduction" in heuristics_list:
@@ -846,6 +951,9 @@ class ComboKernel(Kernel):
             return heuristics_list[i], size_hints_list[i], self.sub_kernels[i]
 
     def get_mutated_args_sub_kernels(self) -> list[str]:
+        # [FUNCTION DOC] Return the sorted names of kernel arguments mutated by any sub-kernel (input,
+        # live in-place and output buffers), translating through the noinline name map when per-subkernel
+        # blocks are used. Raises AssertionError if a mutated output arg was removed.
         mutated_args: OrderedSet[str] = OrderedSet()
         for num, sub_kernel in enumerate(self.sub_kernels):
             arg_name_map = (
@@ -872,6 +980,9 @@ class ComboKernel(Kernel):
         return sorted(mutated_args)
 
     def select_dispatch_strategy(self) -> None:
+        # [FUNCTION DOC] Set self.dispatch_class if unset: flatten-grid dispatch with per-subkernel blocks;
+        # sequential if not mixed sizes or any dynamic x numel; otherwise round robin when block
+        # utilization (sum over max times count of absolute x numels) exceeds BLOCK_UTILIZATION, else sequential.
         if self.dispatch_class is not None:
             return
         if self.per_subkernel_blocks:
@@ -904,6 +1015,12 @@ class ComboKernel(Kernel):
         size_hints_list: list[dict[str, int]],
         pointwise_with_reduce: bool = False,
     ) -> str:
+        # [FUNCTION DOC] Build the decorator text (foreach, reduction or pointwise heuristics plus jit) for
+        # the combo kernel and return it. Computes min x blocks and the dispatch strategy, builds triton_meta
+        # (signature, device, constants, configs) and inductor_meta (grid type, combo grid meta, kernel name,
+        # mutated args, memory option, optional bandwidth/flop sums and max persistent rblock). Stores
+        # self.triton_meta, self.inductor_meta and self._kernel_num_gb as side effects.
+        # Raises AssertionError if no dispatch class is available. The pointwise_with_reduce argument is unused.
         """Write the @triton_heuristics.<heuristics> decorator line for the combo kernel."""
 
         can_use_32bit = all(k.index_dtype == "tl.int32" for k in self.sub_kernels)
@@ -1028,6 +1145,10 @@ class ComboKernel(Kernel):
         return heuristics_line
 
     def codegen_blocks(self, code: IndentedBuffer) -> None:
+        # [FUNCTION DOC] Write constexpr block size assignments for every block arg into code, using
+        # the stitched config value if present, else the 2D size for YBLOCK (and XBLOCK when a y tree
+        # exists), the 1D size for XBLOCK, or the reduction size for R0_BLOCK.
+        # Raises AssertionError for unsupported block names.
         has_yblock = any(self.y_tree_list)
         stitched_kwargs = (
             self.no_bench_stitched_config.kwargs
@@ -1049,6 +1170,9 @@ class ComboKernel(Kernel):
             code.splice(f"{block}: tl.constexpr = {size}")
 
     def get_block_args(self) -> list[ConstexprArg]:
+        # [FUNCTION DOC] Compute block argument names (suffixed by sub-kernel index when per-subkernel
+        # blocks) from non-skipped range trees, set self.block_args and append each sub-kernel's y tree
+        # (or None) to self.y_tree_list; returns the corresponding constexpr args.
         """
         Calculate blocks from sub_kernels and range_trees.
         Update self.block_args, self.y_tree_list
@@ -1078,6 +1202,9 @@ class ComboKernel(Kernel):
     def add_numel_to_args(
         self, argdefs: list[ArgName], signature: list[Any]
     ) -> list[ArgName]:
+        # [FUNCTION DOC] For each dynamic (non-integer) active range tree numel, append a size arg named
+        # <prefix>numel_<num> to signature and argdefs and record it in dynamic_shape_args. Mutates
+        # signature and argdefs; returns argdefs.
         for num, sub_kernel in enumerate(self.sub_kernels):
             for tree in sub_kernel.active_range_trees():
                 if not isinstance(tree.numel, (Integer, int)):
@@ -1091,6 +1218,9 @@ class ComboKernel(Kernel):
     def add_numel_to_call_args(
         self, name: str, call_args: list[Any], arg_types: list[Any]
     ) -> None:
+        # [FUNCTION DOC] Append the runtime numel expressions for dynamic shape args to call_args and
+        # their types to arg_types (skipping reduction trees of non-reduction sub-kernels). Uses the
+        # symbol itself for simple numels, else asks the wrapper to generate a numel expression.
         for num, sub_kernel in enumerate(self.sub_kernels):
             for tree in sub_kernel.range_trees:
                 numel_name = f"{tree.prefix}numel_{num}"
@@ -1108,6 +1238,8 @@ class ComboKernel(Kernel):
                     arg_types.append(type(expr))
 
     def kernel_benchmark_extra_args(self) -> list[str]:
+        # [FUNCTION DOC] Return string hint values for each dynamic numel arg, in sub-kernel order, for
+        # use as extra benchmark harness arguments.
         extra_args = []
         for num, sub_kernel in enumerate(self.sub_kernels):
             for tree in sub_kernel.range_trees:
@@ -1122,6 +1254,8 @@ class ComboKernel(Kernel):
         return extra_args
 
     def _merge_noinline_kernel_args(self) -> None:
+        # [FUNCTION DOC] HELPER: Register every sub-kernel's local args in the combo's args, then store
+        # per-subkernel maps from local arg names to combo-level names in noinline_arg_name_maps.
         for sub_kernel in self.sub_kernels:
             self._merge_noinline_kernel_arg(sub_kernel)
 
@@ -1131,6 +1265,9 @@ class ComboKernel(Kernel):
         ]
 
     def _merge_noinline_kernel_arg(self, sub_kernel: TritonKernel) -> None:
+        # [FUNCTION DOC] HELPER: Replay one sub-kernel's local args into the combo args: tensors as
+        # in-place (linking outputs to the input), output or input; symbolic sizes as size vars; other
+        # size args as seed offsets with integer values. Mutates self.args.
         # Each noinline body codegens in a local namespace, so different members
         # can all have local names like in_ptr0/out_ptr0. First replay every
         # local arg into the combo-main namespace; names are resolved only after
@@ -1165,6 +1302,9 @@ class ComboKernel(Kernel):
     def _resolve_noinline_kernel_arg_names(
         self, sub_kernel: TritonKernel
     ) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Map each local arg name of the sub-kernel to its combo-level name
+        # (output name for in-place or output tensors, input name otherwise, size var name for sizes).
+        # Raises AssertionError for unsupported argument kinds.
         local_args = sub_kernel.args
         local_to_main: dict[str, str] = {}
         local_argdefs, _, local_signature, _ = local_args.python_argdefs()
@@ -1194,6 +1334,9 @@ class ComboKernel(Kernel):
     def _noinline_block_args_for_sub_kernel(
         self, sub_kernel: TritonKernel, num: int
     ) -> list[tuple[ArgName, str]]:
+        # [FUNCTION DOC] HELPER: For a noinline sub-kernel, list pairs of (constexpr parameter, suffixed
+        # block name passed at the call) for x and y trees and non-persistent reduction trees, skipping
+        # x when there is no x dim.
         block_args: list[tuple[ArgName, str]] = []
         for tree in sub_kernel.range_trees:
             if tree.prefix == "x" and sub_kernel.no_x_dim:
@@ -1208,6 +1351,8 @@ class ComboKernel(Kernel):
         return block_args
 
     def _signature_key_part(self, arg: Any) -> tuple[Any, ...]:
+        # [FUNCTION DOC] HELPER: Hashable descriptor of one arg used to decide whether two noinline
+        # functions are interchangeable (tensor dtype and alignment, size expr type, constexpr name).
         if isinstance(arg, TensorArg):
             return ("tensor", arg.dtype, is_unaligned_buffer(arg))
         if isinstance(arg, SizeArg):
@@ -1217,6 +1362,9 @@ class ComboKernel(Kernel):
         return (type(arg).__name__, getattr(arg, "name", None))
 
     def _prepare_noinline_sub_kernel_calls(self) -> None:
+        # [FUNCTION DOC] HELPER: Build and store noinline_sub_kernel_calls: for each sub-kernel, the
+        # device function parameters, matching call arguments, and a signature key. Parameters are the
+        # local args, dynamic numels, pid offsets (x, and y if present) and block constexprs.
         calls: list[NoinlineSubKernelCall] = []
         for num, sub_kernel in enumerate(self.sub_kernels):
             local_to_main = self.noinline_arg_name_maps[num]
@@ -1265,6 +1413,9 @@ class ComboKernel(Kernel):
         self,
         heuristics_list: list[str],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Whether all sub-kernels may share one emitted body: needs 2+ members, no
+        # autotune or per-subkernel blocks, not ROCm, sequential or round-robin dispatch, no dynamic
+        # shapes or y trees, only plain pointwise members with an x dim.
         if len(self.sub_kernels) < 2:
             return False
         if self.enable_autotune or self.per_subkernel_blocks:
@@ -1293,6 +1444,8 @@ class ComboKernel(Kernel):
 
     @staticmethod
     def _plain_lines(code: IndentedBuffer) -> list[str] | None:
+        # [FUNCTION DOC] HELPER: Return the buffer's lines as strings (evaluating deferred lines, dropping
+        # ones that evaluate to nothing), or None if any line is of another kind.
         lines: list[str] = []
         for line in code._lines:
             if isinstance(line, str):
@@ -1307,6 +1460,8 @@ class ComboKernel(Kernel):
 
     @staticmethod
     def _replace_names_in_line(line: str, replacements: dict[str, str]) -> str | None:
+        # [FUNCTION DOC] HELPER: Replace whole identifier tokens in a source line per the mapping,
+        # leaving other text unchanged. Returns None if the line cannot be tokenized.
         if not replacements:
             return line
         try:
@@ -1327,6 +1482,7 @@ class ComboKernel(Kernel):
     def _replace_names(
         cls, lines: list[str], replacements: dict[str, str]
     ) -> list[str] | None:
+        # [FUNCTION DOC] HELPER: Apply the identifier replacements to every line; None if any line fails.
         replaced: list[str] = []
         for line in lines:
             new_line = cls._replace_names_in_line(line, replacements)
@@ -1337,6 +1493,8 @@ class ComboKernel(Kernel):
 
     @staticmethod
     def _names_in_lines(lines: list[str]) -> OrderedSet[str] | None:
+        # [FUNCTION DOC] HELPER: Collect all identifier tokens appearing in the lines, in first-seen
+        # order; None if tokenization fails.
         names: OrderedSet[str] = OrderedSet()
         try:
             for line in lines:
@@ -1349,6 +1507,7 @@ class ComboKernel(Kernel):
 
     @staticmethod
     def _range_tree_names(sub_kernel: TritonKernel) -> list[str]:
+        # [FUNCTION DOC] HELPER: Ordered list of each range tree's name followed by its entry names.
         names: list[str] = []
         for tree in sub_kernel.range_trees:
             names.append(tree.name)
@@ -1359,6 +1518,8 @@ class ComboKernel(Kernel):
     def _range_tree_name_replacements(
         cls, first: TritonKernel, sub_kernel: TritonKernel
     ) -> dict[str, str] | None:
+        # [FUNCTION DOC] HELPER: Map range-tree variable names of sub_kernel to those of first, when the
+        # trees match in count, prefix, tensor dim and reduction flag; None if the structures differ.
         if len(first.range_trees) != len(sub_kernel.range_trees):
             return None
 
@@ -1389,6 +1550,9 @@ class ComboKernel(Kernel):
         sub_kernel: TritonKernel,
         args: list[str],
     ) -> dict[str, str] | None:
+        # [FUNCTION DOC] HELPER: Full rename map turning sub_kernel's body into the first sub-kernel's
+        # naming: temporaries matched by canonical op-trace name, range-tree names, and each pointer arg
+        # replaced by a foreach_arg placeholder. None if a temporary has no match or trees differ.
         first_cse_names = {
             canonical: name for name, canonical in first._op_trace_cse_names.items()
         }
@@ -1414,6 +1578,8 @@ class ComboKernel(Kernel):
         args_by_subkernel: list[list[str]],
         tensor_args: dict[str, TensorArg],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if every sub-kernel uses the same non-zero number of tensor args,
+        # all are known tensors, and at each position all share one (dtype, unaligned) property pair.
         if not args_by_subkernel:
             return False
         num_args = len(args_by_subkernel[0])
@@ -1441,6 +1607,7 @@ class ComboKernel(Kernel):
 
     @classmethod
     def _setup_lhs_names(cls, sub_kernel_codes: list[SubKernelCode]) -> list[str]:
+        # [FUNCTION DOC] HELPER: Unique setup-assigned names across sub-kernels, in first-seen order.
         names: list[str] = []
         seen: OrderedSet[str] = OrderedSet()
         for sub_kernel_code in sub_kernel_codes:
@@ -1456,6 +1623,10 @@ class ComboKernel(Kernel):
         signature: list[Any],
         heuristics_list: list[str],
     ) -> SharedBody | None:
+        # [FUNCTION DOC] HELPER: Try to build a SharedBody: requires sharing to be allowed, identical op
+        # traces, and that after renaming temporaries, range names and pointer args to placeholders every
+        # sub-kernel body is textually identical with compatible arg properties. Returns None if any
+        # check fails.
         if not self._can_share_body(heuristics_list):
             return None
 
@@ -1531,6 +1702,9 @@ class ComboKernel(Kernel):
     def _codegen_sub_kernel_bodies(
         self,
     ) -> list[SubKernelCode]:
+        # [FUNCTION DOC] HELPER: For each sub-kernel, generate setup lines and body (prologue, body,
+        # PDL filtering) and make block/numel names unique per sub-kernel unless per-subkernel blocks.
+        # Side effects: runs codegen on the sub-kernels and updates self.grids.
         sub_kernel_codes: list[SubKernelCode] = []
         for num, sub_kernel in enumerate(self.sub_kernels):
             setup = IndentedBuffer()
@@ -1561,6 +1735,8 @@ class ComboKernel(Kernel):
         num: int,
         sub_kernel_code: SubKernelCode,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emit one dispatch branch (pid range header, setup, body) for sub-kernel
+        # num. Raises AssertionError if the dispatch class is unset.
         if self.dispatch_class is None:
             raise AssertionError("dispatch_class must not be None")
         self.dispatch_class.codegen_pid_range(self, num, code)
@@ -1574,6 +1750,9 @@ class ComboKernel(Kernel):
         kernel_name: str,
         sub_kernel_codes: list[SubKernelCode],
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Write noinline device functions for the sub-kernels into code (identical
+        # setup/body/signature combinations reuse one function named after the kernel) and return the
+        # per-branch call lines.
         """Emit each sub-kernel body as a @triton.jit(noinline=True) device
         function and return the per-branch call lines."""
         call_lines: list[str] = []
@@ -1612,6 +1791,9 @@ class ComboKernel(Kernel):
         sub_kernel_codes: list[SubKernelCode],
         shared_body: SharedBody,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emit dispatch branches that only run setup and bind placeholder names to
+        # each sub-kernel's pointers, then an else branch with defaults, then the single shared body after
+        # the branches. Raises AssertionError if the dispatch class is unset.
         if self.dispatch_class is None:
             raise AssertionError("dispatch_class must not be None")
         for num, sub_kernel_code in enumerate(sub_kernel_codes):
@@ -1640,6 +1822,11 @@ class ComboKernel(Kernel):
         code.splice(shared_body.body)
 
     def codegen_kernel(self, name: str | None = None) -> str:
+        # [FUNCTION DOC] Generate and return the full Triton source of the combo kernel (imports, helper
+        # functions, optional noinline functions, heuristics decorator, kernel def with pid dispatch over
+        # sub-kernel bodies or a shared body, optional proton scopes and benchmark harness). Chooses
+        # heuristics, args, block args and numel args; mutates many instance fields.
+        # Raises AssertionError if noinline call args are missing from the main signature.
         """Generate the triton code for a combo kernel that fuses multiple sub-kernels."""
         # TODO: is it correct to use the first sub kernel's heuristics?
         heuristics_list, size_hints_list = [], []
@@ -1762,6 +1949,10 @@ class ComboKernel(Kernel):
         return code.getvalue()
 
     def codegen_kernel_benchmark(self, num_gb: float) -> IndentedBuffer:
+        # [FUNCTION DOC] Build benchmark harness code: an argument factory (random strided tensors for
+        # buffers and constants, hinted ints for sizes, zeroed workspaces), a call function launching the
+        # kernel on the device stream, a benchmark-all-configs function, and a main block printing time,
+        # size and bandwidth using num_gb. Raises KeyError for args that are none of those kinds.
         """
         Generates Python code for benchmarking this combo kernel.
         - Creates example inputs (random tensors, constants, sizes).
@@ -1871,6 +2062,8 @@ class ComboKernel(Kernel):
         return result
 
     def imports_for_benchmark_kernel(self) -> str:
+        # [FUNCTION DOC] Return import lines for the benchmark harness (rand_strided, the device's
+        # raw-stream getter, torch).
         # Dedent BEFORE substituting get_raw_stream: a multi-line override would
         # otherwise collapse dedent's common prefix and misindent the imports.
         return textwrap.dedent(
@@ -1884,6 +2077,10 @@ class ComboKernel(Kernel):
     def uniquify_block_sizes(
         self, code: IndentedBuffer, num_kernel: int, uniquify: list[str]
     ) -> IndentedBuffer:
+        # [FUNCTION DOC] Return a copy of code in which every occurrence of the listed names is suffixed
+        # with the sub-kernel index (by substring replacement, including deferred lines); returns code
+        # unchanged if the list is empty.
+        # KNOWN ISSUE: substring replacement can also alter longer names that contain a listed name.
         if not uniquify:
             return code
         modified = IndentedBuffer(initial_indent=code._indent)
@@ -1910,6 +2107,8 @@ class ComboKernel(Kernel):
         return modified
 
     def call_kernel(self, name: str) -> None:
+        # [FUNCTION DOC] Emit the wrapper-level launch of the kernel named name with the combo's args,
+        # adding dynamic numel call args when present. Raises AssertionError if the dispatch class is unset.
         _, call_args, _, arg_types = self.args.python_argdefs()
 
         wrapper = V.graph.wrapper_code
@@ -1928,6 +2127,11 @@ class ComboKernel(Kernel):
         )
 
     def combo_grid_meta(self, size_hints_list: list[dict[str, int]]) -> dict[str, Any]:
+        # [FUNCTION DOC] Build the metadata mapping for grid/dispatch/autotune: kernel count, minimum
+        # blocks (None if dynamic), autotune grouping, block arg names, a default block config (stitched,
+        # compile-time autotuned, per-subkernel or generic; None when autotuning), and per-subkernel
+        # entries (no_x_dim, heuristic, size hints, hints, numels with None for dynamic ones).
+        # Raises AssertionError if compile-time autotune has no launch candidates.
         """
         Build metadata used by combo-kernel grid/dispatch/autotune helpers.
         """
