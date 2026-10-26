@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Simple wrapper higher-order ops: wrap (testing), inductor_compiled_code (opaque compiled
+# callable with fake/functionalize/proxy rules and a side table), wrap_with_set_grad_enabled,
+# wrap_with_autocast, dynamo_bypassing_wrapper, wrap_activation_checkpoint and
+# tag_activation_checkpoint. Import-time side effects: instantiates the HOP singletons,
+# registers fallthroughs for autograd keys, mode redirects, fake/functionalize/proxy impls,
+# and creates the global side table and id counters.
 import inspect
 import itertools
 import logging
@@ -36,12 +43,17 @@ uid = itertools.count(1)
 
 # Used for testing the HigherOrderOperator mechanism
 class Wrap(HigherOrderOperator):
+    # [CLASS DOC] Testing HOP named "wrap" that simply calls the given function eagerly
+    # with the given arguments, hidden from dynamo tracing. Stateless.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP under the name "wrap".
         super().__init__("wrap")
 
     def __call__(
         self, func: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs
     ) -> _R:
+        # [FUNCTION DOC] Calls func with args and kwargs through a dynamo-disabled inner
+        # wrapper and returns its result. Exceptions from func propagate.
         # Dynamo already traces the body of HigherOrderOp beforehand when it
         # so no need to trace into it.
         import torch._dynamo  # noqa: F401
@@ -49,6 +61,7 @@ class Wrap(HigherOrderOperator):
 
         @disable
         def wrapper():
+            # [FUNCTION DOC] HELPER: Runs func with the captured args and returns the result.
             result = func(*args, **kwargs)
             return result
 
@@ -59,6 +72,9 @@ wrap = Wrap()
 
 
 class InductorCompiledCode(HigherOrderOperator):
+    # [CLASS DOC] HOP named "inductor_compiled_code" that wraps an inductor compiled
+    # callable (or its side-table index) taking a list of inputs. Argument index 1 (the
+    # inputs list) is marked as boxed. Behavior per dispatch key is registered below.
     """
     Defines a HOP for wrapping inductor compiled functions as a callable.
     When used with torch.compile via "wrap_inductor_compiled_regions",
@@ -66,10 +82,13 @@ class InductorCompiledCode(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP and records that argument index 1 is boxed.
         super().__init__("inductor_compiled_code")
         self._boxed_arg_indices = (1,)
 
     def __call__(self, func, inputs, *, name: str | None = None):
+        # [FUNCTION DOC] Dispatches the HOP with func (callable object or int index),
+        # the list of input tensors, and an optional name; returns the outputs.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(func, inputs, name=name)
 
@@ -83,6 +102,10 @@ _inductor_compiled_callable_id = itertools.count()
 
 
 class InductorCompiledCallable:
+    # [CLASS DOC] Holds the compiled callable, the original FX graph module (used for
+    # fake tensor propagation), an optional region name, a unique idx, and a flag marking
+    # it as taking boxed (list) inputs. Calling it forwards the input list to the
+    # compiled callable.
     """
     A wrapper class that holds both the Inductor-compiled callable and the
     original FX graph for fake tensor propagation.
@@ -95,6 +118,8 @@ class InductorCompiledCallable:
         original_gm=None,
         compile_region_name: str | None = None,
     ):
+        # [FUNCTION DOC] Stores the arguments and draws a fresh unique idx from the global
+        # counter; sets the boxed-call marker so AOT autograd passes inputs as a list.
         self.idx = next(_inductor_compiled_callable_id)
         self.compiled_callable = compiled_callable
         self.original_gm = original_gm
@@ -103,10 +128,14 @@ class InductorCompiledCallable:
         self._boxed_call = True
 
     def __call__(self, inputs):
+        # [FUNCTION DOC] Calls the compiled callable with the input list and returns its outputs.
         return self.compiled_callable(inputs)
 
 
 class InductorCodeSideTable:
+    # [CLASS DOC] Maps integer idx to InductorCompiledCallable using a weak-value mapping
+    # so entries vanish when the callable is garbage collected. Supports pickling by
+    # converting to a strong dict on save and back to a weak mapping on load.
     """
     Side table for storing InductorCompiledCallable objects.
 
@@ -120,29 +149,38 @@ class InductorCodeSideTable:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an empty weak-value mapping from idx to callable.
         self.id_to_callable: weakref.WeakValueDictionary[
             int, InductorCompiledCallable
         ] = weakref.WeakValueDictionary()
 
     def add_callable(self, callable_obj: InductorCompiledCallable) -> int:
+        # [FUNCTION DOC] Stores the callable under its idx (overwriting any entry) and returns the idx.
         """Register a callable and return its idx."""
         self.id_to_callable[callable_obj.idx] = callable_obj
         return callable_obj.idx
 
     def get_callable(self, idx: int) -> InductorCompiledCallable:
+        # [FUNCTION DOC] Returns the callable stored under idx; raises an assertion error
+        # if idx is missing (never registered or already collected).
         """Get the callable at the given index."""
         if idx not in self.id_to_callable:
             raise AssertionError(f"Invalid inductor code index: {idx}")
         return self.id_to_callable[idx]
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a state mapping holding a plain (strong)
+        # dict copy of the table.
         # Convert WeakValueDictionary to regular dict for pickling
         return {"id_to_callable": dict(self.id_to_callable)}
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Pickle support: rebuilds the weak-value table from the saved dict.
+        # Note entries not otherwise referenced may disappear immediately.
         self.id_to_callable = weakref.WeakValueDictionary(state["id_to_callable"])
 
     def reset_table(self) -> None:
+        # [FUNCTION DOC] Replaces the table with a new empty weak-value mapping.
         """Reset the table."""
         self.id_to_callable = weakref.WeakValueDictionary()
 
@@ -153,6 +191,9 @@ inductor_code_side_table = InductorCodeSideTable()
 def _resolve_inductor_callable(
     func: int | InductorCompiledCallable,
 ) -> InductorCompiledCallable:
+    # [FUNCTION DOC] HELPER: Returns func if it is an InductorCompiledCallable, or looks
+    # up the side table when func is an int index. Raises an assertion error for other
+    # types or for an unknown index.
     """
     Resolve func to an InductorCompiledCallable.
 
@@ -168,6 +209,8 @@ def _resolve_inductor_callable(
 
 @inductor_compiled_code.py_impl(DispatchKey.CompositeExplicitAutograd)
 def inductor_compiled_code_impl(func, inputs, *, name=None):
+    # [FUNCTION DOC] Eager implementation: resolves func and runs its compiled callable on
+    # the input list, returning the outputs. The name argument is unused.
     resolved = _resolve_inductor_callable(func)
     return resolved.compiled_callable(inputs)
 
@@ -179,6 +222,9 @@ redirect_to_mode(inductor_compiled_code, _CachedTorchDispatchMode)
 
 @register_fake(inductor_compiled_code)
 def inductor_compiled_code_fake(func, inputs, *, name=None):
+    # [FUNCTION DOC] Fake-tensor rule: resolves func and runs the stored original FX graph
+    # on the fake inputs to get output metadata, returned as a tuple. Raises RuntimeError
+    # if the original graph was not kept.
     resolved = _resolve_inductor_callable(func)
     if resolved.original_gm is None:
         raise RuntimeError(
@@ -192,6 +238,8 @@ def inductor_compiled_code_fake(func, inputs, *, name=None):
 
 @inductor_compiled_code.py_functionalize_impl
 def inductor_compiled_code_functionalize(ctx, func, inputs, *, name=None):
+    # [FUNCTION DOC] Functionalization rule: unwraps the inputs, redispatches the HOP to
+    # the next key (forwarding name only when given), and re-wraps the result tensors.
     # Unwrap the functional tensors to get the underlying tensors
     unwrapped_inputs = ctx.unwrap_tensors(inputs)
 
@@ -204,6 +252,10 @@ def inductor_compiled_code_functionalize(ctx, func, inputs, *, name=None):
 
 @inductor_compiled_code.py_impl(ProxyTorchDispatchMode)
 def inductor_compiled_code_proxy(mode, func, inputs, *, name=None):
+    # [FUNCTION DOC] Proxy-tracing rule: computes example outputs via the fake path,
+    # registers the resolved callable in the global side table (mutating it), and emits a
+    # call node taking the int index and proxied inputs. Returns example outputs tracked
+    # to the output proxy.
     resolved = _resolve_inductor_callable(func)
 
     # Run the fake impl to get example outputs for tracing
@@ -226,7 +278,10 @@ def inductor_compiled_code_proxy(mode, func, inputs, *, name=None):
 
 
 class WrapWithSetGradEnabled(HigherOrderOperator):
+    # [CLASS DOC] HOP "wrap_with_set_grad_enabled": runs a function with grad mode set to
+    # a given value, restoring the previous mode afterwards. Stateless.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP under its name.
         super().__init__("wrap_with_set_grad_enabled")
 
     def __call__(
@@ -236,6 +291,10 @@ class WrapWithSetGradEnabled(HigherOrderOperator):
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> _R:
+        # [FUNCTION DOC] Sets global grad mode to enable_grad, calls wrapped_func with the
+        # args, restores the previous mode and returns the result. Dynamo-disabled.
+        # KNOWN ISSUE: the previous mode is restored without a finally block, so it is
+        # not restored if wrapped_func raises.
         # Dynamo already traces the body of HigherOrderOp beforehand when it
         # so no need to trace into it.
         import torch._dynamo
@@ -243,7 +302,8 @@ class WrapWithSetGradEnabled(HigherOrderOperator):
 
         @disable
         def wrapper():
-            prev = torch.is_grad_enabled()
+            # [FUNCTION DOC] HELPER: Saves grad mode, sets it, runs wrapped_func, restores mode, returns result.
+            prev =torch.is_grad_enabled()
             torch.set_grad_enabled(enable_grad)
             res = wrapped_func(*args, **kwargs)
             torch.set_grad_enabled(prev)
@@ -256,7 +316,10 @@ wrap_with_set_grad_enabled = WrapWithSetGradEnabled()
 
 
 class WrapWithAutocast(HigherOrderOperator):
+    # [CLASS DOC] HOP "wrap_with_autocast": runs a function inside an autocast context
+    # built from device type, dtype, enabled and cache_enabled. Stateless.
     def __init__(self):
+        # [FUNCTION DOC] Registers the HOP under its name.
         super().__init__("wrap_with_autocast")
 
     def __call__(
@@ -269,6 +332,9 @@ class WrapWithAutocast(HigherOrderOperator):
         *args: _P.args,
         **kwargs: _P.kwargs,
     ) -> _R:
+        # [FUNCTION DOC] Enters an autocast context with the given device_type, dtype,
+        # enabled and cache_enabled, calls wrapped_func with the args inside it, and
+        # returns the result. Dynamo-disabled.
         # Dynamo already traces the body of HigherOrderOp beforehand when it
         # so no need to trace into it.
         import torch._dynamo
@@ -276,6 +342,7 @@ class WrapWithAutocast(HigherOrderOperator):
 
         @disable
         def wrapper():
+            # [FUNCTION DOC] HELPER: Runs wrapped_func under autocast and returns the result.
             with torch.autocast(device_type, dtype, enabled, cache_enabled):
                 return wrapped_func(*args, **kwargs)
 
@@ -292,7 +359,10 @@ wrap_with_autocast = WrapWithAutocast()
 # extra *args and **kwargs are forwarded to `wrapper_fn(inner_fn)` when it is
 # executed.
 class DynamoBypassingWrapper(HigherOrderOperator):
+    # [CLASS DOC] HOP "dynamo_bypassing_wrapper": applies a wrapper function to inner_fn
+    # outside of dynamo tracing, then calls the result with the extra args. Stateless.
     def __init__(self):
+        # [FUNCTION DOC] Registers the HOP under its name.
         super().__init__("dynamo_bypassing_wrapper")
 
     def __call__(
@@ -302,6 +372,10 @@ class DynamoBypassingWrapper(HigherOrderOperator):
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC] If wrapper_fn_or_key is a string, inner_fn must be a GraphModule
+        # (else assertion error) and the wrapper function is looked up in its meta mapping
+        # under that key; otherwise the argument is the wrapper function itself. Calls the
+        # wrapper on inner_fn, then calls that result with args and kwargs; returns it.
         # Dynamo already traces the body of HigherOrderOp beforehand when it
         # so no need to trace into it.
         import torch._dynamo
@@ -319,6 +393,7 @@ class DynamoBypassingWrapper(HigherOrderOperator):
 
         @disable
         def wrapper():
+            # [FUNCTION DOC] HELPER: Builds the wrapped function and calls it with the captured args.
             return wrapper_fn(inner_fn)(*args, **kwargs)
 
         return wrapper()
@@ -328,6 +403,8 @@ dynamo_bypassing_wrapper = DynamoBypassingWrapper()
 
 
 class WrapActivationCheckpoint(HigherOrderOperator):
+    # [CLASS DOC] HOP "wrap_activation_checkpoint" (not cacheable): runs a graph module under
+    # non-reentrant torch.utils.checkpoint using an fx Interpreter. Stateless.
     """
     This operator is used to wrap torch.utils.checkpoint. This avoids
     TorchDynamo to look into saved tensor hooks and directly passes the control
@@ -346,9 +423,13 @@ class WrapActivationCheckpoint(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP as non-cacheable.
         super().__init__("wrap_activation_checkpoint", cacheable=False)
 
     def __call__(self, function: GraphModule, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Forces use_reentrant and preserve_rng_state to false in kwargs
+        # (mutating the passed mapping), then runs the graph module via an Interpreter
+        # inside checkpoint with node metadata preserved. Returns the checkpoint result.
         # use_reentrant is set to False because this op is going to be traced.
         # And we ensure that AOT Autograd traces through the non reentrant
         # version of checkpointing.
@@ -368,6 +449,9 @@ wrap_activation_checkpoint = WrapActivationCheckpoint()
 
 
 class TagActivationCheckpoint(HigherOrderOperator):
+    # [CLASS DOC] HOP "tag_activation_checkpoint" (cacheable) for the torch.compile stack.
+    # Under PreDispatch it stays a HOP node; otherwise it runs the checkpoint
+    # implementation directly. Stateless.
     """
     This operator is supposed to be used only with torch.compile stack. This
     accepts a Fx graph module which needs to be checkpointed. This operator adds
@@ -387,10 +471,15 @@ class TagActivationCheckpoint(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP as cacheable.
         super().__init__("tag_activation_checkpoint", cacheable=True)
 
     @staticmethod
     def divide_kwargs(kwargs):
+        # [FUNCTION DOC] Splits kwargs into those that are options of the checkpoint
+        # function (its signature parameters except function/args/kwargs, plus
+        # preserve_rng_state) and the rest, which belong to the checkpointed function.
+        # Returns the pair (checkpoint_kwargs, gmod_kwargs); input order is preserved.
         """
         checkpoint fn can have mixed kwargs between checkpointed fn and
         checkpoint fn itself. For example
@@ -429,6 +518,9 @@ class TagActivationCheckpoint(HigherOrderOperator):
         return checkpoint_kwargs, gmod_kwargs
 
     def __call__(self, gmod, *args, **kwargs):
+        # [FUNCTION DOC] Computes the highest-priority dispatch key of the arguments. If it
+        # is PreDispatch, goes through normal HOP dispatch; otherwise calls
+        # tag_activation_checkpoint_impl directly. Returns the outputs.
         dispatch_key_set = torch._ops._compute_keyset(
             args, kwargs, self.non_fallthrough_keys
         )
@@ -444,12 +536,19 @@ tag_activation_checkpoint = TagActivationCheckpoint()
 
 
 def _always_prefer_recompute(ctx, op, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Selective-checkpoint policy that returns PREFER_RECOMPUTE for every op.
     from torch.utils.checkpoint import CheckpointPolicy
 
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
 def tag_activation_checkpoint_impl(gmod, *args, **kwargs):
+    # [FUNCTION DOC] Runs gmod under non-reentrant selective checkpointing. Takes a unique
+    # graph id from the global counter. Uses the context function in gmod meta (with a
+    # one-time warning) or else a policy that always recomputes; wraps it to tag the
+    # forward context with the graph id. Mutates kwargs: use_reentrant, preserve_rng_state
+    # and early_stop false, context_fn set. Runs gmod via an Interpreter wrapper function
+    # inside checkpoint with node metadata preserved and returns its result.
     import functools
 
     import torch.fx.traceback as fx_traceback
@@ -473,6 +572,8 @@ Please make sure the checkpointed region does not contain in-place ops (e.g. tor
         )
 
     def context_fn_with_graph_id():
+        # [FUNCTION DOC] HELPER: Calls the chosen context function, sets the graph id on the
+        # forward context, and returns the (forward, recompute) context pair.
         fwd_ctx, recomp_ctx = context_fn()
         # Plumb ac_graph_id so _CachingTorchDispatchMode tags all nodes
         # (including ops from desugared HOPs like custom autograd.Function).
@@ -501,6 +602,7 @@ Please make sure the checkpointed region does not contain in-place ops (e.g. tor
     # tensors and prevents the autograd graph from being freed.
 
     def run_with_interpreter(*args):
+        # [FUNCTION DOC] HELPER: Runs gmod on args with a fresh Interpreter and returns the outputs.
         return Interpreter(gmod).run(*args)
 
     with fx_traceback.preserve_node_meta():
@@ -516,6 +618,12 @@ def proxy_mode_key(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[torch.Tensor]:
+    # [FUNCTION DOC] Proxy-mode rule for tag_activation_checkpoint. Requires pre-dispatch
+    # tracing (assertion error otherwise). Computes example outputs, re-traces the graph
+    # module body with make_fx under preserved metadata, copies the checkpoint context
+    # function into the new module's meta, registers it on the tracer root under a fresh
+    # name, and emits a call node of the HOP with it. Returns example outputs tracked to
+    # the output proxy.
     import torch.fx.traceback as fx_traceback
     from torch.fx import Interpreter
 

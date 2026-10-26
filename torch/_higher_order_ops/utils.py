@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Shared utilities for higher-order ops (cond, scan, while_loop, map, etc.): autograd-not-
+# implemented wrappers, subgraph tracing helpers (make_fx re-entry, fake tracing), alias and
+# mutation analysis of subgraphs, metadata consistency checks, forward/backward graph
+# construction, compilation-environment setup for HOP eager execution, pytree/mask helpers,
+# and HopInstance/schema helpers. Import-time side effects: creates a thread-local flag
+# object used to detect HOP-internal compilation; otherwise only definitions.
 import contextlib
 import functools
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -38,12 +45,18 @@ from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 @dataclass
 class UnsupportedAliasMutationException(RuntimeError):
+    # [CLASS DOC] Error (a RuntimeError dataclass) raised when a subgraph aliases or mutates
+    # inputs in an unsupported way; carries a human readable reason string.
     reason: str
 
 
 def autograd_not_implemented_inner(
     operator: OperatorBase, delayed_error: bool, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC] Calls the operator below autograd and returns its result. If grad mode is
+    # on and any tensor argument requires grad, either raises RuntimeError (default) or,
+    # when delayed_error is true, wraps each tensor output in a node that raises only when
+    # backward reaches it (floating or complex outputs are detached and given requires_grad).
     """If autograd is enabled and any of the arguments require grad this will either
     raise an error or return a DelayedError depending on the value of delayed.
 
@@ -70,6 +83,7 @@ def autograd_not_implemented_inner(
                 )
 
                 def fake_requires_grad(tensor):
+                    # [FUNCTION DOC] HELPER: Detaches floating/complex tensors and marks them as requiring grad; others unchanged.
                     if torch.is_floating_point(tensor) or torch.is_complex(tensor):
                         tensor = tensor.detach()
                         tensor.requires_grad = True
@@ -84,17 +98,24 @@ def autograd_not_implemented_inner(
 
 
 def autograd_not_implemented(op: OperatorBase, deferred_error: bool) -> Callable:
+    # [FUNCTION DOC] Returns a callable that applies the autograd-not-implemented behavior to op,
+    # with errors raised immediately or deferred according to deferred_error.
     def inner(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards to the inner autograd-not-implemented routine for op.
         return autograd_not_implemented_inner(op, deferred_error, *args, **kwargs)
 
     return inner
 
 
 def _maybe_run_with_interpreter(fn):
+    # [FUNCTION DOC] HELPER: If fn is a graph module and node metadata preservation is active,
+    # returns a wrapper that runs it with an fx Interpreter (so stack traces propagate);
+    # otherwise returns fn unchanged.
     maybe_interpreted_fn = fn
     if isinstance(fn, torch.fx.GraphModule) and fx_traceback.has_preserved_node_meta():
         # Running graph with interpreter is needed for propagating the stack_trace
         def graph_with_interpreter(*args):
+            # [FUNCTION DOC] HELPER: Runs the graph module with an Interpreter under preserved node metadata.
             with fx_traceback.preserve_node_meta():
                 return torch.fx.Interpreter(fn).run(*args)
 
@@ -103,6 +124,9 @@ def _maybe_run_with_interpreter(fn):
 
 
 def _hop_compile_and_call(fn, args, kwargs=None):
+    # [FUNCTION DOC] HELPER: Compiles fn with a full-graph requirement using the HOP compilation
+    # environment backend and calls it with args and optional kwargs, returning the result.
+    # Temporarily resets the global fullgraph frame counter to zero and restores it afterwards.
     """Compile and call fn with fullgraph=True for HOP eager execution.
 
     Pre-activates the fullgraph counter so that compile_wrapper treats this as
@@ -123,6 +147,8 @@ def _hop_compile_and_call(fn, args, kwargs=None):
 
 
 def _maybe_compile_and_run_fn(fn, *args):
+    # [FUNCTION DOC] HELPER: Runs fn on args via compile-and-call when not already inside dynamo
+    # compilation; otherwise calls fn directly. Returns the result.
     if not torch.compiler.is_dynamo_compiling():
         return _hop_compile_and_call(fn, args)
     else:
@@ -130,10 +156,17 @@ def _maybe_compile_and_run_fn(fn, *args):
 
 
 def reenter_make_fx(fn, subgraph_decomp_table=None):
+    # [FUNCTION DOC] Returns a function that traces fn as a subgraph inside the currently
+    # active make_fx session (optionally with a custom decomposition table) and returns the
+    # resulting graph module.
     from torch.fx.experimental.proxy_tensor import _CURRENT_MAKE_FX_TRACER
 
     @functools.wraps(fn)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: Traces fn on args as a subgraph of the current tracer and returns
+        # the graph module. Raises an assertion error when no make_fx session is active.
+        # KNOWN ISSUE: the tracer global is imported once when reenter_make_fx runs, so a
+        # session started afterwards is not seen by an already created wrapper.
         if _CURRENT_MAKE_FX_TRACER is None:
             raise AssertionError(
                 "Cannot reenter make_fx when we're not under a make_fx tracing session"
@@ -153,6 +186,9 @@ def reenter_make_fx(fn, subgraph_decomp_table=None):
 
 
 def _maybe_reenter_make_fx(fn, subgraph_decomp_table=None):
+    # [FUNCTION DOC] HELPER: If a make_fx session is active returns the re-entering tracer for fn;
+    # otherwise returns a function that runs a fresh make_fx on fn, in fake tracing mode when
+    # the inputs carry no fake mode and in real mode (under their fake mode) otherwise.
     from torch.fx.experimental.proxy_tensor import _CURRENT_MAKE_FX_TRACER
 
     if _CURRENT_MAKE_FX_TRACER is not None:
@@ -160,8 +196,10 @@ def _maybe_reenter_make_fx(fn, subgraph_decomp_table=None):
     else:
 
         def _maybe_make_fx_with_fake_mode(fn):
+            # [FUNCTION DOC] HELPER: Wraps fn in a function that traces it with make_fx and returns the graph module.
             @functools.wraps(fn)
             def wrapped(*args):
+                # [FUNCTION DOC] HELPER: Detects a fake mode from args and traces fn with make_fx accordingly.
                 from torch._guards import detect_fake_mode
 
                 fake_mode = detect_fake_mode(args)
@@ -188,14 +226,21 @@ def check_meta_consistency(
     rhs_name: str,
     include_contiguity: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Verifies that two lists of values (tensors, symints, ints) match pairwise
+    # in tensor metadata (optionally including contiguity), device and basic type. Raises
+    # UncapturedHigherOrderOpError if lengths differ or any pair differs, with a message
+    # listing every differing pair. Returns nothing.
     def diff_meta_pairs(
         lhs_list: list[torch.Tensor | torch.SymInt | int],
         rhs_list: list[torch.Tensor | torch.SymInt | int],
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns descriptions of differing pairs; raises if list lengths differ.
         def diff_meta(
             lhs: torch.Tensor | torch.SymInt | int,
             rhs: torch.Tensor | torch.SymInt | int,
         ) -> str:
+            # [FUNCTION DOC] HELPER: Returns a text of metadata differences for tensor pairs, a type
+            # mismatch text if kinds differ (int-like vs tensor), or an empty string if equal.
             if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
                 return ", ".join(
                     diff_tensor_meta(
@@ -211,11 +256,13 @@ def check_meta_consistency(
             else:
 
                 def _both_int_types(lhs, rhs):
+                    # [FUNCTION DOC] HELPER: True if both values are ints or symints.
                     return isinstance(lhs, (int, torch.SymInt)) and isinstance(
                         rhs, (int, torch.SymInt)
                     )
 
                 def _both_tensor(lhs, rhs):
+                    # [FUNCTION DOC] HELPER: True if both values are tensors.
                     return isinstance(lhs, torch.Tensor) and isinstance(
                         rhs, torch.Tensor
                     )
@@ -230,6 +277,7 @@ def check_meta_consistency(
             lhs: torch.Tensor | torch.SymInt | int,
             rhs: torch.Tensor | torch.SymInt | int,
         ) -> str:
+            # [FUNCTION DOC] HELPER: For tensor pairs returns "device" if device type or index differ, else an empty string.
             if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
                 if (
                     rhs.device.type == lhs.device.type
@@ -271,11 +319,17 @@ _hop_compile_tls = threading.local()
 
 
 def _in_hop_compile() -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether the current thread is inside HOP internal compilation (false by default).
     return getattr(_hop_compile_tls, "in_hop_compile", False)
 
 
 @contextmanager
 def setup_compilation_env():
+    # [FUNCTION DOC] Context manager yielding a dynamo backend for compiling inside HOP or
+    # export regions. Sets the thread-local in-HOP-compile flag, applies the compilation
+    # config overrides, disables the cache limit, and temporarily removes the pre-dispatch and
+    # metadata torch function modes; yields an eager backend that re-enters those modes if
+    # any were active, otherwise the plain eager backend. Restores the flag on exit.
     """
     Context manager that sets up proper environment and backend when invoking torch.compile
     inside torch.export region or inside HOP.
@@ -310,6 +364,8 @@ def setup_compilation_env():
 
 @contextmanager
 def _set_compilation_env():
+    # [FUNCTION DOC] HELPER: Context manager that turns off the fx-tracing flag and sets dynamo
+    # config to allow empty graphs and capture scalar outputs, restoring all three on exit.
     _old_is_tracing = torch.fx._symbolic_trace._get_is_fx_tracing()
     _old_allow_empty_graphs = torch._dynamo.config.allow_empty_graphs
     _old_capture_scalar_outputs = torch._dynamo.config.capture_scalar_outputs
@@ -337,6 +393,10 @@ def _set_compilation_env():
 
 # The invariant here is that we always trace the branch with fake tensor
 def _maybe_fake_tracing(fn, inputs: list[Any], pre_dispatch):
+    # [FUNCTION DOC] HELPER: Traces fn on inputs with make_fx (data-dependent op errors off),
+    # always using fake tensors: reuses the fake mode of the first fake input in real mode,
+    # else fake tracing mode. Proxy tracing is disabled around it. When a shape environment
+    # exists, inserts deferred runtime asserts into the graph. Returns the graph module.
     fake_mode_det = None
     for inp in pytree.tree_leaves(inputs):
         if is_fake_tensor(inp):
@@ -370,6 +430,12 @@ def _maybe_fake_tracing(fn, inputs: list[Any], pre_dispatch):
 
 
 def potential_input_alias_or_mutation(gm, inputs, pre_dispatch=False):
+    # [FUNCTION DOC] Traces gm on inputs and analyzes aliasing and mutation. Returns the bare
+    # boolean True when tracing raises UnsupportedAliasMutationException (nested functionalized
+    # cond); otherwise a pair of (input-input, input-output, output-output alias maps) and the
+    # input mutation collection. Other exceptions propagate.
+    # KNOWN ISSUE: the exceptional return is a bool while callers unpack a nested pair, so
+    # callers fail with a type error in that case.
     try:
         gm = _maybe_fake_tracing(gm, inputs, pre_dispatch)
     except UnsupportedAliasMutationException:
@@ -392,6 +458,9 @@ def potential_input_alias_or_mutation(gm, inputs, pre_dispatch=False):
 
 
 def analyze_potential_input_alias_or_mutation(name, aliases, input_mutations):
+    # [FUNCTION DOC] Raises RuntimeError naming the offending inputs if any alias map is
+    # non-empty, or naming the mutating nodes if input_mutations is non-empty. name prefixes
+    # the message. Returns nothing otherwise.
     if any(len(a) > 0 for a in aliases):
         # TODO: Investigate here further which node is exactly aliasing
         raise RuntimeError(
@@ -411,6 +480,7 @@ def analyze_potential_input_alias_or_mutation(name, aliases, input_mutations):
 
 
 def _has_potential_branch_input_mutation(gm, inputs, pre_dispatch=False):
+    # [FUNCTION DOC] HELPER: Returns true if tracing gm on inputs shows any input mutation.
     (
         (_, _, _),
         inp_mutation,
@@ -420,6 +490,8 @@ def _has_potential_branch_input_mutation(gm, inputs, pre_dispatch=False):
 
 
 def has_potential_input_alias_or_mutation(gm, inputs, pre_dispatch=False):
+    # [FUNCTION DOC] Returns a pair of booleans for gm traced on inputs: whether any aliasing
+    # exists (input-input, input-output or output-output) and whether any input is mutated.
     (
         (
             inp_inp_alias_map,
@@ -441,6 +513,12 @@ def has_potential_input_alias_or_mutation(gm, inputs, pre_dispatch=False):
 
 
 def _collect_fake_inputs(inputs):
+    # [FUNCTION DOC] HELPER: Maps proxies/nodes (using their stored example values) and plain ints
+    # to a flat list of example inputs. Batched or functional tensors are unwrapped to their
+    # fake tensor; tensor subclasses contribute their fake inner tensors; non-tensor example
+    # values pass through; ints pass through. Raises an assertion error on non-fake tensors or
+    # unexpected types.
+    # KNOWN ISSUE: a proxy or node without a meta attribute is silently skipped.
     from torch._subclasses.fake_tensor import FakeTensor
 
     # Get the example values of the inputs.
@@ -497,6 +575,8 @@ def _collect_fake_inputs(inputs):
 
 
 def _check_alias_and_mutation(graph_module, inputs_fake, name, pre_dispatch):
+    # [FUNCTION DOC] HELPER: Raises RuntimeError saying name may alias input/output or modify
+    # inputs, when analysis of graph_module on inputs_fake finds either. Returns nothing.
     aliases, inp_mutation = has_potential_input_alias_or_mutation(
         graph_module, inputs_fake, pre_dispatch=pre_dispatch
     )
@@ -507,6 +587,7 @@ def _check_alias_and_mutation(graph_module, inputs_fake, name, pre_dispatch):
 
 
 def unique_graph_id(proxy_mode, prefix):
+    # [FUNCTION DOC] Returns (index, name) for a graph name not yet used on the tracer root of proxy_mode.
     """Returns a unique name and id for a graph to be added to a proxy_mode tracer"""
     # There are probably better ways - I know that create_arg has some self incrementing name
     # magic to it, but since we explicitly have to get the name for register_module,
@@ -517,6 +598,8 @@ def unique_graph_id(proxy_mode, prefix):
 def unique_graph_name_with_root(
     root: torch.fx.GraphModule, prefix: str
 ) -> tuple[int, str]:
+    # [FUNCTION DOC] Finds the smallest non-negative integer i such that the root module has no
+    # attribute named prefix_i; returns (i, that name). Does not register anything.
     next_name = None
     i = 0
     # pyrefly: ignore [bad-assignment]
@@ -530,6 +613,9 @@ def unique_graph_name_with_root(
 
 
 def _from_fun(t):
+    # [FUNCTION DOC] HELPER: Converts a tensor to a fresh uninitialized strided tensor with the same
+    # metadata (non-bool dtypes); for bool tensors syncs and unwraps functional wrappers and
+    # returns a clone of the plain tensor. Non-tensors are returned unchanged.
     from torch._functorch.aot_autograd import from_fun
 
     if isinstance(t, torch.Tensor):
@@ -560,6 +646,8 @@ def _from_fun(t):
 
 
 def clone_outputs_aliasing_inputs(args):
+    # [FUNCTION DOC] Returns a function that clones a tensor if it shares storage with any tensor
+    # in args and returns other values unchanged. Used to keep backward graphs functional.
     input_storage = {
         StorageWeakRef(arg._typed_storage())
         for arg in args
@@ -567,6 +655,7 @@ def clone_outputs_aliasing_inputs(args):
     }
 
     def maybe_clone(t):
+        # [FUNCTION DOC] HELPER: Clones t if its storage matches an input's storage, else returns t.
         if (
             isinstance(t, torch.Tensor)
             and StorageWeakRef(t._typed_storage()) in input_storage
@@ -578,6 +667,7 @@ def clone_outputs_aliasing_inputs(args):
 
 
 def query_requires_grad(t: torch.Tensor) -> bool:
+    # [FUNCTION DOC] Returns the requires_grad flag of t, first unwrapping a functional tensor wrapper.
     """requires_grad of ``t``, looking through a functional wrapper.
 
     A FunctionalTensor does not carry the autograd metadata of the tensor it
@@ -590,7 +680,10 @@ def query_requires_grad(t: torch.Tensor) -> bool:
 
 
 def prepare_fw_with_masks(fn):
+    # [FUNCTION DOC] Returns a function that calls fn and returns its outputs together with a list
+    # of booleans saying which outputs are tensors that require grad.
     def fw_with_masks(*args):
+        # [FUNCTION DOC] HELPER: Runs fn on args; returns (outputs, per-output requires-grad mask).
         fw_out = fn(*args)
         return fw_out, [
             bool(isinstance(ret, torch.Tensor) and query_requires_grad(ret))
@@ -601,7 +694,11 @@ def prepare_fw_with_masks(fn):
 
 
 def prepare_fw_with_masks_all_requires_grad(fn):
+    # [FUNCTION DOC] Like prepare_fw_with_masks, but if any input tensor requires grad, marks all
+    # floating point output tensors as requiring grad (in place), matching autograd.Function
+    # semantics. Returns the wrapper producing (outputs, nested mask of requires-grad per tensor).
     def fw_with_masks(*args):
+        # [FUNCTION DOC] HELPER: Runs fn on args, forces floating outputs to require grad when any input does, returns (outputs, masks).
         fw_out = fn(*args)
         # Note [force all outputs to be require grad]
         # Instead of using the original fn, we set the output of original
@@ -625,6 +722,10 @@ def prepare_fw_with_masks_all_requires_grad(fn):
 # `None` gradients are problematic for CUDA graphs. Those gradients are
 # replaced with an all-zero tensor for better optimization
 def unmask_none_gradients(grads, operands):
+    # [FUNCTION DOC] Pairs each gradient with its operand; keeps non-None gradients, replaces
+    # None with zeros shaped like the operand if it is a tensor, or None for int/symint
+    # operands. Raises an assertion error if an operand is not a tensor, int or symint.
+    # Returns a list.
     allowed_types = (torch.Tensor, int, torch.SymInt)
     if not all(isinstance(o, allowed_types) for o in operands):
         raise AssertionError(
@@ -647,6 +748,9 @@ def unmask_none_gradients(grads, operands):
 
 
 def _maybe_fake_prop_ignore_unbacked(fn, args):
+    # [FUNCTION DOC] HELPER: Calls fn on plain (non-functional) versions of args with
+    # functionalization, functional mode, proxy tracing and other current modes disabled. If the
+    # args carry a fake mode, enters it and ignores fresh unbacked symbols. Returns fn's result.
     with suspend_functionalization(), disable_functional_mode():
         with disable_proxy_modes_tracing():
             unfunc_args = [_from_fun(arg) for arg in args]
@@ -664,6 +768,8 @@ def _maybe_fake_prop_ignore_unbacked(fn, args):
 
 
 def redirect_to_mode(hop: OperatorBase, mode):
+    # [FUNCTION DOC] Registers on hop an implementation for the given mode type that forwards the
+    # call to the mode's torch dispatch handler; returns the registered function.
     """Utility for redispatching HOP to underlying mode
 
     Args:
@@ -676,6 +782,7 @@ def redirect_to_mode(hop: OperatorBase, mode):
 
     @hop.py_impl(mode)
     def impl(mode, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the mode's torch dispatch handler with the HOP, no types, and the args.
         return mode.__torch_dispatch__(hop, [], args, kwargs)
 
     return impl
@@ -684,6 +791,14 @@ def redirect_to_mode(hop: OperatorBase, mode):
 # TODO: The parameter use_output_and_grad_bw is required because some operations
 # that utilize this function, such as the while_loop, may require (grad, fwd_outputs)
 def create_fw_bw_graph(fn, use_output_and_grad_bw, fw_inputs, fw_outputs):
+    # [FUNCTION DOC] Builds a forward graph and a joint (backward) graph for fn. The forward is
+    # traced on fw_inputs. The joint function takes gradients and inputs (or, with
+    # use_output_and_grad_bw, a nested pair of grads and inputs+outputs, using only the last
+    # element of the second as inputs), runs an autograd joint of the masked forward, fills
+    # None gradients with zeros, and clones outputs aliasing inputs. Example gradients derive
+    # from fw_outputs. Returns (fw_graph, joint_graph). Uses dummy AOT config.
+    # KNOWN ISSUE: in the use_output_and_grad_bw path only the last of the supplied
+    # inputs-and-outputs is treated as the inputs, which looks specific to while_loop.
     from torch._functorch.aot_autograd import AOTConfig, create_joint
 
     # Note:[HOP create fw_bw graph] We create "clean" environments for make_fx by suspending all dispatch keys
@@ -716,6 +831,8 @@ def create_fw_bw_graph(fn, use_output_and_grad_bw, fw_inputs, fw_outputs):
     fw_graph = _maybe_reenter_make_fx(fn)(*fw_inputs)
 
     def joint_fn(*joint_operands_grads):
+        # [FUNCTION DOC] HELPER: Splits the arguments into grads and inputs, runs the joint
+        # forward-backward, and returns gradient list with None filled and aliases cloned.
         if use_output_and_grad_bw:
             grads = joint_operands_grads[0]
             inputs = joint_operands_grads[1][-1:]
@@ -753,6 +870,9 @@ def create_fw_bw_graph(fn, use_output_and_grad_bw, fw_inputs, fw_outputs):
 
 
 def _unstack_pytree(xs):
+    # [FUNCTION DOC] HELPER: Splits a pytree of tensors along the leading dimension into a list of
+    # pytrees, one per index. Raises RuntimeError if any leaf is not a tensor or if leading
+    # sizes differ.
     flat_xs, inspec = pytree.tree_flatten(xs)
     if not all(isinstance(xs, torch.Tensor) for xs in flat_xs):
         raise RuntimeError(f"Leaves of xs must be Tensor {flat_xs}")
@@ -769,6 +889,10 @@ def _unstack_pytree(xs):
 
 
 def _stack_pytree(pytrees):
+    # [FUNCTION DOC] HELPER: Inverse of unstacking: stacks the corresponding leaves of a list of
+    # same-structured pytrees into tensors along a new leading dimension. Leaf positions that
+    # are None in all trees stay None. Raises RuntimeError for mixed or non-tensor leaves and
+    # an assertion error for an empty list. Returns a pytree with the shared structure.
     flat_out = []
     out_spec = None
     for pt in pytrees:
@@ -806,6 +930,10 @@ def _stack_pytree(pytrees):
 # iterating over the pos list and pop one item from the front of partitioned_args[pos[i]].
 # We use t_idx and s_idx to keep track of the next index of the item we are going to pop for the two lists.
 def save_values_for_backward(ctx, args):
+    # [FUNCTION DOC] Saves args on an autograd context: tensors through save_for_backward, all
+    # other values (symints, ints, None, script objects, opaque classes) as a plain list
+    # attribute, plus a position list recording which group each arg came from. Raises an
+    # assertion error for disallowed types or if ctx already has these attributes.
     if not all(
         isinstance(arg, (torch.Tensor, torch.SymInt, int, type(None), FakeScriptObject))
         or is_custom_class(type(arg))
@@ -829,6 +957,9 @@ def save_values_for_backward(ctx, args):
 
 
 def saved_values(ctx):
+    # [FUNCTION DOC] Reconstructs the original ordered args saved by save_values_for_backward by
+    # interleaving saved tensors and stored non-tensor values per the position list. Returns a
+    # tuple; raises an assertion error if counts are inconsistent.
     args = []
     t_idx = 0
     s_idx = 0
@@ -848,6 +979,8 @@ def saved_values(ctx):
 
 
 def split_into_chunks(iterable: Sequence[Any], chunk_sizes: list[int]) -> list[Any]:
+    # [FUNCTION DOC] Cuts a sequence into consecutive slices with the given sizes and returns the
+    # list of slices. Raises an assertion error if the sizes do not sum to the sequence length.
     if sum(chunk_sizes) != len(iterable):
         raise AssertionError(
             f"the sum of all chunks ({sum(chunk_sizes)}) needs to match the length of the iterable ({len(iterable)})."
@@ -861,6 +994,8 @@ def split_into_chunks(iterable: Sequence[Any], chunk_sizes: list[int]) -> list[A
 
 
 def _clone_aliasing_output(inputs: Sequence[Any], outputs: Sequence[Any]):
+    # [FUNCTION DOC] HELPER: Returns a list of outputs in which any tensor sharing storage with an
+    # input or with an earlier output is replaced by a clone; other values are unchanged.
     # For tensors whose grad is None, create zero tensors as gradients
     # This invariant is useful for cudagraph.
 
@@ -888,6 +1023,12 @@ def _clone_aliasing_output(inputs: Sequence[Any], outputs: Sequence[Any]):
 def create_bw_fn(
     fn: Callable, args: tuple[Any, ...], return_fw_outputs: bool = False
 ) -> Callable:
+    # [FUNCTION DOC] Builds a backward function for fn at the given example args. The result takes
+    # the primals followed by output gradients, runs a joint forward-backward (forcing outputs
+    # to require grad when any input does), replaces None gradients of tensor inputs by zeros,
+    # clones gradients aliasing inputs or each other, and returns the gradient list (preceded
+    # by the forward outputs when return_fw_outputs). Raises an assertion error if the
+    # gradient count differs from the arg count.
     """
     For a fn that accepts flat inputs and returns flat outputs:
         fw_out = fn(*args),
@@ -921,6 +1062,8 @@ def create_bw_fn(
     )
 
     def flat_fn(*args_and_grad_outs):
+        # [FUNCTION DOC] HELPER: Splits inputs into primals and tangents, runs the joint, and returns
+        # the (optionally forward-output-prefixed) cleaned gradients.
         primals = args_and_grad_outs[:n_primals]
         tangents = args_and_grad_outs[n_primals:]
         fw_outs, grad_args = bw_fn(primals, tangents)
@@ -947,6 +1090,8 @@ def create_bw_fn(
 
 
 def get_dummy_aot_autograd_config():
+    # [FUNCTION DOC] Returns a placeholder AOT autograd configuration with no compilers or
+    # partitioner, empty decompositions and no parameters, for tracing joint graphs.
     from torch._functorch.aot_autograd import AOTConfig
 
     return AOTConfig(
@@ -965,6 +1110,8 @@ def get_dummy_aot_autograd_config():
 # When `dim` has size 0 (e.g. a zero-length scan) there is no real slice to
 # take, so return an uninitialized tensor with `dim` removed.
 def first_slice_copy(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    # [FUNCTION DOC] Returns a copy of the first slice of t along dim. If dim has size zero,
+    # returns a zero-filled tensor shaped like t with that dim removed.
     if t.shape[dim] == 0:
         shape = list(t.shape)
         del shape[dim]
@@ -974,12 +1121,16 @@ def first_slice_copy(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 # Returns a mask whether a list element is a tensor or not
 def get_tensor_mask(tensor_list: Iterable[Any]) -> list[bool]:
+    # [FUNCTION DOC] Returns a list of booleans, true where the element is a tensor.
     return [bool(isinstance(v, torch.Tensor)) for v in tensor_list]
 
 
 def mask_list(
     mask: list[bool], inp: list[Any], other: list[Any] | None = None
 ) -> list[Any]:
+    # [FUNCTION DOC] Applies a boolean mask to inp. Without other, returns only elements where the
+    # mask is true; with other, returns inp elements where true and other elements where
+    # false. Raises an assertion error if the lengths of mask, inp (and other) differ.
     # Masks elements on an `inp` list.
     # If other is None, then the elements of the `inp` list where the mask is False are removed
     # If other is not None, then the elements of the `inp` list where the mask is False are
@@ -999,6 +1150,8 @@ def mask_list(
 
 
 def first_slice_copy_with_grad(li: Iterable[Any]) -> list[Any]:
+    # [FUNCTION DOC] Returns the first-slice copy of each tensor in li, re-applying each source
+    # tensor's requires_grad flag to the copy. Every element must be a tensor.
     # First_slice_copy does not keep the original requires_grad flag,
     # but we need it for materialize_as_graph
     # in order to compute the correct gradients
@@ -1012,6 +1165,9 @@ def first_slice_copy_with_grad(li: Iterable[Any]) -> list[Any]:
 def diff_tensor_meta(
     meta1: TensorMetadata, meta2: TensorMetadata, check_grad=True
 ) -> list[str]:
+    # [FUNCTION DOC] Compares two tensor metadata records field by field (skipping requires_grad
+    # unless check_grad) and returns a list of description strings for differing fields.
+    # A comparison that would need a data-dependent guard is counted as a difference.
     from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
 
     pair_diffs = []
@@ -1039,6 +1195,7 @@ def diff_tensor_meta(
 #      hops may receive int inputs from the shape of outer tensor inputs.
 #      However, CompositeExplicitAutograd won't receive SymInt inputs because it only accepts real tensor inputs.
 def validate_subgraph_args_types(lifted_args: tuple[Any, ...] | list[Any]):
+    # [FUNCTION DOC] Raises an assertion error unless every arg is a tensor, int or symint.
     allowed_types = (torch.Tensor, int, torch.SymInt)
     if not all(
         isinstance(arg, (torch.Tensor, int, torch.SymInt)) for arg in lifted_args
@@ -1054,6 +1211,12 @@ def check_input_alias_and_mutation(
     gm: torch.fx.GraphModule,
     fake_args: list[FakeTensor],
 ) -> tuple[dict[int, int], dict[int, int], dict[int, int], list[int]]:
+    # [FUNCTION DOC] Analyzes graph module gm and returns four items: input-input alias map,
+    # input-output alias map, output-output alias map (index to index mappings by shared
+    # storage) and the list of mutated input indices. Delegates to the variant that also
+    # returns outputs.
+    # KNOWN ISSUE: the fake_args parameter is unused; example inputs come from the graph's
+    # placeholder metadata.
     (
         inp_inp_alias_map,
         inp_out_alias_map,
@@ -1065,10 +1228,13 @@ def check_input_alias_and_mutation(
 
 
 def _tensor_storage(t) -> StorageWeakRef:
+    # [FUNCTION DOC] HELPER: Returns a weak reference to the tensor's underlying storage.
     return StorageWeakRef(t._typed_storage())
 
 
 def _get_example_value(n):
+    # [FUNCTION DOC] HELPER: For a graph node returns its stored value metadata, else its example
+    # value metadata, else None; non-node inputs are returned unchanged.
     if not isinstance(n, torch.fx.Node):
         return n
     if "val" in n.meta:
@@ -1079,6 +1245,8 @@ def _get_example_value(n):
 
 
 def get_graph_output_example_values(gm: torch.fx.GraphModule) -> list[Any]:
+    # [FUNCTION DOC] Returns the example values of the flattened outputs of the graph module's
+    # output node (None where a node has no value metadata).
     output_node = gm.graph.find_nodes(op="output")[0]
     return [_get_example_value(n) for n in pytree.tree_flatten(output_node.args[0])[0]]
 
@@ -1092,6 +1260,14 @@ def check_input_alias_and_mutation_return_outputs(
     list[int],
     tuple[Any, ...] | list[Any],
 ]:
+    # [FUNCTION DOC] Inspects the graph module using value metadata: builds storage maps for
+    # placeholder inputs and outputs, derives input-input, input-output and output-output alias
+    # maps (index to index), and scans call nodes of operator overloads for write arguments
+    # whose storage belongs to an input to collect mutated input indices (an assertion error
+    # if a written argument is not a tensor). Returns the three maps, the mutated indices,
+    # and the output example values.
+    # KNOWN ISSUE: placeholders without value metadata are dropped, which can shift the input
+    # indices relative to the true placeholder positions.
     fake_args = [
         _get_example_value(n)
         for n in gm.graph.find_nodes(op="placeholder")
@@ -1173,6 +1349,10 @@ def register_fake(hop, fn: F, *, skip_cache: bool = ...) -> F: ...
 
 
 def register_fake(hop, fn=None, *, skip_cache=False):
+    # [FUNCTION DOC] Registers a fake-tensor implementation for hop in a global registry (assertion
+    # error if already registered) and routes the FakeTensorMode key to the mode handler; if
+    # skip_cache the hop is also recorded as not cacheable. Usable as a decorator (fn omitted,
+    # returns the registering function) or directly (returns fn).
     """
     Register a fake function for a HOP. This is conceptually equivalent of the
     register_fake utility for the custom ops. The registered function is called
@@ -1187,6 +1367,7 @@ def register_fake(hop, fn=None, *, skip_cache=False):
         raise AssertionError(f"hop {hop} already registered in registered_hop_fake_fns")
 
     def register(func: F) -> F:
+        # [FUNCTION DOC] HELPER: Performs the registration of func for hop and returns func.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         redirect_to_mode(hop, FakeTensorMode)
@@ -1202,6 +1383,9 @@ def register_fake(hop, fn=None, *, skip_cache=False):
 
 
 class SubgraphCallableWrapper:
+    # [CLASS DOC] Callable wrapper holding a function and the subgraph it came from; hashes by
+    # the subgraph's identity so fake tensor dispatch caching keys on the subgraph, and
+    # copies the subgraph's boxed-call flag.
     """
     Wraps a callable while preserving the original subgraph identity for
     fake tensor caching. Without this, passing a plain closure to
@@ -1209,18 +1393,25 @@ class SubgraphCallableWrapper:
     """
 
     def __init__(self, fn, subgraph):
+        # [FUNCTION DOC] Stores fn and subgraph and copies the subgraph's boxed-call flag (default false).
         self.fn = fn
         self.subgraph = subgraph
         self._boxed_call = getattr(subgraph, "_boxed_call", False)
 
     def __hash__(self):
+        # [FUNCTION DOC] Returns the object identity number of the subgraph.
+        # KNOWN ISSUE: equality is not overridden, so equal hashes do not imply equal wrappers.
         return id(self.subgraph)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped function with the given arguments and returns its result.
         return self.fn(*args, **kwargs)
 
 
 class FunctionalizeCtxWrapper(SubgraphCallableWrapper):
+    # [CLASS DOC] Subgraph wrapper that runs a subgraph through a functionalization context.
+    # State: ctx and the indices of inputs whose updated values are appended to the outputs.
+    # Boxed subgraphs take a single list of inputs.
     """Functionalizes a subgraph and optionally returns selected input updates.
 
     Each update is a new tensor; the original input is not mutated.
@@ -1229,19 +1420,31 @@ class FunctionalizeCtxWrapper(SubgraphCallableWrapper):
     # Prevents PYTORCH_TEST_WITH_DYNAMO=1 test failures
     @torch._disable_dynamo
     def __init__(self, ctx, subgraph, mutated_input_indices=()):
+        # [FUNCTION DOC] Wraps subgraph as both function and identity, and stores the functionalization
+        # context and the tuple of mutated input indices. Dynamo is disabled for this method.
         super().__init__(subgraph, subgraph)
         self.ctx = ctx
         self.mutated_input_indices = mutated_input_indices
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a description string naming the wrapped subgraph.
+        # KNOWN ISSUE: the string has an unbalanced closing parenthesis.
         return f"FunctionalizeCtxWrapper on subgraph {self.subgraph})"
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the functionalized subgraph. Graph modules run via the
+        # functionalization context (boxed ones take a list, building one from positional args
+        # if needed; unboxed ones run through an Interpreter with node metadata preserved);
+        # other callables are functionalized directly. If mutated input indices are set, the
+        # outputs are extended with the values of those inputs, read before the call.
         def append_mutated_inputs(fn):
+            # [FUNCTION DOC] HELPER: Returns fn unchanged when no mutated indices are set; otherwise a
+            # wrapper returning fn's outputs followed by the selected inputs.
             if not self.mutated_input_indices:
                 return fn
 
             def wrapped(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Snapshots the selected inputs, calls fn, and returns outputs plus the snapshots.
                 inputs = args[0] if self._boxed_call else args
                 # Snapshot before a boxed GraphModule clears its input list.
                 mutated_inputs = tuple(inputs[i] for i in self.mutated_input_indices)
@@ -1275,7 +1478,10 @@ class FunctionalizeCtxWrapper(SubgraphCallableWrapper):
 
 # A wrapper over HigherOrderOperator that also carries its schema
 class HopInstance:
+    # [CLASS DOC] Pairs a higher-order operator with the schema generated for a particular call;
+    # calling it calls the operator. Attributes: _op and _schema.
     def __init__(self, op: HigherOrderOperator, schema: HopSchema):
+        # [FUNCTION DOC] Stores op and schema; raises an assertion error if op is not a HigherOrderOperator.
         if not isinstance(op, HigherOrderOperator):
             raise AssertionError(f"Expected HigherOrderOperator, got {type(op)}")
         self._op = op
@@ -1283,10 +1489,12 @@ class HopInstance:
         self._schema = schema
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped operator with the arguments and returns its result.
         return self._op(*args, **kwargs)
 
     @staticmethod
     def create(hop: HigherOrderOperator, *args, **kwargs):
+        # [FUNCTION DOC] Generates the schema of hop for the given example arguments and returns a HopInstance for it.
         return HopInstance(hop, hop.gen_schema(*args, **kwargs))
 
 
@@ -1294,6 +1502,11 @@ class HopInstance:
 # flat args and kwargs. We need to make use of the hop's schema's tree_spec
 # to unflatten the args and kwargs before calling the hop.
 def call_op(op: OpOverload | HopInstance, args, kwargs):
+    # [FUNCTION DOC] Calls an operator overload directly with args and kwargs. For a HopInstance,
+    # fills the remaining schema arguments from kwargs by name (positional unless keyword-only),
+    # then, if the schema has a tree spec, unflattens the bound values into the original args
+    # and kwargs before calling; otherwise calls with bound args and kwargs. Raises an
+    # assertion error for missing arguments, wrong counts or a bad op type.
     if isinstance(op, OpOverload):
         return op(*args, **kwargs)
 
@@ -1336,6 +1549,11 @@ def materialize_as_graph(
     force_enable_grad=False,
     subgraph_decomp_table: Mapping[OpOverload, Callable] | None = None,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Traces fn on args into a graph module in a clean environment: functionalization
+    # suspended, current modes disabled, a fake mode entered if one is available (from the
+    # active make_fx tracer or globally), args converted to plain tensors, dispatch key sets
+    # forced to the given (default: current) include and exclude sets, optionally with grad
+    # enabled. Returns the graph module; raises an assertion error if tracing yields none.
     if include_key_set is None:
         include_key_set = torch._C._dispatch_tls_local_include_set()
     if exclude_key_set is None:
@@ -1343,6 +1561,7 @@ def materialize_as_graph(
 
     @torch._dynamo.disable(recursive=True, reason=None)
     def _materialize_as_graph_inner():
+        # [FUNCTION DOC] HELPER: Does the traced materialization described above, excluded from dynamo, and returns the graph module.
         from torch._guards import active_fake_mode
         from torch.fx.experimental.proxy_tensor import _CURRENT_MAKE_FX_TRACER
 
@@ -1379,11 +1598,18 @@ def materialize_as_graph(
 
 
 def materialize_callable_in_args(op: HopInstance, args, kwargs):
+    # [FUNCTION DOC] Traces the HOP call to turn callable arguments into graph modules. Flattens
+    # args and kwargs, traces the call, finds the HOP node, and for every argument that became
+    # a graph module attribute replaces the original callable with that graph module (the
+    # original must be callable, else assertion error); other args are kept. Returns the
+    # (args, kwargs) structure rebuilt from the materialized values. Raises an assertion
+    # error if the schema is not a function schema matching the traced argument count.
     schema = op._schema
     hop = op._op
     flat_args, flat_spec = pytree.tree_flatten((args, kwargs))
 
     def wrapped_fn(*flat_args):
+        # [FUNCTION DOC] HELPER: Ignores its flat arguments and performs the HOP call with the captured args and kwargs.
         return call_op(op, args, kwargs)
 
     # We need to trace the higher order op in order to materilaize the callable inputs that
@@ -1418,6 +1644,8 @@ def materialize_callable_in_args(op: HopInstance, args, kwargs):
 
 
 def has_user_subclass(args, allowed_subclasses):
+    # [FUNCTION DOC] Flattens args and returns true if any is a tensor of a subclass type that is not
+    # in allowed_subclasses; false otherwise.
     """Check if any tensor arguments are user subclasses.
 
     This is used to determine if tensor subclasses should get a chance to run
@@ -1442,6 +1670,8 @@ def has_user_subclass(args, allowed_subclasses):
 
 
 def _has_gen_schema(op: HigherOrderOperator):
+    # [FUNCTION DOC] HELPER: True if the operator's class overrides schema generation, except for
+    # invoke_quant_packed, which cannot generate one.
     # There is an InvokeQuant argument we cannot gen_schema.
     if op is torch.ops.higher_order.invoke_quant_packed:
         return False
@@ -1452,6 +1682,7 @@ def _has_gen_schema(op: HigherOrderOperator):
 
 
 def filter_with_masks(data: list[torch.Tensor | None], masks: list[bool]):
+    # [FUNCTION DOC] Returns the elements of data where the mask is true; raises an assertion error on length mismatch.
     if len(data) != len(masks):
         raise AssertionError(
             f"data length ({len(data)}) != masks length ({len(masks)})"
@@ -1460,6 +1691,9 @@ def filter_with_masks(data: list[torch.Tensor | None], masks: list[bool]):
 
 
 def fill_none_with_masks(data: list[torch.Tensor | None], masks: list[bool]):
+    # [FUNCTION DOC] Inverse of filtering: builds a list with the next data element at each true
+    # mask position and None at false positions. data must have at least as many elements as
+    # true masks (otherwise iteration ends with an error).
     data_iter = iter(data)
     return [next(data_iter) if kept else None for kept in masks]
 
@@ -1467,6 +1701,9 @@ def fill_none_with_masks(data: list[torch.Tensor | None], masks: list[bool]):
 def create_fn_remove_none(
     fn: Callable[_P, Any],
 ) -> tuple[Callable[_P, list[torch.Tensor]], list[bool]]:
+    # [FUNCTION DOC] Returns (wrapped, mask). wrapped calls fn, flattens the result, records in the
+    # shared mask list (mutated on each call) which leaves are tensors, and returns only the
+    # tensor leaves. Read the mask only after wrapped has run.
     """Wrap ``fn`` so its non-Tensor output leaves are dropped, and expose the
     mask of which leaves survived.
 
@@ -1490,6 +1727,7 @@ def create_fn_remove_none(
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls fn, updates the shared mask, and returns the tensor leaves of the result.
         leaves = pytree.tree_leaves(fn(*args, **kwargs))
         mask.clear()
         mask.extend(isinstance(o, torch.Tensor) for o in leaves)

@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the while_loop higher-order op (WhileLoopOp / while_loop_op), the user-facing
+# while_loop function, and its dispatch implementations: dense eager loop, proxy tracing
+# (builds cond/body subgraphs with unbacked-symint carries), fake tensor mode, and
+# functionalization (with auto-functionalize support). Also defines the stack_output
+# variant op (WhileLoopStackOutputOp, returning per-iteration stacked outputs) and an
+# autograd Function (WhileLoopAutogradOp) whose backward is itself built as a while_loop.
+# Import-time side effects: instantiates both ops and registers all of their dispatch
+# implementations (including partial-application variants for the stack-output op).
 import contextlib
 import functools
 from collections.abc import Callable
@@ -33,7 +42,11 @@ from torch.fx.experimental.proxy_tensor import (
 
 
 class WhileLoopOp(HigherOrderOperator):
+    # [CLASS DOC] The "while_loop" HOP. Stateless; validates argument containers and
+    # forwards to HOP dispatch. Also generates an operator schema describing cond/body
+    # graphs, carried inputs, additional inputs and which of them are mutated.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP under the name "while_loop".
         super().__init__("while_loop")
 
     def __call__(
@@ -46,6 +59,10 @@ class WhileLoopOp(HigherOrderOperator):
         *,
         mutated_arg_indices: str = "",
     ):
+        # [FUNCTION DOC] Entry point of the op. Raises RuntimeError unless carried_inputs and
+        # additional_inputs are each a tuple or list, then validates the element types of
+        # both. mutated_arg_indices (a comma separated string of flat input positions) is
+        # forwarded as a keyword only when non-empty. Returns the dispatched result.
         if not isinstance(carried_inputs, (tuple, list)):
             raise RuntimeError(
                 f"carried_inputs must be a tuple or list, got {type(carried_inputs)}"
@@ -78,6 +95,11 @@ class WhileLoopOp(HigherOrderOperator):
         additional_inputs,
         mutated_arg_indices="",
     ):
+        # [FUNCTION DOC] Builds the HOP schema. Converts cond_fn and body_fn to graph modules
+        # (tracing them on the concatenated inputs if they are not already), parses the
+        # mutated index string into a set of flat positions (carried inputs first, then
+        # additional inputs), adds each argument with its mutation flag, adds body outputs
+        # as schema outputs, records the pytree spec, and returns the generated schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
         from torch._higher_order_ops.utils import materialize_as_graph
 
@@ -134,6 +156,12 @@ while_loop_op = WhileLoopOp()
 
 
 def while_loop(cond_fn, body_fn, carried_inputs):
+    # [FUNCTION DOC] Public API: repeatedly applies body_fn to the carried inputs while
+    # cond_fn returns true, and returns the final carried values. Flattens the carried
+    # inputs (additional inputs are currently always empty) into flat cond/body wrappers.
+    # When dynamo is compiling, calls the op directly. Otherwise validates that both
+    # functions are callable and that carried leaves are tensors, symints or ints (raises
+    # RuntimeError), then runs the op through the HOP compile-and-call helper.
     r"""
     Run ``body_fn(*carried_inputs)`` while ``cond_fn(*carried_inputs)`` returns
     a True scalar tensor. Returns the output of body_fn or initial
@@ -216,10 +244,12 @@ def while_loop(cond_fn, body_fn, carried_inputs):
     flat_inputs, in_spec = pytree.tree_flatten((carried_inputs, additional_inputs))
 
     def flat_cond_fn(*flat_args):
+        # [FUNCTION DOC] HELPER: Rebuilds the nested inputs from flat args and calls cond_fn on them.
         carried, additional = pytree.tree_unflatten(flat_args, in_spec)
         return cond_fn(*carried, *additional)
 
     def flat_body_fn(*flat_args):
+        # [FUNCTION DOC] HELPER: Rebuilds the nested inputs from flat args and calls body_fn on them.
         carried, additional = pytree.tree_unflatten(flat_args, in_spec)
         return body_fn(*carried, *additional)
 
@@ -227,6 +257,8 @@ def while_loop(cond_fn, body_fn, carried_inputs):
         return while_loop_op(flat_cond_fn, flat_body_fn, tuple(flat_inputs), tuple())
 
     def _validate_input(cond_fn, body_fn, carried_inputs):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError unless both functions are callable and
+        # all carried leaves are tensors, symints or ints; also validates flat input types.
         from torch._higher_order_ops.utils import validate_subgraph_args_types
 
         if not callable(cond_fn) or not callable(body_fn):
@@ -247,6 +279,7 @@ def while_loop(cond_fn, body_fn, carried_inputs):
     # Dynamo is expecting a callable with "__code__" attribute.
     # We cannot directly pass cond_op to it. So we wrap it in a dummy function.
     def _while_loop_op_wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Plain function (with a code object, for dynamo) that forwards to the op.
         return while_loop_op(*args, **kwargs)
 
     from torch._higher_order_ops.utils import _hop_compile_and_call
@@ -266,9 +299,20 @@ def while_loop_dense(
     stack_output=False,
     mutated_arg_indices="",
 ):
+    # [FUNCTION DOC] Eager implementation. Evaluates cond_fn on carried values plus
+    # additional inputs; if false, returns clones of the carried values (unsqueezed with a
+    # leading dimension when stack_output). Otherwise loops: runs body_fn, optionally
+    # records each output, requires a tuple of the same length as the carried inputs, and
+    # re-evaluates cond_fn. Returns the final carried tuple, or per-position stacked
+    # tensors of all iteration outputs when stack_output. Raises RuntimeError for a
+    # non-sequence carried_inputs or a cond result that is not a boolean scalar, and an
+    # assertion error for a bad body_fn output. mutated_arg_indices is ignored.
+    # KNOWN ISSUE: with stack_output the outputs are recorded before the tuple and length
+    # checks, so a non-tuple body result is enumerated before being rejected.
     carried_vals = carried_inputs
 
     def _validate_cond_output(pred):
+        # [FUNCTION DOC] HELPER: Accepts a python bool or a scalar bool tensor, otherwise raises RuntimeError.
         if (
             isinstance(pred, torch.Tensor)
             and pred.size() == torch.Size([])
@@ -332,6 +376,9 @@ def while_loop_dense(
 def while_loop_autograd(
     cond_fn, body_fn, operands, additional_inputs, mutated_arg_indices=""
 ):
+    # [FUNCTION DOC] Autograd key implementation: applies WhileLoopAutogradOp to the
+    # functions, the counts of carried and additional inputs, and the flattened inputs.
+    # mutated_arg_indices is accepted but ignored. Returns the final carried values.
     return WhileLoopAutogradOp.apply(
         cond_fn,
         body_fn,
@@ -343,6 +390,7 @@ def while_loop_autograd(
 
 
 def _find_or_create_fake_mode() -> FakeTensorMode:
+    # [FUNCTION DOC] HELPER: Returns the currently active fake mode, or a new one with a fresh shape environment if none.
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
     fake_mode = torch._guards.detect_fake_mode()
@@ -355,6 +403,9 @@ def _find_or_create_fake_mode() -> FakeTensorMode:
 def _create_unbacked_symint(
     fake_mode: FakeTensorMode, ignore_fresh_unbacked_symbols: bool
 ) -> torch.SymInt:
+    # [FUNCTION DOC] HELPER: Creates a new unbacked symint from the fake mode's shape
+    # environment, optionally without registering it as a pending fresh unbacked symbol.
+    # Raises an assertion error if the mode or its shape environment is missing.
     if fake_mode is None or fake_mode.shape_env is None:
         raise AssertionError("Must provide a fake_mode with shape_env.")
     ctx = (
@@ -376,6 +427,9 @@ def while_loop_tracing(
     stack_output=False,
     mutated_arg_indices="",
 ):
+    # [FUNCTION DOC] Proxy-mode (tracing) implementation. Picks the stack-output or normal
+    # op and delegates to the inner tracing helper with all arguments. Returns the traced
+    # outputs.
     op = while_loop_stack_output_op if stack_output else while_loop_op
 
     def _trace_while_loop(
@@ -387,6 +441,13 @@ def while_loop_tracing(
         additional_inputs,
         mutated_arg_indices,
     ):
+        # [FUNCTION DOC] HELPER: Replaces int/symint carries with fresh unbacked symints and
+        # clones tensor carries (clearing constant markers) with proxy tracing disabled,
+        # then traces cond_fn and body_fn into graphs. Registers both graphs on the tracer
+        # root under fresh indexed names (assertion error if the body name already exists),
+        # emits a call node of the op with proxied args (mutated_arg_indices is passed only
+        # for the non-stacked op and when non-empty), runs the op on the unspecialized
+        # carries for example outputs, and returns them tracked to the output proxy.
         # NOTE [unspecialize int carry with unbacked symints]
         # When we support int carry, we'll also need to support int output of body_fn because.
         # previous iteration's output is next iteration's input and they must match.
@@ -427,6 +488,8 @@ def while_loop_tracing(
         fake_mode: FakeTensorMode = _find_or_create_fake_mode()
 
         def _unspecialize_carried_inputs(x):
+            # [FUNCTION DOC] HELPER: Ints and symints become new unbacked symints; tensors
+            # are cloned with any constant value cleared; other values are returned as is.
             if isinstance(x, (int, torch.SymInt)):
                 return _create_unbacked_symint(
                     fake_mode, ignore_fresh_unbacked_symbols=True
@@ -457,6 +520,8 @@ def while_loop_tracing(
             )
 
             def produce_graph(fn):
+                # [FUNCTION DOC] HELPER: Traces fn into a graph module using cloned tensor
+                # carries followed by the additional inputs.
                 cloned_carried_inputs = pytree.tree_map_only(
                     torch.Tensor, lambda x: x.clone(), unspecialized_carried_inputs
                 )
@@ -527,6 +592,12 @@ def while_loop_fake_tensor_mode(
     stack_output=False,
     mutated_arg_indices="",
 ):
+    # [FUNCTION DOC] Fake tensor mode implementation. Runs body_fn once (ignoring fresh
+    # unbacked symbols) and checks its outputs match the carried inputs in metadata. For
+    # the normal op returns the body outputs with int/symint leaves replaced by new
+    # unbacked symints. For stack_output (all carries must be tensors, else assertion
+    # error) returns each output repeated along a new leading dimension of a fresh
+    # unbacked length. mutated_arg_indices is ignored.
     with mode:
         # NOTE: [Handling unback symints in subgraph of while_loop]
         # The idea is that the scope of unbacked symints are limited to the subgraph.
@@ -615,6 +686,10 @@ def while_loop_func(
     stack_output=False,
     mutated_arg_indices="",
 ):
+    # [FUNCTION DOC] Functionalization implementation. For the normal op under python
+    # functionalization, auto-functionalizes the call when the HOP instance allows it.
+    # Otherwise unwraps tensors, functionalizes cond/body, checks both for input aliasing
+    # or mutation (raising on violations), redispatches the op and wraps the result.
     op = while_loop_stack_output_op if stack_output else while_loop_op
     # For now, we only support auto-functionalization for while_loop when using python
     # functionalization mode
@@ -665,6 +740,8 @@ def while_loop_func(
 
 
 class WhileLoopStackOutputOp(HigherOrderOperator):
+    # [CLASS DOC] The "while_loop_stack_output" HOP: like while_loop but returns, for each
+    # carried position, the stack of its values across all iterations. Stateless.
     """
     while_loop_stack_output is a variant of while_loop that returns a stack of outputs.
     Its semantic can be illurated using python code as:
@@ -679,6 +756,7 @@ class WhileLoopStackOutputOp(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP under the name "while_loop_stack_output".
         super().__init__("while_loop_stack_output")
 
     def __call__(
@@ -689,6 +767,9 @@ class WhileLoopStackOutputOp(HigherOrderOperator):
         additional_inputs: tuple[torch.Tensor | torch.SymInt | int, ...],
         /,
     ):
+        # [FUNCTION DOC] Validates that carried and additional inputs are tuples or lists
+        # (RuntimeError otherwise) with valid element types, then dispatches. Takes no
+        # mutated_arg_indices. Returns stacked per-iteration outputs.
         if not isinstance(carried_inputs, (tuple, list)):
             raise RuntimeError(
                 f"carried_inputs must be a tuple or list, got {type(carried_inputs)}"
@@ -762,6 +843,10 @@ class WhileLoopStackOutputOp(HigherOrderOperator):
 
 
 class WhileLoopAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for while_loop. Forward runs the stack-output op below
+    # autograd and saves functions, carries, additional inputs and all iteration outputs
+    # on ctx; backward runs a reversed while_loop over iterations applying the body's
+    # backward function and accumulating gradients.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -772,6 +857,12 @@ class WhileLoopAutogradOp(torch.autograd.Function):
         num_additional_inputs,
         *carries_and_inputs,
     ):
+        # [FUNCTION DOC] Splits the flat inputs into carries and additional inputs, runs
+        # the stack-output op below autograd, and stores the functions, inputs, outputs and
+        # dispatch key sets on ctx (assertion error if ctx attributes already exist).
+        # Checks every tensor output has the same leading loop count, removes that count
+        # from pending unbacked symbols, asserts it is at least one, and returns the last
+        # iteration slice of each stacked output.
         from torch._higher_order_ops.scan import split_into_chunks
 
         carries, additional_inputs = split_into_chunks(
@@ -837,6 +928,14 @@ class WhileLoopAutogradOp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
+        # [FUNCTION DOC] Builds the gradient of the loop. Creates a single-step backward of
+        # the body, masks out non-differentiable (non floating tensor) carries and
+        # additional inputs, initializes gradient carries from the incoming grads (cloned
+        # contiguous) and zero gradients for additional inputs, reconstructs each
+        # iteration's input from the saved outputs, and traces a cond/body pair that walks
+        # iterations in reverse accumulating additional-input gradients. Runs it as a
+        # while_loop and returns None for the four non-tensor forward args followed by the
+        # carry gradients and additional-input gradients (None-filled by the masks).
         from torch._higher_order_ops.cond import create_bw_fn
         from torch._higher_order_ops.scan import split_into_chunks
 
@@ -894,6 +993,8 @@ class WhileLoopAutogradOp(torch.autograd.Function):
         )
 
         def cond_fn(*flat_args):
+            # [FUNCTION DOC] HELPER: Backward loop condition; true while the step index is
+            # below the number of saved iterations.
             (
                 idx,
                 grad_carries,
@@ -909,6 +1010,10 @@ class WhileLoopAutogradOp(torch.autograd.Function):
             return idx < fw_carries[0].size(0)
 
         def body_fn(*flat_args):
+            # [FUNCTION DOC] HELPER: One backward step. Selects the saved inputs of the
+            # iteration at the reversed index, applies the body backward function, filters
+            # to differentiable gradients, and returns the incremented index, new carry
+            # gradients, and accumulated additional-input gradients.
             (
                 idx,
                 grad_carries,

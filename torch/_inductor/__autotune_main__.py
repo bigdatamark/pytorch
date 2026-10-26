@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Entry point for the autotune subprocess launched by the inductor autotuning machinery.
+# Parses the parent pid and the read/write pipe file descriptors from the command line,
+# then runs the TuningProcess main loop over those pipes.
+# Defines a logger and the main function; running as a script calls main.
+# No side effects at import time other than creating the logger.
 import argparse
 import logging
 import os
@@ -10,6 +16,12 @@ log = logging.getLogger(__name__)
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Subprocess entry point. Parses the command-line options for the parent pid and the
+    # read and write pipe file descriptors, and opens them as binary file objects.
+    # Installs the parent-death watcher via the async compile initializer, then runs
+    # TuningProcess.process_main on the pipes. Any exception is logged, not re-raised,
+    # and both pipes are always closed on exit. Returns nothing.
     parser = argparse.ArgumentParser()
     parser.add_argument("--parent", type=int)
     parser.add_argument("--read-fd", type=int)
