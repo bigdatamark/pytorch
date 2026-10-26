@@ -1,3 +1,6 @@
+# [MODULE DOC] Configuration for TorchInductor. Defines module-level settings (many read from TORCHINDUCTOR_* environment variables or justknobs at import),
+# nested config namespace classes (cpp, triton, aot_inductor, cutlass, cuda, xpu, rocm, halide, trace, etc.) and small default-computing helpers.
+# Import-time side effects: reads os.environ and, in fbcode, justknobs; computes compile_threads; ends by calling install_config_module on this module to add patch, save_config and related methods.
 import os
 import sys
 from collections.abc import Callable
@@ -23,10 +26,14 @@ can_inplace_pad_graph_input = False  # ease testing
 
 
 def fx_graph_remote_cache_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for the FX graph remote cache flag.
+    # Reads a tri-state environment variable; returns True, False, or None when unset (None defers to other logic).
     return get_tristate_env("TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE")
 
 
 def vec_isa_ok_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for the vectorized-ISA-ok override.
+    # Returns True if the environment variable is 1, False if it is 0, otherwise None (meaning detect automatically).
     if os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "1":
         return True
     if os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "0":
@@ -35,14 +42,18 @@ def vec_isa_ok_default() -> bool | None:
 
 
 def autotune_remote_cache_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for the autotune remote cache flag; tri-state value read from the environment (None when unset).
     return get_tristate_env("TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE")
 
 
 def bundled_autotune_remote_cache_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for the bundled autotune remote cache flag; tri-state value read from the environment (None when unset).
     return get_tristate_env("TORCHINDUCTOR_BUNDLED_AUTOTUNE_REMOTE_CACHE")
 
 
 def bundle_triton_into_fx_graph_cache_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for bundling Triton kernels into the FX graph cache.
+    # Tri-state environment value; when unset defaults to True outside fbcode and None inside fbcode.
     return get_tristate_env(
         "TORCHINDUCTOR_BUNDLE_TRITON_INTO_FX_GRAPH_CACHE",
         True if not is_fbcode() else None,
@@ -50,10 +61,14 @@ def bundle_triton_into_fx_graph_cache_default() -> bool | None:
 
 
 def autotune_at_compile_time_default() -> bool | None:
+    # [FUNCTION DOC] HELPER: Default for autotuning at compile time; tri-state value read from the environment (None when unset).
     return get_tristate_env("TORCHINDUCTOR_AUTOTUNE_AT_COMPILE_TIME")
 
 
 def static_cuda_launcher_default() -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether the static CUDA launcher is used.
+    # An explicit environment variable wins (enabled only when it equals 1). In fbcode, a justknob version is read and the launcher is
+    # enabled when that version is at most the built-in version constant. Otherwise (OSS) returns True.
     STATIC_CUDA_LAUNCHER_VERSION = 2
 
     if "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER" in os.environ:
@@ -69,6 +84,9 @@ def static_cuda_launcher_default() -> bool:
 
 
 def prologue_fusion_enabled() -> bool:
+    # [FUNCTION DOC] Decide whether prologue fusion is enabled.
+    # An explicit environment variable wins (enabled only when it equals 1). In fbcode, a justknob version is compared against a
+    # built-in version constant (enabled when the knob is at most the constant). Other branch is the OSS default (see code below).
     ENABLE_PROLOGUE_FUSION_VERSION = 0
 
     if "TORCHINDUCTOR_PROLOGUE_FUSION" in os.environ:
@@ -566,6 +584,9 @@ autotune_cudagraph_benchmarking: bool = (
 
 # Modifies the number of autotuning choices displayed, set to None for all
 def _autotune_num_choices_displayed_default() -> int | None:
+    # [FUNCTION DOC] HELPER: Number of autotune choices to display.
+    # Returns 10 when the environment variable is unset, None (show all) when it is none or all (case-insensitive), else the integer value.
+    # Raises ValueError if the value is not an integer.
     env_val = os.environ.get("TORCHINDUCTOR_AUTOTUNE_NUM_CHOICES_DISPLAYED")
     if env_val is None:
         return 10
@@ -657,6 +678,9 @@ max_autotune_gemm_backends = os.environ.get(
 # nearly all of it (diminishing returns beyond 10). Set to 0, None, or env var
 # "none"/"all" to tune all configs.
 def _nvgemm_max_profiling_configs_default() -> int | None:
+    # [FUNCTION DOC] HELPER: Cap on NVGEMM configs to profile.
+    # Reads the environment variable (default 10); none or all (case-insensitive) gives None (tune all), else the integer value.
+    # Raises ValueError for a non-integer value.
     env_val = os.environ.get("TORCHINDUCTOR_NVGEMM_MAX_PROFILING_CONFIGS", "10")
     if env_val.lower() in ("none", "all"):
         return None
@@ -806,16 +830,20 @@ coordinate_descent_search_radius = int(
 
 
 def _parse_autoheuristic_collect_env():
+    # [FUNCTION DOC] HELPER: Return the comma-separated list of heuristic names from the autoheuristic-collect environment variable (empty string gives a list with one empty string).
     collect_env = os.environ.get("TORCHINDUCTOR_AUTOHEURISTIC_COLLECT", "").split(",")
     return collect_env
 
 
 def _parse_autoheuristic_use_env():
+    # [FUNCTION DOC] HELPER: Return the comma-separated list of heuristic names from the autoheuristic-use environment variable (default is mixed_mm).
     use_env = os.environ.get("TORCHINDUCTOR_AUTOHEURISTIC_USE", "mixed_mm").split(",")
     return use_env
 
 
 class autoheuristic_collect:
+    # [CLASS DOC] Config namespace; each boolean attribute says whether the named autoheuristic should collect training data.
+    # Values are computed at import time from the collect environment variable.
     """
     Config for which autoheuristic optimizations should collect training data.
     """
@@ -825,6 +853,8 @@ class autoheuristic_collect:
 
 
 class autoheuristic_use:
+    # [CLASS DOC] Config namespace; each attribute is True if the named autoheuristic should use its learned heuristic, else None.
+    # None means fall back to the global deterministic setting (see use_autoheuristic). Computed at import time from the use environment variable.
     """
     Config for which autoheuristic optimizations should use learned heuristics.
     """
@@ -840,10 +870,13 @@ run_jit_post_compile_hook = (
 
 
 def run_autoheuristic(name: str) -> bool:
+    # [FUNCTION DOC] Return True if the named autoheuristic should either collect data or use a learned heuristic.
     return collect_autoheuristic(name) or use_autoheuristic(name)
 
 
 def collect_autoheuristic(name: str) -> bool:
+    # [FUNCTION DOC] Return whether the named autoheuristic should collect data.
+    # Uses the attribute on the collect config class if present; otherwise checks membership in the environment-provided name list (for non-standard test names).
     if hasattr(autoheuristic_collect, name):
         return getattr(autoheuristic_collect, name)
     else:
@@ -852,6 +885,9 @@ def collect_autoheuristic(name: str) -> bool:
 
 
 def use_autoheuristic(name: str) -> bool:
+    # [FUNCTION DOC] Return whether the named autoheuristic should use a learned heuristic.
+    # Uses the attribute on the use config class if present; a None attribute falls back to the global deterministic config.
+    # Otherwise checks membership in the environment-provided name list (for non-standard test names).
     if hasattr(autoheuristic_use, name):
         attr = getattr(autoheuristic_use, name)
         if attr is None:
@@ -1169,6 +1205,8 @@ disabled_passes: str = Config(
 
 # The multiprocessing start method to use for inductor workers in the codecache.
 def decide_worker_start_method() -> str:
+    # [FUNCTION DOC] HELPER: Pick the multiprocessing start method for inductor compile workers.
+    # Reads the worker-start environment variable, defaulting to subprocess; raises AssertionError unless it is subprocess, fork or spawn.
     if "TORCHINDUCTOR_WORKER_START" in os.environ:
         start_method = os.environ["TORCHINDUCTOR_WORKER_START"]
     else:
@@ -1282,11 +1320,14 @@ partitioned_scatter_force: bool = (
 
 
 class _collective:
+    # [CLASS DOC] HELPER: Config namespace for collective ops: auto_select (default off) and the byte threshold for using one-shot all-reduce (128 KiB).
     auto_select: bool = False
     one_shot_all_reduce_threshold_bytes: int = 128 * 1024
 
 
 class aten_distributed_optimizations:
+    # [CLASS DOC] Config namespace of options for distributed (collective overlap, reordering, bucketing) optimization passes on ATen FX graphs.
+    # Holds plain class-level settings only; no behavior of its own.
     """Configuration for distributed optimization passes on ATen FX graphs."""
 
     # Move collectives earlier and waits later in the inductor schedule
@@ -1434,6 +1475,8 @@ class aten_distributed_optimizations:
 
 
 def parallel_compile_enabled_internally() -> bool:
+    # [FUNCTION DOC] HELPER: Rollout knob for internal parallel compile.
+    # Reads a justknob integer version and returns True when a built-in version constant is at least that version. Needs the internal utils module (fbcode only).
     """
     TODO: Remove when parallel compiled is fully enabled internally. For rollout, use a
     knob to enable / disable. The justknob should not be performed at import, however.
@@ -1448,6 +1491,9 @@ def parallel_compile_enabled_internally() -> bool:
 
 
 def decide_compile_threads() -> int:
+    # [FUNCTION DOC] Decide the number of compile worker threads.
+    # Precedence: the compile-threads environment variable (integer; raises ValueError if invalid), then 1 on win32, then 1 in fbcode when parallel compile is not enabled,
+    # otherwise the smaller of 32 and the CPU count (AssertionError if the count is zero). Logs the decision; returns the thread count.
     """
     Here are the precedence to decide compile_threads
     1. User can override it by TORCHINDUCTOR_COMPILE_THREADS.  One may want to disable async compiling by
@@ -1740,6 +1786,8 @@ enable_autograd_for_aot: bool = False
 
 
 def get_worker_log_path() -> str | None:
+    # [FUNCTION DOC] Return the dedicated log path for the compile worker, or None.
+    # Only in fbcode with a MAST job name set does it build a path using the rank from the environment (default 0); otherwise None.
     log_loc = None
     if is_fbcode():
         mast_job_name = os.environ.get("MAST_HPC_JOB_NAME", None)
@@ -1758,6 +1806,8 @@ torchinductor_worker_logpath: str = Config(
 
 
 class auto_chunker:
+    # [CLASS DOC] Config namespace for the auto chunker pass: enable flag (env controlled), output size and amplify ratio thresholds, and an optional forced number of chunks.
+    # The chunk count is parsed as an integer from the environment at import time (ValueError if invalid).
     enable: bool = os.environ.get("TORCHINDUCTOR_AUTO_CHUNKER") == "1"
 
     # Don't chunk from a node if the output size is not large enough
@@ -1775,6 +1825,7 @@ class auto_chunker:
 
 # config specific to codegen/cpp.py
 class cpp:
+    # [CLASS DOC] Config namespace for the C++ backend (codegen of cpp); plain class-level settings read at import time from environment variables.
     """
     Settings for cpp backend.
     This class provides a centralized location for managing cpp backend settings.
@@ -1919,6 +1970,8 @@ class cpp:
 
 
 def tlx_mode_from_env() -> Literal["allow", "force"] | None:
+    # [FUNCTION DOC] HELPER: Read the TLX mode environment variable.
+    # Returns allow or force only for exactly those values; any other value (unset, empty, typo) returns None so TLX stays off.
     # Only the explicit values "allow"/"force" enable torchTLX. Any other
     # value -- unset, empty, a typo, or a legacy "default" -- maps to None so
     # TLX stays off. See the "Knob" section of the torchTLX README under
@@ -1930,6 +1983,7 @@ def tlx_mode_from_env() -> Literal["allow", "force"] | None:
 
 
 class triton:
+    # [CLASS DOC] Config namespace for Triton codegen (codegen/triton.py): autotuning, tiling, fusion, cudagraph and TLX settings; plain class-level settings.
     """
     Config specific to codegen/triton.py
     """
@@ -2333,6 +2387,7 @@ class triton:
 
 
 class aot_inductor:
+    # [CLASS DOC] Config namespace for Ahead-Of-Time Inductor compilation settings (AOTI); plain class-level settings.
     """
     Settings for Ahead-Of-Time Inductor Compilation
     """
@@ -2532,6 +2587,7 @@ class aot_inductor:
 # it should only control the flags in aot_inductor.
 # it should not do anything else.
 class aot_inductor_mode:
+    # [CLASS DOC] Convenience namespace meant to toggle a group of aot_inductor flags; currently only the compile_standalone boolean (default off).
     # dynamic_linkage=False
     # link_libtorch=False
     # package_cpp_only=True
@@ -2541,6 +2597,7 @@ class aot_inductor_mode:
 
 
 class cutlass:
+    # [CLASS DOC] Config namespace for the CUTLASS backend (compile options, op filtering, autotuning); base class for the cuda and xpu configs.
     """
     Config specific to cutlass backend.
     """
@@ -2672,6 +2729,7 @@ class cutlass:
 
 @inherit_fields_from(cutlass)
 class cuda(cutlass):
+    # [CLASS DOC] CUDA-specific CUTLASS config, inheriting the cutlass fields: arch, CUDA version, nvcc path, device LTO and ptxas info flags.
     # CUDA arch to use for CUDA template kernel compilation.
     # e.g. "70", "75", "80", "90", etc.
     # When arch is None, Inductor uses torch.cuda.get_device_capability(0).
@@ -2699,6 +2757,7 @@ class cuda(cutlass):
 
 @inherit_fields_from(cutlass)
 class xpu(cutlass):
+    # [CLASS DOC] XPU (Intel) specific CUTLASS config, inheriting the cutlass fields: Xe arch, oneAPI version and root, and the CUTLASS directory (resolved to a real path from the environment at import).
     # Xe arch to use for SYCL kernel compilation.
     # eg. 12, 20, which corresponding to Xe12(PVC) and Xe20 (BMG)
     arch: str | None = None
@@ -2713,6 +2772,7 @@ class xpu(cutlass):
 
 
 class rocm:
+    # [CLASS DOC] Config namespace for the ROCm backend, including the CK (composable kernel) backend settings; plain class-level settings.
     # Offload arch list for device code compilation, e.g. ["gfx90a", "gfx942"].
     # If empty, the `native` arch is used
     arch: list[str] = []
@@ -2827,11 +2887,13 @@ xpu_backend: Literal["triton"] = "triton"
 
 
 class mtia:
+    # [CLASS DOC] Config namespace for the MTIA backend; currently a flag to disable welford reductions.
     # Configuration to force inductor to never use welford reductions for MTIA backend
     disable_welford_reduction = False
 
 
 class halide:
+    # [CLASS DOC] Config namespace for the Halide backend: CPU and GPU target strings, scheduler and related settings.
     # Base halide target to use for CPU devices
     cpu_target = "host"
 
@@ -2860,6 +2922,8 @@ class halide:
 
 # create a directory containing lots of debug information
 def _get_debug_graph_format(format_env_name: str, legacy_svg_env_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Choose the debug graph output format.
+    # Returns the value of the named format environment variable if set; else svg if the legacy svg variable equals 1; else the global graph format variable, defaulting to svg.
     if format_env_name in os.environ:
         return os.environ[format_env_name]
     if os.environ.get(legacy_svg_env_name, "0") == "1":
@@ -2868,6 +2932,8 @@ def _get_debug_graph_format(format_env_name: str, legacy_svg_env_name: str) -> s
 
 
 class trace:
+    # [CLASS DOC] Config namespace for torch.compile debug trace artifacts (master enable switch, output directory, which graphs and info to save, provenance tracking).
+    # Values are read from environment variables at import time.
     """Configuration for torch.compile debug trace artifacts."""
 
     # master switch for all debugging flags below
@@ -2988,6 +3054,8 @@ class trace:
 
 
 def effective_provenance_tracking_level() -> int:
+    # [FUNCTION DOC] Return the provenance tracking level to use.
+    # If provenance tracking to timeline is on, the level is raised to at least 1; otherwise the configured level is returned.
     if trace.provenance_tracking_to_timeline:
         return max(trace.provenance_tracking_level, 1)
     return trace.provenance_tracking_level
@@ -3056,6 +3124,7 @@ write_are_deterministic_algorithms_enabled = (
 
 
 class lookup_table:
+    # [CLASS DOC] Config namespace for the template config lookup table: an optional table of overrides and a flag to check source hashes to avoid stale entries.
     # Lookup table for template config overrides
     table: dict[str, list[dict[str, Any]]] | None = None
 
@@ -3067,6 +3136,7 @@ class lookup_table:
 
 
 class test_configs:
+    # [CLASS DOC] Config namespace of flags used only by tests to force particular behavior (e.g. extern kernels, autotuning choices).
     force_extern_kernel_in_multi_template: bool = False
 
     # Force custom op autotuning choice selection:
@@ -3131,6 +3201,7 @@ if TYPE_CHECKING:
 
 
 class eager_numerics:
+    # [CLASS DOC] Config namespace of options making compiled numerics match eager (division rounding, flush-to-zero, libdevice choice, etc.).
     # x / y in Triton is lowered to div.full which is approx
     # PyTorch eager uses the equivalent of Triton's div_rn, which can
     # come at a performance penalty

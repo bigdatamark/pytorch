@@ -1,3 +1,5 @@
+# [MODULE DOC] Config for communication (collective) runtime estimation and reordering/sink-waits passes in Inductor: estimation sources, rank alignment, overlap ratios, memory budgets.
+# Only module-level settings; install_config_module is called at import to add patch and save_config.
 import os
 import sys
 
