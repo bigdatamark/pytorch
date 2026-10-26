@@ -1,3 +1,8 @@
+# [MODULE DOC] Runtime estimation for collective communication ops (NCCL) used by inductor scheduling and bucketing passes.
+# Contains enums for collective, GPU, interconnect, NCCL hardware/algorithm/protocol kinds; interconnect profiles and
+# NCCL-derived latency and bandwidth tables (adapted from NCCL tuning code); GPU/interconnect detection; an analytical
+# time model that picks the best algorithm/protocol pair; and estimators working on IR nodes or FX nodes (optionally
+# using the real NCCL time estimator). Import-time side effects: defines constants and a logger only.
 import functools
 import logging
 import math
@@ -22,6 +27,7 @@ log = logging.getLogger(__name__)
 
 
 class NCCL_COLL(IntEnum):
+    # [CLASS DOC] Enumeration of collective kinds recognized by the estimator (all-reduce, all-gather, reduce-scatter, all-to-all, unsupported, point-to-point).
     ALL_REDUCE = 0
     ALL_GATHER = 1
     REDUCE_SCATTER = 2
@@ -31,6 +37,7 @@ class NCCL_COLL(IntEnum):
 
 
 class NVIDIA_GPU_TYPE(IntEnum):
+    # [CLASS DOC] Enumeration of NVIDIA GPU generations (Volta, Ampere, Hopper, Blackwell) used to index tuning tables.
     VOLTA = 0
     AMPERE = 1
     HOPPER = 2
@@ -38,6 +45,7 @@ class NVIDIA_GPU_TYPE(IntEnum):
 
 
 class InterconnectType(IntEnum):
+    # [CLASS DOC] Enumeration of interconnect kinds (NVLink generations, InfiniBand HDR/NDR, PCIe) keyed into INTERCONNECT_PROFILES.
     NVLINK_V100 = 0
     NVLINK_A100 = 1
     NVLINK_H100 = 2
@@ -49,6 +57,8 @@ class InterconnectType(IntEnum):
 
 @dataclass(frozen=True)
 class InterconnectProfile:
+    # [CLASS DOC] Immutable record of empirically calibrated interconnect parameters: bus bandwidth (GB/s), per-ring-step
+    # latency and fixed startup latency (microseconds) and an optional floor on saturation message size (bytes).
     """Empirically calibrated interconnect parameters for saturation estimation."""
 
     bus_bw_GBps: float  # effective bus bandwidth at large messages (GB/s)
@@ -96,6 +106,9 @@ _GPU_TO_INTER: dict[NVIDIA_GPU_TYPE, InterconnectType] = {
 
 @functools.lru_cache
 def _has_nvlink() -> bool:
+    # [FUNCTION DOC] HELPER: Cached check for whether GPUs are connected by NVLink. Returns True when fewer than two CUDA
+    # devices exist; otherwise parses the topology matrix from the nvidia-smi tool (before its legend) for NV links,
+    # falling back to a peer-access check between devices 0 and 1 (True if that check errors). Side effect: runs a subprocess (5 s timeout).
     """Detect NVLink via nvidia-smi topology, falling back to peer access check."""
     import subprocess
 
@@ -123,6 +136,9 @@ def _has_nvlink() -> bool:
 
 @functools.lru_cache
 def get_gpu_type() -> NVIDIA_GPU_TYPE:
+    # [FUNCTION DOC] Cached detection of the GPU generation. Prefers the compute capability major version of device 0
+    # (10+ Blackwell, 9 Hopper, 8 Ampere, 7 Volta); otherwise matches GPU names from the environment-collection helper;
+    # unknown defaults to Ampere. Returns an NVIDIA_GPU_TYPE.
     # Prefer compute capability (works for all NVIDIA GPUs, including H200, L40, etc.)
     if torch.cuda.is_available() and torch.cuda.device_count() > 0:
         major = torch.cuda.get_device_properties(0).major
@@ -149,6 +165,9 @@ def get_gpu_type() -> NVIDIA_GPU_TYPE:
 
 
 def detect_interconnect(group_size: int) -> InterconnectType:
+    # [FUNCTION DOC] Choose the interconnect for a group size: within a single node returns PCIe if no NVLink, otherwise the
+    # NVLink type of the GPU generation; across nodes returns the InfiniBand type of the generation. Assumes 8 GPUs per node
+    # if CUDA is unavailable.
     """Auto-detect interconnect type from GPU generation and group topology."""
     gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 8
     gpu_gen = get_gpu_type()
@@ -160,6 +179,8 @@ def detect_interconnect(group_size: int) -> InterconnectType:
 
 
 def get_collective_type_from_kernel_name(kernel_name: str) -> NCCL_COLL:
+    # [FUNCTION DOC] Classify a kernel name by substring into a collective kind (all reduce, all gather, reduce scatter,
+    # all to all, point to point) or UNSUPPORTED. Raises AssertionError if the name is None.
     if kernel_name is None:
         raise AssertionError("kernel_name must not be None")
     if "all_reduce" in kernel_name:
@@ -177,6 +198,8 @@ def get_collective_type_from_kernel_name(kernel_name: str) -> NCCL_COLL:
 
 
 def get_collective_type(node: ir.IRNode) -> NCCL_COLL:
+    # [FUNCTION DOC] Return the collective kind of an IR node from its python kernel name.
+    # Raises ValueError if the node is not a collective kernel, AssertionError if it has no kernel name.
     if not isinstance(node, ir._CollectiveKernel):
         raise ValueError(f"node is not a collective kernel: {node}")
 
@@ -187,6 +210,8 @@ def get_collective_type(node: ir.IRNode) -> NCCL_COLL:
 
 
 def get_ir_node_size_numel(size: torch.Size, fallback: int = 4096 * 4096) -> int:
+    # [FUNCTION DOC] Number of elements for an IR size: exact when it is a concrete integer, otherwise the size-variable
+    # optimization hint using the given fallback.
     numel = sympy_product(size)
     if isinstance(numel, sympy.Integer):
         return int(numel)
@@ -194,12 +219,14 @@ def get_ir_node_size_numel(size: torch.Size, fallback: int = 4096 * 4096) -> int
 
 
 def get_fx_node_size_numel(size: torch.Size, fallback: int = 4096 * 4096) -> int:
+    # [FUNCTION DOC] Number of elements for an FX tensor size (product of dims), converted to a concrete hint using the fallback for symbolic values.
     numel = functools.reduce(operator.mul, size, 1)
     result = optimization_hint(numel, fallback=fallback)
     return result
 
 
 def get_collective_input_size_bytes(node: ir.IRNode) -> int:
+    # [FUNCTION DOC] Sum the byte sizes (element count times dtype size) of all inputs of a collective IR node. Returns an int.
     sz_bytes = 0
     for inp in node.inputs:  # type: ignore[attr-defined]
         numel = get_ir_node_size_numel(inp.layout.size)
@@ -208,6 +235,8 @@ def get_collective_input_size_bytes(node: ir.IRNode) -> int:
 
 
 def get_collective_group_size(node: ir.IRNode) -> int:
+    # [FUNCTION DOC] Return the process group size of a collective (non-wait) kernel, looked up by the group name stored as
+    # its last constant arg. Raises TypeError for other node kinds.
     if isinstance(node, ir._CollectiveKernel) and not isinstance(node, ir._WaitKernel):
         from torch.distributed.distributed_c10d import _get_group_size_by_name
 
@@ -222,17 +251,20 @@ def get_collective_group_size(node: ir.IRNode) -> int:
 
 
 class NCCL_HW(IntEnum):
+    # [CLASS DOC] Enumeration of NCCL hardware link classes (NVLink, PCI, network) used to index the hardware latency table.
     NVLINK = 0
     PCI = 1
     NET = 2
 
 
 class NCCL_ALGO(IntEnum):
+    # [CLASS DOC] Enumeration of NCCL algorithms modeled (tree, ring).
     TREE = 0
     RING = 1
 
 
 class NCCL_PROTO(IntEnum):
+    # [CLASS DOC] Enumeration of NCCL wire protocols (LL, LL128, SIMPLE) used to index latency and bandwidth tables.
     # Matches NCCL devcomm.h protocol enum
     LL = 0  # Low-latency
     LL128 = 1  # Low-latency 128-byte
@@ -427,6 +459,7 @@ _GPU_INTER_NODE_BW: dict[NVIDIA_GPU_TYPE, float] = {
 
 
 def get_intra_node_bw() -> float:
+    # [FUNCTION DOC] Return intra-node bandwidth in GB/s: the config override if set, else a PCIe value without NVLink, else the table value for the detected GPU generation.
     """Return intra-node bandwidth in GB/s. Config overrides auto-detection."""
     override = torch._inductor.config.intra_node_bw
     if override is not None:
@@ -437,6 +470,7 @@ def get_intra_node_bw() -> float:
 
 
 def get_inter_node_bw() -> float:
+    # [FUNCTION DOC] Return inter-node bandwidth in GB/s: the config override if set, else the table value for the detected GPU generation (default 25).
     """Return inter-node (IB/RoCE) bandwidth in GB/s. Config overrides auto-detection."""
     override = torch._inductor.config.inter_node_bw
     if override is not None:
@@ -445,6 +479,7 @@ def get_inter_node_bw() -> float:
 
 
 def _log2i(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Floor of the base-2 logarithm of an integer; returns 0 for non-positive input.
     """Integer log2, matching NCCL's log2i (floor of log2)."""
     if n <= 0:
         return 0
@@ -456,6 +491,13 @@ def _log2i(n: int) -> int:
 
 
 def estimate_nccl_collective_runtime_nccl_estimator(snode) -> float | None:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Estimate a collective's runtime in milliseconds using the real NCCL time estimator.
+    # Resolves the process group from the node's last constant arg, evaluates the node's python kernel name to get the
+    # function, runs it on a CUDA device inside a time-estimator context, and waits on the result.
+    # Returns None if the estimator reports an error (negative time). Raises AssertionError for missing node or result.
+    # Side effects: allocates device tensors via the call; evaluates a string.
+    # KNOWN ISSUE: for the all-gather out variant, args are rearranged by adding a tuple and a single element, which looks
+    # like a type error (the first arg should probably be wrapped in a tuple).
     kernel = snode.node
     if kernel is None:
         raise AssertionError("snode.node must not be None")
@@ -498,6 +540,12 @@ def _nccl_algo_time(
     algo: int,
     proto: int,
 ) -> float:
+    # [FUNCTION DOC] HELPER: Estimated time in microseconds of a collective for one algorithm/protocol pair, mirroring NCCL
+    # tuning. Derives node count and ranks, picks bus bandwidth (intra or inter node, with InfiniBand efficiency and
+    # multi-rail corrections), applies per-protocol and per-algorithm bandwidth caps, computes steps and algorithm
+    # bandwidth, adds latency terms (ring or tree) and a tree correction for medium messages.
+    # Returns -1 when the combination is disabled or invalid (LL128 across many nodes or over IB, nonpositive bandwidth,
+    # unsupported collective).
     """Compute NCCL estimated time in us for a given (algo, proto) pair.
 
     Mirrors ncclTopoTuneModel bandwidth/latency computation and
@@ -645,6 +693,8 @@ def _nccl_best_algo_time(
     group_size: int,
     coll: NCCL_COLL,
 ) -> tuple[float, int, int]:
+    # [FUNCTION DOC] HELPER: Try ring and tree (tree only for all-reduce) with each protocol and return the minimum time in
+    # microseconds with its algorithm and protocol; time stays infinity if no pair is valid.
     """Find the best (algo, proto) for a given collective and return (time_us, algo, proto).
 
     Iterates all supported (algo, proto) combinations and picks the one with
@@ -671,6 +721,8 @@ def _nccl_best_algo_time(
 def estimate_nccl_collective_runtime_impl(
     tensor_storage_size_bytes: int, group_size: int, coll: NCCL_COLL
 ) -> float:
+    # [FUNCTION DOC] Estimated collective runtime in milliseconds for a byte size, group size and collective kind, using the
+    # best algorithm/protocol pair. Returns 0 for a single-rank group, unsupported kind, or when no valid estimate exists.
     """Returns estimated NCCL collective runtime in milliseconds (ms).
 
     Uses a multi-algorithm, multi-protocol model aligned with NCCL's
@@ -695,6 +747,9 @@ def compute_min_saturation_bytes(
     coll: NCCL_COLL,
     target_efficiency: float = 0.9,
 ) -> int:
+    # [FUNCTION DOC] Smallest message size in bytes at which the collective reaches the target bus-bandwidth efficiency, from the
+    # interconnect profile: effective ratio times total latency (base plus steps times hop latency) times bandwidth, floored
+    # by the profile minimum. Supports all-gather, reduce-scatter and all-reduce only (AssertionError otherwise); returns 0 for a single rank.
     """Compute min message size for target BW efficiency using empirical profiles.
 
     Uses per-interconnect profiles calibrated to real NCCL behavior (algorithm,
@@ -732,6 +787,8 @@ def compute_min_saturation_bytes(
 
 
 def estimate_nccl_collective_runtime(node: ir.IRNode) -> float:
+    # [FUNCTION DOC] Estimated runtime in milliseconds of a collective IR node: computes input bytes, group size and kind from
+    # the node and calls the analytical estimator.
     """Returns estimated NCCL collective runtime in milliseconds (ms).
 
     Uses the multi-algorithm, multi-protocol analytical model aligned with
@@ -747,6 +804,9 @@ def estimate_nccl_collective_runtime(node: ir.IRNode) -> float:
 
 
 def estimate_fx_collective_size(fx_node: torch.fx.Node) -> int:
+    # [FUNCTION DOC] Estimate bytes moved by a collective FX node: tensor input sizes (excluding any pre-allocated out
+    # argument) plus output sizes (single tensor or list). Returns 0 if there are no tensor inputs, no output metadata, or
+    # the output is not a tensor or sequence.
     """Estimate the size of a collective operation in bytes, including inputs and outputs."""
     input_bytes = None
 
@@ -757,9 +817,11 @@ def estimate_fx_collective_size(fx_node: torch.fx.Node) -> int:
     kwargs.pop("out", None)
 
     def tensor_bytes(t: torch.Tensor) -> int:
+        # [FUNCTION DOC] HELPER: Byte size of a tensor from its size hint and dtype size.
         return get_fx_node_size_numel(t.size()) * get_dtype_size(t.dtype)
 
     def add_inp_bytes(inp: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: If the node's metadata value is a tensor, add its byte size to the enclosing input byte total (initializing it).
         inp_val = inp.meta.get("val", None)
         if not isinstance(inp_val, torch.Tensor):
             return
@@ -794,6 +856,8 @@ def estimate_fx_collective_size(fx_node: torch.fx.Node) -> int:
 
 
 def estimate_fx_collective_memory_footprint(fx_node: torch.fx.Node) -> int:
+    # [FUNCTION DOC] Estimate the bytes concurrently live for a collective FX node: the collective size, halved for all-reduce
+    # since it can run in place.
     """Estimate the memory footprint of a collective operation in bytes.
 
     This returns the total bytes that need to be live concurrently in memory.
@@ -812,6 +876,10 @@ def estimate_nccl_collective_runtime_from_fx_node(
     override_size: int | None = None,
     use_nccl_estimator: bool = True,
 ) -> float:
+    # [FUNCTION DOC] Estimated runtime in milliseconds of a collective FX node. Optionally uses the real NCCL estimator
+    # (disabled for all-to-all; skipped for fake backends or backends without time estimates) and falls back to the analytical
+    # model. Args: override_size replaces the computed byte size; use_nccl_estimator toggles the real estimator.
+    # Normalizes node args to keywords to find the group. Raises AssertionError for non-OpOverload targets.
     """Returns estimated NCCL collective runtime in milliseconds (ms).
 
     Tries the NCCL simulator first (if available and enabled), falls back
@@ -852,6 +920,9 @@ def estimate_nccl_collective_runtime_from_fx_node(
     coll = get_collective_type_from_kernel_name(fx_node.target.name())
 
     def _nccl_estimate() -> float | None:
+        # [FUNCTION DOC] HELPER: Try the real NCCL time estimator for this node. Returns None for fake process groups, missing CUDA
+        # backend, unsupported backends or negative estimates; otherwise materializes real tensors from fake metadata, runs the
+        # op in a time-estimator context, waits on results, and returns milliseconds. Side effect: allocates device tensors.
         # TODO: Refactor with estimate_nccl_collective_runtime_nccl_estimator
         from torch.distributed.distributed_c10d import _resolve_process_group, Backend
 
@@ -871,6 +942,7 @@ def estimate_nccl_collective_runtime_from_fx_node(
         flat_args, flat_args_pytree_spec = pytree.tree_flatten((args, kwargs))
 
         def _tensor(size, dtype, device) -> torch.Tensor:  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Allocate an uninitialized tensor of the given size (or the override size as one element list), dtype and device.
             return torch.empty(
                 size if override_size is None else [override_size],
                 dtype=dtype,
@@ -878,6 +950,8 @@ def estimate_nccl_collective_runtime_from_fx_node(
             )
 
         def to_real_tensor(e: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Recursively convert FX nodes (via metadata values) and tensors into real flat tensors sized by hints;
+            # other values are returned unchanged.
             if isinstance(e, torch.fx.Node):
                 return to_real_tensor(e.meta["val"])
             if isinstance(e, torch.Tensor):

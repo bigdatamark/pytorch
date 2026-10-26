@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers that build the SYCL (icpx) compiler command line used by the XPU CUTLASS backend.
+# Contains compiler discovery, library/arch/compile option builders and xpu_compile_command.
+# Import-time side effects: creates the module logger only. Reuses CUTLASS include path discovery from the cuda package.
 # mypy: allow-untyped-defs
 import functools
 import logging
@@ -16,10 +19,17 @@ log = logging.getLogger(__name__)
 
 
 @functools.cache
+    # [FUNCTION DOC] Returns True if the given compiler name/path is non-None and found on PATH (cached per argument).
+    # Args: icpx_path, executable name or path (default icpx). Returns bool; no exceptions.
 def icpx_exist(icpx_path: str | None = "icpx") -> bool:
     return icpx_path is not None and shutil.which(icpx_path) is not None
 
 
+    # [FUNCTION DOC] HELPER: Pick the SYCL compiler executable. Order: icpx on PATH, then config.xpu.oneapi_root,
+    # then the ONEAPI_ROOT environment variable (the first existing directory wins), else the bare name icpx.
+    # Side effect: when a oneapi root is used, appends its include directory to the CPLUS_INCLUDE_PATH environment variable
+    # (colon separated, creating it if absent). Returns the compiler path; does not raise.
+    # KNOWN ISSUE: the include path is appended on every call, so repeated calls duplicate entries.
 def _sycl_compiler() -> str:
     # Search order:
     # 0) which icpx
@@ -50,6 +60,10 @@ def _sycl_compiler() -> str:
 
 
 def _sycl_lib_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Build linker flags for the XPU runtime, used by the CUTLASS backend.
+    # Queries the library paths for the xpu device type, skips paths containing the torch lib directory,
+    # adds a library search flag plus an rpath linker flag per remaining path, then links the sycl library.
+    # Returns the list of flags. Raises NotImplementedError on non-Linux platforms.
     """
     Util function for CUTLASS backend to find the correct XPU libraries.
     """
@@ -76,12 +90,17 @@ def _sycl_lib_options() -> list[str]:
 
 
 def _sycl_arch_as_compile_option() -> str:
+    # [FUNCTION DOC] HELPER: Map the detected XPU architecture (Xe12 or Xe20) to the device target string for the SYCL
+    # ahead-of-time compile option; unknown or undetected architectures fall back to pvc. Returns a string.
     arc_option_map = {"Xe12": "pvc", "Xe20": "bmg-g21,bmg-g31"}
     arch = get_xpu_arch()
     return arc_option_map.get(arch, "pvc")
 
 
 def _sycl_compiler_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Build the list of fixed SYCL compile flags for CUTLASS (defines, O3, C++20, spir64_gen target,
+    # SPIR-V extensions, and a device-specific backend option string including large register file options).
+    # If config.cutlass.enable_debug_info is set, adds line info and debug flags. Returns a list of strings.
     options = [
         "-DCUTLASS_ENABLE_SYCL",
         "-DSYCL_INTEL_TARGET",
@@ -116,6 +135,12 @@ def xpu_compile_command(
     dst_file_ext: str,
     extra_args: list[str] | None = None,
 ) -> str:
+    # [FUNCTION DOC] Build a shell command string that compiles source files with the SYCL compiler.
+    # Args: src_files (inputs), dst_file (output path), dst_file_ext (o = object, so = shared library, exe = executable),
+    # extra_args (optional leading flags). Assembles compiler, extras, CUTLASS include paths, a system include, compile
+    # options and library options, then output flags by extension. Returns the joined command line (logged at debug level).
+    # Raises NotImplementedError for any other extension.
+    # KNOWN ISSUE: the system include path is the hardcoded string /include, which looks like a leftover placeholder.
     if extra_args is None:
         extra_args = []
     include_paths = _cutlass_include_paths()
