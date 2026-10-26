@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] FX graph passes that fuse and reschedule DDP gradient all-reduce collectives in Inductor graphs.
+# Contents: node-move helpers, CommBlock (a collective plus its wait/getitem/reshape nodes), discovery of such blocks, two fusion strategies
+# (concat-based and coalesced-op-based), size-based bucketing, schedule_comm_wait (delay waits to first use) and the fuse_ddp_communication driver.
+# Uses the logger named comm_fusion and bumps the ddp_buckets counter. No import-time side effects beyond logger creation.
 import collections
 import inspect
 import logging
@@ -26,12 +30,14 @@ logger: logging.Logger = logging.getLogger("comm_fusion")
 
 
 def move_block_after(block: list[fx.Node], target_node: fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Move the nodes in the block, in order, to directly after the target node (each node becoming the next anchor). Mutates graph order.
     for node in block:
         target_node.append(node)
         target_node = node
 
 
 def move_block_before(block: list[fx.Node], target_node: fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Move the nodes in the block, in order, to directly before the target node, each after the previous one's position chain. Mutates graph order.
     for node in block:
         target_node.prepend(node)
         target_node = node
@@ -43,6 +49,8 @@ def call_function(
     args: tuple[fx.node.Argument, ...] | None = None,
     kwargs: dict[str, fx.node.Argument] | None = None,
 ) -> fx.Node:
+    # [FUNCTION DOC] HELPER: Create a call_function node in the graph and compute its fake value and tensor metadata under the fake mode, storing both in node meta.
+    # Raises RuntimeError if the target is given as a string. Returns the new node.
     # We accept target as a str to avoid typing error as the type of
     # a node.target is str | Callable[..., Any].
     # This also allows us to avoid writing check for every call.
@@ -62,6 +70,8 @@ def call_function(
 
 @dataclass(unsafe_hash=True)
 class CommBlock:
+    # [CLASS DOC] Dataclass (hashable by identity fields) describing one collective communication: tensor shape (or list of shapes), all nodes in the block,
+    # input nodes, wait nodes, the collective node itself, and the ordered set of output nodes (waits or their trailing split/reshape/getitem/detach/alias users).
     shape: torch.Size | list[torch.Size]
     node_list: list[fx.Node]
     inputs: list[fx.Node]
@@ -71,6 +81,12 @@ class CommBlock:
 
 
 def get_comm_block(comm_node: fx.Node) -> CommBlock | None:
+    # [FUNCTION DOC] Given a collective node, collect the nodes forming its communication block. Supports a single output consumed by one wait node,
+    # or multiple outputs each via a getitem used by exactly one wait node; any other user pattern returns None.
+    # Follows users of the waits through split, reshape, getitem, detach and alias nodes (by node name prefix) to find the block outputs.
+    # Shape comes from the first input's tensor metadata (single or list/tuple); an unexpected metadata type logs a warning and returns None.
+    # Returns the CommBlock or None.
+    # KNOWN ISSUE: takes the first user without checking that the collective has any users, so a collective with no users raises StopIteration.
     """
     Given a collective node (e.g., allreduce), find out all the nodes belong to
     this communication.
@@ -152,9 +168,12 @@ def get_all_comm_blocks(
     comm_ops: tuple[torch._ops.OpOverload, ...],
     comm_filter: Callable[..., bool] | None = None,
 ) -> list[CommBlock]:
+    # [FUNCTION DOC] Return a CommBlock for every graph node whose target is among the given collective ops and that passes the optional filter (default accepts all).
+    # Nodes for which no block can be built are skipped. Graph is not modified.
     if comm_filter is None:
 
         def always_true(comm_block: CommBlock) -> bool:
+            # [FUNCTION DOC] HELPER: Default filter that accepts every block.
             return True
 
         comm_filter = always_true
@@ -175,6 +194,9 @@ def _fuse_allreduce_by_concat(
     all_input_nodes: list[fx.Node],
     last_comm_block: CommBlock,
 ) -> CommBlock:
+    # [FUNCTION DOC] HELPER: Fuse several all-reduce blocks by flattening each pre-collective input, concatenating, applying a single division with the shared divisor,
+    # and creating one collective plus one wait cloned from the last block. New nodes are moved right after the last input node.
+    # Raises AssertionError if inputs are not nodes or divisors differ. Returns the new CommBlock. Old nodes are not erased here.
     """Given a list of inputs in order, create a fused allreduce using concat."""
     # Flatten all the inputs to the all_reduce nodes.
     with graph.inserting_after(last_input_node):
@@ -239,6 +261,9 @@ def _fuse_with_coalesced_op(
     all_input_nodes: list[fx.Node],
     last_comm_block: CommBlock,
 ) -> CommBlock:
+    # [FUNCTION DOC] HELPER: Fuse several all-reduce blocks into one coalesced all-reduce: one foreach division of all dividends by the shared divisor,
+    # a coalesced collective, then per-input getitem plus wait nodes. New nodes are moved after the foreach division node.
+    # Raises AssertionError if divisors differ. Returns the new CommBlock; the original division nodes are left for dead-code removal.
     """Given a list of inputs in order, create a fused allreduce by coalesced."""
     last_comm_node = last_comm_block.comm_node
     last_wait_node = last_comm_block.wait_nodes[0]
@@ -303,6 +328,9 @@ def _scatter_fused_allreduce_waits(
     node_indices: dict[fx.Node, int],
     split_and_reshape: bool = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Redirect users of the original wait nodes to the fused result. With split_and_reshape, inserts a split by element counts and a reshape to each
+    # original shape; otherwise uses the fused waits directly. Users that were scheduled before the fused collective (by node index) are collected
+    # and moved, in original order, to right after the last fused result so the graph stays topologically sorted. Mutates the graph.
     """
     Scatters the result of the fused communication node to the original users.
     If the fused method is concat splitting the output and reshape will be inserted,
@@ -390,6 +418,9 @@ def _fuse_allreduce(
     node_indices: dict[fx.Node, int],
     use_concat: bool,
 ) -> CommBlock:
+    # [FUNCTION DOC] HELPER: Fuse a list of all-reduce blocks (returned unchanged if only one). Picks the latest input node as insertion point, fuses with concat or coalescing
+    # per use_concat, scatters results to old users, then erases the old waits and collectives and eliminates dead code. Returns the fused block.
+    # Raises AssertionError if two inputs share an index.
     """Given a list of allreduce CommBlock, fuse the CommBlocks into one CommBlock."""
 
     if len(comm_blocks) == 1:
@@ -435,6 +466,9 @@ def _fuse_allreduce(
 def _bucket_size_fusion(
     graph: fx.Graph, comm_blocks: list[CommBlock], bucket_size_mb: int
 ) -> Generator[list[CommBlock], None, None]:
+    # [FUNCTION DOC] HELPER: Generator that groups consecutive blocks into buckets by byte size: the first bucket targets 1 MB, later ones target bucket_size_mb.
+    # Yields each list of blocks when the size threshold is reached or at the last block. Logs on rank 0 and sets the ddp_buckets counter.
+    # Requires the distributed package to be initialized (queries the rank).
     MB = 1024**2
     bucket_size = 1 * MB
     bucket_cap_size = bucket_size_mb * MB
@@ -474,11 +508,14 @@ def _bucket_size_fusion(
 def _fuse_ddp_communication(
     graph: fx.Graph, algorithm_fn: Callable[..., Any], fusion_fn: Callable[..., Any]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Find DDP gradient all-reduce blocks and fuse them: locate the output node, build blocks for all-reduce ops whose input is a tensor division
+    # and whose single wait result goes to the graph output or a copy, then apply algorithm_fn to group blocks and fusion_fn to fuse each group.
     for output in reversed(graph.nodes):
         if output.op == "output":
             break
 
     def ddp_reducer_filter(block: CommBlock) -> bool:
+        # [FUNCTION DOC] HELPER: Filter for DDP gradient blocks: the collective input must be a division, the wait must have one user, and that user must be the output or a copy.
         if (
             not isinstance(block.comm_node.args[0], fx.Node)
             or block.comm_node.args[0].target != aten.div.Tensor
@@ -513,6 +550,7 @@ def _fuse_ddp_communication(
 
 
 def fuse_ddp_with_coalesced_op(graph: fx.Graph, bucket_size_mb: int) -> None:
+    # [FUNCTION DOC] Fuse DDP all-reduces into coalesced all-reduce ops, bucketed by size (in MB). Mutates the graph.
     _fuse_ddp_communication(
         graph,
         partial(_bucket_size_fusion, bucket_size_mb=bucket_size_mb),
@@ -521,6 +559,7 @@ def fuse_ddp_with_coalesced_op(graph: fx.Graph, bucket_size_mb: int) -> None:
 
 
 def fuse_ddp_with_concat_op(graph: fx.Graph, bucket_size_mb: int) -> None:
+    # [FUNCTION DOC] Fuse DDP all-reduces by concatenating gradients into flat buffers, bucketed by size (in MB). Mutates the graph.
     _fuse_ddp_communication(
         graph,
         partial(_bucket_size_fusion, bucket_size_mb=bucket_size_mb),
@@ -529,6 +568,8 @@ def fuse_ddp_with_concat_op(graph: fx.Graph, bucket_size_mb: int) -> None:
 
 
 def schedule_comm_wait(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Delay each all-reduce wait (and its trailing split/reshape/getitem nodes) to just before the earliest user of its outputs, to improve overlap.
+    # Returns immediately if there are no blocks. Raises AssertionError if a block has no outputs. Mutates graph order.
     """
     Delay the execution of wait tensors of allreduce until its first user.
 
@@ -582,6 +623,8 @@ def schedule_comm_wait(graph: fx.Graph) -> None:
 def fuse_ddp_communication(
     graph: fx.Graph, passes: list[Callable[..., None] | str], bucket_size_mb: int
 ) -> None:
+    # [FUNCTION DOC] Run a list of passes (callables or names of functions in this module) over the graph, each within a graph-transform observer.
+    # Passes whose signature has a bucket_size_mb parameter receive it; others are called with the graph only. Mutates the graph.
     for i, pa in enumerate(passes):
         with GraphTransformObserver(
             graph.owning_module,  # pyrefly: ignore[bad-argument-type]

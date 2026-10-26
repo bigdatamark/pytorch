@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines the control_deps higher-order operator and a pass helper that wraps FX call nodes in it to impose explicit scheduling order.
+# Contents: ControlDeps operator class and its singleton control_deps, fake/eager/autograd implementations, subgraph naming and creation helpers,
+# and preserve_node_ordering. Import-time side effects: instantiates the operator, marks it as side-effecting so dead-code elimination keeps it,
+# and registers its fake-tensor and dispatch implementations.
 """
 Effect ordering pass for inductor.
 
@@ -21,6 +25,8 @@ from torch.utils._ordered_set import OrderedSet
 
 
 class ControlDeps(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator control_deps(additional_deps, subgraph, *args, **kwargs). Runs the subgraph on args while recording that all
+    # additional_deps must be computed first (ordering only). Stateless; named control_deps. Execution semantics equal just calling the subgraph.
     """
     Higher-order operator that enforces ordering by making dependencies explicit.
 
@@ -41,9 +47,12 @@ class ControlDeps(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize the higher-order operator with the name control_deps.
         super().__init__("control_deps")
 
     def __call__(self, additional_deps, subgraph, *args, **kwargs):
+        # [FUNCTION DOC] Validate and dispatch the operator. additional_deps must be a tuple or list and subgraph a GraphModule or callable; otherwise raises TypeError.
+        # Then delegates to the base higher-order operator call, returning the subgraph result.
         """Call the operator with dependencies and subgraph.
 
         Args:
@@ -76,6 +85,7 @@ has_side_effect(control_deps)
 # Register fake implementation for tracing
 @register_fake(control_deps)
 def _(additional_deps, subgraph, *args, **kwargs):
+    # [FUNCTION DOC] Fake-tensor implementation of control_deps: ignores additional_deps and returns the result of calling the subgraph on the arguments.
     """Fake tensor implementation - execute the subgraph."""
     return subgraph(*args, **kwargs)
 
@@ -83,6 +93,7 @@ def _(additional_deps, subgraph, *args, **kwargs):
 # Register eager execution implementation
 @control_deps.py_impl(DispatchKey.CompositeExplicitAutograd)
 def control_deps_eager(additional_deps, subgraph, *args, **kwargs):
+    # [FUNCTION DOC] Eager (CompositeExplicitAutograd) implementation: ignores additional_deps and runs the subgraph on the arguments.
     """Eager implementation - just execute the subgraph."""
     return subgraph(*args, **kwargs)
 
@@ -91,10 +102,13 @@ def control_deps_eager(additional_deps, subgraph, *args, **kwargs):
 # causing dispatch through AutogradCUDA even in post-autograd graphs.
 @control_deps.py_impl(DispatchKey.Autograd)
 def control_deps_autograd(additional_deps, subgraph, *args, **kwargs):
+    # [FUNCTION DOC] Autograd-key implementation: ignores additional_deps and runs the subgraph (needed because dependency tensors may carry autograd state).
     return subgraph(*args, **kwargs)
 
 
 def get_subgraph_name(gm: fx.GraphModule, name):
+    # [FUNCTION DOC] Return an unused attribute name on the module for a new subgraph: the prefix subgraph_ plus the given name,
+    # with a numeric suffix appended (smallest free integer starting at 0) if that attribute already exists.
     name = f"subgraph_{name}"
 
     if not hasattr(gm, name):
@@ -110,6 +124,8 @@ def get_subgraph_name(gm: fx.GraphModule, name):
 def _extract_unique_nodes(
     args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[list[fx.Node], list[Any], Any]:
+    # [FUNCTION DOC] HELPER: Flatten args and kwargs with pytree and collect unique fx Node instances in first-occurrence order.
+    # Returns a triple: the unique node list, the full flattened list, and the pytree spec to rebuild the structure.
     """Extract unique fx.Node instances from args/kwargs using pytree.
 
     Args:
@@ -136,6 +152,11 @@ def preserve_node_ordering(
     additional_deps_map: dict[fx.Node, OrderedSet[fx.Node]],
     verbose: bool = False,
 ) -> None:
+    # [FUNCTION DOC] For each dependent node in the mapping (node to ordered set of dependency nodes), replace it with a control_deps call node.
+    # Builds a subgraph module reproducing the original operation, stores it as a new attribute of the owning module, inserts a get_attr for it
+    # and a control_deps call taking the dependencies (remapped to already-replaced nodes) and the original node arguments.
+    # Copies metadata (dropping eager_input_vals), redirects all users, erases the original and gives the new node the original name.
+    # Does nothing for an empty mapping. Raises AssertionError if a node is not call_function or the graph has no owning module. Mutates the graph. The verbose flag is unused.
     """
     Preserve node ordering using control_deps HOP with subgraph.
 
@@ -220,6 +241,10 @@ def preserve_node_ordering(
 def _create_subgraph_for_node(
     graph: fx.Graph, node: fx.Node, additional_deps=None
 ) -> fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Build a GraphModule that recreates a node's operation: one placeholder per unique fx Node argument (copying value metadata, or
+    # the attribute value for get_attr nodes), optional extra placeholders for additional_deps, a call of the same target with rebuilt args and kwargs.
+    # Output is the result alone, or the result followed by the passed-through dep placeholders, with value metadata set.
+    # Raises AssertionError if the graph lacks an owning module or the target is not callable. Returns a lazy graph module.
     """
     Create a subgraph that exactly recreates a node's operation optionally passing through additional dependencies.
 
@@ -257,6 +282,7 @@ def _create_subgraph_for_node(
 
     # Replace fx.Node instances with their placeholders
     def replace_nodes(item: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Map an fx Node to its subgraph placeholder; return any other item unchanged.
         if isinstance(item, fx.Node):
             return node_to_placeholder[item]
         return item

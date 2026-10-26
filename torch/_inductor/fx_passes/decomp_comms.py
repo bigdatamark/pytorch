@@ -1,3 +1,6 @@
+# [MODULE DOC] Inductor pass decomposing collective patterns into local compute plus lighter collectives.
+# Currently implements Gram-matrix all-gather decomposition (all-gather feeding mm of X transposed with X becomes local mm plus all-reduce sum),
+# gated by the allow_comms_decompositions option. Contains pattern-matching helpers and the decomp_comms entry point. No import-time side effects.
 """
 Decompose collective communication patterns into mathematically equivalent
 local computation + lighter collectives.
@@ -34,6 +37,7 @@ _MIN_GRAM_MMS = 2
 
 
 def _get_fake_mode(node: fx.Node) -> torch._subclasses.fake_tensor.FakeTensorMode:
+    # [FUNCTION DOC] HELPER: Return the FakeTensorMode from the compile context, or else from the fake values of the node's inputs; raises RuntimeError if none found.
     """Get FakeTensorMode: V.fake_mode during compilation, from node meta in tests."""
     mode = V.fake_mode
     if isinstance(mode, torch._subclasses.fake_tensor.FakeTensorMode):
@@ -48,6 +52,7 @@ def _get_fake_mode(node: fx.Node) -> torch._subclasses.fake_tensor.FakeTensorMod
 
 
 def _retrace_node_meta(node: fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Recompute a call_function node's recorded value by running its target on fake input values; no-op for other ops or invalid inputs. Raises AssertionError if the target is not callable.
     """Recompute node.meta["val"] by running the op on input FakeTensors."""
     if node.op != "call_function":
         return
@@ -62,6 +67,7 @@ def _retrace_node_meta(node: fx.Node) -> None:
 
 
 def _is_2d_transpose(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node is a transpose of a 2D tensor (t, permute with dims one zero, or transpose of the two dims incl. negatives).
     """True if node is aten.t, permute([1,0]), or transpose(0,1) on a 2D input."""
     if node.op != "call_function":
         return False
@@ -84,6 +90,7 @@ def _is_2d_transpose(node: fx.Node) -> bool:
 
 
 def is_gram_mm(node: fx.Node) -> bool:
+    # [FUNCTION DOC] True if the node is a 2D matmul of a tensor with its own transpose (either order).
     """True if node computes mm(X, X.T) or mm(X.T, X)."""
     if node.op != "call_function" or node.target is not aten.mm.default:
         return False
@@ -96,6 +103,7 @@ def is_gram_mm(node: fx.Node) -> bool:
 
 
 def gram_source(gram_node: fx.Node) -> fx.Node:
+    # [FUNCTION DOC] Return the untransposed operand of a Gram matmul. Raises AssertionError if the arguments are not nodes.
     """Return the base tensor X (non-transposed arg) from a Gram mm."""
     a = gram_node.args[0]
     b = gram_node.args[1]
@@ -105,6 +113,7 @@ def gram_source(gram_node: fx.Node) -> fx.Node:
 
 
 class AllGatherInfo(NamedTuple):
+    # [CLASS DOC] Named tuple describing an all-gather chain: the local shard, group name, all-gather node, wait node, and the entry node (a covering slice if present, else the wait).
     shard: fx.Node
     group_name: str
     ag_node: fx.Node
@@ -117,6 +126,8 @@ class AllGatherInfo(NamedTuple):
 def find_all_gather_ancestor(
     node: fx.Node, max_depth: int = 30
 ) -> AllGatherInfo | None:
+    # [FUNCTION DOC] Breadth-first search backward from a node (up to max_depth, skipping placeholders) for a wait on an all-gather-into-tensor whose shard is a node and group name a string.
+    # If the wait has a single slice user, that slice is the entry node. Returns an AllGatherInfo or None.
     """Walk backward from node to find an all_gather -> wait [-> slice] chain.
 
     The trailing slice is optional. Inductor folds the FSDP identity slice
@@ -164,6 +175,7 @@ def find_all_gather_ancestor(
 
 
 def _select_getitem(split_node: fx.Node, rank: int | None) -> fx.Node | None:
+    # [FUNCTION DOC] HELPER: Among getitem users of a split, pick the one for the given rank, or if rank is None the lowest-index one with users. Returns None if none.
     """Pick getitem from a split: by rank if known, else lowest-index with users."""
     getitems = [
         u
@@ -185,6 +197,8 @@ def _select_getitem(split_node: fx.Node, rank: int | None) -> fx.Node | None:
 def find_split_getitem(
     start: fx.Node, rank: int | None = None, max_search: int = 3000
 ) -> tuple[fx.Node, fx.Node] | None:
+    # [FUNCTION DOC] Scan forward through later nodes depending on start, for a split along dim 0 and the chosen getitem. Gives up (None) at a collective or wait,
+    # a split on another dim, or after max_search nodes. Returns the pair (split node, getitem node) or None.
     """Walk forward from start to find split(dim=0) -> getitem[rank]."""
     chain: OrderedSet[fx.Node] = OrderedSet([start])
     searched = 0
@@ -209,6 +223,7 @@ def find_split_getitem(
 
 
 def _is_reduction(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node is an op overload tagged as a reduction.
     """True if node is a reduction op (sum, mean, norm, etc.)."""
     return (
         node.op == "call_function"
@@ -218,6 +233,8 @@ def _is_reduction(node: fx.Node) -> bool:
 
 
 def _is_l2_norm_op(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node computes an L2 norm (Frobenius, norm, or vector norm with order 2).
+    # KNOWN ISSUE: the plain norm-with-scalar and frobenius variants are accepted without checking the order argument.
     """True if node computes an L2 (Frobenius) norm."""
     if node.op != "call_function":
         return False
@@ -243,6 +260,7 @@ _DECOMPOSABLE_REDUCTIONS = (
 
 
 def _valid_entry_slice(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if the slice node is an identity-like trim of dim 0: integer arguments, start 0, step 1, end absent or at least the row count.
     val = node.meta.get("val")
     dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
     start = node.args[2] if len(node.args) > 2 else node.kwargs.get("start", 0)
@@ -266,6 +284,7 @@ def _valid_entry_slice(node: fx.Node) -> bool:
 
 
 def _reduction_includes_sharded_dim(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if a reduction reduces over dim 0 (the sharded dimension). False for non-reductions or reductions over other dims; unknown reductions assumed True.
     """True if a reduction reduces over dim 0 (the sharded dimension).
 
     Returns False for reductions over only non-sharded dims. Unknown reduction
@@ -275,6 +294,7 @@ def _reduction_includes_sharded_dim(node: fx.Node) -> bool:
         return False
 
     def _dims_include_zero(dims: object) -> bool:
+        # [FUNCTION DOC] HELPER: True if the given dim(s) include dim 0 after normalizing negatives against the input rank (default rank 2); non-integer specs count as True.
         if isinstance(dims, int):
             dims = [dims]
         elif not isinstance(dims, (list, tuple)):
@@ -304,6 +324,7 @@ def _reduction_includes_sharded_dim(node: fx.Node) -> bool:
 
 
 def _gram_shape_is_decomposable(gram_node: fx.Node, gathered_rows: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if neither output dim of the Gram matmul equals the gathered row count (no value means False).
     """True if the Gram output shape doesn't depend on the gathered row count.
 
     X.T @ X = sum(Xi.T @ Xi) only when the contraction dim is the sharded
@@ -318,6 +339,7 @@ def _gram_shape_is_decomposable(gram_node: fx.Node, gathered_rows: int) -> bool:
 
 
 def _insert_all_reduce_wait(graph: fx.Graph, node: fx.Node, group_name: str) -> fx.Node:
+    # [FUNCTION DOC] HELPER: Insert an all-reduce (sum) and wait after the node, rewire the node's other users to the wait, and return the wait node.
     """Insert all_reduce(sum) + wait_tensor after node, rewire users."""
     with graph.inserting_before(node.next):
         ar = graph.call_function(
@@ -331,6 +353,7 @@ def _insert_all_reduce_wait(graph: fx.Graph, node: fx.Node, group_name: str) -> 
 
 
 def _collect_dependent_chain(start: fx.Node, stop: fx.Node) -> OrderedSet[fx.Node]:
+    # [FUNCTION DOC] HELPER: Collect call_function nodes after start, up to stop, that transitively depend on start (start included).
     """Collect call_function nodes transitively dependent on start, up to stop."""
     chain: OrderedSet[fx.Node] = OrderedSet([start])
     n = start.next
@@ -342,6 +365,7 @@ def _collect_dependent_chain(start: fx.Node, stop: fx.Node) -> OrderedSet[fx.Nod
 
 
 def _collect_split_path_chain(start: fx.Node, stop: fx.Node) -> OrderedSet[fx.Node]:
+    # [FUNCTION DOC] HELPER: From the dependent chain between start and stop, keep only nodes on a path to stop.
     chain = _collect_dependent_chain(start, stop)
     path: OrderedSet[fx.Node] = OrderedSet()
     stack = [stop]
@@ -357,6 +381,7 @@ def _collect_split_path_chain(start: fx.Node, stop: fx.Node) -> OrderedSet[fx.No
 def _has_unsupported_sharded_reduction(
     chain: OrderedSet[fx.Node], gram_set: OrderedSet[fx.Node]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the chain has a reduction over the sharded dim that is not a Gram mm, L2 norm or sum (logs it at debug level).
     """True if chain contains a reduction over dim 0 we can't correct."""
     for node in chain:
         if node in gram_set:
@@ -376,6 +401,10 @@ def _has_unsupported_sharded_reduction(
 
 
 def decomp_gram_matrix_all_gather(gm: fx.GraphModule) -> fx.GraphModule:
+    # [FUNCTION DOC] Graph-module pass: for each all-gather whose Gram matmuls (at least the minimum count) can be computed on the local shard, replace the gather with local compute.
+    # Checks: single-user gather, split along dim 0 with integer size, shape and slice sanity, even split, no other consumed getitems, closed rewritten region,
+    # supported reductions only. Transform: handle FSDP padding by trimming the shard, add all-reduce sums after Gram mms, correct L2 norms and sums over the sharded dim,
+    # bypass the split, retrace shapes, erase dead nodes. Recompiles the module if anything changed; returns the module. Needs an initialized process group to resolve rank.
     """Eliminate all_gather when the gathered tensor feeds Gram matrix computation.
 
     Replaces all_gather + mm(X.T, X) with local mm(Xi.T, Xi) + all_reduce(sum).
@@ -570,6 +599,7 @@ def decomp_gram_matrix_all_gather(gm: fx.GraphModule) -> fx.GraphModule:
 
 
 def decomp_comms(gm: fx.GraphModule) -> fx.GraphModule:
+    # [FUNCTION DOC] Entry point running all decomposition passes (currently the Gram all-gather one) with structured trace artifacts logged before and after. Returns the module.
     """Run all collective decomposition passes."""
     from torch._logging import trace_structured
 

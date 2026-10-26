@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor post-grad pass that decomposes small/skinny matrix multiplications (bmm, addmm, mm) into broadcast multiply plus sum,
+# which lets Inductor fuse them as memory-bound pointwise/reduction kernels.
+# Import-time side effect: reads config.post_grad_fusion_options for a decompose_mm_pass entry and overrides the module-level threshold
+# variables (min first dimension, max other dimension, and CPU variants) from it when present.
+# Registers three graph patterns (bmm, addmm, mm) into the decompose_mm_pass pattern matcher pass.
 import logging
 
 import torch
@@ -49,16 +54,22 @@ if "decompose_mm_pass" in config.post_grad_fusion_options:
 
 
 def check_device(a: Tensor, b: Tensor, device="cuda") -> bool:
+    # [FUNCTION DOC] HELPER: Return True if both tensors have the same device type and that type equals the given device string (default cuda).
     return (a.device.type == b.device.type) and (b.device.type == device)
 
 
 def realize_inputs(inputs: list[torch.fx.Node]):
+    # [FUNCTION DOC] HELPER: Mark each fx Node in the list with metadata telling Inductor to realize it to strides; non-Node entries are ignored. Mutates node meta.
     for inp in inputs:
         if isinstance(inp, torch.fx.node.Node):
             inp.meta["inductor_realize_to_strides"] = True
 
 
 def should_decompose_bmm(mat1, mat2) -> bool:
+    # [FUNCTION DOC] Decide whether a batched matmul should be decomposed. Inputs are fx Nodes whose recorded values are tensors.
+    # Returns False if metadata is invalid or either operand is not 3-dimensional.
+    # On CUDA/XPU: needs batch size at least the configured minimum and at least two of m, n, k below the max-other-dimension threshold.
+    # On CPU: needs both batch sizes at most the CPU first-dimension threshold. Other devices: False.
     if is_node_meta_valid(mat1) and is_node_meta_valid(mat2):
         mat1 = mat1.meta["val"]
         mat2 = mat2.meta["val"]
@@ -91,6 +102,10 @@ def should_decompose_bmm(mat1, mat2) -> bool:
 
 
 def should_decompose_mm(mat1, mat2) -> bool:
+    # [FUNCTION DOC] Decide whether a 2D matmul should be decomposed, based on node metadata, device and configured thresholds.
+    # Returns False for invalid metadata or non-2D operands. Without the skip_dynamic_shape_dim_check option, requires statically known
+    # conditions: on CUDA/XPU first dim of mat1 large and both dims of mat2 small; on CPU first dim of mat1 and dims of mat2 under CPU limits.
+    # With the option set, dimensions that are not statically known to violate the condition are also accepted (dynamic shapes allowed).
     """
     Determines whether matrix multiplication (mm) should be decomposed into pointwise operations
     based on the input matrices' metadata, shapes, device placement, and configuration options.
@@ -210,6 +225,7 @@ def should_decompose_mm(mat1, mat2) -> bool:
 
 
 def print_decompose_pattern(match: Match, inputs: list[torch.fx.Node]):
+    # [FUNCTION DOC] HELPER: Log at debug level the target of the last matched node and the shapes of the given input nodes (None when no value recorded).
     node = match.nodes[-1]
     log.debug(
         "Decompose %s with input shape: %s",
@@ -226,7 +242,11 @@ def print_decompose_pattern(match: Match, inputs: list[torch.fx.Node]):
     pass_dict=construct_pattern_matcher_pass("decompose_mm_pass"),
 )
 def decompose_bmm(match: Match, mat1: torch.fx.Node, mat2: torch.fx.Node):
+    # [FUNCTION DOC] Pattern handler for a bmm call: if should_decompose_bmm accepts the operands, bump the decompose_bmm counter,
+    # replace the match with a broadcast-multiply, sum over the contraction dim, cast back to the input dtype, log, and mark the inputs for realization.
+    # Otherwise leaves the graph unchanged. Returns nothing.
     def repl(mat1, mat2):
+        # [FUNCTION DOC] HELPER: Replacement computation for bmm: expand operands with a new axis, multiply, sum over the contraction axis, cast to the first input's dtype.
         return torch.sum(mat1[:, :, :, None] * mat2[:, None, :, :], dim=-2).to(
             mat1.dtype
         )
@@ -250,7 +270,10 @@ def decompose_addmm(
     mat2: torch.fx.Node,
     mat3: torch.fx.Node,
 ):
+    # [FUNCTION DOC] Pattern handler for an addmm call (bias, mat1, mat2): if should_decompose_mm accepts the matmul operands,
+    # bump the decompose_addmm counter, replace the match with multiply-sum plus the bias, log, and mark all three inputs for realization.
     def repl(mat1, mat2, mat3):
+        # [FUNCTION DOC] HELPER: Replacement computation for addmm: broadcast multiply, sum over contraction axis, cast to the matrix dtype, add the bias.
         return (
             torch.sum(mat2[:, :, None] * mat3[None, :, :], dim=-2).to(mat2.dtype) + mat1
         )
@@ -273,7 +296,10 @@ def decompose_mm(
     mat1: torch.fx.Node,
     mat2: torch.fx.Node,
 ):
+    # [FUNCTION DOC] Pattern handler for an mm call: if should_decompose_mm accepts the operands, bump the decompose_mm counter,
+    # replace the match with a broadcast-multiply and sum, log, and mark the inputs for realization.
     def repl(mat1, mat2):
+        # [FUNCTION DOC] HELPER: Replacement computation for mm: broadcast multiply, sum over contraction axis, cast to the first input's dtype.
         return torch.sum(mat1[:, :, None] * mat2[None, :, :], dim=-2).to(mat1.dtype)
 
     if should_decompose_mm(mat1, mat2):
