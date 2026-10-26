@@ -1,3 +1,6 @@
+# [MODULE DOC] CUDA device op overrides for Inductor wrapper codegen: provides CUDADeviceOpOverrides, whose
+# methods return code snippets (Python and C++) for device/stream handling, kernel loading and TMA helpers.
+# Import-time side effect: registers an instance under the cuda device name.
 from __future__ import annotations
 
 import torch
@@ -12,44 +15,59 @@ from ..common import (
 
 
 class CUDADeviceOpOverrides(DeviceOpOverrides):
+    # [CLASS DOC] CUDA implementation of DeviceOpOverrides: returns source-code strings (Python and C++/AOTI) used by wrapper codegen
+    # for device setting, sync, guards, streams, kernel loading/launch helpers, TMA descriptor helpers and scratch workspace
+    # allocation. Stateless; registered for the cuda device at import.
     """
     CUDA-specific codegen functions, see DeviceOpOverrides for details
     """
 
     def import_get_raw_stream_as(self, name: str) -> str:
+    # [FUNCTION DOC] Returns an import statement binding the raw current-stream getter to the given name.
         return f"from torch._C import _cuda_getCurrentRawStream as {name}"
 
     def set_device(self, device_idx: DeviceIdx) -> str:
+    # [FUNCTION DOC] Returns Python source that sets the current CUDA device to device_idx.
         return f"torch.cuda.set_device({device_idx})"
 
     def synchronize(self) -> str:
+    # [FUNCTION DOC] Returns Python source that synchronizes CUDA.
         return "torch.cuda.synchronize()"
 
     def device_guard(self, device_idx: DeviceIdx) -> str:
+    # [FUNCTION DOC] Returns Python source constructing a CUDA device guard context for device_idx.
         return f"torch.cuda._DeviceGuard({device_idx})"
 
     def current_device_idx_expr(self) -> str:
+    # [FUNCTION DOC] Returns Python source expression for the current CUDA device index.
         return "torch.cuda.current_device()"
 
     def current_stream(self) -> str:
+    # [FUNCTION DOC] Returns Python source expression for the current CUDA stream.
         return "torch.cuda.current_stream()"
 
     def cpp_device_guard(self) -> str:
+    # [FUNCTION DOC] Returns the C++ device guard type name.
         return "at::cuda::CUDAGuard"
 
     def cpp_aoti_device_guard(self) -> str:
+    # [FUNCTION DOC] Returns the AOTI C++ device guard type name.
         return "AOTICudaGuard"
 
     def cpp_stream_guard(self) -> str:
+    # [FUNCTION DOC] Returns the C++ stream guard type name.
         return "at::cuda::CUDAStreamGuard"
 
     def cpp_aoti_stream_guard(self) -> str:
+    # [FUNCTION DOC] Returns the AOTI C++ stream guard type name.
         return "AOTICudaStreamGuard"
 
     def cpp_getStreamFromExternal(self) -> str:
+    # [FUNCTION DOC] Returns the C++ function name that wraps an external stream.
         return "at::cuda::getStreamFromExternal"
 
     def kernel_header(self) -> str:
+    # [FUNCTION DOC] Returns C++ include lines (CUDA guard, stream, empty-tensor headers) for generated kernel code.
         source_codes = """
         #include <c10/cuda/CUDAGuard.h>
         #include <c10/cuda/CUDAStream.h>
@@ -58,6 +76,9 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
         return source_codes
 
     def kernel_driver(self) -> str:
+    # [FUNCTION DOC] Returns C++ source with a driver-error-check macro and loadKernel (from file or in-memory image, optionally
+    # setting max dynamic shared memory) and launchKernel helpers. The warp-size placeholder is replaced by the HIP device warp
+    # size when running on ROCm with CUDA available, else 32. Driver errors are thrown as runtime errors.
         """Return C++ host-side helpers (loadKernel, launchKernel, CUDA_DRIVER_CHECK)
         embedded in AOTI-generated wrapper code."""
         # NVIDIA devices have a warp size of 32, while AMD devices can have a
@@ -153,6 +174,9 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
         return source_codes.replace("__WARP_SIZE__", str(warp_size))
 
     def tma_descriptor_helpers(self) -> str:
+    # [FUNCTION DOC] Returns C++ source defining host-side TMA descriptor init helpers (1D, 2D, general rank) and a descriptor
+    # struct, guarded for CUDA 12+ non-ROCm builds. Raises RuntimeError on HIP. Generated helpers throw on unsupported
+    # element sizes or too-small blocks.
         """
         CUDA helper functions for initializing TMA Descriptors on host side
         """
@@ -341,20 +365,27 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
         """
 
     def cpp_stream_type(self) -> str:
+    # [FUNCTION DOC] Returns the C++ stream type name.
         return "cudaStream_t"
 
     def aoti_get_stream(self) -> str:
+    # [FUNCTION DOC] Returns the AOTI C API function name that gets the current CUDA stream.
         return "aoti_torch_get_current_cuda_stream"
 
     def cpp_kernel_type(self) -> str:
+    # [FUNCTION DOC] Returns the C++ driver kernel handle type name.
         return "CUfunction"
 
     def cpp_device_ptr(self) -> str:
+    # [FUNCTION DOC] Returns the C++ device pointer type name.
         return "CUdeviceptr"
 
     def cpp_scratch(
         self, idx: int, workspace: TritonScratchWorkspace, prefix: str | None = None
     ) -> tuple[list[str], str] | None:
+        # [FUNCTION DOC] Generates C++ lines declaring a device pointer variable named from idx (and optional prefix) for a Triton
+        # scratch workspace. If workspace.size is positive, allocates a 1-D tensor sized per grid via the AOTI API and takes its
+        # data pointer; otherwise declares a null pointer. Returns (lines, variable name).
         prefix = f"{prefix}_" if prefix else ""
         var_name = f"{prefix}scratch_{idx}"
         if workspace.size > 0:

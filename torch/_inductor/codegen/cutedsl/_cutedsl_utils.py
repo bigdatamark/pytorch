@@ -1,4 +1,7 @@
 # mypy: disable-error-code=import-not-found
+# [MODULE DOC] CuteDSL jit helper functions used by generated kernels to convert
+# between SSA tensor values and non-SSA register fragments/scalars (needed for
+# indexed loads). Requires the cutlass package at import time.
 # pyrefly: ignore [import-error, missing-import]
 import cutlass
 import cutlass.cute as cute
@@ -6,6 +9,9 @@ import cutlass.cute as cute
 
 @cute.jit  # type: ignore[misc]
 def ssa_to_indexable(ssa_value: cute.TensorSSA, dtype: str) -> cute.Numeric:
+    # [FUNCTION DOC] HELPER: Converts an SSA vector to a scalar usable as an index
+    # by materializing it into a register fragment (cast to dtype) and returning
+    # its first element. Workaround for missing gather support.
     """
     Convert SSA form to indexable non-SSA form.
 
@@ -19,6 +25,9 @@ def ssa_to_indexable(ssa_value: cute.TensorSSA, dtype: str) -> cute.Numeric:
 
 @cute.jit  # type: ignore[misc]
 def ssa_to_fragment(ssa_value: cute.TensorSSA, dtype: str) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Stores an SSA vector into a new register-memory tensor
+    # of the same shape and given dtype, casting first (at compile time) if the SSA
+    # dtype differs. Returns the fragment.
     """Materialize an SSA vector into a register fragment.
 
     Casts to the fragment dtype when the SSA dtype differs (e.g. an int64 index
@@ -34,6 +43,8 @@ def ssa_to_fragment(ssa_value: cute.TensorSSA, dtype: str) -> cute.Tensor:
 
 @cute.jit  # type: ignore[misc]
 def result_to_ssa(value: cute.Numeric, dtype: str) -> cute.TensorSSA:
+    # [FUNCTION DOC] HELPER: Wraps a scalar value in a one-element register
+    # fragment of the given dtype and loads it back as an SSA value.
     """
     Convert non-SSA result back to SSA form.
 

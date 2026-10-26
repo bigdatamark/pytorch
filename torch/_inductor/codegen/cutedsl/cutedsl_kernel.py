@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Kernel-side codegen for CuteDSL templates: CuteDSLTemplateKernel (signature, hooks, call emission),
+# ModificationWrapperCuteDSL (inlines score/mask-style modification subgraphs, including captured tensor loads with
+# lane analysis and vectorized/gather strategies), small dataclasses for load configuration and index metadata, a
+# sympy printer and a kernel runner wrapper. Import-time: creates loggers and a module-level expression printer.
 import contextlib
 import dataclasses
 import logging
@@ -47,7 +51,9 @@ kernel_code_log = torch._logging.getArtifactLogger(__name__, "kernel_code")
 
 
 class CuteDSLPrinter(PythonPrinter):
+    # [CLASS DOC] Sympy-to-source printer for CuteDSL kernels; extends the Python printer to render integer-to-float conversion as a Float64 cast.
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a ToFloat expression as a Float64 cast of its single argument; raises AssertionError if it does not have exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError("ToFloat expects exactly one argument")
         return f"cutlass.Float64({self.doprint(expr.args[0])})"
@@ -57,14 +63,18 @@ cutedsl_pexpr = CuteDSLPrinter().doprint
 
 
 class CuteDSLKernelWrapper:
+    # [CLASS DOC] Thin callable wrapper giving a compiled CuteDSL kernel function a run method (matching other kernel runners). Holds kernel_fn and
+    # kernel_path (for logging only).
     """Wrapper to provide .run() interface for CuteDSL kernels"""
 
     def __init__(self, kernel_fn: Callable[..., Any], kernel_path: str | None = None):
+        # [FUNCTION DOC] Stores the kernel function and path and logs the path at info level on the kernel_code artifact logger.
         self.kernel_fn = kernel_fn
         self.kernel_path = kernel_path
         kernel_code_log.info("CuteDSL kernel path: %s", kernel_path)
 
     def run(self, *args, stream=None, **kwargs):
+        # [FUNCTION DOC] Invokes the wrapped kernel function with the given args and kwargs and an explicit stream keyword; returns its result.
         """
         Execute the CuteDSL kernel.
 
@@ -81,6 +91,8 @@ class CuteDSLKernelWrapper:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CuteDSLVectorLoadConfig:
+    # [CLASS DOC] Frozen settings for vectorized loads in captured-tensor accesses: vec_size (lanes), index (the symbol that varies per lane) and dim
+    # (tensor dimension to vectorize; negative counts from the end).
     vec_size: int
     index: sympy.Symbol
     dim: int
@@ -89,6 +101,8 @@ class CuteDSLVectorLoadConfig:
     def from_fixed_inputs(
         fixed_inputs: dict[str, Any],
     ) -> "CuteDSLVectorLoadConfig | None":
+        # [FUNCTION DOC] Pops the three vector_load_* keys (vec size, index name, dim) from the mapping (mutating it). Returns None if any is missing,
+        # else a config with int-converted size and dim and the index name turned into an index symbol.
         vec_size = fixed_inputs.pop("vector_load_vec_size", None)
         index = fixed_inputs.pop("vector_load_index", None)
         dim = fixed_inputs.pop("vector_load_dim", None)
@@ -101,11 +115,14 @@ class CuteDSLVectorLoadConfig:
         )
 
     def normalized_dim(self, ndim: int) -> int:
+        # [FUNCTION DOC] Returns the vector dimension as a non-negative index for a tensor with ndim dims (adds ndim if negative).
         return self.dim + ndim if self.dim < 0 else self.dim
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CuteDSLIndexFragment:
+    # [CLASS DOC] Frozen record describing generated index code for a captured-tensor load: code string, whether it is a static integer, whether lanes are
+    # uniform, whether lanes are contiguous (and the proven contiguous_width, if known).
     """Generated index expression metadata for CuteDSL tensor loads.
 
     Attributes:
@@ -125,6 +142,8 @@ class CuteDSLIndexFragment:
 
 @dataclasses.dataclass(frozen=True)
 class IndexSymbolInfo:
+    # [CLASS DOC] Frozen record of what lane analysis may assume for a generated index symbol: the recovered semantic expression (None if unknown)
+    # and whether contiguity is still valid (False after negative-index wrapping).
     """What lane analysis may assume about a generated index symbol.
 
     expr: Recovered semantic index expression, or None when the value's
@@ -145,6 +164,8 @@ class IndexSymbolInfo:
 
 @dataclasses.dataclass
 class CuteDSLSubgraphInfo:
+    # [CLASS DOC] Dataclass bundling the per-subgraph kernel state that is swapped in and out while rendering a modification: body buffer,
+    # template_mask, template_out and an optional CSE cache.
     """Minimal subgraph info for CuteDSL kernels."""
 
     body: IndentedBuffer
@@ -153,15 +174,20 @@ class CuteDSLSubgraphInfo:
     cse: CSE[Any, str] | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Marks the cse field as only overwritten on the kernel when it is not None.
         self.only_copy_if_non_none_fields = ("cse",)
 
     def to_dict(self):
+        # [FUNCTION DOC] Returns a shallow mapping from each dataclass field name to its value.
         return {
             field.name: getattr(self, field.name) for field in dataclasses.fields(self)
         }
 
 
 class CuteDSLTemplateKernel(Kernel):
+    # [CLASS DOC] Kernel implementation used to render CuteDSL templates. Holds input/output buffer nodes, optional modification subgraphs, the main body
+    # buffer, named subgraph bodies, render hooks (placeholder to deferred generator), CSE state, collected tensor buffer names, aux scalar
+    # bindings and captured IR nodes. Template hooks (def_kernel, modification, etc.) are exposed to the template renderer; call_kernel emits the launch.
     """
     Template kernel implementation for CuteDSL (CUTLASS Python DSL).
     Handles code generation and argument management for CuteDSL CUDA kernels.
@@ -175,6 +201,8 @@ class CuteDSLTemplateKernel(Kernel):
         output_node: Buffer,
         subgraphs: list[Buffer] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes kernel state: names, buffers, empty bodies/hooks, name-to-input mapping (using the node name or a positional fallback),
+        # a fresh CSE with prefix tmp, empty tensor-buffer list, empty aux scalar bindings and empty capture map.
         # Call parent Kernel constructor
         super().__init__()
         self.kernel_name = kernel_name
@@ -211,20 +239,25 @@ class CuteDSLTemplateKernel(Kernel):
         self._capture_input_nodes: dict[str, Any] = {}
 
     def set_capture_input_nodes(self, nodes_by_name: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Replaces the mapping of captured input names to IR nodes.
         """Set captured inputs collected while rendering the CuteDSL template."""
         self._capture_input_nodes = nodes_by_name
 
     def _get_capture_input_node(self, name: str) -> Any | None:
+        # [FUNCTION DOC] HELPER: Looks up a captured node by name in this kernel's captures first, then in the graph-level capture mapping (if any); None if absent.
         """Return the IR node for a captured input name, if known."""
         graph_captures = getattr(V.graph, "_cutedsl_capture_nodes", {})
         return self._capture_input_nodes.get(name, graph_captures.get(name))
 
     @contextlib.contextmanager
     def _patch_get_dtype_for_captures(self):
+        # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the graph's dtype lookup so captured synthetic names resolve to the captured node's dtype,
+        # falling back to the original lookup. Restores it on exit.
         """Teach python_argdefs to resolve synthetic captured input names."""
         original_get_dtype = V.graph.get_dtype
 
         def get_dtype(name: str) -> torch.dtype:
+            # [FUNCTION DOC] HELPER: Dtype lookup used by the patch: captured node dtype if known, else the original graph lookup.
             capture = self._get_capture_input_node(name)
             if capture is not None:
                 return capture.get_dtype()
@@ -234,6 +267,7 @@ class CuteDSLTemplateKernel(Kernel):
             yield
 
     def kexpr(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Renders a sympy expression as CuteDSL source, first replacing any aux-scalar symbols (and their renamed forms) with their tuple lookups.
         """Convert sympy expression to CuteDSL string representation."""
         symbol_codes = self.aux_scalar_bindings.symbol_codes_with_renames(
             self.rename_indexing
@@ -245,9 +279,11 @@ class CuteDSLTemplateKernel(Kernel):
         return cutedsl_pexpr(expr)
 
     def create_cse_var(self, *args, **kwargs):
+        # [FUNCTION DOC] Creates a CuteDSL-specific CSE variable, forwarding all arguments.
         return CuteDSLCSEVariable(*args, **kwargs)
 
     def gen_imports(self) -> str:
+        # [FUNCTION DOC] Returns the fixed import block (torch, cutlass, cute, dlpack, cuda driver bindings, MLIR math dialect, operator and the SSA conversion helpers) prepended to rendered templates.
         """Generate common imports for CuteDSL templates."""
         imports = IndentedBuffer()
         imports.splice(
@@ -265,6 +301,7 @@ class CuteDSLTemplateKernel(Kernel):
         return imports.getvalue()
 
     def gen_defines(self, **kwargs) -> str:
+        # [FUNCTION DOC] Returns one line per keyword declaring a compile-time constant parameter with the given value, in keyword order.
         """Generate CuteDSL parameter definitions from kwargs, similar to Triton's gen_defines."""
         params = IndentedBuffer()
         for name, val in kwargs.items():
@@ -272,6 +309,10 @@ class CuteDSLTemplateKernel(Kernel):
         return params.getvalue()
 
     def render(self, template, **kwargs):
+        # [FUNCTION DOC] Renders the template: saves the kwargs, builds aux scalar bindings from the AUX_SCALAR_SYMBOLS kwarg, exposes helper hooks (def_kernel, gen_defines,
+        # get_output, tensor buffer helpers, aux scalars, unpack_buffers, modification, set_cute_hash) to the template, renders it, prepends the imports and returns
+        # a PartialRender holding the code and the registered render hooks.
+        # KNOWN ISSUE: the string after the local import is not a docstring (it follows a statement), so it is just an unused expression.
         from torch._inductor.select_algorithm import PartialRender
 
         """Render the kernel using the template, returning PartialRender object with hooks."""
@@ -310,6 +351,9 @@ class CuteDSLTemplateKernel(Kernel):
 
     @contextlib.contextmanager
     def set_subgraph_body(self, body_name: str):
+        # [FUNCTION DOC] Context manager: makes the named subgraph body active by copying its fields (body, mask, out, cse; a None cse is skipped) onto the kernel,
+        # creating an empty entry if new. On exit, saves the current field values back into the named entry and restores the previous state.
+        # Raises AssertionError if the kernel lacks any subgraph-info field.
         """Set the active subgraph body for template processing."""
         if not all(
             hasattr(self, field.name)
@@ -355,6 +399,7 @@ class CuteDSLTemplateKernel(Kernel):
 
     @contextlib.contextmanager
     def create_subgraph_body(self, body_name: str, *, clear_cse: bool = False):
+        # [FUNCTION DOC] Context manager: registers a new empty subgraph body (with a cloned CSE if clear_cse, else none) then activates it. Raises AssertionError if the name already exists.
         """Create a new subgraph body for template processing."""
         if body_name in self.subgraph_bodies:
             raise AssertionError(f"Subgraph body '{body_name}' already exists")
@@ -369,6 +414,7 @@ class CuteDSLTemplateKernel(Kernel):
             yield
 
     def _get_reinterpret_view(self, node) -> ReinterpretView | None:
+        # [FUNCTION DOC] HELPER: Unwraps mutable boxes; if the result is a view returns its reinterpret-view conversion, else None.
         """Extract or convert to ReinterpretView from a node, handling all views."""
         while isinstance(node, MutableBox):
             node = node.data
@@ -377,6 +423,9 @@ class CuteDSLTemplateKernel(Kernel):
         return None
 
     def def_kernel(self, *argnames):
+        # [FUNCTION DOC] Template hook defining the kernel signature. Registers each input node as an arg named with the prefix arg_ plus the template's name (extra inputs beyond argnames
+        # are registered but not named), records them, and registers the output. Installs a deferred hook that renders the def line (template args, then remaining
+        # args such as output/sizevars, then stream) plus renames from template names to arg names. Returns the placeholder text; raises AssertionError if already registered.
         """Define kernel function signature for CuteDSL templates.
 
         When inputs are ReinterpretViews of the same underlying buffer (e.g., Q/K/V
@@ -406,6 +455,8 @@ class CuteDSLTemplateKernel(Kernel):
             self.args.output(self.output_node.get_name())
 
         def hook():
+            # [FUNCTION DOC] HELPER: Deferred renderer for the kernel def line: template input arg names, then other arg names not already used, then stream;
+            # body holds renames from template names to arg names. Returns the code text.
             # Generate signature with template input args plus additional args (output, sizevars)
             code = IndentedBuffer()
             code.writeline(f"# Kernel function signature: {self.kernel_name}")
@@ -435,6 +486,7 @@ class CuteDSLTemplateKernel(Kernel):
         return "<DEF_KERNEL>"
 
     def get_output(self):
+        # [FUNCTION DOC] Returns the argument name of the output buffer. Raises AssertionError if there is no output node, ValueError if it is not among the output args.
         """Get the actual argument name for the output buffer."""
         if not self.output_node:
             raise AssertionError("Output node must exist to get output buffer name")
@@ -445,6 +497,7 @@ class CuteDSLTemplateKernel(Kernel):
         return output
 
     def set_cute_hash(self, func_name: str, suffix: str = ""):
+        # [FUNCTION DOC] Returns a source line assigning a hash attribute to the named function, using the kernel name (plus suffix if given), so flash-attention can skip runtime hashing.
         """Generate code to set __cute_hash__ on a codegen function.
 
         This allows hash_callable in flash_attn to skip expensive runtime hashing
@@ -455,10 +508,12 @@ class CuteDSLTemplateKernel(Kernel):
         return f'{func_name}.__cute_hash__ = "{hash_value}"'
 
     def get_tensor_buffers(self):
+        # [FUNCTION DOC] Returns the list of collected tensor buffer arg names.
         """Get list of tensor buffer names that were collected during modifications."""
         return self.collected_tensor_buffers
 
     def add_tensor_inputs(self, buffers):
+        # [FUNCTION DOC] Registers each non-symbolic buffer as a kernel input, records its remapped name once in the collected list, and returns the remapped names in order; sympy entries are skipped.
         """Register extra tensor buffers and return their rendered input names."""
         buffer_names = []
         for buffer in buffers:
@@ -471,6 +526,7 @@ class CuteDSLTemplateKernel(Kernel):
         return buffer_names
 
     def define_aux_scalars(self, symbols):
+        # [FUNCTION DOC] Returns the source of the runtime scalar tuple; raises AssertionError if the given symbols differ from those bound at render time.
         """Return the runtime scalar tuple for captured symbolic scalars."""
         if tuple(symbols) != self.aux_scalar_bindings.symbols:
             raise AssertionError(
@@ -480,9 +536,12 @@ class CuteDSLTemplateKernel(Kernel):
         return self.aux_scalar_bindings.tuple_expr(self.rename_indexing, cutedsl_pexpr)
 
     def unpack_buffers(self, buffer_list_name: str, *, indent_width: int = 4):
+        # [FUNCTION DOC] Registers a deferred hook (placeholder returned) that expands to one assignment per collected tensor buffer, taking elements by position from the named list,
+        # indented by indent_width; empty text if none. Re-registration overwrites.
         """Generate buffer unpacking code via render hook."""
 
         def hook():
+            # [FUNCTION DOC] HELPER: Deferred renderer: returns assignments unpacking each collected tensor buffer from the list by position, or empty text if none.
             tensor_buffers = self.get_tensor_buffers()
             if not tensor_buffers:
                 return ""
@@ -504,6 +563,8 @@ class CuteDSLTemplateKernel(Kernel):
         return placeholder
 
     def call_kernel(self, name: str, node=None):
+        # [FUNCTION DOC] Emits the kernel call in the wrapper: template inputs first (reinterpret-view reference if the input is a view, else its name) then remaining args from the arg
+        # definitions (skipping already-passed inputs; captured view nodes use their view reference), with dtypes. Uses the Triton-style call generation path.
         """Call the kernel function. Simplified version of TritonTemplateKernel.call_kernel.
 
         For inputs that are ReinterpretViews (e.g., Q/K/V slices from fused QKV),
@@ -546,6 +607,7 @@ class CuteDSLTemplateKernel(Kernel):
         wrapper.generate_kernel_call(name, call_args, triton=True, arg_types=arg_types)
 
     def _get_subgraph(self, subgraph_number: int):
+        # [FUNCTION DOC] HELPER: Validates the subgraph number is an int in range of the subgraph list and that the body is empty (AssertionError otherwise); returns that subgraph.
         """Get subgraph by number for modification processing."""
         if not isinstance(subgraph_number, int):
             raise AssertionError(
@@ -570,6 +632,9 @@ class CuteDSLTemplateKernel(Kernel):
         mask: str | None = None,
         **fixed_inputs,
     ) -> str:
+        # [FUNCTION DOC] Template hook generating code for a subgraph modification. Picks an unused body name, renders the subgraph pointwise under a ModificationWrapperCuteDSL handler
+        # (fixed_inputs substitute placeholders), assigns the result to output_name and collects tensor buffers touched. Returns the body text.
+        # Raises AssertionError for non-ComputedBuffer subgraphs or missing result, NotImplementedError for list (scatter) subgraphs or when output_name is None.
         """Generate CuteDSL code for a subgraph modification."""
         # Find unique name to avoid collisions between multiple modifications of same subgraph
         num = 0
@@ -618,6 +683,9 @@ class CuteDSLTemplateKernel(Kernel):
 
 
 class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] Ops handler wrapper used while inlining a modification subgraph: delegates ops to CuteDSLOpOverrides, resolves fixed (template-supplied) inputs on load,
+    # emits captured-tensor loads (static, uniform, contiguous-vector or per-lane gather), tracks index symbol semantics for lane analysis and caches repeated
+    # captured loads. Read-only: stores are unsupported. Holds kernel, fixed inputs, optional vector load config, mask, tensor_buffers and caches.
     """
     Wrapper handler that enables CuteDSL code generation during subgraph modifications.
 
@@ -635,6 +703,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         fixed_inputs: dict[str, Any],
         mask: str | None,
     ):
+        # [FUNCTION DOC] Sets up the handler with CuteDSL op overrides, a name, the kernel, a copy of fixed inputs (vector-load keys are popped into a config), mask, and empty tracking
+        # structures for tensor buffers, index symbol info and the captured-load cache.
         cutedsl_ops = CuteDSLOpOverrides()
         super().__init__(cutedsl_ops)
         self.name = f"CuteDSLPlaceholderSubstitution_{subgraph_number}"
@@ -654,6 +724,7 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         self._captured_load_cache: dict[tuple[str, sympy.Expr], CuteDSLCSEVariable] = {}
 
     def _get_input_dtype(self, name: str) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: dtype of a named input from the kernel's inputs; otherwise a fallback guess: int32 for the names b, h, m, n, else float32.
         """Get the dtype for an input from the kernel's named_input_nodes."""
         if name in self.kernel.named_input_nodes:
             return self.kernel.named_input_nodes[name].dtype
@@ -661,6 +732,9 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         return torch.float32 if name not in ("b", "h", "m", "n") else torch.int32
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Handles a load. For a non-fixed name (captured tensor): returns the cached value if the same name/index was loaded; otherwise registers the input, builds Int32 index
+        # fragments per dimension (hierarchical index splits per dim; scalar buffers have none), emits the fragment load and a load into SSA, upcasts half types to float32 when
+        # configured, caches and returns the result. For a fixed input: returns a CSE variable holding the fixed value, tagging integer string values with their index expression.
         """Handle loading from tensor or fixed(template args) input for CuteDSL."""
         from torch._inductor.kernel.flex.flex_flash_attention import HierarchicalIndex
 
@@ -740,6 +814,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         var_dtype: torch.dtype,
         buffer: Any,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Emits code creating a register fragment holding values loaded from a captured tensor and returns its name. Scalar buffers and all-static indices give a single-element
+        # fragment; otherwise the fragment is sized to the dynamic index lanes and filled by the contiguous vector load, uniform load, or per-lane gather (first applicable).
         """
         Emit a register fragment load from a captured tensor.
 
@@ -795,6 +871,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         var_dtype: torch.dtype,
         vector_dim: int,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True only if an autovectorized copy is safe: non-bool dtype, contiguous lanes in the vector dim, other dims static or uniform, vector width above 1, unit stride, proven
+        # contiguous width at least the width, and statically known alignment of size, layout offset and the other strides to the vector size.
         """Return true when vector lanes form a safe contiguous tensor tile.
 
         This is stricter than lane-contiguity analysis: CuTe autovec also needs
@@ -853,6 +931,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         var_dtype: torch.dtype,
         vector_dim: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits code for an aligned tile load: takes lane 0 of the vector index (assumed divisible by the width), makes a tile view of the source, rebuilds an aligned pointer/tensor with
+        # alignment at most 16 bytes, and copies it into the fragment with autovec copy.
         """Emit an autovec load for lanes contiguous in one tensor dimension."""
         scalar_indices = [
             idx.code if idx.is_static_int else f"{idx.code}[0]" for idx in idx_vars
@@ -897,12 +977,14 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
 
     @staticmethod
     def _can_emit_uniform_load(idx_vars: list[CuteDSLIndexFragment]) -> bool:
+        # [FUNCTION DOC] HELPER: True if every index is a static integer or lane-uniform.
         """Return true when every vector lane reads the same tensor element."""
         return all(idx.is_static_int or idx.is_lane_uniform for idx in idx_vars)
 
     def _emit_uniform_load(
         self, var: str, idx_vars: list[CuteDSLIndexFragment], val_frag: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits one scalar load (element 0 of non-static indices) and a loop that stores it into every element of the fragment.
         """Emit one scalar load and broadcast it across the value fragment."""
         scalar_value = self.kernel.cse.newvar(dtype=None)
         scalar_indices = [
@@ -920,6 +1002,7 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
     def _emit_per_lane_gather_load(
         self, var: str, idx_vars: list[CuteDSLIndexFragment], val_frag: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits a loop over fragment elements doing one scalar load per element; static indices inline, lane-uniform indices use element 0, others use the loop element.
         """Emit scalar per-lane loads for non-contiguous gather indices.
 
         Lane-uniform index fragments hold a single element, so they are indexed
@@ -949,6 +1032,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         cute_dtype: str,
         torch_dtype: torch.dtype,
     ) -> CuteDSLIndexFragment:
+        # [FUNCTION DOC] HELPER: Produces index metadata for one dimension. A static integer (negative values wrapped by dim size) is inlined. Otherwise the expression is renamed, analyzed for lane
+        # uniformity/contiguity, and emitted as a fragment materialized from the SSA value in the given dtype.
         """Materialize an index and preserve enough metadata for load selection."""
         static_expr = self._static_integer_expr(expr)
         if static_expr is not None:
@@ -976,6 +1061,8 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
     def _analyze_index_fragment(
         self, expr: sympy.Expr
     ) -> tuple[bool, bool, int | None]:
+        # [FUNCTION DOC] HELPER: Returns (lane uniform, lane contiguous, contiguous width) for an index expression. Without a vector config: all unknown/false. Vec size 1: uniform. Unknown symbol semantics or
+        # unresolved computed symbols give the pessimistic answer; otherwise lane classification of the recovered semantic expression, with contiguity dropped if a negative-index wrap was involved.
         if self.vector_load_config is None:
             return False, False, None
         if self.vector_load_config.vec_size <= 1:
@@ -1009,6 +1096,7 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         )
 
     def _has_unresolved_index_symbols(self, semantic_expr: sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: True if the expression still contains a generated CSE-named symbol (prefix followed by digits) other than the lane variable, meaning semantics could not be recovered.
         """Return whether the expression references opaque computed indices.
 
         Lane analysis treats unknown non-lane symbols as lane-uniform scalars,
@@ -1029,6 +1117,7 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
 
     @staticmethod
     def _static_integer_expr(expr: object) -> int | sympy.Integer | None:
+        # [FUNCTION DOC] HELPER: Returns the expression as an integer if it is an int/Integer, a symbol whose name is a (possibly negative) integer literal, or a sympy expression that simplifies to an Integer; else None.
         if isinstance(expr, int | sympy.Integer):
             return expr
         if isinstance(expr, sympy.Symbol) and expr.name.lstrip("-").isdigit():
@@ -1043,11 +1132,13 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
     def _wrap_static_index(
         index: int | sympy.Integer, dim_size: sympy.Expr
     ) -> int | sympy.Expr:
+        # [FUNCTION DOC] HELPER: Wraps a negative static index by adding the dimension size (simplified); non-negative indices are returned unchanged.
         if int(index) < 0:
             return V.graph.sizevars.simplify(sympy.Integer(index) + dim_size)
         return index
 
     def _semantic_index_expr(self, expr: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Substitutes known semantic expressions for generated symbols (from recorded index info and CSE variables carrying an index expression) and simplifies.
         """Recover the original index meaning from generated CSE names."""
         replacements: dict[sympy.Symbol, sympy.Expr] = {
             symbol: info.expr
@@ -1060,6 +1151,7 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         return V.graph.sizevars.simplify(expr.xreplace(replacements))
 
     def _lane_uniform_symbols(self) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] HELPER: Returns index symbols for all string-keyed CSE cache entries other than the vector lane index, treated as lane-uniform.
         """Return generated CSE source symbols that are uniform across lanes."""
         vector_index_name = (
             None
@@ -1075,6 +1167,9 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         )
 
     def indirect_indexing(self, index_var: str, size, check, wrap_neg=True):
+        # [FUNCTION DOC] Converts an index value to a symbolic index. Integer inputs are wrapped (when wrap_neg and negative) and returned as Integer. A CSE variable with a known index expression that may be negative gets a generated conditional
+        # wrap (add the size cast to the index dtype when negative) and a recorded info entry with contiguity disabled. Otherwise returns a symbol for the variable's source name and records its semantic expression (or None).
+        # The check argument is unused.
         """Convert index variable to symbolic form."""
         if isinstance(index_var, int | sympy.Integer):
             if wrap_neg and index_var < 0:
@@ -1121,11 +1216,13 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> str:
+        # [FUNCTION DOC] Always raises NotImplementedError: CuteDSL modifications are read-only.
         raise NotImplementedError(
             "Store operations not supported - CuteDSL limited to read-only operations"
         )
 
     def _add_kernel_input(self, name: str):
+        # [FUNCTION DOC] HELPER: Registers the buffer name as a kernel input, records its remapped name once in tensor_buffers, and returns the remapped name.
         """Add name as input to kernel and return input ref."""
         # Get the remapped name that will be used in the kernel
         remapped_name = self.kernel.args.input(name)
@@ -1135,11 +1232,13 @@ class ModificationWrapperCuteDSL(V.WrapperHandler):  # type: ignore[name-defined
         return remapped_name
 
     def _process_indexing(self, index):
+        # [FUNCTION DOC] HELPER: Renames an index expression for the kernel and renders it as source. KNOWN ISSUE: appears unused in this module.
         """Process and rename indexing, adding symbols as kernel inputs."""
         renamed = self.kernel.rename_indexing(index)
         return self.kernel.kexpr(renamed)
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Fallback for ops: calls the same-named method on the inner handler; on NotImplementedError raises a new NotImplementedError with a formatted message asking the user to file an issue, including op name, args and kwargs (original chained).
         try:
             return getattr(self._inner, name)(*args, **kwargs)
         except NotImplementedError as e:

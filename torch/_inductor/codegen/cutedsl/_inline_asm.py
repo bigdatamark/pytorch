@@ -1,3 +1,6 @@
+# [MODULE DOC] Lowers elementwise inline PTX assembly over CuteDSL fragments via MLIR/LLVM inline asm:
+# constraint parsing, bit-level operand packing, output conversion (including E8M0 decoding) and the
+# user-op inline_asm_elementwise_intrinsic. Requires cutlass at import time; no other import-time side effects.
 """Lower elementwise inline PTX over CuteDSL fragments.
 
 Each assembly invocation consumes `pack` adjacent fragment elements. LLVM
@@ -27,6 +30,7 @@ from cutlass.cutlass_dsl import dsl_user_op, T
 
 @functools.cache
 def inline_asm_cache_key() -> str:
+    # [FUNCTION DOC] HELPER: Returns (cached) hex SHA-256 of this module's source file, so generated-kernel cache keys change when it changes.
     """Include this module's source in generated kernel cache keys."""
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -42,6 +46,8 @@ CONSTRAINT_TYPES = {
 
 
 def split_constraints(constraints: str) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: Splits a comma-separated constraint list into output letters (entries starting with an equals sign) and input letters,
+    # stripping equals and ampersand markers. Raises NotImplementedError for any letter not in CONSTRAINT_TYPES.
     """Split an LLVM constraint list into output and input register classes."""
     outputs, inputs = [], []
     for entry in constraints.split(","):
@@ -58,6 +64,7 @@ def split_constraints(constraints: str) -> tuple[list[str], list[str]]:
 
 
 def bitcast_to(value: ir.Value, target: ir.Type) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Returns the value unchanged if already of the target type, else bitcasts it (no numeric conversion).
     """Reinterpret a value's bits as an equally wide type."""
     if value.type == target:
         return value
@@ -65,6 +72,8 @@ def bitcast_to(value: ir.Value, target: ir.Type) -> ir.Value:
 
 
 def narrow_integer(value: ir.Value, width: int) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Truncates an integer value wider than width to a signless integer of that width; narrower or equal values pass through.
+    # Raises TypeError if the value is not an integer type.
     """Truncate an integer register to `width` bits."""
     if not ir.IntegerType.isinstance(value.type):
         raise TypeError(f"expected an integer inline-asm result, got {value.type}")
@@ -74,6 +83,8 @@ def narrow_integer(value: ir.Value, width: int) -> ir.Value:
 
 
 def decode_e8m0(value: ir.Value) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Decodes an E8M0 code (narrowed to 8 bits, zero-extended to 32) to Float32 bits: code shifted into the exponent field;
+    # code 0 becomes the bit pattern of 2^-127; code 255 becomes a quiet NaN. Returns a Float32 value.
     """Decode one biased E8M0 bit pattern to its exact Float32 value."""
     code = arith.extui(T.i32(), narrow_integer(value, 8))
     bits = arith.shli(code, arith.constant(T.i32(), 23))
@@ -85,6 +96,8 @@ def decode_e8m0(value: ir.Value) -> ir.Value:
 
 
 def convert_output(value: ir.Value, result_type) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Converts a raw asm register result to the logical element type: E8M0 is decoded to Float32; otherwise integers
+    # are narrowed to the type width and the bits are reinterpreted as the type's MLIR type.
     """Convert a register result to the requested logical element type."""
     if result_type == cutlass.Float8E8M0FNU:
         return decode_e8m0(value)
@@ -97,6 +110,8 @@ def convert_output(value: ir.Value, result_type) -> ir.Value:
 
 
 def fragment_element(source, index: int) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Returns element index of a TensorSSA vector; an existing IR value is returned as is; Python int/float becomes a
+    # Float32 constant; other objects are unwrapped via their IR value accessor.
     """Extract element `index` from a TensorSSA, or unwrap a scalar value."""
     if isinstance(source, cute.TensorSSA):
         return vector.extract(source.ir_value(), [], [index])
@@ -108,6 +123,7 @@ def fragment_element(source, index: int) -> ir.Value:
 
 
 def zero_for_constraint(letter: str) -> ir.Value:
+    # [FUNCTION DOC] HELPER: Returns a zero constant of the register type for the constraint letter (float zero for f and d, integer zero otherwise).
     """Create a zero in the register type named by an inline-asm constraint."""
     target = CONSTRAINT_TYPES[letter]()
     return arith.constant(target, 0.0 if letter in ("f", "d") else 0)
@@ -121,6 +137,8 @@ def packed_operands(
     count: int,
     pack: int,
 ) -> list[ir.Value]:
+    # [FUNCTION DOC] HELPER: Builds the operand list for one asm invocation: source-major, pack lanes per source, lane index base plus lane.
+    # Scalar sources always use element 0. Lanes past count are zero filled. Each operand is bitcast to its constraint's register type.
     """Gather one source-major inline-asm pack, padding a partial tail with zero."""
     operands = []
     for source_index, source in enumerate(sources):
@@ -152,6 +170,11 @@ def inline_asm_elementwise_intrinsic(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Emits elementwise inline PTX over TensorSSA fragments (and/or scalars). Validates: pack at least 1, output constraint count equals
+    # pack, input constraint count equals number of sources times pack, scalar_sources empty or same length as sources (else ValueError).
+    # Fragments are broadcast to a common shape, then the asm runs once per group of pack elements; multi-output results are an LLVM struct
+    # unpacked per field; outputs for padded tail lanes are dropped; each is converted to result_type (E8M0 computed as Float32).
+    # Returns a TensorSSA of the broadcast shape, or a scalar of the compute type if no fragment sources. has_side_effects is the negation of is_pure.
     """Apply an inline PTX block elementwise across a TensorSSA fragment.
 
     Args:

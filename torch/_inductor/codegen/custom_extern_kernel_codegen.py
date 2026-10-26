@@ -1,3 +1,7 @@
+# [MODULE DOC] Registry of custom Python/C++ wrapper codegen for extern fallback
+# kernels. Defines CustomCodegen, generate_print_python and the
+# CUSTOM_EXTERN_KERNEL_CODEGEN mapping (operator name to CustomCodegen), which
+# currently only registers the print higher-order op for Python.
 """
 Custom extern kernel codegen registry.
 
@@ -40,6 +44,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class CustomCodegen:
+    # [CLASS DOC] Plain dataclass pairing optional codegen callables for an operator:
+    # python (Python wrapper) and cpp (C++ wrapper); None means unsupported.
     """
     Container for custom codegen implementations.
 
@@ -56,6 +62,10 @@ def generate_print_python(
     node: ir.FallbackKernel,
     writeline: Callable[[str], None],
 ) -> None:
+    # [FUNCTION DOC] Emits a line that calls builtin print on the print HOP fallback.
+    # The first codegen arg is the format string; remaining positional args plus
+    # keyword args are passed to its format method (no format call if none).
+    # Raises ValueError if there are no positional args. Output via writeline.
     """
     Generate a builtin print call for the print HOP fallback (Python wrapper).
 

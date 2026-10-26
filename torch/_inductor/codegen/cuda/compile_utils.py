@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for compiling CUDA/CUTLASS code with nvcc in Inductor: locating nvcc and CUTLASS,
+# CUDA arch normalization and gencode option building (including AOTI multi-arch), nvcc/linker option
+# assembly, and cuda_compile_command which returns the full command string. At import time it creates
+# loggers and, in fbcode, imports triton's build_paths.
 # mypy: allow-untyped-defs
 import logging
 import os
@@ -21,6 +25,8 @@ autotuning_log = torch._logging.getArtifactLogger(__name__, "autotuning")
 
 
 def use_re_build() -> bool:
+    # [FUNCTION DOC] Returns True only in fbcode when nvcc is not available locally and the remote-execution helper says the build should not run locally;
+    # False otherwise. Used for CUTLASS compilation only.
     """
     Use for CUTLASS compilation only right now.
     """
@@ -32,6 +38,7 @@ def use_re_build() -> bool:
 
 
 def _cutlass_path() -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the CUTLASS root directory (fbcode: from the packaged cutlass headers; else config.cutlass.cutlass_dir if cutlass is importable), or None.
     if config.is_fbcode():
         from libfb.py import parutil
 
@@ -43,6 +50,7 @@ def _cutlass_path() -> str | None:
 
 
 def _cutlass_paths() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the fixed list of CUTLASS subdirectories (relative) needed for include paths.
     return [
         "include",
         "tools/library/include",
@@ -52,6 +60,8 @@ def _cutlass_paths() -> list[str]:
 
 
 def _clone_cutlass_paths(build_root: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Copies each needed CUTLASS subdirectory into build_root (merging into existing dirs; filesystem side effect)
+    # and returns the new paths. Returns an empty list if CUTLASS is not found.
     cutlass_root = _cutlass_path()
     if cutlass_root is None:
         return []
@@ -65,6 +75,7 @@ def _clone_cutlass_paths(build_root: str) -> list[str]:
 
 
 def _cutlass_include_paths() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns canonical (realpath) absolute CUTLASS include directories, or an empty list if CUTLASS is not found.
     cutlass_root = _cutlass_path()
     if cutlass_root is None:
         return []
@@ -76,6 +87,8 @@ def _cutlass_include_paths() -> list[str]:
 
 
 def _cuda_compiler() -> str | None:
+    # [FUNCTION DOC] HELPER: Picks the nvcc to use, in order: config.cuda.cuda_cxx if it exists, the fbcode SDK nvcc, the CUDACXX env var,
+    # nvcc under CUDA_HOME, else the bare name nvcc.
     if cuda_env.nvcc_exist(config.cuda.cuda_cxx):
         return config.cuda.cuda_cxx
     if config.is_fbcode():
@@ -88,6 +101,9 @@ def _cuda_compiler() -> str | None:
 
 
 def _cuda_lib_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds linker flags for CUTLASS builds: library search path flags and rpath entries (except for torch/lib dirs and
+    # rpath for stubs dirs), plus cuda and cudart libs. Sets GPU runtime env as a side effect.
+    # Raises NotImplementedError on non-Linux platforms.
     """
     Util function for CUTLASS backend to find the correct CUDA libraries.
     """
@@ -123,6 +139,7 @@ def _cuda_lib_options() -> list[str]:
 
 
 def _nvcc_host_compiler_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the fixed host-compiler flags (PIC, no strict aliasing, hidden visibility, conversion warnings).
     return [
         "-fPIC",
         "-fno-strict-aliasing",
@@ -132,6 +149,8 @@ def _nvcc_host_compiler_options() -> list[str]:
 
 
 def _cuda_arch_with_compile_suffix(arch: str) -> str:
+    # [FUNCTION DOC] HELPER: Normalizes the arch and appends the architecture-specific suffix a for archs 90, 100, 101, 103, 107, 110, 120, 121
+    # (required by CUTLASS); other archs are returned unchanged.
     arch = _normalize_cuda_arch(arch)
     if arch == "90":
         # Required by cutlass compilation.
@@ -154,6 +173,7 @@ def _cuda_arch_with_compile_suffix(arch: str) -> str:
 
 
 def _nvcc_arch_as_compile_option() -> str | None:
+    # [FUNCTION DOC] HELPER: Detected CUDA arch with compile suffix, or None if undetectable.
     arch = cuda_env.get_cuda_arch()
     if arch is None:
         return arch
@@ -161,6 +181,7 @@ def _nvcc_arch_as_compile_option() -> str | None:
 
 
 def _nvcc_arch_as_compile_option_or_raise() -> str:
+    # [FUNCTION DOC] HELPER: Like _nvcc_arch_as_compile_option but raises RuntimeError if the arch cannot be determined.
     arch = _nvcc_arch_as_compile_option()
     if arch is None:
         raise RuntimeError("Unable to determine CUDA architecture")
@@ -168,6 +189,8 @@ def _nvcc_arch_as_compile_option_or_raise() -> str:
 
 
 def _normalize_cuda_arch(arch: str) -> str:
+    # [FUNCTION DOC] HELPER: Strips sm_ / compute_ prefixes and dots (e.g. 9.0 becomes 90); raises ValueError unless the result is digits with an optional
+    # trailing letter.
     arch = arch.removeprefix("sm_").removeprefix("compute_").replace(".", "")
     if not re.fullmatch(r"\d+[a-z]?", arch):
         raise ValueError(f"Unrecognized CUDA arch: {arch}")
@@ -175,6 +198,7 @@ def _normalize_cuda_arch(arch: str) -> str:
 
 
 def _cuda_arch_number(arch: str) -> int:
+    # [FUNCTION DOC] HELPER: Numeric part of a normalized arch, ignoring any trailing letter suffix.
     arch = _normalize_cuda_arch(arch)
     if arch[-1].isalpha():
         arch = arch[:-1]
@@ -182,11 +206,13 @@ def _cuda_arch_number(arch: str) -> int:
 
 
 def _cuda_arch_suffix(arch: str) -> str:
+    # [FUNCTION DOC] HELPER: Trailing letter suffix of a normalized arch, or empty string.
     arch = _normalize_cuda_arch(arch)
     return arch[-1] if arch[-1].isalpha() else ""
 
 
 def _cuda_arch_same_generation(arch: str, other: str) -> bool:
+    # [FUNCTION DOC] HELPER: If either arch has a suffix, requires exact equality of normalized strings; otherwise compares numeric parts.
     arch = _normalize_cuda_arch(arch)
     other = _normalize_cuda_arch(other)
     if _cuda_arch_suffix(arch) or _cuda_arch_suffix(other):
@@ -195,18 +221,22 @@ def _cuda_arch_same_generation(arch: str, other: str) -> bool:
 
 
 def _cuda_arch_is_compatible_with_current(arch: str, current_arch: str) -> bool:
+    # [FUNCTION DOC] HELPER: If current arch has a suffix, requires equality; otherwise arch must be numerically >= the current arch.
     if _cuda_arch_suffix(current_arch):
         return _normalize_cuda_arch(arch) == _normalize_cuda_arch(current_arch)
     return _cuda_arch_number(arch) >= _cuda_arch_number(current_arch)
 
 
 def _aoti_cuda_target_arch() -> str:
+    # [FUNCTION DOC] HELPER: Target arch for AOTI: config.cuda.arch with compile suffix if set, else the detected arch (raises RuntimeError if unknown).
     if config.cuda.arch is not None:
         return _cuda_arch_with_compile_suffix(str(config.cuda.arch))
     return _nvcc_arch_as_compile_option_or_raise()
 
 
 def _parse_gencode_options(flags: list[str]) -> OrderedSet[tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Extracts (kind, normalized arch) pairs from -gencode flags (either equals or space form). Only sm and compute entries in the code=
+    # list are kept; malformed flags/entries are skipped silently.
     options: OrderedSet[tuple[str, str]] = OrderedSet()
     for flag in flags:
         if flag.startswith("-gencode="):
@@ -232,6 +262,9 @@ def _parse_gencode_options(flags: list[str]) -> OrderedSet[tuple[str, str]]:
 
 
 def _cuda_multi_arch_gencode_options(current_arch: str | None = None) -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds -gencode payload strings for AOTI CUDA fatbins. Starts from TORCH_CUDA_ARCH_LIST (unless unset or native), keeping only sm
+    # entries compatible with the current arch (warning on others), ensures an sm entry for the current generation and a compute (PTX) entry for the
+    # current arch, and returns them sorted by arch number, sm before compute. current_arch defaults to the detected arch (may raise RuntimeError).
     """
     Return nvcc -gencode option payloads for AOTI CUDA fatbins.
 
@@ -274,6 +307,7 @@ def _cuda_multi_arch_gencode_options(current_arch: str | None = None) -> list[st
     options.add(("compute", current_arch))
 
     def sort_key(option: tuple[str, str]) -> tuple[int, int, str]:
+        # [FUNCTION DOC] HELPER: Sort key: arch number, then sm before compute, then arch string.
         kind, arch = option
         return (_cuda_arch_number(arch), 0 if kind == "sm" else 1, arch)
 
@@ -286,6 +320,8 @@ def _cuda_multi_arch_gencode_options(current_arch: str | None = None) -> list[st
 def _cuda_gencode_options_have_non_current_sass(
     gencode_options: list[str], current_arch: str | None = None
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if any gencode option requests SASS (sm) for an arch not in the same generation as current_arch
+    # (defaults to the detected arch; may raise RuntimeError).
     if not current_arch:
         current_arch = _nvcc_arch_as_compile_option_or_raise()
     current_arch = _normalize_cuda_arch(current_arch)
@@ -298,6 +334,9 @@ def _cuda_gencode_options_have_non_current_sass(
 
 
 def _nvcc_compiler_options() -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds the nvcc option list for CUTLASS: gencode for the detected arch (sm, compute, optional lto), CUTLASS macros, c++20,
+    # opt level, relaxed constexpr, NDEBUG; adds fbcode ccbin, debug info, ptxas info/keep flags and fast-math flags per config.
+    # Raises RuntimeError if the arch is unknown.
     arch = _nvcc_arch_as_compile_option_or_raise()
     code = [f"sm_{arch}", f"compute_{arch}"]
     if config.cuda.enable_cuda_lto:
@@ -344,6 +383,10 @@ def cuda_compile_command(
     dst_file_ext: str,
     extra_args: list[str] | None = None,
 ) -> str:
+    # [FUNCTION DOC] Builds the nvcc command line string compiling src_files into dst_file. dst_file_ext selects the mode:
+    # o (compile only), so (shared library) or exe; anything else raises NotImplementedError. Combines compiler options, extra_args,
+    # host-compiler options (via -Xcompiler), CUTLASS include paths and CUDA link options. Under remote build, CUTLASS dirs are
+    # cloned next to dst_file and paths are made basenames. Logs the command at debug level. Returns the command string.
     if extra_args is None:
         extra_args = []
     if use_re_build():
