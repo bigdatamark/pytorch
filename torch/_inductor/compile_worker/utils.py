@@ -1,3 +1,5 @@
+# [MODULE DOC] Helpers for compile worker subprocesses: top-level process flag, worker initializer with parent-death
+# watchdog, and parent change detection.
 import os
 import signal
 from threading import Thread
@@ -10,6 +12,8 @@ _IN_TOPLEVEL_PROCESS = True
 
 
 def in_toplevel_process() -> bool:
+    # [FUNCTION DOC] Return True in the main process and False inside async compile worker subprocesses
+    # (the flag is cleared by _async_compile_initializer).
     global _IN_TOPLEVEL_PROCESS
     return _IN_TOPLEVEL_PROCESS
 
@@ -24,6 +28,11 @@ def in_toplevel_process() -> bool:
 # This function cannot be an inner function since otherwise mp_context="spawn" would
 # not work for ProcessPoolExecutor since inner functions cannot be pickled.
 def _async_compile_initializer(orig_ppid: int, close_fds: tuple[int, ...] = ()) -> None:
+    # [FUNCTION DOC] HELPER: Pool worker initializer; must be module level so spawn can pickle it.
+    # Closes any inherited file descriptors in close_fds (fork mode only, ignoring OSError), records the original
+    # parent pid, starts a daemon thread that checks once a minute and SIGKILLs this process if the parent changed,
+    # ignores SIGINT, installs the torch crash handler, marks the process as not top-level, and claims a
+    # watchdog heartbeat slot. Mutates module globals.
     # In fork mode a worker inherits the sidecar's entire fd table, including the
     # sidecar<->parent pipes. The worker must not keep those open: holding the
     # result pipe's write end would stop the parent from ever seeing EOF when the
@@ -40,6 +49,8 @@ def _async_compile_initializer(orig_ppid: int, close_fds: tuple[int, ...] = ()) 
     import torch._C
 
     def run() -> None:
+        # [FUNCTION DOC] HELPER: Watchdog thread body; loops forever sleeping 60 seconds and kills this process with SIGKILL
+        # if its parent pid differs from the original parent.
         while True:
             sleep(60)
             if orig_ppid != os.getppid():
@@ -69,4 +80,6 @@ _original_parent: int | None = None
 
 
 def has_parent_changed() -> bool:
+    # [FUNCTION DOC] Return True if the current parent pid differs from the one recorded at initialization
+    # (also True if the initializer never ran, since the recorded parent is then unset).
     return _original_parent != os.getppid()

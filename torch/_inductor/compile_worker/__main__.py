@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Command line entry point for the Inductor compile worker sidecar process launched by SubprocPool.
+# Importing this module sets the triton ptxas path and preloads triton if available; running it as a script calls main().
 import argparse
 import base64
 import functools
@@ -36,6 +38,9 @@ except ImportError:
 
 
 def _lookup_and_create_type(base: type[_T], qname: str) -> _T:
+    # [FUNCTION DOC] HELPER: Resolve a dotted qualified name to a class by importing its module and
+    # reading the attribute, verify it is a subclass of base, and return a new instance built with no arguments.
+    # Raises TypeError if the class is not a subtype of base; import/attribute errors propagate.
     """
     Given a base type and qualified name: import & lookup that name, check
     that it's of the given type and then instantiate it.
@@ -49,6 +54,11 @@ def _lookup_and_create_type(base: type[_T], qname: str) -> _T:
 
 
 def main():
+    # [FUNCTION DOC] Entry point of the compile worker sidecar subprocess. Parses command line options
+    # (pickler class name, subprocess kind, worker count, parent pid, read/write file descriptors, base64 torch key),
+    # exits silently if the parent pid no longer matches (parent died), opens the pipes, runs pre-fork setup,
+    # installs the torch cache key, initializes the worker environment and runs the SubprocMain loop.
+    # Any exception is logged, not raised. Side effects: file descriptors opened, global torch_key set.
     try:
         parser = argparse.ArgumentParser()
         parser.add_argument(

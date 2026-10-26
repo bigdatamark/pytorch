@@ -1,3 +1,4 @@
+# [MODULE DOC] Subprocess-based out-of-process FX compile: runs inductor graph compilation in a spawned worker via SubprocPool.
 from __future__ import annotations
 
 import atexit
@@ -29,8 +30,12 @@ if TYPE_CHECKING:
 
 @final
 class _SubprocessFxCompile(_OutOfProcessFxCompile):
+    # [CLASS DOC] HELPER: Out-of-process FX compile implementation that sends the pickled compile request to a single spawned
+    # subprocess worker pool and returns a future for the pickled result. Final class.
     @override
     def _send_to_child_async(
+        # [FUNCTION DOC] Submit the pickled input to the shared process pool, together with the current values of the
+        # inductor and triton cache directory environment variables so the child shares caches. Returns a future of the pickled output.
         self, input: _WireProtocolPickledInput
     ) -> Future[_WireProtocolPickledOutput]:
         # TODO: Do we need to copy across some kind of logging IDs? (ChromiumEventLogger)
@@ -49,6 +54,7 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
     @staticmethod
     @functools.cache
     def process_pool() -> AnyPool:
+        # [FUNCTION DOC] Create (once, cached) a one-worker spawn-based SubprocPool and register its shutdown at exit. Returns the pool.
         pool = SubprocPool(
             # TODO: Consider raising this limit if we start using async w/
             # subprocess and want to compile multiple graphs in parallel.
@@ -62,6 +68,8 @@ class _SubprocessFxCompile(_OutOfProcessFxCompile):
 
     @classmethod
     def _run_in_child_subprocess(
+        # [FUNCTION DOC] HELPER: Runs inside the child process. Clears inductor caches and resets metrics, then runs the compile
+        # via _run_in_child with the given pickled input and environment overrides and returns the pickled output.
         cls,
         pickled_input: _WireProtocolPickledInput,
         extra_env: Mapping[str, str | None] | None,

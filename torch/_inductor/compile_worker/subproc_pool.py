@@ -1,3 +1,6 @@
+# [MODULE DOC] Subprocess compile pool. SubprocPool (parent side) launches a sidecar process running SubprocMain (sidecar side), which runs
+# a fork or spawn process pool; they exchange framed messages (MsgHeader) over pipes, with a watchdog for slow jobs and a health monitor for sidecar death.
+# Also defines the pickler hook, exception carriers, pool teardown helpers and test helpers. Import-time side effect: imports torch._thread_safe_fork.
 import base64
 import functools
 import itertools
@@ -46,6 +49,8 @@ _T = TypeVar("_T")
 
 
 class MsgHeader(IntEnum):
+    # [CLASS DOC] Integer enum of message types on the parent/sidecar pipe: ERROR, SHUTDOWN, QUIESCE, WAKEUP, JOB, and STATUS
+    # (out-of-band watchdog report that does not affect any future).
     ERROR = 0
     SHUTDOWN = 1
     QUIESCE = 2
@@ -57,6 +62,8 @@ class MsgHeader(IntEnum):
 
 
 def _current_compile_id() -> Any:
+    # [FUNCTION DOC] HELPER: Return the current compile id from the compile context for later attribution of watchdog reports,
+    # or None if it cannot be determined (any error is swallowed).
     # Snapshotted at submit so a later watchdog STATUS report (handled on the
     # read thread, which has no ambient compile context) can be attributed to the
     # right compile in tlparse.
@@ -69,10 +76,13 @@ def _current_compile_id() -> Any:
 
 
 def _pack_msg(msg_header: MsgHeader, job_id: int, length: int) -> bytes:
+    # [FUNCTION DOC] HELPER: Encode a message header as three native-size integers: message type, job id and payload length.
     return struct.pack("nnn", int(msg_header), job_id, length)
 
 
 def _unpack_msg(data: bytes) -> tuple[MsgHeader, int, int]:
+    # [FUNCTION DOC] HELPER: Decode a header. Empty data (pipe closed) yields an ERROR header with job id and length of minus one;
+    # otherwise returns the MsgHeader, job id and payload length.
     if not data:
         return MsgHeader.ERROR, -1, -1
     msg_header, job_id, length = struct.unpack("nnn", data)
@@ -93,6 +103,7 @@ _WORKER_TERMINATE_GRACE_SECONDS = 10.0
 
 
 def _send_msg(
+    # [FUNCTION DOC] HELPER: Write the packed header and any payload to the pipe and flush. May raise OSError such as a broken pipe.
     write_pipe: IO[bytes], msg_header: MsgHeader, job_id: int = -1, data: bytes = b""
 ) -> None:
     length = len(data)
@@ -103,12 +114,15 @@ def _send_msg(
 
 
 def _recv_msg(read_pipe: IO[bytes]) -> tuple[MsgHeader, int, bytes]:
+    # [FUNCTION DOC] HELPER: Read one header and then its payload from the pipe. Returns (header, job id, payload bytes);
+    # a closed pipe produces an ERROR header and empty payload.
     msg_header, job_id, length = _unpack_msg(read_pipe.read(msg_bytes))
     data = read_pipe.read(length) if length > 0 else b""
     return msg_header, job_id, data
 
 
 class _SubprocExceptionInfo:
+    # [CLASS DOC] HELPER: Picklable carrier for an exception raised in a worker job; holds the formatted traceback text in details.
     """
     Carries exception info from subprocesses across the wire. traceback
     objects are not pickleable, so we store the trace as a string and
@@ -116,49 +130,66 @@ class _SubprocExceptionInfo:
     """
 
     def __init__(self, details: str) -> None:
+        # [FUNCTION DOC] HELPER: Store the traceback text.
         self.details = details
 
 
 class SubprocException(Exception):
+    # [CLASS DOC] Exception raised in the parent when a job running in a subprocess failed; message includes the job name and remote traceback.
     """
     Thrown when a job in a subprocess raises an Exception.
     """
 
     def __init__(self, details: str, name: str = "<unknown>") -> None:
+        # [FUNCTION DOC] Save details and build the message with the name and details.
         self.details = details
         super().__init__(
             f"An exception occurred in a subprocess:\n\nName={name}\n{details}"
         )
 
     def with_name(self, name: str) -> "SubprocException":
+        # [FUNCTION DOC] Return a new SubprocException with the same details but the given name.
         return SubprocException(self.details, name)
 
 
 class SubprocPickler:
+    # [CLASS DOC] Hook for custom serialization of jobs and results between processes; the default uses pickle with the highest protocol.
+    # Subclasses are located by module and class name in the sidecar, so they must be importable and constructible without arguments.
     """
     Allows a caller to provide a custom pickler for passing data with the
     subprocess.
     """
 
     def dumps(self, obj: object) -> bytes:
+        # [FUNCTION DOC] Serialize an object to bytes.
         return pickle.dumps(obj, pickle.HIGHEST_PROTOCOL)
 
     def loads(self, data: bytes) -> object:
+        # [FUNCTION DOC] Deserialize bytes to an object.
         return pickle.loads(data)
 
 
 class SubprocKind(Enum):
+    # [CLASS DOC] Enum of worker start methods used by the sidecar's process pool: FORK or SPAWN.
     FORK = "fork"
     SPAWN = "spawn"
 
 
 class SubprocPool:
+    # [CLASS DOC] Parent-side executor-like object that launches a sidecar Python process, which owns the real process pool, and talks to it over a
+    # pair of pipes. Tracks pending futures by job id, the sidecar process handle, reader and health-monitor daemon threads, wait counters for
+    # metrics, optional quiesce timer, and a running flag. Key methods: submit, quiesce, wakeup, shutdown.
     """
     Mimic a concurrent.futures.ProcessPoolExecutor, but wrap it in
     a subprocess.Popen() to try to avoid issues with forking/spawning
     """
 
     def __init__(
+        # [FUNCTION DOC] Create the pipes, build the sidecar command line (the compile worker main module or an internal binary) with pickler, kind,
+        # worker count, parent pid, fds and torch key, choose the log file (devnull if logging is suppressed, else the configured or default path),
+        # start the sidecar passing only its pipe ends and close those ends in the parent. Initialize locks, future tables, wait counters and
+        # an optional inactivity Timer that quiesces the pool; start the reader and health threads last.
+        # Side effects: spawns a process, opens files, enters wait counters.
         self,
         nprocs: int,
         pickler: SubprocPickler | None = None,
@@ -281,6 +312,9 @@ class SubprocPool:
         self.health_thread.start()
 
     def submit(
+        # [FUNCTION DOC] Submit a callable (bound with any extra args) to the sidecar. Pickles it, allocates a job id, registers a future,
+        # per-job wait counter and compile id, exits quiesce state if needed and tracks the first job, then sends a JOB message.
+        # Returns the future. Raises RuntimeError if the pool is closed.
         self, job_fn: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
     ) -> Future[_T]:
         if args or kwargs:
@@ -310,12 +344,18 @@ class SubprocPool:
         return future
 
     def _send(self, msg_header: MsgHeader, job_id: int = -1, data: bytes = b"") -> None:
+        # [FUNCTION DOC] HELPER: Under the write lock send a message to the sidecar; raises RuntimeError if the pool is no longer running.
         with self.write_lock:
             if not self.running:
                 raise RuntimeError("Attempting to use a closed pool")
             _send_msg(self.write_pipe, msg_header, job_id, data)
 
     def _read_thread(self) -> None:
+        # [FUNCTION DOC] HELPER: Reader thread loop. Handles STATUS messages via _handle_worker_status; on any non-JOB message or read error marks the pool
+        # not running, closes the read pipe, shuts down (cancelling pending futures) and exits. For JOB results it unpickles the payload (an unpickling failure
+        # becomes that future's exception), resets the quiesce timer, and resolves the matching future with a result or SubprocException or
+        # other exception, then clears its bookkeeping and exits the first-job counter.
+        # KNOWN ISSUE: the future lookup by job id is unguarded, so a result arriving after the futures were cleared would raise KeyError and end the thread.
         while True:
             data = b""
             job_id = -1
@@ -376,6 +416,8 @@ class SubprocPool:
                 self._job_compile_id.pop(job_id, None)
 
     def _health_monitor(self) -> None:
+        # [FUNCTION DOC] HELPER: Health thread loop: while running, poll the sidecar process every couple of seconds and, if it has exited,
+        # handle its death and stop.
         # Poll the sidecar for liveness. If it dies while we still think we are
         # running, fail the pending compiles rather than let waiters block
         # forever (see health_thread comment in __init__).
@@ -387,6 +429,9 @@ class SubprocPool:
             time.sleep(_SIDECAR_HEALTH_POLL_SECONDS)
 
     def _on_sidecar_death(self, returncode: int) -> None:
+        # [FUNCTION DOC] HELPER: If still running, mark the pool stopped, exit the running wait counter, log an error with the exit code and
+        # diagnostics, and fail all pending futures with a RuntimeError (or cancel them), closing their wait counters and clearing tables.
+        # Deliberately leaves the read pipe for the reader thread to close.
         with self.futures_lock:
             if not self.running:
                 # Expected exit (shutdown) or already handled.
@@ -428,6 +473,8 @@ class SubprocPool:
         # death already produced an EOF, _read_thread will close the pipe itself.
 
     def _log_sidecar_death_diagnostics(self, returncode: int) -> None:
+        # [FUNCTION DOC] HELPER: Log the last 50 lines of the worker log file (if any is readable) and emit them with the exit code as a
+        # structured trace artifact for production debugging; failures are only logged as warnings.
         tail = ""
         if self.log_path and self.log_path != os.devnull:
             try:
@@ -458,6 +505,8 @@ class SubprocPool:
             log.warning("Failed to emit sidecar-death trace artifact", exc_info=True)
 
     def _handle_worker_status(self, job_id: int, data: bytes) -> None:
+        # [FUNCTION DOC] HELPER: Unpickle a STATUS payload; if it is a mapping, add the compile id recorded for the job and emit it as a JSON
+        # structured trace artifact. Never raises; errors are logged as warnings. Does not touch futures.
         # Best-effort, and runs on the read thread: a bad status report (corrupt
         # payload or a logging failure) must not escape and kill result
         # processing, so guard the whole thing.
@@ -483,6 +532,8 @@ class SubprocPool:
             log.warning("failed to report compile worker status", exc_info=True)
 
     def quiesce(self) -> None:
+        # [FUNCTION DOC] Ask the sidecar to shut down its worker pool without exiting, and start the quiesced wait counter if not already running.
+        # Raises RuntimeError if the pool is closed.
         self._send(MsgHeader.QUIESCE)
         if self.quiesce_waitcounter is None:
             self.quiesce_waitcounter = _WaitCounter(
@@ -491,9 +542,13 @@ class SubprocPool:
             self.quiesce_waitcounter.__enter__()
 
     def wakeup(self) -> None:
+        # [FUNCTION DOC] Ask the sidecar to start its worker pool again after quiescing; raises RuntimeError if closed.
         self._send(MsgHeader.WAKEUP)
 
     def shutdown(self) -> None:
+        # [FUNCTION DOC] Idempotent shutdown. Under the write lock stop the timer, mark not running, send SHUTDOWN and close the pipe; wait up to 300 seconds
+        # for the sidecar, killing it on timeout, and close the log file. OSError is logged and ignored. In all cases cancel remaining pending futures
+        # (or fail them with a closed-pool RuntimeError) and clear tables.
         try:
             with self.write_lock:
                 if not self.running:
@@ -532,9 +587,13 @@ class SubprocPool:
 
 
 class SubprocMain:
+    # [CLASS DOC] Sidecar-side counterpart of SubprocPool, run by the compile worker main module. Reads messages from the parent, runs jobs in a
+    # process pool (fork or spawn), and writes results back. State: pickler, kind, worker count, pipes, write lock, pool and its finalizer,
+    # running flag, in-flight job start times with lock, and a stop event for the watchdog thread.
     """Communicates with a SubprocPool in the parent process, called by __main__.py"""
 
     def __init__(
+        # [FUNCTION DOC] Store arguments and initialize empty pool, in-flight table, locks and the watchdog stop event.
         self,
         pickler: SubprocPickler,
         kind: SubprocKind,
@@ -557,6 +616,8 @@ class SubprocMain:
         self._watchdog_stop = threading.Event()
 
     def main(self) -> None:
+        # [FUNCTION DOC] Sidecar main loop. For fork kind allocate the shared heartbeat buffer, start the watchdog thread, then read messages:
+        # JOB submits, WAKEUP starts the pool, QUIESCE shuts down the pool but keeps running, and anything else (including closed pipe) shuts down and returns.
         # Phase heartbeats rely on fork inheritance of the shared buffer; spawn
         # workers get no buffer and degrade to duration-only reporting.
         if self.kind == SubprocKind.FORK:
@@ -574,9 +635,12 @@ class SubprocMain:
                 return self._shutdown()
 
     def _quiesce(self) -> None:
+        # [FUNCTION DOC] HELPER: Shut down the worker pool without terminating running workers.
         self._shutdown_pool(terminate_workers=False)
 
     def _shutdown(self) -> None:
+        # [FUNCTION DOC] HELPER: Stop the watchdog, mark not running, send SHUTDOWN to the parent and close both pipes (ignoring a broken pipe),
+        # then terminate the worker pool.
         self._watchdog_stop.set()
         with self.write_lock:
             self.running = False
@@ -589,6 +653,8 @@ class SubprocMain:
         self._shutdown_pool(terminate_workers=True)
 
     def _shutdown_pool(self, *, terminate_workers: bool) -> None:
+        # [FUNCTION DOC] HELPER: Detach the current pool, if any. If terminating, cancel the finalizer and forcibly terminate workers;
+        # otherwise ask the pool to shut down without waiting.
         if self.pool is None:
             return
 
@@ -608,6 +674,8 @@ class SubprocMain:
             pool.shutdown(wait=False)
 
     def submit(self, job_id: int, data: bytes) -> None:
+        # [FUNCTION DOC] Record the job start time for the watchdog, then loop while running trying to submit it; if the pool is broken
+        # (a worker crashed) log a warning, drop the pool and retry with a new one.
         # Clock starts before _start_pool/_warm_process_pool, so the first job's
         # reported elapsed intentionally includes cold pool creation and the fork
         # of the workers -- that wait is real and worth surfacing.
@@ -632,7 +700,11 @@ class SubprocMain:
                 self.pool = None
 
     def _submit_inner(self, job_id: int, data: bytes) -> None:
+        # [FUNCTION DOC] HELPER: Ensure the pool is started and submit the job to a worker; attach a done callback that clears the in-flight entry
+        # and sends the result (or the pickled exception) back to the parent as a JOB message if still running. Raises AssertionError if the pool is missing.
         def callback(fut: Future[Any]) -> None:
+            # [FUNCTION DOC] HELPER: Done callback: forget the job in flight; if still running, take the future result (on failure log and pickle the exception),
+            # require it to be bytes (AssertionError otherwise) and send it to the parent under the write lock.
             with self._inflight_lock:
                 self._inflight.pop(job_id, None)
             if not self.running:
@@ -659,6 +731,8 @@ class SubprocMain:
         future.add_done_callback(callback)
 
     def _start_pool(self) -> None:
+        # [FUNCTION DOC] HELPER: If no pool exists, recycle heartbeat slots, then create a tracked process pool of nprocs workers with the chosen start method and an
+        # initializer that watches the parent (closing inherited pipe fds only under fork), register a finalizer to shut it down, and pre-start the workers.
         if self.pool is not None:
             return
 
@@ -688,6 +762,7 @@ class SubprocMain:
         _warm_process_pool(self.pool, self.nprocs)
 
     def _start_watchdog(self) -> None:
+        # [FUNCTION DOC] HELPER: If the configured watchdog interval is positive, start a daemon thread running the watchdog loop.
         interval = config.compile_worker_watchdog_interval_seconds
         if interval <= 0:
             return
@@ -699,6 +774,8 @@ class SubprocMain:
         ).start()
 
     def _watchdog_loop(self, interval: float) -> None:
+        # [FUNCTION DOC] HELPER: Every interval seconds until stopped, read worker heartbeats and report status for each in-flight job that has been running
+        # at least that long, so slow jobs are reported repeatedly with growing elapsed time.
         # Every `interval` seconds, report any job still running past `interval`
         # so a stuck/slow worker leaves a breadcrumb (the parent turns these into
         # tlparse artifacts). Re-reports each tick with a growing elapsed time.
@@ -716,6 +793,8 @@ class SubprocMain:
                 self._report_status(job_id, elapsed, heartbeats.get(job_id), now_ns)
 
     def _report_status(
+        # [FUNCTION DOC] HELPER: Build a status mapping with job id and elapsed seconds, add the worker phase, phase elapsed time and pid when a heartbeat exists,
+        # or mark the job queued when heartbeats are enabled but none was found, and send it as a STATUS message. Pipe errors are ignored.
         self,
         job_id: int,
         elapsed: float,
@@ -750,6 +829,8 @@ class SubprocMain:
 
     @staticmethod
     def do_job(pickler: SubprocPickler, job_id: int, data: bytes) -> bytes:
+        # [FUNCTION DOC] Runs in a pool worker: record the job in the heartbeat slot, unpickle and run the job callable, converting an exception into a
+        # _SubprocExceptionInfo with the traceback text, return the pickled result, and always clear the heartbeat slot. Returns bytes.
         # do the pickle/unpickle in the sub-subproc
         watchdog.set_current_job(job_id)
         try:
@@ -767,6 +848,8 @@ AnyPool = ProcessPoolExecutor | SubprocPool
 
 
 def _get_process_pool_processes(pool: ProcessPoolExecutor) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Return a list of the worker process objects of a ProcessPoolExecutor using private attributes, trying the older then newer
+    # layout; empty list if neither is available.
     processes = getattr(pool, "_processes", None)
     if processes is not None:
         return list(processes.values())
@@ -780,6 +863,8 @@ def _get_process_pool_processes(pool: ProcessPoolExecutor) -> list[Any]:
 
 
 def _terminate_process_pool(pool: ProcessPoolExecutor) -> None:
+    # [FUNCTION DOC] HELPER: Terminate all live pool workers, wait for them up to a shared grace period, kill those still alive, then shut the pool down
+    # waiting and cancelling queued futures. Errors are logged and ignored.
     processes = _get_process_pool_processes(pool)
     for process in processes:
         try:
@@ -810,6 +895,8 @@ def _terminate_process_pool(pool: ProcessPoolExecutor) -> None:
 
 
 def _warm_process_pool(pool: ProcessPoolExecutor, n: int) -> None:
+    # [FUNCTION DOC] HELPER: Force the executor to start its worker processes immediately by calling private executor methods (start the queue management
+    # thread, or add processes and start the manager thread, depending on Python version), since forking is cheapest early.
     # We have to fork processes for compiler workers, but the more memory and other resources that are loaded, the
     # slower the os.fork time is, quite drastically. It also holds the GIL so we can't put it on another thread.
 
@@ -835,14 +922,17 @@ def _warm_process_pool(pool: ProcessPoolExecutor, n: int) -> None:
 
 
 class TestException(RuntimeError):
+    # [CLASS DOC] HELPER: Test-only exception type.
     pass
 
 
 def raise_testexc() -> Never:
+    # [FUNCTION DOC] HELPER: Test helper that always raises TestException.
     raise TestException
 
 
 def _test_signal_then_sleep(signal_path: str, seconds: float) -> None:
+    # [FUNCTION DOC] HELPER: Test helper: create the signal file to announce the job started, then sleep for the given seconds.
     # Test helper: announce that this worker has begun executing by creating
     # signal_path, then block. Lets a test wait until a job is actually running
     # in a worker before acting on the pool (e.g. shutting it down).
@@ -851,6 +941,7 @@ def _test_signal_then_sleep(signal_path: str, seconds: float) -> None:
 
 
 def _ignore_sigterm_and_sleep_for_test() -> None:
+    # [FUNCTION DOC] HELPER: Test helper: ignore SIGTERM and sleep forever, to exercise escalation to a kill during teardown.
     # Test helper: a compile worker that ignores SIGTERM and blocks, forcing pool
     # teardown to escalate to SIGKILL instead of stalling on a graceful shutdown.
     import signal
@@ -861,6 +952,7 @@ def _ignore_sigterm_and_sleep_for_test() -> None:
 
 
 def _report_phase_and_sleep_for_test(phase: int, seconds: float) -> None:
+    # [FUNCTION DOC] HELPER: Test helper: report the given heartbeat phase, then sleep for the given seconds.
     # Test helper: report a heartbeat phase from a worker, then block, so the
     # sidecar watchdog observes and reports that phase.
     watchdog.report_phase(watchdog.Phase(phase))

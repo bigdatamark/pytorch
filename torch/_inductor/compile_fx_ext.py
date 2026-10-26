@@ -1,3 +1,6 @@
+# [MODULE DOC] Infrastructure for serialized/out-of-process FX graph compilation: wire-protocol input and output containers, serializers for
+# Virtualized, lowering and fake tensor mode state, log capture and replay, and the _SerializedFxCompile, _OutOfProcessFxCompile and debug compile classes.
+# Import-time side effect: imports async_compile.
 from __future__ import annotations
 
 import contextlib
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
 
 
 def _graph_contains_triton_kernel_wrappers(gm: GraphModule) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if any (sub)GraphModule in gm has a node targeting a triton kernel wrapper higher-order op
+    # (functional or mutation variant), since those depend on process-local state and cannot be sent to another process.
     """
     Check if the graph contains triton kernel wrapper nodes. These nodes contain
     references to the kernel_side_table which is process-local and can't be
@@ -69,6 +74,8 @@ def _graph_contains_triton_kernel_wrappers(gm: GraphModule) -> bool:
 
 @dataclass
 class _VirtualizedSerializer:
+    # [CLASS DOC] HELPER: Dataclass snapshot of the serializable parts of the Virtualized global V (aot compilation, choices,
+    # local buffer context, ops, kernel, current node). Field names must match attributes of V.
     """
     This handles the data for serializing Virtualized.
     """
@@ -84,6 +91,7 @@ class _VirtualizedSerializer:
 
     @classmethod
     def serialize(cls) -> _VirtualizedSerializer:
+        # [FUNCTION DOC] Build a snapshot by reading each field's attribute from the current V.
         """
         Turn the current state of torch._inductor.virtualized.V into a
         serializable structure.
@@ -94,6 +102,7 @@ class _VirtualizedSerializer:
         return _VirtualizedSerializer(**kwargs)
 
     def patch(self) -> _VirtualizedSerializerContextManager:
+        # [FUNCTION DOC] Return a context manager that installs the saved values into V; see the context manager class.
         """
         Returns a context manager which patches the saved values into the
         current environment. While patched, any value not listed above will be
@@ -103,16 +112,21 @@ class _VirtualizedSerializer:
 
 
 class _VirtualizedSerializerContextManager(contextlib.ExitStack):
+    # [CLASS DOC] HELPER: ExitStack that, on entry, sets every V handler: handlers with a saved field get that value, all others are set to
+    # the poisoned placeholder so unexpected reads raise. Restores on exit.
     """
     Helper for _VirtualizedSerializer.patch()
     """
 
     def __init__(self, virtualized: _VirtualizedSerializer) -> None:
+        # [FUNCTION DOC] HELPER: Store the snapshot.
         super().__init__()
         self.virtualized = virtualized
 
     @override
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Enter the stack, then for every setter on V (names starting with set_, minus an optional handler suffix) enter its context
+        # with the saved value or the poison placeholder. Returns self.
         super().__enter__()
 
         for set_name in dir(V):
@@ -133,6 +147,7 @@ class _VirtualizedSerializerContextManager(contextlib.ExitStack):
 
 
 def _is_fallback_handler(op: object) -> bool:
+    # [FUNCTION DOC] HELPER: Return the op's fallback-handler marker, or False if it has none.
     try:
         return op._is_fallback_handler  # type: ignore[attr-defined]
     except AttributeError:
@@ -140,6 +155,8 @@ def _is_fallback_handler(op: object) -> bool:
 
 
 class _LoweringSerializer:
+    # [CLASS DOC] HELPER: Captures which lowerings were overridden with forced fallbacks (names kept in an ordered set) so a child process can
+    # reproduce them. Not a full copy of the lowering table (see comment about the limitation).
     """
     This handles the data for serializing lowering.lowering
     """
@@ -151,6 +168,7 @@ class _LoweringSerializer:
     fallbacks: OrderedSet[str]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Record the string names of all lowerings whose handler is a fallback handler.
         from . import lowering
 
         self.fallbacks = OrderedSet(
@@ -158,20 +176,24 @@ class _LoweringSerializer:
         )
 
     def patch(self) -> _LoweringSerializerContextManager:
+        # [FUNCTION DOC] Return a context manager that reapplies the recorded fallbacks.
         return _LoweringSerializerContextManager(self)
 
 
 class _LoweringSerializerContextManager(contextlib.ExitStack):
+    # [CLASS DOC] HELPER: ExitStack that forces fallback for each recorded lowering not already a fallback in the current process.
     """
     Helper for _LoweringSerializer.patch()
     """
 
     def __init__(self, lowering: _LoweringSerializer) -> None:
+        # [FUNCTION DOC] HELPER: Store the serializer.
         super().__init__()
         self.lowering = lowering
 
     @override
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Enter the stack and force fallback on every lowering named in the recorded set that is not already a fallback. Returns self.
         super().__enter__()
 
         from . import lowering
@@ -187,14 +209,18 @@ class _LoweringSerializerContextManager(contextlib.ExitStack):
 
 @dataclass
 class _FakeTensorModeSerializer:
+    # [CLASS DOC] HELPER: Carries the fake tensor mode settings to transfer: the allow_non_fake_inputs flag and the shape environment.
     allow_non_fake_inputs: bool
 
     def __init__(self, fake_mode: FakeTensorMode) -> None:
+        # [FUNCTION DOC] HELPER: Copy the flag and shape environment from the given fake mode.
         self.allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
         self.shape_env = fake_mode.shape_env
 
     @contextlib.contextmanager
     def patch(self, fake_mode: FakeTensorMode) -> Generator[None, None, None]:
+        # [FUNCTION DOC] Context manager: temporarily set the fake mode's allow_non_fake_inputs to the saved value and restore the old value afterwards.
+        # KNOWN ISSUE: the restore is not in a finally block, so an exception inside the with body leaves the changed value in place.
         saved_allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
         fake_mode.allow_non_fake_inputs = self.allow_non_fake_inputs
 
@@ -205,6 +231,8 @@ class _FakeTensorModeSerializer:
 
 @dataclass
 class _WireProtocolInput:
+    # [CLASS DOC] HELPER: Everything sent from parent to child for an out-of-process compile: graph module, example inputs, inputs to check,
+    # graph kwargs, tracing context, portable config, Virtualized snapshot, optional test determinism guard, logger state, lowering and fake mode snapshots.
     """
     For _SerializedFxCompile - encapsulates all the data being transferred
     (sent) from the parent to the child.
@@ -225,6 +253,7 @@ class _WireProtocolInput:
     fake_tensor_mode: _FakeTensorModeSerializer
 
     def serialize(self) -> _WireProtocolPickledInput:
+        # [FUNCTION DOC] Pickle this object with the graph-aware pickler and return it wrapped as a _WireProtocolPickledInput.
         """
         Turns this object into a _WireProtocolPickledInput which can be
         directly transferred across a stream.
@@ -235,6 +264,7 @@ class _WireProtocolInput:
 
 
 def _current_fake_mode() -> FakeTensorMode:
+    # [FUNCTION DOC] HELPER: Return the fake mode of the active tracing context if one exists, otherwise a new FakeTensorMode with a fresh ShapeEnv.
     fake_mode = None
     if context := torch._guards.TracingContext.try_get():
         fake_mode = context.fake_mode
@@ -247,9 +277,11 @@ def _current_fake_mode() -> FakeTensorMode:
 
 @dataclass
 class _WireProtocolPickledInput:
+    # [CLASS DOC] HELPER: Wrapper around the serialized bytes of a _WireProtocolInput.
     value: bytes
 
     def deserialize(self) -> _WireProtocolInput:
+        # [FUNCTION DOC] Unpickle using the current fake mode and return the _WireProtocolInput; raises AssertionError on a wrong type.
         """
         Turn this streamable object back into a _WireProtocolInput.
         """
@@ -264,6 +296,8 @@ class _WireProtocolPickledInput:
 
 @dataclass
 class _WireProtocolOutput:
+    # [CLASS DOC] HELPER: Everything returned from child to parent: the output code, metrics deltas, captured log records,
+    # recorded warnings (or None) and the shape environment.
     """
     For _SerializedFxCompile - encapsulates all the data being transferred
     (returned) back from the child to the parent.
@@ -276,6 +310,7 @@ class _WireProtocolOutput:
     shape_env: torch.fx.experimental.symbolic_shapes.ShapeEnv | None
 
     def serialize(self) -> _WireProtocolPickledOutput:
+        # [FUNCTION DOC] Prepare a compiled graph for serialization if applicable, pickle this object and return it wrapped as a _WireProtocolPickledOutput.
         """
         Turns this object into a _WireProtocolPickledOutput which can be
         directly transferred across a stream.
@@ -289,9 +324,12 @@ class _WireProtocolOutput:
 
 @dataclass
 class _WireProtocolPickledOutput:
+    # [CLASS DOC] HELPER: Wrapper around the serialized bytes of a _WireProtocolOutput.
     value: bytes
 
     def deserialize(self, constants: CompiledFxGraphConstants) -> _WireProtocolOutput:
+        # [FUNCTION DOC] Unpickle using the current fake mode, checking the type (AssertionError otherwise), and for compiled graphs
+        # run the post-deserialization hook with the given constants. Returns the _WireProtocolOutput.
         """
         Turn this streamable object back into a _WireProtocolOutput.
         """
@@ -307,6 +345,8 @@ class _WireProtocolPickledOutput:
 
 
 class _LoggerState:
+    # [CLASS DOC] HELPER: Context manager that records the levels of non-propagating torch._inductor loggers and, while entered, attaches queue handlers
+    # to capture their records for replay in the parent. Entering returns a _CapturedLogs object.
     """
     This class is for tracking logging that happens during an out-of-process
     compile so we can "replay" those messages when the compile is done. Used as
@@ -319,10 +359,13 @@ class _LoggerState:
     captured_logs: _CapturedLogs | None = None
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Walk the torch._inductor logger tree (using the logger registry under a lock on older Pythons, child listing on 3.12+)
+        # and store the name and level of every real logger that does not propagate to a parent.
         # Mapping from logger name to level.
         self.loggers = {}
 
         def filter(
+            # [FUNCTION DOC] HELPER: Type guard accepting only real loggers under torch._inductor that do not propagate; placeholders and propagating loggers are rejected.
             logger: logging.Logger | logging.PlaceHolder,
         ) -> TypeGuard[logging.Logger]:
             if not isinstance(logger, logging.Logger):
@@ -355,6 +398,7 @@ class _LoggerState:
                 q.extend(logger.getChildren())
 
     def __enter__(self) -> _CapturedLogs:
+        # [FUNCTION DOC] Start capturing: create and apply a _CapturedLogs, returning it. Raises AssertionError if already capturing.
         if self.captured_logs is not None:
             raise AssertionError("captured_logs already set on __enter__")
         self.captured_logs = _CapturedLogs(self)
@@ -362,6 +406,8 @@ class _LoggerState:
         return self.captured_logs
 
     def __exit__(
+        # [FUNCTION DOC] Remove the capture handlers; raises AssertionError if not capturing.
+        # KNOWN ISSUE: captured_logs is not reset to None afterwards, so entering the same instance again would raise.
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
@@ -373,6 +419,7 @@ class _LoggerState:
 
 
 class _CapturedLogs:
+    # [CLASS DOC] HELPER: Holds the unbounded queue of captured log records and the installed handlers by logger name (None when not applied).
     """
     Helper for _LoggerState - this class actually attaches to the logger in
     the child process and grabs the log messages themselves.
@@ -383,6 +430,7 @@ class _CapturedLogs:
     handlers: dict[str, logging.Handler] | None
 
     def __init__(self, state: _LoggerState) -> None:
+        # [FUNCTION DOC] HELPER: Store the state and create an empty queue with no handlers.
         self.state = state
         # A queue of the log entries
         # TODO: For memory purposes should we log to a file and then respond with that?
@@ -391,6 +439,7 @@ class _CapturedLogs:
         self.handlers = None
 
     def finish(self) -> list[logging.LogRecord]:
+        # [FUNCTION DOC] Drain the queue and return all captured records as a list; AssertionError if handlers are still applied.
         if self.handlers is not None:
             raise AssertionError("expected handlers to be None in finish")
         logs = []
@@ -402,6 +451,7 @@ class _CapturedLogs:
         return logs
 
     def remove(self) -> None:
+        # [FUNCTION DOC] Remove the queue handlers from their loggers; AssertionError if not applied.
         if self.handlers is None:
             raise AssertionError("expected handlers to be set in remove")
         handlers, self.handlers = self.handlers, None
@@ -410,6 +460,7 @@ class _CapturedLogs:
             logger.removeHandler(handler)
 
     def apply(self) -> None:
+        # [FUNCTION DOC] Attach a queue handler to every tracked logger and restore its recorded level (unless unset); AssertionError if already applied.
         from logging.handlers import QueueHandler
 
         if self.handlers is not None:
@@ -425,6 +476,8 @@ class _CapturedLogs:
 
 
 class _SerializedFxCompile(FxCompile):
+    # [CLASS DOC] FxCompile base class for compiles that cross a serialization boundary: pickle the inputs, run the compile in a child,
+    # unpickle the output. Subclasses implement _send_to_child; falls back to in-process compile when serialization is impossible.
     """
     This is used to represent an FxCompile which occurs across a serialized
     boundary.
@@ -432,6 +485,8 @@ class _SerializedFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
+        # [FUNCTION DOC] Serialize the compile request (falling back to an in-process compile if not possible), send it to the child, deserialize the
+        # result with the constants, tag compiled graphs with the region name, post-process, count the compile in stats and return the output code.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
@@ -465,6 +520,9 @@ class _SerializedFxCompile(FxCompile):
         return output.graph
 
     def serialize_compile(
+        # [FUNCTION DOC] Build the pickled input and constants holder for a compile. Returns None (caller should compile in-process) if the graph has
+        # uncacheable higher-order ops, triton kernel wrapper nodes, or if pickling fails (logged as a warning). Captures the tracing context,
+        # portable config, Virtualized, logging, lowering and fake mode state, and the test determinism guard when available.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
@@ -539,6 +597,7 @@ class _SerializedFxCompile(FxCompile):
 
     @abstractmethod
     def _send_to_child(
+        # [FUNCTION DOC] HELPER: Abstract; transfer the pickled input to the child, run the child entry point and return the pickled output.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
         # The implementation of this should transfer `input` to the child, call
@@ -546,10 +605,14 @@ class _SerializedFxCompile(FxCompile):
         ...
 
     def _postprocess(self, output: _WireProtocolOutput) -> None:
+        # [FUNCTION DOC] HELPER: Hook run on the deserialized output in the parent; the base implementation does nothing.
         pass
 
     @classmethod
     def _run_in_child(
+        # [FUNCTION DOC] Child-side entry point. Under an exit stack: patch subprocess environment, record warnings, deserialize the input, apply its
+        # Virtualized, lowering, config, logger capture, determinism guard, tracing context, debug context and fake mode settings, then do an in-process
+        # compile. Returns the pickled output with metrics deltas, captured logs, warnings and shape environment.
         cls,
         pickled_input: _WireProtocolPickledInput,
         extra_env: Mapping[str, str | None] | None = None,
@@ -602,8 +665,10 @@ class _SerializedFxCompile(FxCompile):
 # input and output but still runs the FxCompile in-process.
 @final
 class _DebugSerdeFxCompile(_SerializedFxCompile):
+    # [CLASS DOC] HELPER: Debug/test compile that serializes input and output but runs the compile in the same process.
     @override
     def _send_to_child(
+        # [FUNCTION DOC] HELPER: Run the child entry point directly in this process.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
         # For debugging just serde the input and output but don't run in a
@@ -612,6 +677,7 @@ class _DebugSerdeFxCompile(_SerializedFxCompile):
 
 
 class _OutOfProcessFxCompile(_SerializedFxCompile):
+    # [CLASS DOC] HELPER: Base for compiles run outside the current process; adds an asynchronous send hook and metrics/log/warning replay in post-processing.
     """
     Represents an FxCompile which is run outside the current process (in
     either a subprocess or possibly even a separate machine).
@@ -620,6 +686,7 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
     @override
     @final
     def _send_to_child(
+        # [FUNCTION DOC] HELPER: Send asynchronously and block on the future for its result. Final.
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
         f = self._send_to_child_async(pickled_input)
@@ -637,10 +704,13 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
 
     @abstractmethod
     def _send_to_child_async(
+        # [FUNCTION DOC] HELPER: Abstract; send the pickled input to the child and return a future of the pickled output.
         self, pickled_input: _WireProtocolPickledInput
     ) -> Future[_WireProtocolPickledOutput]: ...
 
     def _postprocess(self, output: _WireProtocolOutput) -> None:
+        # [FUNCTION DOC] HELPER: Apply the child's metrics deltas, forward the output source code to the test output-saving hook if set,
+        # replay recorded warnings and re-emit captured log records through their loggers in the parent.
         # Since our metrics were gathered in a subprocess make sure to add them
         # here.
         CachedMetricsHelper.apply_deltas(output.metrics)
@@ -658,6 +728,7 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
         # function exits.
         @functools.cache
         def getLogger(name: str) -> logging.Logger:
+            # [FUNCTION DOC] HELPER: Cached logger lookup by name.
             return logging.getLogger(name)
 
         if output.warning_replay:
@@ -693,10 +764,14 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
 #
 @final
 class _DebugFileFxCompile(_SerializedFxCompile):
+    # [CLASS DOC] HELPER: Debugging compile that writes the pickled input to a numbered temp file, prints its path and terminates the process.
+    # Counter of files is a class attribute.
     file_index = 0
 
     @override
     def _send_to_child(
+        # [FUNCTION DOC] HELPER: Write the input bytes to a temp file and print its path, then exit the whole process immediately
+        # (the alternative branches that run or read back a result are disabled).
         self, pickled_input: _WireProtocolPickledInput
     ) -> _WireProtocolPickledOutput:
         idx = _DebugFileFxCompile.file_index

@@ -1,3 +1,5 @@
+# [MODULE DOC] Tracks queue wait statistics for Inductor's async compile process pools via TrackedProcessPoolExecutor.
+# Import-time side effects: imports torch._thread_safe_fork and registers an atexit hook that logs the metrics.
 import atexit
 import concurrent
 import dataclasses
@@ -26,6 +28,8 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class _QueueStats:
+    # [CLASS DOC] HELPER: Plain record of process pool queue statistics: pending futures keyed by object id with enqueue
+    # time, list of queue wait durations, enqueue/dequeue counts, max observed queue depth and number of pools created.
     # Mapping from id(future) -> start time
     pending: dict[int, float] = dataclasses.field(default_factory=dict)
     timing: list[float] = dataclasses.field(default_factory=list)
@@ -42,7 +46,11 @@ _queue_stats_lock = threading.Lock()
 
 
 class TrackedProcessPoolExecutor(ProcessPoolExecutor):
+    # [CLASS DOC] ProcessPoolExecutor subclass that records, in module global statistics guarded by a lock, how long
+    # each submitted job waits in the queue before starting to run. Reported at exit by _queue_stats_report.
     def __init__(
+        # [FUNCTION DOC] Increment the global pool count under the lock, then construct the underlying executor
+        # with the given max_workers, multiprocessing context and initializer.
         self,
         max_workers: int | None = None,
         mp_context: BaseContext | None = None,
@@ -53,6 +61,8 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
         super().__init__(max_workers, mp_context, initializer)
 
     def _record_dequeue(self, f: Future[Any]) -> None:
+        # [FUNCTION DOC] HELPER: When a future leaves the pending state, remove it from the pending map (ignore if unknown),
+        # count a dequeue and append its queue wait time to the timing list. Takes the stats lock.
         now = time()
         with _queue_stats_lock:
             stats = _queue_stats
@@ -63,10 +73,14 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
             stats.timing.append(duration)
 
     def _record_enqueue(self, f: Future[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Register a newly submitted future: store its start time, bump the enqueue count and max queue depth,
+        # and wrap its set_running_or_notify_cancel method so the dequeue is recorded when it starts running.
+        # If the future is already past the pending state, record the dequeue immediately.
         # Monkeypatch the set_running_or_notify_cancel so we can track when the Future moves out of PENDING.
         saved_running_or_notify_cancel = f.set_running_or_notify_cancel
 
         def set_running_or_notify_cancel() -> Any:
+            # [FUNCTION DOC] HELPER: Wrapper that records the dequeue for the future then delegates to the original method and returns its result.
             self._record_dequeue(f)
             return saved_running_or_notify_cancel()
 
@@ -82,6 +96,7 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
             self._record_dequeue(f)
 
     def submit(
+        # [FUNCTION DOC] Submit a callable to the pool as the base class does, record the enqueue, and return the future.
         self, fn: Callable[_P, _R], /, *args: _P.args, **kwargs: _P.kwargs
     ) -> Future[_R]:
         # pyrefly: ignore [bad-argument-type]
@@ -92,6 +107,8 @@ class TrackedProcessPoolExecutor(ProcessPoolExecutor):
 
 @atexit.register
 def _queue_stats_report() -> None:
+    # [FUNCTION DOC] HELPER: Registered with atexit. If any pool was created, logs at info level the pool count, enqueue/dequeue counts,
+    # max queue depth and, when timings exist, the longest queue time, median and (with 20 or more samples) 95th percentile. Sorts the timing list in place.
     stats = _queue_stats
     if stats.pool_count == 0:
         return

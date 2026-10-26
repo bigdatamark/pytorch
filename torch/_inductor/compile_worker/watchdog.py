@@ -1,3 +1,6 @@
+# [MODULE DOC] Shared-memory heartbeat used by the compile worker sidecar watchdog to report which phase each worker is in.
+# Holds module globals for the shared array, slot counter and this worker's slot, with sidecar-side (create, reset,
+# read_heartbeats) and worker-side (init_worker_slot, set_current_job, report_phase, clear_current_job) functions.
 """Shared-memory heartbeat so the compile-worker sidecar's watchdog can report
 which phase a slow/stuck worker is in (see SubprocMain._watchdog_loop).
 
@@ -32,6 +35,8 @@ from typing import Any
 
 
 class Phase(IntEnum):
+    # [CLASS DOC] Integer enum of compile phases (RUNNING, QUERYING_CACHE, COMPILING) stored in the shared buffer;
+    # values must stay stable, append new ones only.
     # Persisted as ints in the shared buffer; append new phases, don't renumber.
     RUNNING = 0
     QUERYING_CACHE = 1
@@ -56,6 +61,8 @@ _slot: int | None = None
 
 
 def create(nprocs: int) -> None:
+    # [FUNCTION DOC] Sidecar side: allocate the shared heartbeat array (nprocs slots of several 64-bit fields, all marked idle)
+    # and the shared slot counter using a fork multiprocessing context. Sets module globals. Must run before forking workers.
     """Sidecar: allocate the shared buffer before forking the worker pool."""
     global _heartbeat, _counter, _nprocs
     ctx = multiprocessing.get_context("fork")
@@ -68,6 +75,8 @@ def create(nprocs: int) -> None:
 
 
 def reset() -> None:
+    # [FUNCTION DOC] Sidecar side: under the counter lock, reset the slot counter to zero and mark every slot idle with pid 0.
+    # No-op if the buffer was not created.
     """Sidecar: recycle all slots for a fresh worker generation. Call before
     (re)building the worker pool so the new workers claim clean slots 0..n-1."""
     if _heartbeat is None or _counter is None:
@@ -81,6 +90,8 @@ def reset() -> None:
 
 
 def init_worker_slot() -> None:
+    # [FUNCTION DOC] Worker side: atomically take the next slot number from the shared counter and, if it is below nprocs,
+    # remember it and write this process pid into the slot. No-op without a buffer.
     """Worker: claim this generation's next slot. No-op if the sidecar didn't
     allocate a buffer (main process / spawn pools)."""
     global _slot
@@ -97,6 +108,8 @@ def init_worker_slot() -> None:
 
 
 def set_current_job(job_id: int) -> None:
+    # [FUNCTION DOC] Worker side: reset the slot phase to RUNNING, stamp the phase start time, and finally write the job id
+    # so readers see a populated slot. No-op without a claimed slot.
     """Worker: mark the start of a job in this worker's slot."""
     if _heartbeat is None or _slot is None:
         return
@@ -108,6 +121,7 @@ def set_current_job(job_id: int) -> None:
 
 
 def report_phase(phase: Phase) -> None:
+    # [FUNCTION DOC] Worker side: stamp the phase start time and store the new phase in this worker's slot. No-op without a slot.
     """Worker: record the phase this worker just entered."""
     if _heartbeat is None or _slot is None:
         return
@@ -117,6 +131,7 @@ def report_phase(phase: Phase) -> None:
 
 
 def clear_current_job() -> None:
+    # [FUNCTION DOC] Worker side: mark this worker's slot idle by writing the empty sentinel to the job id field.
     """Worker: mark this slot idle when its job finishes."""
     if _heartbeat is None or _slot is None:
         return
@@ -124,11 +139,14 @@ def clear_current_job() -> None:
 
 
 def enabled() -> bool:
+    # [FUNCTION DOC] Return True if the shared heartbeat buffer exists (fork pools only).
     """Sidecar: whether phase heartbeats are active (fork pools only)."""
     return _heartbeat is not None
 
 
 def read_heartbeats() -> dict[int, tuple[int, int, int]]:
+    # [FUNCTION DOC] Sidecar side: scan all slots and return a mapping from job id to a tuple of (phase, phase start in monotonic ns,
+    # worker pid) for busy slots; empty mapping if disabled. Reads are unlocked, so a torn read is possible but harmless.
     """Sidecar: job_id -> (phase, phase_start_ns, pid) for currently-busy slots.
 
     phase_start_ns is worker monotonic_ns; on Linux CLOCK_MONOTONIC is

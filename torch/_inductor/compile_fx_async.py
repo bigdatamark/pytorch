@@ -1,3 +1,6 @@
+# [MODULE DOC] Asynchronous and progressive FX compile strategies: run eager or fast compiled code while out-of-process compiles
+# finish in the background, then hot-swap to the compiled result. Import-time side effect: imports async_compile to warm up pools.
+# Defines BUG_CACHES_DONT_WORK_WITH_ASYNC flag (True), ProgressiveCompilationState, _AsyncOutputCode/_AsyncFxCompile and _ProgressiveOutputCode/_ProgressiveFxCompile.
 from __future__ import annotations
 
 from collections import deque
@@ -31,6 +34,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class _PostCompileData:
+    # [CLASS DOC] HELPER: Dataclass bundling the arguments (example inputs, constants, graph kwargs) needed to call post_compile later,
+    # once a background compile result becomes available.
     example_inputs: Sequence[InputType]
     constants: CompiledFxGraphConstants
     graph_kwargs: _CompileFxKwargs
@@ -38,11 +43,15 @@ class _PostCompileData:
 
 @dataclass
 class ProgressiveCompilationState:
+    # [CLASS DOC] HELPER: Mutable state for progressive compilation: a queue of futures for increasingly optimized background compiles,
+    # the callback converting a pickled result into OutputCode, and the post-compile data (None until post_compile is called).
     progression_futures: deque[Future[_WireProtocolPickledOutput]]
     callback: Callable[[_WireProtocolPickledOutput], OutputCode]
     post_compile_data: _PostCompileData | None
 
     def check_and_get_ready_stage(self) -> int:
+        # [FUNCTION DOC] Return the index of the latest finished future in the queue, or -1 if the queue is empty,
+        # if no future is done, or if post-compile data has not been supplied yet. Does not block or mutate.
         """Check if any progression stage is ready and return its index, or -1 if none are ready."""
         if not self.progression_futures:
             return -1
@@ -56,6 +65,9 @@ class ProgressiveCompilationState:
         return stage_index
 
     def switch_to_progression_stage(self, stage_index: int) -> tuple[OutputCode, bool]:
+        # [FUNCTION DOC] Take the result of the future at stage_index, convert it to OutputCode with the callback, run post_compile on it
+        # if post-compile data exists, and drop that future and all earlier ones from the queue. Returns the new output code and
+        # whether no futures remain (so the caller may discard the state). Raises the future's exception if the compile failed.
         """
         Switch to the specified progression stage and return the optimized output code.
         Returns a tuple of (optimized_output_code, should_clear_compilation_state).
@@ -83,6 +95,9 @@ class ProgressiveCompilationState:
 # out-of-process compile to finish and then switching over to it.
 @final
 class _AsyncOutputCode(OutputCode):
+    # [CLASS DOC] HELPER: OutputCode that runs an eager function until an out-of-process compile future completes, then swaps in the
+    # compiled OutputCode. State: eager function (cleared after switch), compiled output code, pending future, conversion callback,
+    # deferred post-compile data, and the current boxed-call convention. Updates class-level run counters on _AsyncFxCompile.
     _eager_fn: Callable[..., Any] | None
     _output_code: OutputCode | None
     _future: Future[_WireProtocolPickledOutput] | None
@@ -91,6 +106,7 @@ class _AsyncOutputCode(OutputCode):
     _boxed_call: bool  # Copied from the forward/output_code
 
     def __init__(
+        # [FUNCTION DOC] Store the eager function, future and callback; the boxed-call flag is copied from the eager function.
         self,
         # eager_fn is run until the future is finished.
         eager_fn: Callable[..., Any],
@@ -109,6 +125,8 @@ class _AsyncOutputCode(OutputCode):
 
     @override
     def __call__(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Run the graph. If the future is done, first switch to the compiled output (adjusting argument boxing).
+        # Runs the eager function if still set, else the compiled output code, counting each run in the stats. Raises AssertionError if neither exists.
         if self._future is not None and self._future.done():
             args = self._switch_to_compiled_fn(args)
 
@@ -124,6 +142,9 @@ class _AsyncOutputCode(OutputCode):
 
     # Takes and returns the args (converted to the "right" boxed mode)
     def _switch_to_compiled_fn(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        # [FUNCTION DOC] HELPER: Consume the finished future, convert its result with the callback (re-raising any compile exception),
+        # apply deferred post_compile data, store the compiled output code and drop the eager function. If the boxed-call convention
+        # of the compiled code differs, repack the arguments (unpack the single boxed list or wrap them in a tuple). Returns the adjusted args.
         if self._future is None:
             raise AssertionError("expected self._future to be not None")
 
@@ -156,6 +177,8 @@ class _AsyncOutputCode(OutputCode):
 
     @override
     def post_compile(
+        # [FUNCTION DOC] If still running eager, save the arguments for later; otherwise forward the call to the compiled output code
+        # (AssertionError if absent).
         self,
         example_inputs: Sequence[InputType],
         constants: CompiledFxGraphConstants,
@@ -176,6 +199,8 @@ class _AsyncOutputCode(OutputCode):
 # over to using the compiled version.
 @final
 class _AsyncFxCompile(FxCompile):
+    # [CLASS DOC] HELPER: FxCompile strategy that compiles in-process eagerly for immediate use while also starting an out-of-process compile,
+    # returning an _AsyncOutputCode that switches over when ready. Holds the out-of-process compiler and class-level debug counters.
     _compile: _OutOfProcessFxCompile
 
     # Some debugging stats:
@@ -189,10 +214,12 @@ class _AsyncFxCompile(FxCompile):
     _stat_compiled_runs: int = 0
 
     def __init__(self, compile: _OutOfProcessFxCompile) -> None:
+        # [FUNCTION DOC] Store the out-of-process compiler.
         self._compile = compile
 
     @classmethod
     def _reset_stats(cls) -> None:
+        # [FUNCTION DOC] HELPER: Zero the class-level debug counters.
         cls._stat_bg_started = 0
         cls._stat_bg_finished = 0
         cls._stat_eager_runs = 0
@@ -200,6 +227,9 @@ class _AsyncFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
+        # [FUNCTION DOC] Compile in-process first (inheriting the compile region name). Then try to serialize the compile for the child;
+        # if not serializable return the eager result. Otherwise start the background compile, count it, and return an _AsyncOutputCode whose callback
+        # deserializes the result, sets the region name on compiled graphs, post-processes it and returns the graph.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
@@ -229,6 +259,8 @@ class _AsyncFxCompile(FxCompile):
 
         # This is called by _switch_to_compiled_fn() when f has a result...
         def callback(pickled_output: _WireProtocolPickledOutput) -> OutputCode:
+            # [FUNCTION DOC] HELPER: Count the finished background compile, deserialize the pickled output with the captured constants,
+            # tag the region name for CompiledFxGraph, run the compiler's postprocess, and return the resulting graph.
             _AsyncFxCompile._stat_bg_finished += 1
             output = pickled_output.deserialize(constants)
             if isinstance(output.graph, CompiledFxGraph):
@@ -243,6 +275,9 @@ class _AsyncFxCompile(FxCompile):
 # to a more optimized version when the expensive compile finishes.
 @final
 class _ProgressiveOutputCode(OutputCode):
+    # [CLASS DOC] HELPER: OutputCode that runs a fast-compiled version immediately and hot-swaps to more optimized background compiles as they finish.
+    # State: fast output code (dropped after the first swap), optimized output code, and a ProgressiveCompilationState (dropped when all futures are consumed).
+    # Always uses the boxed calling convention.
     _fast_output_code: OutputCode | None
     _optimized_output_code: OutputCode | None
     _compilation_state: ProgressiveCompilationState | None
@@ -252,6 +287,7 @@ class _ProgressiveOutputCode(OutputCode):
     _boxed_call: bool = True
 
     def __init__(
+        # [FUNCTION DOC] Store the fast output code and wrap the futures in a queue-based compilation state.
         self,
         # Fast compile that runs faster than the progressive compiles
         fast_output_code: OutputCode,
@@ -270,6 +306,8 @@ class _ProgressiveOutputCode(OutputCode):
 
     @override
     def __call__(self, args: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] Switch to a newer ready stage if any, then run the optimized output code if present else the fast one, counting runs.
+        # Passes the args as one boxed list or spread out depending on the chosen code's boxed flag. Returns the result.
         # Check if any newer progression stage is ready and switch to it
         self._check_and_switch_progression()
 
@@ -290,6 +328,7 @@ class _ProgressiveOutputCode(OutputCode):
         return res
 
     def _check_and_switch_progression(self) -> None:
+        # [FUNCTION DOC] HELPER: If compilation state remains and some stage is ready, switch to it; otherwise do nothing.
         if not self._compilation_state:
             return
 
@@ -301,6 +340,8 @@ class _ProgressiveOutputCode(OutputCode):
         self._switch_to_progression_stage(stage_index)
 
     def _switch_to_progression_stage(self, stage_index: int) -> None:
+        # [FUNCTION DOC] HELPER: Ask the state to produce the output code for the stage, make it the optimized code, drop the fast code,
+        # and discard the state when no futures remain. Raises AssertionError if the state is missing.
         if self._compilation_state is None:
             raise AssertionError("expected self._compilation_state to be not None")
         optimized_output_code, should_clear_state = (
@@ -316,6 +357,9 @@ class _ProgressiveOutputCode(OutputCode):
 
     @override
     def post_compile(
+        # [FUNCTION DOC] Forward post_compile to the fast output code and remember the arguments in the compilation state so they apply to
+        # optimized results later. Raises AssertionError if the fast code or state is gone.
+        # KNOWN ISSUE: fails if called after a swap, since the fast output code has been cleared by then.
         self,
         example_inputs: Sequence[InputType],
         constants: CompiledFxGraphConstants,
@@ -337,6 +381,8 @@ class _ProgressiveOutputCode(OutputCode):
 # progressive compiles in the background and hot-swaps when they're ready.
 @final
 class _ProgressiveFxCompile(FxCompile):
+    # [CLASS DOC] HELPER: FxCompile strategy that compiles quickly in-process and starts one background out-of-process compile per progression config,
+    # returning a _ProgressiveOutputCode. Holds fast compiler, optimized compiler, list of config override mappings and debug counters.
     _fast_compile: FxCompile
     _optimized_compile: _OutOfProcessFxCompile
     _progression_configs: list[dict[str, Any]]
@@ -348,6 +394,7 @@ class _ProgressiveFxCompile(FxCompile):
     _stat_optimized_runs: int = 0
 
     def __init__(
+        # [FUNCTION DOC] Store the fast compiler, optimized out-of-process compiler and progression configs.
         self,
         fast_compile: FxCompile,
         optimized_compile: _OutOfProcessFxCompile,
@@ -359,6 +406,7 @@ class _ProgressiveFxCompile(FxCompile):
 
     @classmethod
     def _reset_stats(cls) -> None:
+        # [FUNCTION DOC] HELPER: Zero the class-level debug counters.
         cls._stat_bg_started = 0
         cls._stat_bg_finished = 0
         cls._stat_fast_runs = 0
@@ -366,6 +414,10 @@ class _ProgressiveFxCompile(FxCompile):
 
     @override
     def codegen_and_compile(
+        # [FUNCTION DOC] For each progression config, patch inductor config, count a started compile, serialize and send the compile to the child,
+        # collecting futures (skipping unserializable ones). Then run the fast compile in-process. With no futures return the fast output;
+        # otherwise return a _ProgressiveOutputCode with a callback that deserializes and post-processes results.
+        # KNOWN ISSUE: the constants captured by the callback come from the last serialized config only.
         self,
         gm: GraphModule,
         example_inputs: Sequence[InputType],
@@ -405,6 +457,8 @@ class _ProgressiveFxCompile(FxCompile):
         # but may be skipped if a level either never completes or if a more optimal level
         # completes before a less optimal one is switched to.
         def callback(pickled_output: _WireProtocolPickledOutput) -> OutputCode:
+            # [FUNCTION DOC] HELPER: Count the finished compile, deserialize with the captured constants, set the region name on compiled graphs,
+            # post-process and return the graph. May run once per completed level, or be skipped for superseded levels.
             _ProgressiveFxCompile._stat_bg_finished += 1
             output = pickled_output.deserialize(constants)
             if isinstance(output.graph, CompiledFxGraph):
