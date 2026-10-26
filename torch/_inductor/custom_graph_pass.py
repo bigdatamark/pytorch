@@ -1,3 +1,5 @@
+# [MODULE DOC] Abstract interfaces for user supplied Inductor custom passes (graph, graph module, scheduler,
+# partitioner, runtime estimator, knapsack solver) with a uuid used for cache keys, plus type aliases and helpers.
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -13,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class CustomPassBase(ABC):
+    # [CLASS DOC] Abstract base for custom passes. Subclasses implement uuid, returning a picklable identifier included in the
+    # compiled graph cache key, or None to disable caching.
     """
     Implement this interface for custom passes:
 
@@ -44,6 +48,7 @@ class CustomPassBase(ABC):
 
     @abstractmethod
     def uuid(self) -> Any | None:
+        # [FUNCTION DOC] Abstract: return an identifier uniquely identifying the pass implementation, or None to skip caching.
         """
         Return an ID to uniquely identify your custom pass implementation. Return None
         to skip inductor code caching entirely.
@@ -51,6 +56,7 @@ class CustomPassBase(ABC):
 
 
 class CustomGraphPass(CustomPassBase):
+    # [CLASS DOC] Abstract custom pass operating on an fx Graph in place; call takes the graph and returns None.
     """
     Implement this interface for custom Graph passes:
 
@@ -72,12 +78,14 @@ class CustomGraphPass(CustomPassBase):
 
     @abstractmethod
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        # [FUNCTION DOC] Abstract: apply the custom pass to the graph in place.
         """
         Implementation of the custom pass.
         """
 
 
 class CustomGraphModulePass(CustomPassBase):
+    # [CLASS DOC] Abstract custom pass operating on a GraphModule in place.
     """
     Implement this interface for custom passes that operate on GraphModule:
 
@@ -88,12 +96,14 @@ class CustomGraphModulePass(CustomPassBase):
 
     @abstractmethod
     def __call__(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] Abstract: apply the custom pass to the graph module in place.
         """
         Implementation of the custom pass.
         """
 
 
 class CustomSchedulerPass(CustomPassBase):
+    # [CLASS DOC] Abstract custom pass over scheduler nodes; takes and returns a list of scheduler nodes.
     """
     Implement this interface for custom Scheduler passes:
 
@@ -104,18 +114,21 @@ class CustomSchedulerPass(CustomPassBase):
 
     @abstractmethod
     def __call__(self, nodes: list["BaseSchedulerNode"]) -> list["BaseSchedulerNode"]:
+        # [FUNCTION DOC] Abstract: transform the list of scheduler nodes and return the new list.
         """
         Implementation of the custom pass.
         """
 
 
 class CustomInferenceAwareGraphPass(CustomGraphPass):
+    # [CLASS DOC] Abstract graph pass whose call also receives an is_inference flag.
     """
     Implement this interface for custom inference aware Graph passes.
     """
 
     @abstractmethod
     def __call__(self, graph: torch.fx.graph.Graph, is_inference: bool) -> None:
+        # [FUNCTION DOC] Abstract: apply the pass to the graph in place, knowing whether it is an inference graph.
         """
         Implementation of the custom pass.
         """
@@ -140,6 +153,8 @@ CustomSchedulerPassCallable: TypeAlias = (
 def get_custom_graph_passes(
     custom_pass: CustomGraphPassType,
 ) -> tuple[CustomGraphPassCallable, ...]:
+    # [FUNCTION DOC] Normalize a custom pass setting into a tuple of passes: None gives empty, a list or tuple is converted
+    # to a tuple, a single pass is wrapped in a one-element tuple.
     if custom_pass is None:
         return ()
     if isinstance(custom_pass, (list, tuple)):
@@ -149,6 +164,8 @@ def get_custom_graph_passes(
 
 @lru_cache(1)
 def get_hash_for_files(paths: tuple[str, ...], extra: str = "") -> bytes:
+    # [FUNCTION DOC] Compute a sha256 digest over the extra string and the bytes of each listed file, in order. Returns bytes.
+    # Raises OSError if a file cannot be read. Result is memoized with a cache of size one.
     """
     Helper to compute a unique string by hashing the contents of a list of files.
     """
@@ -161,6 +178,8 @@ def get_hash_for_files(paths: tuple[str, ...], extra: str = "") -> bytes:
 
 
 class CustomPartitionerFn(CustomPassBase):
+    # [CLASS DOC] Abstract custom partitioner: call takes a graph module and joint inputs (plus keyword args) and returns
+    # a pair of graph modules (forward, backward); uuid identifies it for caching.
     """
     Implement this interface for custom partitioner:
 
@@ -191,12 +210,14 @@ class CustomPartitionerFn(CustomPassBase):
     def __call__(
         self, gm: torch.fx.GraphModule, joint_inputs: Sequence[object], **kwargs: Any
     ) -> tuple[torch.fx.GraphModule, torch.fx.GraphModule]:
+        # [FUNCTION DOC] Abstract: partition the joint graph module and return the two resulting graph modules.
         """
         Implementation of the custom partitioner.
         """
 
     @abstractmethod
     def uuid(self) -> Any | None:
+        # [FUNCTION DOC] Abstract: return an identifier for this partitioner, or None to skip caching.
         """
         Return an ID to uniquely identify your custom partitioner implementation.
         Return None to skip inductor code caching entirely.
@@ -207,6 +228,7 @@ CustomPartitionerFnType: TypeAlias = CustomPartitionerFn | None
 
 
 class CustomRuntimeEstimator(CustomPassBase):
+    # [CLASS DOC] Abstract custom runtime estimator: call maps an fx node to an estimated runtime as a float.
     """
     Implement this interface for custom runtime estimators:
 
@@ -227,6 +249,7 @@ class CustomRuntimeEstimator(CustomPassBase):
 
     @abstractmethod
     def __call__(self, node: "torch.fx.Node") -> float:
+        # [FUNCTION DOC] Abstract: return the estimated runtime of the given node.
         """
         Implementation of the custom runtime estimator.
 
@@ -239,6 +262,8 @@ class CustomRuntimeEstimator(CustomPassBase):
 
 
 class CustomKnapsackSolver(CustomPassBase):
+    # [CLASS DOC] Abstract custom knapsack solver for the partitioner's recompute decision; call returns two index lists
+    # (saved nodes, recomputed nodes).
     """
     Implement this interface for custom knapsack solvers:
 
@@ -273,6 +298,8 @@ class CustomKnapsackSolver(CustomPassBase):
         node_info: "NodeInfo",
         all_recomputable_banned_nodes: list["torch.fx.Node"],
     ) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Abstract: given memory costs, joint graph, memory budget, node info and banned recomputable nodes, return
+        # the indices of saved nodes and of recomputed nodes.
         """
         Implementation of the custom knapsack solver.
         """

@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities for Inductor's CUDA graph support: skip-reason checks (mutation, devices, allocator), placeholder
+# metadata, partition metadata remapping, and a pluggable CUDAGraphPolicy.
+# Import-time side effects: creates two artifact loggers (cudagraphs, cudagraph_static_inputs) and defines
+# type aliases OutputType and ModelType.
 # mypy: disallow-untyped-defs
 from __future__ import annotations
 
@@ -35,6 +39,8 @@ ModelType = Callable[[list[InputType]], OutputType]
 
 
 def cudagraph_trees_generation_cloning() -> Literal["user_visible"] | None:
+    # [FUNCTION DOC] Read the triton cudagraph_trees_generation_cloning config value and validate it.
+    # Returns None or the string user_visible; raises AssertionError for any other value.
     mode = config.triton.cudagraph_trees_generation_cloning
     if mode not in (None, "user_visible"):
         raise AssertionError(
@@ -46,6 +52,7 @@ def cudagraph_trees_generation_cloning() -> Literal["user_visible"] | None:
 
 
 def cudagraph_trees_clone_live_user_visible_outputs() -> bool:
+    # [FUNCTION DOC] Returns True when the generation cloning config mode is user_visible, otherwise False.
     return cudagraph_trees_generation_cloning() == "user_visible"
 
 
@@ -60,6 +67,10 @@ INPUT_STORAGE_MUTATION_TARGETS = (
 
 
 class CUDAGraphPolicy:
+    # [CLASS DOC] Pluggable policy hooking into Inductor's post_compile CUDA graph wrapping, selected via the cudagraph_policy
+    # config (None means built-in behavior). Subclasses override cudagraphify (how to wrap), should_wrap (whether to
+    # wrap an inner compiled graph) and wrap_output (optional outer wrapping). Defaults wrap everything via
+    # compile_fx.cudagraphify and leave outputs unchanged. Stateless.
     """Pluggable policy controlling CUDA graph wrapping in Inductor's post_compile.
 
     Override methods to customize:
@@ -92,6 +103,10 @@ class CUDAGraphPolicy:
         is_inference: bool,
         **kwargs: Any,
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] Wrap a compiled callable with CUDA graph capture/replay by delegating to compile_fx.cudagraphify.
+        # Args: model callable, example inputs (unused by the default), static input indices, device index and
+        # is_backward/is_inference flags; extra keyword args are forwarded. Returns the wrapped callable.
+        # The import of compile_fx happens lazily at call time.
         """Wrap a single compiled callable with CUDA graph capture/replay.
 
         Called by ``cudagraph_post_compile`` for each ``CompiledFxGraph``.
@@ -122,6 +137,7 @@ class CUDAGraphPolicy:
         )
 
     def should_wrap(self, compiled_graph: OutputCode) -> bool:
+        # [FUNCTION DOC] Decide whether a given inner compiled graph should get CUDA graph wrapping. Default always returns True.
         """Whether to apply cudagraph wrapping to this CompiledFxGraph.
 
         Called for each inner ``CompiledFxGraph`` during ``post_compile``.
@@ -133,6 +149,7 @@ class CUDAGraphPolicy:
         return True
 
     def wrap_output(self, output_code: _OC) -> _OC:
+        # [FUNCTION DOC] Optional outer-level wrapping of an OutputCode after post_compile. Default returns the input unchanged.
         """Optional outer-level wrapping after inner post_compile completes.
 
         Called by ``_compile_fx_inner``, ``BundledOutputCodeLoadable.post_compile``,
@@ -148,6 +165,7 @@ class CUDAGraphPolicy:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FunctionID:
+    # [CLASS DOC] HELPER: frozen record holding an integer id that uniquely identifies a function wrapped for cudagraph recording.
     "Unique counter of a function wrapped in cudagraphify_impl"
 
     id: int
@@ -155,6 +173,8 @@ class FunctionID:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PlaceholderInfo:
+    # [CLASS DOC] Frozen, serializable summary of an fx placeholder node: name, stack trace, user placeholder infos (recursive,
+    # one level deep in practice) and the stack trace of its mutating use. Used in cudagraph logging/error messages.
     """
     A serializable version of torch.fx.Node that contains information
     pertinent to placeholder stack traces. We use these in logging and error messages
@@ -170,12 +190,17 @@ class PlaceholderInfo:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class InputStorageMutationInfo:
+    # [CLASS DOC] Frozen record of graph inputs whose storage is rebound by set-like ops (input_idxs) plus the first
+    # stack trace found for such an op (or None).
     input_idxs: OrderedSet[int]
     stack_trace: str | None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class WrappedFunction:
+    # [CLASS DOC] Frozen description of a function to record for CUDA graph replay: the callable, static input indices, a
+    # FunctionID, constant tensors, placeholder infos, mutated input indices, a kernel_free_cudagraph flag and the
+    # set of user visible output indices. Used to find an applicable graph in the cudagraph tree.
     """
     Represents a function that you want to record for CUDA graph replay,
     with a little more metadata so we can identify if we have an applicable
@@ -197,6 +222,8 @@ class WrappedFunction:
 def get_mutating_use_stack_trace_from_node(
     placeholder_node: torch.fx.Node,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Find a stack trace for the mutating use of a placeholder node. If the node has exactly one user,
+    # return that user's stack_trace metadata; otherwise return the first stack trace on a copy_ user; else None.
     # reinplaced uses might have a single, non-copy_ use
     if len(placeholder_node.users) == 1:
         return next(iter(placeholder_node.users)).meta.get("stack_trace", None)
@@ -210,12 +237,16 @@ def get_mutating_use_stack_trace_from_node(
 
 
 def get_mutating_use_stack_trace(placeholder_info: PlaceholderInfo) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the stored mutating-use stack trace of a PlaceholderInfo (may be None).
     return placeholder_info.mutating_use_stack_trace
 
 
 def get_input_storage_mutation_info(
     gm: torch.fx.GraphModule,
 ) -> InputStorageMutationInfo:
+    # [FUNCTION DOC] Scan a graph module for storage-rebinding ops (set_, shallow_copy_data_ variants) whose first argument is
+    # directly a graph placeholder. Returns InputStorageMutationInfo with the placeholder indices (in placeholder
+    # order) and the stack trace of the first such op. Ops on temporary views are ignored. No side effects.
     placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
     placeholder_indices = {node: idx for idx, node in enumerate(placeholders)}
     storage_mutation_input_idxs: OrderedSet[int] = OrderedSet()
@@ -246,6 +277,8 @@ def get_input_storage_mutation_info(
 def get_input_storage_mutation_reason(
     storage_mutation_info: InputStorageMutationInfo,
 ) -> str | None:
+    # [FUNCTION DOC] Build a human readable skip reason from storage mutation info: None if no inputs were mutated, otherwise
+    # a message with the count of instances, with the stack trace appended when present.
     storage_mutation_input_idxs = storage_mutation_info.input_idxs
     if not storage_mutation_input_idxs:
         return None
@@ -258,6 +291,8 @@ def get_input_storage_mutation_reason(
 
 
 def to_placeholder_info(placeholder_node: torch.fx.Node) -> PlaceholderInfo:
+    # [FUNCTION DOC] Convert an fx node into a PlaceholderInfo. For placeholder nodes, recursively converts the users and finds the
+    # mutating use stack trace; for other nodes (the users) no recursion is done, so recursion depth is one.
     name = placeholder_node.name
     stack_trace = placeholder_node.meta.get("stack_trace", None)
     users = []
@@ -273,12 +308,14 @@ def to_placeholder_info(placeholder_node: torch.fx.Node) -> PlaceholderInfo:
 
 
 def get_placeholder_info(graph: torch.fx.Graph) -> list[PlaceholderInfo]:
+    # [FUNCTION DOC] Returns a list of PlaceholderInfo for every placeholder node of the graph, in graph order.
     return [
         to_placeholder_info(node) for node in graph.nodes if node.op == "placeholder"
     ]
 
 
 def format_default_skip_message(reason: str) -> str:
+    # [FUNCTION DOC] Returns the standard message text saying cudagraphs are skipped due to the given reason.
     return f"skipping cudagraphs due to {reason}"
 
 
@@ -286,6 +323,8 @@ def get_mutation_stack_trace(
     placeholders: Sequence[PlaceholderInfo],
     mutation_indices: AbstractSet[int] | Sequence[int],
 ) -> str:
+    # [FUNCTION DOC] Build the skip message for mutated inputs. Uses the first non-empty mutating-use stack trace among the placeholders
+    # at the mutation indices; appends it to the message when found. Returns the message string.
     stack_trace: str | None = ""
 
     for idx in mutation_indices:
@@ -307,6 +346,9 @@ def check_for_mutation(
     inputs: list[InputType],
     is_cuda_graph_recorded_tensor: Callable[[torch.Tensor], bool],
 ) -> str | None:
+    # [FUNCTION DOC] Check whether a wrapped function mutates inputs in a way that prevents cudagraphs. With cudagraph_trees on,
+    # mutations of static inputs or tensors already recorded by a cuda graph are ignored; otherwise all mutated indices count.
+    # Logs the indices at debug level. Returns None if no relevant mutation, else a skip-reason message.
     # doesn't work for non-trees because the warmup run would apply mutation twice
     if torch._inductor.config.triton.cudagraph_trees:
         # checking if mutation is only on parameters/static inputs
@@ -334,6 +376,7 @@ def check_for_mutation(
 
 
 def _get_use_stack_trace(node: torch.fx.Node) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the first non-empty stack_trace metadata among the node's users, or None.
     for use in node.users:
         if stack_trace := use.meta.get("stack_trace", None):
             return stack_trace
@@ -343,6 +386,9 @@ def _get_use_stack_trace(node: torch.fx.Node) -> str | None:
 def check_multiple_devices_or_any_cpu_nodes(
     device_node_mapping: dict[torch.device, torch.fx.Node],
 ) -> str | None:
+    # [FUNCTION DOC] Check device constraints for cudagraphs. Mutates the given mapping: removes meta entries, and cpu entries when cudagraph
+    # partition is in use. Returns a skip message if a cpu node remains (with a user stack trace if known) or if there are
+    # multiple devices or no cuda device; returns None when exactly one cuda device remains.
     # meta tensors are supported since there is no compute
     device_node_mapping.pop(torch.device("meta"), None)
 
@@ -369,6 +415,7 @@ def check_multiple_devices_or_any_cpu_nodes(
 
 
 def check_caching_allocator_for_cudagraphs() -> str | None:
+    # [FUNCTION DOC] Returns a skip message if CUDA is available but the caching allocator is disabled, else None.
     """Skip cudagraphs when the CUDA/HIP caching allocator is disabled
     (via ``torch.cuda.caching_allocator_enable(False)`` or the env-var
     bypass ``PYTORCH_NO_(CUDA|HIP)_MEMORY_CACHING``). Cudagraph capture
@@ -391,6 +438,7 @@ def check_caching_allocator_for_cudagraphs() -> str | None:
 def check_lowering_disable_cudagraph(
     device_node_mapping: dict[torch.device, torch.fx.Node],
 ) -> str | None:
+    # [FUNCTION DOC] Lowering-time check: returns the allocator skip reason if any, else the device check result (None when OK).
     return (
         check_caching_allocator_for_cudagraphs()
         or check_multiple_devices_or_any_cpu_nodes(device_node_mapping)
@@ -398,6 +446,9 @@ def check_lowering_disable_cudagraph(
 
 
 def log_cudagraph_skip_and_bump_counter(msg: str) -> None:
+    # [FUNCTION DOC] Log a cudagraph skip warning and increment the inductor cudagraph_skips counter. Raises RuntimeError with the
+    # message if the cudagraph_or_error config is set. Otherwise records cudagraph_skip_reason in the metrics context
+    # when one is in progress.
     cudagraphs_log.warning(msg)
     counters["inductor"]["cudagraph_skips"] += 1
 
@@ -411,9 +462,11 @@ def log_cudagraph_skip_and_bump_counter(msg: str) -> None:
 
 @dataclasses.dataclass
 class BoxedDeviceIndex:
+    # [CLASS DOC] Mutable box holding an optional device index (value), shared between holders so it can be set later.
     value: int | None
 
     def set(self, device_idx: int | None) -> None:
+        # [FUNCTION DOC] Set the boxed device index; raises AssertionError unless the argument is None or an int.
         if not (device_idx is None or isinstance(device_idx, int)):
             raise AssertionError(
                 f"expected device_idx to be None or int, got {device_idx!r}"
@@ -427,6 +480,10 @@ def check_for_mutation_ignore_cuda_graph_managed_tensor(
     mutated_input_idxs: OrderedSet[int],
     static_input_idxs: Sequence[int],
 ) -> str | None:
+    # [FUNCTION DOC] Check mutated inputs for the graph-module path. With cudagraph_trees, mutations of static inputs are ignored and
+    # a stack-trace based message is returned if others remain; otherwise any mutated input yields the default message.
+    # Returns None when no relevant mutation.
+    # KNOWN ISSUE: the mutated_inputs set is only used for its size in the non-tree path.
     default_msg = format_default_skip_message("mutated inputs")
 
     # doesn't work for non-trees because the warmup run would apply mutation twice
@@ -446,6 +503,7 @@ def check_for_mutation_ignore_cuda_graph_managed_tensor(
 
 
 def get_placeholder_stack_trace(placeholder: PlaceholderInfo) -> str | None:
+    # [FUNCTION DOC] Returns the placeholder's own stack trace if non-empty, else the first non-empty stack trace of its users, else None.
     """
     Gets the first non-empty stack trace of a placeholder or its users.
     """
@@ -460,6 +518,8 @@ def get_placeholder_stack_trace(placeholder: PlaceholderInfo) -> str | None:
 
 
 class CheckInvariantStatus(Enum):
+    # [CLASS DOC] Enum of outcomes for the cudagraph invariant check: SUCCESS and three mismatch kinds (managed tensor pointers,
+    # static input pointers, expected dead indices). str() gives a human readable description.
     # Check invariant succeeded
     SUCCESS = 1
 
@@ -473,6 +533,7 @@ class CheckInvariantStatus(Enum):
     ExpectedDeadIndicesBeforeGraphMismatch = 4
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a readable description for mismatch statuses; other members give the name and value.
         if self.name == "CudagraphManagedIdxMismatch":
             return "cudagraph managed tensor data pointer changed"
         elif self.name == "StaticInputIdxMismatch":
@@ -490,6 +551,9 @@ def log_data_ptr_mismatch(
     target_idxs: Sequence[int],
     mismatch: CheckInvariantStatus,
 ) -> str:
+    # [FUNCTION DOC] Build an error message listing, for the target indices, inputs whose current data pointer differs from the recorded one,
+    # with input name and stack trace. Raises AssertionError on length mismatch among inputs, recorded pointers and
+    # placeholders, or if a target input is not a tensor. Returns the message string, starting with the mismatch text.
     """
     Logs the mismatch between input data pointers and recorded data pointers.
     This checks only idxs in target_idxs.
@@ -520,9 +584,12 @@ def maybe_warning_due_to_dynamic_shape(
     fn_cache: dict[tuple[int, ...], Callable[..., Any]],
     new_int_key: Any,
 ) -> bool:
+    # [FUNCTION DOC] Warn if the number of recorded cudagraphs (cache size plus one) exceeds the dynamic shape warn limit config.
+    # Returns True if a warning was logged, else False. new_int_key is unused.
     num_cudagraphs = len(fn_cache.keys()) + 1
 
     def warn_msg() -> str:
+        # [FUNCTION DOC] HELPER: Builds the dynamic shape warning text including the distinct size count.
         return (
             "CUDAGraph supports dynamic shapes by recording a new graph for each "
             "distinct input size. Recording too many CUDAGraphs may lead to "
@@ -547,6 +614,8 @@ def maybe_warning_due_to_dynamic_shape(
 
 @dataclasses.dataclass(frozen=True)
 class CudagraphCachedInfo:
+    # [CLASS DOC] Frozen info needed to realign inputs: placeholders, stack traces, user visible output indices and
+    # cudagraph failure reasons.
     """
     Info needed to realign inputs
     """
@@ -559,6 +628,8 @@ class CudagraphCachedInfo:
 
 @dataclasses.dataclass(frozen=True)
 class CudagraphMetadata:
+    # [CLASS DOC] Frozen metadata for recording a CUDA graph: placeholders, static and mutated input index sets, stack traces,
+    # user visible output indices and a mapping of constant names to tensors.
     """
     Metadata for recording a CUDA graph.
     """
@@ -575,6 +646,9 @@ def get_partition_cudagraph_metadata(
     partition_map: GraphPartitionMap,
     metadata: CudagraphMetadata,
 ) -> CudagraphMetadata:
+    # [FUNCTION DOC] Convert graph level cudagraph metadata to a partition's metadata using the partition's input and output index
+    # mappings and constant names. Inputs not coming from graph inputs get dummy placeholders. For each output the stack
+    # trace comes from a user visible graph output if any, else the first mapped one; None if unmapped. Returns new CudagraphMetadata.
     """
     Convert the cudagraph metadata at the graph level to the graph partition level,
     given the graph partition info (i.e., mapping from partition input/output index
@@ -645,6 +719,8 @@ def get_partition_cudagraph_metadata(
 
 
 def collect_cuda_data_ptrs(obj: object) -> OrderedSet[int]:
+    # [FUNCTION DOC] HELPER: Debug helper returning the set of data pointers of CUDA tensors in the object (including subclass inner
+    # tensors, skipping fake, meta and non-cuda tensors). Non-tensors give an empty set; pointer errors are ignored.
     """Debug helper that collects the data pointers of all CUDA tensors in the object."""
     if not isinstance(obj, torch.Tensor):
         return OrderedSet()

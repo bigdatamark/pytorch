@@ -1,3 +1,9 @@
+# [MODULE DOC] Inductor debugging and tracing support: DebugContext/DebugFormatter that write debug artifacts (fx graphs, IR,
+# diagrams, autotuning results, profiles, logs) into a per-compilation directory, graph drawing helpers, kernel
+# provenance tracking globals (kernel to post-grad to pre-grad node mappings), structured-trace logging of collective
+# schedules / runtimes / graph execution order, saving and replaying compile_fx_inner arguments, and the AOT Inductor minifier wrapper.
+# Import-time side effects: creates the module logger and two artifact loggers, and defines module-level global state
+# (graph execution tracking flags, provenance dictionaries, a save-args counter).
 import collections
 import contextlib
 import copy
@@ -64,10 +70,13 @@ _RAW_DOT_GRAPH_FORMATS = OrderedSet(["dot", "raw"])
 
 @functools.cache
 def has_dot() -> bool:
+    # [FUNCTION DOC] Returns True if the graphviz dot executable is found on PATH. Result is cached.
     return shutil.which("dot") is not None
 
 
 def _get_graph_output_format(fname: str | None) -> str:
+    # [FUNCTION DOC] HELPER: Choose the graph output format: the file extension of fname if it has one, otherwise the functorch
+    # torch_compile_graph_format config.
     if fname is not None:
         _, ext = os.path.splitext(fname)
         if ext:
@@ -80,6 +89,10 @@ def draw_buffers(
     print_graph: bool = False,
     fname: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Draw the scheduler node graph to a file via graphviz. Args: scheduler nodes, print_graph to also print the fx graph,
+    # fname output path (defaults to the graph being compiled). Logs a warning and returns if a non-raw format needs dot
+    # and it is missing. Builds an fx graph from the nodes, attaches tensor metadata (shape group and dtype) to each node,
+    # legalizes it and renders it. Side effects: writes the diagram file, optional print. Returns None.
     """
     Draw a graph in fname.
     """
@@ -134,12 +147,18 @@ def draw_buffers(
 
 
 def create_fx_from_snodes(snodes: list[BaseSchedulerNode]) -> fx.Graph:
+    # [FUNCTION DOC] Build a fx graph from scheduler nodes. Each scheduler node becomes a fake call_function node named after the node,
+    # with fusion metadata (group, scheduler node, type among extern, template, nop, compute, fused). Nodes that feed
+    # graph outputs become the graph outputs; edges are made from read dependencies (missing buffers become placeholders,
+    # self edges are skipped). Raises RuntimeError for an unknown scheduler node type. Returns the fx Graph.
     """
     Creates a FX Graph from a list of SchedulerNode objects.
     """
 
     def get_fake_func(name: str) -> Callable[..., int]:
+        # [FUNCTION DOC] HELPER: Create a placeholder function with the given name that always returns 0, used as a fake call target.
         def func1(*args: Any) -> int:
+            # [FUNCTION DOC] HELPER: Fake call target; ignores arguments and returns 0.
             return 0
 
         func1.__name__ = name
@@ -186,6 +205,7 @@ def create_fx_from_snodes(snodes: list[BaseSchedulerNode]) -> fx.Graph:
         fx_node = graph.call_function(node_func, args=(), kwargs=kwargs)  # type: ignore[arg-type]
 
         def in_output(snode: BaseSchedulerNode | FusedSchedulerNode) -> bool:
+            # [FUNCTION DOC] HELPER: Whether a scheduler node (or any node inside a fused node) has an output buffer used by an output node.
             if isinstance(snode, FusedSchedulerNode):
                 return any(in_output(x) for x in snode.snodes)
             return any(
@@ -238,6 +258,10 @@ def update_orig_fx_node_name_to_buf_name(
     parent_buf_name: str | None = None,
     n_origins: int = 0,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursively map original fx node names to the scheduler buffer name that first claims them via IR origins.
+    # Fused nodes (more than one child) are recursed into using the outermost buffer name as the owner. Mutates the given mapping;
+    # does nothing for None. Raises AssertionError if a non-fused node does not have exactly itself as child.
+    # KNOWN ISSUE: the n_origins argument is unused.
     if nodes is None:
         return
     for node in nodes:
@@ -274,6 +298,8 @@ def update_orig_fx_node_name_to_buf_name(
 def get_node_name_to_buf_meta(
     node_name_to_buf_name: dict[str, str],
 ) -> dict[str, BufMeta]:
+    # [FUNCTION DOC] HELPER: Convert a mapping from node name to buffer name into a mapping from node name to BufMeta (buffer name and
+    # the number of node names that share that buffer).
     buf_name_to_n_node = {}
     for node_name, buf_name in node_name_to_buf_name.items():
         if buf_name not in buf_name_to_n_node:
@@ -293,6 +319,9 @@ def annotate_orig_fx_with_snodes(
     gm: torch.fx.GraphModule,
     snodes: SchedulerNodeList,
 ) -> None:
+    # [FUNCTION DOC] Annotate the original fx graph module nodes with buffer metadata (stored in node meta under buf_meta) derived from
+    # the scheduler nodes. Mutates gm in place; returns None.
+    # KNOWN ISSUE: the docstring wrongly says it creates an FX graph; the check that the mapping is None can never be true.
     """
     Creates a FX Graph from a list of SchedulerNode objects.
     """
@@ -308,6 +337,9 @@ def annotate_orig_fx_with_snodes(
 
 @contextlib.contextmanager
 def enable_aot_logging() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that, when the TORCH_COMPILE_DEBUG environment variable equals 1, patches the functorch
+    # debug_partitioner config and attaches a file handler (debug log under the debug dir torchinductor folder) to the
+    # aot_autograd logger for the duration; otherwise it just yields. The handler and patches are removed on exit. Yields None.
     compile_debug = os.environ.get("TORCH_COMPILE_DEBUG", "0") == "1"
 
     import torch._functorch.aot_autograd
@@ -361,6 +393,7 @@ _inductor_kernel_provenance_debug_handle: int = 0
 
 @dataclasses.dataclass
 class _KernelExternInfo:
+    # [CLASS DOC] HELPER: Per-kernel record for extern kernels: whether it is extern, an optional semantic key and optional shape/dtype metadata.
     is_extern: bool = False
     semantic_key: str | None = None
     shapes: dict[str, Any] | None = None
@@ -370,10 +403,13 @@ _inductor_kernel_extern_info: dict[str, _KernelExternInfo] = {}
 
 
 def get_kernel_information_jsons() -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC] Returns the module-level mapping of kernel information JSON dictionaries.
     return _kernel_information_jsons
 
 
 def alias_kernel_provenance(original_kernel_name: str, alias_kernel_name: str) -> None:
+    # [FUNCTION DOC] Make existing kernel provenance (stack traces and post-grad node info) for one kernel name available under an
+    # alias name. Mutates the module-level dictionaries; missing entries are skipped.
     """Expose existing kernel provenance under an additional generated name."""
     if original_kernel_name in _inductor_kernel_stack_trace:
         _inductor_kernel_stack_trace[alias_kernel_name] = _inductor_kernel_stack_trace[
@@ -386,12 +422,15 @@ def alias_kernel_provenance(original_kernel_name: str, alias_kernel_name: str) -
 
 
 def reset_inductor_kernel_provenance_debug_handle() -> None:
+    # [FUNCTION DOC] Reset the module-level kernel provenance debug handle counter to zero.
     global _inductor_kernel_provenance_debug_handle
     _inductor_kernel_provenance_debug_handle = 0
 
 
 @contextlib.contextmanager
 def reset_provenance_globals() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that saves copies of the provenance globals, resets them to defaults (graph id -1, empty mappings,
+    # handle 0) on entry, and restores the saved values on exit (even on error). Yields None.
     """Context manager that resets provenance tracking globals upon entering
     and restores their original values when exiting."""
     global _pre_grad_graph_id
@@ -449,10 +488,16 @@ def reset_provenance_globals() -> Iterator[None]:
 
 
 class DebugContext:
+    # [CLASS DOC] Context manager created per compilation that manages the debug directory (state: _path, _prof, _stack of exit
+    # callbacks), log capture and installs itself as the debug handler on V. Attribute access for unknown names returns the
+    # matching DebugFormatter method when trace config for that name is enabled, else a no-op callable.
     _counter = itertools.count()
 
     @staticmethod
     def create_debug_dir(folder_name: str) -> str | None:
+        # [FUNCTION DOC] Static: create a unique numbered directory under the debug dir (config trace debug_dir or the default) in a
+        # torchinductor folder, named by folder_name and a counter; skips counters whose directory already exists.
+        # Returns the path (None only if the counter is exhausted). Creates directories on disk.
         debug_dir = config.trace.debug_dir or get_debug_dir()
         for n in DebugContext._counter:
             dirname = os.path.join(
@@ -470,11 +515,14 @@ class DebugContext:
         return None
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize with no profiler, no path and an empty exit stack.
         self._prof = None
         self._path = None
         self._stack = contextlib.ExitStack()
 
     def copy(self, new_path: str) -> None:
+        # [FUNCTION DOC] Copy the debug directory to new_path (must end in .debug, else AssertionError) under a file lock, replacing any
+        # existing directory. Does nothing if no debug path. OS errors are logged as a warning.
         if not self._path:
             return
         if not new_path.endswith(".debug"):
@@ -498,6 +546,8 @@ class DebugContext:
         *args: Any,
         **kwargs: Any,
     ) -> IO[Any]:
+        # [FUNCTION DOC] Open a file inside the debug directory with the given mode and extra open arguments. Raises AssertionError if no
+        # debug path is set. Returns the file object.
         if not self._path:
             raise AssertionError("expected self._path to be set")
         return open(os.path.join(self._path, filename), write_mode, *args, **kwargs)
@@ -510,17 +560,22 @@ class DebugContext:
         *args: Any,
         **kwargs: Any,
     ) -> Iterator[IO[Any]]:
+        # [FUNCTION DOC] Context manager version of fopen: opens a file in the debug directory and yields it, closing on exit. Raises
+        # AssertionError if no debug path is set.
         if not self._path:
             raise AssertionError("expected self._path to be set")
         with open(os.path.join(self._path, filename), write_mode, *args, **kwargs) as f:
             yield f
 
     def filename(self, suffix: str) -> str:
+        # [FUNCTION DOC] Returns the path of a file with the given suffix inside the debug directory. Raises AssertionError if no path is set.
         if not self._path:
             raise AssertionError("expected self._path to be set")
         return os.path.join(self._path, suffix)
 
     def upload_tar(self) -> None:
+        # [FUNCTION DOC] If the trace upload_tar config callable is set, tar-gzip the debug directory and call the callable with the
+        # tarball path. Raises AssertionError if no debug path. Side effects: writes a tar file, external upload.
         if config.trace.upload_tar is not None:
             import tarfile
 
@@ -534,12 +589,16 @@ class DebugContext:
             config.trace.upload_tar(tar_file)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Enter the context: with config debug, set the torch._dynamo logger to DEBUG (restored on exit); install this
+        # context as the debug handler on V; if tracing is enabled create the debug directory and set up debug.log and/or
+        # info.log capture per config. Returns None.
         if config.debug:
             log = logging.getLogger("torch._dynamo")
             prev_level = log.level
             log.setLevel(logging.DEBUG)
 
             def reset_log_level(level: Any) -> None:
+            # [FUNCTION DOC] HELPER: Restore a logger level (callback registered on the exit stack).
                 log.setLevel(level)
 
             self._stack.callback(reset_log_level, prev_level)
@@ -561,6 +620,8 @@ class DebugContext:
         filename: str,
         level: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Open a log file in the debug directory and attach a stream handler at the level to the torch._inductor
+        # logger (lowering its level if needed); handler removal is registered on the exit stack.
         log = logging.getLogger("torch._inductor")
         fd = self._stack.enter_context(self.fopen(filename))
         ch = logging.StreamHandler(fd)
@@ -578,6 +639,8 @@ class DebugContext:
         exc_val: BaseException | None,
         exc_tb: Any | None,
     ) -> None:
+        # [FUNCTION DOC] Exit the context: if a profiler exists disable it and save its stats; if a debug path exists upload the tarball and
+        # log a warning with the path; close the exit stack (undoing handlers and log levels). Does not suppress exceptions.
         if self._prof:
             self._prof.disable()
             self._save_profile_data()
@@ -588,6 +651,8 @@ class DebugContext:
         self._stack.close()
 
     def _save_profile_data(self) -> None:
+        # [FUNCTION DOC] HELPER: Dump profiler data to compile.prof and write cumulative and total time statistics (top 100 each) to
+        # compile.stats in the debug directory. Raises AssertionError if no profiler is set.
         if not self._prof:
             raise AssertionError("expected self._prof to be set")
         self._prof.dump_stats(self.filename("compile.prof"))
@@ -600,6 +665,8 @@ class DebugContext:
             stats.print_stats(100)
 
     def __getattr__(self, name: str) -> Callable[..., None] | None:
+        # [FUNCTION DOC] Dynamic dispatch of debug hooks. If tracing is enabled and the config flag with this name is truthy, return the
+        # same-named DebugFormatter method (None with a warning if that fails); otherwise return a no-op callable accepting any arguments.
         if config.trace.enabled and getattr(config.trace, name):
             try:
                 return getattr(DebugFormatter(self), name)
@@ -609,13 +676,17 @@ class DebugContext:
         else:
 
             def ignored(*args: Any, **kwargs: Any) -> None:
+            # [FUNCTION DOC] HELPER: No-op replacement hook.
                 pass
 
             return ignored
 
 
 class DebugFormatter:
+    # [CLASS DOC] Writes the individual debug artifacts for a DebugContext; holds the handler and its file helper methods (fopen,
+    # fopen_context, filename). Method names match trace config flags and are looked up via DebugContext attribute access.
     def __init__(self, handler: DebugContext) -> None:
+        # [FUNCTION DOC] Store the handler and its file helpers.
         self.fopen = handler.fopen
         self.fopen_context = handler.fopen_context
         self.filename = handler.filename
@@ -626,6 +697,8 @@ class DebugFormatter:
         gm: torch.fx.GraphModule,
         inputs: list[torch.Tensor],
     ) -> None:
+        # [FUNCTION DOC] Write fx_graph_runnable.py (a repro script via save_graph_repro, optionally saving real tensors when configured, with
+        # tracing disabled during the save) and fx_graph_readable.py (printed readable graph) into the debug directory.
         with self.fopen("fx_graph_runnable.py") as fd:
             save_dir = None
             if torch._inductor.config.trace.save_real_tensors:
@@ -656,19 +729,23 @@ class DebugFormatter:
         gm: torch.fx.GraphModule,
         inputs: list[torch.Tensor],
     ) -> None:
+        # [FUNCTION DOC] Write the readable form of the transformed graph module to fx_graph_transformed.py. Inputs are unused.
         with self.fopen("fx_graph_transformed.py") as fd:
             fd.write(gm.print_readable(print_output=False))
 
     def ir_pre_fusion(self, nodes: SchedulerNodeList) -> None:
+        # [FUNCTION DOC] Write the pre-fusion IR text of the scheduler nodes to ir_pre_fusion.txt.
         with self.fopen("ir_pre_fusion.txt") as fd:
             fd.write(self._write_ir(nodes))
 
     def ir_post_fusion(self, nodes: SchedulerNodeList) -> None:
+        # [FUNCTION DOC] Write the post-fusion IR text of the scheduler nodes to ir_post_fusion.txt.
         with self.fopen("ir_post_fusion.txt") as fd:
             fd.write(self._write_ir(nodes))
 
     @staticmethod
     def _write_ir(nodes: SchedulerNodeList) -> str:
+        # [FUNCTION DOC] HELPER: Static: concatenate debug_str of each node separated by blank lines and return the string.
         buf = io.StringIO()
         for node in nodes:
             buf.write(node.debug_str())
@@ -676,6 +753,7 @@ class DebugFormatter:
         return buf.getvalue()
 
     def graph_diagram(self, nodes: SchedulerNodeList) -> None:
+        # [FUNCTION DOC] Draw the scheduler node graph to graph_diagram with the configured format extension in the debug directory.
         draw_buffers(
             nodes,
             fname=self.filename(f"graph_diagram.{config.trace.graph_diagram_format}"),
@@ -686,6 +764,8 @@ class DebugFormatter:
         gm: torch.fx.GraphModule,
         nodes: SchedulerNodeList,
     ) -> None:
+        # [FUNCTION DOC] Annotate the original fx graph with scheduler buffer info and draw it to the orig fx graph diagram file in the
+        # debug directory, using a scalable graphviz command and stack trace parsing.
         annotate_orig_fx_with_snodes(gm, nodes)
         draw_graph(
             gm,
@@ -699,6 +779,7 @@ class DebugFormatter:
         )
 
     def output_code(self, filename: str, extension: str = "py") -> None:
+        # [FUNCTION DOC] Copy the given generated code file into the debug directory as output_code with the given extension.
         shutil.copy(filename, self.filename(f"output_code.{extension}"))
 
     def log_autotuning_results(
@@ -710,9 +791,14 @@ class DebugFormatter:
         precompile_elapse: float,
         prescreening_elapse: float | None,
     ) -> None:
+        # [FUNCTION DOC] Append one JSON line per autotuning candidate to autotuning_result_json_list.txt in the debug directory. Each line merges
+        # the candidate's info dict with general properties (op name, CUDA device name and count, input node descriptions,
+        # autotune, precompile and prescreen times) and its benchmark time. Requires CUDA for the device queries.
         from .ir import FixedLayout
 
         def build_node_info(node: ir.IRNode) -> dict[str, str]:
+            # [FUNCTION DOC] HELPER: Describe an IR node as a dictionary of strings (name, type, layout with static hints, dtype, device, stride,
+            # size, numel, and nested data node); fields that raise errors are omitted.
             if hasattr(node, "name"):
                 node_name = node.name
             else:
@@ -789,6 +875,7 @@ class DebugFormatter:
 
 
 def log_ir_pre_fusion(nodes: SchedulerNodeList) -> None:
+    # [FUNCTION DOC] Log the pre-fusion IR at info level when enabled and forward the nodes to the debug handler hook.
     if ir_pre_fusion_log.isEnabledFor(logging.INFO):
         ir_pre_fusion_log.info("BEFORE FUSION\n%s", DebugFormatter._write_ir(nodes))
 
@@ -796,6 +883,7 @@ def log_ir_pre_fusion(nodes: SchedulerNodeList) -> None:
 
 
 def log_ir_post_fusion(nodes: SchedulerNodeList) -> None:
+    # [FUNCTION DOC] Log the post-fusion IR at info level when enabled and forward the nodes to the debug handler hook.
     if ir_post_fusion_log.isEnabledFor(logging.INFO):
         ir_post_fusion_log.info("AFTER FUSION\n%s", DebugFormatter._write_ir(nodes))
 
@@ -803,6 +891,7 @@ def log_ir_post_fusion(nodes: SchedulerNodeList) -> None:
 
 
 def _dump_collective_schedule(schedule: list[str | None]) -> None:
+    # [FUNCTION DOC] HELPER: Emit the collective schedule list as a structured trace artifact (json). Errors are logged at debug level, never raised.
     try:
         trace_structured(
             "artifact",
@@ -820,6 +909,8 @@ def _dump_collective_schedule(schedule: list[str | None]) -> None:
 
 
 def log_collective_schedule(nodes: Sequence[BaseSchedulerNode]) -> None:
+    # [FUNCTION DOC] Collect the kernel names of collective kernels among the scheduler nodes, in order, and dump them as a structured
+    # trace artifact only if at least one exists.
     schedule = [
         getattr(op, "python_kernel_name", None)
         for node in nodes
@@ -832,15 +923,20 @@ def log_collective_schedule(nodes: Sequence[BaseSchedulerNode]) -> None:
 
 
 def log_runtime_and_tensor_meta(node_runtimes: Sequence[tuple[Any, float]]) -> None:
+    # [FUNCTION DOC] Emit a structured trace artifact (json) with, per scheduler node, name, type (collective or compute), estimated
+    # runtime in ns and output shape/stride/dtype. Sizes are converted via optimization hints. All errors are swallowed
+    # with a debug log.
     """Log per-op runtime estimates and output tensor metadata for TLParse."""
 
     try:
         to_optimization_hints = V.graph.sizevars.optimization_hints
 
         def to_list(x: Sequence[Any] | None) -> list[Any]:
+            # [FUNCTION DOC] HELPER: Convert a size or stride sequence to a list of hinted values; None gives an empty list.
             return list(to_optimization_hints(x)) if x is not None else []
 
         def dtype_to_str(dtype: Any) -> str | None:
+            # [FUNCTION DOC] HELPER: Convert a dtype to a string without the torch prefix; None stays None.
             if dtype is None:
                 return None
             s = str(dtype)
@@ -896,6 +992,7 @@ def log_runtime_and_tensor_meta(node_runtimes: Sequence[tuple[Any, float]]) -> N
 
 
 def log_graph_execution() -> None:
+    # [FUNCTION DOC] Emit the recorded graph execution order as a structured trace artifact if any exists; errors are logged at debug level.
     """Emit a structured artifact with the graph execution order."""
     if not GRAPH_EXECUTION_ORDER:
         return
@@ -914,6 +1011,8 @@ def log_graph_execution() -> None:
 
 @contextlib.contextmanager
 def record_and_log_graph_execution_order() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that enables graph execution recording (resets execution order and compile id globals), and on
+    # exit logs the order and clears the globals and flag. Yields None.
     """Record graph execution order and log it once on exit."""
     global RECORD_GRAPH_EXECUTION, GRAPH_EXECUTION_ORDER, GRAPH_COMPILE_IDS
     GRAPH_EXECUTION_ORDER = []
@@ -930,12 +1029,14 @@ def record_and_log_graph_execution_order() -> Iterator[None]:
 
 @dataclasses.dataclass
 class TensorMetadataHolder:
+    # [CLASS DOC] HELPER: Pickle-friendly holder of tensor metadata and its device, replacing tensors when saving arguments.
     tensor_metadata: TensorMetadata
     device: torch.device
 
 
 @dataclasses.dataclass
 class SymExprMetadataHolder:
+    # [CLASS DOC] HELPER: Pickle-friendly holder of a symbolic scalar: type name, expression, hint and per-symbol hints.
     pytype: str
     expr: Any
     hint: int | float | bool | None
@@ -949,6 +1050,9 @@ def create_mapping_pre_post_grad_nodes(
     pre_grad_graph_id: int | None,
     post_to_pre_grad_nodes_json: dict[str, Any],
 ) -> dict[str, dict[str, list[str]]]:
+    # [FUNCTION DOC] Build bidirectional mappings (preToPost and postToPre) between pre-grad graph node names and post-grad node keys, from
+    # a provenance mapping, considering only nodes whose graph_id equals the pre-grad graph id and following nested from_node
+    # entries. Returns empty mappings on malformed input, non-int graph id or any exception (an error is signposted and logged).
     """
     Create bidirectional mappings between pre_grad graph nodes
     and post_grad graph code nodes, and vice versa.
@@ -976,6 +1080,7 @@ def create_mapping_pre_post_grad_nodes(
     try:
 
         def check_format(node: dict[str, Any]) -> bool:
+            # [FUNCTION DOC] HELPER: Validate that a provenance node is a mapping with graph_id, name and from_node keys; logs an error and returns False if not.
             if not isinstance(node, dict):
                 log.error(
                     "Provenance tracking error: node provenance in post_to_pre_grad_nodes_json is not a dict"
@@ -1016,6 +1121,8 @@ def create_mapping_pre_post_grad_nodes(
                     )
 
         def convert_sets_to_lists(d: dict[str, Any]) -> None:
+            # [FUNCTION DOC] HELPER: Convert each value of the mapping to a list in place so it is JSON serializable.
+            # KNOWN ISSUE: the final rebinding of d to a copy has no effect.
             for key in d:
                 d[key] = list(d[key])
             d = dict(d)
@@ -1047,6 +1154,8 @@ def create_mapping_pre_post_grad_nodes(
 def create_node_mapping_kernel_to_post_grad(
     triton_kernel_to_post_grad_json: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC] Build the kernel-to-post-grad and post-grad-to-kernel mappings (cppCodeToPost and postToCppCode) from a mapping of kernel
+    # name to list of post-grad node names. Returns empty mappings on malformed input or any exception (signposted and logged).
     """Create bidirectional mappings between triton kernel name and post_grad
     graph code nodes, and vice versa.
     """
@@ -1076,6 +1185,8 @@ def create_node_mapping_kernel_to_post_grad(
                 post_to_cpp_code[curr_node].add(outer_key)
 
         def convert_sets_to_lists(d: dict[str, Any]) -> None:
+            # [FUNCTION DOC] HELPER: Convert each value of the mapping to a list in place so it is JSON serializable.
+            # KNOWN ISSUE: the final rebinding of d to a copy has no effect.
             for key in d:
                 d[key] = list(d[key])
             d = dict(d)
@@ -1105,6 +1216,9 @@ def create_node_mapping_kernel_to_post_grad(
 
 
 def dump_inductor_provenance_info() -> dict[str, Any]:
+    # [FUNCTION DOC] Build the provenance node mapping dictionary: when a pre-grad graph id is set, merge the post-to-pre mapping with the
+    # kernel-to-post-grad mapping and, if tracing is enabled, write it to a json file in the debug directory; always add version 2.0.
+    # Returns an empty dictionary on any exception (signposted).
     try:
         global _pre_grad_graph_id
         global _inductor_post_to_pre_grad_nodes
@@ -1143,6 +1257,7 @@ def dump_inductor_provenance_info() -> dict[str, Any]:
 
 
 def _serialize_provenance_shape(size: Sequence[Any]) -> list[int | str]:
+    # [FUNCTION DOC] HELPER: Convert dimensions to a list where static dims become ints and symbolic dims become strings.
     shape: list[int | str] = []
     for dim in size:
         if ir._is_static(dim):
@@ -1153,6 +1268,7 @@ def _serialize_provenance_shape(size: Sequence[Any]) -> list[int | str]:
 
 
 def _get_tensor_metadata(node: ir.IRNode) -> tuple[list[int | str], str] | None:
+    # [FUNCTION DOC] HELPER: Returns the serialized shape and dtype string of an IR node, or None if it has no tensor output or unknown size or dtype.
     if not node.has_tensor_output():
         return None
 
@@ -1165,6 +1281,9 @@ def _get_tensor_metadata(node: ir.IRNode) -> tuple[list[int | str], str] | None:
 
 
 def create_kernel_information_json() -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC] Build per-kernel information (stack traces, post-grad nodes, pre-grad nodes, extern semantic key plus optional extern shape
+    # metadata) from the provenance globals, over all known kernels. The semantic key is the explicit annotation, else the single
+    # pre-grad node for extern kernels, else None. Returns an empty dictionary on any exception (signposted and logged).
     """Create kernel information JSON with extended metadata for cross-hardware comparison."""
     try:
         global _inductor_post_to_pre_grad_nodes
@@ -1233,6 +1352,11 @@ def set_kernel_post_grad_provenance_tracing(
     kernel_name: str,
     is_extern: bool = False,
 ) -> int | None:
+    # [FUNCTION DOC] Record provenance for a generated kernel: returns None if provenance tracking level is 0 or on any exception. Otherwise
+    # increments the debug handle, names the kernel with the handle appended, and for an extern kernel (must be an ExternKernel,
+    # else AssertionError caught and returns None) records origin nodes, semantic key and input/output shapes and dtypes; for a
+    # normal kernel (must be a list) records origins and stack traces from the scheduler nodes. Mutates the module globals.
+    # Returns the new debug handle.
     """
     Set the mapping between `kernel_name` and the post_grad nodes in `node_schedule`.
 
@@ -1359,6 +1483,9 @@ def set_kernel_post_grad_provenance_tracing(
 
 
 def save_args_for_compile_fx_inner(*args: Any, **kwargs: Any) -> None:
+    # [FUNCTION DOC] Pickle the arguments of a compile_fx_inner call into a numbered file under inductor_saved_args in the temp directory
+    # (creating the folder), after replacing tensors and symbolic values and graph module metadata with picklable holders.
+    # At debug log level prints the replay instructions. Side effects: file I/O, print.
     """
     This function is used to save arguments for a compile_fx_inner function call
     to the file system.  Later on one can replay the compile_fx_inner call
@@ -1370,6 +1497,7 @@ def save_args_for_compile_fx_inner(*args: Any, **kwargs: Any) -> None:
         os.mkdir(folder)
 
     def python_value(value: Any) -> int | float | bool | None:
+        # [FUNCTION DOC] HELPER: Convert a numeric or symbolic value to a plain int, float or bool; None stays None.
         if value is None:
             return None
         if isinstance(value, bool):
@@ -1385,6 +1513,7 @@ def save_args_for_compile_fx_inner(*args: Any, **kwargs: Any) -> None:
             return float(value)
 
     def handle_sym_expr(x: Any, pytype: str) -> SymExprMetadataHolder:
+        # [FUNCTION DOC] HELPER: Build a SymExprMetadataHolder for a symbolic scalar, capturing its expression, hint and backed hints of its free symbols.
         node = x.node
         shape_env = node.shape_env
         symbol_hints: dict[str, int | float | bool] = {}
@@ -1403,6 +1532,8 @@ def save_args_for_compile_fx_inner(*args: Any, **kwargs: Any) -> None:
         )
 
     def handle_tensor(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Replace a value with a picklable form: graph modules are deep-copied with node metadata converted; tensors become
+        # TensorMetadataHolder; symbolic int, float, bool become SymExprMetadataHolder; others are returned unchanged.
         """
         Pickle FakeTensor/SymInt will result in errors like:
         AttributeError: Can't pickle local object 'WeakValueDictionary.__init__.<locals>.remove'
@@ -1452,6 +1583,8 @@ load_args_and_run_compile_fx_inner({path!r})
 
 
 def load_args_and_run_compile_fx_inner(path: str) -> Any:
+    # [FUNCTION DOC] Load arguments saved by save_args_for_compile_fx_inner from a pickle file, rebuild fake tensors (random strided) and symbolic values
+    # under a fake mode with a fresh shape env, and run compile_fx_inner with save_args disabled. Returns its result.
     from torch._dynamo.source import ConstantSource
     from torch._inductor.compile_fx import compile_fx_inner
     from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
@@ -1463,6 +1596,8 @@ def load_args_and_run_compile_fx_inner(path: str) -> Any:
     symbol_cache: dict[str, Any] = {}
 
     def restore_sym_expr(x: SymExprMetadataHolder) -> Any:
+        # [FUNCTION DOC] HELPER: Recreate a symbolic int, float or bool from a SymExprMetadataHolder using the shared shape env and symbol cache
+        # (backed symbols from hints, otherwise unbacked). Raises AssertionError for an unknown type.
         expr = x.expr
         if isinstance(expr, str):
             import sympy
@@ -1502,6 +1637,8 @@ def load_args_and_run_compile_fx_inner(path: str) -> Any:
             raise AssertionError(f"Unexpected symbolic expression type: {x.pytype}")
 
     def handle_tensor(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Inverse of the save-time conversion: graph module metadata is restored in place, tensor holders become random
+        # strided tensors, symbolic holders become symbolic values; others are unchanged.
         if isinstance(x, GraphModule):
             for node in x.graph.nodes:
                 node.meta = tree_map(handle_tensor, node.meta)
@@ -1534,6 +1671,10 @@ def aot_inductor_minifier_wrapper(
     inductor_configs: dict[str, Any],
     package_path: FileLike | None = None,
 ) -> str:
+    # [FUNCTION DOC] Wrapper around an AOT Inductor compile function that supports the minifier. With dump_aoti_minifier: repro level 3 dumps the
+    # module first; level 4 first checks accuracy on flattened inputs. Runs func with load_and_run set to the minifier flag and returns its
+    # string result. On AccuracyError dumps a minify accuracy repro and re-raises; on other errors with the minifier on, dumps a repro
+    # (run for level 1, else minify) and re-raises. Raises AssertionError if the module is not a GraphModule.
     from torch._dynamo.debug_utils import AccuracyError
     from torch._dynamo.repro.aoti import dump_to_minify
     from torch._inductor import config
