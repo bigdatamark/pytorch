@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Base template class for generating CUTLASS C++ kernels in Inductor.
+# Defines ArgInfo (runtime argument name and C++ type) and CUTLASSTemplate, which handles
+# code generation with caching, builds the benchmark request and template caller used
+# for autotuning, and provides shared C++ header, global definitions and type-cast
+# helpers. Concrete GEMM templates subclass it and implement render.
+# Import-time side effects: creates an autotuning artifact logger and a module-level
+# alias for the GEMM operation type (any).
 import functools
 import hashlib
 import itertools
@@ -34,12 +41,21 @@ autotuning_log = getArtifactLogger(__name__, "autotuning")
 
 @dataclass(frozen=True)
 class ArgInfo:
+    # [CLASS DOC] Immutable description of one runtime kernel argument: name (key looked
+    # up in generate kwargs) and ty (C++ type string).
     name: str
     ty: str
 
 
 @clear_on_fresh_cache
 class CUTLASSTemplate(KernelTemplate):
+    # [CLASS DOC] Base class for CUTLASS kernel templates (not instantiated directly).
+    # Instance state: input_nodes, output_node (a placeholder output buffer named buf_out
+    # with the given layout), optional input_reorder, layout and device_type taken from the
+    # layout device. Class state: a global index counter and a code cache mapping a key to
+    # (code, size args, offset args), cleared on fresh cache via the decorator. Key methods:
+    # generate (builds a template caller for autotuning), generate_code_and_args (cached
+    # rendering), header and globals (shared C++ preamble), and render (abstract).
     """
     CUTLASSTemplate is a class that provides a template for generating CUTLASS Templates. Used as a baseclass for the
     CUTLASSGemmTemplate, providing functionality that might also be relevant for non-GEMM CUTLASS Kernels.
@@ -57,6 +73,9 @@ class CUTLASSTemplate(KernelTemplate):
         layout: Layout,
         input_reorder: list[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base template with its name, input buffers,
+        # output layout and optional input ordering; creates the placeholder output buffer
+        # and records the layout's device type string.
         """
         Baseclass for CUTLASS C++ Templates, derived from KernelTemplate.
         Not to be instantiated directly.
@@ -79,13 +98,20 @@ class CUTLASSTemplate(KernelTemplate):
     @functools.lru_cache(None)
     # pyrefly: ignore [bad-override]
     def _template_from_string(cls, source: str) -> Any:
+        # [FUNCTION DOC] HELPER: Memoized wrapper delegating to the base class template
+        # compiler for the given source text.
         return KernelTemplate._template_from_string(source)
 
     @staticmethod
     def supports_epilogue_fusion(op: GemmOperation, device_type: str) -> bool:
+        # [FUNCTION DOC] Default policy hook: epilogue fusion is not supported (always
+        # False). Subclasses override it per operation and device type.
         return False
 
     def make_key(self, name: str, input_key: str, layout_repr: str) -> str:
+        # [FUNCTION DOC] Returns a hex digest cache key from the name, input key, input
+        # reorder, output layout text and runtime arg info (but not runtime arg values).
+        # KNOWN ISSUE: the docstring mentions a kwargs argument that the function lacks.
         """
         Make a key for the code cache. The idea of the method is to cache
         everything that matters but doesn't include runtime param values, i.e.,
@@ -110,6 +136,15 @@ class CUTLASSTemplate(KernelTemplate):
     def generate_code_and_args(
         self, name: str, input_key: str, layout_repr: str, **kwargs
     ) -> tuple[str, tuple[int, ...]]:
+        # [FUNCTION DOC] Returns (C++ source, extra runtime args). Extra args are the
+        # dynamic shape args, then offset args, then runtime arg values from kwargs. If
+        # caching is enabled and the key is cached, reuses the cached code and size and
+        # offset args and only recomputes runtime values. Otherwise renders the template
+        # with a fresh kernel while the graph dtype lookup is patched to the output node,
+        # logs the code and args, and raises AssertionError if the leading call arguments
+        # are not the deduplicated reordered inputs followed by the output. Symbolic
+        # sizes are resolved to concrete hints for benchmarking. Side effect: stores into
+        # the class-level code cache when a key exists.
         """
         Generate code and args with caching. We cache the code even if runtime
         args are different.
@@ -187,6 +222,13 @@ class CUTLASSTemplate(KernelTemplate):
         output_tensor_meta: TensorMeta | list[TensorMeta],
         **kwargs,
     ) -> CUTLASSTemplateCaller:
+        # [FUNCTION DOC] Generates code, names the kernel from a short hash of the source
+        # (replacing the template name inside the code), builds a benchmark request, and
+        # determines epilogue fusion support from the op in kwargs (false if no op,
+        # otherwise the class policy for the op and device). Returns a template caller
+        # holding a render factory that builds a fresh kernel and a partial render for a
+        # given template buffer and epilogue nodes. Requires an op entry in kwargs (key
+        # error otherwise).
         """
         Generates the CUDA template caller object for the given GEMM template and operation.
         This CUTLASSTemplateCaller may be used to call and benchmark the generated CUDA kernel
@@ -235,6 +277,10 @@ class CUTLASSTemplate(KernelTemplate):
             template_node: CUTLASSTemplateBuffer,
             epilogue_nodes: list[BaseSchedulerNode] | None = None,
         ) -> tuple[CUTLASSTemplateKernel, functools.partial[str]]:
+            # [FUNCTION DOC] HELPER: Creates a new template kernel and a deferred render
+            # call bound to it, the template buffer node, epilogue nodes and the generate
+            # kwargs. Raises AssertionError if epilogue nodes are given but fusion is
+            # unsupported. Returns (kernel, render partial).
             if not supports_epilogue_fusion and epilogue_nodes:
                 raise AssertionError("epilogue fusion is not supported for this kernel")
             kernel = CUTLASSTemplateKernel(
@@ -266,6 +312,8 @@ class CUTLASSTemplate(KernelTemplate):
         )
 
     def header(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Returns a buffer with the C++ standard library and CUTLASS/CuTe
+        # include lines shared by all generated kernels.
         res = IndentedBuffer()
         res.splice(
             """
@@ -291,6 +339,10 @@ class CUTLASSTemplate(KernelTemplate):
         return res
 
     def globals(self) -> IndentedBuffer:
+        # [FUNCTION DOC] Returns a buffer with shared C++ definitions: a symbol export
+        # macro (visibility or dll export by compiler), a using directive for cute, a
+        # status-check macro that throws a runtime error on CUTLASS failure, and an
+        # identity functor used for casting or rounding in epilogue trees.
         res = IndentedBuffer()
         res.splice(
             """
@@ -333,6 +385,9 @@ class CUTLASSTemplate(KernelTemplate):
         return res
 
     def cute_int(self, int_str: str, var_name: str) -> str:
+        # [FUNCTION DOC] Returns C++ text for an integer value followed by a comment with
+        # the variable name; the strings one and long-one become a compile-time constant
+        # of one, anything else is passed through.
         res = ""
         if int_str in ("1", "1L"):
             res = "cute::Int<1>{}"
@@ -361,12 +416,20 @@ class CUTLASSTemplate(KernelTemplate):
     }
 
     def cutlass_type_cast(self, node: IRNode, ptr: str) -> str:
+        # [FUNCTION DOC] Returns the pointer text unchanged if node is None, else a C++
+        # cast of the pointer to a pointer of the CUTLASS type matching the node dtype.
+        # KNOWN ISSUE: unsupported dtypes yield the text None in the cast instead of
+        # raising an error.
         if node is None:
             return ptr
         else:
             return f"({self._DTYPE_TO_CUTLASS.get(node.get_dtype())}*)({ptr})"
 
     def cutlass_sparse_meta_type_cast(self, node: IRNode, ptr: str) -> str:
+        # [FUNCTION DOC] Like the type cast helper but for sparse metadata tensors: maps
+        # 32-bit and 16-bit integer dtypes to unsigned C++ types; returns the pointer
+        # unchanged if node is None.
+        # KNOWN ISSUE: other dtypes yield the text None in the cast instead of raising.
         if node is None:
             return ptr
         else:
@@ -375,12 +438,18 @@ class CUTLASSTemplate(KernelTemplate):
             )
 
     def render(self, **kwargs) -> str:
+        # [FUNCTION DOC] Abstract hook: subclasses return the kernel C++ source. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def get_runtime_arg_info(self) -> list[ArgInfo]:
+        # [FUNCTION DOC] Returns the runtime argument descriptions; by default a single
+        # constant unsigned 8-bit swizzle argument.
         return [ArgInfo("swizzle", "const uint8_t")]
 
     def get_runtime_arg_values(self, **kwargs) -> list[Any]:
+        # [FUNCTION DOC] Returns the values from kwargs for each runtime arg in order;
+        # raises a key error if one is missing.
         """
         Helper method to retrieve runtime args from generate kwargs
         """

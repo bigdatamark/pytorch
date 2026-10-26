@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Debug helpers for printing or saving intermediate tensor values around
+# kernel launches in generated Inductor code (both the Python wrapper and the AOTI C++
+# wrapper). Contains a runtime tensor-stats printer used by generated Python code, the
+# IntermediateValueDebuggingLevel enum selecting the mode, and DebugPrinterManager, a
+# context manager that emits the print or save lines into the wrapper code before and
+# after a kernel call. Import-time side effects: creates a module logger.
 from __future__ import annotations
 
 import functools
@@ -23,6 +29,11 @@ log = logging.getLogger(__name__)
 
 
 def _print_debugging_tensor_value_info(msg, arg):
+    # [FUNCTION DOC] HELPER: Runtime function called from generated code. Prints the
+    # message, then if arg is not a tensor prints its value and returns. For tensors
+    # prints the contents when there are at most 64 elements, then element count, size,
+    # dtype and mean, min, max and standard deviation computed on a float copy. Side
+    # effect: writes to standard output; forces device synchronization via item calls.
     # helper for printing debugging stats for intermediate tensor values
     # at jit inductor level codegen
     max_numel_to_print = 64
@@ -48,6 +59,10 @@ def _print_debugging_tensor_value_info(msg, arg):
 
 # AOTI debug printing related configs
 class IntermediateValueDebuggingLevel(Enum):
+    # [CLASS DOC] Enumeration of debug modes (values are the strings of the config
+    # setting): OFF (zero), SAVE_ONLY (one, save every intermediate tensor to a file),
+    # PRINT_ONLY (two, print tensor values), PRINT_KERNEL_NAMES_ONLY (three, print only
+    # kernel names, useful for locating a crashing kernel).
     # OFF: No intermediate tensor value debug info will be printed or saved.
     OFF = "0"
     # LEVEL 1: Save all intermediate tensor values to individual `.pt` files. No debug printing will be displayed.
@@ -60,6 +75,13 @@ class IntermediateValueDebuggingLevel(Enum):
 
 
 class DebugPrinterManager:
+    # [CLASS DOC] Context manager that wraps the emission of a kernel call in the wrapper
+    # code, writing debug print or save lines before launch on entry and after launch on
+    # exit, according to the debugging level. State: debug_printer_level, use_array_ref
+    # (C++ array-ref tensors need conversion), args_to_print_or_save, kernel_name,
+    # arg_signatures, kernel, kernel_type, and the lower-cased filter list of kernel
+    # names from config. Usage: call set_printer_args to configure, then use as a
+    # with-block around kernel call codegen. Output goes through the graph wrapper code.
     def __init__(
         self,
         debug_printer_level,
@@ -71,7 +93,12 @@ class DebugPrinterManager:
         arg_signatures: list[type] | None = None,
         kernel_type=None,
     ):
-        self.debug_printer_level = IntermediateValueDebuggingLevel(debug_printer_level)
+        # [FUNCTION DOC] Stores the arguments, converting the level into the enum (raises
+        # ValueError for an invalid level value) and defaulting the arg list to empty.
+        # The kernel filter names are read from config.
+        # KNOWN ISSUE: the arg_signatures and kernel_type parameters are ignored; both
+        # attributes are reset to None here and only set later by set_printer_args.
+        self.debug_printer_level =IntermediateValueDebuggingLevel(debug_printer_level)
         self.use_array_ref = use_array_ref
         if args_to_print_or_save is None:
             args_to_print_or_save = []
@@ -83,6 +110,8 @@ class DebugPrinterManager:
         self.kernel_type = None
 
     def __enter__(self):
+        # [FUNCTION DOC] Emits the pre-launch debug lines for the configured args and
+        # kernel name. Returns None (the with-target is not usable).
         self._perform_debug_print_or_save_helper(
             self.args_to_print_or_save,
             self.kernel_name,
@@ -91,6 +120,11 @@ class DebugPrinterManager:
         )
 
     def __exit__(self, args_to_print_or_save, kernel_name, arg_signatures):
+        # [FUNCTION DOC] Emits the post-launch debug lines. Does not suppress exceptions.
+        # KNOWN ISSUE: the parameters are really the exception type, value and traceback
+        # of the context manager protocol, but are named and forwarded as if they were
+        # args, kernel name and signatures; the helper ignores them and uses instance
+        # state, so behavior is correct only by accident.
         self._perform_debug_print_or_save_helper(
             args_to_print_or_save,
             kernel_name,
@@ -105,6 +139,12 @@ class DebugPrinterManager:
         before_launch,
         arg_signatures: list[type] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Dispatches on the debug level: nothing for OFF; save
+        # codegen for SAVE_ONLY; print codegen for PRINT_ONLY; kernel-name-only print
+        # (empty arg list) for PRINT_KERNEL_NAMES_ONLY. before_launch selects the phase
+        # label. Side effect: emits lines into wrapper code.
+        # KNOWN ISSUE: the args, kernel name and signatures parameters are ignored in
+        # favor of the instance attributes of the same meaning.
         if self.debug_printer_level == IntermediateValueDebuggingLevel.OFF:
             return
         if self.debug_printer_level == IntermediateValueDebuggingLevel.SAVE_ONLY:
@@ -136,6 +176,9 @@ class DebugPrinterManager:
 
     @functools.lru_cache  # noqa: B019
     def _get_debug_filtered_kernel_names(self) -> list[str]:
+        # [FUNCTION DOC] HELPER: Memoized per instance. Returns the lower-cased, stripped
+        # kernel names from the comma separated AOT inductor filter config, or an empty
+        # list if unset.
         if config.aot_inductor.filtered_kernel_names is None:
             return []
         return [
@@ -151,6 +194,12 @@ class DebugPrinterManager:
         kernel,
         kernel_type=None,
     ):
+        # [FUNCTION DOC] Configures what to print or save for the next kernel call. Turns
+        # the level OFF (with an info log) for multi-kernels. For extern kernels keeps only
+        # string args starting with buf or arg; for cpp kernels keeps the same, wrapping
+        # each in an array-ref to tensor conversion call when array refs are used; for other
+        # kernels keeps all args. Also stores the kernel name, argument signatures, kernel
+        # and kernel type. Mutates instance state only.
         # Note: MultiKernel debug printing is not supported for now
         if isinstance(kernel, MultiKernel):
             log.info(
@@ -186,6 +235,9 @@ class DebugPrinterManager:
         self.kernel = kernel
 
     def codegen_model_inputs_value_print(self, input_args_to_print: list[str]) -> None:
+        # [FUNCTION DOC] When the level is PRINT_ONLY and the C++ wrapper is in use, writes
+        # a line to the wrapper prefix printing each model input tensor handle with an
+        # inputs label. Does nothing for other levels or the Python wrapper.
         if self.debug_printer_level != IntermediateValueDebuggingLevel.PRINT_ONLY:
             return
         for arg in input_args_to_print:
@@ -201,7 +253,13 @@ class DebugPrinterManager:
         before_launch=True,
         arg_signatures: list[type] | None = None,
     ) -> None:
-        for i, arg in enumerate(args_to_save):
+        # [FUNCTION DOC] Emits lines that save each tensor arg. Args whose signature entry
+        # is present but not a torch dtype (not a tensor) are skipped. For the C++ wrapper
+        # writes a save-tensor-handle call labeled with the launch phase and kernel name.
+        # For the Python wrapper ensures a directory under the current working directory
+        # exists (creating it, a side effect at codegen time) and writes a torch save line
+        # to a file named from phase, kernel and arg.
+
             if arg_signatures is not None and not isinstance(
                 arg_signatures[i], torch_dtype
             ):
@@ -238,6 +296,16 @@ class DebugPrinterManager:
         before_launch=True,
         arg_signatures: list[type] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Emits lines that print values. For the kernel-names-only level,
+        # writes a C print of the kernel name (C++ wrapper only) and returns. For levels
+        # other than PRINT_ONLY returns. Otherwise, skips everything if a kernel filter
+        # is set and this kernel is not in it; for each arg in the C++ wrapper prints
+        # tensor handles (signature says tensor, or no signatures with cpp or extern
+        # kernel type) or integer-like scalars (symbolic, int, float, bool signature types);
+        # for the Python wrapper writes a call to the runtime stats printer.
+        # KNOWN ISSUE: the scalar check compares against the type of the type object
+        # (metaclass) rather than the classes themselves, so it likely never matches real
+        # scalar signatures.
         launch_prefix = "before_launch" if before_launch else "after_launch"
 
         # if the debug printing level is PRINT_KERNEL_NAMES_ONLY

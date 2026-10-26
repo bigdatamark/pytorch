@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared utilities for the Inductor CUTLASS backend: importing the CUTLASS
+# python packages (via symlinks in the cache dir), architecture and toolkit detection for
+# CUDA and XPU, generating the library of GEMM operations (cached), dtype mapping and
+# matching between torch and CUTLASS, accumulator dtype and alignment inference, a
+# context manager capturing compiled sources, and the standalone-runner compile command.
+# Import-time side effects: registers an atexit hook that moves the CUTLASS compiled
+# cache file into the cache dir, creates a module logger, defines dtype tables, and
+# chooses the dtype-to-CUTLASS C++ type table based on whether torch was built with XPU.
 import atexit
 import functools
 import logging
@@ -37,6 +45,10 @@ XW_DTYPES: OrderedSet[torch.dtype] = OrderedSet(
 
 @atexit.register
 def move_cutlass_compiled_cache() -> None:
+    # [FUNCTION DOC] Exit hook. If CUTLASS was ever imported through the cached import
+    # check and the cutlass_cppgen module exposes an existing cache file, moves that file
+    # into the inductor cache directory (logging success at debug level, or a warning
+    # on OS errors). Silently does nothing otherwise. Side effects: filesystem move.
     """Move CUTLASS compiled cache file to the cache directory if it exists."""
     if try_import_cutlass.cache_info().currsize == 0:
         return
@@ -61,6 +73,9 @@ def move_cutlass_compiled_cache() -> None:
 
 
 def _rename_cutlass_import(content: str, cutlass_modules: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Rewrites import statements in the given text so that each
+    # listed module is imported from the cutlass_library package instead. Returns the
+    # new text; no other effects.
     for cutlass_module in cutlass_modules:
         content = content.replace(
             f"from {cutlass_module} import ",
@@ -71,6 +86,18 @@ def _rename_cutlass_import(content: str, cutlass_modules: list[str]) -> str:
 
 @functools.cache
 def try_import_cutlass() -> bool:
+    # [FUNCTION DOC] Memoized check that the CUTLASS python packages are importable;
+    # returns True if so, False (with a debug or warning log) otherwise. In fbcode it
+    # just imports cutlass_cppgen and cutlass_library. Otherwise it locates the CUTLASS
+    # python directory from the xpu or cutlass config, and if it exists (and the staging
+    # directory is not already on the search path) creates symlinks in a staging
+    # directory under the cache dir for cutlass_library, cutlass_cppgen, pycute and
+    # mock modules for cuda, scipy and pydot, appending the staging directory to the
+    # module search path. Raises AssertionError if an existing path is not a symlink or
+    # points elsewhere. Side effects: creates directories and symlinks, mutates the
+    # module search path, imports CUTLASS modules.
+    # KNOWN ISSUE: the docstring says three ways of passing CUTLASS are supported but
+    # lists only two.
     """
     We want to support three ways of passing in CUTLASS:
     1. fbcode, handled by the internal build system.
@@ -97,6 +124,7 @@ def try_import_cutlass() -> bool:
     # TODO(mlazos): epilogue visitor tree currently lives in python/cutlass,
     # but will be moved to python/cutlass_library in the future (later 2025)
     def path_join(path0, path1):
+        # [FUNCTION DOC] HELPER: Returns the absolute normalized path of the two joined parts.
         return os.path.abspath(os.path.join(path0, path1))
 
     # contains both cutlass and cutlass_library
@@ -134,6 +162,11 @@ def try_import_cutlass() -> bool:
         if tmp_cutlass_full_path not in sys.path:
 
             def link_and_append(dst_link, src_path, parent_dir):
+                # [FUNCTION DOC] HELPER: Ensures dst_link is a symlink to src_path. If the
+                # link path exists it must be a symlink resolving to the same target
+                # (AssertionError otherwise); if absent, creates the parent directory
+                # and the symlink. Then appends the parent directory to the module search
+                # path if not already present.
                 if os.path.lexists(dst_link):
                     if not os.path.islink(dst_link):
                         raise AssertionError(
@@ -189,6 +222,10 @@ def try_import_cutlass() -> bool:
 
 
 def _normalize_xpu_arch(arch: str) -> str:
+    # [FUNCTION DOC] HELPER: Strips an Xe prefix if present and returns the rest;
+    # otherwise returns the arch string when its integer value is in the range 12 to 50
+    # inclusive. Raises NotImplementedError for values outside that range.
+    # KNOWN ISSUE: the prefixed form is returned without range validation.
     if arch.startswith("Xe"):
         return arch[2:]
     if 12 <= int(arch) and int(arch) <= 50:
@@ -198,6 +235,10 @@ def _normalize_xpu_arch(arch: str) -> str:
 
 
 def _normalize_cuda_arch(arch: str) -> str:
+    # [FUNCTION DOC] HELPER: Maps a CUDA arch (string with digits, or number) to the
+    # nearest supported floor bucket as a string: 107, 103, 100, 90, 80, 75 or 70.
+    # Values above 107 are returned as is after a warning. Raises ValueError if a string
+    # has no digits and NotImplementedError if below 70.
     arch_num = arch
     if isinstance(arch, str):
         digits = "".join(ch for ch in arch if ch.isdigit())
@@ -229,6 +270,9 @@ def _normalize_cuda_arch(arch: str) -> str:
 
 @functools.lru_cache(8)
 def cutlass_arch(device_type: str) -> str:
+    # [FUNCTION DOC] Memoized. Detects the device architecture for the device type (xpu
+    # or otherwise cuda) and returns it normalized for CUTLASS; may raise from the
+    # normalizers for unsupported architectures.
     if device_type == "xpu":
         arch = get_xpu_arch()
         return _normalize_xpu_arch(arch)
@@ -239,6 +283,8 @@ def cutlass_arch(device_type: str) -> str:
 
 @functools.lru_cache(1)
 def toolkit_version(device_type: str) -> str:
+    # [FUNCTION DOC] Memoized. Returns the XPU toolkit version for xpu, otherwise the
+    # CUDA version.
     if device_type == "xpu":
         return get_xpu_version()
     else:
@@ -246,6 +292,8 @@ def toolkit_version(device_type: str) -> str:
 
 
 def get_device_cutlass_config(device_type: str):
+    # [FUNCTION DOC] Returns the xpu config module for xpu, otherwise the cutlass config
+    # section of the inductor config.
     """Get device-specific CUTLASS config (xpu/cuda overrides general cutlass config)."""
     if device_type == "xpu":
         return config.xpu
@@ -256,6 +304,11 @@ def get_device_cutlass_config(device_type: str):
 
 @dataclass
 class CUTLASSArgs:
+    # [CLASS DOC] Dataclass mimicking the command line argument object that the CUTLASS
+    # library manifest expects. Fields: architectures, toolkit_version, instantiation_level,
+    # operations (required except the last two), device_type (default cuda), plus fixed
+    # defaults for build directories, kernel filters and arch-compilation flags. The
+    # latter fixed attributes are plain class attributes, not dataclass fields.
     """
     CUTLASS args used to initialize a CUTLASS Manifest.
     """
@@ -280,6 +333,8 @@ class CUTLASSArgs:
     device_type: str = "cuda"
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validation: raises RuntimeError if architectures or toolkit
+        # version is missing (None).
         if self.architectures is None or self.toolkit_version is None:
             raise RuntimeError(
                 f"{self.architectures=} or {self.toolkit_version=} is None!"
@@ -289,6 +344,15 @@ class CUTLASSArgs:
 @clear_on_fresh_cache
 @functools.cache
 def _gen_ops_cached(arch: str, version: str, device_type: str) -> dict[Any, Any]:
+    # [FUNCTION DOC] HELPER: Memoized (cleared on fresh cache) generation of the CUTLASS
+    # operation table for an arch, version and device type. Raises AssertionError if
+    # CUTLASS cannot be imported; returns an empty mapping (after logging an error) if
+    # arch or version is missing. Builds a manifest from CUTLASSArgs (arch 103 and 107
+    # use the SM100 generator with an a-suffixed manifest arch; 107 gets an extra 103a
+    # feature), then runs the generator: Intel Xe for xpu, SM100 (if available) plus
+    # SM90 for arch 100, or the SM generator for the arch otherwise. Raises
+    # NotImplementedError when the generator is missing. Returns the manifest operations
+    # mapping and logs generation time.
     # Note: Cache needs to be specific for cuda architecture and version
 
     # Import cutlass python scripts.
@@ -362,6 +426,8 @@ def _gen_ops_cached(arch: str, version: str, device_type: str) -> dict[Any, Any]
 
 
 def gen_ops(device_type: str) -> dict[Any, Any]:
+    # [FUNCTION DOC] Returns all supported CUTLASS operations for the current device,
+    # detecting arch and toolkit version, under a timing context, via the cached generator.
     """
     Generates all supported CUTLASS operations.
     """
@@ -396,6 +462,9 @@ else:
 def torch_dtype_to_cutlass_type(
     torch_dtype: torch.dtype,
 ) -> "cutlass_library.library.DataType":  # type: ignore[name-defined] # noqa: F821
+    # [FUNCTION DOC] Memoized. Maps a torch dtype (float32, float16, bfloat16, float8 e4m3
+    # or e5m2) to the CUTLASS library data type enum. Raises AssertionError if CUTLASS
+    # cannot be imported and NotImplementedError for other dtypes.
     # Import cutlass python scripts.
     if not try_import_cutlass():
         raise AssertionError("Failed to import CUTLASS library")
@@ -420,6 +489,10 @@ def dtype_match(
     torch_dtype: torch.dtype | None,
     cutlass_dtype: "cutlass_library.library.DataType",  # type: ignore[name-defined]  # noqa: F821
 ) -> bool:
+    # [FUNCTION DOC] Memoized. True if the CUTLASS data type corresponds to the torch
+    # dtype: float32 matches f32 or tf32; half, bfloat16, int8, uint8, int32 and the two
+    # float8 types match their one counterpart; any other dtype (including None) gives
+    # False. Raises AssertionError if CUTLASS cannot be imported.
     # Import cutlass python scripts.
     if not try_import_cutlass():
         raise AssertionError("Failed to import CUTLASS library")
@@ -451,6 +524,13 @@ def dtype_match(
 def get_accumulator_dtype(
     input_torch_dtypes: list[torch.dtype],
 ) -> torch.dtype | None:
+    # [FUNCTION DOC] Infers the accumulator dtype for GEMM input dtypes. Raises
+    # AssertionError if any dtype is not an allowed input dtype or the result is not an
+    # allowed accumulator. Returns None unless exactly two dtypes are given. Mixed
+    # float8 e5m2/e4m3 gives float32; equal dtypes use that dtype; differing dtypes
+    # are only supported as a half/bfloat16 paired with a 8-bit integer (the wider one
+    # is used). Floating types map to float32, int8 maps to int32, anything else raises
+    # NotImplementedError.
     """
     Given a pair of input torch dtypes, returns the inferred accumulator torch dtype.
     """
@@ -502,6 +582,9 @@ def get_accumulator_dtype(
 
 @functools.lru_cache(32)
 def get_alignments(torch_dtype: torch.dtype) -> list[int]:
+    # [FUNCTION DOC] Memoized. Returns candidate alignments (in elements, largest first)
+    # for the dtype: 16-bit floats 8,4,2,1; float32 and int32 4,2,1; 8-bit types
+    # 16,8,4,2. Raises NotImplementedError for other dtypes.
     """
     Returns all possible valid CUTLASS alignments in terms of the number of elements for a given dtype.
     CUTLASS gemm / conv SM80 APIs support 16 bytes max alignment, and 2 bytes min alignment.
@@ -525,6 +608,11 @@ def get_alignments(torch_dtype: torch.dtype) -> list[int]:
 
 
 def get_max_alignment(inductor_layout: Layout) -> int:
+    # [FUNCTION DOC] Returns the largest candidate alignment (in elements) valid for the
+    # layout: the contiguous (stride one) dimension size and the layout offset must be
+    # multiples of it, and every other stride must be too. Returns 1 if no dimension has
+    # stride one or no candidate fits. Symbolic values are decided through the graph size
+    # variables evaluation, which may add guards.
     """
     Returns the max alignment (in terms of number of elements) for a given Inductor Layout.
     """
@@ -534,9 +622,13 @@ def get_max_alignment(inductor_layout: Layout) -> int:
     offset = inductor_layout.offset
 
     def is_static_int(number: object) -> TypeIs[int | sympy.Integer]:
+        # [FUNCTION DOC] HELPER: True if the value is a plain or symbolic-library integer.
         return isinstance(number, (int | sympy.Integer))
 
     def a_factor_of(x, alignment):
+        # [FUNCTION DOC] HELPER: True if x is divisible by alignment. Static integers use
+        # a direct remainder test; otherwise asks the graph size variables to evaluate
+        # whether the symbolic remainder is zero.
         if is_static_int(x) and is_static_int(alignment):
             return x % alignment == 0
         rem = sympy.Mod(x, alignment)
@@ -563,15 +655,26 @@ def get_max_alignment(inductor_layout: Layout) -> int:
 
 
 class CUTLASSCompileSourceCapturingContext:
+    # [CLASS DOC] HELPER: Context manager for tests and benchmarks that records every
+    # source string passed to the device code cache compile method (CUDA or XPU) while
+    # still calling the original compile. State: sources (captured list), device_type
+    # and the active mock patch. Entering installs the patch; exiting removes it.
     # Helper class for Benchmarking and Testing CUTLASS Kernels in isolation.
     # Can be used to capture the sourcecode passed to CUDACodeCache.compile
 
     def __init__(self, device_type: str):
+        # [FUNCTION DOC] HELPER: Initializes an empty captured source list and stores the
+        # device type; no patch is active yet.
         self.sources = []
         self._compile_patch = None
         self.device_type = device_type
 
     def __enter__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Patches the compile method of the XPU or CUDA code cache
+        # class with a wrapper that appends the source to the captured list and calls the
+        # original. Returns self. Side effect: global monkey patch until exit.
+        # KNOWN ISSUE: the wrapper accepts extra_args but does not forward it to the
+        # original compile.
         import unittest.mock as mock
 
         import torch._inductor.codecache
@@ -584,6 +687,8 @@ class CUTLASSCompileSourceCapturingContext:
         _compile_method_orig = codecache_cls.compile
 
         def my_compile(source_code, dst_file_ext, extra_args: list[str] | None = None):
+            # [FUNCTION DOC] HELPER: Replacement compile: records the source, then calls
+            # the original compile with the source and extension only.
             self.sources.append(source_code)
             return _compile_method_orig(source_code, dst_file_ext)
 
@@ -595,12 +700,17 @@ class CUTLASSCompileSourceCapturingContext:
         return self
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Removes the compile patch installed on entry.
         self._compile_patch.__exit__(*args, **kwargs)  # type: ignore[union-attr]
 
 
 def cutlass_standalone_runner_compile_command(
     device_type: str, srcpath: Path, exepath: Path
 ):
+    # [FUNCTION DOC] Builds the compile command for a captured kernel source file into a
+    # standalone executable, using the XPU or CUDA command builder by device type, with
+    # a define enabling the standalone runner (plus a trace-level define for non-xpu).
+    # Returns the command; nothing is executed.
     # returns command string to compile a (captured) CUDA GEMM Kernel source to a standalone executable that's ready to run
     # Passes the correct preprocessor define to nvcc to ensure the standalone runner is enabled.
 

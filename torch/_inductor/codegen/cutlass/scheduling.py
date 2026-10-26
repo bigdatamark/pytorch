@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Scheduler backend for CUTLASS C++ template kernels. Defines
+# CUTLASSScheduling (fusion decisions for pointwise epilogues, kernel source
+# registration with the wrapper code, and call-site codegen) and WhyNoFuseNames
+# (fusion-rejection logger carrying two node names). Intended to be delegated to by the
+# combined CUDA/XPU scheduling classes. Import-time side effects: creates a module logger.
 import hashlib
 import logging
 from collections.abc import Sequence
@@ -33,12 +38,20 @@ log = logging.getLogger(__name__)
 
 
 class WhyNoFuseNames(WhyNoFuse):
+    # [CLASS DOC] HELPER: Fusion-failure reporter that records the names of the two nodes
+    # considered for fusion (name1, name2); calling it logs why fusion was rejected.
     def __init__(self, name1: str, name2: str) -> None:
+        # [FUNCTION DOC] HELPER: Stores the two node names.
         self.name1 = name1
         self.name2 = name2
 
 
 class CUTLASSScheduling(BaseScheduling):
+    # [CLASS DOC] Partial scheduling backend for CUTLASS kernels. Stateless itself; uses
+    # the global graph (V.graph) for wrapper code and size variables. Decides whether
+    # pointwise nodes can be fused as epilogues into a CUTLASS template node
+    # (can_fuse_vertical), registers generated kernel source with the wrapper
+    # (define_kernel) and emits the template kernel and its call (codegen_template).
     """
     Partial Scheduling implementation for cutlass C++ Kernels.
     This class is intended to be used in combination with TritonScheduling,
@@ -49,23 +62,38 @@ class CUTLASSScheduling(BaseScheduling):
 
     @classmethod
     def get_backend_features(cls, device) -> OrderedSet[BackendFeature]:
+        # [FUNCTION DOC] Returns an empty set of backend features for any device.
         return OrderedSet()
 
     def group_fn(self, sizes):
+        # [FUNCTION DOC] Maps each size list to the simplified product of its dimensions
+        # and returns the results as a tuple.
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
     @staticmethod
     def is_cutlass_template(node: BaseSchedulerNode) -> TypeGuard[SchedulerNode]:
+        # [FUNCTION DOC] True if the node is a plain scheduler node wrapping a CUTLASS
+        # template buffer.
         return isinstance(node, SchedulerNode) and isinstance(
             node.node, CUTLASSTemplateBuffer
         )
 
     def is_cutlass_fused_template(self, node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] True if the node is a fused scheduler node that also satisfies
+        # the CUTLASS template check.
+        # KNOWN ISSUE: the template check requires a plain scheduler node, which a fused
+        # node normally is not, so this likely returns False for typical fused nodes
+        # unless the fused class derives from the scheduler node class.
         return isinstance(node, FusedSchedulerNode) and self.is_cutlass_template(node)
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Decides whether node2 can be fused vertically after node1 as an
+        # epilogue. If node1 is a CUTLASS template node, checks node2 against it with
+        # no existing epilogues; if node1 is a fused template node, checks node2 against
+        # its template node and already-fused epilogue nodes. Raises AssertionError if a
+        # needed node has no IR node. Returns False for any other combination.
         if self.is_cutlass_template(node1) and isinstance(node2, BaseSchedulerNode):
             if not node1.node:
                 raise AssertionError("node1.node should not be None")
@@ -91,6 +119,14 @@ class CUTLASSScheduling(BaseScheduling):
         return False
 
     def define_kernel(self, src_code: str, node_schedule) -> str:
+        # [FUNCTION DOC] Registers C++ kernel source with the graph wrapper code and
+        # returns the kernel name. Reuses the existing name if the same source was seen.
+        # Otherwise derives a name from a short hash of the source (with a descriptive
+        # fused-name segment when enabled and not the plain fused name), substitutes the
+        # kernel-name placeholder in the source, builds an async-compile wrapper snippet
+        # with a metadata comment (kernel path and origins), and defines it on the
+        # wrapper. For JIT cpp_wrapper mode (not AOT) also compiles a shared library now
+        # and adds it to the wrapper's external kernel libs. Mutates wrapper state.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -150,6 +186,14 @@ class CUTLASSScheduling(BaseScheduling):
         epilogue_nodes: Sequence[BaseSchedulerNode],
         prologue_nodes: Sequence[BaseSchedulerNode],
     ):
+        # [FUNCTION DOC] Generates a CUTLASS template kernel and its call. Bumps the
+        # epilogue fusion counter, verifies (AssertionError otherwise) that the template
+        # node wraps a CUTLASS template buffer with reduction numel one and that all
+        # epilogue IR nodes are computed buffers. Builds the kernel and render function,
+        # marks all nodes as run, emulates stores/loads so memory planning sees them,
+        # renders the source, defines the kernel, sets up debug printing, emits the call
+        # and a comment, then merges removed buffers into the graph and frees buffers.
+        # Prologue nodes are accepted but unused.
         """
         Codegen a cutlass template, possibly with fused epilogues
         """
@@ -210,6 +254,8 @@ class CUTLASSScheduling(BaseScheduling):
     def _unwrap_epilogue_nodes(
         fused_node: FusedSchedulerNode,
     ) -> list[BaseSchedulerNode]:
+        # [FUNCTION DOC] HELPER: Returns the nodes of a fused node excluding its template
+        # node. Raises AssertionError if any node lacks an IR node.
         nodes = fused_node.get_nodes()
         template_node = fused_node.get_template_node()
         if not all(n.node is not None for n in nodes):
@@ -223,6 +269,10 @@ class CUTLASSScheduling(BaseScheduling):
     def _is_compatible_reshape(
         template_size: Sequence[sympy.Expr], node_size: Sequence[sympy.Expr]
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if node_size is a strictly higher-rank split of
+        # template_size, i.e. consecutive node dimensions multiply to each template
+        # dimension in order and all dimensions are consumed. False if the node rank is
+        # not larger or grouping fails.
         """
         Check if node_size is a compatible reshape of template_size.
         This allows cases like template [8192, 3072] with node [16, 512, 3072]
@@ -235,6 +285,8 @@ class CUTLASSScheduling(BaseScheduling):
         n_idx = 0
 
         def _matches_template_dim(lhs: sympy.Expr, rhs: sympy.Expr) -> bool:
+            # [FUNCTION DOC] HELPER: True if the two size expressions are equal, using a
+            # direct comparison, then a static equality query, then symbolic simplification.
             # Fast path for concrete/static equality before invoking simplify.
             if lhs == rhs:
                 return True
@@ -260,6 +312,19 @@ class CUTLASSScheduling(BaseScheduling):
         existing_epilogue_nodes: list[BaseSchedulerNode],
         node_to_fuse: BaseSchedulerNode,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Core epilogue fusion legality check. Returns False (with
+        # a logged reason) unless every constituent node of node_to_fuse is a pointwise
+        # computed buffer with a name and a size equal to, or a compatible reshape of,
+        # the template output size; the node has no aliasing or mutation, is not a
+        # reduction, config enables cutlass epilogue fusion, and the template supports
+        # epilogue fusion. Then tries generating EVT python code for the existing plus
+        # new nodes; NotImplementedError (unsupported op or dtype) rejects fusion.
+        # Finally rejects external reads that are non-contiguous compatible reshapes.
+        # Raises AssertionError for wrong buffer type or if the first epilogue node does
+        # not read the template buffer.
+        # KNOWN ISSUE: the unsupported-op branch tests for an _op_ prefix on the error
+        # text, but the EVT handler raises with the plain op name, so that branch likely
+        # never triggers and all such failures report as unsupported dtype.
         """
         Check if the given node can be fused with the epilogue. At the moment, Kernels
         support fusion with Pointwise operations, wrapped in (named) ComputedBuffer nodes.

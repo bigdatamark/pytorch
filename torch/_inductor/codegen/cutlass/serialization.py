@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] JSON serialization of CUTLASS library GEMM operations, so they can be
+# cached or sent between processes. Contains CUTLASSOperationSerializer (serialize and
+# deserialize GemmOperation objects plus nested tile, math instruction, tensor and
+# enum descriptions) and get_cutlass_operation_serializer (cached factory returning None
+# when cutlass is unavailable). cutlass_library is imported lazily inside functions.
+# Import-time side effects: none.
 import functools
 import json
 from enum import Enum
@@ -8,6 +14,12 @@ from torch._inductor.codegen.cutlass.utils import try_import_cutlass
 
 
 class CUTLASSOperationSerializer:
+    # [CLASS DOC] Stateless collection of class methods converting a cutlass_library
+    # GemmOperation to a JSON string and back. Nested components (tile description, math
+    # instruction, tensor description, enums) are each encoded as their own JSON string
+    # and embedded as string values; several helpers are memoized with an unbounded cache,
+    # so their arguments must be hashable. Enums are encoded by class name and member
+    # name. Public API: serialize, deserialize.
     """Serializes and deserializes CUTLASS GEMM operations to/from JSON.
 
     Handles GemmOperation objects and their nested components (TileDescription, TensorDescription).
@@ -30,6 +42,8 @@ class CUTLASSOperationSerializer:
 
     @classmethod
     def serialize(cls, operation: "GemmOperation") -> str:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] Returns the JSON text of a GEMM operation. Raises AssertionError
+        # if the object's class is not exactly named GemmOperation.
         """Serialize a GEMM operation to JSON string.
 
         Args:
@@ -46,6 +60,8 @@ class CUTLASSOperationSerializer:
 
     @classmethod
     def deserialize(cls, json_str: str) -> "GemmOperation":  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] Parses JSON text and rebuilds the GemmOperation. Raises on
+        # invalid JSON or missing required keys; requires cutlass_library to be importable.
         """Deserialize JSON string to a GEMM operation.
 
         Args:
@@ -59,6 +75,11 @@ class CUTLASSOperationSerializer:
 
     @classmethod
     def _gemm_operation_to_json(cls, operation: "GemmOperation") -> dict[str, Any]:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Builds a dictionary with the required fields (kind, arch,
+        # tile description, A, B, C, epilogue element type) and optional ones (functors,
+        # D, schedules), then copies each optional attribute that exists on the operation
+        # (mixed input, scale factors, 3x flag), encoding tensor descriptions and enums
+        # and passing other values as is.
         """Convert GemmOperation to JSON-serializable dict.
 
         Args:
@@ -121,6 +142,12 @@ class CUTLASSOperationSerializer:
 
     @classmethod
     def _json_to_gemm_operation(cls, json_dict: dict[str, Any]) -> "GemmOperation":  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Reconstructs a GemmOperation from the dictionary. Decodes
+        # all enums and nested descriptions (epilogue functor enum class depends on the
+        # 3x flag), builds the scale factor D entry only when both it and its vector size
+        # are present, defaults mixed input shuffle to false, and calls the constructor.
+        # Raises a key error if required fields (kind, arch, tile description, epilogue
+        # element) are missing.
         """Convert JSON dict to GemmOperation object.
 
         Args:
@@ -221,6 +248,11 @@ class CUTLASSOperationSerializer:
     @classmethod
     @functools.lru_cache(None)
     def _tile_description_to_json(cls, tile_desc: "TileDescription") -> str:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Memoized. Encodes a tile description as JSON text with
+        # threadblock shape, stages, warp count, nested math instruction, compute
+        # capability bounds (stored under short names), cluster shape and explicit vector
+        # sizes; adds the tile shape only when it exists and differs from the threadblock
+        # shape.
         """
         Convert TileDescription to JSON string.
 
@@ -259,6 +291,9 @@ class CUTLASSOperationSerializer:
     def _json_to_tile_description(
         cls, json_dict: str | None
     ) -> Optional["TileDescription"]:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Memoized. Decodes JSON text into a TileDescription (None
+        # input gives None). Accepts both short and long compute capability key names,
+        # defaults cluster shape to ones, and restores a distinct tile shape if present.
         """
         Convert JSON dict to TileDescription object.
 
@@ -315,6 +350,9 @@ class CUTLASSOperationSerializer:
         cls,
         math_instruction: Optional["MathInstruction"],  # type: ignore[name-defined]  # noqa: F821
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Memoized. Encodes a math instruction (shape, operand and
+        # accumulator element types, opcode class, math operation, scale factor element)
+        # as JSON text; None gives None.
         """Convert MathInstruction to JSON string.
 
         Args:
@@ -347,6 +385,9 @@ class CUTLASSOperationSerializer:
     def _json_to_math_instruction(
         cls, json_dict: str | None
     ) -> Optional["MathInstruction"]:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Memoized. Decodes JSON text into a MathInstruction (None
+        # gives None), converting the enum fields, then sets the scale factor element on
+        # the object if present and not null.
         """Convert JSON string to MathInstruction object.
 
         Args:
@@ -401,6 +442,8 @@ class CUTLASSOperationSerializer:
         cls,
         tensor_desc: Optional["TensorDescription"],  # type: ignore[name-defined]  # noqa: F821
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Memoized. Encodes a tensor description (element, layout,
+        # alignment, complex transform) as JSON text; None gives None.
         """Convert TensorDescription to JSON string.
 
         Args:
@@ -428,6 +471,9 @@ class CUTLASSOperationSerializer:
         json_dict: str | None,
         tensor_name: str | None = None,
     ) -> Optional["TensorDescription"]:  # type: ignore[name-defined]  # noqa: F821
+        # [FUNCTION DOC] HELPER: Memoized. Decodes JSON text into a TensorDescription
+        # (None gives None). The tensor_name argument is only part of the cache key so
+        # that different tensors in one operation get distinct objects.
         """Convert JSON string to TensorDescription object.
 
         Args:
@@ -461,6 +507,8 @@ class CUTLASSOperationSerializer:
     @classmethod
     @functools.lru_cache(None)
     def _enum_to_json(cls, enum_value: Enum | None) -> str | None:
+        # [FUNCTION DOC] HELPER: Memoized. Encodes an enum member as JSON text holding its
+        # class name and member name; None gives None.
         """Convert enum value to JSON string.
 
         Args:
@@ -482,6 +530,11 @@ class CUTLASSOperationSerializer:
     @classmethod
     @functools.lru_cache(None)
     def _json_to_enum(cls, json_dict: str | None, enum_class: Any) -> Enum | None:
+        # [FUNCTION DOC] HELPER: Memoized. Decodes JSON text and returns the member of
+        # the given enum class with the stored member name (the stored class name is
+        # ignored); None gives None. Raises a key error for unknown names.
+        # KNOWN ISSUE: the docstring describes a name/value format, but the code reads
+        # only the name entry of the encoding produced by the enum encoder.
         """Convert JSON string to enum value.
 
         Format: {name: "EnumName", value: 1}
@@ -503,6 +556,8 @@ class CUTLASSOperationSerializer:
 
 @functools.lru_cache(1)
 def get_cutlass_operation_serializer() -> CUTLASSOperationSerializer | None:
+    # [FUNCTION DOC] Cached factory: returns a serializer instance if the cutlass
+    # library can be imported, otherwise None.
     if not try_import_cutlass():
         return None
     return CUTLASSOperationSerializer()

@@ -1,4 +1,12 @@
 # mypy: ignore-errors
+# [MODULE DOC] Extension of the CUTLASS python library GEMM emitter used by Inductor.
+# Defines EmitGemmUniversal3xInstanceWithEVT, a modified copy of the upstream CUTLASS 3.x
+# GemmUniversal emitter that renders C++ type definitions for a GEMM operation and lets an
+# EVT (epilogue visitor tree) name replace the epilogue functor; also supports an xpu
+# device type (Xe arch tags, auto stage count).
+# Import-time behavior: the class is only defined if try_import_cutlass() succeeds, in
+# which case the cutlass_library gemm_operation and library modules are star-imported
+# into this module namespace. Otherwise the module is effectively empty.
 from ..utils import try_import_cutlass
 
 
@@ -14,9 +22,18 @@ if try_import_cutlass():
     _LOGGER = logging.getLogger(__name__)
 
     class EmitGemmUniversal3xInstanceWithEVT:
+        # [CLASS DOC] Emits the C++ source for a CUTLASS 3.x GemmUniversal kernel type
+        # (epilogue collective builder, mainloop collective builder, kernel and a named
+        # struct) from a cutlass_library operation description. State: operation_suffix,
+        # includes (header list), builtin_epilogue_functor_template, evt_name (if set it
+        # overrides the epilogue functor text), device_type ("cuda" or "xpu") and
+        # gemm_template (the string template). Key methods: emit, instance_template.
         """Responsible for emitting a CUTLASS 3.x template definition"""
 
         def __init__(self, operation_suffix="", evt_name=None, device_type="cuda"):
+            # [FUNCTION DOC] Stores the suffix, EVT name and device type and sets up the
+            # default include list plus the epilogue functor and GEMM text templates.
+            # No I/O or global side effects.
             self.operation_suffix = operation_suffix
             self.includes = [
                 "cutlass/cutlass.h",
@@ -77,6 +94,9 @@ public ${operation_name}_base { };
 
         #
         def instance_template(self):
+            # [FUNCTION DOC] Returns the template text that registers the kernel in a
+            # CUTLASS library manifest: wraps the operation in a device GEMM adapter and
+            # appends a new gemm-kind object, between compile guard start and end markers.
             return """
 ${compile_guard_start}
 {
@@ -88,6 +108,10 @@ ${compile_guard_end}
         """
 
         def emit_block_scale_epilogue_functor(self, operation):
+            # [FUNCTION DOC] Renders the block-scaled linear combination epilogue functor
+            # type text for an operation, filling in vector size, D/C element types,
+            # scale-factor D element and layout, and accumulator type (also used as the
+            # scalar type). Returns the substituted string.
             block_scaled_template = """
             ${epilogue_functor}<
                 ${epi_vs},
@@ -115,10 +139,15 @@ ${compile_guard_end}
 
         @staticmethod
         def pointerize_if_grouped(operation, layout):
+            # [FUNCTION DOC] HELPER: Returns the layout tag text unchanged for ordinary
+            # GEMMs, or with a pointer suffix appended for grouped GEMM kinds.
             return layout if not is_grouped(operation.gemm_kind) else layout + "* "
 
         @staticmethod
         def problem_shape(operation):
+            # [FUNCTION DOC] HELPER: Returns the C++ problem shape type text: a four
+            # integer shape for ordinary GEMMs, or a group problem shape wrapping a three
+            # integer shape for grouped GEMM kinds.
             gemm_shape_type = "cute::Shape<int,int,int,int>"
             grouped_gemm_shape_type = "cute::Shape<int,int,int>"
             grouped_gemm_shape_type = (
@@ -132,6 +161,20 @@ ${compile_guard_end}
             )
 
         def emit(self, operation):
+            # [FUNCTION DOC] Given a cutlass_library GEMM operation, builds the full set of
+            # template substitution values and returns the rendered C++ definition text.
+            # Handles: static/dynamic cluster shapes, sm100 tile shape adjustment, explicit
+            # or automatic stage count (xpu always automatic), builtin vs block-scaled
+            # epilogue functors, complex and block-scaled element tuples, special epilogue
+            # tile/schedule for NVFP4 256-wide tiles, mixed-input dtype handling (narrow
+            # vs wide operand, optional shuffled reordered layout prelude code), arch tag
+            # (Sm or Xe by device type). If evt_name is set it replaces the epilogue
+            # functor. No I/O; pure string generation.
+            # KNOWN ISSUE: the non-enum epilogue functor branch reads self.epilogue_functor,
+            # which this class never defines, so it would raise an attribute error.
+            # KNOWN ISSUE: the block-scaled epilogue override is applied twice (inside the
+            # enum branch and again afterwards); the second is redundant. Also logging is
+            # used for _LOGGER without an explicit import (relies on star imports).
             """Given a gem operation, emits a template definition of the operation"""
 
             opcode_class_main = operation.tile_description.math_instruction.opcode_class
