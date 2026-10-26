@@ -1,3 +1,6 @@
+# [MODULE DOC] Multi-kernel support for Inductor codegen: MultiKernelState/MultiKernel/SizeHintMultiKernel generate wrapper definitions that group alternative sub-kernels at compile time;
+# MultiKernelCall/SizeHintMultiKernelCall are the run-time classes that benchmark or shape-select the best sub-kernel, with an on-disk pick cache and cpp-wrapper choice recording.
+# No import-time side effects besides creating the module logger.
 # mypy: allow-untyped-defs
 import functools
 import logging
@@ -22,6 +25,8 @@ log = logging.getLogger(__name__)
 
 
 class MultiKernelState:
+    # [CLASS DOC] Compile-time registry of multi-kernel definitions, referenced by the wrapper codegen (wrapper_code.multi_kernel_state). State: a mapping from tuple of sub-kernel
+    # names to the multi-kernel name (prevents duplicate definitions) and an IndentedBuffer accumulating the generated definition code. Key method: define_kernel.
     """
     Maintain state of multi-kernel compilation so we don't define duplicated
     multi-kernel for the same set of sub-kernels.
@@ -30,6 +35,7 @@ class MultiKernelState:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates the empty name mapping and the empty definition code buffer.
         self.subkernel_to_kernel_name = {}
         self.kernel_defs = IndentedBuffer()
 
@@ -38,6 +44,11 @@ class MultiKernelState:
         kernels: list[Any],
         kernel_shape_keys: list[None | tuple[tuple[int, ...], ...]] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Registers a multi-kernel for the given sub-kernels and returns its name (multi_kernel_N, numbered by registration count); returns the existing name if the same
+        # sub-kernel names were registered before. Unless in the second cpp-wrapper pass (returns early with no code), writes into kernel_defs an arg_index mapping (per kernel, slices of the call
+        # arguments; template multi-buffers get extra per-kernel grid argument slices, otherwise numel args are added to the call args of the first kernel), then an async_compile call:
+        # a plain multi_kernel over the list of kernel names, or, when kernel_shape_keys is given, a size-hint multi-kernel keyed by shape (requires Triton template kernels and equal lengths).
+        # With autotune_at_compile_time, also records the name in the wrapper's source-to-kernel map. Raises AssertionError on inconsistent size-hint arguments.
         """
         Previously we name the multi kernel as "multi_kernel_{kernel_names[0]}".
         This has some minor issue.
@@ -139,6 +150,9 @@ class MultiKernelState:
 
 
 class MultiKernel:
+    # [CLASS DOC] Compile-time handle for a multi-kernel wrapping two or more equivalent sub-kernels (alternatives to be benchmarked at runtime). Attributes: kernels, kernel_name (assigned by
+    # MultiKernelState), and a placeholder args object so that code checking for an args attribute treats it as a non-null kernel. Key methods: call_kernel, workspace merging, nan checks,
+    # and properties that combine the sub-kernels' removed/inplace buffers.
     """
     This class maintains the compile time state for multi kernels.
 
@@ -154,6 +168,7 @@ class MultiKernel:
     """
 
     def __init__(self, kernels):
+        # [FUNCTION DOC] Stores the sub-kernels (raises AssertionError if fewer than 2) and defines the multi-kernel through the wrapper's multi-kernel state to get its name. Sets a dummy args object.
         if len(kernels) < 2:
             raise AssertionError(f"expected at least 2 kernels, got {len(kernels)}")
 
@@ -168,6 +183,7 @@ class MultiKernel:
 
     @staticmethod
     def _merge_workspace_args(left: list[WorkspaceArg], right: list[WorkspaceArg]):
+        # [FUNCTION DOC] HELPER: Merges two lists of workspace args by inner name, keeping the larger (maximum) workspace for names present in both; returns left unchanged if the lists are equal.
         if left == right:
             return left
         result = {x.inner_name: x for x in left}
@@ -182,6 +198,7 @@ class MultiKernel:
 
     @staticmethod
     def merge_workspaces_inplace(kernels):
+        # [FUNCTION DOC] Makes all kernels share one merged workspace argument list: reduces the per-kernel workspace lists with the merge helper and assigns the result to every kernel's args. Returns the merged list, or None when given fewer than 2 kernels.
         if len(kernels) < 2:
             return
         # All kernels must share the same workspace
@@ -194,6 +211,10 @@ class MultiKernel:
         return workspace_args
 
     def call_kernel(self, kernel_name):
+        # [FUNCTION DOC] Emits the wrapper code that launches the multi-kernel. Checks the sub-kernels have identical call args and arg types (AssertionError otherwise) and the given name matches. Builds the argument list
+        # (for template multi-buffers the per-kernel grid args are appended; otherwise numel args from the first kernel), allocates and frees workspaces around the call, and in the cpp wrapper
+        # calls the single already-chosen kernel directly (found via lookup_choice in the second pass).
+        # KNOWN ISSUE: for template multi-buffers the extension of the call args list mutates the list obtained from the first kernel's argdefs in place (aliased as multi_call_args).
         """
         Collect the union of arguments from all subkernels as the arguments
         for the multi-kernel.
@@ -264,6 +285,7 @@ class MultiKernel:
             V.graph.wrapper_code.generate_workspace_deallocation(ws)
 
     def codegen_nan_check(self):
+        # [FUNCTION DOC] Emits wrapper assertions that every distinct tensor argument of every sub-kernel contains no NaN or inf values.
         wrapper = V.graph.wrapper_code
         seen: OrderedSet[str] = OrderedSet()
         for k in self.kernels:
@@ -280,15 +302,18 @@ class MultiKernel:
 
     @property
     def removed_buffers(self):
+        # [FUNCTION DOC] Property: the set of buffers removed by all sub-kernels (intersection).
         return OrderedSet.intersection(*[k.removed_buffers for k in self.kernels])
 
     @property
     def inplaced_to_remove(self):
+        # [FUNCTION DOC] Property: the set of inplaced buffers to remove for all sub-kernels (intersection).
         return OrderedSet.intersection(*[k.inplaced_to_remove for k in self.kernels])
 
     @property
     @cache_on_self
     def inplace_update_buffers(self):
+        # [FUNCTION DOC] Cached property: the inplace-update mapping shared by all sub-kernels. Raises AssertionError if the kernels disagree.
         """
         Make sure all kernels have the same inplace update mappings.
         """
@@ -300,15 +325,20 @@ class MultiKernel:
         return self.kernels[0].inplace_update_buffers
 
     def warn_mix_layout(self, kernel_name: str):
+        # [FUNCTION DOC] No-op hook kept for interface compatibility.
         pass
 
 
 class MultiKernelCall:
+    # [CLASS DOC] Run-time object for a multi-kernel: holds the sub-kernels (possibly still compile futures), the arg_index slices that select each kernel's arguments, the picked kernel index
+    # (None until chosen), a flag for whether the choice was recorded, and whether the on-disk pick cache is disabled. On first run it benchmarks all sub-kernels, picks the fastest, persists the pick,
+    # and afterwards forwards calls to the picked kernel.
     """
     This class is called at run time to actually run the kernel
     """
 
     def __init__(self, multi_kernel_name, kernels, arg_index):
+        # [FUNCTION DOC] Stores kernels, name and arg_index (raises AssertionError if no kernels). The cache is disabled by an environment variable or the persistent reduction metric table. If config forces a sub-kernel (multi_kernel above 1) it is picked by index (AssertionError if out of range); else the pick is loaded from the cache if enabled.
         if len(kernels) < 1:
             raise AssertionError(f"expected at least 1 kernel, got {len(kernels)}")
         self._kernels = kernels
@@ -336,6 +366,7 @@ class MultiKernelCall:
         self._recorded = False
 
     def cache_file_path(self):
+        # [FUNCTION DOC] Returns the path of the pick cache file, keyed by a hash of each sub-kernel's cache key, size hints and triton meta.
         key = code_hash(
             ",".join(
                 [
@@ -348,6 +379,7 @@ class MultiKernelCall:
         return pathlib.Path(path)
 
     def load_cache(self):
+        # [FUNCTION DOC] Reads the picked kernel index from the cache file if it exists and validates it is in range (AssertionError otherwise; also if a pick already exists). Logs at debug level.
         if self.picked_kernel is not None:
             raise AssertionError("expected self.picked_kernel to be None")
         path = self.cache_file_path()
@@ -368,6 +400,7 @@ class MultiKernelCall:
                 )
 
     def store_cache(self):
+        # [FUNCTION DOC] Atomically writes the picked kernel index to the cache file, creating the directory. Raises AssertionError if nothing was picked yet.
         if self.picked_kernel is None:
             raise AssertionError("expected self.picked_kernel to not be None")
         path = self.cache_file_path()
@@ -378,6 +411,7 @@ class MultiKernelCall:
 
     @property
     def kernels(self):
+        # [FUNCTION DOC] Property: returns the sub-kernel list, resolving any compile futures in place (blocks on pending compilation, so call after parallel compile finishes).
         """
         Read results from future.
 
@@ -392,6 +426,7 @@ class MultiKernelCall:
         return self._kernels
 
     def benchmark_sub_kernels(self, *args, **kwargs):
+        # [FUNCTION DOC] Benchmarks every sub-kernel (cloning arguments per run, using only each kernel's own arguments) and returns the list of timings in milliseconds. Tests may mock this to force a pick.
         """
         Benchmark all the sub kernels and return the execution time
         (in milliseconds) for each of time.
@@ -401,7 +436,9 @@ class MultiKernelCall:
         """
 
         def wrap_fn(kernel, index):
+            # [FUNCTION DOC] HELPER: Returns a closure that benchmarks one sub-kernel.
             def inner():
+                # [FUNCTION DOC] HELPER: Runs the kernel once on freshly cloned, filtered arguments.
                 filtered_args = self._get_filtered_args(args, index)
                 args_clone, kwargs_clone = kernel.clone_args(*filtered_args, **kwargs)
                 return kernel.run(*args_clone, **kwargs_clone)
@@ -419,6 +456,7 @@ class MultiKernelCall:
         ]
 
     def _get_filtered_args(self, args, index):
+        # [FUNCTION DOC] HELPER: Returns the subset of the all-kernel argument list that belongs to the kernel at index, via the arg_index slices; under the cpp wrapper returns args unchanged. Safe at runtime when the graph is a null handler.
         """
         We pass in all arguments to all kernels into the MultiKernelCall
         so when invoking a particular kernel we need to filter to only the
@@ -443,6 +481,7 @@ class MultiKernelCall:
     # which can be slower.
     @staticmethod
     def record_choice(multi_kernel_name: str, picked_kernel_name: str):
+        # [FUNCTION DOC] Records the chosen kernel name for the multi-kernel in the graph's multi_kernel_to_choice map for the second cpp-wrapper pass. Does nothing outside codegen or when recording is off.
         """
         Record the multi-kernel choice for cpp-wrapper after autotuning
 
@@ -460,6 +499,7 @@ class MultiKernelCall:
 
     @staticmethod
     def lookup_choice(multi_kernel_name: str) -> str:
+        # [FUNCTION DOC] Returns the recorded chosen kernel name for a multi-kernel during cpp-wrapper codegen. Raises AssertionError if the choice was not recorded.
         # this should always been done during cpp-wrapper codegen
         if not (
             V.graph.record_multi_kernel_choice
@@ -473,6 +513,8 @@ class MultiKernelCall:
         return V.graph.multi_kernel_to_choice[multi_kernel_name]
 
     def run(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the multi-kernel. If no kernel is picked, benchmarks all sub-kernels, picks the fastest, logs, adds a row to the persistent reduction metric table, and stores the cache unless disabled. The first time
+        # also records the picked kernel name (AssertionError if it has none). Then runs the picked kernel with its filtered arguments.
         if self.picked_kernel is None:
             timings = self.benchmark_sub_kernels(*args, **kwargs)
             self.picked_kernel = timings.index(min(timings))
@@ -506,7 +548,9 @@ class MultiKernelCall:
         run(*filtered_args, **kwargs)
 
     def _metrics_table_row(self, timings):
+        # [FUNCTION DOC] HELPER: Builds a metrics table row with size hints, reduction hint and, for up to 4 kernels, source file path and latency (empty strings for missing). Raises AssertionError if more than 4 timings.
         def get_kernel_path(k):
+            # [FUNCTION DOC] HELPER: Returns the source file name of the kernel's underlying python function.
             return k.fn.fn.__code__.co_filename
 
         k0 = self.kernels[0]
@@ -530,6 +574,8 @@ class MultiKernelCall:
 
 
 class SizeHintMultiKernel(MultiKernel):
+    # [CLASS DOC] Compile-time multi-kernel whose sub-kernels are keyed by size-hint shapes (given as a mapping from shape key to kernel); only a one-dimensional search over hints is generated.
+    # Attributes: kernels, kernel_shape_keys, kernel_name, placeholder args object.
     """
     Version of multi-kernel that generates kernels based on specified size hints.
     Currently only performs 1-d search over hints; doesn't perform combinatorial n-d search
@@ -540,6 +586,7 @@ class SizeHintMultiKernel(MultiKernel):
     """
 
     def __init__(self, kernels):
+        # [FUNCTION DOC] Splits the non-empty mapping (AssertionError otherwise) into parallel lists of kernels and shape keys and defines the size-hint multi-kernel in the wrapper state. Does not call the parent constructor.
         if not (isinstance(kernels, dict) and len(kernels) >= 1):
             raise AssertionError("expected kernels to be a non-empty dict")
 
@@ -557,6 +604,8 @@ class SizeHintMultiKernel(MultiKernel):
 
 
 class SizeHintMultiKernelCall(MultiKernelCall):
+    # [CLASS DOC] Run-time size-hint multi-kernel: sub-kernels keyed by the input/output shapes they were tuned for. Chooses a kernel per runtime shape using a log2 L1 distance heuristic,
+    # and caches the choice per distinct shape tuple (state: list of hint keys and a shape-to-index mapping).
     """
     Runtime class for size-hint multi-kernels.
     Instead of having a plain list of kernels to benchmark over, keys them by input & output shapes,
@@ -565,6 +614,7 @@ class SizeHintMultiKernelCall(MultiKernelCall):
     """
 
     def __init__(self, multi_kernel_name, kernels, arg_index):
+        # [FUNCTION DOC] Initializes the parent with the mapping's kernel values, remembers the shape keys as hints, and creates the empty per-shape choice cache.
         super().__init__(multi_kernel_name, list(kernels.values()), arg_index)
         self._kernel_hints = list(kernels.keys())
 
@@ -572,6 +622,7 @@ class SizeHintMultiKernelCall(MultiKernelCall):
         self._shape_cache = {}
 
     def _get_shape_cache_key(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Returns a tuple of the shapes of all arguments that have a shape attribute.
         """
         Generate a cache key based on tensor shapes for shape-specialized dispatch.
         """
@@ -582,23 +633,27 @@ class SizeHintMultiKernelCall(MultiKernelCall):
         return tuple(shapes)
 
     def _get_cached_shape_choice(self, cache_key):
+        # [FUNCTION DOC] HELPER: Returns the cached kernel index for the shape key, or None.
         """
         Get cached kernel choice for a specific shape.
         """
         return self._shape_cache.get(cache_key)
 
     def _cache_shape_choice(self, cache_key, kernel_idx):
+        # [FUNCTION DOC] HELPER: Stores the kernel index for the shape key.
         """
         Cache kernel choice for a specific shape.
         """
         self._shape_cache[cache_key] = kernel_idx
 
     def _dist_heuristic(self, k1, k2):
+        # [FUNCTION DOC] HELPER: Sums, over paired shapes and dimensions, the absolute difference of base-2 logs of sizes (non-positive sizes map to -1). Lower means closer.
         """
         log2 L1 distance heuristic for kernel selection.
         """
 
         def dist(x, y):
+            # [FUNCTION DOC] HELPER: Absolute difference of log2 of two sizes, treating non-positive sizes as -1.
             lx = math.log2(x) if x > 0 else -1
             ly = math.log2(y) if y > 0 else -1
             return abs(lx - ly)
@@ -609,6 +664,7 @@ class SizeHintMultiKernelCall(MultiKernelCall):
         return out
 
     def run(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the multi-kernel: reuses the cached choice for this argument shape or selects by shape, records the picked kernel name once (AssertionError if missing), then runs it with its filtered arguments.
         cache_key = self._get_shape_cache_key(*args, **kwargs)
         cached_choice = self._get_cached_shape_choice(cache_key)
         if cached_choice is not None:
@@ -636,6 +692,8 @@ class SizeHintMultiKernelCall(MultiKernelCall):
         run(*filtered_args, **kwargs)
 
     def _select_kernel_by_shape(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Picks the kernel whose shape key is closest to the runtime shapes (keys that are None get a huge distance), stores it as the picked kernel and caches it for this shape.
+        # KNOWN ISSUE: the docstring says it benchmarks kernels, but the code only uses the distance heuristic and does no benchmarking.
         """
         Benchmark kernels for a particular shape and return the
         best kernel for this shape.

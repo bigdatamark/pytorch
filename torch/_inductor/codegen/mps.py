@@ -1,3 +1,6 @@
+# [MODULE DOC] Early-prototype Inductor backend for Apple MPS: generates Metal compute shaders for pointwise and reduction kernels. Defines a sympy-to-Metal
+# printer (MetalExprPrinter), op overrides (MetalOverrides), the kernel generator (MetalKernel) and scheduling (MetalScheduling). No import-time side
+# effects other than initializing pointwise and special op overrides on MetalOverrides.
 # This is not a feature-complete compiler backend
 # Just an early prototype that shows that one can compile elementwise ops into a Metal shader
 from __future__ import annotations
@@ -56,6 +59,8 @@ DTYPE_TO_METAL = {
 
 
 def value_to_metal(val: float | int | bool | str | CSEVariable) -> str:
+    # [FUNCTION DOC] Renders a Python constant (or CSE variable/str) as Metal source text: infinities map to HUGE_VALF / -HUGE_VALF, NaN to NAN,
+    # bools to true/false, anything else via its string form.
     if isinstance(val, float):
         if val == torch.inf:
             return "HUGE_VALF"
@@ -70,9 +75,12 @@ def value_to_metal(val: float | int | bool | str | CSEVariable) -> str:
 
 
 class MetalExprPrinter(ExprPrinter_):
+    # [CLASS DOC] Sympy expression printer that emits Metal C++ source for index/size math. Stateless; each _print_* method handles one
+    # sympy function type (floor division, modular indexing, min/max, rounding, casts, conditional).
     """Converts sympy expression to Metal code snippet"""
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints floor division; integer-valued uses the c10 metal floor_divide helper, otherwise floor of the numerator divided by the divisor.
         x, div = expr.args
         x = self.doprint(x)
         div = self.doprint(div)
@@ -81,6 +89,7 @@ class MetalExprPrinter(ExprPrinter_):
         return f"metal::floor({x}) / ({div})"
 
     def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints (x / div) % mod. Integer values use plain integer division, others floor first. When div is 65536 and mod is not a power of two, uses the c10 safe_mod helper to work around a Metal compiler bug.
         x, div, mod = expr.args
         # Workaround for Metal compiler bug with fused (x / A) % B, see PR 175481
         use_safe_mod = div == 65536 and (mod & (mod - 1)) != 0
@@ -98,6 +107,7 @@ class MetalExprPrinter(ExprPrinter_):
         return f"({x}) % ({mod})"
 
     def _print_min_max(self, expr: sympy.Expr, fn: str) -> str:
+        # [FUNCTION DOC] HELPER: Folds a variadic Min/Max into nested binary metal min/max calls via _print_binary_min_max.
         # pyrefly: ignore [missing-attribute]
         args = list(map(self._print, expr.args))
         result = args[0]
@@ -107,29 +117,35 @@ class MetalExprPrinter(ExprPrinter_):
 
     @staticmethod
     def _print_binary_min_max(a: str, b: str, fn: str) -> str:
+        # [FUNCTION DOC] HELPER: Builds a metal min/max call with both operands cast to the common promoted type of their sum.
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
         return f"metal::{fn}({typecast_a}, {typecast_b})"
 
     def _print_Min(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a sympy Min as nested metal min calls.
         return self._print_min_max(expr, "min")
 
     def _print_Max(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a sympy Max as nested metal max calls.
         return self._print_min_max(expr, "max")
 
     def _print_Abs(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints absolute value via metal abs. Raises AssertionError unless exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"metal::abs({self._print(expr.args[0])})"
 
     def _print_RoundToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints round-to-nearest-even (metal rint) cast to long. Raises AssertionError unless exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"static_cast<long>(metal::rint({self._print(expr.args[0])}))"
 
     def _print_RoundDecimal(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints rounding a float to ndigits via scaling by a power of ten, rint, and unscaling, cast to float. For integer inputs it raises ValueError (after an AssertionError check that ndigits is negative); AssertionError if not 2 args.
         if len(expr.args) != 2:
             raise AssertionError(f"expected 2 args, got {len(expr.args)}")
         number, ndigits = expr.args
@@ -144,24 +160,29 @@ class MetalExprPrinter(ExprPrinter_):
         return f"static_cast<float>(metal::rint(1e{ndigits} * {number_str}) * 1e{-ndigits})"
 
     def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints true division of two integer expressions by casting both to float.
+        # KNOWN ISSUE: per the in-code TODO, precision is only exact up to 2 to the power 23 because of float32.
         lhs, rhs = expr.args
         # TODO: This is only accurate up to 2**23
         # pyrefly: ignore [missing-attribute]
         return f"static_cast<float>({self._print(lhs)}) / static_cast<float>({self._print(rhs)})"
 
     def _print_PowByNatural(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints power by casting both operands to float and calling metal precise pow. Raises AssertionError unless 2 args.
         if len(expr.args) != 2:
             raise AssertionError(f"expected 2 args, got {len(expr.args)}")
         x, y = map(self.doprint, expr.args)
         return f"metal::precise::pow(static_cast<float>({x}), static_cast<float>({y}))"
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a cast to float. Raises AssertionError unless 1 arg.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         x = self.doprint(expr.args[0])
         return f"static_cast<float>({x})"
 
     def _print_Float(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a sympy Float; integer-valued floats are printed as plain integers because Metal rejects sympy's integer-valued float form, else the default string.
         if expr.is_integer:
             # sympy considers 0.0 to be integer, but Metal doesn't.
             # this workaround prints the float as an integer
@@ -171,6 +192,7 @@ class MetalExprPrinter(ExprPrinter_):
             return str(expr)
 
     def _print_FloorToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints floor of the argument (cast to float first) converted to int. Raises AssertionError unless 1 arg. Also used as the printer for sympy floor.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         x = self.doprint(expr.args[0])
@@ -179,18 +201,21 @@ class MetalExprPrinter(ExprPrinter_):
     _print_floor = _print_FloorToInt
 
     def _print_TruncToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints truncation toward zero converted to int. Raises AssertionError unless 1 arg.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         x = self.doprint(expr.args[0])
         return f"static_cast<int>(metal::trunc({x}))"
 
     def _print_OpaqueUnaryFn_log2(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints metal precise log2. Raises AssertionError unless 1 arg.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         x = self.doprint(expr.args[0])
         return f"metal::precise::log2({x})"
 
     def _print_Where(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] Prints a conditional (ternary) expression from the three sympy arguments, parenthesized as atoms.
         c, p, q = (
             self.parenthesize(arg, PRECEDENCE["Atom"] - 0.5) for arg in expr.args
         )
@@ -198,6 +223,9 @@ class MetalExprPrinter(ExprPrinter_):
 
 
 class MetalOverrides(OpOverrides):
+    # [CLASS DOC] Op-handler overrides that map inductor pointwise ops to Metal source expressions (strings). Mostly static methods; they return
+    # expression text, and some also emit statements into the active kernel buffers (V.kernel) or register required metal headers.
+    # Special-function overrides are attached dynamically by _initialize_special_ops.
     """Implements Metal-specific overrides for ops. Base class emits Python-friendly overrides."""
 
     @staticmethod
@@ -207,6 +235,7 @@ class MetalOverrides(OpOverrides):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
+        # [FUNCTION DOC] Emits a static_cast to the Metal type for dtype; float64 requests log a warning and are cast to float instead.
         if dtype == torch.double:
             log.warning(
                 "float64 cast requested, probably from tensorify_python_scalars"
@@ -218,14 +247,17 @@ class MetalOverrides(OpOverrides):
     def to_dtype_bitcast(
         x: CSEVariable, dtype: torch.dtype, src_dtype: torch.dtype
     ) -> str:
+        # [FUNCTION DOC] Emits an as_type bitcast to the target dtype from the source dtype.
         return f"as_type<{DTYPE_TO_METAL[dtype]}>(static_cast<{DTYPE_TO_METAL[src_dtype]}>({x}))"
 
     @staticmethod
     def constant(val: bool | float | int, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Renders a constant via value_to_metal; dtype is ignored.
         return value_to_metal(val)
 
     @staticmethod
     def index_expr(expr: sympy.Expr, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Prints the sympy index expression into a CSE variable on the kernel compute buffer (with bounds info), then casts it to dtype.
         idx_str = V.kernel.index_to_str(V.kernel.prepare_indexing(expr))
         var = V.kernel.cse.generate(
             V.kernel.compute, idx_str, bounds=get_bounds_index_expr(expr)
@@ -234,12 +266,15 @@ class MetalOverrides(OpOverrides):
 
     @staticmethod
     def value_expr(expr: sympy.Expr, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Same lowering as index_expr (Metal index_expr already yields the requested dtype).
         # Metal index_expr already emits the requested dtype, so value_expr has
         # the same lowering here.
         return MetalOverrides.index_expr(expr, dtype)
 
     @staticmethod
     def masked(mask: CSEVariable, body: sympy.Expr, other: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits a guarded block: runs body inside an if on mask, assigning to a fresh variable, else assigns the other value; results cached by a key of mask, generated body text and fill value. Temporarily swaps kernel buffers and mutates cse prefix/counter. Returns the CSE variable.
+        # KNOWN ISSUE: the cse name_prefix is extended with a suffix and the iter_buffer_ids counter is reset, and neither is restored here; the in-code TODO also notes the annotation of other is wrong.
         # TODO: Type annotation for other is wrong, it's often float or int
         # TODO: Should it be converted to lambda on MacOS-15+?
 
@@ -276,15 +311,18 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def where(a: OpVarT, b: OpVarT, c: OpVarT) -> str:
+        # [FUNCTION DOC] Emits a ternary select; the else value is cast to the type of the true value.
         return f"{a} ? {b} : static_cast<decltype({b})>({value_to_metal(c)})"
 
     @staticmethod
     def remainder(a: OpVarT, b: OpVarT) -> str:
+        # [FUNCTION DOC] Emits the c10 metal remainder helper (Python-style modulo).
         return f"c10::metal::remainder({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def maximum(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits c10 metal max with both operands cast to a common promoted type.
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
         return f"c10::metal::max({typecast_a}, {typecast_b})"
@@ -292,6 +330,7 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def minimum(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits c10 metal min with both operands cast to a common promoted type.
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
         return f"c10::metal::min({typecast_a}, {typecast_b})"
@@ -299,89 +338,108 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_or(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the logical or op.
         return f"{a} || {b}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_and(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the logical and op.
         return f"{a} && {b}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isnan(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the is-nan op.
         return f"metal::isnan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isinf(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the is-inf op.
         return f"metal::isinf({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def log(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the natural log (precise) op.
         return f"metal::precise::log({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def exp(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the exponential (precise) op.
         return f"metal::precise::exp({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def abs(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the absolute value op.
         return f"metal::abs({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def signbit(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the signbit op.
         return f"metal::signbit({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sin(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the sine (precise) op.
         return f"metal::precise::sin({x})"
 
     @staticmethod
     def sinc(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the sinc (c10 helper) op.
         return f"c10::metal::sinc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def cos(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the cosine (precise) op.
         return f"metal::precise::cos({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tan(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the tangent (precise) op.
         return f"metal::precise::tan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def asin(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the arcsine (precise) op.
         return f"metal::precise::asin({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def acos(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the arccosine (precise) op.
         return f"metal::precise::acos({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the arctangent (precise) op.
         return f"metal::precise::atan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan2(x: CSEVariable, y: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the two-argument arctangent (precise) op.
         return f"::metal::precise::atan2({x}, {y})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sqrt(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the square root (precise) op.
         return f"metal::precise::sqrt({x})"
 
     @staticmethod
     def neg(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits negation cast back to the operand's own type.
+        # KNOWN ISSUE: per the in-code TODO this may rely on undefined behavior for unsigned types.
         # TODO: Does it rely on undefined behavior?
         # If so, add special logic for unsigned types
         return f"static_cast<decltype({x})>(-{x})"
@@ -389,36 +447,43 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def rsqrt(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the reciprocal square root (precise) op.
         return f"metal::precise::rsqrt({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tanh(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the hyperbolic tangent (precise) op.
         return f"metal::precise::tanh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atanh(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the inverse hyperbolic tangent (precise) op.
         return f"metal::precise::atanh({x})"
 
     @staticmethod
     def floordiv(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits the c10 floor_divide helper; operands must be integers.
         # a and b must be of integer type
         return f"c10::metal::floor_divide({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def floor(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the floor op.
         return f"metal::floor({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sign(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the sign op.
         return f"metal::sign({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def fmod(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits metal fmod with both operands cast to a common promoted type.
         typecast_a = f"static_cast<decltype({a}+{b})>({a})"
         typecast_b = f"static_cast<decltype({a}+{b})>({b})"
         return f"metal::fmod({typecast_a}, {typecast_b})"
@@ -426,11 +491,13 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def trunc(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the truncation op.
         return f"metal::trunc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def truncdiv(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits division truncated toward zero: metal trunc of the quotient if either operand is floating, else plain integer division.
         quot = f"{a} / {b}"
         if (a.dtype is not None and a.dtype.is_floating_point) or (
             b.dtype is not None and b.dtype.is_floating_point
@@ -441,15 +508,18 @@ class MetalOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ceil(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Returns Metal expression text for the ceiling op.
         return f"metal::ceil({x})"
 
     @staticmethod
     def rand(seed: CSEVariable, offset: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits the c10 metal rand call for seed/offset and registers the random header on the kernel.
         V.kernel.headers.add("random")
         return f"c10::metal::rand({seed}, {offset})"
 
     @staticmethod
     def randn(seed: CSEVariable, offset: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits the c10 metal randn call for seed/offset and registers the random header on the kernel.
         V.kernel.headers.add("random")
         return f"c10::metal::randn({seed}, {offset})"
 
@@ -457,30 +527,36 @@ class MetalOverrides(OpOverrides):
     def randint64(
         seed: CSEVariable, offset: CSEVariable, low: CSEVariable, high: CSEVariable
     ) -> str:
+        # [FUNCTION DOC] Emits the c10 metal randint64 call (seed, offset, low, high) and registers the random header on the kernel.
         V.kernel.headers.add("random")
         return f"c10::metal::randint64({seed}, {offset}, {low}, {high})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def round(x: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits metal rint (round half to even).
         return f"metal::rint({x})"
 
     @staticmethod
     def pow(a: CSEVariable, b: CSEVariable) -> str:
+        # [FUNCTION DOC] Emits metal pow with both operands cast to a common promoted type.
         cast_a = f"static_cast<decltype({a}+{b})>({a})"
         cast_b = f"static_cast<decltype({a}+{b})>({b})"
         return f"metal::pow({cast_a}, {cast_b})"
 
     def _special_unary(self, a: CSEVariable, name: str) -> str:
+        # [FUNCTION DOC] HELPER: Emits a c10 metal special-math call by name for one argument and registers the special_math header; bound via partialmethod for erf, bessel and similar ops.
         V.kernel.headers.add("special_math")
         return f"c10::metal::{name}({a})"
 
     def _special_binary(self, a: CSEVariable, b: CSEVariable, name: str) -> str:
+        # [FUNCTION DOC] HELPER: Emits a c10 metal special-math call by name for two arguments and registers the special_math header.
         V.kernel.headers.add("special_math")
         return f"c10::metal::{name}({a}, {b})"
 
     @classmethod
     def _initialize_special_ops(cls) -> None:
+        # [FUNCTION DOC] HELPER: Class-level setup that attaches special-math ops (erf family, bessel functions, polygamma, igamma, zeta, orthogonal polynomials, lgamma mapped to log_gamma) as partial methods on the class; names of forward-style functions get a forward suffix. Mutates the class; called once at import.
         # Unary special ops
         for name in [
             "erf",
@@ -550,6 +626,11 @@ MetalOverrides._initialize_special_ops()
 
 
 class MetalKernel(SIMDKernel):
+    # [CLASS DOC] SIMDKernel specialization that generates a Metal compute shader. Class attributes: Metal expression printers, max threadgroup size 1024,
+    # simd group size 32, set of required c10 metal headers, and the list of multistage reduction entries. Instance state: counter for
+    # threadgroup accumulator names. Key methods: load/store/reduction, codegen_body/codegen_kernel (shader source), call_kernel (launch code).
+    # KNOWN ISSUE: headers and multistage_reduction_entry are class-level mutable containers shared by all kernels, so headers added by one kernel
+    # (for example error or random) persist into later kernels.
     """Implement Metal codegen based on the SIMDKernel abstraction"""
 
     overrides = MetalOverrides  # type: ignore[assignment]
@@ -569,13 +650,16 @@ class MetalKernel(SIMDKernel):
         tiling: dict[str, sympy.Expr],
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base SIMD kernel with the tiling and keyword args, and creates the counter used to name threadgroup accumulator variables.
         super().__init__(tiling, **kwargs)
         self.acc_var_ids = itertools.count()
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Returns the Metal type name for a torch dtype (KeyError for unsupported dtypes).
         return DTYPE_TO_METAL[dtype]
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] Generates a load from an input buffer into a CSE variable on the loads buffer; half and bfloat values are widened to float32. Returns the variable.
         """Codegen a load from an InputBuffer"""
         var = self.args.input(name)
         index = self.prepare_indexing(index)
@@ -592,6 +676,7 @@ class MetalKernel(SIMDKernel):
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Appends a deferred store line for an output buffer: plain assignment with cast, or an atomic add (registers the atomic header) when mode is atomic_add. Raises RuntimeError for other modes. Goes to the compute buffer inside a reduction, else the stores buffer.
         var = self.args.output(name)
         index = self.prepare_indexing(index)
         dtype_str = self.dtype_to_str(V.graph.get_dtype(name))
@@ -611,6 +696,7 @@ class MetalKernel(SIMDKernel):
             self.stores.writeline(DeferredLine(name, line))
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        # [FUNCTION DOC] Appends a deferred store of a reduced value, guarded so only the thread with reduction index zero writes.
         var = self.args.output(name)
         index = self.prepare_indexing(index)
         dtype_str = self.dtype_to_str(V.graph.get_dtype(name))
@@ -629,6 +715,7 @@ class MetalKernel(SIMDKernel):
         is_threadgroup: bool = True,
         bounds: ValueRanges[Any] = ValueRanges.unknown(),
     ) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: Declares a new accumulator variable (threadgroup or thread local, optional array size and initial value) in the indexing code and returns it as a CSE variable. Raises AssertionError if a threadgroup variable is given a default value.
         if isinstance(dtype, torch.dtype):
             dtype = self.dtype_to_str(dtype)
         var_name = f"tmp_acc_{next(self.acc_var_ids)}"
@@ -651,6 +738,7 @@ class MetalKernel(SIMDKernel):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Caching wrapper: returns a previously generated result for the same dtype, reduction type and value, else calls _reduction_nocache and caches it.
         "Caching wrapper around _reduction_nocache"
         cache_key = (src_dtype, reduction_type, value)
         # Return cached reduction
@@ -667,6 +755,8 @@ class MetalKernel(SIMDKernel):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] HELPER: Generates Metal code for a reduction (any, sum, prod, max, min, argmax, argmin, welford_reduce, welford_combine) using threadgroup shared memory and c10 helpers; uses a per-thread accumulator when the reduction is multistage (larger than the threadgroup). Registers the reduction_utils header, writes to indexing/compute/stores buffers, returns the result variable(s). Raises AssertionError if not inside a reduction or a load mask is active, NotImplementedError for other reduction types.
+        # KNOWN ISSUE: for welford_combine in the multistage case the zero-initialization of the accumulator is emitted twice (redundant, harmless).
         """Codegen a reduction operation.
         Only sum and prod operations are somewhat reasonable optimized"""
         if not self.inside_reduction:
@@ -675,6 +765,7 @@ class MetalKernel(SIMDKernel):
             raise AssertionError("expected no load mask during reduction")
 
         def _unwrap_helper(res3: CSEVariable) -> tuple[CSEVariable, ...]:
+            # [FUNCTION DOC] HELPER: Splits a float3 result variable into its x, y, z component variables.
             # Unwraps vec3 dtype into individual components
             return OpsWrapper._unwrap(
                 [CSEVariable(f"{res3}.{t}", res3.bounds, res3.dtype) for t in "xyz"]
@@ -849,6 +940,7 @@ class MetalKernel(SIMDKernel):
         raise NotImplementedError(reduction_type)
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry) -> None:
+        # [FUNCTION DOC] Emits the definition of an index variable. Non-reduction entries or small reduction ranges become a plain assignment; large reduction ranges open a loop (once per root) striding by the max threadgroup size and compute each entry from a linear index, adding a bounds break when needed. Records entries in multistage_reduction_entry.
         index_expr = self.rename_indexing(entry.expr)
         index_str = self.sexpr(index_expr)  # type: ignore[misc]
 
@@ -923,6 +1015,7 @@ class MetalKernel(SIMDKernel):
                 )
 
     def codegen_body(self) -> None:
+        # [FUNCTION DOC] Concatenates loads, compute and stores into the body. For multistage reductions closes the opened loops, invalidates CSE variables created inside (keeping reduction results), clears the entry list and range-node caches. Clears the loads, compute and stores buffers.
         """
         Concat output code from index_code, loads, compute, stores,
         suffix into self.body.
@@ -963,6 +1056,7 @@ class MetalKernel(SIMDKernel):
         self.stores.clear()
 
     def codegen_kernel(self, name: str = "generated_kernel") -> str:
+        # [FUNCTION DOC] Returns the full shader source text wrapped for the Python wrapper (compile_mps_shader call) or the C++ wrapper (raw string with embedded headers). Emits includes, an optional max threads attribute for reductions, the kernel signature (output and input buffers, size variables, dynamic numels, optional error buffer, thread position args) and the body. Raises RuntimeError for float64 non-scalar inputs and AssertionError for more than 3 index variables.
         """Called at the end to generate a final kernel string"""
         self.codegen_body()
         code = IndentedBuffer()
@@ -1072,6 +1166,8 @@ class MetalKernel(SIMDKernel):
     def call_kernel(
         self, name: str, node: Any = None, deallocate_ws: bool = True
     ) -> None:
+        # [FUNCTION DOC] Emits the wrapper call to launch the kernel: collects buffer, size-variable and dynamic numel arguments, computes thread and group sizes (reductions capped at the max threadgroup size), adds an error buffer index when the error header is used (Python wrapper only), and calls the wrapper's generate_kernel_call for the mps device. Raises RuntimeError in the C++ wrapper if there are no threads.
+        # KNOWN ISSUE: the in-code TODO notes error buffer handling is not implemented for AOTI.
         """
         Codegens a call to this kernel
         """
@@ -1107,6 +1203,7 @@ class MetalKernel(SIMDKernel):
         expr_printer = self.cexpr if V.graph.cpp_wrapper else self.pexpr
 
         def format_threads(threads: list[str], kwarg: str) -> str:
+            # [FUNCTION DOC] HELPER: Formats a list of thread extents as a braced uint64 list (C++ wrapper) or as a keyword list argument (Python wrapper).
             if V.graph.cpp_wrapper:
                 threads = [f"static_cast<uint64_t>({t})" for t in threads]
                 return f"{{{', '.join(threads)}}}"
@@ -1163,6 +1260,7 @@ class MetalKernel(SIMDKernel):
         )
 
     def device_assert_async(self, cond: CSEVariable, msg: str) -> None:
+        # [FUNCTION DOC] Emits a device-side assertion: in the C++ wrapper an early return when the condition fails; otherwise reports the message through the error buffer (registers the error header) and returns.
         if V.graph.cpp_wrapper:
             self.cse.generate(self.compute, f"if (!{cond}) return", assignment=False)
         else:
@@ -1179,6 +1277,8 @@ class MetalKernel(SIMDKernel):
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
+        # [FUNCTION DOC] Emits an index bounds check on the compute buffer for lower and/or upper bounds, returning early on violation (C++ wrapper) or reporting an out-of-range message through the error buffer (Python wrapper). No-op if neither bound is requested.
+        # KNOWN ISSUE: per the in-code TODO it is unclear whether the upper bound is inclusive or exclusive.
         if not (lower or upper):
             return
 
@@ -1214,14 +1314,17 @@ class MetalKernel(SIMDKernel):
 
 
 class MetalScheduling(SIMDScheduling):
+    # [CLASS DOC] SIMDScheduling for the MPS backend using MetalKernel as the kernel type. Defines how generated Metal sources are registered with the wrapper.
     kernel_type = MetalKernel  # type: ignore[assignment]
 
     def __init__(self, scheduler: Scheduler | None) -> None:
+        # [FUNCTION DOC] Initializes the base SIMD scheduling with the given scheduler (may be None).
         super().__init__(scheduler)
 
     def define_kernel(
         self, src_code: str, node_schedule: list[SchedulerNode], kernel: MetalKernel
     ) -> str:
+        # [FUNCTION DOC] Registers generated Metal source with the wrapper and returns the kernel name; reuses a cached name for identical source. C++ wrapper path: one library per kernel, defined via wrapper.define_kernel. Python path: extracts shader text from the compile_mps_shader call, strips include lines, renames the kernel function to a unique name, and writes an async_compile metal definition (with sorted header list) into the wrapper header.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             return wrapper.src_to_kernel[src_code]

@@ -1,3 +1,7 @@
+# [MODULE DOC] Generates Metal shader source for flex attention on MPS. Contains dtype maps, an FX-aten-op to Metal expression table,
+# a compiler from score_mod/mask_mod FX graphs to inline Metal statements, two shader generators (simdgroup matrix-multiply
+# path and a per-thread fallback path), and MetalFlexAttentionNode, an IR extern-kernel node that emits the shader and launch
+# call in the wrapper. No import-time side effects beyond defining constants (the op table temporaries are deleted).
 # mypy: allow-untyped-defs
 """Metal shader template for flex attention on MPS"""
 
@@ -133,6 +137,12 @@ def _fx_graph_to_metal(
     var_prefix: str,
     int_ctype: str = "int",
 ) -> str:
+    # [FUNCTION DOC] HELPER: Translates a score_mod/mask_mod FX graph into Metal statements and returns them joined by newlines.
+    # fixed_inputs maps placeholder names to Metal variable names; captured maps placeholder names to captured-buffer or captured-scalar records.
+    # Only nodes the output depends on are emitted; the result is assigned to output_var, temps are named with var_prefix, int_ctype is the
+    # C type for integer temps. Tracks which values are integers so integer arithmetic/floor-division stay exact. Captured tensors are
+    # tracked as views and indexed down to a scalar load. Raises NotImplementedError for unsupported ops, constant tensor attributes,
+    # non-scalar use of captured buffers, or unsupported indexing patterns. No external side effects.
     """Compile an FX GraphModule to inline Metal code.
 
     `fixed_inputs` maps scalar placeholder names (score/b/h/q/kv) to Metal
@@ -152,6 +162,7 @@ def _fx_graph_to_metal(
     tmp_counter = itertools.count()
 
     def _is_int(node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node is a non-bool Python int or an FX node known to hold an integer value.
         if isinstance(node, bool):
             return False
         if isinstance(node, int):
@@ -169,9 +180,12 @@ def _fx_graph_to_metal(
             stack.extend(nd.all_input_nodes)
 
     def _tmp() -> str:
+        # [FUNCTION DOC] HELPER: Returns a fresh temporary variable name using the prefix and a running counter.
         return f"{var_prefix}{next(tmp_counter)}"
 
     def _val(node) -> str:
+        # [FUNCTION DOC] HELPER: Returns the Metal expression for an FX node or literal: variable name for nodes, true/false for bools,
+        # INFINITY/NAN/float literals for floats, decimal text for ints. Raises NotImplementedError if the node is a captured buffer not yet fully indexed.
         if isinstance(node, torch.fx.Node):
             if node.name in views:
                 raise NotImplementedError(
@@ -359,6 +373,8 @@ def _compile_subgraph_to_metal(
     var_prefix: str,
     int_ctype: str = "int",
 ) -> str:
+    # [FUNCTION DOC] HELPER: Maps graph placeholders by position to Metal names (first the fixed names, the rest to captured_meta entries)
+    # and delegates to the FX-to-Metal compiler. Returns the generated Metal statements as a string.
     """
     Bind placeholders by position to Metal variable names and emit parts of Metal .
 
@@ -402,9 +418,13 @@ def _generate_mma_shader(
     max_param="",
     max_write_code="",
 ):
+    # [FUNCTION DOC] HELPER: Builds the full Metal shader source for the simdgroup-matrix path (Q times K transposed on 8x8 tiles).
+    # Takes dtype, head dims, block sizes, buffer parameter text, scalar unpack code, precompiled score/mask code, whether full blocks
+    # exist, the softmax scale, and optional logsumexp / max-score parameter and write code. Returns the shader source string.
     """Generate Metal shader using simdgroup_matrix for Q@K^T."""
 
     def _block_loop_body(is_partial):
+        # [FUNCTION DOC] HELPER: Returns the Metal text for a loop over KV tiles; partial blocks include the mask code, full blocks skip the mask.
         if is_partial:
             mask_section = f"""
                     bool mask_result = true;
@@ -611,6 +631,10 @@ def _generate_metal_shader(
     write_max: bool = False,
     captures_fit_int32: bool = True,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the complete Metal flex attention shader source. Chooses the simdgroup-matrix path when head dims and
+    # block_m are multiples of 8 and a block_n of at least 8 fits in 32KB threadgroup memory, else a per-thread fallback path.
+    # Assigns buffer indices (out, Q, K, V, kv blocks, optional full blocks, captures, optional lse and max outputs, packed scalar params),
+    # compiles score_mod/mask_mod graphs, and builds the scalar unpack code. Raises NotImplementedError for unsupported capture dtypes.
     """Generate the complete Metal shader source for flex attention.
 
     `score_captured` / `mask_captured` describe the captures of score_mod /
@@ -804,6 +828,7 @@ def _generate_metal_shader(
 
     # Fallback: per-thread dot product with cooperative K/V tiling.
     def _fallback_block_loop_body(is_partial):
+        # [FUNCTION DOC] HELPER: Returns the Metal text for a KV-tile loop in the fallback path; mask code is included only for partial blocks.
         if is_partial:
             mask_section = f"""
                 bool mask_result = true;
@@ -965,6 +990,9 @@ kernel void flex_attn_fwd(
 
 
 class MetalFlexAttentionNode(ir.ExternKernelAlloc):
+    # [CLASS DOC] IR extern-kernel node for MPS flex attention. Holds the shader source, scalar args packed into an int64 buffer,
+    # the launch grid and block_m. The last num_mutated_outputs inputs (logsumexp, max scores) are written in place and exposed as
+    # mutation outputs. Key method: codegen.
     """IR node for MPS flex attention; emits a compiled Metal shader at codegen."""
 
     def __init__(
@@ -977,6 +1005,8 @@ class MetalFlexAttentionNode(ir.ExternKernelAlloc):
         block_m: int,
         num_mutated_outputs: int = 0,
     ):
+        # [FUNCTION DOC] Stores shader, scalar args, grid and block_m; registers MutationOutput nodes for the trailing mutated inputs.
+        # Calls the ExternKernelAlloc constructor with the kernel name metal_flex_attention.
         super().__init__(
             layout=layout,
             inputs=inputs,
@@ -995,6 +1025,9 @@ class MetalFlexAttentionNode(ir.ExternKernelAlloc):
         ]
 
     def codegen(self, wrapper) -> None:
+        # [FUNCTION DOC] Emits wrapper code: compiles the shader once per distinct source (cached in wrapper.src_to_kernel, spliced into the
+        # header), allocates the output with empty_strided, builds an int64 params tensor from scalar args, and launches flex_attn_fwd
+        # with threads = grid_x*block_m, grid_y, grid_z and group size block_m. Mutates wrapper state (imports, header, lines).
         wrapper.add_import_once(
             "from torch._inductor.runtime.runtime_utils import compile_mps_shader"
         )
