@@ -1,3 +1,10 @@
+# [MODULE DOC] Post-scheduling bucketing of collectives for inductor overlap scheduling.
+# Defines OverlapPreservingBucketer, which merges compatible all-gather / reduce-scatter /
+# all-reduce collectives (and their waits) into bucketed ops while keeping every
+# compute-hides-collective relationship intact, using an augmented dependency graph and
+# a per-process-group linked timeline of events. Also defines PGEvent, WhyNoBucket,
+# is_collective_or_wait and the entry point finalize_overlap_scheduling.
+# Import-time side effects: creates the module logger named bucket_log only.
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -35,18 +42,25 @@ bucket_log = logging.getLogger(__name__)
 
 @dataclass
 class WhyNoBucket:
+    # [CLASS DOC] Debug-logging helper for a pair of nodes that failed to bucket.
+    # State: name1 and name2 (node names) and an unused reason/args pair. Calling the instance
+    # with a format string and arguments emits a debug log line explaining why the pair
+    # cannot be bucketed, only when debug logging is enabled.
     name1: str
     name2: str
     reason: str
     args: tuple[Any, ...]
 
     def __init__(self, node1: fx.Node, node2: fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Record the names of the two nodes; reason is empty and args is an empty tuple.
         self.name1 = node1.name
         self.name2 = node2.name
         self.reason = ""
         self.args = ()
 
     def __call__(self, reason: str, *args: Any) -> None:
+        # [FUNCTION DOC] HELPER: If debug logging is enabled, log that the stored node names cannot be bucketed,
+        # appending the given reason text formatted with the extra args. Returns nothing.
         if bucket_log.isEnabledFor(logging.DEBUG):
             bucket_log.debug(
                 "cannot bucket %s with %s: " + reason,
@@ -57,6 +71,8 @@ class WhyNoBucket:
 
 
 def is_collective_or_wait(n: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Return true if the node is a schedulable wait, or a node whose only user
+    # is a schedulable wait (i.e. a collective start). Otherwise false.
     """Check if node is a collective start or wait."""
     if _schedulable_wait_node(n):
         return True
@@ -70,6 +86,10 @@ def is_collective_or_wait(n: fx.Node) -> bool:
 
 @dataclass
 class PGEvent:
+    # [CLASS DOC] One event (collective start, wait, or hiding compute node) in a process group timeline.
+    # State: node, event_type (compute, starts or waits), position (index in the timeline), and
+    # prev/next links forming a doubly linked list. Order encodes the sequential execution of
+    # operations on one NCCL stream. Key methods: is_start/is_wait/is_compute, unlink, insert_between.
     """
     Represents an important event in a process group timeline. Either
     a collective start, wait, or hiding compute. Each node is linked
@@ -92,17 +112,22 @@ class PGEvent:
 
     @property
     def is_start(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when the event type is starts.
         return self.event_type == "starts"
 
     @property
     def is_wait(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when the event type is waits.
         return self.event_type == "waits"
 
     @property
     def is_compute(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when the event type is compute.
         return self.event_type == "compute"
 
     def unlink(self) -> tuple[Optional["PGEvent"], Optional["PGEvent"]]:
+        # [FUNCTION DOC] HELPER: Detach this event from the linked list, joining its neighbours to each other,
+        # clear its own links, and return the former (prev, next) pair. Mutates neighbours.
         """Remove this event from the linked list, return (prev, next)."""
         prev_event, next_event = self.prev, self.next
         if self.prev:
@@ -116,6 +141,8 @@ class PGEvent:
     def insert_between(
         self, prev_event: Optional["PGEvent"], next_event: Optional["PGEvent"]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Link this event between the given prev and next events (either may be none),
+        # updating their pointers and this event's pointers. No return value.
         """Insert this event between prev_event and next_event in the linked list."""
         if prev_event:
             prev_event.next = self
@@ -127,6 +154,13 @@ class PGEvent:
 
 
 class OverlapPreservingBucketer:
+    # [CLASS DOC] Buckets collectives of the same kind while preserving comm/compute overlap.
+    # State: the fx graph, collective_info (start node to CollectiveInfo), the scheduled node order and
+    # its index map, bucketing limits and options, node_to_event (node to PGEvent for the PG currently
+    # being processed), all_hiding_nodes, bitset ancestors that include hiding-interval edges, and
+    # aug_graph (AugmentedGraphHelper holding extra dependencies that model timelines and merges).
+    # Construction builds a timeline per process group and adds hiding constraints.
+    # Entry point: bucket_collectives. Merges are validated by _can_add_to_bucket and applied by _apply_bucket.
     """
     Buckets collective operations while preserving compute-collective overlap relationships.
     Uses an augmented graph to track dependencies between compute and collective operations.
@@ -145,6 +179,11 @@ class OverlapPreservingBucketer:
         bucket_exposed_first: bool | None = None,
         bucket_only_internode_comms: bool = False,
     ):
+        # [FUNCTION DOC] Store the configuration, index the scheduled nodes, compute ancestors, build the augmented
+        # graph, build per-PG timelines (which adds sequential extra deps) and add hiding-interval deps.
+        # Args: graph, collective_info, scheduled order, max bucket size in GB, max candidate distance,
+        # whether to insert overlap deps as control deps, whether to bucket at all, bucket mode (defaults to
+        # the default mode), bucket_exposed_first (none means decide per group), internode-only flag.
         self.graph = graph
         self.collective_info = collective_info
         self.scheduled = scheduled
@@ -168,6 +207,8 @@ class OverlapPreservingBucketer:
         self._add_hiding_interval_constraints()
 
     def _compute_node_ancestors(self) -> BitsetAncestors:
+        # [FUNCTION DOC] HELPER: Build bitset ancestors of the scheduled nodes, adding extra edges for every hidden
+        # collective: start -> each hiding node -> wait. Exposed collectives add no edges.
         """Compute ancestor sets including hiding interval deps using bitsets."""
         extra_inputs: dict[fx.Node, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
         for start, info in self.collective_info.items():
@@ -180,6 +221,8 @@ class OverlapPreservingBucketer:
         return BitsetAncestors(list(self.scheduled), extra_inputs=extra_inputs)
 
     def build_timelines(self) -> dict[str, PGEvent | None]:
+        # [FUNCTION DOC] Collect the process group names of all collective starts and build a timeline for each.
+        # Returns a mapping from group name to the head PGEvent of its timeline (or none if empty).
         "Construct each process groups ordered series of event"
         all_pgs: OrderedSet[str] = OrderedSet()
         for start in self.collective_info:
@@ -193,6 +236,10 @@ class OverlapPreservingBucketer:
         return pg_timeline
 
     def build_timeline(self, pg: str) -> PGEvent | None:
+        # [FUNCTION DOC] Build the linked timeline for one process group by scanning the scheduled nodes in order.
+        # Starts and waits of that group become events, as do compute nodes and any nodes known to hide a
+        # collective of the group (including waits of other groups). Consecutive events get a sequential
+        # extra dependency in the augmented graph. Returns the head event, or none if no events.
         """
         Build a timeline of important events (starts, waits, hiding compute) for this process group
         and constrain this ordering in the augmented graph.
@@ -243,6 +290,7 @@ class OverlapPreservingBucketer:
         return head
 
     def _populate_node_to_event(self, pg: str) -> None:
+        # [FUNCTION DOC] HELPER: Clear node_to_event and refill it by walking the given group's timeline from its head.
         """Populate node_to_event mapping for a specific PG's timeline."""
         self.node_to_event.clear()
         head = self.pg_to_timeline_head[pg]
@@ -252,6 +300,8 @@ class OverlapPreservingBucketer:
             curr = curr.next
 
     def _add_hiding_interval_constraints(self) -> None:
+        # [FUNCTION DOC] HELPER: For every non-exposed collective add extra deps enforcing start -> hiding node -> wait,
+        # and record the hiding nodes in all_hiding_nodes.
         """
         Add hiding interval constraints: start -> compute -> wait.
         """
@@ -266,6 +316,8 @@ class OverlapPreservingBucketer:
             self.all_hiding_nodes |= info.hiding_nodes
 
     def identify_internode_group_names(self) -> OrderedSet[str]:
+        # [FUNCTION DOC] Heuristically find internode process groups: groups whose first examined all-gather
+        # looks like an FSDP all-gather. Returns the set of group names. Each group is checked only once.
         # Identify internode comm groups.
         # Temporary uses FSDP pattern as heuristic for outer groups.
         checked_pgs = OrderedSet()
@@ -279,6 +331,9 @@ class OverlapPreservingBucketer:
         return internode_pgs
 
     def _bucket_collectives_impl(self) -> list[CollBucket]:
+        # [FUNCTION DOC] HELPER: Group collective starts by process group, then by bucket key, find buckets in each
+        # group (skipping non-internode groups if configured) and apply every bucket with more than one
+        # collective, incrementing the collective_buckets counter. Returns all buckets found.
         """Find and apply bucket transformations for collectives."""
         pg_collectives: dict[str, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
         internode_pgs = self.identify_internode_group_names()
@@ -321,6 +376,10 @@ class OverlapPreservingBucketer:
         return all_buckets
 
     def _apply_deps_and_effect_tokens(self) -> None:
+        # [FUNCTION DOC] HELPER: Finish the augmented graph (drop erased deps, optionally auto-fix cycles per config), check
+        # no dep refers to an erased node (raises via torch._check), stable-topologically sort the graph with
+        # the extra deps, and if insert_overlap_deps is set, add control dependencies for the deps that are
+        # not collective-to-collective. Mutates the graph.
         """Apply topological sort and effect tokens to preserve overlap."""
         from torch._dynamo.graph_deduplication import _stable_topological_sort
 
@@ -360,6 +419,8 @@ class OverlapPreservingBucketer:
                 preserve_node_ordering(self.graph, filtered_deps)
 
     def bucket_collectives(self) -> None:
+        # [FUNCTION DOC] Run bucketing if enabled, apply deps and lint the graph, then when debug logging is on
+        # emit a structured trace artifact with per-key bucket statistics and bucket details. Mutates the graph.
         """Run the full bucketing and dep application flow."""
         # Step 1: Bucket collectives
         all_buckets: list[CollBucket] | None = None
@@ -380,6 +441,7 @@ class OverlapPreservingBucketer:
             stats_num_total_collectives_per_key = defaultdict(int)
 
             def _bucket_key(node):
+                # [FUNCTION DOC] HELPER: Return the full bucket key of a node for the current bucket mode.
                 return get_full_bucket_key(node, self.bucket_mode)
 
             for start, info in self.collective_info.items():
@@ -420,6 +482,8 @@ class OverlapPreservingBucketer:
             )
 
     def _compute_overlap_ratio(self, node: fx.Node) -> float:
+        # [FUNCTION DOC] HELPER: Return the fraction of a collective's estimated time that is hidden by compute:
+        # 0.0 when the estimate is non-positive or fully exposed, up to 1.0 when fully hidden.
         """
         Compute what fraction of the collective's time is hidden by compute.
         Returns 0.0 for fully exposed, 1.0 for fully hidden.
@@ -436,6 +500,8 @@ class OverlapPreservingBucketer:
         current_pg: str,
         internode_pgs: OrderedSet[str],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decide whether to sort a group by exposure first: use the explicit option if set,
+        # otherwise true only for internode groups.
         """Determine whether to bucket exposed collectives first."""
         if self.bucket_exposed_first is None:
             return current_pg in internode_pgs
@@ -446,6 +512,10 @@ class OverlapPreservingBucketer:
         collective_group: OrderedSet[fx.Node],
         internode_pgs: OrderedSet[str],
     ) -> list[CollBucket]:
+        # [FUNCTION DOC] HELPER: Greedily build buckets from a group of same-key collectives. Order is by overlap ratio
+        # (exposed first) or by schedule position. Each seed skips if already processed or used for
+        # hiding; candidates within the distance window are added while the memory cap holds and
+        # _can_add_to_bucket succeeds, stopping after 20 consecutive failures. Returns buckets of size > 1.
         """Find valid buckets within a group of similar collectives."""
         max_bucket_bytes = int(self.max_bucket_memory_gb * 1024 * 1024 * 1024)
         buckets = []
@@ -533,12 +603,16 @@ class OverlapPreservingBucketer:
         return buckets
 
     def _ancestor_dep(self, n1: fx.Node, n2: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Return whether the precomputed ancestors record a dependency between the two nodes.
         """Check if there's an ancestor relationship between two nodes."""
         return self.node_ancestors.has_dep(n1, n2)
 
     def _get_intervals(
         self, event: PGEvent
     ) -> tuple[tuple[int, int] | None, list[tuple[int, int]]]:
+        # [FUNCTION DOC] HELPER: For a start or wait event, return the collective's execution interval (start position,
+        # wait position) and a list of hiding intervals (start position, hiding node position). Returns
+        # (none, empty list) for compute events or unknown collectives.
         """Get (execution_interval, hiding_intervals) for a collective event.
 
         Returns:
@@ -588,6 +662,10 @@ class OverlapPreservingBucketer:
         wait_pos: fx.Node,
         why: WhyNoBucket,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Check that placing the bucket start/wait at the given nodes keeps all hiding intervals
+        # valid: hiding compute must lie between new start and wait, and no other collective's execution
+        # interval in the affected timeline regions may strictly enclose a hiding interval. Logs the reason
+        # via why and returns false on violation.
         """
         Check that (start_pos, wait_pos) doesn't violate any hiding intervals or collectives.
 
@@ -627,9 +705,11 @@ class OverlapPreservingBucketer:
                 return False
 
         def get_wait(n: fx.Node) -> fx.Node:
+            # [FUNCTION DOC] HELPER: Return the wait node of a collective.
             return self.collective_info[n].wait_node
 
         def get_pos(n: fx.Node) -> int:
+            # [FUNCTION DOC] HELPER: Return the timeline position of a node.
             return self.node_to_event[n].position
 
         latest_start_pos = max(get_pos(candidate), get_pos(bucket_info.collectives[0]))
@@ -680,6 +760,7 @@ class OverlapPreservingBucketer:
 
         # Check: no hiding interval should be enclosed by any execution interval
         def enclosed_interval(inner: tuple[int, int], outer: tuple[int, int]) -> bool:
+            # [FUNCTION DOC] HELPER: True if the inner interval lies strictly inside the outer interval.
             return outer[0] < inner[0] and inner[1] < outer[1]
 
         for hiding_interval in hiding_intervals:
@@ -695,6 +776,9 @@ class OverlapPreservingBucketer:
         return True
 
     def remove_from_event(self, node: fx.Node) -> tuple[PGEvent | None, PGEvent | None]:
+    # [FUNCTION DOC] Unlink a start or wait event from the timeline, removing its extra deps and adding a
+    # bypass dep between its neighbours. Raises AssertionError for compute events.
+    # Returns the former (prev, next) events.
         """Remove node from timeline and return (prev_event, next_event)."""
         event = self.node_to_event[node]
         if event.is_compute:
@@ -720,6 +804,8 @@ class OverlapPreservingBucketer:
         prev_event: PGEvent | None,
         next_event: PGEvent | None,
     ) -> None:
+    # [FUNCTION DOC] Undo remove_from_event: relink the node's event between the given neighbours, re-add its
+    # extra deps and remove the bypass dependency.
         """Restore node to timeline after failed merge attempt."""
         event = self.node_to_event[node]
 
@@ -742,6 +828,11 @@ class OverlapPreservingBucketer:
         wait_pos: fx.Node,
         why: WhyNoBucket,
     ) -> bool:
+    # [FUNCTION DOC] HELPER: Try merging the candidate with the bucket at one (start, wait) timeline choice.
+    # Checks hiding intervals, removes the moved start, rejects if a path exists between starts, merges
+    # them in the augmented graph, then does the same for waits (rolling back the start merge on failure).
+    # On success updates node_to_event and returns true; otherwise restores state and returns false.
+    # Raises AssertionError if start_pos is neither the bucket seed nor the candidate.
         """
         Try a specific timeline position for the candidate.
         Returns True if valid and merges are successful.
@@ -823,6 +914,8 @@ class OverlapPreservingBucketer:
     def _has_ancestor_conflicts(
         self, bucket_info: CollBucket, candidate: fx.Node
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Return true if the candidate conflicts with any bucket member by precomputed ancestry:
+        # start ancestry, wait ancestry, or a hiding node of one being an ancestor of the other's wait.
         """
         Check if candidate has ancestor conflicts with bucket collectives.
         Returns True if there are conflicts.
@@ -856,6 +949,9 @@ class OverlapPreservingBucketer:
         bucket_info: CollBucket,
         candidate: fx.Node,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decide whether the candidate can join the bucket without breaking overlap. Rejects
+        # candidates used for hiding or with ancestor conflicts, then tries four (start, wait) timeline
+        # placements in order and returns true on the first that works.
         """
         Check if candidate can be added to bucket without breaking comm/compute overlap.
 
@@ -927,6 +1023,11 @@ class OverlapPreservingBucketer:
         return False
 
     def _apply_bucket(self, bucket_info: CollBucket) -> None:
+    # [FUNCTION DOC] HELPER: Replace the bucket's collectives with one bucketed op using the merge function for the
+    # collective kind (all-gather, all-reduce or reduce-scatter), placed before the first node after the
+    # bucket. Maps old starts, waits and fused dtype-convert nodes to their replacements and transfers
+    # their extra deps in the augmented graph. Mutates the graph; raises AssertionError on unexpected kind
+    # or wait count mismatch.
         """
         Apply bucketing transformation.
 
@@ -1048,6 +1149,9 @@ def finalize_overlap_scheduling(
     bucket_only_internode_comms: bool = False,
     bucket_mode: BucketMode | None = None,
 ) -> None:
+    # [FUNCTION DOC] Entry point after overlap scheduling: build an OverlapPreservingBucketer from the arguments
+    # and run bucket_collectives on the graph module's graph (bucketing if enabled, then dependencies).
+    # Mutates the graph in place; returns nothing.
     """
     Finalize overlap scheduling by applying deps and optionally bucketing.
 
