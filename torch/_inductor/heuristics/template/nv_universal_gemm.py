@@ -1,3 +1,6 @@
+# [MODULE DOC] NVGEMM kernel selection using nvMatmulHeuristics: ranks cutlass.operators kernels by estimated runtime, matching on
+# (tile_m, tile_n, cluster_m, cluster_n), and optionally adds hand-picked supplemental configs. Provides a lazily created singleton.
+# Import-time side effects: creates a module logger and an autotuning artifact logger.
 from __future__ import annotations
 
 import logging
@@ -32,6 +35,7 @@ ConfigKey = tuple[int, int, int, int]
 
 @dataclass
 class HeuristicConfig:
+    # [CLASS DOC] Dataclass holding one config recommended by nvMatmulHeuristics: tile, cluster, stages, split_k, warp tile sizes and estimated runtime.
     """Configuration recommended by nvMatmulHeuristics."""
 
     tile_m: int
@@ -48,11 +52,13 @@ class HeuristicConfig:
 
 
 def _make_config_key_from_heuristic(cfg: HeuristicConfig) -> ConfigKey:
+    # [FUNCTION DOC] HELPER: Build the (tile_m, tile_n, cluster_m, cluster_n) key from a HeuristicConfig.
     """Build config key from HeuristicConfig returned by nvMatmulHeuristics."""
     return (cfg.tile_m, cfg.tile_n, cfg.cluster_m, cfg.cluster_n)
 
 
 def _make_config_key_from_kernel_design(design) -> ConfigKey | None:
+    # [FUNCTION DOC] HELPER: Build the config key from a cutlass.operators design object's tile_shape and cluster_shape; return None if either is missing or shorter than 2.
     """Build config key from cutlass.operators kernel metadata.design."""
     if (
         hasattr(design, "tile_shape")
@@ -70,6 +76,7 @@ def _make_config_key_from_kernel_design(design) -> ConfigKey | None:
 
 
 def _make_config_key_from_heuristics_kernel(kernel) -> ConfigKey:
+    # [FUNCTION DOC] HELPER: Build the config key from an nvMatmulHeuristics kernel struct using its cta and cluster entries.
     """Build config key from nvMatmulHeuristics kernel config struct."""
     return (
         kernel.cta[0],
@@ -80,11 +87,13 @@ def _make_config_key_from_heuristics_kernel(kernel) -> ConfigKey:
 
 
 class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
+    # [CLASS DOC] Singleton-style heuristics for NVGEMM kernel filtering through nvMatmulHeuristics; stateless, GEMM max-autotune gated.
     """
     Heuristics for NVGEMM kernel selection using nvMatmulHeuristics.
     """
 
     def should_run(self, inputs: KernelInputs) -> bool:
+        # [FUNCTION DOC] Return true if the GEMM max-autotune gate passes and nvMatmulHeuristics is available.
         """Check if heuristics should be used.
 
         Args:
@@ -99,6 +108,11 @@ class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
         count: int,
         accumulator_type: torch.dtype = torch.float32,
     ) -> list:
+        # [FUNCTION DOC] Filter and rank cutlass.operators kernels to at most count using nvMatmulHeuristics estimates for the problem (m, n, k, batch, dtypes, layouts from strides).
+        # If heuristics are unavailable/off, no kernel configs can be extracted, no heuristic configs return, or none match, returns the first count kernels.
+        # Otherwise returns matched kernels sorted by estimated runtime, then, if config nvgemm_supplement_configs is on, appends one kernel for each supplemental config key not already selected.
+        # Logs debug and autotuning info.
+        # KNOWN ISSUE: the docstring says matching includes tile_k, but the key only has tile_m, tile_n, cluster_m, cluster_n.
         """
         Filter and rank kernels using nvMatmulHeuristics.
 
@@ -269,6 +283,7 @@ class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
         return result
 
     def _extract_config_to_kernels(self, kernels: list) -> dict[ConfigKey, list]:
+        # [FUNCTION DOC] HELPER: Group kernels into a mapping from config key to list of kernels, skipping kernels whose design yields no key.
         """Build a map from config key to kernels."""
         config_to_kernels: dict[ConfigKey, list] = defaultdict(list)
 
@@ -280,6 +295,7 @@ class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
         return config_to_kernels
 
     def _get_layout_enum(self, layout_a: str, layout_b: str):
+        # [FUNCTION DOC] HELPER: Map two layout strings (row or col) to the NvMatmulHeuristicsMatmulLayout enum member; imports nvMatmulHeuristics lazily.
         """Map layout strings to NvMatmulHeuristicsMatmulLayout enum."""
         import nvMatmulHeuristics
 
@@ -292,12 +308,14 @@ class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
         self,
         valid_configs: OrderedSet[ConfigKey],
     ):
+        # [FUNCTION DOC] HELPER: Return a callback for nvMatmulHeuristics that accepts only kernel configs whose key is in valid_configs.
         """
         Create callback for nvMatmulHeuristics that only accepts configurations
         matching the available cutlass.operators kernel tile/cluster shapes.
         """
 
         def validity_check(kernel_config_ptr, problem_ptr):
+            # [FUNCTION DOC] HELPER: Callback taking kernel and problem pointers; returns 1 if the kernel key is a valid config, else 0.
             kernel = kernel_config_ptr.contents
             key = _make_config_key_from_heuristics_kernel(kernel)
             return 1 if key in valid_configs else 0
@@ -319,6 +337,9 @@ class NVUniversalGemmHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
         dtype_b: torch.dtype | None = None,
         out_dtype: torch.dtype | None = None,
     ) -> list[HeuristicConfig]:
+        # [FUNCTION DOC] HELPER: Query nvMatmulHeuristics for up to count recommended configs for the problem, restricted by a validity callback to valid_configs.
+        # Builds a precision string from dtype letters (3, or 5 letters for mixed or single-char fp8), creates and destroys a CUTLASS3 backend, and returns a list of HeuristicConfig,
+        # or an empty list if nothing is returned. Logs the results. Imports nvMatmulHeuristics lazily.
         """
         Get kernel configurations recommended by nvMatmulHeuristics.
 
@@ -455,6 +476,7 @@ _nvgemm_heuristics: NVUniversalGemmHeuristics | None = None
 
 
 def get_nvgemm_heuristics() -> NVUniversalGemmHeuristics:
+    # [FUNCTION DOC] Return the module-level NVUniversalGemmHeuristics instance, creating it on first use. Mutates a module global.
     """Get the singleton NVUniversalGemmHeuristics instance."""
     global _nvgemm_heuristics
     if _nvgemm_heuristics is None:

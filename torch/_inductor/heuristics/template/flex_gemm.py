@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QuACK GEMM config helpers for FlexGEMM: convert configs to hashable keys and back, list device-compatible configs in a measured priority order,
+# filter by user-pinned fields and choose an untuned default by shape. Needs torch._vendor.quack. No import-time side effects beyond imports.
 from __future__ import annotations
 
 from dataclasses import fields
@@ -19,6 +21,7 @@ GemmConfigKey: TypeAlias = tuple[tuple[str, Any], ...]
 
 
 def gemm_config_key(config: quack_gemm_config.GemmConfig) -> GemmConfigKey:
+    # [FUNCTION DOC] Return a tuple of (field name, value) pairs for every field of the QuACK GemmConfig dataclass; a hashable key.
     """Project a QuACK GEMM config using the dataclass schema as the contract."""
     return tuple(
         (field.name, getattr(config, field.name))
@@ -27,6 +30,7 @@ def gemm_config_key(config: quack_gemm_config.GemmConfig) -> GemmConfigKey:
 
 
 def gemm_config_from_key(config_key: GemmConfigKey) -> quack_gemm_config.GemmConfig:
+    # [FUNCTION DOC] Inverse of gemm_config_key: rebuild a GemmConfig from a key of name/value pairs.
     """Reconstruct a QuACK GEMM config from its generated-code cache key."""
     return quack_gemm_config.GemmConfig(**dict(config_key))
 
@@ -34,6 +38,8 @@ def gemm_config_from_key(config_key: GemmConfigKey) -> quack_gemm_config.GemmCon
 def explicit_gemm_configs_for_device(
     config: dict[str, Any], device: torch.device
 ) -> tuple[quack_gemm_config.GemmConfig, ...]:
+    # [FUNCTION DOC] Return candidate configs for the CUDA device that match every pinned field in the config mapping, using exact type matching so bool/int do not alias.
+    # Raises NotImplementedError for unknown field names, for a device_capacity targeting a different SM than the device, or when no candidate matches.
     """Return device configs matching every explicitly pinned field.
 
     Exact type matching prevents bool/int aliases from selecting a different key.
@@ -76,6 +82,7 @@ def explicit_gemm_configs_for_device(
 
 @cache
 def dense_gemm_config_priority_keys() -> tuple[GemmConfigKey, ...]:
+    # [FUNCTION DOC] Return (cached) keys of the dense QuACK configs in measured preference order. The first four are default, skinny, large-rect, large.
     """Return the measured dense FlexGEMM QuACK preference order."""
     configs = (
         quack_gemm_config.GemmConfig(
@@ -180,6 +187,8 @@ def dense_gemm_config_priority_keys() -> tuple[GemmConfigKey, ...]:
 
 
 def candidate_gemm_configs_for_device(device: torch.device):
+    # [FUNCTION DOC] Return QuACK configs for the device's compute capability major (11 treated as 10), excluding TMA-gather configs,
+    # sorted by priority-list position then tile m, tile n, cluster m, cluster n and persistence. Raises RuntimeError if none exist.
     """Return all device-compatible QuACK configs before shape-specific ranking."""
     device_capacity = torch.cuda.get_device_capability(device)[0]
     if device_capacity == 11:
@@ -216,6 +225,9 @@ def default_gemm_config_key(
     n,
     configs: Sequence[quack_gemm_config.GemmConfig] | None = None,
 ) -> GemmConfigKey:
+    # [FUNCTION DOC] Pick the untuned default config key for generated code from candidates (default: all for the device).
+    # Uses guard_or_false on symbolic m and n to find min/max dimension and prefers skinny, large-rect or large keys by size ranges, falling back to the default key,
+    # then the first candidate. If m versus n cannot be decided, returns the default key if present, else the first candidate. Reads the current graph V.graph sizevars.
     """Return the untuned default QuACK config key for generated code."""
     configs = candidate_gemm_configs_for_device(device) if configs is None else configs
     config_keys = OrderedSet([gemm_config_key(config) for config in configs])

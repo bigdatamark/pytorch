@@ -1,3 +1,4 @@
+# [MODULE DOC] Backward-compatible module re-exporting the shared heuristic registry functions, the registry/cache dicts and TemplateConfigHeuristics. No logic of its own.
 """Backward-compatible re-exports from the shared heuristics registry."""
 
 from torch._inductor.heuristics.registry import (

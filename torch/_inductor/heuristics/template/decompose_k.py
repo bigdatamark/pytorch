@@ -1,3 +1,5 @@
+# [MODULE DOC] Heuristics for the decompose-K subgraph template of mm, which splits the reduction dimension K into chunks.
+# Import-time side effect: registers a no-op heuristic for all devices and the real one for cuda (including ROCm) and xpu.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
 
 @register_template_heuristic(decompose_k_subgraph_template.uid, None, op_name="mm")
 class EmptyDecomposeKConfigHeuristics(TemplateConfigHeuristics):
+    # [CLASS DOC] Empty heuristic (no configs) registered for all devices to disable decompose-K where the real one is not registered.
     """empty heuristics to skip decompose k on anything not cuda"""
 
 
@@ -40,11 +43,14 @@ class EmptyDecomposeKConfigHeuristics(TemplateConfigHeuristics):
 # by either adding specific register_template_heuristic tags, or setting the
 # device to None (enabled on all devices)
 class DecomposeKConfigHeuristics(GemmMaxAutotuneTemplateConfigHeuristics):
+    # [CLASS DOC] Max-autotune gated heuristic yielding one config per candidate K split that divides K.
     def _get_template_configs_impl(
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Yield a config with key k_split for each candidate from get_k_splits(m, n, k) whose value statically divides K.
+        # Yields nothing if any shape/stride has unbacked symbols. Raises AssertionError if kernel_inputs is not MMKernelInputs.
         """
         Get all the valid k_splits for the given m, n, k.
         """

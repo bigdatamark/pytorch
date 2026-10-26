@@ -1,3 +1,5 @@
+# [MODULE DOC] Heuristics for ATen (extern kernel) choices of mm, bmm, addmm, baddbmm and related ops, so they go through
+# the same template-config flow as other templates. Import-time side effect: registers the classes below in the heuristic registry.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
 @register_template_heuristic(aten_bmm_dtype.uid, "cuda")
 @register_template_heuristic(aten_bmm_dtype.uid, "xpu")
 class ATenConfigHeuristics(TemplateConfigHeuristics):
+    # [CLASS DOC] Pseudo heuristic producing exactly one empty config, so a plain ATen choice with no kwargs is handled like a template. Subclass it for ATen choices needing kwargs.
     """
     Pseudo heuristic to make ATen choices go through the same flow as other templates
 
@@ -51,6 +54,7 @@ class ATenConfigHeuristics(TemplateConfigHeuristics):
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Yield a single empty config dict (one choice, no template kwargs). Inputs are ignored.
         yield dict()
 
 
@@ -59,11 +63,13 @@ class ATenConfigHeuristics(TemplateConfigHeuristics):
 @register_template_heuristic(aten_addmm.uid, None, op_name="addmm")
 @register_template_heuristic(aten_baddbmm.uid, None, op_name="baddbmm")
 class ATenAddMMConfigHeuristics(ATenConfigHeuristics):
+    # [CLASS DOC] ATen heuristic for addmm/baddbmm choices that need alpha and beta passed as extra kwargs.
     def get_extra_kwargs(
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Return the base extra kwargs plus alpha and beta read as scalars from the kernel inputs.
         kwargs = super().get_extra_kwargs(kernel_inputs, op_name)
         alpha = kernel_inputs.get_scalar("alpha")
         beta = kernel_inputs.get_scalar("beta")
@@ -78,11 +84,14 @@ class ATenAddMMConfigHeuristics(ATenConfigHeuristics):
 class ATenBiasAddMMConfigHeuristics(
     ATenAddMMConfigHeuristics, GemmMaxAutotuneTemplateConfigHeuristics
 ):
+    # [CLASS DOC] ATen bias-addmm (cublasLt) heuristic: only valid for a 2D bias with a zero leading stride when triton autotune_cublasLt is enabled; also gated by max-autotune via the GEMM base class.
     def _get_template_configs_impl(
         self,
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Check that the first input (bias) is 2D with stride zero in dim 0 and that the autotune_cublasLt config is on,
+        # raising AssertionError otherwise; then yield the parent's configs (one empty config).
         nodes = kernel_inputs.nodes()
         # for addmm, bias is the first input
         bias = nodes[0]
