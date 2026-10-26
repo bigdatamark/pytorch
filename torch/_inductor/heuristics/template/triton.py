@@ -1,3 +1,6 @@
+# [MODULE DOC] Triton GEMM/conv/flex-attention config heuristics for Inductor autotuning templates.
+Defines config dataclasses (Gemm, Blackwell, Conv, Flex, ROCm variants), per-device singleton heuristic classes (CPU, CUDA, ROCm, XPU, MTIA) holding candidate tile configs, template mixins that turn configs into template keyword dicts, and concrete heuristic classes registered per template uid and device.
+Import-time side effects: reads meta-WS enablement, detects ROCm, optionally imports the origami package (ROCm with max_autotune and origami enabled), and registers heuristics via register_template_heuristic.
 from __future__ import annotations
 
 import dataclasses
@@ -59,6 +62,7 @@ log = logging.getLogger(__name__)
 
 
 def _origami_enabled() -> bool:
+    # [FUNCTION DOC] HELPER: Returns the rocm origami config flag (whether origami GEMM config selection is enabled).
     """Check if origami GEMM optimization is enabled."""
     return config.rocm.origami
 
@@ -67,6 +71,7 @@ USE_META_WS = meta_ws_enabled()
 
 
 def _use_template_autows() -> bool:
+    # [FUNCTION DOC] HELPER: True only when the template autoWS opt-in config flag is set and the meta-WS Triton build is detected.
     """Whether to expand the Blackwell GEMM search space with Meta Triton autoWS
     configs: opt-in flag plus an enabled meta-WS Triton build."""
     return config.triton.enable_template_autows and USE_META_WS
@@ -98,20 +103,25 @@ else:
 # here keeps the noqa suppressions localized and makes the migration a one-line
 # change per helper instead of ~10 scattered call sites.
 def _origami_problem(selector):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Accessor for the private problem attribute of an origami selector; centralizes private access.
     return selector._problem
 
 
 def _origami_hardware(selector):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Accessor for the private hardware attribute of an origami selector; centralizes private access.
     return selector._hardware
 
 
 def _origami_configs(selector):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Accessor for the private configs attribute of an origami selector; centralizes private access.
     return selector._configs
 
 
 # Gemm Configs
 @dataclasses.dataclass
 class BaseConfig:
+    # [CLASS DOC] Plain dataclass for one GEMM tile config: block sizes m/n/k, pipeline stages, warps and an optional keyword-only hint_override (shape hint used for multi-kernel variants).
+    # Base type for GEMM and conv configs on CPU and CUDA.
     """
     Base Gemm configuration used for most backends (CPU, CUDA)
     """
@@ -126,6 +136,7 @@ class BaseConfig:
 
 @dataclasses.dataclass
 class GemmConfig(BaseConfig):
+    # [CLASS DOC] BaseConfig plus keyword-only group_m (default 8), the program grouping factor for GEMM tile ordering.
     """
     Gemm configuration used for most backends (CPU, CUDA)
     """
@@ -138,6 +149,7 @@ ConvConfig = BaseConfig
 
 @dataclasses.dataclass
 class DepthwiseConvConfig:
+    # [CLASS DOC] Dataclass of tile parameters for the depthwise conv1d template: block sizes over batch, length and channel (channels-last layout), stages and warps.
     """
     Configuration for depthwise conv1d Triton template.
     Uses BLOCK_N x BLOCK_L x BLOCK_C tiling (channels-last NLC layout).
@@ -153,6 +165,7 @@ class DepthwiseConvConfig:
 
 @dataclasses.dataclass
 class BlackwellGPUGemmConfig(GemmConfig):
+    # [CLASS DOC] GemmConfig extended with Blackwell-only knobs (all keyword-only): epilogue_subtile (power of two, 1 means none), warp_specialize, flatten, and meta-WS autoWS knobs use_meta_ws, data_partition_factor, separate_epilogue_store.
     """
     Gemm configuration used for templates with features explicitly
     targeting Nvidia Blackwell GPUs
@@ -171,6 +184,7 @@ class BlackwellGPUGemmConfig(GemmConfig):
 # FlexAttention Configs
 @dataclasses.dataclass
 class FlexConfig:
+    # [CLASS DOC] Dataclass for flex attention forward configs: block_m, block_n, num_stages, num_warps. Backward reuses block sizes for several kernel tile roles.
     """
     Base Config class for flex attention
     - FlexAttn forward and backward will use this. For flex decoding,
@@ -189,6 +203,8 @@ class FlexConfig:
 
 @dataclasses.dataclass
 class FlexBwDConfig:
+    # [CLASS DOC] Dataclass for flex attention backward configs with four independent block sizes (m1, n1, m2, n2), stages and warps.
+    # Kernel requires n1 divisible by m1 and m2 divisible by n2.
     """
     Base Config class for flex attention backward
     - FlexAttn backward will use this.
@@ -222,6 +238,7 @@ class FlexBwDConfig:
 
 @dataclasses.dataclass
 class FlexDecodeConfig:
+    # [CLASS DOC] Dataclass for flex decoding configs: block_n, num_stages, num_warps.
     """
     Config class for flex decoding
     """
@@ -234,6 +251,7 @@ class FlexDecodeConfig:
 # ROCm classes
 @dataclasses.dataclass
 class ROCmGemmConfig(GemmConfig):
+    # [CLASS DOC] GemmConfig plus AMD-specific kernel args: matrix_instr_nonkdim, waves_per_eu, kpack.
     """
     ROCm subclass for GEMMs, with AMD backend specific tuneable kernargs
     """
@@ -245,6 +263,7 @@ class ROCmGemmConfig(GemmConfig):
 
 @dataclasses.dataclass
 class ROCmConvConfig(ConvConfig):
+    # [CLASS DOC] Conv config (same shape as BaseConfig) plus AMD-specific kernel args: matrix_instr_nonkdim, waves_per_eu, kpack.
     """
     ROCm subclass for Conv, with AMD backend specific tuneable kernargs
     """
@@ -256,6 +275,7 @@ class ROCmConvConfig(ConvConfig):
 
 @dataclasses.dataclass
 class ROCmFlexConfig(FlexConfig):
+    # [CLASS DOC] FlexConfig plus AMD-specific kernel args (matrix_instr_nonkdim, waves_per_eu, kpack).
     """
     ROCm subclass for FlexAttn, with AMD backend specific tuneable kernargs
     """
@@ -267,6 +287,7 @@ class ROCmFlexConfig(FlexConfig):
 
 @dataclasses.dataclass
 class ROCmFlexBwDConfig(FlexBwDConfig):
+    # [CLASS DOC] FlexBwDConfig plus AMD-specific kernel args (matrix_instr_nonkdim, waves_per_eu, kpack).
     """
     ROCm subclass for FlexAttn backward, with AMD backend specific tuneable kernargs
     """
@@ -278,6 +299,7 @@ class ROCmFlexBwDConfig(FlexBwDConfig):
 
 @dataclasses.dataclass
 class ROCmFlexDecodeConfig(FlexDecodeConfig):
+    # [CLASS DOC] FlexDecodeConfig plus AMD-specific kernel args (matrix_instr_nonkdim, waves_per_eu, kpack).
     """
     ROCm subclass for FlexDecode, with AMD backend specific tuneable kernargs
     """
@@ -288,6 +310,8 @@ class ROCmFlexDecodeConfig(FlexDecodeConfig):
 
 
 class BaseHeuristicSingleton(type):
+    # [CLASS DOC] HELPER: Metaclass making each heuristic class a thread-safe per-class singleton.
+    # Holds a class-level mapping from class to instance and a lock; avoids repeating heavy initialization.
     """
     Thread-safe implementation of singleton to be used in the config heuristic subclasses
     to ensure heavy __init__ calls are not repeatedly run
@@ -299,6 +323,8 @@ class BaseHeuristicSingleton(type):
     def __call__(
         cls: BaseHeuristicSingleton, *args: Any, **kwargs: Any
     ) -> BaseConfigHeuristic:
+        # [FUNCTION DOC] HELPER: Returns the single cached instance for this class, creating it under the lock on first use.
+        # Extra call arguments are ignored; the instance is always built with no arguments.
         with cls._lock:
             if cls not in cls._instances:
                 instance = super().__call__()
@@ -307,11 +333,16 @@ class BaseHeuristicSingleton(type):
 
 
 class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
+    # [CLASS DOC] Base for device-specific Triton config heuristics. Instances are singletons (via metaclass).
+    # State: lists of candidate configs for mm, exhaustive mm, extra mm, int8, mixed, persistent, Blackwell persistent, scaled, mm_plus_mm, conv, depthwise conv and flex attention/decoding, plus flags has_int8_tensor and should_scale_configs.
+    # Key methods: preprocess_mm_configs (filter, scale, prune, dedupe into Triton configs) and the get_*_configs getters.
     """
     Base class for mm_configs, device specific triton kernels config inherit from here
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Builds all default candidate config lists and flags as instance attributes (no arguments, no I/O).
+        # Includes hand-picked lists plus generated exhaustive sets for gemm and flex configs. Subclasses override lists after calling this.
         # Whether the heuristic is used for int8. Use this when the heuristic is int8 exclusive
         # but prefer the preprocess_mm_configs argument when it's used for both
         self.has_int8_tensor: bool = False
@@ -848,6 +879,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
     def _get_extra_config_key_and_kwargs(
         self, conf: BaseConfig
     ) -> tuple[tuple[int | None, ...], dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Hook for subclasses to add extra items to the dedup key and extra kernel keyword arguments for a config.
+        # Base returns an empty key tuple and empty mapping.
         """Hook for subclasses to extend config dedup key and kwargs."""
         return (), {}
 
@@ -855,6 +888,9 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         self,
         configs: list[BaseConfig],
     ) -> Generator[TritonConfig, None, None]:
+        # [FUNCTION DOC] HELPER: Turns a list of scaled configs into Triton config objects (generator).
+        # Clamps warps so each warp covers at least a 16x16 tile, builds a dedup key from tile sizes, stages, hint override, warps and optional group/Blackwell/extra fields, skips duplicates and stops once the test-config cap on count is reached.
+        # Yields one Triton config per unique key with the matching kernel keyword arguments.
         """
         Finalizes configs after scaling, applying additional constraints.
         """
@@ -932,6 +968,10 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         exclude: Callable[[sympy.Integer, sympy.Integer, sympy.Integer], bool],
         hint_override: int | None = None,
     ) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Scales and filters configs for the given m, n, k problem size.
+        # If scaling is disabled returns configs unchanged. Otherwise, for the default hint and each multi-kernel hint, computes power-of-two block upper bounds from size hints, scales each config block sizes by the scale factor, clamps between minimum and bound, drops configs the exclude predicate rejects, and copies configs only when values change.
+        # Returns the new list.
+        # KNOWN ISSUE: the hint_override parameter is never used; the loop variable of the same name overwrites it.
         """
         Scales and filters matrix multiplication configs based on input size.
         """
@@ -1004,6 +1044,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         has_sm_layout_conversion: bool,
         layout_conversion_byte_size: int,
     ):
+        # [FUNCTION DOC] Estimates the maximum shared memory bytes a config needs: per-stage loads of both input tiles times stages, plus an optional layout-conversion epilogue buffer (with padding) when requested, plus 128 bytes for barriers.
+        # Returns the byte count as an integer. No side effects.
         shared_mem_loads = dtype_size * (
             gemm_config.block_m * gemm_config.block_k
             + gemm_config.block_n * gemm_config.block_k
@@ -1038,6 +1080,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         has_sm_layout_conversion: bool,
         layout_conversion_byte_size: int,
     ) -> Callable[[BaseConfig, int], bool] | None:
+        # [FUNCTION DOC] HELPER: Builds a predicate telling whether a config and element size exceed the device shared memory limit.
+        # Queries CUDA (opt-in per-block limit, or per-block limit on ROCm) or XPU local memory size; returns None if no device is available, properties lack the field, or the query raises an error.
         """
         Returns a function that checks whether a given configuration exceeds the available shared memory for the device.
         based on the config's theoretical maximum shared memory used.
@@ -1065,6 +1109,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
         # TODO make a BaseDeviceConfigHeuristics to handle different device configuration in its own implementation.
         def exceeds(gemm_config: BaseConfig, dtype_size: int) -> bool:
+            # [FUNCTION DOC] HELPER: Returns True when the estimated shared memory of the config exceeds the device limit captured from the enclosing scope.
             estimation = self.get_shared_memory_estimation(
                 gemm_config,
                 dtype_size,
@@ -1082,6 +1127,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         has_sm_layout_conversion: bool = False,
         layout_conversion_byte_size: int = 0,
     ) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Removes configs whose estimated shared memory exceeds the device limit.
+        # Returns the input unchanged if the element size is not positive or the device limit cannot be determined.
         if dtype_size <= 0:
             return configs
 
@@ -1097,6 +1144,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         self,
         configs: list[BaseConfig],
     ) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Drops configs whose accumulator would certainly spill registers (accumulator registers per thread above 255, using the device warp size).
+        # Returns the input unchanged if the CUDA device properties cannot be read.
         try:
             device = torch.cuda.current_device()
             props = torch.cuda.get_device_properties(device)
@@ -1123,6 +1172,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return pruned_configs
 
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Hook for subclasses to filter configs; base returns them unchanged.
         """
         Filter configs based on specific requirements.
         Subclasses can override this to implement custom filtering logic.
@@ -1144,6 +1194,9 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         op_name: str = "mm",  # For preprocessing overrides e.g. on CPU
         **kwargs,
     ) -> Generator[TritonConfig, None, None]:
+        # [FUNCTION DOC] Main pipeline turning a candidate config list into Triton configs for an m, n, k problem.
+        # Applies subclass filtering, scaling and exclusion, optionally prunes by shared memory (config flag) and, for the EXHAUSTIVE search space, prunes likely register-spilling configs, then returns the lazy generator from the finalize step.
+        # Extra keyword arguments may carry layout-conversion info. op_name is unused here (overrides use it).
         configs = self._filter_configs(configs)
         scaled_configs = self._scale_mm_configs(
             m, n, k, configs, scale, has_int8_tensor, exclude
@@ -1167,12 +1220,15 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
     def triton_config(
         self, num_stages: int, num_warps: int, **kwargs: Any
     ) -> TritonConfig:
+        # [FUNCTION DOC] Builds a Triton config object from keyword options with the given stages and warps.
         return TritonConfig(kwargs, num_stages=num_stages, num_warps=num_warps)
 
     def get_mm_configs(self) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] Returns a partial of preprocess_mm_configs bound to the default mm config list.
         return partial(self.preprocess_mm_configs, configs=self.mm_configs)
 
     def get_exhaustive_mm_configs(self) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] Returns a partial of preprocess_mm_configs bound to the exhaustive config list (used also as the candidate pool for ROCm origami selection).
         """Get exhaustive MM configs for origami optimization.
 
         Note: When these configs are used with origami (on ROCm with
@@ -1184,11 +1240,13 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return partial(self.preprocess_mm_configs, configs=self.exhaustive_configs)
 
     def get_conv_configs(self) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] Returns a partial of preprocess_mm_configs bound to the conv config list with op name set to conv.
         return partial(
             self.preprocess_mm_configs, configs=self.conv_configs, op_name="conv"
         )
 
     def get_depthwise_conv_configs(self) -> list[TritonConfig]:
+        # [FUNCTION DOC] Converts the depthwise conv config dataclasses into Triton configs with block size keyword arguments, stages and warps. Returns a list.
         """Return TritonConfig list for depthwise conv1d autotuning."""
         return [
             TritonConfig(
@@ -1207,6 +1265,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
     def get_flex_attn_fwd_configs(
         self, head_dim: int, seq_len: sympy.Expr, dtype: Any
     ) -> list[FlexConfig]:
+        # [FUNCTION DOC] Returns flex attention forward configs for a head dimension, sequence length and dtype.
+        # Under max_autotune returns the exhaustive list directly for the EXHAUSTIVE flex search space, otherwise starts from the autotune list; then appends a default config chosen by head dim and float32-vs-other dtype if not already present.
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
@@ -1233,6 +1293,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
     def get_flex_attn_bwd_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexBwDConfig]:
+        # [FUNCTION DOC] Returns flex attention backward configs: exhaustive list or autotune list under max_autotune, plus a fixed default (16, 16, 16, 16 blocks, 1 stage, 4 warps) appended if absent. Head dim and dtype are unused.
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
         if config.max_autotune:
@@ -1250,6 +1311,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
     def get_flex_decode_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexDecodeConfig]:
+        # [FUNCTION DOC] Returns flex decode configs: exhaustive list or autotune list under max_autotune, plus a fixed default (block 64, 1 stage, 2 warps) appended if absent. Head dim and dtype are unused.
         flex_decode_configs: list[FlexDecodeConfig] = []
 
         if config.max_autotune:
@@ -1266,6 +1328,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
 
 
 class CPUConfigHeuristic(BaseConfigHeuristic):
+    # [CLASS DOC] CPU heuristic: overrides config preprocessing to use CPU-specific scaling (0.5) and size-based exclusion rules per op.
     """
     CPU-specific config heuristic with CPU-specific optimizations.
     """
@@ -1273,6 +1336,9 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
     def _get_cpu_exclude_function(
         self, method: str = "bmm"
     ) -> Callable[[sympy.Integer, sympy.Integer, sympy.Integer], bool]:
+        # [FUNCTION DOC] HELPER: Returns a predicate (m, n, k) -> bool for excluding large blocks on CPU, chosen by op name: conv, mm-like (mm, addmm, int_mm) or the default bmm rule.
+        # Thresholds limit block volume to reduce Triton CPU compile time.
+        # KNOWN ISSUE: the conv membership test uses a plain string rather than a tuple, so it is a substring test; any op name that is a substring of conv (including an empty string) takes the conv branch.
         """
         Get CPU-specific exclude function based on method type.
         Returns a function that can be used as exclude condition.
@@ -1283,6 +1349,7 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
             def exclude_conv(
                 m: sympy.Integer, n: sympy.Integer, k: sympy.Integer
             ) -> bool:
+                # [FUNCTION DOC] HELPER: Excludes when any block dim exceeds 256 or the product of the three exceeds 2 to the 17.
                 # Thresholds are experimentally determined to reduce Triton CPU compile times
                 if m > 256 or n > 256 or k > 256:
                     return True
@@ -1294,6 +1361,7 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
             def exclude_mm(
                 m: sympy.Integer, n: sympy.Integer, k: sympy.Integer
             ) -> bool:
+                # [FUNCTION DOC] HELPER: Excludes when the m by n block area exceeds 2 to the 13.
                 return m * n > 2**13
 
             return exclude_mm
@@ -1302,6 +1370,7 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
             def exclude_bmm(
                 m: sympy.Integer, n: sympy.Integer, k: sympy.Integer
             ) -> bool:
+                # [FUNCTION DOC] HELPER: Excludes when any block dim exceeds 128 or the m by n area exceeds 2 to the 12.
                 if m > 128 or n > 128 or k > 128:
                     return True
                 return m * n > 2**12
@@ -1323,6 +1392,8 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
         op_name: str = "mm",  # For preprocessing overrides e.g. on CPU
         **kwargs,
     ) -> Generator[TritonConfig, None, None]:
+        # [FUNCTION DOC] CPU override of config preprocessing: picks the exclusion predicate for the op name, then delegates to the base implementation with a fixed scale of 0.5 (the caller scale and exclude arguments are ignored).
+        # Returns the Triton config generator.
         """
         CPU-specific preprocessing that applies CPU-specific scaling (0.5) and exclusion logic.
         """
@@ -1345,11 +1416,13 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
 
 
 class CUDAConfigHeuristic(BaseConfigHeuristic):
+    # [CLASS DOC] CUDA heuristic: adds per-architecture default flex attention forward config tables (sm_120, sm_100, h100, a100) keyed by dtype and head dim, and CUDA-specific flex config selection by compute capability.
     """
     Child class for CUDA device specific gemm/flex attention/conv/ configs.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the base init and builds the default flex forward config tables per GPU architecture, and replaces the backward autotune list with one omitting block size 128 (to avoid resource failures).
         super().__init__()
         self.sm_120_default_flex_config = {
             (torch.float32, 64): FlexConfig(128, 32, 2, 4),
@@ -1418,6 +1491,9 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_fwd_configs(
         self, head_dim: int, seq_len: sympy.Expr, dtype: Any
     ) -> list[FlexConfig]:
+        # [FUNCTION DOC] CUDA flex forward configs: as the base, but the default is looked up by compute capability (tables for 12.x/11+, 10.x, 9.0, 8.x) keyed by dtype and head dim, falling back to a generic default. Large head dims use fixed smaller defaults.
+        # Queries the current CUDA device capability.
+        # KNOWN ISSUE: the float32 and non-float32 default branches for small head dims are identical.
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1462,6 +1538,8 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_bwd_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexBwDConfig]:
+        # [FUNCTION DOC] CUDA flex backward configs: base list handling, then a default picked by capability class (float32, baseline, sm8x, sm90, sm10x, sm11x, sm12x) via a mapping of head-dim-dependent choices; head dims above 256 use a minimal default.
+        # Queries the CUDA device capability; appends the default if absent.
         capability = torch.cuda.get_device_capability()
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
         if config.max_autotune:
@@ -1537,6 +1615,8 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
     def get_flex_decode_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexDecodeConfig]:
+        # [FUNCTION DOC] CUDA flex decode configs: base list handling plus a default chosen by capability.
+        # KNOWN ISSUE: the capability checks are separate if/else statements, so the second one always overwrites the result of the first block; the sm_90/100/103 selection has no effect and every device except 11.0 gets block 64, 1 stage, 2 warps.
         capability = torch.cuda.get_device_capability()
 
         default_config = FlexDecodeConfig(64, 1, 2)
@@ -1565,11 +1645,13 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
 
 
 class ROCmConfigHeuristic(BaseConfigHeuristic):
+    # [CLASS DOC] ROCm heuristic: AMD-specific mm and exhaustive config lists (with waves_per_eu, matrix_instr_nonkdim, kpack), architecture-specific flex defaults (gfx950, gfx942, RDNA3), and ROCm finalize/filter behavior (stages forced to the backend default).
     """
     Child class for ROCm specific gemm/flex attention/conv/ configs.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the base init, then sets the default stage count from the backend and rebuilds ROCm mm, exhaustive mm, flex forward/backward/decode autotune and exhaustive lists, and architecture-specific default flex config tables.
         super().__init__()
 
         self.default_num_stages = get_backend_num_stages()
@@ -1786,6 +1868,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         configs: list[BaseConfig],
         dtype_size: int,
     ) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Drops exhaustive configs that crash the AMD compiler (matrix_instr_nonkdim 2 with kpack 2, or block_k at most 16 with kpack 2). dtype_size unused. Returns the pruned list.
         # these cause AMD compile to crash
         pruned_configs = [
             c
@@ -1801,6 +1884,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return pruned_configs
 
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] ROCm filter: mutates every config to use the default number of stages, then defers to the base filter. Returns the list.
         """
         ROCm specific filtering
         """
@@ -1812,6 +1896,9 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         self,
         configs: list[BaseConfig],
     ) -> Generator[TritonConfig, None, None]:
+        # [FUNCTION DOC] ROCm finalize: generator turning configs into Triton configs with AMD kernel args.
+        # Mutates warps (capped by tile area), skips configs where block sizes are not multiples of matrix_instr_nonkdim, dedupes by key, fixes non-positive group_m to 8, recomputes waves_per_eu from warps when nonzero, honors the test-config cap.
+        # Yields Triton configs created with keyword options.
         """
         Finalizes configs after scaling, applying additional constraints.
         """
@@ -1881,6 +1968,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_fwd_configs(
         self, head_dim: int, seq_len: sympy.Expr, dtype: Any
     ) -> list[FlexConfig]:
+        # [FUNCTION DOC] ROCm flex forward configs: base list handling, then default by dtype and head dim; on RDNA3 chooses by sequence length tier (short, medium, long) using static size knowledge; otherwise gfx950 or gfx942 tables by compute capability. Adds default if absent.
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
@@ -1932,6 +2020,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_bwd_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexBwDConfig]:
+        # [FUNCTION DOC] ROCm flex backward configs: base list handling plus an AMD default chosen by dtype and head dim, with the architecture default kpack. Appended if absent.
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
         if config.max_autotune:
@@ -1970,6 +2059,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
     def get_flex_decode_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexDecodeConfig]:
+        # [FUNCTION DOC] ROCm flex decode configs: base list handling plus default (block 64, 1 stage, 4 warps) with architecture default kpack, appended if absent.
         flex_decode_configs: list[FlexDecodeConfig] = []
 
         if config.max_autotune:
@@ -1987,11 +2077,13 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
 
 class XPUConfigHeuristic(BaseConfigHeuristic):
+    # [CLASS DOC] Intel XPU heuristic: extends mm configs with two extra entries and defines XPU flex default and autotune configs; extra backward and decode configs are added when the CI environment variable is not set.
     """
     Placeholder child class for Intel GPU specific overrides.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the base init, appends two extra mm configs, and builds XPU flex tables and autotune lists; reads the CI environment variable to decide whether to add larger backward and decode search spaces.
         super().__init__()
         self.mm_configs = self.mm_configs + [
             GemmConfig(32, 64, 128, 2, 2),
@@ -2045,6 +2137,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_fwd_configs(
         self, head_dim: int, seq_len: sympy.Expr, dtype: Any
     ) -> list[FlexConfig]:
+        # [FUNCTION DOC] XPU flex forward configs: base list handling plus a default from the XPU table by dtype and head dim, with generic fallback and fixed defaults for large head dims.
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
@@ -2074,6 +2167,8 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
     def get_flex_attn_bwd_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexBwDConfig]:
+        # [FUNCTION DOC] XPU flex backward configs: base list handling plus a default by dtype and head dim (float32 small; head dim up to 256 gets 64-block, 8 warps; larger gets small blocks).
+        # Appended if absent.
         flex_attn_bwd_configs: list[FlexBwDConfig] = []
 
         if config.max_autotune:
@@ -2101,6 +2196,7 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
     def get_flex_decode_configs(
         self, head_dim: int, dtype: Any
     ) -> list[FlexDecodeConfig]:
+        # [FUNCTION DOC] XPU flex decode configs: base list handling plus default (block 64, 1 stage, 2 warps), appended if absent.
         flex_decode_configs: list[FlexDecodeConfig] = []
 
         if config.max_autotune:
@@ -2120,10 +2216,12 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
         configs: list[BaseConfig],
         dtype_size: int,
     ) -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: XPU does not prune exhaustive configs; returns them unchanged.
         return configs
 
 
 class MTIAConfigHeuristic(BaseConfigHeuristic):
+    # [CLASS DOC] Placeholder MTIA heuristic with no overrides.
     """
     Placeholder child class for MTIA specific overrides.
     """
@@ -2131,6 +2229,8 @@ class MTIAConfigHeuristic(BaseConfigHeuristic):
 
 # Template-specific mixin classes
 class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
+    # [CLASS DOC] Mixin turning config generators of a BaseConfigHeuristic subclass into template keyword dictionaries (ALLOW_TF32, EVEN_K, ACC_TYPE, stages, warps and tile sizes).
+    # Declares attribute annotations it expects from the heuristic base; includes ROCm origami-based selection for static shapes.
     """
     Mixin class that converts config lists to template kwargs.
     This handles the logic that was previously in choices.get_mm_configs.
@@ -2159,6 +2259,8 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns extra template keyword arguments: ALLOW_TF32 computed per device (XPU uses mkldnn flag; CUDA requires tf32 precision and statically known sizes m at least 16 and min of n, k at least 512; otherwise false).
+        # Raises an error if inputs are not matmul kernel inputs.
         if not isinstance(kernel_inputs, MMKernelInputs):
             raise AssertionError(f"Expected MMKernelInputs, got {type(kernel_inputs)}")
         m, n, k = kernel_inputs.mnk_symbolic()
@@ -2183,11 +2285,13 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         }
 
     def _valid(self, kernel_inputs: KernelInputs) -> bool:
+        # [FUNCTION DOC] HELPER: Validity hook for kernel inputs; always True in the base mixin.
         return True
 
     def _get_config_generator(
         self,
     ) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] HELPER: Chooses the config generator: exhaustive configs for the EXHAUSTIVE gemm search space, otherwise the default mm configs. Subclasses may override.
         """
         Get the appropriate config generator based on search space.
         Can be overridden by subclasses for template-specific behavior.
@@ -2204,6 +2308,8 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator yielding template keyword dictionaries for a matmul-like kernel.
+        # Raises an error for non-matmul inputs or fewer than two input nodes; yields nothing if the inputs are invalid. Gets m, n, k and dtype, then either (ROCm with origami available, DEFAULT search space, static shapes) selects top-k configs via origami, builds configs with computed warps/group_m/occupancy and converts them, falling back to the regular generator if none result, or uses the regular generator; logs warnings/info as side effects.
         """
         Convert config lists to template kwargs.
         This replaces the logic from choices.get_mm_configs and inlines mm_options.
@@ -2309,6 +2415,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
             def _config_key(cfg: BaseConfig) -> tuple[int, int, int]:
                 """
                 Generate a stable key for origami configs based on immutable tile dimensions.
+                # [FUNCTION DOC] HELPER: Builds a stable lookup key from block m, n, k only, since other attributes may change during filtering.
                 Uses only block_m, block_n, block_k since these uniquely identify an origami
                 config and remain invariant across _filter_configs modifications (which may
                 change num_stages, num_warps, and other attributes).
@@ -2474,6 +2581,7 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
         k: sympy.Integer | sympy.Symbol,
         out_dtype: torch.dtype,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Converts a Triton config into template options: EVEN_K from static divisibility of k by BLOCK_K, USE_FAST_ACCUM False, accumulator type for the output dtype, stages, warps and the config kwargs; ensures GROUP_M exists (default 8). Returns a dictionary.
         """
         Convert triton config to template kwargs.
         Moved from mm_common.mm_options.
@@ -2502,10 +2610,12 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
 
     @staticmethod
     def _dtype_to_triton(dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] HELPER: Converts a torch dtype to its Triton type string.
         """Convert a torch dtype to a triton type string."""
         return triton_type(dtype)
 
     def _get_acc_type(self, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] HELPER: Returns the Triton accumulator type: float32 for half, bfloat16 and fp8 e4m3 variants, otherwise the Triton type of the dtype.
         """
         Get accumulator type for the given dtype.
         Moved from mm_common.acc_type.
@@ -2522,17 +2632,20 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
 
 # INT8 specific mixin to filter correctly
 class INT8MMTemplateConfigMixin(MMTemplateConfigMixin):
+    # [CLASS DOC] Mixin for int8 matmul heuristics: sets has_int8_tensor True so scaling uses larger minimum K blocks.
     """
     Ensure that we feed in has_int8_tensor=True
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and sets the int8 flag.
         super().__init__()
         self.has_int8_tensor = True
 
 
 # MMPlusMM specific mixin to avoid running _scale_mm_configs
 class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
+    # [CLASS DOC] Mixin for mm_plus_mm heuristics: disables config scaling, drops configs with block_k not statically below k, and filters outputs likewise.
     """
     Ensure that _should_scale_configs is False
     """
@@ -2540,6 +2653,7 @@ class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
     # TODO(coconutruben): remove this once all tests work
     # with proper scaling on mm_plus_mm
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and disables config scaling.
         super().__init__()
         self.should_scale_configs = False
 
@@ -2558,6 +2672,7 @@ class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
         op_name: str = "mm",
         **kwargs,
     ) -> Generator[TritonConfig, None, None]:
+        # [FUNCTION DOC] Filters configs to those whose block_k is statically known smaller than k, then delegates to the parent preprocessing with the same arguments. Returns the generator.
         configs = [
             c for c in configs if V.graph.sizevars.statically_known_lt(c.block_k, k)
         ]
@@ -2580,6 +2695,8 @@ class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator over parent template kwargs, yielding only those whose BLOCK_K is statically smaller than k (a block equal to k triggers a Triton compiler error).
+        # Raises an error if inputs are not matmul kernel inputs.
         if not isinstance(kernel_inputs, MMKernelInputs):
             raise AssertionError("Expect MMKernelInputs")
         m, n, k = kernel_inputs.mnk_symbolic()
@@ -2596,6 +2713,7 @@ class MMPlusMMTemplateConfigMixin(MMTemplateConfigMixin):
 
 
 class TMAWorkspaceMixin(MMTemplateConfigMixin):
+    # [CLASS DOC] Mixin for TMA templates: adds a TMA workspace argument to extra kwargs and removes configs with two warps.
     """
     Small mixin to ensure that the workspace arg is correct for TMA
     and TMA specific filtering can happen.
@@ -2606,6 +2724,7 @@ class TMAWorkspaceMixin(MMTemplateConfigMixin):
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Extends parent extra kwargs with a workspace argument sized for two TMA descriptors on the input device.
         kwargs = super().get_extra_kwargs(kernel_inputs, op_name)
         kwargs["workspace_arg"] = get_tma_workspace_arg(
             num_tma_descriptors=2,
@@ -2615,6 +2734,7 @@ class TMAWorkspaceMixin(MMTemplateConfigMixin):
 
     # pyrefly: ignore [bad-override]
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Drops configs with num_warps equal to 2 (unsafe for TMA), then applies the parent filter.
         """
         TMA specific filtering, as num_warps=2 not safe for TMA
         """
@@ -2623,6 +2743,7 @@ class TMAWorkspaceMixin(MMTemplateConfigMixin):
 
 
 def get_shared_memory_checker_opts(op_name: str, dtype_size: int):
+    # [FUNCTION DOC] HELPER: Returns options for the shared-memory checker: layout conversion enabled, element size 4 for addmm (accumulator type) otherwise the given dtype size.
     return {
         "has_sm_layout_conversion": True,
         # addmm requires the acc dtype for layout conversion due to adding bias
@@ -2633,6 +2754,7 @@ def get_shared_memory_checker_opts(op_name: str, dtype_size: int):
 
 # TMA-specific mixin for TMA templates
 class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
+    # [CLASS DOC] Mixin for persistent TMA templates: adds TMA options (row-major flags, SM count, descriptor size, experimental-API flag, store/load config flags) to each template kwargs dictionary and enables shared-memory pruning options.
     """
     TMA-specific mixin that uses persistent configs and adds TMA options.
     This inherits from MMTemplateConfigMixin and overrides config generation.
@@ -2644,6 +2766,9 @@ class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator that computes TMA options from the two matrices layouts and config flags, then yields each parent template kwargs merged with them.
+        # Raises an error for non-matmul inputs.
+        # KNOWN ISSUE: caller kwargs are not forwarded to the parent; only the shared-memory checker options are passed.
         """
         Generate TMA template configs by calling super and adding TMA-specific options.
         """
@@ -2674,6 +2799,7 @@ class TMATemplateConfigMixin(TMAWorkspaceMixin, MMTemplateConfigMixin):
 
 # TMA mixins for Blackwell templates
 class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
+    # [CLASS DOC] Mixin for the Blackwell persistent TMA GEMM template: supports the meta autoWS sweep, prunes unsupported combos, and sets warp specialization and flatten flags only when safe.
     """Config mixin for the Blackwell persistent-TMA GEMM template.
 
     Generates the fb-triton autoWS (meta-WS) config sweep and prunes the
@@ -2686,6 +2812,8 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator over parent TMA template kwargs: skips autoWS configs failing the constraints, disables warp specialization when warps are below 4 or stages below 2, disables flatten when meta WS is used or constraints are violated, and adds the SM count.
+        # Yields updated dictionaries.
         """
         Generate TMA template configs by calling super and adding TMA-specific options.
         """
@@ -2725,6 +2853,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
 
     @staticmethod
     def _autows_constraints_ok(template_kwargs: dict[str, Any]) -> bool:
+        # [FUNCTION DOC] HELPER: Checks autoWS lowering limits: each epilogue subtile must be at least 32 wide, and data partition factor 2 requires block_m of 128 or 256. Returns True when valid.
         """autoWS lowering constraints; swept configs violating these are pruned."""
         block_m = template_kwargs["BLOCK_M"]
         block_n = template_kwargs["BLOCK_N"]
@@ -2742,6 +2871,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
     def _get_config_generator(
         self,
     ) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] HELPER: Under autoWS opt-in returns a generator over the full autoWS sweep; otherwise uses the parent generator choice.
         # No curated autoWS set yet: sweep the full autoWS space for both default
         # and exhaustive search, and let _get_template_configs_impl prune it.
         if _use_template_autows():
@@ -2752,6 +2882,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
 
     @staticmethod
     def _generate_autows_configs() -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Builds the full autoWS Blackwell config list over block sizes, stages 2-6, warps 4 and 8, subtile, data partition and separate epilogue store options, with meta WS on and flatten off.
         configs: list[BaseConfig] = []
         for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
             [32, 64, 128, 256], repeat=3
@@ -2782,6 +2913,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
 
     @staticmethod
     def _generate_exhaustive_configs() -> list[BaseConfig]:
+        # [FUNCTION DOC] HELPER: Builds the exhaustive Blackwell config list over block sizes, stages 2-6, warps 4 and 8 and subtile 1, 2, 4, with warp specialization and flatten on.
         configs: list[BaseConfig] = []
         for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
             [32, 64, 128, 256],
@@ -2809,6 +2941,7 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
 
 # Scaled MM-specific mixin for scaled MM templates
 class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
+    # [CLASS DOC] Base mixin for scaled matmul heuristics: normalizes scale tensors and bias on kernel inputs, validates scale compatibility and overrides accumulator type with the output dtype.
     """
     This is a base that handles the common case for ScaledMM
 
@@ -2818,6 +2951,8 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
     def adjust_kernel_inputs(
         self, kernel_inputs: KernelInputs, op_name: str
     ) -> KernelInputs:
+        # [FUNCTION DOC] Rebuilds matmul kernel inputs for scaled mm: reshapes tensor-wise (all-ones) scales to 2D, unsqueezes a 1D bias to match, and returns new inputs.
+        # Raises an error for non-matmul inputs, or when a tensor-wise scale_b has more than two dimensions.
         """
         for scaled_mm, we need to unsqueeze scale tensors, and bias
         """
@@ -2836,12 +2971,14 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
             bias = L[aten.unsqueeze](bias, 0)
 
         def is_tensorwise_scale(scale: Any) -> bool:
+            # [FUNCTION DOC] HELPER: True if the scale is scalar or all dimensions are statically one.
             size = scale.get_size()
             return len(size) == 0 or all(
                 V.graph.sizevars.statically_known_equals(dim, 1) for dim in size
             )
 
         def normalize_tensorwise_scale(scale: Any, *, allow_high_rank: bool) -> Any:
+            # [FUNCTION DOC] HELPER: Reshapes tensor-wise scales to one by one; leaves others unchanged. Raises an error when high rank is not allowed and rank exceeds two.
             if not is_tensorwise_scale(scale):
                 return scale
             if not allow_high_rank and len(scale.get_size()) > 2:
@@ -2873,6 +3010,8 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator for scaled mm template kwargs: adjusts inputs, requires at least four input nodes, validates that scales are compatible, requires matmul inputs, returns nothing if invalid, then yields parent kwargs with ACC_TYPE set from the output dtype.
+        # Raises assertion errors on violations.
         """
         Generate scaled MM template configs with scaled MM-specific options.
         Handles the remaining logic from mm_common, including assertions.
@@ -2891,6 +3030,7 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
 
         # Scale compatibility assertion from mm_common.scaled_mm_options
         def are_compatible_scales(size_a: Any, size_b: Any) -> bool:
+            # [FUNCTION DOC] HELPER: Scales are compatible if they have equal rank or both have rank at most one.
             # Same sized scales are compatible
             if len(size_a) == len(size_b):
                 return True
@@ -2926,6 +3066,7 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
 
 
 class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
+    # [CLASS DOC] Mixin for scaled mm with the regular mm template: adds epilogue scaling function and suffix argument count, validity checks on K, and AMD MI350X block filtering.
     """Mixin for scaled mm with the regular mm template"""
 
     def get_extra_kwargs(
@@ -2933,6 +3074,7 @@ class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
         kernel_inputs: KernelInputs,
         op_name: str,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Extends parent extra kwargs with the number of suffix args (inputs minus two), the scale epilogue function and its hash name.
         kwargs = super().get_extra_kwargs(kernel_inputs, op_name)
         from ...kernel.mm_common import scale_mm_epilogue
 
@@ -2944,6 +3086,7 @@ class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
         }
 
     def _valid(self, kernel_inputs: KernelInputs) -> bool:
+        # [FUNCTION DOC] HELPER: Rejects shapes with K at most 16 (Triton crash) and K below 32 on B200 GPUs. Raises an error for non-matmul inputs. Returns bool.
         if not isinstance(kernel_inputs, MMKernelInputs):
             raise AssertionError("Expect MMKernelInputs for ScaledMMConfigMixin")
         _, _, k = kernel_inputs.mnk_symbolic()
@@ -2959,12 +3102,14 @@ class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
 
     # pyrefly: ignore [bad-override]
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Filters out configs with block_k at most 64 on ROCm devices of capability 9.5 or higher (no matching MFMA), then applies the parent filter.
         """
         Filter out bad configs for specific hardware.
         On AMD MI350X (GFX 9.5+), skip configs with BLOCK_K<=64 due to lack of corresponding MFMA instructions.
         """
 
         def should_skip_mi350x_config(config: BaseConfig) -> bool:
+            # [FUNCTION DOC] HELPER: Returns True if the config should be skipped on MI350X; returns False when device capability cannot be queried.
             """Skip config if BLOCK_K<=64 on MI350X (GFX 9.5+)"""
             try:
                 return (
@@ -2983,6 +3128,7 @@ class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
 
 # Scaled TMA-specific mixin for scaled MM templates with TMA
 class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
+    # [CLASS DOC] Mixin for scaled mm TMA templates: removes configs with two warps or block_k below 32 and adds TMA options (descriptor size, SM count, experimental-API flag).
     """
     Scaled TMA-specific mixin that extends BaseScaledMMConfigMixin with TMA functionality.
     This is for scaled MM templates that use device TMA.
@@ -2991,6 +3137,7 @@ class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
 
     # pyrefly: ignore [bad-override]
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Drops configs with two warps or block_k below 32, then applies the parent filter.
         """
         TMA specific filtering:
         - num_warps=2 not safe for TMA
@@ -3005,6 +3152,7 @@ class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator over parent scaled mm kwargs adding TMA_SIZE, NUM_SMS and TMA_EXPERIMENTAL_API entries.
         """
         Generate scaled TMA template configs with both scaled MM and TMA-specific options.
         """
@@ -3026,6 +3174,7 @@ class ScaledTMAConfigMixin(TMAWorkspaceMixin, BaseScaledMMConfigMixin):
 class ScaledBlackwellTMAConfigMixin(
     BlackwellTMATemplateConfigMixin, ScaledMMConfigMixin
 ):
+    # [CLASS DOC] Mixin combining Blackwell TMA behavior with scaled mm epilogue scaling.
     """
     Scaled Blackwell TMA-specific mixin that extends ScaledMMConfigMixin with TMA functionality.
     This is for scaled MM templates that use device TMA on Blackwell.
@@ -3033,6 +3182,8 @@ class ScaledBlackwellTMAConfigMixin(
     """
 
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Drops configs with block_k below 32, then applies the parent filter (which handles ScaledMM filtering).
+        # KNOWN ISSUE: the docstring mentions warp-specialization filters that are not applied here but in the template kwargs generator.
         """
         Warp specialization-specific filtering (BlackwellTMATemplateConfigMixin)
         (compilation issues occur in some versions of Triton)
@@ -3060,6 +3211,7 @@ class ScaledBlackwellTMAConfigMixin(
     register=torch.version.hip is None,
 )
 class CUDAMMTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
+    # [CLASS DOC] Registered CUDA heuristic for the standard mm and bmm templates (not on ROCm).
     """Standard MM template heuristic for CUDA"""
 
 
@@ -3070,6 +3222,7 @@ class CUDAMMTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
     bmm_template.uid, "cuda", register=torch.version.hip is None, op_name="baddbmm"
 )
 class CUDAAddMMTemplateConfigHeuristic(AddMMConfigMixin, CUDAMMTemplateConfigHeuristic):
+    # [CLASS DOC] Registered CUDA heuristic for addmm and baddbmm templates, adding addmm-specific config handling.
     """Addmm specific mixin for CUDA"""
 
 
@@ -3081,9 +3234,11 @@ class CUDAAddMMTemplateConfigHeuristic(AddMMConfigMixin, CUDAMMTemplateConfigHeu
     op_name="mm-ah",
 )
 class CUDAMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic):
+    # [CLASS DOC] Registered CUDA heuristic for the autoheuristic mm variant, using only the extra mm config list.
     """Standard MM template heuristic for CUDA using the extra mm configs only (for autoheuristic)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and sets both mm and exhaustive lists to the extra mm configs.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.extra_mm_configs
@@ -3098,9 +3253,11 @@ class CUDAMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, CUDAConfigHeuristic
 class CUDAPersistentTMATemplateConfigHeuristic(
     TMATemplateConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for the persistent TMA mm template.
     """Persistent TMA template heuristic for CUDA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the persistent mm config list.
         super().__init__()
         # Override mm_configs to use persistent_mm_configs
         self.mm_configs = self.persistent_mm_configs
@@ -3115,9 +3272,11 @@ class PersistentMMTemplateConfigHeuristic(
     MMTemplateConfigMixin,
     ROCmConfigHeuristic,  # type: ignore[misc]
 ):
+    # [CLASS DOC] Registered ROCm heuristic for the persistent mm template (pointer loads, no TMA); adds the SM count to kwargs.
     """Persistent MM template heuristic (no TMA, standard pointer loads)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the persistent mm config list.
         super().__init__()
         self.mm_configs = self.persistent_mm_configs
 
@@ -3127,6 +3286,7 @@ class PersistentMMTemplateConfigHeuristic(
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator over parent kwargs adding NUM_SMS to each dictionary.
         for template_kwargs in super()._get_template_configs_impl(
             kernel_inputs, op_name, **kwargs
         ):
@@ -3141,9 +3301,11 @@ class PersistentMMTemplateConfigHeuristic(
 class CUDABlackwellPersistentTMATemplateConfigHeuristic(
     BlackwellTMATemplateConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for the Blackwell warp-specialized persistent TMA mm template.
     """Blackwell Persistent TMA template"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init, uses the Blackwell persistent mm configs and generates the exhaustive Blackwell config list.
         super().__init__()
         self.mm_configs = self.blackwell_persistent_mm_configs
         self.exhaustive_configs = self._generate_exhaustive_configs()
@@ -3158,6 +3320,7 @@ class CUDABlackwellPersistentTMATemplateConfigHeuristic(
 class CUDAAddmmPersistentTMATemplateConfigHeuristic(
     AddMMConfigMixin, CUDAPersistentTMATemplateConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for addmm on the persistent TMA template.
     """Addmm specific mixin for CUDA"""
 
 
@@ -3170,9 +3333,11 @@ class CUDAAddmmPersistentTMATemplateConfigHeuristic(
 class CUDABlackwellAddmmPersistentTMATemplateConfigHeuristic(
     AddMMConfigMixin, CUDABlackwellPersistentTMATemplateConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for addmm on the Blackwell persistent TMA template.
     """Addmm extension for DataCenter Blackwell Templates"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init, uses Blackwell persistent mm plus addmm configs, and regenerates exhaustive configs.
         super().__init__()
         # NOTE: to ensure that we pass tests, addmm needs a small config
         self.mm_configs = (
@@ -3186,14 +3351,17 @@ class CUDABlackwellAddmmPersistentTMATemplateConfigHeuristic(
     mm_template.uid, "cuda", register=torch.version.hip is None, op_name="scaled_mm"
 )
 class CUDAScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, CUDAConfigHeuristic):
+    # [CLASS DOC] Registered CUDA heuristic for scaled mm on the regular mm template.
     """Scaled MM template heuristic for CUDA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled mm config list.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.scaled_mm_configs
 
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Drops configs with block_k below 32, then applies the parent filter.
         configs = [c for c in configs if c.block_k >= 32]
         return super()._filter_configs(configs)
 
@@ -3207,9 +3375,11 @@ class CUDAScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, CUDAConfigHeurist
 class CUDAScaledTMAEpilogueScalingTemplateConfigHeuristic(
     ScaledTMAConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for scaled mm TMA with epilogue scaling (tensor-wise, row-wise).
     """Scaled TMA template heuristic for CUDA: epilogue scaling variants (TensorWise, RowWise)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled persistent mm configs.
         super().__init__()
         # Override mm_configs to use scaled_persistent_mm_configs for TMA
         self.mm_configs = self.scaled_persistent_mm_configs
@@ -3224,12 +3394,14 @@ class CUDAScaledTMAEpilogueScalingTemplateConfigHeuristic(
 class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
     ScaledTMAConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for scaled mm TMA with main-loop (block-wise) scaling.
     """
     Scaled TMA template heuristic for CUDA:
         main loop scaling variants (BlockWise1x128, BlockWise1x32, BlockWise1x16, BlockWise128x128)
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled persistent mm configs.
         super().__init__()
         # Override mm_configs to use scaled_persistent_mm_configs for TMA
         self.mm_configs = self.scaled_persistent_mm_configs
@@ -3240,6 +3412,8 @@ class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
         op_name: str,
         **kwargs,
     ) -> Generator[dict[str, Any], None, None]:
+        # [FUNCTION DOC] Generator for block-wise scaling: derives scaling options and tile sizes of both operands from the scale shapes, then yields parent kwargs extended with TILE_SIZE and minimum block-versus-tile entries for the four operand dimensions.
+        # Expects exactly four input nodes.
         """
         Generate main loop scaling kernel inputs.
         """
@@ -3293,9 +3467,11 @@ class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
 class CUDAScaledBlackwellTMATemplateConfigHeuristic(
     ScaledBlackwellTMAConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for scaled mm on the Blackwell TMA template.
     """Scaled Blackwell TMA template heuristic for CUDA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the Blackwell scaled persistent mm configs.
         super().__init__()
         self.mm_configs = self.blackwell_scaled_persistent_mm_configs
 
@@ -3308,9 +3484,11 @@ class CUDAScaledBlackwellTMATemplateConfigHeuristic(
 class CUDAMMPlusMMTemplateConfigHeuristic(
     MMPlusMMTemplateConfigMixin, CUDAConfigHeuristic
 ):
+    # [CLASS DOC] Registered CUDA heuristic for the mm_plus_mm template.
     """MM Plus MM template heuristic for CUDA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the mm_plus_mm configs for both default and exhaustive lists.
         super().__init__()
         # Override mm_configs to use mm_plus_mm_configs
         self.mm_configs = self.mm_plus_mm_configs
@@ -3328,9 +3506,11 @@ class CUDAMMPlusMMTemplateConfigHeuristic(
     op_name="int_mm",
 )
 class CUDAInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, CUDAConfigHeuristic):
+    # [CLASS DOC] Registered CUDA heuristic for int8 mm (int_mm).
     """Int8 MM template heuristic for CUDA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the int8 configs for both default and exhaustive lists.
         super().__init__()
         # Override mm_configs to use int8_mm_configs
         self.mm_configs = self.int8_mm_configs
@@ -3355,6 +3535,7 @@ class CUDAInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, CUDAConfigHeu
     register=IS_ROCM,
 )
 class ROCmMMTemplateConfigHeuristic(MMTemplateConfigMixin, ROCmConfigHeuristic):
+    # [CLASS DOC] Registered ROCm heuristic for the standard mm and bmm templates.
     """Standard MM template heuristic for ROCm"""
 
 
@@ -3365,6 +3546,7 @@ class ROCmMMTemplateConfigHeuristic(MMTemplateConfigMixin, ROCmConfigHeuristic):
     bmm_template.uid, "cuda", register=IS_ROCM, op_name="baddbmm"
 )
 class ROCmAddMMTemplateConfigHeuristic(AddMMConfigMixin, ROCmMMTemplateConfigHeuristic):
+    # [CLASS DOC] Registered ROCm heuristic for addmm and baddbmm templates.
     """Addmm specific mixin for ROCm"""
 
 
@@ -3377,15 +3559,18 @@ class ROCmAddMMTemplateConfigHeuristic(AddMMConfigMixin, ROCmMMTemplateConfigHeu
 class ROCmAddMMPersistentTemplateConfigHeuristic(
     AddMMConfigMixin, PersistentMMTemplateConfigHeuristic
 ):
+    # [CLASS DOC] Registered ROCm heuristic for addmm on the persistent mm template.
     """Addmm specific mixin for persistent MM on ROCm"""
 
 
 # TODO(coconutruben): deprecate once autoheuristic is deprecated
 @register_template_heuristic("mm-ah", "cuda", register=IS_ROCM)
 class ROCmMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, ROCmConfigHeuristic):
+    # [CLASS DOC] Registered ROCm heuristic for the autoheuristic mm variant using only extra mm configs.
     """Standard MM template heuristic for ROCm using the extra mm configs only (for autoheuristic)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and sets both lists to the extra mm configs.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.extra_mm_configs
@@ -3399,14 +3584,17 @@ class ROCmMMAHTemplateConfigHeuristic(MMTemplateConfigMixin, ROCmConfigHeuristic
     op_name="scaled_mm",
 )
 class ROCmScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, ROCmConfigHeuristic):
+    # [CLASS DOC] Registered ROCm heuristic for non-TMA scaled mm.
     """Scaled MM template heuristic for ROCm (non-TMA)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled mm config list.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.scaled_mm_configs
 
     def _filter_configs(self, configs: list[BaseConfig]) -> list[BaseConfig]:
+        # [FUNCTION DOC] Drops configs with block_k below 32, then applies the parent filter.
         configs = [c for c in configs if c.block_k >= 32]
         return super()._filter_configs(configs)
 
@@ -3418,9 +3606,11 @@ class ROCmScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, ROCmConfigHeurist
     op_name="int_mm",
 )
 class ROCmInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, ROCmConfigHeuristic):
+    # [CLASS DOC] Registered ROCm heuristic for int8 mm.
     """Int8 MM template heuristic for ROCm"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the int8 configs for both lists.
         super().__init__()
         # Override mm_configs to use int8_mm_configs
         self.mm_configs = self.int8_mm_configs
@@ -3439,9 +3629,11 @@ class ROCmInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, ROCmConfigHeu
 class ROCmMMPlusMMTemplateConfigHeuristic(
     MMPlusMMTemplateConfigMixin, ROCmConfigHeuristic
 ):
+    # [CLASS DOC] Registered ROCm heuristic for mm_plus_mm.
     """MM Plus MM template heuristic for ROCm"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init, forces the default stage count to 1 (pipelining gives no benefit), and uses the mm_plus_mm configs for both lists.
         super().__init__()
         # self.default_num_stages is used to make sure all configs have that in ROCm land
         # for mm_plus_mm, we actually just want stages = 1, as pipelining brings no benefits
@@ -3461,20 +3653,24 @@ class ROCmMMPlusMMTemplateConfigHeuristic(
 @register_template_heuristic(mm_template.uid, "cpu")
 @register_template_heuristic(bmm_template.uid, "cpu")
 class CPUMMTemplateConfigHeuristic(MMTemplateConfigMixin, CPUConfigHeuristic):
+    # [CLASS DOC] Registered CPU heuristic for standard mm and bmm templates.
     """Standard MM template heuristic for CPU"""
 
 
 @register_template_heuristic(mm_template.uid, "cpu", op_name="addmm")
 @register_template_heuristic(bmm_template.uid, "cpu", op_name="baddbmm")
 class CPUAddmmTemplateConfigHeuristic(AddMMConfigMixin, CPUMMTemplateConfigHeuristic):
+    # [CLASS DOC] Registered CPU heuristic for addmm and baddbmm templates.
     """Addmm specific mixin for CPU"""
 
 
 @register_template_heuristic(mm_template.uid, "cpu", op_name="scaled_mm")
 class CPUScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, CPUConfigHeuristic):
+    # [CLASS DOC] Registered CPU heuristic for non-TMA scaled mm.
     """Scaled MM template heuristic for CPU (non-TMA)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled mm configs for both lists.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.scaled_mm_configs
@@ -3487,9 +3683,11 @@ class CPUScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, CPUConfigHeuristic
 
 @register_template_heuristic(mm_template.uid, "cpu", op_name="int_mm")
 class CPUInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, CPUConfigHeuristic):
+    # [CLASS DOC] Registered CPU heuristic for int8 mm.
     """Int8 MM template heuristic for CPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the int8 configs for both lists.
         super().__init__()
         # Override mm_configs to use int8_mm_configs
         self.mm_configs = self.int8_mm_configs
@@ -3504,9 +3702,11 @@ class CPUInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, CPUConfigHeuri
 class CPUMMPlusMMTemplateConfigHeuristic(
     MMPlusMMTemplateConfigMixin, CPUConfigHeuristic
 ):
+    # [CLASS DOC] Registered CPU heuristic for mm_plus_mm.
     """MM Plus MM template heuristic for CPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the mm_plus_mm configs for both lists.
         super().__init__()
         # Override mm_configs to use mm_plus_mm_configs
         self.mm_configs = self.mm_plus_mm_configs
@@ -3523,9 +3723,11 @@ class CPUMMPlusMMTemplateConfigHeuristic(
 @register_template_heuristic(mm_template.uid, "xpu")
 @register_template_heuristic(bmm_template.uid, "xpu")
 class XPUMMTemplateConfigHeuristic(MMTemplateConfigMixin, XPUConfigHeuristic):
+    # [CLASS DOC] Registered XPU heuristic for standard mm and bmm templates.
     """Standard MM template heuristic for XPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the default mm configs as the exhaustive list.
         super().__init__()
 
         # TODO(etaf): Design proper exhaustive search space for XPU.
@@ -3535,6 +3737,7 @@ class XPUMMTemplateConfigHeuristic(MMTemplateConfigMixin, XPUConfigHeuristic):
 @register_template_heuristic(mm_template.uid, "xpu", op_name="addmm")
 @register_template_heuristic(bmm_template.uid, "xpu", op_name="baddbmm")
 class XPUAddmmTemplateConfigHeuristic(AddMMConfigMixin, XPUMMTemplateConfigHeuristic):
+    # [CLASS DOC] Registered XPU heuristic for addmm and baddbmm templates.
     """Addmm specific mixin for XPU"""
 
 
@@ -3545,9 +3748,11 @@ class XPUAddmmTemplateConfigHeuristic(AddMMConfigMixin, XPUMMTemplateConfigHeuri
 class XPUPersistentTMATemplateConfigHeuristic(
     TMATemplateConfigMixin, XPUConfigHeuristic
 ):
+    # [CLASS DOC] Registered XPU heuristic for the persistent TMA mm template.
     """Persistent TMA template heuristic for XPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the persistent mm configs.
         super().__init__()
         # Override mm_configs to use persistent_mm_configs
         self.mm_configs = self.persistent_mm_configs
@@ -3557,14 +3762,17 @@ class XPUPersistentTMATemplateConfigHeuristic(
 class XPUAddmmPersistentTMATemplateConfigHeuristic(
     AddMMConfigMixin, XPUPersistentTMATemplateConfigHeuristic
 ):
+    # [CLASS DOC] Registered XPU heuristic for addmm on the persistent TMA template.
     """Addmm specific mixin for XPU"""
 
 
 @register_template_heuristic(mm_template.uid, "xpu", op_name="scaled_mm")
 class XPUScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, XPUConfigHeuristic):
+    # [CLASS DOC] Registered XPU heuristic for non-TMA scaled mm.
     """Scaled MM template heuristic for XPU (non-TMA)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled mm configs for both lists.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.scaled_mm_configs
@@ -3577,9 +3785,11 @@ class XPUScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, XPUConfigHeuristic
 
 @register_template_heuristic(mm_template.uid, "xpu", op_name="int_mm")
 class XPUInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, XPUConfigHeuristic):
+    # [CLASS DOC] Registered XPU heuristic for int8 mm.
     """Int8 MM template heuristic for XPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the int8 configs for both lists.
         super().__init__()
         # Override mm_configs to use int8_mm_configs
         self.mm_configs = self.int8_mm_configs
@@ -3594,9 +3804,11 @@ class XPUInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, XPUConfigHeuri
 class XPUMMPlusMMTemplateConfigHeuristic(
     MMPlusMMTemplateConfigMixin, XPUConfigHeuristic
 ):
+    # [CLASS DOC] Registered XPU heuristic for mm_plus_mm.
     """MM Plus MM template heuristic for XPU"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the mm_plus_mm configs for both lists.
         super().__init__()
         # Override mm_configs to use mm_plus_mm_configs
         self.mm_configs = self.mm_plus_mm_configs
@@ -3613,20 +3825,24 @@ class XPUMMPlusMMTemplateConfigHeuristic(
 @register_template_heuristic(mm_template.uid, "mtia")
 @register_template_heuristic(bmm_template.uid, "mtia")
 class MTIAMMTemplateConfigHeuristic(MMTemplateConfigMixin, MTIAConfigHeuristic):
+    # [CLASS DOC] Registered MTIA heuristic for standard mm and bmm templates.
     """Standard MM template heuristic for MTIA"""
 
 
 @register_template_heuristic(mm_template.uid, "mtia", op_name="addmm")
 @register_template_heuristic(bmm_template.uid, "mtia", op_name="baddbmm")
 class MTIAAddMMTemplateConfigHeuristic(AddMMConfigMixin, MTIAMMTemplateConfigHeuristic):
+    # [CLASS DOC] Registered MTIA heuristic for addmm and baddbmm templates.
     """Addmm specific mixin for MTIA"""
 
 
 @register_template_heuristic(mm_template.uid, "mtia", op_name="scaled_mm")
 class MTIAScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, MTIAConfigHeuristic):
+    # [CLASS DOC] Registered MTIA heuristic for non-TMA scaled mm.
     """Scaled MM template heuristic for MTIA (non-TMA)"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the scaled mm configs for both lists.
         super().__init__()
         # Override mm_configs to use scaled_mm_configs
         self.mm_configs = self.scaled_mm_configs
@@ -3639,9 +3855,11 @@ class MTIAScaledMMTemplateConfigHeuristic(ScaledMMConfigMixin, MTIAConfigHeurist
 
 @register_template_heuristic(mm_template.uid, "mtia", op_name="int_mm")
 class MTIAInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, MTIAConfigHeuristic):
+    # [CLASS DOC] Registered MTIA heuristic for int8 mm.
     """Int8 MM template heuristic for MTIA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the int8 configs for both lists.
         super().__init__()
         # Override mm_configs to use int8_mm_configs
         self.mm_configs = self.int8_mm_configs
@@ -3656,9 +3874,11 @@ class MTIAInt8MMTemplateConfigHeuristic(INT8MMTemplateConfigMixin, MTIAConfigHeu
 class MTIAMMPlusMMTemplateConfigHeuristic(
     MMPlusMMTemplateConfigMixin, MTIAConfigHeuristic
 ):
+    # [CLASS DOC] Registered MTIA heuristic for mm_plus_mm.
     """MM Plus MM template heuristic for MTIA"""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent init and uses the mm_plus_mm configs for both lists.
         super().__init__()
         # Override mm_configs to use mm_plus_mm_configs
         self.mm_configs = self.mm_plus_mm_configs
