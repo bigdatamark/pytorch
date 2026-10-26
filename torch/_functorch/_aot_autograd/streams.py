@@ -1,3 +1,12 @@
+# [MODULE DOC] FX graph passes for multi-stream execution in AOTAutograd graphs.
+# Reads/writes the per-node stream index stored in node meta "custom", assigns
+# streams to gradient-accumulation and epilogue copy nodes, inserts record/wait
+# event nodes between backward nodes on different streams, handles safe
+# deallocation of tensors last used on a side stream (timeline estimates instead
+# of record_stream), records mutated-input stream indices into forward metadata,
+# and wraps stream sync ops in control_deps so later passes keep their ordering.
+# Import-time side effects: defines partition constants and a tuple of sync ops
+# resolved from torch.ops.streams.
 import operator
 from collections.abc import Callable
 from typing import Any, TYPE_CHECKING, TypeAlias
@@ -44,10 +53,17 @@ _SYNC_OPS = (
 
 
 def get_roofline_estimate(node: Node) -> float:
+    # [FUNCTION DOC] Estimates the runtime of a call_function node in milliseconds
+    # (microsecond estimate divided by 1e6 scaling used here): the larger of the
+    # data transfer time and compute time computed from the fake values in node
+    # meta. Returns 0.0 for ops in the ignore list. Raises AssertionError if the
+    # node is not a call_function node. Pure; no mutation.
     if node.op != "call_function":
         raise AssertionError(f"non-func node in roofline estimate: {node.op}")
 
     def map_value(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Maps a graph node to its "value" meta (fake tensor)
+        # when present, otherwise returns the node; non-node inputs pass through.
         return x.meta.get("value", x) if isinstance(x, Node) else x
 
     func = node.target
@@ -75,19 +91,27 @@ def get_roofline_estimate(node: Node) -> float:
 
 
 def is_gradient_acc(node: Node) -> bool:
+    # [FUNCTION DOC] Returns whether the node's meta flags it as a gradient
+    # accumulation node (default False when the flag is absent).
     return node.meta.get("is_gradient_acc", False)
 
 
 def is_bwd_node(node: Node) -> Partition:
+    # [FUNCTION DOC] Returns True if the node's partitioner_tag marks it as backward
+    # (either "is_backward" or "must_be_in_backward"), else False.
     tag = node.meta.get("partitioner_tag")
     return tag == "is_backward" or tag == "must_be_in_backward"
 
 
 def get_device(node: Node) -> torch.device:
+    # [FUNCTION DOC] Returns the device of the node's fake value in meta "val".
+    # Raises KeyError if the node has no "val" meta.
     return node.meta["val"].device
 
 
 def get_stream(node: Node) -> int | None:
+    # [FUNCTION DOC] Returns the stream index annotated on the node (under the
+    # "custom" meta mapping, key "stream"), or None when not annotated.
     maybe_annotation = node.meta.get("custom", None)
     if maybe_annotation is not None:
         return node.meta["custom"].get("stream", None)
@@ -96,6 +120,8 @@ def get_stream(node: Node) -> int | None:
 
 
 def get_stream_or_current_stream(node: Node) -> int:
+    # [FUNCTION DOC] Returns the node's annotated stream index, falling back to the
+    # current stream index of the node's device when unannotated.
     ind = get_stream(node)
     if ind is None:
         ind = get_current_stream(get_device(node))
@@ -103,6 +129,8 @@ def get_stream_or_current_stream(node: Node) -> int:
 
 
 def set_stream(node: Node, ind: int) -> None:
+    # [FUNCTION DOC] Writes the stream index into the node's "custom" meta mapping,
+    # creating the mapping if missing (mutates node meta). Returns nothing.
     if "custom" in node.meta:
         node.meta["custom"].update({"stream": ind})
     else:
@@ -110,6 +138,9 @@ def set_stream(node: Node, ind: int) -> None:
 
 
 def insert_record_event_after_node(graph: Graph, node: Node, event_ind: int) -> Node:
+    # [FUNCTION DOC] Inserts a record_event call right after the given node, using
+    # the event index and the node's stream (or current stream). Tags the new node
+    # as must-be-in-backward in meta. Mutates the graph; returns the new node.
     with graph.inserting_after(node):
         node = graph.call_function(
             torch.ops.streams.record_event.default,
@@ -124,6 +155,9 @@ def insert_record_event_after_node(graph: Graph, node: Node, event_ind: int) -> 
 
 
 def insert_wait_event_before_node(graph: Graph, node: Node, event_ind: int) -> Node:
+    # [FUNCTION DOC] Inserts a wait_event call right before the given node, waiting
+    # on the event index from the node's stream (or current stream). Tags the new
+    # node as must-be-in-backward in meta. Mutates the graph; returns the new node.
     with graph.inserting_before(node):
         node = graph.call_function(
             torch.ops.streams.wait_event.default,
@@ -142,6 +176,10 @@ def populate_stream_timeline(
     graph: Graph,
     stream_index: int | None,
 ) -> IndexedDict[Node, float]:
+    # [FUNCTION DOC] Lazily builds and caches (in the passed mapping) an ordered
+    # timeline for one stream: each backward call_function node on that stream maps
+    # to the cumulative estimated runtime including itself, starting from zero.
+    # Returns the cached ordered mapping. Mutates stream_to_timeline.
     if stream_index not in stream_to_timeline:
         stream_to_timeline[stream_index] = IndexedDict()
         total_time = 0.0
@@ -171,6 +209,14 @@ def handle_synced_deallocation(
     node: Node,
     last_usage: Node,
 ) -> None:
+    # [FUNCTION DOC] Arranges safe freeing of a tensor allocated on one stream but
+    # last used on a different (side) stream, for backward nodes only. Inserts
+    # record_event after the last usage and a sync_dealloc node placed after the
+    # allocating-stream node whose estimated timestamp reaches the side stream's
+    # finish time (linear search over the timelines). Raises AssertionError if
+    # either node is not backward or both streams are equal. Mutates the graph.
+    # KNOWN ISSUE: when no accelerator is available a record_stream node is inserted
+    # but the function does not return, so the sync_dealloc path still runs after it.
     if not is_bwd_node(node):
         raise AssertionError(
             "synced allocations should only be handled on backward nodes"
@@ -237,6 +283,11 @@ def insert_sync(
     producer: Node,
     node_to_wait_event_ind: dict[Node, int],
 ) -> None:
+    # [FUNCTION DOC] Ensures the consumer waits for the producer across streams:
+    # the first time a producer is seen, allocates a new event, inserts record_event
+    # after the producer and wait_event before the consumer, and remembers the event
+    # in the mapping. KNOWN ISSUE: for a producer already in the mapping nothing is
+    # inserted, so a second consumer of the same producer gets no wait of its own.
     if producer not in node_to_wait_event_ind:
         node_to_wait_event_ind[producer] = new_event()
 
@@ -248,6 +299,9 @@ def insert_sync(
 
 def assign_backward_streams(gm: torch.fx.GraphModule) -> None:
     """Assigns backward streams to gradient accumulation nodes"""
+    # [FUNCTION DOC] Walks the graph in reverse; for each gradient accumulation
+    # node, picks the first stream annotation found among its users and then its
+    # flattened args, and sets it on the node (mutates node meta). No return.
 
     # NB: iterate in reverse order to more closely match eager
     # the user node stream will be populated first
@@ -274,6 +328,10 @@ def assign_backward_streams(gm: torch.fx.GraphModule) -> None:
 
 def insert_backward_syncs(gm: torch.fx.GraphModule) -> None:
     """Inserts stream syncs for backward nodes if consumer and producer are on different streams"""
+    # [FUNCTION DOC] For each backward call_function node, checks each flattened
+    # backward call_function arg; when the arg runs on a different stream and is
+    # not on CPU, inserts a record/wait event pair via insert_sync (one event per
+    # producer, tracked in a local mapping). Mutates the graph; no return.
     node_to_wait_event_ind: dict[Node, int] = {}
     for node in gm.graph.nodes:
         if node.op == "call_function" and is_bwd_node(node):
@@ -289,6 +347,10 @@ def insert_backward_syncs(gm: torch.fx.GraphModule) -> None:
 
 def sync_deallocations(gm: torch.fx.GraphModule) -> None:
     """Handles https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html#torch.Tensor.record_stream"""
+    # [FUNCTION DOC] For each backward call_function node with users, finds its
+    # last user (by node ordering); if that user is not the graph output and runs
+    # on a different stream than the node, calls handle_synced_deallocation with a
+    # shared per-stream timeline cache. Mutates the graph; no return.
     # Note: this is only needed if the last usage of a tensor is on a stream other than
     # the stream the tensor was allocated on
 
@@ -314,6 +376,9 @@ def sync_deallocations(gm: torch.fx.GraphModule) -> None:
 
 
 def assign_epilogue_copy_streams(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] For each copy_ node (epilogue mutation copies), if its source
+    # arg's stream differs from the copy's stream, sets the copy's stream to the
+    # source's stream (or its device's current stream). Mutates node meta.
     for epi_copy in gm.graph.find_nodes(op="call_function", target=aten.copy_.default):
         arg_stream = get_stream(epi_copy.args[1])
         copy_stream = get_stream(epi_copy)
@@ -332,6 +397,10 @@ def populate_fw_metadata_with_stream_indices(
 
     We extract the stream index for each mutated input from the graph's output node.
     """
+    # [FUNCTION DOC] Sets mutated_inp_stream_indices on the metadata to a list with
+    # one entry per mutated runtime input: the stream annotated on the matching
+    # leading output node (None if not a node or missing). Empty list when there are
+    # no mutated inputs. Raises AssertionError if the graph has no output node.
 
     num_mutated_inps = fw_metadata.num_mutated_inp_runtime_indices
     if num_mutated_inps == 0:
@@ -389,6 +458,11 @@ def _expand_dict_returning_deps(
     ``additional_deps`` (ordering-only) which is safe since that tuple is
     never decomposed.
     """
+    # [FUNCTION DOC] HELPER: Returns the dependency list with each
+    # triton_kernel_wrapper_functional dep that has not-yet-visited getitem users
+    # replaced by new getitem nodes (one per such user, inserted before the sync
+    # node, meta copied, old getitems rewired and erased, new ones marked visited).
+    # Other deps pass through unchanged. Raises AssertionError on nested dict values.
     expanded: list[Node] = []
     for dep in deps:
         if not (
@@ -441,6 +515,13 @@ def _wrap_sync_node(
     ``visited`` is the set of nodes at or before the sync node in graph order,
     used to distinguish pre-sync vs post-sync users.
     """
+    # [FUNCTION DOC] HELPER: Replaces one sync node with a control_deps call whose
+    # subgraph runs the sync and passes through only deps that still have later
+    # users. Adds the subgraph as a module attribute, copies partitioner_tag and
+    # value meta, creates getitem passthrough nodes, rewires post-sync users (incl.
+    # nested args; keeps copy_ destination identity for partition-scoped deps),
+    # erases the sync node, and marks new nodes visited. Returns the control_deps
+    # node and the passthrough getitems. Mutates graph, gm, and visited.
     from torch._inductor.fx_passes.control_dependencies import (
         _create_subgraph_for_node,
         control_deps,
@@ -454,9 +535,15 @@ def _wrap_sync_node(
     sync_is_bwd = is_bwd_node(sync_node)
 
     def _user_rewrite_pred(dep: Node) -> Callable[[Node], bool]:
+        # [FUNCTION DOC] HELPER: Returns a predicate selecting which users of dep
+        # should be rewired to the passthrough: unvisited users only; for
+        # partition-scoped deps, only users in the same partition as the sync (the
+        # output node counts as backward); otherwise output users only if dep is backward.
         if dep in partition_scoped_deps:
 
             def pred(user: Node) -> bool:
+                # [FUNCTION DOC] HELPER: Partition-scoped rule: unvisited user in
+                # the same fwd/bwd partition as the sync node.
                 if user in visited:
                     return False
                 if user.op == "output":
@@ -468,6 +555,8 @@ def _wrap_sync_node(
         dep_is_bwd = is_bwd_node(dep)
 
         def pred(user: Node) -> bool:
+            # [FUNCTION DOC] HELPER: Default rule: unvisited user, excluding the
+            # output node unless dep is a backward node.
             return user not in visited and (user.op != "output" or dep_is_bwd)
 
         return pred
@@ -556,6 +645,7 @@ def _wrap_sync_node(
                 continue
 
             def _replace(n: Node) -> Node:
+                # [FUNCTION DOC] HELPER: Substitutes the passthrough getitem for dep.
                 return getitem_node if n is dep else n
 
             if (
@@ -589,6 +679,12 @@ def _collect_sync_forward_deps(
     single reverse liveness traversal; the forward pass still handles sync/event
     state introduced while rewriting the graph.
     """
+    # [FUNCTION DOC] HELPER: Single reverse pass over the graph computing, for each
+    # wait_stream / wait_event (graph-input deps only) node, the set of values that
+    # later work on the waiting stream needs, and for each full barrier
+    # (synchronize device/event/stream) node, all values live in its partition.
+    # Returns (stream_sync_deps, full_barrier_deps) as mappings from sync node to
+    # ordered sets of nodes. Unannotated nodes count as stream 0. Pure graph read.
     stream_sync_deps: dict[Node, OrderedSet[Node]] = {}
     full_barrier_deps: dict[Node, OrderedSet[Node]] = {}
     live_inputs: dict[Partition, dict[int, OrderedSet[Node]]] = {
@@ -603,6 +699,8 @@ def _collect_sync_forward_deps(
     )
 
     def _add_live(node: Node, partition: Partition, stream: int) -> None:
+        # [FUNCTION DOC] HELPER: Records the node as live for the given partition and
+        # stream, and records that location in the node's location set.
         stream_inputs = live_inputs[partition].get(stream)
         if stream_inputs is None:
             stream_inputs = live_inputs[partition][stream] = OrderedSet()
@@ -655,6 +753,8 @@ def _collect_sync_forward_deps(
         )
 
         def _collect(n: Node) -> Node:
+            # [FUNCTION DOC] HELPER: For an input node with a value, marks it live
+            # at every target location of the consumer; returns the node unchanged.
             if "val" in n.meta:
                 for partition, stream in target_locations:
                     _add_live(n, partition, stream)
@@ -686,6 +786,9 @@ def _collect_full_barrier_deps(
     Forward compute deps (stream_to_nodes) are kept -- backward legitimately
     depends on forward activations.
     """
+    # [FUNCTION DOC] HELPER: Returns a deduplicated, order-preserving list of all
+    # live per-stream nodes followed by accumulated sync deps (skipping forward
+    # nodes when bwd is true). Pure; does not mutate inputs.
     all_deps = [n for nodes in stream_to_nodes.values() for n in nodes]
     seen = set(all_deps)
     for deps in stream_sync_deps.values():
@@ -706,6 +809,12 @@ def wrap_all_sync_nodes_with_control_deps(gm: torch.fx.GraphModule) -> None:
     for that stream, then the deps are reset to the control_deps node
     (maintaining the ordering chain for subsequent syncs on the same stream).
     """
+    # [FUNCTION DOC] Walks the graph once, tracking per-stream live nodes, prior sync
+    # anchors and per-event state (anchor, passthroughs, stream). For each sync op
+    # (record/wait event, wait_stream, synchronize event/stream/device) computes the
+    # deps it must order against (full barriers cover all streams) and wraps it with
+    # _wrap_sync_node, then resets the accumulated deps. Recompiles the module if
+    # any sync was wrapped. Raises RuntimeError on an empty graph. Mutates gm.
     graph = gm.graph
     if len(graph.nodes) == 0:
         raise RuntimeError("Expected a non-empty graph")

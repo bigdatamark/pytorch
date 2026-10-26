@@ -1,3 +1,9 @@
+# [MODULE DOC] Single, stable import surface for runtime helpers that standalone
+# artifacts (emitted by compile_to_python) close over: alias regeneration from a
+# base, tensor-alias unwrapping, dynamic-index marking, list normalization, and
+# CUDARngStateHelper. Pure re-exports with no logic; import-time side effect is
+# importing torch._dynamo first to avoid a circular import. The re-exported
+# objects must keep their identity (the standalone composer keys on id()).
 """Runtime-support surface for standalone artifacts.
 
 Modules emitted by ``torch._functorch.aot_autograd.compile_to_python`` inline

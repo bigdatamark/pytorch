@@ -1,3 +1,12 @@
+# [MODULE DOC] Central type definitions for AOTAutograd: the OutputType enum,
+# alias/mutation info records for inputs and outputs, subclass/plain-tensor
+# creation metadata, ViewAndMutationMeta (the forward-graph analysis result that
+# is cached), SubclassMeta, TensorAlias, BackwardSignature/GraphSignature,
+# config dataclasses (CacheableAOTConfig, AOTConfig), AOTState, AOTGraphCapture,
+# JointWithDescriptors, CompilerWrapper/InductorWrapper base classes, compiler and
+# trace-function protocols, and name type aliases (FxValue, GraphInputName, ...).
+# Import-time side effect: rebinds the module-level name zip to the strict
+# (length-checking) zip from .utils.
 """
 The various dataclasses, Enums, namedtuples etc used in AOTAutograd. This includes
 input/output types, metadata, config, function signatures etc.
@@ -83,6 +92,11 @@ OutputType = Enum(
 # This class stores info about every user output.
 @dataclass(frozen=True)
 class OutputAliasInfo:
+    # [CLASS DOC] Immutable record describing one user output of the traced forward:
+    # its OutputType (non-alias, alias of input, alias of intermediate, ...), raw
+    # Python type, base index into the relevant base list (None for non-alias),
+    # dynamic dims, requires_grad flags (general and for backward tangents) and an
+    # optional ViewMetaSequence used to replay views on a regenerated base.
     # Tells us if this output is:
     # (1) a regular (non-aliased) output
     # (2) an alias of a forward input
@@ -127,6 +141,9 @@ class OutputAliasInfo:
 
 
 class MutationType(Enum):
+    # [CLASS DOC] Enum classifying how an input is mutated: not mutated, mutated
+    # with the mutation kept inside the graph, or mutated outside the graph (handled
+    # by the runtime epilogue copy-back).
     NOT_MUTATED = 1
     MUTATED_IN_GRAPH = 2
     MUTATED_OUT_GRAPH = 3
@@ -135,6 +152,12 @@ class MutationType(Enum):
 # This class tells us info about user inputs.
 @dataclass(frozen=True)
 class InputAliasInfo:
+    # [CLASS DOC] Immutable record of what happened to one user input during
+    # tracing: leaf-ness, data/metadata/storage-metadata mutation flags, whether
+    # mutations are hidden from autograd or happen under no_grad/inference mode,
+    # inductor storage resize, shallow-copy-data flag, requires_grad and whether
+    # input mutations are kept in the graph. The mutation_type property derives the
+    # MutationType from these flags.
     is_leaf: bool
     mutates_data: bool
     mutates_metadata: bool
@@ -147,6 +170,9 @@ class InputAliasInfo:
     keep_input_mutations: bool
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates the invariant that storage-metadata mutation
+        # (for example a set_ call) implies metadata mutation; raises AssertionError
+        # if violated.
         if self.mutates_storage_metadata:
             # For convenience, we guarantee that this is always true.
             # In practice, If we call .set_(), then at runtime there is no need
@@ -159,6 +185,10 @@ class InputAliasInfo:
 
     @functools.cached_property
     def mutation_type(self) -> MutationType:
+        # [FUNCTION DOC] Cached property. Returns NOT_MUTATED when no data, metadata
+        # or storage-resize mutation occurred; MUTATED_IN_GRAPH when the helper
+        # _check_if_mutation_can_be_in_graph says the mutation can stay in the graph
+        # for these flags; otherwise MUTATED_OUT_GRAPH.
         if (
             (not self.mutates_data)
             and (not self.mutates_metadata)
@@ -183,6 +213,9 @@ class InputAliasInfo:
 
 @dataclass
 class MemoryFormatMeta:
+    # [CLASS DOC] Records the expected layout of a tangent: either concrete size and
+    # stride (static shapes) or a memory_format (dynamic shapes, subclasses,
+    # overlapping outputs). All fields optional; built by from_tensor.
     # For static shapes we assume tangents have the same strideness as outputs
     size: Sequence[int] | None = None
     stride: Sequence[int] | None = None
@@ -194,6 +227,11 @@ class MemoryFormatMeta:
     def from_tensor(
         t: torch.Tensor, force_use_memory_format: bool = False
     ) -> MemoryFormatMeta | None:
+        # [FUNCTION DOC] Static factory. Chooses to record only a suggested memory
+        # format when forced, when guessing tangent strides is disabled in config,
+        # for traceable wrapper subclasses, for tensors with symbolic sizes/strides,
+        # or for strided tensors with internal overlap; otherwise records the exact
+        # size and stride. Returns a MemoryFormatMeta (never actually None).
         # We only memorize expected memory format for
         # 1. Traceable wrapper subclasses
         # We can not create restrided subclass tensor, as torch.empty_strided works only with dense tensors.
@@ -231,6 +269,10 @@ class MemoryFormatMeta:
 
 @dataclass
 class PlainTensorMeta:
+    # [CLASS DOC] Describes a non-subclass tensor in a flattened argument list: its
+    # index in the unwrapped (plain tensor) list, optional memory format info, and
+    # boolean masks saying which size/stride entries are symbolic placeholders that
+    # are passed as extra arguments after the tensor.
     unwrapped_idx: int
     memory_format: MemoryFormatMeta | None = None
     size_symbol_placeholders: tuple[bool, ...] = ()
@@ -238,6 +280,9 @@ class PlainTensorMeta:
 
     @property
     def arg_count(self) -> int:
+        # [FUNCTION DOC] Property: number of flat arguments this tensor occupies, one
+        # for the tensor plus one per symbolic size placeholder and per symbolic
+        # stride placeholder.
         return (
             1
             + sum(self.size_symbol_placeholders)
@@ -247,11 +292,20 @@ class PlainTensorMeta:
 
 @dataclass
 class OpaqueMeta:
+    # [CLASS DOC] Marker (no fields) for an opaque custom-class object occupying a
+    # single slot in a subclass's flattened attribute list.
     pass
 
 
 @dataclass
 class SubclassCreationMeta:
+    # [CLASS DOC] Recipe to rebuild a tensor subclass from a flat list of plain
+    # tensors/symints: start index and total argument count (inclusive of nested
+    # subclasses), mapping of attribute name to nested creation meta (subclass,
+    # plain tensor or opaque), outer size/stride, flatten metadata, the original
+    # fake subclass (dropped by make_runtime_safe in favour of its type), optional
+    # memory format and attrs from which outer size/stride can be read at runtime.
+    # Invariant: original_subclass is a fake tensor (checked at construction).
     """
     Used for AOTDispatch.
     This dataclass gives us the information we need to reconstruct a tensor subclass
@@ -306,11 +360,18 @@ class SubclassCreationMeta:
         Iterable[IntLikeType | None],
         Iterable[IntLikeType | None],
     ]:
+        # [FUNCTION DOC] Returns (outer_size, outer_stride) for the subclass, filling
+        # symbolic placeholder entries from consecutive items of all_args starting at
+        # curr_start_idx (sizes first, then strides); entries without placeholders are
+        # returned unchanged. Pure.
         from .subclass_utils import compute_symint_placeholders
 
         def compute(
             outer: Iterable[IntLikeType | None], start_idx: int
         ) -> tuple[Any, int | Any]:
+            # [FUNCTION DOC] HELPER: Substitutes placeholder entries of one sequence
+            # with args taken in order from start_idx; returns the new sequence and the
+            # next unused index (unchanged sequence and start index if no placeholders).
             placeholders = compute_symint_placeholders(outer)
             has_symbolic = any(placeholders)
 
@@ -334,6 +395,13 @@ class SubclassCreationMeta:
         *,
         is_runtime: bool,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Rebuilds the tensor subclass from the flat all_args: gathers
+        # inner tensors/opaque objects per attribute (recursing for nested subclasses),
+        # then calls the subclass type's __tensor_unflatten__ with the metadata and
+        # outer size/stride. At runtime uses the saved subclass type and computed (or
+        # attribute-derived) outer size/stride; at trace time uses the original fake
+        # subclass and copies its autograd metadata onto the result. Raises
+        # AssertionError on unexpected argument types or missing runtime type.
         inner_tensors: dict[str, torch.Tensor | CustomClassBase] = {}
 
         curr_start_idx = self.flat_tensor_start_idx
@@ -401,7 +469,14 @@ class SubclassCreationMeta:
         return rebuilt
 
     def make_runtime_safe(self) -> None:
+        # [FUNCTION DOC] Prepares the meta for caching/runtime: stores the subclass
+        # type, drops the fake original subclass, converts outer size/stride to tuples
+        # with SymInts replaced (nested ints become -1, others None), and recurses into
+        # nested subclass metas. Mutates self; raises AssertionError if the original
+        # subclass is already None.
         def _make_size_runtime_safe(x: None | int | torch.SymInt) -> int | None:
+            # [FUNCTION DOC] HELPER: Maps a SymInt to -1 if it is a nested int else
+            # None; other values pass through unchanged.
             dummy = -1
             if isinstance(x, torch.SymInt):
                 # Replace nested ints by a dummy value (-1) as NJT ignores
@@ -430,6 +505,8 @@ class SubclassCreationMeta:
                 creation_meta.make_runtime_safe()
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates that original_subclass is a fake tensor (to avoid
+        # holding real memory); raises AssertionError otherwise.
         # sanity assert to make sure we don't leak memory
         if not is_fake(self.original_subclass):
             raise AssertionError(
@@ -444,6 +521,15 @@ class SubclassCreationMeta:
 # they are covered by warm cache tests.
 @dataclass(eq=False)
 class ViewAndMutationMeta:
+    # [CLASS DOC] Result of AOTAutograd's analysis of the user forward and the
+    # central metadata object (saved in the AOT autograd cache). Holds per-input and
+    # per-output alias/mutation info, intermediate-base count, traced tangents and
+    # their subclass metas, saved-for-backward counts, rng/token/stream/donated
+    # buffer info and other flags. __post_init__ derives many cached index lists and
+    # counts (mutated input indices, aliased output indices, num_forward, ...);
+    # make_runtime_safe strips non-serializable state; slice properties give the
+    # layout of forward outputs and saved values. Defines a custom __eq__ comparing
+    # a subset of fields (and therefore is unhashable).
     # length = # user inputs
     # This gives us info about every input, and what sort of mutation happened to it (if any)
     input_info: list[InputAliasInfo]
@@ -588,6 +674,12 @@ class ViewAndMutationMeta:
     tangent_source_stack_traces: list[str | None] | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Pre-computes derived attributes from input_info,
+        # output_info and traced_tangents: indices/counts of inputs mutated outside
+        # the graph and inside the graph (with and without autograd visibility),
+        # aliased and unsafe-view output indices, counts of outputs by alias kind,
+        # dynamic output flag, runtime output types of tangents, rng-offset output
+        # count (from config), and num_forward_returns/num_forward boundaries.
         # pre-compute the indices of the inputs that are mutated.
         # When keep_input_mutations is set, we don't need to worry about our epilogue
         # handling data-only mutations, because we keep them directly in the graph.
@@ -730,6 +822,11 @@ class ViewAndMutationMeta:
         self.num_forward = self.num_forward_returns + self.num_outputs_rng_offset
 
     def make_runtime_safe(self) -> None:
+        # [FUNCTION DOC] Called once after tracing: records per-tangent subclass
+        # flatten metadata in traced_tangent_metas, clears traced_tangents, makes all
+        # subclass metas runtime safe, and drops view_meta_sequence from outputs whose
+        # view metas have symbolic inputs (replacing the output_info entry). Mutates
+        # self; raises AssertionError if traced_tangent_metas was already set.
         """
         There are various fields in ViewAndMutationMeta that aren't serializable. This function is called after all tracing
         is completed to simplify certain fields in the metadata so that they can be safely cached.
@@ -745,6 +842,9 @@ class ViewAndMutationMeta:
             )
 
         def extract_metadata(t: object) -> tuple[Sequence[str], object] | None:
+            # [FUNCTION DOC] HELPER: For a traceable wrapper subclass tensor returns
+            # the pair (inner tensor names, flatten spec) from __tensor_flatten__;
+            # returns None for anything else.
             if isinstance(t, torch.Tensor) and is_traceable_wrapper_subclass(t):
                 (inner_tensors, flatten_spec) = t.__tensor_flatten__()  # type: ignore[attr-defined]
                 # Technically, we only need the flatten_spec, not the inner tensors.
@@ -780,6 +880,10 @@ class ViewAndMutationMeta:
 
     @property
     def tensors_saved_for_backwards_slice(self) -> slice:
+        # [FUNCTION DOC] Property: slice of the forward outputs holding all saved
+        # tensors (version-counter-checked ones followed by unchecked ones), starting
+        # at num_forward. Requires the symint and no-vc-check counts to be set; raises
+        # AssertionError if they are None or the sub-slices are inconsistent.
         if self.num_symints_saved_for_bw is None:
             raise AssertionError("num_symints_saved_for_bw must not be None")
         if self.num_tensors_saved_with_no_vc_check is None:
@@ -800,6 +904,10 @@ class ViewAndMutationMeta:
 
     @property
     def tensors_saved_for_backwards_with_vc_check_slice(self) -> slice:
+        # [FUNCTION DOC] Property: slice of forward outputs for saved tensors that
+        # need version-counter checks: from num_forward up to (but excluding) the
+        # trailing no-vc-check tensors, opaque objects and symints (negative end), or
+        # to the end when there are none. Raises AssertionError if counts are unset.
         """
         Slice of forward outputs that are tensors saved for backward that
         require version counter checks (i.e., were saved via save_for_backward).
@@ -821,6 +929,10 @@ class ViewAndMutationMeta:
 
     @property
     def tensors_saved_for_backwards_no_vc_check_slice(self) -> slice:
+        # [FUNCTION DOC] Property: slice (negative indices from the end) of the saved
+        # tensors without version-counter checks, which sit just before the opaque
+        # objects and symints. Returns an empty slice when there are none. Raises
+        # AssertionError if counts are unset.
         """
         Slice of forward outputs that are tensors saved for backward that
         do NOT require version counter checks (i.e., were stashed on ctx
@@ -843,6 +955,9 @@ class ViewAndMutationMeta:
 
     @property
     def opaque_objects_saved_for_backwards_slice(self) -> slice:
+        # [FUNCTION DOC] Property: slice (negative indices) of saved opaque objects,
+        # located just before the trailing symints; empty slice if there are none.
+        # Missing counts are treated as zero.
         num_opaque = self.num_opaque_objects_saved_for_bw or 0
         num_symints = self.num_symints_saved_for_bw or 0
         if num_opaque > 0:
@@ -855,6 +970,8 @@ class ViewAndMutationMeta:
 
     @property
     def symints_saved_for_backwards_slice(self) -> slice:
+        # [FUNCTION DOC] Property: slice of the last saved-symint entries of the forward
+        # outputs; empty slice when zero. Raises AssertionError if the count is unset.
         if self.num_symints_saved_for_bw is None:
             raise AssertionError("num_symints_saved_for_bw must not be None")
         if self.num_symints_saved_for_bw > 0:
@@ -863,6 +980,10 @@ class ViewAndMutationMeta:
             return slice(0, 0)  # empty slice
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equality on input/output info, intermediate base count,
+        # keep_input_mutations, rng flags, backward token count, and the shape and dtype
+        # of each traced tangent (lengths must match). Returns NotImplemented for other
+        # types. Other fields are ignored.
         if not isinstance(other, ViewAndMutationMeta):
             return NotImplemented
         return (
@@ -883,6 +1004,10 @@ class ViewAndMutationMeta:
 
 @dataclass(eq=False)
 class SubclassMeta:
+    # [CLASS DOC] Subclass-related metadata for a traced graph: fw_metadata (forward
+    # metadata recomputed on the dense, desugared tensors) and optional
+    # grad_input_metas (how to rebuild grad input subclasses; absent for inference).
+    # Fields are assigned after construction because __init__ does nothing.
     # A copy of all forward metadata, but computed on the *dense* tensor forward (after desugaring subclasses)
     # So for example, if the user had a model containing two `TwoTensor` inputs,
     # Then `SubclassMeta.fw_metadata.input_infos` would have length 4 here.
@@ -915,6 +1040,8 @@ class SubclassMeta:
     grad_input_metas: list[PlainTensorMeta | SubclassCreationMeta] | None = None
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] No-op constructor; the dataclass fields are set by callers
+        # after construction (so a new instance lacks fw_metadata until assigned).
         # The fields in this class get set after its construction.
         pass
 
@@ -927,11 +1054,17 @@ class SubclassMeta:
 # does not know to treat them as tensors.
 @dataclass(frozen=True)
 class TensorAlias:
+    # [CLASS DOC] Immutable opaque wrapper around a tensor that aliases an input; it
+    # hides the alias from the autograd.Function so only its metadata is used to
+    # regenerate the output at runtime.
     alias: torch.Tensor
 
 
 @dataclass
 class BackwardSignature:
+    # [CLASS DOC] Describes the backward part of an exported joint graph: mappings
+    # from gradient node names to parameter names and to user input names, and the
+    # node name of the loss output.
     """
     Provides information about the backward section of an exported
     joint forward-backward graph.
@@ -957,6 +1090,11 @@ FQN = NewType("FQN", str)
 
 @dataclass
 class GraphSignature:
+    # [CLASS DOC] Describes the calling convention of an exported graph module:
+    # which graph inputs are parameters, buffers, user inputs or tokens (with FQN
+    # mappings), which outputs are user outputs, mutated buffers/parameters/user
+    # inputs or tokens, the pytree in/out specs, and an optional BackwardSignature.
+    # Built by from_tracing_metadata.
     """
     Provides information about an exported module.
     For a particular fx GraphModule, this class contains information on:
@@ -1015,6 +1153,13 @@ class GraphSignature:
         loss_index: int | None,
         backward_signature: BackwardSignature | None,
     ) -> GraphSignature:
+        # [FUNCTION DOC] Classmethod factory. Slices graph input names assuming the
+        # order (tokens, params, buffers, user inputs) and output names assuming
+        # (tokens, mutated inputs, user outputs, param gradients). Maps data-mutated
+        # inputs to the matching output names and classifies them as user input,
+        # buffer or parameter mutations. Raises AssertionError if names are not fully
+        # consumed, a mutated parameter appears when tracing joint, a mutation name is
+        # unknown, mutation counts mismatch metadata, or leftover outputs remain.
         graph_inputs = graph_input_names
         graph_outputs = graph_output_names
         parameters = list(named_parameters)
@@ -1130,6 +1275,8 @@ class GraphSignature:
 
 @dataclass
 class AOTAutogradCacheInfo:
+    # [CLASS DOC] Cache bookkeeping for one compilation: the cache key, start time in
+    # nanoseconds and the forward symints.
     cache_key: str
     start_time_ns: int
     forward_symints: list[torch.SymInt]
@@ -1137,6 +1284,8 @@ class AOTAutogradCacheInfo:
 
 @dataclass
 class CacheableAOTConfig:
+    # [CLASS DOC] Serializable subset of AOTConfig (no compilers or decompositions)
+    # used in cache keys and cached entries. Invariant: pre_dispatch implies export.
     """
     Serializable subset of AOTConfig used by cache keys and cached entries.
     """
@@ -1155,12 +1304,19 @@ class CacheableAOTConfig:
     precompile_backend_id: str | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates that pre_dispatch is only enabled for export; raises
+        # AssertionError otherwise.
         if self.pre_dispatch and not self.is_export:
             raise AssertionError("Can only have pre_dispatch IR for export.")
 
 
 @dataclass(frozen=True)
 class AOTConfig:
+    # [CLASS DOC] Immutable configuration for AOTDispatcher: forward/backward/
+    # inference compilers, partition function, decompositions, counts of params and
+    # buffers, aot id, flags (export, no tangents, dynamic shapes, pre_dispatch,
+    # input mutation handling, functionalization/lazy backward options), source and
+    # static-input info, cache info. Invariant: pre_dispatch implies export.
     """
     Configuration for AOTDispatcher
     """
@@ -1200,6 +1356,8 @@ class AOTConfig:
     _disable_torch_fn_metadata_mode: bool = False
 
     def to_cacheable(self) -> CacheableAOTConfig:
+        # [FUNCTION DOC] Returns a CacheableAOTConfig copying only the serializable
+        # fields (no compilers, partition function, decompositions or cache info).
         return CacheableAOTConfig(
             num_params_buffers=self.num_params_buffers,
             aot_id=self.aot_id,
@@ -1215,6 +1373,8 @@ class AOTConfig:
         )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates that pre_dispatch is only enabled for export; raises
+        # AssertionError otherwise.
         if self.pre_dispatch:
             if not self.is_export:
                 raise AssertionError("Can only have pre_dispatch IR for export.")
@@ -1237,6 +1397,10 @@ SubclassTracingInfo = collections.namedtuple(
 
 @dataclass
 class AOTState:
+    # [CLASS DOC] Mutable state carried across AOTAutograd stages: whether autograd
+    # is needed, current fake flat args and their descriptors (periodically
+    # refreshed), forward metadata, the AOTConfig, an open ExitStack of tracing
+    # contexts (must not be exited while in use), and the fake tensor mode.
     """
     When we run AOTAutograd, this class encapsulates the state in the compiler which
     must be preserved across stages.  This is state in the traditional sense (not an
@@ -1300,6 +1464,11 @@ FxValue = Tensor | int | SymInt | BackwardState | CustomClassBase
 
 
 class CompilerWrapper:
+    # [CLASS DOC] Base class (identity behavior) for composable calling-convention
+    # transforms: pre_compile rewrites the function, args and metadata before
+    # tracing; post_compile wraps the compiled function so it matches the original
+    # calling convention. Wrappers are not serialized; they are reapplied after
+    # cache load. Subclasses override the two methods.
     """
     AOTAutograd needs to do many transformations to the calling convention of the user function
     it is tracing, e.g., deduplicating inputs, unpacking subclasses, etc.  CompilerWrapper lets
@@ -1335,6 +1504,8 @@ class CompilerWrapper:
         *,
         fw_metadata: ViewAndMutationMeta,
     ) -> tuple[TraceFn, list[FxValue], list[AOTInput], ViewAndMutationMeta]:
+        # [FUNCTION DOC] Default prologue: returns the function, args, descriptors and
+        # metadata unchanged (no side effects). Subclasses transform them.
         """
         Process the inputs to the compiler_fn. You can pass in extra metadata via kwargs.
         Args:
@@ -1352,6 +1523,7 @@ class CompilerWrapper:
         *,
         runtime_metadata: ViewAndMutationMeta,
     ) -> Callable[_P, _R]:
+        # [FUNCTION DOC] Default epilogue: returns the compiled function unchanged.
         """
         Given an output of the compiler, wrap it with information received from prologue.
         Args:
@@ -1370,6 +1542,10 @@ class CompilerWrapper:
 
 
 class InductorWrapper:
+    # [CLASS DOC] Base class like CompilerWrapper but for transforms applied to the
+    # partitioned FX graph just before Inductor compilation: pre_compile may modify
+    # the graph module / flat args in place (default does nothing); post_compile
+    # wraps the Inductor-compiled function (default returns it unchanged).
     """
     This is sort of like CompilerWrapper, but it happens at a different part of the lifecycle:
     it talks about transformations we do to the traced and partitioned FX graph before we
@@ -1396,6 +1572,7 @@ class InductorWrapper:
         *,
         fw_metadata: ViewAndMutationMeta,
     ) -> None:
+        # [FUNCTION DOC] Default prologue hook: does nothing and returns None.
         """
         Process the inputs to the compiler_fn. You can pass in extra metadata via kwargs.
         Args:
@@ -1413,6 +1590,7 @@ class InductorWrapper:
         *,
         runtime_metadata: ViewAndMutationMeta,
     ) -> Callable[_P, _R]:
+        # [FUNCTION DOC] Default epilogue: returns the compiled function unchanged.
         """
         Given an output of the compiler, wrap it with information received from prologue.
         Args:
@@ -1432,6 +1610,10 @@ class InductorWrapper:
 
 @dataclass
 class AOTGraphCapture:  # Produced by aot_stage1_graph_capture
+    # [CLASS DOC] Output of the graph-capture stage: the compiler wrappers applied
+    # (needed to enter/exit them at call time), the captured FX graph module, the
+    # updated flat args and descriptors (primals and tangents tuple for autograd,
+    # plain list otherwise) and optional subclass metadata.
     # AOTAutograd typically operates by taking complicated graphs and
     # desugaring them into simpler graphs that use PyTorch features.  These
     # wrappers establish invariants so that when we actually do tracing we can
@@ -1466,6 +1648,8 @@ TOutputCode = TypeVar("TOutputCode", bound="OutputCode")
 
 
 class AOTDispatchCompiler(Protocol):
+    # [CLASS DOC] Protocol for a forward/backward compiler: callable taking a graph
+    # module and example inputs and returning a compiled result.
     """
     Represents a fw or bw_compiler passed to AOTAutograd.
     """
@@ -1479,6 +1663,9 @@ class AOTDispatchCompiler(Protocol):
 
 # TODO: bikeshed on this name
 class SerializableAOTDispatchCompiler(AOTDispatchCompiler):
+    # [CLASS DOC] Compiler wrapper holding an OutputCode type and a compiler function
+    # that returns that OutputCode, making results cacheable. Calling it runs the
+    # function and returns the OutputCode.
     """
     Represents an AOTDispatchCompiler that returns an OutputCode, and is
     therefore cacheable. SerializableAOTDispatchCompiler always return an OutputCode.
@@ -1491,6 +1678,8 @@ class SerializableAOTDispatchCompiler(AOTDispatchCompiler):
         output_code_ty: type[TOutputCode],
         compiler_fn: Callable[[torch.fx.GraphModule, Sequence[InputType]], TOutputCode],
     ) -> None:
+        # [FUNCTION DOC] Stores the OutputCode type and the compiler function as
+        # attributes. No validation.
         # pyrefly: ignore [invalid-type-var]
         self.output_code_ty = output_code_ty
         # pyrefly: ignore [invalid-type-var]
@@ -1501,19 +1690,27 @@ class SerializableAOTDispatchCompiler(AOTDispatchCompiler):
         gm: torch.fx.GraphModule,
         example_inputs: Sequence[InputType],
     ) -> OutputCode:
+        # [FUNCTION DOC] Invokes the wrapped compiler function on the graph module and
+        # example inputs and returns its OutputCode result.
         output_code = self.compiler_fn(gm, example_inputs)
         return output_code
 
 
 class FlatFn(Protocol):
+    # [CLASS DOC] Protocol: callable taking flat values and returning a flat list of
+    # output values.
     def __call__(self, *args: FxValue) -> list[FxValue]: ...
 
 
 class TraceFn(Protocol):
+    # [CLASS DOC] Protocol: callable taking flat values and returning the flat output
+    # values together with their output descriptors.
     def __call__(self, *args: FxValue) -> tuple[list[FxValue], list[AOTOutput]]: ...
 
 
 class PreppedForAutogradTraceFn(Protocol):
+    # [CLASS DOC] Protocol: trace function prepared for autograd; returns the outputs
+    # plus a list of booleans (per-output flags) and their output descriptors.
     def __call__(
         self,
         *args: FxValue,
@@ -1521,6 +1718,9 @@ class PreppedForAutogradTraceFn(Protocol):
 
 
 class JointTraceFn(Protocol):
+    # [CLASS DOC] Protocol for a joint forward-backward trace function: carries a
+    # JointFnHandle attribute and is called with primals and tangents, returning
+    # (outputs, gradients which may be None) and their descriptors.
     handle: JointFnHandle
 
     def __call__(
@@ -1533,6 +1733,10 @@ class JointTraceFn(Protocol):
 
 @dataclass
 class JointWithDescriptors:
+    # [CLASS DOC] Bundle returned for the joint graph with descriptors: the internal
+    # AOTState and AOTGraphCapture, ordered parameter and buffer name lists
+    # (parameters first) and the input/output pytree specs. Exposes graph_module
+    # (get/set on the captured graph), fake_mode and cache_hash.
     _aot_state: AOTState
     _aot_graph_capture: AOTGraphCapture
 
@@ -1546,17 +1750,23 @@ class JointWithDescriptors:
 
     @property
     def graph_module(self) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Property getter: returns the captured joint graph module.
         return self._aot_graph_capture.graph_module
 
     @graph_module.setter
     def graph_module(self, value: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] Property setter: replaces the captured graph module on the
+        # underlying AOTGraphCapture (mutation).
         self._aot_graph_capture.graph_module = value
 
     @property
     def fake_mode(self) -> FakeTensorMode:
+        # [FUNCTION DOC] Property: the fake tensor mode of the underlying AOTState.
         return self._aot_state.fake_mode
 
     def cache_hash(self) -> str:
+        # [FUNCTION DOC] Returns the hex SHA-256 of this object's string form, for use
+        # as a cache key (separate from display so repr changes are explicit).
         """
         Return a hash string suitable for use as a cache key. This method
         exists to decouple cache key generation from __str__/__repr__, so

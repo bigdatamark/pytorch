@@ -1,3 +1,9 @@
+# [MODULE DOC] Converts live Python metadata values (scalars, containers, dtypes,
+# devices, enums, dataclasses, view-replay recipes, opaque reduce-able objects) into
+# Python source expressions that rebuild an equal value, recording needed imports.
+# Public entry: emit_value. Also holds _REBUILD_HELPER (source lines of a helper
+# emitted into artifacts). Raises NotImplementedError for non-expressible values.
+# No import-time side effects beyond defining names (id is only shadowed for typing).
 """Reconstruct live Python values as standalone, auditable source.
 
 The composer (to_standalone_python.py) inlines AOTAutograd's runtime wrappers, which
@@ -63,6 +69,11 @@ def _emit_importable(obj: Any, imports: set[str]) -> str:
     import). Works for classes, functions, and modules. Raises if ``obj`` is not
     reachable as ``module.qualname`` (e.g. a local or lambda), since then it cannot be
     reproduced in the standalone module without embedding it."""
+    # [FUNCTION DOC] HELPER: Builds a dotted reference "module.qualname" for a class,
+    # function or module after verifying that importing the module and walking the
+    # qualname gives back the identical object. Adds an import statement to the
+    # imports set (mutation). Raises NotImplementedError if the object has no
+    # module/qualname, is local/lambda, or does not round-trip.
     import importlib
 
     module = getattr(obj, "__module__", None)
@@ -97,6 +108,10 @@ def _reject_shared_mutable(obj: Any, _seen: set[_ObjId]) -> None:
     reconstruction -- so a shared one of those still emits fine. ``_seen`` is threaded in
     place across the whole traversal (unlike the per-level in-progress cycle set), so it
     catches shared siblings, not just self-referential ancestors."""
+    # [FUNCTION DOC] HELPER: Aliasing guard. If the object identity was already
+    # recorded in the seen set, raises NotImplementedError (shared mutable object
+    # cannot be emitted as a literal); otherwise records its identity in the set
+    # (mutates _seen in place). Returns nothing.
     if id(obj) in _seen:
         raise NotImplementedError(
             f"compile_to_python cannot bake a shared mutable {type(obj).__qualname__}: "
@@ -121,6 +136,11 @@ def emit_value(obj: Any, imports: set[str]) -> str:
 
     Any import needed by the emitted expression is recorded into ``imports`` (as ``import
     module`` statements)."""
+    # [FUNCTION DOC] Public entry point. Starts a fresh traversal (empty in-progress
+    # and seen identity sets) and returns the source expression string for obj.
+    # Side effect: adds required import statements to the imports set.
+    # Raises NotImplementedError for live tensors/storages, lambdas, symbolic
+    # values, self-referential or shared-mutable structures, and unsupported reduces.
     return _emit_value(obj, imports, set(), set())
 
 
@@ -140,6 +160,17 @@ def _emit_value(
     emitted anywhere in this traversal (threaded in place, like ``imports``): revisiting
     one means the same mutable object is shared across positions, whose aliasing a flat
     literal cannot preserve, so we raise (see ``_reject_shared_mutable``)."""
+    # [FUNCTION DOC] HELPER: Recursive core of emit_value. Dispatches on the value's
+    # kind in order: reject live tensors/storages; non-finite floats/complex; exact
+    # builtin scalars and bytearray (repr); cycle and shared-mutable guards; torch
+    # dtype/layout/memory_format/device/Size; concrete Sym scalars (symbolic ones
+    # raise); importable types/functions/modules; enums (by member name or Flag
+    # value); functools.partial; view-replay recipes; namedtuple/tuple/list/set/
+    # frozenset (sorted by emitted text)/dict; dataclasses (must round-trip via
+    # init fields); otherwise falls back to _emit_via_reduce. Returns source text,
+    # mutates imports and the seen set; raises NotImplementedError when unsupported.
+    # The inner _emit_value shadow just forwards to the module-level recursion with
+    # the current path set including this object.
     import dataclasses
     import enum
     import functools
@@ -229,6 +260,9 @@ def _emit_value(
     _child = _in_progress | {id(obj)}
 
     def _emit_value(obj: Any, imports: set[str]) -> str:
+        # [FUNCTION DOC] HELPER: Closure that recurses into a child value using the
+        # enclosing call's path set (with the parent added) and the shared seen set;
+        # returns the child's source expression.
         # Shadow the module-level recursion entry point so every recursive call in
         # this function body automatically threads the current in-progress set (with
         # the parent ``obj`` added) plus the traversal-wide seen set, without touching
@@ -439,6 +473,13 @@ def _emit_via_reduce(
     the reduce state -- so there is no ``pickle.loads`` at exec time and the bytes
     are readable. The reduce state recurses back through ``_emit_value``, so any
     non-source-expressible leaf inside it still raises."""
+    # [FUNCTION DOC] HELPER: Fallback emitter using the pickle reduce protocol
+    # (reduce_ex with protocol 2) but producing source text. Applies the shared
+    # mutable guard, then validates the reduce tuple (needs a tuple with tuple args;
+    # rejects the storage-bytes loader, list/dict items, and a protocol-5 state
+    # setter). Builds a constructor call (via __new__ for the newobj forms, else
+    # callable applied to args) and wraps it in a _rebuild call when state exists.
+    # Returns source text; raises NotImplementedError for any unsupported form.
     import copyreg
 
     import torch
@@ -449,6 +490,8 @@ def _emit_via_reduce(
     _reject_shared_mutable(obj, _seen)
 
     def _emit_value(obj: Any, imports: set[str]) -> str:
+        # [FUNCTION DOC] HELPER: Closure recursing into reduce-state members with the
+        # enclosing path and seen sets; returns the member's source expression.
         # Continue threading the cycle guard + seen set through the reduce-state recursion.
         return _emit_value_recurse(obj, imports, _in_progress, _seen)
 
