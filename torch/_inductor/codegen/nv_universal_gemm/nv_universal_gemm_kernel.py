@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Code generation and runtime helpers for the NVGEMM backend. Contains
+# (a) runtime helpers imported by generated wrapper modules: compile with disk-cache
+# fallback, build cutlass GEMM argument objects, kernel lookup, cache keys, EFC
+# artifact wrap/unwrap, reuse of cached args across launches, the run and precompile
+# entry points; (b) subprocess precompile worker support, including temporary patching
+# of max-active-cluster queries; (c) NVUniversalGemmKernel, which renders the generated
+# Python wrapper source and emits the kernel call into the Inductor wrapper code.
+# Import-time side effects: creates a module logger only; cutlass is imported lazily.
 """
 NVIDIA Universal GEMM kernel code generation.
 
@@ -46,6 +54,8 @@ log = logging.getLogger(__name__)
 
 
 def _current_target_sm(dev_idx: int):
+    # [FUNCTION DOC] HELPER: Queries the CUDA compute capability of device dev_idx
+    # and returns a cutlass TargetSm for it (major*10 + minor).
     """TargetSm for the current CUDA device, used to stamp disk-cached artifacts."""
     from cutlass.operators.arch import TargetSm
 
@@ -64,6 +74,9 @@ def _make_disk_config_key(
     swizzle_type_a: Any | None = None,
     swizzle_type_b: Any | None = None,
 ) -> tuple:
+    # [FUNCTION DOC] HELPER: Builds the disk-cache config key: a tuple of the
+    # kernel name, variant name and string forms of the accumulator, scale and
+    # swizzle types.
     return (
         kernel_name,
         variant_name,
@@ -90,6 +103,11 @@ def _compile_nvgemm(
     cc: int | None = None,
     base_kernel=None,
 ):
+    # [FUNCTION DOC] Builds GEMM arguments, resolves the kernel (kernel_obj if given,
+    # else a lookup by name using base_kernel/epilogue/cc), then asks fallback_fn
+    # for a prebuilt artifact and compiles only if none is returned. Returns
+    # (artifact, args, kernel, was_compiled). Raises RuntimeError if the kernel is
+    # not found and NotImplementedError for unsupported variants.
     """Compile an NVGEMM artifact, trying a fallback (disk cache) first.
 
     Thread safety is handled at the dispatch layer: autotuning precompile
@@ -139,6 +157,9 @@ def _compile_nvgemm(
 
 
 class CUDAContextMetadata:
+    # [CLASS DOC] Immutable-by-convention (slotted) bundle of CUDA facts computed in
+    # the main process for subprocess workers: max_active_clusters (may be None) and
+    # the device capability (major, minor) tuple. Built via from_kernel.
     """CUDA device metadata that subprocess workers can't query on their own.
 
     Subprocess compile workers don't have CUDA initialized (and can't due to
@@ -152,11 +173,16 @@ class CUDAContextMetadata:
         max_active_clusters: int | None,
         device_capability: tuple[int, int],
     ):
+        # [FUNCTION DOC] Stores the max active clusters value and device capability.
         self.max_active_clusters = max_active_clusters
         self.device_capability = device_capability
 
     @staticmethod
     def from_kernel(kernel, device) -> CUDAContextMetadata:
+        # [FUNCTION DOC] Static factory. If the kernel implementation exposes a
+        # cluster shape, queries the max active clusters for it (failures are logged
+        # as warnings and leave None); reads the device capability and returns the
+        # metadata object. Requires CUDA in the calling process.
         """Build from a cutlass.operators Kernel and torch device in the main process."""
         import torch
 
@@ -178,6 +204,10 @@ class CUDAContextMetadata:
 
 
 def _patch_max_active_clusters(max_active_clusters):
+    # [FUNCTION DOC] HELPER: Replaces get_max_active_clusters in every importable
+    # module listed in the module list (that defines it) with a function returning
+    # the given constant. Mutates those modules (global side effect) and returns a
+    # list of (module, original function) pairs for restoration.
     """Patch get_max_active_clusters in all CuTeDSL modules.
 
     Returns a list of (module, original_fn) pairs for restoration.
@@ -187,6 +217,8 @@ def _patch_max_active_clusters(max_active_clusters):
     patched = []
 
     def mac_fn(*a, **kw):
+        # [FUNCTION DOC] HELPER: Ignores its arguments and returns the captured
+        # max active clusters value.
         return max_active_clusters
 
     for mod_name in _MAX_ACTIVE_CLUSTERS_MODULES:
@@ -201,6 +233,8 @@ def _patch_max_active_clusters(max_active_clusters):
 
 
 def _restore_max_active_clusters(patched):
+    # [FUNCTION DOC] HELPER: Puts back each original function recorded by the patch
+    # helper into its module. No return value.
     """Undo _patch_max_active_clusters."""
     for m, orig in patched:
         m.get_max_active_clusters = orig  # pyrefly: ignore [missing-attribute]
@@ -222,6 +256,13 @@ def _worker_nvgemm_autotuning_precompile(
     swap_ab=False,
     metadata=None,
 ):
+    # [FUNCTION DOC] Runs in a compile subprocess. Applies the parent's env, builds
+    # fake tensors from tensor metadata, mirrors the swap_ab transpose, computes
+    # scaled-GEMM modes, and for a bias epilogue splits off the bias and builds the
+    # epilogue args. With max active clusters patched in, optionally rebuilds the
+    # operator from metadata (failure logged, falls back to lookup), compiles via
+    # _compile_nvgemm, and writes a freshly compiled artifact to the disk cache.
+    # Returns (None, elapsed microseconds). Side effects: env/caches, disk writes.
     """Subprocess worker: compile one NVGEMM kernel and save to disk cache.
 
     Called from AsyncCompile.nvgemm_precompile() in a subprocess worker
@@ -381,7 +422,10 @@ def _get_scaled_gemm_modes(
     scale_type_b: Any | None,
     swizzle_type_b: Any | None,
 ) -> tuple[Any, Any, Any, Any]:
-    scale_mode_a, swizzle_mode_a = to_cutlass_scale_mode(scale_type_a, swizzle_type_a)
+    # [FUNCTION DOC] HELPER: Converts Inductor scale/swizzle types for A and B into
+    # cutlass scale and swizzle modes; returns the four modes (A scale, A swizzle,
+    # B scale, B swizzle). Raises NotImplementedError if any is unsupported.
+    scale_mode_a, swizzle_mode_a =to_cutlass_scale_mode(scale_type_a, swizzle_type_a)
     scale_mode_b, swizzle_mode_b = to_cutlass_scale_mode(scale_type_b, swizzle_type_b)
     if any(
         mode is None
@@ -409,6 +453,12 @@ def _create_gemm_arguments(
     local_reduce_source: str = "identity",
     local_reduce_feeds_main: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Builds the cutlass argument object for a variant name:
+    # grouped (A, B, offsets), scaled (operands wrapped with scales and modes) or
+    # dense GEMM, with accumulator type and optional epilogue. For scaled/dense,
+    # optionally attaches local-reduction fields. Raises NotImplementedError for
+    # local reductions on non-scaled variants or with a bad axis (not 0 or 1) or
+    # group (not above 1), for an epilogue on grouped GEMM, and for unknown variants.
     import cutlass.operators
 
     has_local_reduce = local_reduce_out is not None or local_reduce_feeds_main
@@ -424,6 +474,9 @@ def _create_gemm_arguments(
         )
 
     def with_local_reduce(args):
+        # [FUNCTION DOC] HELPER: If local reduction is requested, sets the reduction
+        # output wrapper, group, axis, type, source and feeds-main attributes on the
+        # args object (mutation); returns the args either way.
         if not has_local_reduce:
             return args
         from cutlass.operators.utils.tensor import TensorWrapper
@@ -494,6 +547,11 @@ def _lookup_gemm_kernel(
     cc: int | None = None,
     base_kernel: Any | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Resolves the operator to use. Without epilogue: uses
+    # base_kernel, else the fast args-filtered lookup (when args and cc are given),
+    # else the full-manifest lookup. With epilogue: resolves the base kernel
+    # similarly and returns the cached epilogue-bound operator. Raises RuntimeError
+    # if nothing is found.
     from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
         get_efc_kernel_with_epilogue,
         get_kernel_by_name,
@@ -535,6 +593,7 @@ def _lookup_gemm_kernel(
 
 
 def _tensor_sig(t):
+    # [FUNCTION DOC] HELPER: Returns (shape, strides, dtype) of a tensor.
     return (t.shape, t.stride(), t.dtype)
 
 
@@ -546,7 +605,10 @@ def _create_gemm_cache_key(
     aux_tensors: tuple = (),
     epilogue_specialization: tuple = (),
 ):
-    cache_key = tuple(s for t in input_tensors for s in _tensor_sig(t))
+    # [FUNCTION DOC] HELPER: Builds a flat tuple key from the shape/stride/dtype of
+    # every input and the output. With an epilogue, appends a marker, the aux
+    # tensor signatures and the epilogue specialization tuple.
+    cache_key =tuple(s for t in input_tensors for s in _tensor_sig(t))
     cache_key = (*cache_key, *_tensor_sig(out))
 
     if has_epilogue:
@@ -556,6 +618,9 @@ def _create_gemm_cache_key(
 
 
 def _unwrap_efc_compiled_obj(compiled_obj):
+    # [FUNCTION DOC] HELPER: If the compiled object is a closure whose first
+    # captured cell is an exportable JIT function, returns that inner function;
+    # otherwise returns the object unchanged.
     """Extract the inner JIT function from an EFC closure for disk serialization."""
     if hasattr(compiled_obj, "__closure__") and compiled_obj.__closure__:
         inner = compiled_obj.__closure__[0].cell_contents
@@ -565,6 +630,10 @@ def _unwrap_efc_compiled_obj(compiled_obj):
 
 
 def _init_efc_jit(kernel, epilogue_args):
+    # [FUNCTION DOC] HELPER: Prepares an epilogue-fusion kernel's JIT without full
+    # compilation: analyzes the epilogue with the arguments' parameters (compile-time
+    # tensors for wrappers) and creates and assigns the JIT object on the kernel's
+    # inner epilogue object (mutation).
     """Lightweight EFC JIT init from epilogue args, without a full kernel.compile().
 
     EFC.compile() calls analyze_epilogue_with_arguments() then creates the JIT
@@ -584,6 +653,11 @@ def _init_efc_jit(kernel, epilogue_args):
 
 
 def _rewrap_efc_compiled_obj(compiled_fn, kernel, epilogue_args=None):
+    # [FUNCTION DOC] HELPER: Turns a disk-loaded raw compiled function into a
+    # launcher usable as an artifact for EFC kernels. Non-EFC kernels get the
+    # function back unchanged. If the EFC JIT is missing, initializes it when
+    # epilogue_args is given, else returns None (forcing recompile). The returned
+    # launcher unwraps runtime tensors from wrappers/operands and calls the function.
     """Reconstruct the EFC wrapped_launch closure from a loaded JIT function.
 
     When epilogue_args is provided and efc.jit is missing, performs a
@@ -606,6 +680,9 @@ def _rewrap_efc_compiled_obj(compiled_fn, kernel, epilogue_args=None):
     )
 
     def wrapped_launch(a_tensor, b_tensor, stream, *supplemental_args):
+        # [FUNCTION DOC] HELPER: Converts supplemental arguments to runtime
+        # tensors and calls the loaded function with unpacked arguments; returns its
+        # result.
         runtime_args = [
             e.runtime_tensor
             if isinstance(e, TensorWrapper)
@@ -624,6 +701,11 @@ def _rewrap_efc_compiled_obj(compiled_fn, kernel, epilogue_args=None):
 def _update_reuse_args_tensors(
     variant_name, args, input_tensors, out, epilogue_args, args_kwargs=None
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Mutates the cached args in place so their operand,
+    # output, epilogue and local-reduction wrappers point at this call's runtime
+    # tensors (layout assumed unchanged). Returns False without changes for grouped
+    # GEMM, True otherwise. Raises AssertionError if local reduction output exists
+    # but args_kwargs is missing.
     """Redirect the cached args at this call's runtime tensors.
 
     A cache hit on ``mem_key`` guarantees identical shapes/strides/dtypes, so
@@ -661,6 +743,11 @@ def _update_reuse_args_tensors(
 
 
 def _clear_reuse_args_tensors(variant_name, args, epilogue_args):
+    # [FUNCTION DOC] HELPER: Releases tensor references held by cached args after a
+    # launch: clears operand, output, epilogue and local-reduction runtime tensors,
+    # and replaces any real tensors in the traced epilogue example inputs with
+    # meta-device equivalents so no storage stays alive (needed for CUDA graph
+    # capture). Mutates args in place.
     """Drop the runtime tensors held by cached args after a launch.
 
     kernel.run enqueues the launch synchronously and reads the pointers during
@@ -722,6 +809,13 @@ def _nvgemm_run(
     aux_tensors: tuple = (),
     swap_ab: bool = False,
 ):
+    # [FUNCTION DOC] Runtime entry point called by generated wrappers. Optionally
+    # swaps/transposes operands and output (swap_ab). Looks up a compiled artifact in
+    # compiled_cache by (shape/stride/dtype key, device). On a hit with reusable args,
+    # redirects tensors under a lock, launches and clears. Otherwise builds args or
+    # compiles (disk cache first, writes new compiles to disk), caches the artifact,
+    # attaches the args for reuse (except grouped GEMM) and launches. Launch uses the
+    # given stream and workspace. Returns None.
     if swap_ab and len(input_tensors) >= 2:
         a, b = input_tensors[0], input_tensors[1]
         if len(input_tensors) >= 4:
@@ -799,6 +893,9 @@ def _nvgemm_run(
     else:
 
         def disk_fallback(kernel):
+            # [FUNCTION DOC] HELPER: Looks up the compiled function in the disk
+            # cache, rewraps it for EFC kernels, and returns a compiled artifact or
+            # None on a miss.
             compiled_fn = disk_cache_get(
                 disk_fn_cache,
                 module_path,
@@ -913,6 +1010,12 @@ def _nvgemm_precompile(
     variant_kwargs: dict | None = None,
     max_active_clusters: int | None = None,
 ):
+    # [FUNCTION DOC] Precompile hook invoked from generated wrappers. Returns
+    # without doing anything if max_active_clusters is unknown or the process is a bad
+    # CUDA fork. Otherwise builds fake tensors from shape/stride/dtype mappings,
+    # patches max active clusters, and (if not already in compiled_cache) compiles the
+    # base kernel, writes the artifact to disk and records it in compiled_cache.
+    # Restores the patch afterwards.
     """Precompile an NVGEMM kernel in a subprocess for parallel compilation.
 
     Precompiles only the base (non-EFC) kernel. EFC kernels produce
@@ -975,13 +1078,18 @@ def _nvgemm_precompile(
 
 
 class NVUniversalGemmKernelWrapper:
+    # [CLASS DOC] Thin holder around a loaded kernel entry function (and its source
+    # path) exposing a run method, matching the interface other kernel wrappers use.
     """Wrapper to provide .run() interface for NVIDIA Universal GEMM kernels."""
 
     def __init__(self, kernel_fn, kernel_path: str | None = None):
+        # [FUNCTION DOC] Stores the kernel function and optional source path.
         self.kernel_fn = kernel_fn
         self.kernel_path = kernel_path
 
     def run(self, *args, stream=None, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped kernel function with the given arguments
+        # and stream; returns its result.
         """Execute the NVIDIA Universal GEMM kernel."""
         return self.kernel_fn(*args, stream=stream, **kwargs)
 
@@ -995,6 +1103,9 @@ class NVUniversalGemmKernelWrapper:
 # treats any constant as an immediate). The param name is deliberately not
 # ``C`` (see _build_bias_epilogue) so a 1D bias routes to the row-broadcast impl.
 def _nvgemm_bias_add_epilogue(accum, bias):
+    # [FUNCTION DOC] HELPER: Epilogue definition for benchmarking: output is the
+    # accumulator plus the bias. Must stay a plain introspectable function without
+    # string constants because the epilogue tracer parses its source.
     D = accum + bias
     return D
 
@@ -1002,6 +1113,10 @@ def _nvgemm_bias_add_epilogue(accum, bias):
 def _build_bias_epilogue(
     bias_name: str, out_name: str
 ) -> tuple[str, list[str], list[str], dict[str, str]]:
+    # [FUNCTION DOC] HELPER: Generates source text of a bias-add epilogue function
+    # named after the bias buffer (never "C"), plus the reads list, an empty writes
+    # list and the variable-to-buffer rename mapping (bias to itself, "D" to the
+    # output buffer). Returns the four values as a tuple.
     """Build the epilogue fields for an addmm bias-add (``accum + bias``).
 
     Uses the bias buffer name as the epilogue-fn parameter, matching
@@ -1027,6 +1142,11 @@ def _compose_bias_into_epilogue(
     epilogue_var_renames: dict[str, Any],
     bias_name: str,
 ) -> tuple[str, list[str], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Rewrites a scheduler-fused epilogue source so it sees
+    # the biased accumulator: adds the bias as a second parameter if not already
+    # read, inserts a line computing the biased value, and replaces whole-word
+    # accumulator references in the body. Returns new (source, reads, renames);
+    # inputs are not mutated. Assumes the first source line is the function header.
     """Inject an addmm bias-add into a scheduler-fused epilogue.
 
     The EFC kernel's ``accum`` is the raw ``A @ B``; a fused pointwise epilogue
@@ -1055,6 +1175,12 @@ def _compose_bias_into_epilogue(
 
 
 class NVUniversalGemmKernel(Kernel):
+    # [CLASS DOC] Codegen Kernel for NVGEMM. State: input/output nodes, kernel
+    # metadata, variant, accumulator and scale/swizzle types, workspace size,
+    # epilogue source/reads/writes/renames, optional local reduction plan and swap_ab.
+    # A baked bias is converted into (or composed into) the epilogue at construction.
+    # render produces the wrapper module source; call_kernel emits the launch into
+    # Inductor wrapper code.
     """
     Kernel implementation for NVIDIA Universal GEMM.
 
@@ -1084,6 +1210,10 @@ class NVUniversalGemmKernel(Kernel):
         swap_ab: bool = False,
         bias_node: Buffer | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores configuration (defaulting epilogue lists/mapping to
+        # empty). If a bias node is given, either builds a standalone bias-add
+        # epilogue or composes the bias into the existing fused epilogue. Then
+        # assigns parameter names "in_ptr<i>" to each input node.
         super().__init__()
         self.kernel_name = kernel_name
         self.input_nodes = input_nodes
@@ -1134,6 +1264,13 @@ class NVUniversalGemmKernel(Kernel):
             self._template_input_args.append((param_name, input_node))
 
     def render(self) -> str:
+        # [FUNCTION DOC] Returns Python source for a wrapper module: imports of the
+        # runtime helpers, optional epilogue source constants, module-level state
+        # (kernel name, disk cache key, compiled and disk caches, variant kwargs,
+        # accumulator type, input names), a main function taking inputs, outputs,
+        # epilogue reads, optional workspace and stream that calls the run helper,
+        # and a precompile function that calls the precompile helper. Raises
+        # NotImplementedError for unsupported scale modes of scaled GEMM.
         """Render the Python source for the NVGEMM kernel wrapper."""
         kernel_name_str = self.kernel_metadata["kernel_name"]
         acc_dtype_str = CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(
@@ -1327,6 +1464,10 @@ class NVUniversalGemmKernel(Kernel):
         return code.getvalue()
 
     def _ordered_output_buffers(self) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns buffer names in output-pointer order: the
+        # primary output first (from the epilogue's D mapping, or the reduction's
+        # primary/output node when there are no epilogue writes), then additional
+        # epilogue writes and local-reduction auxiliary outputs without duplicates.
         """Graph-output buffer names in out_ptr order.
 
         out_ptr0 is the primary GEMM output (the epilogue's `D` store, passed as
@@ -1360,6 +1501,10 @@ class NVUniversalGemmKernel(Kernel):
         return ordered
 
     def _render_epilogue_kwargs(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the comma-separated keyword text for the
+        # epilogue arguments constructor: each epilogue variable (except the
+        # accumulator) maps to its output pointer parameter if its buffer is an
+        # output, else to the buffer name.
         """Render kwargs for the EpilogueArguments constructor.
 
         Each epilogue variable maps to either an output pointer -- the `D` store
@@ -1381,6 +1526,8 @@ class NVUniversalGemmKernel(Kernel):
         return ", ".join(kwargs_parts)
 
     def _get_reinterpret_view(self, node) -> ReinterpretView | None:
+        # [FUNCTION DOC] HELPER: Unwraps mutable boxes; if the underlying node is a
+        # view, converts it to a reinterpret view and returns it, else None.
         """Extract or convert to ReinterpretView from a node, handling all views."""
         while isinstance(node, MutableBox):
             node = node.data
@@ -1389,6 +1536,12 @@ class NVUniversalGemmKernel(Kernel):
         return None
 
     def call_kernel(self, name: str, node=None):
+        # [FUNCTION DOC] Emits the kernel launch into the graph's wrapper code.
+        # With a local reduction, un-removes and allocates the primary output buffer.
+        # Collects call arguments in order: inputs (using reinterpret views when
+        # present), output buffers, epilogue reads (falling back to graph inputs),
+        # and an uninitialized workspace if needed (allocated before and freed after
+        # the call). Side effects: writes to wrapper code and graph buffer state.
         """
         Generate the kernel call in the wrapper code.
 

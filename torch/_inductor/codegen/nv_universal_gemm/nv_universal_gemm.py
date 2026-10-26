@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Autotune-side integration of the NVIDIA Universal GEMM backend:
+# defines the GEMM variant enum, a benchmark request that compiles and times a
+# cutlass.operators kernel (with disk caching), a ChoiceCaller wrapping one kernel,
+# and the entry points that add plain, addmm (bias epilogue), grouped and scaled GEMM
+# choices to an autotune choice list. Import-time side effects: creates the
+# output_code artifact logger; cutlass itself is imported lazily inside functions.
 """
 NVIDIA Universal GEMM (NVGEMM) backend for PyTorch Inductor.
 
@@ -49,6 +55,9 @@ log = getArtifactLogger(__name__, "output_code")
 
 
 class GemmVariant(Enum):
+    # [CLASS DOC] Enumeration of the GEMM flavors the backend handles: GEMM (dense),
+    # GROUPED_GEMM (contiguous-offset grouped) and SCALED_GEMM (block/row scaled).
+    # Members carry no payload; the op_name property gives the logging/naming string.
     """
     Enum for different GEMM operation types supported by NVIDIA Universal GEMM.
     """
@@ -61,6 +70,8 @@ class GemmVariant(Enum):
 
     @property
     def op_name(self) -> str:
+        # [FUNCTION DOC] Property: returns the operation name string for this
+        # variant (grouped, scaled, or the default plain-gemm name).
         """Return the operation name for logging and naming."""
         if self == GemmVariant.GROUPED_GEMM:
             return "nv_universal_grouped_gemm"
@@ -70,6 +81,12 @@ class GemmVariant(Enum):
 
 
 class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
+    # [CLASS DOC] Benchmark request for one cutlass.operators GEMM kernel. State:
+    # the operator, accumulator type, variant, workspace size, scale/swizzle types,
+    # swap_ab and has_bias_epilogue flags, a per-request disk-function cache and the
+    # currently allocated workspace. Compiles (using a disk cache) and runs the
+    # kernel on tensors built from the recorded tensor metadata; also supports
+    # subprocess precompile.
     """Benchmark request for NVIDIA Universal GEMM kernels."""
 
     def __init__(
@@ -88,6 +105,10 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         swap_ab: bool = False,
         has_bias_epilogue: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base request (no extra args) and records
+        # the kernel, accumulator type, variant, workspace size, scale/swizzle
+        # types and the swap_ab / bias-epilogue flags; creates an empty disk
+        # function cache and no workspace.
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, ())
         self.kernel = kernel
         self.accumulator_type = accumulator_type
@@ -107,6 +128,11 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         *input_tensors: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> float:
+        # [FUNCTION DOC] Times the kernel. Ignores the passed input tensors and
+        # rebuilds all inputs (and the output if not given) from the recorded tensor
+        # metadata, builds the run function, benchmarks it (CUDA-graph based if
+        # enabled, else the device do_bench) and always cleans up the workspace.
+        # Returns the measured time as a float.
         """Benchmark the NVIDIA Universal GEMM kernel.
 
         Override the base class to always create tensors from input_tensor_meta.
@@ -135,6 +161,13 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         return res
 
     def make_run_fn(self, *input_tensors: torch.Tensor, out: torch.Tensor):
+        # [FUNCTION DOC] Compiles the kernel for the given tensors and returns a
+        # zero-argument callable that launches it on the current CUDA stream.
+        # Registers the fp4 dtype; delegates to the bias path when a bias epilogue is
+        # set. For swap_ab, transposes operands (swapping scales) and the output.
+        # For scaled GEMM computes the scale/swizzle modes. Tries the disk cache
+        # before compiling and stores freshly compiled objects to disk. Allocates a
+        # workspace tensor if needed (kept on self).
         """Create a function to run the NVIDIA Universal GEMM kernel."""
         from cutlass.operators.artifact import CompiledArtifact
 
@@ -190,6 +223,9 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         )
 
         def disk_fallback(kernel):
+            # [FUNCTION DOC] HELPER: Loads a compiled function from the disk cache,
+            # rewraps it for epilogue-fusion kernels, and returns a compiled
+            # artifact for the kernel, or None on a miss.
             compiled_fn = disk_cache_get(
                 self._disk_fn_cache,
                 kernel_name,
@@ -237,6 +273,8 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         workspace = self._workspace
 
         def run_kernel():
+            # [FUNCTION DOC] HELPER: Launches the compiled kernel on the current
+            # CUDA stream with the captured args and workspace.
             stream = torch.cuda.current_stream()
             kernel.run(
                 args,
@@ -249,6 +287,11 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         return run_kernel
 
     def _make_bias_run_fn(self, input_tensors, out):
+        # [FUNCTION DOC] HELPER: Variant of make_run_fn for the fused GEMM +
+        # bias-add epilogue. Treats the last input as the bias, builds epilogue
+        # arguments, compiles an epilogue-fusion kernel (disk cache first, then
+        # stores new compiles), allocates the workspace if needed and returns a
+        # launcher callable for the current stream.
         """Build a run fn for the fused GEMM + bias-add epilogue (addmm).
 
         Mirrors make_run_fn's disk caching but with the bias epilogue: the
@@ -281,6 +324,9 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         )
 
         def disk_fallback(kernel):
+            # [FUNCTION DOC] HELPER: Disk-cache lookup for the bias-epilogue
+            # kernel; rewraps the loaded function with the epilogue args and returns
+            # a compiled artifact, or None on a miss.
             compiled_fn = disk_cache_get(
                 self._disk_fn_cache, kernel_name, disk_config_key, cache_key, dev_idx
             )
@@ -325,6 +371,8 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         workspace = self._workspace
 
         def run_kernel():
+            # [FUNCTION DOC] HELPER: Launches the bias-epilogue kernel on the
+            # current CUDA stream.
             kernel.run(
                 args,
                 artifact,
@@ -336,16 +384,26 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         return run_kernel
 
     def precompile(self):
+        # [FUNCTION DOC] Builds tensors from metadata, compiles the kernel via
+        # make_run_fn (populating the disk cache) without running it, then releases
+        # the workspace.
         input_tensors = tuple(x.to_tensor() for x in self.input_tensor_meta)
         out = self.output_tensor_meta.to_tensor()
         self.make_run_fn(*input_tensors, out=out)
         self.cleanup_run_fn()
 
     def cleanup_run_fn(self) -> None:
+        # [FUNCTION DOC] Drops the reference to the allocated workspace tensor.
         self._workspace = None
 
 
 class NVUniversalGemmCaller(ChoiceCaller):
+    # [CLASS DOC] Autotune choice wrapping one cutlass.operators kernel. State: the
+    # kernel, accumulator type, variant, workspace size, scale/swizzle types, whether
+    # it supports epilogue fusion, swap_ab, optional baked bias node, the layout the
+    # kernel writes, a memoized output node and a benchmark request (bmreq).
+    # Key methods: benchmark, precompile, output_node (builds the IR buffer),
+    # hash_key (precompile dedup), get_make_kernel_render (codegen factory).
     """
     ChoiceCaller for NVIDIA Universal GEMM kernels.
 
@@ -372,6 +430,10 @@ class NVUniversalGemmCaller(ChoiceCaller):
         kernel_layout: Layout | None = None,
         bias_node: Buffer | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the choice: builds a description from the
+        # variant, kernel name and swap/bias flags, stores all configuration, uses
+        # kernel_layout (default: layout) as the kernel output layout, and creates
+        # the benchmark request from the input/output tensor metadata.
         super().__init__(
             name=name,
             input_nodes=input_nodes,
@@ -413,16 +475,25 @@ class NVUniversalGemmCaller(ChoiceCaller):
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a short readable name including the operator name.
         return f"NVUniversalGemmCaller({self.kernel.metadata.operator_name})"
 
     def precompile(self):
+        # [FUNCTION DOC] Delegates compilation to the benchmark request.
         self.bmreq.precompile()
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Propagates the CUDA-graph benchmarking flag to the
+        # request and returns its benchmark time for the given inputs and output.
         self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
         return self.bmreq.benchmark(*args, out=out)
 
     def output_node(self) -> TensorBox:
+        # [FUNCTION DOC] Returns the IR TensorBox for this choice, wrapping an
+        # NVUniversalGemmBuffer built from the caller's configuration (the original
+        # output layout, even for swap_ab). Memoized: a cached node is reused only if
+        # its buffer name is still registered in the graph, otherwise it is rebuilt.
+        # Copies the "ktc" annotation if present. Registers a buffer in the graph.
         from torch._inductor.ir import NVUniversalGemmBuffer
 
         # Without memoization, each call registers a new buffer (via
@@ -467,12 +538,17 @@ class NVUniversalGemmCaller(ChoiceCaller):
         return self._cached_output_node
 
     def call_name(self) -> str:
+        # [FUNCTION DOC] Returns the choice's name.
         return self.name
 
     def to_callable(self):
+        # [FUNCTION DOC] Returns the benchmark request's run-function factory.
         return self.bmreq.make_run_fn
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Returns an underscore-joined string of variant op name,
+        # operator name, accumulator, scale and swizzle types and a swap marker; used
+        # as the precompile dedup key. Does not include the bias flag.
         # `select_algorithm` uses this as a precompile dedup key. Two callers
         # wrapping the same physical kernel name but with different accumulator/
         # scale/swizzle types produce distinct compiled artifacts; collapsing
@@ -492,6 +568,8 @@ class NVUniversalGemmCaller(ChoiceCaller):
         )
 
     def info_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a mapping with the choice name, backend (variant op
+        # name) and kernel name, plus a swap_ab entry when swap_ab is set.
         info = {
             "name": self.name,
             "backend": self.variant.op_name,
@@ -502,6 +580,10 @@ class NVUniversalGemmCaller(ChoiceCaller):
         return info
 
     def get_make_kernel_render(self):
+        # [FUNCTION DOC] Returns a factory that, given an output node and optional
+        # fused-epilogue data (code, reads, writes, renames, local reduction), creates
+        # an NVUniversalGemmKernel and a render callable for it. Configuration is
+        # captured from this caller at call time.
         from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
             NVUniversalGemmKernel,
         )
@@ -531,6 +613,10 @@ class NVUniversalGemmCaller(ChoiceCaller):
             epilogue_var_renames=None,
             local_reduce=None,
         ):
+            # [FUNCTION DOC] HELPER: Unwraps input nodes to their underlying
+            # buffers, splits off the trailing bias node when a bias is baked in,
+            # builds the kernel codegen object with a placeholder kernel name and
+            # returns (kernel, render callable).
             from torch._inductor.ir import StorageBox, TensorBox
 
             processed_inputs = []
@@ -574,6 +660,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
             )
 
             def render():
+                # [FUNCTION DOC] HELPER: Renders the kernel source text.
                 return render_kernel.render()
 
             return render_kernel, render
@@ -584,6 +671,9 @@ class NVUniversalGemmCaller(ChoiceCaller):
 def _create_dummy_tensor_from_layout(
     layout: Layout, dtype_override: torch.dtype | None = None
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] HELPER: Makes an example fake tensor from a layout, viewed as
+    # dtype_override if that differs. Returns None on any failure so the candidate
+    # is skipped rather than aborting autotune.
     """
     Create a FakeTensor from a Layout for kernel filtering.
 
@@ -608,6 +698,9 @@ _TILE_RE = re.compile(r"tile(\d+)x\d+x\d+")
 
 
 def _include_efc_kernels_only(metadata) -> bool:
+    # [FUNCTION DOC] HELPER: Predicate on operator metadata: True only for
+    # epilogue-fusion-capable classes whose name encodes a tile M of at least 128.
+    # Raises RuntimeError if an EFC operator name lacks the tile pattern.
     """Filter to include only EFC (Epilogue Fusion Compatible) kernels.
 
     Excludes tile_M=64 EFC kernels: cutlass.operators has a broadcast bug in the
@@ -633,6 +726,7 @@ def _include_efc_kernels_only(metadata) -> bool:
 
 
 def _exclude_efc_kernels(metadata) -> bool:
+    # [FUNCTION DOC] HELPER: True if the operator class is not an EFC class.
     """Filter to exclude EFC kernels (for non-epilogue cases)."""
     return "EFC" not in metadata.operator_class.__name__
 
@@ -652,6 +746,14 @@ def _add_nv_gemm_choices_impl(
     kernel_layout: Layout | None = None,
     bias_node: Buffer | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Core routine that appends NVGEMM choices to the list
+    # in place. Builds fake tensors from the input/output layouts (transposing for
+    # swap_ab), builds cutlass GEMM args (returns silently on unsupported scale
+    # modes, failed dummies or unknown CUDA arch), partitions compatible operators
+    # into non-EFC and EFC buckets (dropping small-tile EFC), clears EFC buckets when
+    # epilogue fusion is off or swap_ab, clears non-EFC when a bias is baked in,
+    # trims by heuristics (dense/scaled with mm_inputs) or a prefix cap, then creates
+    # one caller per kernel, skipping those whose construction raises.
     """
     Unified implementation for adding NVIDIA Universal GEMM choices.
 
@@ -744,6 +846,8 @@ def _add_nv_gemm_choices_impl(
     # form below called `kernel.supports(args)` once per bucket -- i.e. twice
     # per non-EFC-class kernel -- across the full cache.
     def _classify(metadata) -> int:
+        # [FUNCTION DOC] HELPER: Maps operator metadata to a bucket: 1 for EFC with
+        # tile M >= 128, 0 for non-EFC, -1 (drop) otherwise.
         if _include_efc_kernels_only(metadata):
             return 1  # efc bucket (with tile_M >= 128)
         if _exclude_efc_kernels(metadata):
@@ -847,6 +951,9 @@ def add_nv_universal_gemm_choices(
     inputs: MMKernelInputs,
     accumulator_type: torch.dtype | None = None,
 ) -> None:
+    # [FUNCTION DOC] Adds dense NVGEMM choices for the matmul inputs to choices
+    # (no-op if the backend is unavailable). Also adds swap_ab choices, ranked on
+    # the transposed problem, when configured and the output is 2D.
     """
     Add NVIDIA Universal GEMM kernels to the autotune choices.
 
@@ -907,6 +1014,10 @@ def add_nv_universal_addmm_choices(
     beta: float | int = 1,
     accumulator_type: torch.dtype | None = None,
 ) -> None:
+    # [FUNCTION DOC] Adds addmm choices using a baked bias-add epilogue. Returns
+    # without adding anything if the backend is unavailable, epilogue fusion is off,
+    # alpha or beta is not 1, the bias rank is not 1 or 2, or its last dim is not
+    # statically equal to N.
     """Add NVGEMM addmm choices: ``bias + mat1 @ mat2`` via an EFC bias-add
     epilogue.
 
@@ -954,6 +1065,8 @@ def add_nv_universal_grouped_gemm_choices(
     input_nodes: list[Buffer],
     accumulator_type: torch.dtype | None = None,
 ) -> None:
+    # [FUNCTION DOC] Adds grouped GEMM choices (inputs: stacked A, per-group B,
+    # offsets) to choices; no-op if the backend is unavailable.
     """
     Add NVIDIA Universal Grouped GEMM kernels to the autotune choices.
 
@@ -987,6 +1100,11 @@ def add_nv_universal_scaled_gemm_choices(
     accumulator_type: torch.dtype | None = None,
     kernel_inputs: MMKernelInputs | None = None,
 ) -> None:
+    # [FUNCTION DOC] Adds scaled GEMM choices from inputs (A, B, scale A, scale B).
+    # Infers scale and swizzle types for each operand; returns without adding if the
+    # backend is missing, fewer than 4 inputs, or a scale type is unsupported. Then
+    # optionally adds swap_ab choices with swapped operands and scales, unranked
+    # by heuristics.
     """
     Add NVIDIA Universal Scaled GEMM (FP8) kernels to the autotune choices.
 

@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Process-global caches of cutlass.operators GEMM operators for the
+# NVGEMM backend. Holds (a) a lazily built full manifest (operator name -> operator),
+# (b) an incrementally filled operator-by-name cache fed by args-filtered queries,
+# (c) a memoized partition of compatible operators per GEMM signature, and (d) a cache
+# of epilogue-fusion (EFC) operators bound to a specific epilogue. Public entry points:
+# partition_compatible_kernels, get_kernel_by_name, get_kernel_by_name_via_args,
+# get_efc_kernel_with_epilogue, ensure_cache_initialized, clear_cache.
+# Import-time side effects: creates the module locks/caches and registers a wrapper with
+# clear_on_fresh_cache so clear_cache runs whenever inductor caches are reset.
 """
 Global kernel cache for NVIDIA Universal GEMM.
 
@@ -25,6 +34,9 @@ log = logging.getLogger(__name__)
 
 @functools.cache
 def _device_target(cc: int) -> Any:
+    # [FUNCTION DOC] HELPER: Memoized conversion of an integer compute capability
+    # into a cutlass TargetSm for the arch-specific ("a" suffixed) target. Imports
+    # cutlass lazily; raises if cutlass is not installed or the target is invalid.
     """The CUDA arch target for this device (e.g. cc=100 -> TargetSm '100a').
 
     Used to reject kernels whose `supported_targets` don't cover this device.
@@ -38,6 +50,10 @@ def _device_target(cc: int) -> Any:
 
 
 def _epilogue_args_signature(epilogue_args: Any) -> tuple:
+    # [FUNCTION DOC] HELPER: Builds a hashable cache-key component from the
+    # epilogue arguments' tensors: for each named tensor, (name, "tensor", dtype,
+    # shape, strides); for non-tensors, (name, type name). Returns an empty tuple
+    # when there are no epilogue args or no tensors. Pure, no side effects.
     """Extract a hashable signature of epilogue args for cache keying.
 
     Two callers with the same `(efc_kernel_name, epilogue_source)` but
@@ -75,6 +91,9 @@ _kernel_by_name_cache: dict[str, Any] | None = None
 
 
 def _operand_dtype_str(operand: Any) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the string form of an operand's dtype, looking
+    # first at the operand itself and then at its wrapped tensor attribute; returns
+    # None if no dtype can be found. Pure.
     """Best-effort cutlass dtype name for a kernel operand or args operand."""
     dtype = getattr(operand, "dtype", None)
     if dtype is None:
@@ -84,6 +103,11 @@ def _operand_dtype_str(operand: Any) -> str | None:
 
 
 def _build_kernel_cache() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the full manifest mapping operator name to
+    # operator object by enumerating every cutlass operator (slow, seconds to
+    # tens of seconds). First tries to import the vendored cutedsl wrapper module
+    # so its operators get registered (an import failure is only logged). Returns
+    # the new mapping; does not store it globally.
     """Build the full kernel name -> kernel manifest (fallback path only)."""
     import cutlass.operators
 
@@ -103,6 +127,9 @@ def _build_kernel_cache() -> dict[str, Any]:
 
 
 def _ensure_caches() -> None:
+    # [FUNCTION DOC] HELPER: Lazily builds the global full-manifest cache using
+    # double-checked locking on the reentrant cache lock. Mutates the module
+    # global manifest; no return value.
     global _kernel_by_name_cache
     if _kernel_by_name_cache is None:
         with _cache_lock:
@@ -111,6 +138,9 @@ def _ensure_caches() -> None:
 
 
 def _get_kernel_cache() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the full manifest mapping, building it first
+    # if needed. Takes a local snapshot of the global so a concurrent clear cannot
+    # invalidate it. Raises AssertionError if the cache is still missing.
     """Return the fallback manifest, building it lazily if needed.
 
     Snapshot to local frame: a concurrent clear_cache() rebinding the global to
@@ -124,6 +154,12 @@ def _get_kernel_cache() -> dict[str, Any]:
 
 
 def _operand_sig(operand: Any) -> tuple | None:
+    # [FUNCTION DOC] HELPER: Builds a hashable signature for a GEMM operand:
+    # (dtype string, shape tuple, stride tuple, recursive signature of its scale
+    # operand, scale mode name, swizzle mode name). The mode/swizzle are read from
+    # the instance attribute dictionary (so dense tensors' methods are not picked up)
+    # and reduced to enum names since the enums are unhashable. Returns None if the
+    # operand is None or dtype/shape/stride cannot be determined.
     """Hashable (dtype, shape, stride, scale-sig, mode, swizzle) signature."""
     if operand is None:
         return None
@@ -150,6 +186,13 @@ def _operand_sig(operand: Any) -> tuple | None:
 
 
 def _partition_sig(args: Any) -> tuple | None:
+    # [FUNCTION DOC] HELPER: Combines the signatures of operands A, B and out plus
+    # the accumulator type into one hashable key identifying everything operator
+    # support checks depend on. Returns None if any operand signature is unavailable.
+    # KNOWN ISSUE: for a dense torch tensor operand, shape/stride are read via
+    # getattr and the stride method itself (not its result) is passed to the tuple
+    # conversion, which would raise a TypeError; this appears to work only for
+    # cutlass wrapper operands whose stride is a sequence attribute.
     """Signature capturing everything `supports(args)` depends on, or None if
     it can't be fully determined (falls back to a non-memoized scan)."""
     a = _operand_sig(getattr(args, "A", None))
@@ -182,6 +225,10 @@ _partition_cache: dict[tuple, list[list[Any]]] = {}
 
 
 def _args_query_candidates(args: Any, cc: int, efc_only: bool) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Asks cutlass for operators compatible with the given
+    # runtime arguments on the arch-specific target for cc, optionally restricted
+    # by a metadata filter to epilogue-fusion-capable (EFC) operator classes
+    # (class name contains "EFC"). Returns the list of operators. Dense GEMM only.
     """Compatible operators via an args-filtered get_operators query (~0.05s).
 
     cutlass prunes by supports(args) and the device target internally. Only
@@ -199,6 +246,11 @@ def _args_query_candidates(args: Any, cc: int, efc_only: bool) -> list[Any]:
 
 
 def _filter_supported(kernels: Any, args: Any, cc: int) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Filters an iterable of operators down to those usable
+    # for args on device cc. Skips operators needing a higher min compute capability,
+    # whose A/B operand dtypes differ from the args, whose supported targets do not
+    # cover the device target, or whose support check reports an error. Returns the
+    # kept operators in input order.
     """Keep the kernels that support `args` on this device.
 
     Prunes by (A, B) operand dtype first (a cheap string compare) so the
@@ -227,6 +279,9 @@ def _filter_supported(kernels: Any, args: Any, cc: int) -> list[Any]:
 
 
 def _manifest_candidates(args: Any, cc: int, efc_only: bool) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Fallback candidate search: scans the full manifest
+    # (building it if necessary, which is slow), optionally keeping only EFC
+    # operator classes, then applies the support filter. Returns the list.
     """Compatible operators via a full-manifest scan (last-resort fallback)."""
     kernels = _get_kernel_cache().values()
     if efc_only:
@@ -239,6 +294,10 @@ def _manifest_candidates(args: Any, cc: int, efc_only: bool) -> list[Any]:
 
 
 def _blockscaled_provider_classes() -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the operator classes that generate
+    # block-scaled GEMM operators: the cutlass built-in persistent block-scaled
+    # operator and the vendored one, each included only if its import succeeds
+    # (ImportError is swallowed). May return an empty list.
     """The operator classes that produce block-scaled (fp4/fp8) kernels.
 
     Both the cutlass built-in and the vendored provider matter: for NVFP4 the
@@ -267,6 +326,9 @@ def _blockscaled_provider_classes() -> list[Any]:
 
 @functools.cache
 def _blockscaled_operators() -> tuple:
+    # [FUNCTION DOC] HELPER: Memoized. Generates, without a concrete target or
+    # args, the complete block-scaled operator pool from every provider class and
+    # returns it as a tuple. Cleared by clear_cache.
     """Generate the architecture-neutral block-scaled operator pool."""
     ops: list[Any] = []
     for cls in _blockscaled_provider_classes():
@@ -275,7 +337,12 @@ def _blockscaled_operators() -> tuple:
 
 
 def _scaled_operand_type_signature(args: Any) -> tuple:
+    # [FUNCTION DOC] HELPER: Summarizes the operand type recipe of scaled GEMM
+    # runtime args as a hashable tuple: per-operand (dtype, scale dtype, scale mode,
+    # swizzle mode) for A and B, the output dtype and the accumulator type.
     def operand_signature(operand: Any) -> tuple:
+        # [FUNCTION DOC] HELPER: Returns (operand dtype, scale dtype, scale mode
+        # string, swizzle string) for one operand; missing parts become None strings.
         scale = getattr(operand, "scale", None)
         return (
             _operand_dtype_str(operand),
@@ -293,9 +360,14 @@ def _scaled_operand_type_signature(args: Any) -> tuple:
 
 
 def _scaled_metadata_type_signature(metadata: Any) -> tuple:
+    # [FUNCTION DOC] HELPER: Same type-recipe signature as the args-based variant
+    # but computed from an operator's metadata operands, so operators can be matched
+    # against scaled GEMM args by equality.
     operands = metadata.operands
 
     def operand_signature(operand: Any) -> tuple:
+        # [FUNCTION DOC] HELPER: Returns (operand dtype, scale dtype, scale mode
+        # string, swizzle string) for one metadata operand.
         scale = getattr(operand, "scale", None)
         return (
             _operand_dtype_str(operand),
@@ -314,6 +386,10 @@ def _scaled_metadata_type_signature(metadata: Any) -> tuple:
 
 @functools.cache
 def _blockscaled_manifest(cc: int, type_signature: tuple):
+    # [FUNCTION DOC] HELPER: Memoized per (cc, type signature). Builds a cutlass
+    # Manifest containing only the block-scaled pool operators whose metadata type
+    # signature equals the requested one. Note cc does not affect the content (it
+    # only keys the cache); target/shape filtering happens at query time.
     """Build a block-scaled manifest for one operand type recipe.
 
     The provider set is generated without a concrete target to preserve its
@@ -334,6 +410,12 @@ def _blockscaled_manifest(cc: int, type_signature: tuple):
 
 
 def _scaled_candidates(args: Any, cc: int, efc_only: bool) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Finds operators for a scaled GEMM by filtering the
+    # block-scaled manifest for the args' type recipe and target. For each resulting
+    # vendored non-EFC operator it synthesizes a matching EFC operator (renamed,
+    # with the EFC class). Returns only the EFC ones if efc_only, else originals plus
+    # synthesized EFC ones; if no EFC variants exist, returns originals unless
+    # efc_only. Falls back to the full-manifest scan when nothing matches.
     """Compatible operators for a scaled GEMM via direct block-scaled enumeration.
 
     get_operators(args=...) derives operand configs from the args and
@@ -384,6 +466,13 @@ def partition_compatible_kernels(
     candidate_source: Literal["args", "scaled", "manifest"] = "manifest",
     classifier_key: str | None = None,
 ) -> list[list[Any]]:
+    # [FUNCTION DOC] Splits the operators compatible with args on device cc into
+    # num_buckets lists using classifier (metadata -> bucket index, or negative to
+    # drop). candidate_source picks the search strategy (args query, scaled
+    # enumeration, or full manifest); any other value raises ValueError. Registers
+    # every candidate in the by-name operator cache (side effect). Results are
+    # memoized when both a signature and classifier_key are available; returns fresh
+    # list copies so callers may mutate them.
     """Partition the operators compatible with `args` into N buckets.
 
     `classifier(metadata)` returns a bucket index in [0, num_buckets-1] or -1 to
@@ -436,6 +525,9 @@ def partition_compatible_kernels(
 
 
 def get_kernel_by_name(kernel_name: str) -> Any:
+    # [FUNCTION DOC] Looks up an operator by name, first in the incrementally
+    # filled by-name cache, then in the full manifest (which may trigger the slow
+    # build). Returns the operator or None if unknown.
     """Get a kernel by name.
 
     Checks the incrementally-populated operator cache first (filled by the
@@ -449,6 +541,11 @@ def get_kernel_by_name(kernel_name: str) -> Any:
 
 
 def get_kernel_by_name_via_args(kernel_name: str, args: Any, cc: int) -> Any:
+    # [FUNCTION DOC] Fast named lookup: returns the cached operator if present;
+    # otherwise runs an args-filtered cutlass query for cc and registers all results
+    # in the by-name cache (keeping existing entries). For vendored EFC block-scaled
+    # names that are still missing, rebuilds plain GEMM arguments from args and
+    # registers the scaled candidates. Returns the operator or None on a miss.
     """Fast single-kernel lookup via an args-filtered get_operators query.
 
     Passing concrete `args` (a cutlass RuntimeArguments) plus the device target
@@ -499,6 +596,8 @@ def get_kernel_by_name_via_args(kernel_name: str, args: Any, cc: int) -> Any:
 
 
 def ensure_cache_initialized() -> None:
+    # [FUNCTION DOC] Forces the full manifest to be built now (side effect: fills
+    # the global manifest cache); no return value.
     """Ensure the kernel cache is initialized."""
     _get_kernel_cache()
 
@@ -507,6 +606,9 @@ _efc_epilogue_cache: dict[tuple[str, str, tuple], Any] = {}
 
 
 def clear_cache() -> None:
+    # [FUNCTION DOC] Resets all module caches under the cache lock: the manifest,
+    # the EFC-with-epilogue cache, the partition memo, the by-name operator cache and
+    # the memoized block-scaled pool/manifest. No return value.
     """Clear all kernel caches."""
     global _kernel_by_name_cache, _efc_epilogue_cache
     with _cache_lock:
@@ -519,7 +621,11 @@ def clear_cache() -> None:
 
 
 class _NVGEMMCacheWrapper:
+    # [CLASS DOC] HELPER: Stateless adapter exposing a cache_clear method so
+    # clear_on_fresh_cache can register this module's clear_cache like a
+    # functools-cached function.
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] HELPER: Delegates to clear_cache.
         clear_cache()
 
 
@@ -530,6 +636,11 @@ clear_on_fresh_cache(_NVGEMMCacheWrapper())
 
 
 def _meta_epilogue_metadata(epilogue_args: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Builds epilogue metadata for a cached EFC operator
+    # from storage-free meta-device copies of the epilogue's tensors (real tensors,
+    # compile-time tensor wrappers, or passthrough values), re-traces the epilogue
+    # using the accumulator shape/element type from the original trace, and returns
+    # the resulting metadata. Avoids retaining real tensors in the cache.
     """Build the cached kernel's epilogue metadata from meta-device tensors.
 
     The EFC kernel is cached in ``_efc_epilogue_cache`` and reused across every
@@ -551,6 +662,8 @@ def _meta_epilogue_metadata(epilogue_args: Any) -> Any:
     from .nv_universal_gemm_utils import cutlass_dtype_to_torch
 
     def _meta_like(t: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns a meta-device tensor with the same
+        # shape, strides and dtype as t.
         return torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device="meta")
 
     fake_kwargs = {}
@@ -587,6 +700,13 @@ def get_efc_kernel_with_epilogue(
     epilogue_source: str = "",
     base_kernel: Any | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Returns an epilogue-fusion operator bound to the given
+    # epilogue, creating and caching it on first use. The cache key combines the
+    # operator name, epilogue source text (derived from the args if empty) and the
+    # epilogue tensor signature. The base operator comes from base_kernel or a
+    # by-name lookup; returns None if it cannot be found. The new operator is built
+    # by copying the base metadata with meta-based epilogue metadata. Holds the
+    # cache lock throughout.
     """Get (or create and cache) an EFC kernel bound to a specific epilogue.
 
     epilogue_source is preferred over inspect.getsource — generated functions
