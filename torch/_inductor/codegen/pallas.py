@@ -54,7 +54,7 @@ class PallasPrinter(PythonPrinter):
         # [FUNCTION DOC] HELPER: Printer hook. Prints the three arguments (condition, true
         # branch, false branch) recursively and returns a jnp.where call string.
         """Convert sympy Where to jnp.where."""
-        c =self.doprint(expr.args[0])
+        c = self.doprint(expr.args[0])
         p = self.doprint(expr.args[1])
         q = self.doprint(expr.args[2])
         return f"jnp.where({c}, {p}, {q})"
@@ -5038,7 +5038,7 @@ from torch._inductor.runtime.runtime_utils import (
         # Writes only into the context code buffer.
         code = ctx.code
         kernel_input_params = ctx.kernel_input_params
-        input_list =f"[{', '.join(kernel_input_params)}]"
+        input_list = f"[{', '.join(kernel_input_params)}]"
 
         # Legacy GPU path with explicit padding (use_emit_pipeline=False)
         # Mosaic GPU requires tensor sizes to be multiples of 128.
