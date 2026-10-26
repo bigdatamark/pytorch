@@ -1,3 +1,9 @@
+# [MODULE DOC] Builds C++ compile/link command lines for inductor (JIT kernels and AOT Inductor) on Linux,
+# macOS and Windows (including MinGW cross-compilation). Contains compiler detection helpers, flag/definition/include
+# computation functions, option classes (BuildOptionsBase, CppOptions, CppTorchOptions, CppTorchDeviceOptions) and
+# CppBuilder which formats and runs the command or emits CMake files. Import time: reads config, platform and
+# environment to set module constants; in fbcode builds imports triton.fb and inductor fb helpers, else defines
+# no-op cache logging stubs.
 # This CPP builder is designed to support both Windows and Linux OS.
 # The design document please check this RFC: https://github.com/pytorch/pytorch/issues/124245
 
@@ -46,15 +52,19 @@ if config.is_fbcode():
 else:
 
     def log_global_cache_errors(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        # [FUNCTION DOC] HELPER: no-op stub for non-fbcode builds; ignores all arguments.
         pass
 
     def log_global_cache_stats(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        # [FUNCTION DOC] HELPER: no-op stub for non-fbcode builds; ignores all arguments.
         pass
 
     def log_global_cache_vals(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        # [FUNCTION DOC] HELPER: no-op stub for non-fbcode builds; ignores all arguments.
         pass
 
     def use_global_cache() -> bool:  # type: ignore[misc]
+        # [FUNCTION DOC] HELPER: non-fbcode stub; always reports that the global cache is not used (returns False).
         return False
 
 
@@ -80,6 +90,8 @@ log = logging.getLogger(__name__)
 
 # =============================== toolchain ===============================
 def _split_compiler_command(compiler: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: splits a compiler string into an argument list (single element on Windows, shell-style split elsewhere).
+    # Raises ValueError if the split yields an empty command.
     if _IS_WINDOWS:
         return [compiler]
     command = shlex.split(compiler)
@@ -89,11 +101,14 @@ def _split_compiler_command(compiler: str) -> list[str]:
 
 
 def _compiler_command(compiler: str, *args: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the split compiler command followed by the extra arguments as a list.
     return [*_split_compiler_command(compiler), *args]
 
 
 @functools.cache
 def _compiler_version_string(cpp_compiler: str) -> str:
+    # [FUNCTION DOC] HELPER: runs the compiler with the version flag and returns its decoded stripped output; returns an empty string if
+    # the compiler is missing, fails, or is an empty command. Cached per compiler string.
     try:
         return (
             subprocess.check_output(
@@ -108,12 +123,16 @@ def _compiler_version_string(cpp_compiler: str) -> str:
 
 
 def _compiler_version_first_line(cpp_compiler: str) -> str:
+    # [FUNCTION DOC] HELPER: returns the first line of the compiler version output, or an empty string if unavailable.
     version_string = _compiler_version_string(cpp_compiler)
     return version_string.splitlines()[0] if version_string else ""
 
 
 @functools.lru_cache(1)
 def cpp_compiler_search(search: Sequence[str | None]) -> str:
+    # [FUNCTION DOC] Finds the first usable C++ compiler in the search sequence by running it with the version flag. A None entry means
+    # install g++ via conda (Linux only, only when the TORCH_INDUCTOR_INSTALL_GXX env var is set), guarded by a file lock.
+    # Skips entries that fail to run. Raises exc.InvalidCxxCompiler if none work. Cached (size 1) by search tuple.
     from torch._inductor.codecache import get_lock_dir, LOCK_TIMEOUT
 
     for cxx in search:
@@ -147,6 +166,10 @@ def cpp_compiler_search(search: Sequence[str | None]) -> str:
 
 
 def install_gcc_via_conda() -> str:
+    # [FUNCTION DOC] Installs (if not already present) a modern g++ into the cache dir via a conda create command and returns the path of
+    # the g++ binary in that prefix. Side effects: subprocess call, filesystem writes.
+    # KNOWN ISSUE: the fallback to which for conda is dead code because the environment lookup supplies a default, so conda is never None;
+    # KNOWN ISSUE: python version 3.8 is hardcoded, and the returned path is not checked to exist after install.
     """On older systems, this is a quick way to get a modern compiler"""
     prefix = os.path.join(cache_dir(), "gcc")
     cxx_path = os.path.join(prefix, "bin", "g++")
@@ -174,6 +197,8 @@ def install_gcc_via_conda() -> str:
 
 @functools.cache
 def check_compiler_exist_windows(compiler: str) -> None:
+    # [FUNCTION DOC] Checks that the Windows compiler can be launched (runs it with the help flag). Raises exc.InvalidCxxCompiler if the
+    # executable is not found; other subprocess failures are tolerated (e.g. clang without that flag). Cached.
     """
     Check if compiler is ready, in case end user not activate MSVC environment.
     """
@@ -189,13 +214,18 @@ def check_compiler_exist_windows(compiler: str) -> None:
 
 
 class WinPeFileVersionInfo:
+    # [CLASS DOC] Wrapper around the Windows version.dll API to read a PE file's version resource. Windows only (uses the WinDLL loader).
+    # State: file_path, version_dll handle, and version_info buffer filled at construction. Key method: get_language_id.
     def __init__(self, file_path: str) -> None:
+        # [FUNCTION DOC] Loads version.dll, configures the C function signatures and reads the file's version info buffer. Raises RuntimeError
+        # if the info cannot be read.
         self.file_path = file_path
         self.version_dll = ctypes.WinDLL("version.dll")  # type: ignore[attr-defined]
         self._setup_functions()
         self._get_version_info()
 
     def _setup_functions(self) -> None:
+        # [FUNCTION DOC] HELPER: declares argument and return types for the three version.dll functions used.
         self.version_dll.GetFileVersionInfoSizeW.argtypes = [
             wintypes.LPCWSTR,
             wintypes.LPDWORD,
@@ -219,6 +249,8 @@ class WinPeFileVersionInfo:
         self.version_dll.VerQueryValueW.restype = wintypes.BOOL
 
     def _get_version_info(self) -> None:
+        # [FUNCTION DOC] HELPER: queries the size of the version resource then reads it into the version_info buffer.
+        # Raises RuntimeError if the size is zero or the read fails.
         dummy = wintypes.DWORD()
         size = self.version_dll.GetFileVersionInfoSizeW(
             self.file_path, ctypes.byref(dummy)
@@ -236,6 +268,9 @@ class WinPeFileVersionInfo:
             raise RuntimeError(f"Can't get version info of {self.file_path}.")
 
     def get_language_id(self) -> int:
+        # [FUNCTION DOC] Returns the language id from the file's translation table, or 0 if the query fails or the table is empty.
+        # KNOWN ISSUE: the loop overwrites the id each iteration, so the last translation entry is returned, not the first;
+        # the collected translation list and code pages are otherwise unused, and a missing buffer prints a message.
         lp_buffer = ctypes.c_void_p()
         u_len = wintypes.UINT()
 
@@ -267,12 +302,16 @@ class WinPeFileVersionInfo:
 
 @functools.cache
 def check_msvc_cl_language_id(compiler: str) -> None:
+    # [FUNCTION DOC] Verifies that an MSVC cl compiler uses the English language pack (language id 1033). Does nothing for non-MSVC
+    # compilers. Locates cl.exe from the given path or via vswhere. Raises RuntimeError if the language id differs. Cached.
     """
     Torch.compile() is only work on MSVC with English language pack well.
     Check MSVC's language pack: https://github.com/pytorch/pytorch/issues/157673#issuecomment-3051682766
     """
 
     def get_msvc_cl_path() -> tuple[bool, str]:
+        # [FUNCTION DOC] HELPER: locates cl.exe by running vswhere and scanning the newest MSVC toolset directory (x64 host, then x86).
+        # Returns a pair of found flag and path; returns False and empty string on any failure.
         """
         Finds the path to cl.exe using vswhere.exe.
         """
@@ -379,6 +418,9 @@ def check_msvc_cl_language_id(compiler: str) -> None:
 
 @functools.cache
 def check_mingw_win32_flavor(compiler: str) -> str:
+    # [FUNCTION DOC] Runs the MinGW compiler in verbose mode and parses the thread model line to return the flavor (win32 or posix).
+    # Raises RuntimeError if the compiler is missing or fails, if no thread model line is found, or the flavor is unsupported.
+    # Cached.
     """
     Check if MinGW `compiler` exists and return it's flavor (win32 or posix).
     """
@@ -412,6 +454,9 @@ def check_mingw_win32_flavor(compiler: str) -> str:
 
 
 def get_cpp_compiler() -> str:
+    # [FUNCTION DOC] Returns the C++ compiler to use. For Windows cross-compilation returns the MinGW compiler (validating flavor unless only
+    # packaging cpp). On Windows uses the CXX env var (default cl) after validating it and its language pack. In fbcode returns
+    # the fbcode compiler; otherwise searches the configured compilers. May raise InvalidCxxCompiler or RuntimeError.
     if (
         config.aot_inductor.cross_target_platform == "windows"
         and sys.platform != "win32"
@@ -439,6 +484,8 @@ def get_cpp_compiler() -> str:
 
 
 def get_ld_and_objcopy(use_relative_path: bool) -> tuple[str, str]:
+    # [FUNCTION DOC] Returns the linker and objcopy tool names. Raises RuntimeError on Windows. In fbcode uses build_paths (objcopy fallback
+    # when relative paths are used); otherwise plain tool names.
     if _IS_WINDOWS:
         raise RuntimeError("Windows is not supported yet.")
     else:
@@ -461,6 +508,8 @@ def convert_cubin_to_obj(
     ld: str,
     objcopy: str,
 ) -> str:
+    # [FUNCTION DOC] Converts a cubin file to an object file with a rodata section by running the linker and two objcopy commands, renaming
+    # the start/size/end symbols to be unique per kernel name. Returns the object file path. Raises CalledProcessError on failure.
     obj_file = cubin_file + ".o"
     # Convert .cubin to .o
     cmd = f"{ld} -r -b binary -z noexecstack -o {obj_file} {cubin_file}"
@@ -487,6 +536,9 @@ def batch_convert_cubins_to_obj(
     output_dir: str,
     cpp_compiler: str = "gcc",
 ) -> str:
+    # [FUNCTION DOC] Combines many cubin files into one object file: writes an assembly file with one embedded-binary block per cubin and
+    # start/end/size symbols, then assembles it with one compiler call. Input is a list of (cubin path, kernel name) pairs, an
+    # output directory and compiler. Returns the object file path. Raises CalledProcessError if assembly fails.
     """Convert multiple cubin files to a single .o using batched .incbin assembly.
 
     Instead of spawning 3 subprocesses per cubin (ld + 2x objcopy), generates
@@ -534,12 +586,15 @@ def batch_convert_cubins_to_obj(
 
 @functools.cache
 def _is_apple_clang(cpp_compiler: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the compiler version first line identifies Apple clang. Cached.
     first_line = _compiler_version_first_line(cpp_compiler)
     return bool(re.search(r"\bApple\b.*\bclang\b", first_line))
 
 
 @functools.cache
 def _is_clang(cpp_compiler: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the compiler is clang (not Intel). On Windows only clang-cl is accepted and plain clang raises
+    # RuntimeError. Checks Apple clang, the version line, then the compiler name. Cached.
     if _IS_WINDOWS:
         # clang suite have many compilers, and only clang-cl is supported.
         if re.search(r"((clang$)|(clang\+\+$))", cpp_compiler):
@@ -562,6 +617,8 @@ def _is_clang(cpp_compiler: str) -> bool:
 
 @functools.cache
 def _is_gcc(cpp_compiler: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the compiler is gcc. Returns False for clang (whose name also ends in g++). Checks the version line then
+    # the compiler name. Cached.
     # Since "clang++" ends with "g++", the regex match below would validate on it.
     if _is_clang(cpp_compiler):
         return False
@@ -579,6 +636,8 @@ def _is_gcc(cpp_compiler: str) -> bool:
 
 @functools.cache
 def _is_gcc_version_less_than(cpp_compiler: str, major: int) -> bool:
+    # [FUNCTION DOC] HELPER: True only if the compiler is gcc and its reported version is lower than the given major version; False when
+    # not gcc or the version cannot be obtained. Cached.
     if not _is_gcc(cpp_compiler):
         return False
 
@@ -603,6 +662,7 @@ def _is_gcc_version_less_than(cpp_compiler: str, major: int) -> bool:
 
 @functools.cache
 def _is_msvc_cl(cpp_compiler: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the Windows compiler help output starts with a Microsoft line. Always False on non-Windows. Cached.
     if not _IS_WINDOWS:
         return False
 
@@ -624,7 +684,10 @@ def _is_msvc_cl(cpp_compiler: str) -> bool:
 
 @functools.cache
 def _is_intel_compiler(cpp_compiler: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the compiler version output's first line mentions Intel. On Windows raises RuntimeError for icx without
+    # the icx-cl style and for versions below the minimum. Returns False if the compiler cannot run. Cached.
     def _check_minimal_version(compiler_version: TorchVersion) -> None:
+        # [FUNCTION DOC] HELPER: raises RuntimeError if the Intel compiler version is below the platform minimum (2024.2.1 on Windows).
         """
         On Windows: early version icx has `-print-file-name` issue, and can't preload correctly for inductor.
         """
@@ -664,31 +727,38 @@ def _is_intel_compiler(cpp_compiler: str) -> bool:
 
 @functools.cache
 def is_gcc() -> bool:
+    # [FUNCTION DOC] Cached check of whether the active C++ compiler is gcc.
     return _is_gcc(get_cpp_compiler())
 
 
 @functools.cache
 def is_clang() -> bool:
+    # [FUNCTION DOC] Cached check of whether the active C++ compiler is clang.
     return _is_clang(get_cpp_compiler())
 
 
 @functools.cache
 def is_intel_compiler() -> bool:
+    # [FUNCTION DOC] Cached check of whether the active C++ compiler is the Intel compiler.
     return _is_intel_compiler(get_cpp_compiler())
 
 
 @functools.cache
 def is_apple_clang() -> bool:
+    # [FUNCTION DOC] Cached check of whether the active C++ compiler is Apple clang.
     return _is_apple_clang(get_cpp_compiler())
 
 
 @functools.cache
 def is_msvc_cl() -> bool:
+    # [FUNCTION DOC] Cached check of whether the active C++ compiler is MSVC cl.
     return _is_msvc_cl(get_cpp_compiler())
 
 
 @functools.cache
 def get_compiler_version_info(compiler: str) -> str:
+    # [FUNCTION DOC] Returns the compiler's verbose version output (falling back to the version flag) as a single line with newlines
+    # replaced by underscores, run with a C locale; returns an empty string if both fail. Cached.
     env = os.environ.copy()
     env["LC_ALL"] = "C"  # Don't localize output
     try:
@@ -714,10 +784,12 @@ def get_compiler_version_info(compiler: str) -> str:
 
 # =============================== cpp builder ===============================
 def _append_list(dest_list: list[str], src_list: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: appends deep copies of the source items to the destination list in place.
     dest_list.extend(copy.deepcopy(item) for item in src_list)
 
 
 def _remove_duplication_in_list(orig_list: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns a new list with duplicates removed, preserving first-seen order.
     new_list: list[str] = []
     for item in orig_list:
         if item not in new_list:
@@ -726,6 +798,7 @@ def _remove_duplication_in_list(orig_list: list[str]) -> list[str]:
 
 
 def _create_if_dir_not_exist(path_dir: str) -> None:
+    # [FUNCTION DOC] HELPER: creates the directory (with parents) if missing; tolerates a creation race; raises RuntimeError on other OS errors.
     if not os.path.exists(path_dir):
         try:
             Path(path_dir).mkdir(parents=True, exist_ok=True)
@@ -735,6 +808,7 @@ def _create_if_dir_not_exist(path_dir: str) -> None:
 
 
 def _remove_dir(path_dir: str) -> None:
+    # [FUNCTION DOC] HELPER: recursively deletes a directory tree if it exists (files, then subdirectories, then the directory).
     if os.path.exists(path_dir):
         for root, dirs, files in os.walk(path_dir, topdown=False):
             for name in files:
@@ -747,6 +821,8 @@ def _remove_dir(path_dir: str) -> None:
 
 
 def _run_compile_cmd(cmd_line: str, cwd: str) -> None:
+    # [FUNCTION DOC] HELPER: runs the shell-split command in the given working directory capturing output. On failure raises
+    # exc.CppCompileError with the output, adding OpenMP setup advice on macOS when OpenMP appears missing.
     cmd = shlex.split(cmd_line)
     try:
         subprocess.run(
@@ -770,17 +846,22 @@ def _run_compile_cmd(cmd_line: str, cwd: str) -> None:
 
 
 def run_compile_cmd(cmd_line: str, cwd: str) -> None:
+    # [FUNCTION DOC] Runs a compile command line in a directory under a compile timing context; raises CppCompileError on failure.
     with dynamo_timed("compile_file"):
         _run_compile_cmd(cmd_line, cwd)
 
 
 def normalize_path_separator(orig_path: str) -> str:
+    # [FUNCTION DOC] Converts path separators to forward slashes on Windows; returns the path unchanged elsewhere.
     if _IS_WINDOWS:
         return orig_path.replace(os.sep, "/")
     return orig_path
 
 
 class BuildOptionsBase:
+    # [CLASS DOC] Base container for C++ build options: compiler, definitions, include dirs, cflags, ldflags, library dirs, libraries and
+    # passthrough args (all lists of strings), plus flags for aot, relative path, compile only, precompiling, preprocessing
+    # and an optional precompiled header path. Subclasses fill the lists and call _finalize_options. Provides getters and JSON saving.
     """
     This is the Base class for store cxx build options, as a template.
     Actually, to build a cxx shared library. We just need to select a compiler
@@ -803,6 +884,7 @@ class BuildOptionsBase:
         precompiling: bool = False,
         preprocessing: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the given options, using empty lists for None, and the mode flags.
         self._compiler = compiler
         self._definitions: list[str] = definitions or []
         self._include_dirs: list[str] = include_dirs or []
@@ -824,12 +906,14 @@ class BuildOptionsBase:
         self._preprocessing: bool = preprocessing
 
     def _process_compile_only_options(self) -> None:
+        # [FUNCTION DOC] HELPER: when compiling only, precompiling or preprocessing, clears library dirs, libraries and linker flags.
         if self._compile_only or self._precompiling or self._preprocessing:
             self._libraries_dirs = []
             self._libraries = []
             self._ldflags = []
 
     def _remove_duplicate_options(self) -> None:
+        # [FUNCTION DOC] HELPER: removes duplicates (keeping order) from every option list in place.
         self._definitions = _remove_duplication_in_list(self._definitions)
         self._include_dirs = _remove_duplication_in_list(self._include_dirs)
         self._cflags = _remove_duplication_in_list(self._cflags)
@@ -839,49 +923,65 @@ class BuildOptionsBase:
         self._passthrough_args = _remove_duplication_in_list(self._passthrough_args)
 
     def _finalize_options(self) -> None:
+        # [FUNCTION DOC] HELPER: applies the compile-only option clearing then duplicate removal. Subclasses call this after filling options.
         self._process_compile_only_options()
         self._remove_duplicate_options()
 
     def get_compiler(self) -> str:
+        # [FUNCTION DOC] Returns the compiler.
         return self._compiler
 
     def get_definitions(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of macro definitions.
         return self._definitions
 
     def get_include_dirs(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of include directories.
         return self._include_dirs
 
     def get_cflags(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of compiler flags.
         return self._cflags
 
     def get_ldflags(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of linker flags.
         return self._ldflags
 
     def get_libraries_dirs(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of library directories.
         return self._libraries_dirs
 
     def get_libraries(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of libraries.
         return self._libraries
 
     def get_passthrough_args(self) -> list[str]:
+        # [FUNCTION DOC] Returns the list of passthrough args.
         return self._passthrough_args
 
     def get_aot_mode(self) -> bool:
+        # [FUNCTION DOC] Returns whether AOT mode is enabled.
         return self._aot_mode
 
     def get_use_relative_path(self) -> bool:
+        # [FUNCTION DOC] Returns whether relative paths are used.
         return self._use_relative_path
 
     def get_compile_only(self) -> bool:
+        # [FUNCTION DOC] Returns whether only compiling (no linking).
         return self._compile_only
 
     def get_precompiling(self) -> bool:
+        # [FUNCTION DOC] Returns whether building a precompiled header.
         return self._precompiling
 
     def get_preprocessing(self) -> bool:
+        # [FUNCTION DOC] Returns whether only preprocessing.
         return self._preprocessing
 
     def save_flags_to_json(self, file: str) -> None:
+        # [FUNCTION DOC] Writes the main option lists and flags to a JSON file at the given path (overwrites the file).
+        # KNOWN ISSUE: the precompiling and preprocessing flags and precompiled header are not saved.
         attrs = {
             "compiler": self.get_compiler(),
             "definitions": self.get_definitions(),
@@ -901,6 +1001,7 @@ class BuildOptionsBase:
 
 
 def _get_warning_all_cflag(warning_all: bool = True) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the all-warnings flag list (Wall on non-Windows when requested), else an empty list.
     if not _IS_WINDOWS:
         return ["Wall"] if warning_all else []
     else:
@@ -908,6 +1009,9 @@ def _get_warning_all_cflag(warning_all: bool = True) -> list[str]:
 
 
 def _get_cpp_std_cflag(std_num: str = "c++20") -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the C++ standard flag. On Windows always c++20 in MSVC syntax regardless of the argument;
+    # elsewhere uses the requested standard.
+    # KNOWN ISSUE: the triple-quoted string inside the Windows branch is not a docstring; it is just an unused expression holding notes.
     if _IS_WINDOWS:
         """
         On Windows, only c++20 can support `std::enable_if_t`.
@@ -923,6 +1027,8 @@ def _get_cpp_std_cflag(std_num: str = "c++20") -> list[str]:
 
 
 def _get_os_related_cpp_cflags(cpp_compiler: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns OS and compiler specific warning and conformance flags (MSVC suppressions on Windows; unused-variable and
+    # pragma suppressions plus clang optimization-argument handling and pedantic for gcc elsewhere).
     if _IS_WINDOWS:
         cflags = [
             "wd4819",
@@ -959,6 +1065,7 @@ def _get_os_related_cpp_cflags(cpp_compiler: str) -> list[str]:
 
 
 def _get_os_related_cpp_definitions(cpp_compiler: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns OS related macro definitions (disables min and max macros on Windows).
     os_definitions: list[str] = []
     if _IS_WINDOWS:
         # On Windows, we need disable min/max macro to avoid C2589 error, as PyTorch CMake:
@@ -968,6 +1075,8 @@ def _get_os_related_cpp_definitions(cpp_compiler: str) -> list[str]:
 
 
 def _get_ffast_math_flags() -> list[str]:
+    # [FUNCTION DOC] HELPER: returns floating-point math flags emulating fast-math with errno preserved and the configured fp-contract
+    # setting (empty on Windows); adds excess-precision flag for gcc.
     if _IS_WINDOWS:
         flags = []
     else:
@@ -1000,6 +1109,7 @@ def _get_ffast_math_flags() -> list[str]:
 
 
 def _get_inductor_debug_symbol_cflags() -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns a pair of compile flags and link flags that enable debug symbols (MSVC flags on Windows, g elsewhere).
     """
     When we turn on generate debug symbol.
     On Windows, it should create a [module_name].pdb file. It helps debug by WinDBG.
@@ -1019,6 +1129,8 @@ def _get_inductor_debug_symbol_cflags() -> tuple[list[str], list[str]]:
 
 @functools.cache
 def _get_linux_aarch64_cpu_flags() -> OrderedSet[str]:
+    # [FUNCTION DOC] HELPER: on Linux aarch64 returns the set of supported CPU capabilities among bf16, sve and sve2 from the torch CPU
+    # capabilities query; otherwise an empty set. Cached.
     flags: OrderedSet[str] = OrderedSet()
 
     if platform.machine() not in ("aarch64", "arm64"):
@@ -1039,6 +1151,8 @@ def _get_linux_aarch64_cpu_flags() -> OrderedSet[str]:
 
 @functools.cache
 def _get_linux_aarch64_arch_flag(cpp_compiler: str) -> str:
+    # [FUNCTION DOC] HELPER: returns the march flag for aarch64: an explicit armv8.6 string with sve/bf16 for gcc older than 13 when the
+    # CPU has them, else native. Cached.
     flags = _get_linux_aarch64_cpu_flags()
 
     if _is_gcc(cpp_compiler) and _is_gcc_version_less_than(cpp_compiler, 13):
@@ -1052,6 +1166,8 @@ def _get_linux_aarch64_arch_flag(cpp_compiler: str) -> str:
 
 
 def _get_cpu_arch_cflags(cpp_compiler: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the CPU architecture flag list from config: empty in fbcode, when the config is the empty string, or on
+    # macOS without explicit setting; default per-machine choice (ppc, riscv, aarch64, native); else uses the configured value.
     if config.is_fbcode():
         return []
 
@@ -1084,6 +1200,9 @@ def _get_cpu_arch_cflags(cpp_compiler: str) -> list[str]:
 def _get_optimization_cflags(
     cpp_compiler: str, min_optimize: bool = False
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns (compile flags, link flags) for optimization: optimized or debug-level settings from config and env vars,
+    # debug symbols, frame pointers, line tables, fast-math flags, gcc vectorization restriction, arch flags and thin LTO.
+    # min_optimize selects the lower wrapper optimization level.
     cflags: list[str] = []
     ldflags: list[str] = []
 
@@ -1146,6 +1265,8 @@ def _get_optimization_cflags(
 
 
 def _get_shared_cflags(cpp_compiler: str, do_link: bool) -> list[str]:
+    # [FUNCTION DOC] HELPER: returns flags for building a shared library (MSVC DLL flags on Windows, dynamic lookup on macOS clang, shared
+    # only when linking plus position independent code elsewhere).
     if _IS_WINDOWS:
         """
         MSVC `/MD` using python `ucrtbase.dll` lib as runtime.
@@ -1170,6 +1291,9 @@ def get_cpp_options(
     extra_flags: Sequence[str] = (),
     min_optimize: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] Computes the base C++ build options as a seven-tuple of lists in this order: definitions, include dirs, cflags, ldflags,
+    # library dirs, libraries, passthrough args. Combines optimization, shared, warning, standard and OS flags, optional LTO
+    # link flags, extra flags, and MinGW static link args for Windows cross-compilation. May raise from MinGW flavor check.
     definitions: list[str] = []
     include_dirs: list[str] = []
     cflags: list[str] = []
@@ -1218,6 +1342,8 @@ def get_cpp_options(
 
 
 class CppOptions(BuildOptionsBase):
+    # [CLASS DOC] Build options for plain C++ (no torch): chooses the compiler (given or detected), computes base options through
+    # get_cpp_options and finalizes them. Used for helper modules such as ISA detection.
     """
     This class is inherited from BuildOptionsBase, and as cxx build options.
     This option need contains basic cxx build option, which contains:
@@ -1239,6 +1365,9 @@ class CppOptions(BuildOptionsBase):
         precompiling: bool = False,
         preprocessing: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initializes base options and fills them from get_cpp_options; do_link is false for compile only, precompiling or
+        # preprocessing modes.
+        # KNOWN ISSUE: the shared parameter name is absent here but accepted by subclasses and ignored.
         super().__init__(
             compile_only=compile_only,
             use_relative_path=use_relative_path,
@@ -1274,6 +1403,7 @@ class CppOptions(BuildOptionsBase):
 
 
 def _get_torch_cpp_wrapper_definition() -> list[str]:
+    # [FUNCTION DOC] HELPER: returns macro definitions for the cpp wrapper (adds the precompiled header macro when enabled in config).
     defs = ["TORCH_INDUCTOR_CPP_WRAPPER", "STANDALONE_TORCH_HEADER"]
     if config.cpp_cache_precompile_headers:
         defs.append("TORCH_INDUCTOR_PRECOMPILE_HEADERS")
@@ -1281,10 +1411,12 @@ def _get_torch_cpp_wrapper_definition() -> list[str]:
 
 
 def _use_custom_generated_macros() -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the definition list marking custom generated macros (note the leading space in the string).
     return [" C10_USING_CUSTOM_GENERATED_MACROS"]
 
 
 def _use_fb_internal_macros() -> list[str]:
+    # [FUNCTION DOC] HELPER: returns internal fbcode macros (glog, MKL) when in fbcode on non-Windows; otherwise an empty list.
     if not _IS_WINDOWS:
         if config.is_fbcode():
             fb_internal_macros = [
@@ -1309,6 +1441,8 @@ def _setup_standard_sys_libs(
     aot_mode: bool,
     use_relative_path: bool,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: for fbcode returns no-stdinc style flags, ordered include paths, linker script and clang linker args; returns
+    # empty lists elsewhere and on Windows. Returns (cflags, include dirs, passthrough args, ldflags).
     cflags: list[str] = []
     include_dirs: list[str] = []
     passthrough_args: list[str] = []
@@ -1348,6 +1482,8 @@ def _setup_standard_sys_libs(
 
 
 def _get_build_args_of_chosen_isa(vec_isa: VecISA) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns (macros, build flags) for the chosen vector ISA; empty unless a valid ISA is given. In fbcode the
+    # macros are rebuilt from the ISA name.
     macros: list[str] = []
     build_flags: list[str] = []
     if vec_isa != invalid_vec_isa:
@@ -1370,6 +1506,10 @@ def _get_build_args_of_chosen_isa(vec_isa: VecISA) -> tuple[list[str], list[str]
 def _get_torch_related_args(
     include_pytorch: bool, aot_mode: bool
 ) -> tuple[list[str], list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns (include dirs, library dirs, libraries) for torch. Links libtorch libraries when configured; for
+    # Windows cross-compilation requires the shim library settings and raises AssertionError if missing or of wrong type;
+    # adds sleef on Windows.
+    # KNOWN ISSUE: the include_pytorch argument is unused, and the AssertionError for a missing shim library path is given a tuple (not a string) as message.
     from torch.utils.cpp_extension import include_paths, TORCH_LIB_PATH
 
     libraries = []
@@ -1418,6 +1558,8 @@ def _get_torch_related_args(
 
 
 def _get_python_include_dirs() -> list[str]:
+    # [FUNCTION DOC] HELPER: returns the python include directory list, using the framework Headers folder on macOS if needed; warns if
+    # Python.h cannot be found.
     include_dir = Path(sysconfig.get_path("include"))
     # On Darwin Python executable from a framework can return
     # non-existing /Library/Python/... include path, in which case
@@ -1431,6 +1573,7 @@ def _get_python_include_dirs() -> list[str]:
 
 
 def _get_python_related_args() -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns (python include dirs, python library dirs) from sysconfig, with Windows libs dir and fbcode include.
     python_include_dirs = _get_python_include_dirs()
     python_include_path = sysconfig.get_path(
         "include", scheme="nt" if _IS_WINDOWS else "posix_prefix"
@@ -1457,6 +1600,7 @@ def _get_python_related_args() -> tuple[list[str], list[str]]:
 
 @functools.cache
 def is_conda_llvm_openmp_installed() -> bool:
+    # [FUNCTION DOC] HELPER: True if conda reports llvm-openmp installed; False if conda is unavailable or fails. Cached.
     try:
         command = "conda list llvm-openmp --json"
         output = subprocess.check_output(command.split()).decode("utf8")
@@ -1467,6 +1611,7 @@ def is_conda_llvm_openmp_installed() -> bool:
 
 @functools.cache
 def homebrew_libomp() -> tuple[bool, str]:
+    # [FUNCTION DOC] HELPER: returns (available, path) for Homebrew libomp; (False, empty) if brew is missing or fails. Cached.
     try:
         # check if `brew` is installed
         if shutil.which("brew") is None:
@@ -1488,6 +1633,8 @@ def homebrew_libomp() -> tuple[bool, str]:
 
 @functools.cache
 def perload_clang_libomp_win(cpp_compiler: str, omp_name: str) -> None:
+    # [FUNCTION DOC] HELPER: preloads the clang OpenMP runtime DLL on Windows by locating it near the compiler, setting an env var that
+    # allows duplicate OpenMP libraries and loading the DLL. Cached; errors from the compiler call are ignored.
     try:
         output = subprocess.check_output(
             _compiler_command(cpp_compiler, "-print-file-name=bin")
@@ -1502,7 +1649,11 @@ def perload_clang_libomp_win(cpp_compiler: str, omp_name: str) -> None:
 
 @functools.cache
 def perload_icx_libomp_win(cpp_compiler: str) -> None:
+    # [FUNCTION DOC] HELPER: preloads Intel compiler runtime DLLs (OpenMP, SVML, libm) on Windows via a nested loader helper. Cached.
+    # KNOWN ISSUE: the explanatory string in the middle of this function is not a docstring (it follows a nested def).
     def _load_icx_built_in_lib_by_name(cpp_compiler: str, lib_name: str) -> bool:
+        # [FUNCTION DOC] HELPER: asks the compiler for a library path by name and loads it if the file exists (also sets the env var that
+        # allows duplicate OpenMP). Returns True if loaded, False otherwise.
         try:
             output = subprocess.check_output(
                 _compiler_command(cpp_compiler, f"-print-file-name={lib_name}"),
@@ -1534,6 +1685,9 @@ def perload_icx_libomp_win(cpp_compiler: str) -> None:
 def _get_openmp_args(
     cpp_compiler: str,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: returns six lists (cflags, ldflags, include dirs, library dir paths, libraries, passthrough args) for OpenMP. No-op
+    # for Windows cross-compilation; on macOS searches OMP_PREFIX, conda, then Homebrew; on Windows picks flags per compiler and
+    # preloads runtimes; on Linux uses gomp or fbcode paths.
     cflags: list[str] = []
     ldflags: list[str] = []
     include_dir_paths: list[str] = []
@@ -1641,6 +1795,7 @@ def _get_openmp_args(
 
 
 def _get_libstdcxx_args() -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: for fbcode returns the library dir and stdc++ library to link; empty lists otherwise.
     """
     For fbcode cpu case, we should link stdc++ instead assuming the binary where dlopen is executed is built with dynamic stdc++.
     """
@@ -1656,6 +1811,7 @@ def _get_libstdcxx_args() -> tuple[list[str], list[str]]:
 def get_mmap_self_macro(
     use_mmap_weights: bool, use_mmap_weights_external: bool
 ) -> list[str]:
+    # [FUNCTION DOC] Returns the memory-map weights macro list for the self or external option. Raises RuntimeError if both are true.
     macros = []
 
     if use_mmap_weights and use_mmap_weights_external:
@@ -1670,6 +1826,7 @@ def get_mmap_self_macro(
 
 
 def get_caching_allocator_macro() -> list[str]:
+    # [FUNCTION DOC] Returns the caching allocator macro list when the AOT Inductor weight caching allocator option is enabled.
     from torch._inductor import config
 
     macros = []
@@ -1687,6 +1844,9 @@ def get_cpp_torch_options(
     use_mmap_weights: bool,
     use_mmap_weights_external: bool,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] Computes torch related build options as a seven-tuple of lists (definitions, include dirs, cflags, ldflags, library dirs,
+    # libraries, passthrough args) by combining wrapper macros, system libs, ISA, torch, python, OpenMP, fbcode, mmap and
+    # caching-allocator pieces.
     """
     This function is used to get the build args of torch related build options.
     1. Torch include_directories, libraries, libraries_directories.
@@ -1772,6 +1932,9 @@ def get_cpp_torch_options(
 
 
 class CppTorchOptions(CppOptions):
+    # [CLASS DOC] Build options extending CppOptions with torch specific settings (torch and python includes and libraries, OpenMP,
+    # macros, vector ISA). Calls get_cpp_torch_options and finalizes.
+    # KNOWN ISSUE: the docstring says it inherits CppTorchOptions; it actually inherits CppOptions.
     """
     This class is inherited from CppTorchOptions, which automatic contains
     base cxx build options. And then it will maintains torch related build
@@ -1800,6 +1963,7 @@ class CppTorchOptions(CppOptions):
         precompiling: bool = False,
         preprocessing: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Builds base options then appends torch specific options and records aot mode. The shared parameter is accepted but unused.
         super().__init__(
             compile_only=compile_only,
             warning_all=warning_all,
@@ -1842,6 +2006,7 @@ class CppTorchOptions(CppOptions):
 
 
 def _set_gpu_runtime_env() -> None:
+    # [FUNCTION DOC] HELPER: in fbcode on non-ROCm builds, sets the CUDA home env var from the SDK path if neither CUDA home variable is set.
     if (
         config.is_fbcode()
         and torch.version.hip is None
@@ -1853,6 +2018,8 @@ def _set_gpu_runtime_env() -> None:
 
 @functools.lru_cache(8)
 def _find_libcudart_static(path: str) -> Path | None:
+    # [FUNCTION DOC] HELPER: returns the resolved directory holding the static cudart library found under the path, or None (with an info log)
+    # if not found. Cached (size 8).
     lib_dirs = list(Path(path).rglob("libcudart_static.a"))
     if lib_dirs:
         return lib_dirs[0].resolve().parent
@@ -1862,6 +2029,8 @@ def _find_libcudart_static(path: str) -> Path | None:
 
 
 def _gen_mingw_import_lib(dll_path: str, def_path: str, import_lib_path: str) -> None:
+    # [FUNCTION DOC] HELPER: generates a MinGW import library for a DLL by running gendef (writing a def file) then dlltool. Raises
+    # CalledProcessError if either tool fails.
     """Generate a MinGW import library (.a) from a DLL using gendef and dlltool."""
     dll_name = os.path.basename(dll_path)
     with open(def_path, "w") as def_file:
@@ -1913,6 +2082,9 @@ void (*__guard_dispatch_icall_fptr)(void) = __guard_dispatch_icall_nop;
 
 
 def _create_msvc_gs_stubs_lib(output_dir: str) -> str | None:
+    # [FUNCTION DOC] HELPER: builds a static library from the stub C source using the MinGW compiler and archiver in the output directory;
+    # returns the library short name, reusing an existing one, or None (after cleanup and a warning) on failure.
+    # Always removes temporary source and object files.
     """
     Create a static library with MSVC GS security symbol stubs for MinGW.
 
@@ -1960,6 +2132,9 @@ def _create_msvc_gs_stubs_lib(output_dir: str) -> str | None:
 
 
 def _ensure_mingw_cudart_import_lib(libraries_dirs: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: for MinGW cross-compilation, generates an import library for the CUDA runtime DLL if needed (needs a Windows CUDA
+    # home env var). Falls back to MSVC stub library on failure or missing DLL. Returns extra library names to link.
+    # Side effects: writes files into a library directory and logs.
     """
     Auto-generate a MinGW-compatible import library (libcudart.a)
     from the CUDA runtime DLL. This avoids linking against the hybrid cudart.lib
@@ -2048,6 +2223,8 @@ def _ensure_mingw_cudart_import_lib(libraries_dirs: list[str]) -> list[str]:
 
 
 def _transform_cuda_paths(lpaths: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: rewrites CUDA library paths in place to the directory with the static cudart (also adding its stubs directory) and in
+    # fbcode adds the SDK lib dir and stubs.
     # This handles two cases:
     # 1. Cases where libs are in (e.g.) lib/cuda-12 and lib/cuda-12/stubs
     # 2. Linux machines may have CUDA installed under either lib64/ or lib/
@@ -2075,6 +2252,7 @@ def _transform_cuda_paths(lpaths: list[str]) -> None:
 
 
 def _transform_rocm_paths(lpaths: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: in fbcode adds the SDK lib directory to the ROCm library paths in place when it exists.
     # Internal path needs special care, using the SDK lib path directly.
     if config.is_fbcode():
         sdk_lib = build_paths.sdk_lib
@@ -2087,6 +2265,9 @@ def get_cpp_torch_device_options(
     aot_mode: bool = False,
     compile_only: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] Computes device specific build options as a seven-tuple of lists for the device type (cuda, xpu, mps, or cpu): macros,
+    # includes, library dirs and libraries, with CUDA or ROCm, XPU driver checks (raising OSError if missing), fbcode extras and
+    # custom op libs. Side effects: may set the CUDA home env var and the cpp_extension module global.
     """
     This function is used to get the build args of device related build options.
     1. Device include_directories, libraries, libraries_directories.
@@ -2204,6 +2385,8 @@ def get_cpp_torch_device_options(
 
 
 class CppTorchDeviceOptions(CppTorchOptions):
+    # [CLASS DOC] Build options extending CppTorchOptions with device (cuda, xpu, mps) specific includes, libraries and macros from
+    # get_cpp_torch_device_options. Overrides _finalize_options to reorder python lib dirs in fbcode.
     """
     This class is inherited from CppTorchOptions, which automatic contains
     base cxx build options and torch common build options. And then it will
@@ -2227,6 +2410,7 @@ class CppTorchDeviceOptions(CppTorchOptions):
         preprocessing: bool = False,
         compiler: str = "",
     ) -> None:
+        # [FUNCTION DOC] Builds torch options then appends device specific options for the device type. The shared parameter is unused.
         super().__init__(
             vec_isa=vec_isa,
             include_pytorch=include_pytorch,
@@ -2273,6 +2457,8 @@ class CppTorchDeviceOptions(CppTorchOptions):
         self._finalize_options()
 
     def _finalize_options(self) -> None:
+        # [FUNCTION DOC] HELPER: runs the base finalization; in fbcode moves the python lib dir to the end of the library dirs so it is searched last.
+        # Raises AssertionError if there is not exactly one python lib dir.
         super()._finalize_options()
         if config.is_fbcode():
             # Re-order library search paths in case there are lib conflicts
@@ -2288,6 +2474,7 @@ class CppTorchDeviceOptions(CppTorchOptions):
 def get_name_and_dir_from_output_file_path(
     file_path: str,
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits an output file path into its base name without extension and its directory; returns (name, dir).
     """
     This function help prepare parameters to new cpp_builder.
     Example:
@@ -2310,6 +2497,10 @@ def get_name_and_dir_from_output_file_path(
 
 
 class CppBuilder:
+    # [CLASS DOC] Builds a shared library, object, precompiled header or preprocessed output from sources using a BuildOptionsBase.
+    # State: formatted argument strings for each option group, the output target file path, the output flag, the sources
+    # argument and flags. The constructor does all formatting; get_command_line assembles the command, build runs it, and
+    # save_*_to_cmake methods emit equivalent CMake content. Windows syntax is used on Windows, GNU style elsewhere.
     """
     CppBuilder is a cpp jit builder, and it supports both Windows, Linux and MacOS.
     Args:
@@ -2328,24 +2519,28 @@ class CppBuilder:
 
     @staticmethod
     def __get_python_module_flags() -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: returns the python module extension and output flag (.pyd and /Fe on Windows, .so and -o otherwise).
         extension = ".pyd" if _IS_WINDOWS else ".so"
         output_flags = "/Fe" if _IS_WINDOWS else "-o"
         return extension, output_flags
 
     @staticmethod
     def __get_object_flags() -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: returns the object file extension and compile-output flag.
         extension = ".obj" if _IS_WINDOWS else ".o"
         output_flags = "/c /Fo" if _IS_WINDOWS else "-c -o"  # codespell:ignore
         return extension, output_flags
 
     @staticmethod
     def __get_precompiled_header_flags() -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: returns the precompiled header extension (.gch for gcc, else .pch) and output flag.
         extension = ".pch" if _IS_WINDOWS or not is_gcc() else ".gch"
         output_flags = "/Fp" if _IS_WINDOWS else "-o"
         return extension, output_flags
 
     @staticmethod
     def __get_preprocessor_output_flags() -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: returns the preprocessed output extension and flags.
         extension = ".i"
         output_flags = "/EP /P" if _IS_WINDOWS else "-E -P -o"
         return extension, output_flags
@@ -2357,6 +2552,10 @@ class CppBuilder:
         BuildOption: BuildOptionsBase,
         output_dir: str = "",
     ) -> None:
+        # [FUNCTION DOC] Formats all option groups into argument strings (platform specific syntax), picks the output extension and flag based
+        # on mode, computes the target file path, and handles sources (relative paths for fbcode remote builds, precompile mode with
+        # exactly one source). Raises AssertionError if more than one mode is set, if precompiling on Windows, or if
+        # precompiling without exactly one source. Warns and ignores precompiled headers on Windows.
         self._compiler = ""
         self._cflags_args = ""
         self._definitions_args = ""
@@ -2512,6 +2711,8 @@ class CppBuilder:
             self._passthrough_parameters_args += f"{passthrough_arg} "
 
     def get_command_line(self) -> str:
+        # [FUNCTION DOC] Returns the full compiler command line string assembled from the stored argument strings (Windows or GNU ordering; link
+        # arguments appended only when linking).
         def format_build_command(
             compiler: str,
             sources: str,
@@ -2524,6 +2725,7 @@ class CppBuilder:
             passthrough_args: str,
             output: str,
         ) -> str:
+            # [FUNCTION DOC] HELPER: formats the command string from the argument strings in platform-specific order; adds link part when linking.
             if _IS_WINDOWS:
                 # https://learn.microsoft.com/en-us/cpp/build/walkthrough-compile-a-c-program-on-the-command-line?view=msvc-1704
                 # https://stackoverflow.com/a/31566153
@@ -2558,9 +2760,12 @@ class CppBuilder:
         return command_line
 
     def get_target_file_path(self) -> str:
+        # [FUNCTION DOC] Returns the target file path with Windows path separator normalization.
         return normalize_path_separator(self._target_file)
 
     def _stage_passthrough_paths(self, args: list[str]) -> list[str]:
+        # [FUNCTION DOC] HELPER: for fbcode remote builds rewrites absolute file paths in passthrough args to base names, records them in the source
+        # list for staging, and adds rpath entries for staged shared libraries. Returns args unchanged otherwise.
         """For fbcode remote builds, treat any absolute file path that appears
         as a passthrough arg (e.g. precompiled .so kernels passed in via
         ``extra_flags``) the same way as a source: stage the file into the
@@ -2600,6 +2805,10 @@ class CppBuilder:
     def build_fbcode_re(
         self,
     ) -> None:
+        # [FUNCTION DOC] Builds remotely in fbcode: copies the linker script, sources, torch includes and any precompiled header into a temp
+        # directory, runs the build command there and copies the output back with suitable permissions. Raises
+        # exc.CppCompileError on subprocess failure and RuntimeError via the build command.
+        # KNOWN ISSUE: relies on the fbcode-only build command helper, which is undefined (NameError) outside fbcode.
         with dynamo_timed("compile_file"):
             command = shlex.split(self.get_command_line())
             try:
@@ -2665,6 +2874,8 @@ class CppBuilder:
                 raise exc.CppCompileError(command, e.output.decode("utf-8")) from e
 
     def build(self) -> None:
+        # [FUNCTION DOC] Runs the build. With relative paths delegates to the fbcode remote build; else creates the output and a temporary build
+        # directory, runs the command there and removes the temporary directory afterwards. Raises CppCompileError on failure.
         """
         It is must need a temporary directory to store object files in Windows.
         After build completed, delete the temporary directory to save disk space.
@@ -2687,6 +2898,8 @@ class CppBuilder:
         cmake_path: str,
         device_type: str,
     ) -> None:
+        # [FUNCTION DOC] Writes (overwrites) the CMake file with project setup, library target, compile definitions and flags (torch or standalone
+        # variants) and, for cuda or xpu, a function that embeds GPU kernels as objects via objcopy. Uses the stored option strings.
         """
         Save global cmake settings here, e.g. compiler options.
         If targeting CUDA, also emit a custom function to embed CUDA kernels.
@@ -2869,12 +3082,15 @@ class CppBuilder:
             f.write(contents)
 
     def save_src_to_cmake(self, cmake_path: str, src_path: str) -> None:
+        # [FUNCTION DOC] Appends a target_sources line for the source file's base name to the CMake file.
         # Remove the directory part of file_path
         src_path = "${CMAKE_CURRENT_SOURCE_DIR}/" + Path(src_path).name
         with open(cmake_path, "a") as f:
             f.write(f"target_sources({self._target_name} PRIVATE {src_path})\n")
 
     def save_kernel_asm_to_cmake(self, cmake_path: str, asm_files: list[str]) -> None:
+        # [FUNCTION DOC] Appends kernel embed calls for each asm file (by base name) to the CMake file plus dependency and link lines.
+        # KNOWN ISSUE: TODO in code: only works for CUDA style kernels so far.
         # TODO: make this work beyond CUDA
         with open(cmake_path, "a") as f:
             for asm_file in asm_files:
@@ -2893,6 +3109,7 @@ class CppBuilder:
                 )
 
     def save_link_cmd_to_cmake(self, cmake_path: str) -> None:
+        # [FUNCTION DOC] Appends link options and libraries to the CMake file. Raises AssertionError if the file does not already exist.
         lflags = " ".join(self._build_option.get_ldflags())
         libs = " ".join(self._build_option.get_libraries())
         contents = textwrap.dedent(
@@ -2914,7 +3131,10 @@ class CppBuilder:
 
 
 def run_asm_build_object(src: str, target: str, cwd: str) -> None:
+    # [FUNCTION DOC] Assembles an assembly source into an object file using the proper assembler (ml64 on Windows, else the C++ compiler or
+    # gcc for the Intel compiler) via the compile command runner in the given working directory.
     def get_asm_compiler() -> str:
+        # [FUNCTION DOC] HELPER: returns the assembler command: ml64 on Windows, otherwise the detected C++ compiler (gcc if it is Intel).
         if _IS_WINDOWS:
             ASM_CC = "ml64"
         else:
@@ -2925,6 +3145,7 @@ def run_asm_build_object(src: str, target: str, cwd: str) -> None:
         return ASM_CC
 
     def get_command_line(asm_cc: str, src: str, target: str) -> str:
+        # [FUNCTION DOC] HELPER: returns the assemble command string for the platform with normalized paths already supplied.
         if _IS_WINDOWS:
             # Format reference:
             # https://learn.microsoft.com/en-us/cpp/assembler/masm/ml-and-ml64-command-line-reference?view=msvc-170

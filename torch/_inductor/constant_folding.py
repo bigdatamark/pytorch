@@ -1,3 +1,7 @@
+# [MODULE DOC] Constant folding support for inductor FX graphs. Provides a ConstantFolder interpreter that finds nodes
+# computable from constants, helpers to replace nodes with frozen constants, to tag graph nodes as constant/main
+# module (for runtime weight updates), and to extract the constant-only subgraph. No import-time side effects
+# beyond defining the aten alias, tag strings and an empty module-level list of ops that must not be folded.
 import collections
 import typing_extensions
 from collections.abc import Callable
@@ -22,11 +26,13 @@ _dont_constant_fold: list[torch.fx.node.Target] = []
 
 
 def add_dont_constant_fold(op: torch.fx.node.Target) -> None:
+    # [FUNCTION DOC] Registers an op target so that constant folding never folds it. Mutates the module-level list; no return.
     global _dont_constant_fold
     _dont_constant_fold.append(op)
 
 
 def clear_dont_constant_fold() -> None:
+    # [FUNCTION DOC] Empties the module-level list of ops excluded from constant folding.
     global _dont_constant_fold
     _dont_constant_fold.clear()
 
@@ -37,6 +43,10 @@ def replace_node_with_constant(
     constant: torch.Tensor | None = None,
     name: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Replaces an FX node in gm with a get_attr node (if constant is given) or a placeholder (lifted constant).
+    # Attribute name is the given name, else a fresh unique frozen-param name using a counter stored on gm.
+    # Rewires all users, copies node meta and name, erases the old node, and for real constants registers it as a
+    # buffer/attribute on gm and marks it as a frozen param. Mutates gm in place; returns nothing.
     g = gm.graph
 
     if name:
@@ -76,10 +86,15 @@ def replace_node_with_constant(
 def is_const_source(
     node: torch.fx.Node, lifted_constant_names: list[str] | None
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the node is a get_attr node or its name is among the lifted constant names (may be None).
     return node.op == "get_attr" or node.name in (lifted_constant_names or ())
 
 
 class ConstantFolder(torch.fx.Interpreter):
+    # [CLASS DOC] Interpreter that runs a graph with sentinel values to discover which nodes are constant-foldable.
+    # State: node_replacements maps nodes to computed constant tensors; replaced_uses counts folded consumers per input;
+    # unknown_value marks non-constant results; deferred_value marks lifted constants with no concrete value yet.
+    # Key methods: run_node (per-node folding decision), is_impure, run.
     def __init__(
         self,
         gm: torch.fx.GraphModule,
@@ -87,6 +102,9 @@ class ConstantFolder(torch.fx.Interpreter):
         lifted_constant_names: list[str] | None = None,
         skip_folding_node_fn: Callable[[torch.fx.Node], bool] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the interpreter on gm and the tracking state. skip_constructors skips nodes without tensor inputs;
+        # lifted_constant_names enables value-less mode where lifted constants are treated as deferred;
+        # skip_folding_node_fn optionally vetoes nodes. Computes last-use table to free env values early.
         super().__init__(gm)
         self.node_replacements: dict[torch.fx.Node, Any] = {}
         self.replaced_uses: dict[torch.fx.Node, int] = collections.Counter()
@@ -101,10 +119,14 @@ class ConstantFolder(torch.fx.Interpreter):
         self.skip_folding_node_fn = skip_folding_node_fn
 
     def _support_dynamic_shape(self) -> bool:
+        # [FUNCTION DOC] Returns False: dynamic shapes are not supported by the constant folder.
         # ConstantFolder not support dynamic shape now
         return False
 
     def _deduce_value(self, node: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] Computes the value of a node. Without lifted constant names, runs the node for real. Otherwise no concrete
+        # values exist: returns unknown_value if the skip function vetoes the node or any Node input is neither a lifted
+        # constant nor deferred; else returns deferred_value.
         if self.lifted_constant_names is None:
             return super().run_node(node)
         # if lifted_constant_names is passed in, no concrete value is available
@@ -122,7 +144,11 @@ class ConstantFolder(torch.fx.Interpreter):
         return self.deferred_value
 
     def is_impure(self, node: torch.fx.node.Node) -> bool:
+        # [FUNCTION DOC] Returns True if folding this node should be avoided: int8 weight dequant-to-bf16 patterns (optionally via
+        # permute) on constant sources, quantized_decomposed dequantize/convert ops, or targets registered in the
+        # do-not-fold list. Otherwise False.
         def is_woq_int8_pattern(node: torch.fx.node.Node) -> bool:
+            # [FUNCTION DOC] HELPER: True if node converts an int8 tensor (per its meta val) to bfloat16 via convert_element_type.
             return (
                 node.target is torch.ops.prims.convert_element_type.default  # type: ignore[return-value]
                 and isinstance(node.args[0], torch.fx.Node)
@@ -166,6 +192,9 @@ class ConstantFolder(torch.fx.Interpreter):
         return False
 
     def node_to_last_non_output_use(self) -> dict[torch.fx.Node, list[torch.fx.Node]]:
+        # [FUNCTION DOC] Builds a mapping from each node to the list of input nodes whose last non-output use is that node, scanning
+        # the graph in reverse; also adds nodes used only by the output to their own list so they are freed immediately.
+        # Returns the mapping. Used to drop interpreter env entries early.
         last_non_output_use = collections.defaultdict(list)
         seen_uses = OrderedSet[torch.fx.Node]()
         output_node = next(iter(reversed(self.module.graph.nodes)))  # type: ignore[arg-type, union-attr]
@@ -175,6 +204,7 @@ class ConstantFolder(torch.fx.Interpreter):
                 continue
 
             def add_use(inp: torch.fx.Node) -> None:
+            # [FUNCTION DOC] HELPER: records inp as a last use of the current node if not already seen.
                 if inp in seen_uses:
                     return
 
@@ -192,10 +222,16 @@ class ConstantFolder(torch.fx.Interpreter):
 
     @typing_extensions.override
     def run_node(self, node: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] Interpreter hook deciding the value for one node. Output nodes: mark their args unknown and defer to base class.
+        # Returns unknown_value for nodes with unknown inputs, zero tensors, triton wrapper nodes, skipped constructors,
+        # seeded nondeterministic ops and higher-order ops. Otherwise obtains a value; for foldable non-source tensors
+        # (not meta, passing insertable check, not impure) records a replacement, counts input uses, and cancels
+        # replacements of inputs whose every use was folded. Returns the computed value.
         if node.target == "output":
             # because we remove nodes from env on last non output use,
             # re-define them now or we'll get error in interpreter
             def set_env(arg: torch.fx.Node) -> None:
+            # [FUNCTION DOC] HELPER: marks arg as unknown in the interpreter environment.
                 self.env[arg] = self.unknown_value
 
             # In-place is fine since we don't mutate
@@ -298,17 +334,22 @@ class ConstantFolder(torch.fx.Interpreter):
         return out
 
     def insertable_tensor_check(self, tensor: torch.Tensor) -> bool:
+        # [FUNCTION DOC] Hook to veto folding of a tensor; base implementation always returns True.
         return True
 
     def add_node_replacement(self, node: torch.fx.Node, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Records tensor as the constant replacement for node.
         self.node_replacements[node] = tensor
 
     def run(self) -> Any:  # type: ignore[override]
+        # [FUNCTION DOC] Runs the interpreter with an initial environment where placeholders are unknown (and lifted constants deferred).
         env: dict[torch.fx.Node, Any] = {}
         self.insert_placerholder_values(env)
         return super().run(initial_env=env)
 
     def insert_placerholder_values(self, env: dict[torch.fx.Node, Any]) -> None:
+        # [FUNCTION DOC] Fills env: placeholders map to unknown_value; if lifted constant names were given, nodes with those names
+        # map to deferred_value. Mutates env in place.
         for n in self.module.graph.find_nodes(op="placeholder"):  # type: ignore[operator, union-attr]
             env[n] = self.unknown_value  # type: ignore[assignment]
         if self.lifted_constant_names is None:
@@ -322,6 +363,9 @@ def constant_fold(
     gm: torch.fx.GraphModule,
     constraint_fn: Callable[[torch.fx.Node], bool] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Constant folds gm in place with dispatch modes disabled: runs ConstantFolder (skipping constructors), replaces
+    # each replaceable node (subject to optional constraint_fn) with a frozen constant, removes unused get_attr
+    # nodes and their attributes, eliminates dead code, lints and recompiles. Returns nothing.
     with torch.utils._python_dispatch._disable_current_modes():
         cf = ConstantFolder(gm, skip_constructors=True)
         cf.run()
@@ -352,6 +396,8 @@ def constant_graph_tag(
     lifted_constant_names: list[str] | None = None,
     skip_folding_node_fn: Callable[[torch.fx.Node], bool] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Runs ConstantFolder on gm and tags every node's meta with a module tag: constant module for const sources and
+    # folded/folded-from nodes, main module otherwise (and for nodes vetoed by skip_folding_node_fn). Mutates meta.
     with torch.utils._python_dispatch._disable_current_modes():
         cf = ConstantFolder(
             gm,
@@ -381,6 +427,9 @@ def run_and_get_constant_graph(
     lifted_constant_names: list[str] | None = None,
     skip_folding_node_fn: Callable[[torch.fx.Node], bool] | None = None,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Tags gm, untags constants consumed by no foldable node (kept in main module), then copies constant-tagged nodes
+    # into a new graph whose outputs are nodes with main-module users. Returns a new GraphModule; gm is only
+    # tag-mutated.
     """
     Construct a GraphModule which corresponds to the part which could be
     constant folded in provided gm.
@@ -391,6 +440,7 @@ def run_and_get_constant_graph(
     )
 
     def untag(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: sets the node tag to main module unless some user is constant-tagged; returns whether it was used to fold.
         used_to_fold = False
         for u in node.users:
             if u.meta[META_TAG] == CONST_MODULE_TAG:
