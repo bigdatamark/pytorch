@@ -1,3 +1,9 @@
+# [MODULE DOC] Auto-generated serialized pattern-matcher graphs for scaled-dot-product-attention (SDPA) fusion, pattern number 3.
+# Matches the attention computation: query-key product divided by inv_scale_factor, softmax, dropout (random mask compared against dropout_p), then value product.
+# Module-level names (one per variant, e.g. training/inference, half precision, batch-size-1) are pattern objects built from
+# call-function expression nodes (extra pattern arguments: inv_scale_factor, dropout_p); training variants are multi-output patterns that also cover the backward graph.
+# Import-time side effects: only constructs pattern objects and imports torch and the pattern matcher; nothing is registered here.
+# Consumed by the SDPA pattern registration in the inductor fx_passes code, which replaces matches with the fused attention op. Do not edit by hand.
 # noqa: F401, E501
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
