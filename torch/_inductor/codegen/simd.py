@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] SIMD-style kernel codegen base layer for Inductor (shared by Triton and similar
+# backends). Defines the iteration range tree classes (IterationRangesRoot / IterationRangesEntry /
+# DerivedIterationRangesRoot) that map flattened tiled dimensions (x, y, z, r0_, r1_) onto loop-nest
+# indices, the SIMDKernel base class (index simplification, range splitting for fusion, mask
+# handling, kernel metrics), the SIMDScheduling class that decides tiling, fusion legality,
+# combo/mix-order kernels and drives kernel codegen from scheduler nodes, plus helpers such as
+# CantSplit, EnableReduction/DisableReduction handling and size/numel utilities. Import-time side
+# effects: creates module loggers (log, perf_hints, schedule, fusion), a shared PythonPrinter
+# expression printer (pexpr) and the all_prefixes ordered set; no other global mutation.
 from __future__ import annotations
 
 import collections
@@ -105,12 +114,19 @@ all_prefixes = OrderedSet(["z", "y", "x", "r0_", "r1_"])
 
 
 def get_max_tiles(default: int = 2) -> int:
+    # [FUNCTION DOC] Return the maximum number of tiled pointwise dimensions allowed: the
+    # triton.max_tiles config value if set, otherwise the supplied default (2).
     max_tiles = torch._inductor.config.triton.max_tiles
     return max_tiles if max_tiles is not None else default
 
 
 @dataclasses.dataclass
 class IterationRanges:
+    # [CLASS DOC] Base node of an iteration range tree: one tiled output dimension that several loop
+    # nests share. Attributes: name, var_list / var_ranges (shared with the root; symbols and their
+    # lengths), numel (elements covered below this node), prefix (x/y/z/r0_/r1_), divisor and length
+    # (how this node splits its parent's index), kernel (owning SIMDKernel) and root. All loop nests
+    # mapped onto one tree must iterate over the same total number of elements.
     """
     Each range tree represents multiple sets of iteration indexing
     in a single tiled dimension in the output kernel.
@@ -138,6 +154,8 @@ class IterationRanges:
         length=sympy.S.One,
         root: IterationRangesRoot,
     ) -> None:
+        # [FUNCTION DOC] Store the constructor arguments as attributes. Pure assignment; no
+        # validation.
         super().__init__()
         self.name = name
         self.var_list = var_list
@@ -152,19 +170,30 @@ class IterationRanges:
     @property
     @cache_property_on_self
     def is_reduction(self) -> bool:
+        # [FUNCTION DOC] Cached property: True when this tree's prefix denotes a reduction dimension
+        # (r0_, r1_).
         return prefix_is_reduction(self.prefix)
 
     def symbol(self) -> sympy.Symbol:
+        # [FUNCTION DOC] Return the sympy index symbol corresponding to this node's name.
         return sympy_index_symbol(self.name)
 
     @property
     @cache_property_on_self
     def symt(self) -> SymT:
+        # [FUNCTION DOC] Cached property: map this node's prefix back to its SymT symbol type via
+        # the inverse of the global prefix_str table. Raises KeyError for an unknown prefix.
         prefix_to_symt = {prefix: symt for symt, prefix in prefix_str.items()}
         return prefix_to_symt[self.prefix]
 
 
 class IterationRangesRoot(IterationRanges):
+    # [CLASS DOC] Root of an iteration range tree: one tiled dimension of the kernel (e.g. x or
+    # r0_). Holds the flat mapping nodes (index expression -> IterationRangesEntry), the program-id
+    # cache shared with templates, and the layout info: tensor_dim (axis on the tensors), grid_dim
+    # (axis of the launch grid), has_zdim, and is_loop (dimension is handled by a single program
+    # looping over the range; only legal for reduction trees without a grid dim). Entries are
+    # interned through lookup so equal splits share a variable.
     """
     Root of a iteration range tree that represents a single
     tiled dimension in the output kernel. It contains multiple
@@ -185,6 +214,9 @@ class IterationRangesRoot(IterationRanges):
         grid_dim: int | None,
         has_zdim: bool,
     ) -> None:
+        # [FUNCTION DOC] Initialize the root as its own root with empty var lists. Defaults
+        # pid_cache to a fresh dict. Raises AssertionError if is_loop is requested for something
+        # that is not a reduction without a grid dim.
         if pid_cache is None:
             pid_cache = {}
         super().__init__(
@@ -216,26 +248,38 @@ class IterationRangesRoot(IterationRanges):
         self.has_zdim = has_zdim
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: debug representation showing name and numel.
         return f"IterationRangesRoot({self.name!r}, {self.numel}, ...)"
 
     def block_size(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the symbolic block size for this tree: an integer-positive symbol
+        # named from the upper-cased prefix followed by BLOCK (e.g. XBLOCK, R0_BLOCK).
         return sympy.Symbol(f"{self.prefix.upper()}BLOCK", integer=True, positive=True)
 
     def block_size_str(self) -> str:
+        # [FUNCTION DOC] Return the block size symbol as a string.
         return str(self.block_size())
 
     def block_offset(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the symbol for the tile-local base offset of this tree (prefix
+        # followed by offset, e.g. xoffset); used when emitting the iteration range header.
         # iteration_ranges_codegen_header uses this to derive the tile-local
         # base index for the tree.
         return sympy.Symbol(f"{self.prefix}offset", integer=True, nonnegative=True)
 
     def mask_name(self) -> str:
+        # [FUNCTION DOC] Return the name of the mask variable for this tree (prefix followed by
+        # mask).
         return f"{self.prefix}mask"
 
     def owns_mask(self, mask_var: str) -> bool:
+        # [FUNCTION DOC] Return True if the given mask variable name is this tree's own mask.
         return mask_var == self.mask_name()
 
     def mask_shape(self, tensor_ndim: int) -> tuple[str, ...]:
+        # [FUNCTION DOC] Return the broadcast shape of this tree's mask as a tuple of strings: all
+        # ones with the block size string at the tree's tensor_dim; empty tuple when the tree has no
+        # tensor dim.
         if self.tensor_dim is None:
             return ()
 
@@ -244,22 +288,37 @@ class IterationRangesRoot(IterationRanges):
         return tuple(shape)
 
     def supports_constant_mask(self) -> bool:
+        # [FUNCTION DOC] Whether masks of this tree may be treated as constant when block sizes are
+        # fixed; always True for the plain root (derived roots override).
         return True
 
     def has_custom_codegen_header(self) -> bool:
+        # [FUNCTION DOC] Whether the tree needs a custom codegen header instead of the standard one;
+        # False here.
         return False
 
     def named_constants(self) -> tuple[tuple[sympy.Symbol, sympy.Expr, bool], ...]:
+        # [FUNCTION DOC] Return extra named constants (symbol, expression, flag) the header must
+        # define; empty here.
         return ()
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Clear the cached codegen results of every entry of this tree. Side effect
+        # on each node.
         for node in self.nodes.values():
             node.cache_clear()
 
     def index_sym(self) -> sympy.Symbol:
+        # [FUNCTION DOC] Return the sympy index symbol for the whole tree (prefix followed by index,
+        # e.g. xindex).
         return sympy_index_symbol(f"{self.prefix}index")
 
     def lookup(self, divisor: sympy.Expr, length: sympy.Expr) -> IterationRangesEntry:
+        # [FUNCTION DOC] Find or create the entry that extracts a (divisor, length) slice of this
+        # tree's index. Uses a floor division when divisor times length statically equals numel,
+        # else a modular indexing expression. New entries get a fresh name from the kernel's
+        # iteration variable counter and are registered in the kernel's range_tree_nodes, this
+        # tree's var_list, var_ranges and nodes (side effects). Returns the entry.
         """
         Lookup a given RangeTreeEntry, creating it if needed
         """
@@ -283,6 +342,8 @@ class IterationRangesRoot(IterationRanges):
         return self.nodes[expr]
 
     def full_range(self) -> IterationRangesEntry:
+        # [FUNCTION DOC] Return the canonical entry covering the whole unsplit range (divisor 1,
+        # length numel), interning it like any other split entry.
         """Return the canonical entry for this root's unsplit logical index.
 
         This is ``lookup(1, numel)``, so the entry is interned in
@@ -293,6 +354,9 @@ class IterationRangesRoot(IterationRanges):
     def construct_entries(
         self, lengths: list[sympy.Expr]
     ) -> list[IterationRangesEntry]:
+        # [FUNCTION DOC] Build entries for a list of lengths, treating the list as row-major
+        # dimensions: the last length gets divisor 1 and earlier ones accumulate divisors. Returns
+        # entries in the original order.
         divisor = sympy.S.One
         itervars = []
         for length in reversed(lengths):
@@ -301,14 +365,22 @@ class IterationRangesRoot(IterationRanges):
         return [*reversed(itervars)]
 
     def construct(self, lengths: list[sympy.Expr]) -> list[sympy.Symbol]:
+        # [FUNCTION DOC] Same as construct_entries but returns the entries' symbols.
         return [e.symbol() for e in self.construct_entries(lengths)]
 
     def vars_and_sizes(
         self, index: sympy.Expr
     ) -> tuple[list[sympy.Symbol], list[sympy.Expr]]:
+        # [FUNCTION DOC] Determine the index variables of this tree that appear in the given index
+        # expression and their sizes. Used vars are sorted by divisor, gaps between consecutive
+        # divisors and any trailing remainder are filled with extra looked-up entries so the sizes
+        # multiply to numel. Returns (vars, sizes), both reversed so the entry with the largest
+        # divisor (outermost) comes first.
         """Figure out vars from this tree used in index"""
 
         def get_sort_key(x: IterationRangesEntry) -> tuple[int, bool]:
+            # [FUNCTION DOC] HELPER: sort key for entries: (hint of divisor, whether length is not
+            # one) so that length-one nodes sort before others with the same divisor.
             """
             Gets the key for sorting nodes. When two nodes have the
             same divisor, the node with length as 1 should be handled
@@ -328,6 +400,8 @@ class IterationRangesRoot(IterationRanges):
         sizes = []
 
         def add(node):
+            # [FUNCTION DOC] HELPER: append a node's symbol and length to the result lists and
+            # multiply the running divisor.
             nonlocal divisor
             index_vars.append(node.symbol())
             sizes.append(node.length)
@@ -347,6 +421,10 @@ class IterationRangesRoot(IterationRanges):
 
 
 class IterationRangesEntry(IterationRanges):
+    # [CLASS DOC] A split entry of an iteration range tree: a variable equal to a floor-div or
+    # modular slice of the root's index. State: parent, expr (the defining index expression),
+    # divisor/length, and a cached codegen callable that emits the variable definition into the
+    # kernel once (cache is clearable). Hash and equality are by name.
     def __init__(
         self,
         name: str,
@@ -355,6 +433,9 @@ class IterationRangesEntry(IterationRanges):
         expr: sympy.Expr,
         parent: IterationRanges,
     ) -> None:
+        # [FUNCTION DOC] Initialize from the parent tree: numel is the parent numel divided by
+        # length; shares the parent's var_list/var_ranges/prefix/kernel/root. Creates a memoized
+        # codegen wrapper around _codegen.
         super().__init__(
             name=name,
             numel=parent.numel / length,
@@ -371,21 +452,34 @@ class IterationRangesEntry(IterationRanges):
         self.expr = expr
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: debug representation with name, divisor, length, expr and
+        # var_ranges.
         return f"IterationRangesEntry({self.name}, {self.divisor}, {self.length}, {self.expr}, {self.var_ranges})"
 
     def set_name(self, name: str) -> None:
+        # [FUNCTION DOC] Rename this entry and make codegen return the name without emitting any
+        # definition (used when the variable is already defined elsewhere). Mutates name and
+        # codegen.
         self.codegen = lambda: name  # type: ignore[assignment]
         self.codegen.cache_clear = lambda: None  # type: ignore[method-assign]
         self.name = name
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Reset the memoized codegen so the variable definition will be emitted
+        # again.
         self.codegen.cache_clear()
 
     def _codegen(self) -> str:
+        # [FUNCTION DOC] HELPER: ask the current kernel to emit the definition of this entry and
+        # return its name.
         V.kernel.codegen_iteration_ranges_entry(self)
         return self.name
 
     def precomputed_args(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] For dynamic shapes, collect sub-expressions of the divisor/length arguments
+        # that are non-trivial expressions built only from size symbols; these should be computed on
+        # the host and passed in. Returns an empty list for plain symbol entries. Raises
+        # AssertionError if expr is neither a FloorDiv nor a ModularIndexing expression.
         # for dynamic shapes, find parts of indexing expressions that have to be precomputed
         precomputed_args: list[sympy.Expr] = []
         if isinstance(self.expr, sympy.Symbol):
@@ -402,15 +496,26 @@ class IterationRangesEntry(IterationRanges):
         return precomputed_args
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash by name.
         return hash(self.name)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equality by name.
+        # KNOWN ISSUE: raises AssertionError instead of returning NotImplemented/False when compared
+        # to a non-IterationRangesEntry object, so comparing against other types (e.g. in
+        # containers) fails.
         if not isinstance(other, IterationRangesEntry):
             raise AssertionError(f"expected IterationRangesEntry, got {type(other)}")
         return self.name == other.name
 
 
 class DerivedIterationRangesRoot(IterationRangesRoot):
+    # [CLASS DOC] A root with reduced numel and block size derived from a parent tree, used for the
+    # grouped reduction output (e.g. parent numel 1024 with local reduction size 128 gives a derived
+    # root of 8 groups). It shares the parent's loop flag, prefix, index and program-id cache but
+    # stores its own block size, block offset and named constants, so grouped results can be stored
+    # at reduced resolution inside the parent's reduction loop. Its masks are always explicit and it
+    # needs a custom codegen header.
     """A root with reduced numel/block_size derived from a parent tree.
 
     Used for the grouped reduction output: if the parent R tree covers 1024
@@ -435,6 +540,9 @@ class DerivedIterationRangesRoot(IterationRangesRoot):
         name_suffix: str = "reduced",
         named_constants: tuple[tuple[sympy.Symbol, sympy.Expr, bool], ...] = (),
     ) -> None:
+        # [FUNCTION DOC] Build the derived root named from name_suffix and the parent name, copying
+        # loop/grid/tensor layout from the parent, and record the given block size, block offset and
+        # named constants.
         super().__init__(
             name=f"{name_suffix}_{parent.name}",
             numel=numel,
@@ -457,30 +565,39 @@ class DerivedIterationRangesRoot(IterationRangesRoot):
         self._named_constants = named_constants
 
     def block_size(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the stored derived block size expression.
         return self._block_size
 
     def block_offset(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the stored derived block offset expression.
         return self._block_offset
 
     def index_sym(self) -> sympy.Symbol:
+        # [FUNCTION DOC] Return the index symbol named after this derived root's own name.
         return sympy_index_symbol(self.name)
 
     def mask_name(self) -> str:
+        # [FUNCTION DOC] Return the mask variable name: the root name followed by mask.
         return f"{self.name}_mask"
 
     def supports_constant_mask(self) -> bool:
+        # [FUNCTION DOC] Always False: derived block sizes are expressions, so masks stay explicit.
         # Derived roots use expressions like R0_BLOCK // G rather than
         # fixed-config block keys, so keep their masks explicit.
         return False
 
     def named_constants(self) -> tuple[tuple[sympy.Symbol, sympy.Expr, bool], ...]:
+        # [FUNCTION DOC] Return the named constants supplied at construction.
         return self._named_constants
 
     def has_custom_codegen_header(self) -> bool:
+        # [FUNCTION DOC] Always True: derived roots emit their own header.
         return True
 
 
 def constant_repr(value: int | float) -> str:
+    # [FUNCTION DOC] Return Python source text for a numeric constant, spelling infinities and NaN
+    # as float(...) calls with string arguments and using repr otherwise.
     if value == float("inf"):
         return 'float("inf")'
     elif value == float("-inf"):
@@ -495,12 +612,18 @@ CSEVariableType = TypeVar("CSEVariableType", bound=CSEVariable, default=CSEVaria
 
 @dataclasses.dataclass
 class PartialAccumulate:
+    # [CLASS DOC] Record of a deferred partial accumulation: buffer_name, reduction_type and the
+    # value to accumulate. Plain data holder collected in the kernel's saved_partial_accumulate
+    # list.
     buffer_name: str
     reduction_type: str
     value: Any
 
 
 class NodeInfo(NamedTuple):
+    # [CLASS DOC] Immutable record of pre-computed information per node group used for combo kernel
+    # partitioning: node_schedule, tiling, tiling_scores, numel, rnumel, features and whether the
+    # reduction is persistent.
     """
     Pre-computed node information for combo kernel partitioning.
     """
@@ -515,6 +638,12 @@ class NodeInfo(NamedTuple):
 
 
 class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
+    # [CLASS DOC] Common base class for Triton/Halide style kernels that use flattened indexing
+    # rather than loop nests. Holds the kernel features, the numels per tiling prefix, the list of
+    # IterationRangesRoot trees and the range_tree_nodes map, the code buffers (body,
+    # indexing_code), flags such as inside_reduction, persistent_reduction, cooperative_reduction,
+    # mix_order_reduction and is_native_matmul, plus a cached simplify_indexing function. Backends
+    # subclass and implement codegen_kernel, call_kernel and friends.
     """
     Common base class for Triton/Halide codegen which both use flattened indexing rather than loop nests.
     """
@@ -535,6 +664,11 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         tiling_scores: dict[str, sympy.Expr] | None = None,
         mix_order_reduction: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize kernel state from tiling and features: buffers, simplified
+        # numels, range trees, reduction flags (overrides win over the should_use_* hooks), native
+        # matmul detection (any dot reduction node when config enabled), the cached
+        # simplify_indexing closure, index dtype and split/min block defaults. Side effect: creates
+        # range trees via initialize_range_tree.
         if pid_cache is None:
             pid_cache = {}
         super().__init__()
@@ -580,6 +714,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         # define this in a closure to make cache local to object
         @functools.cache
         def simplify_indexing(index: sympy.Expr):
+            # [FUNCTION DOC] HELPER: cached closure that simplifies an index with the current
+            # ranges, merges contiguous dims in every tree and combines modular indexing pairs.
+            # Cache is per kernel object.
             index = V.graph.sizevars.simplify_with_ranges(index, self.var_ranges())
             for tree in self.range_trees:
                 index = self.combine_contiguous_dims(index, tree)
@@ -605,6 +742,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         prologue_preserves_zero_mask_fn,
         render,
     ) -> str:
+        # [FUNCTION DOC] Hook for generating template source with fused prologues/epilogues; the
+        # base implementation raises NotImplementedError. Subclasses (e.g. the Triton template
+        # kernel) provide the real behavior.
         """Generate template source code with fused prologues and epilogues.
 
         Subclasses override this to implement custom code generation.
@@ -614,6 +754,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         raise NotImplementedError
 
     def get_unfused_epilogues(self) -> list[Any]:
+        # [FUNCTION DOC] Return epilogue nodes that were not fused and need separate codegen; the
+        # base returns an empty list.
         """Return epilogue nodes that were not fused into the kernel.
 
         These nodes need separate codegen (via ``call_kernel``) and must
@@ -626,9 +768,14 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return []
 
     def _get_store_output_subgraph_name(self, i: int) -> str:
+        # [FUNCTION DOC] HELPER: placeholder name string for the i-th store-output subgraph.
         return f"<STORE_OUTPUT_{i}>"
 
     def get_store_output_count(self):
+        # [FUNCTION DOC] Return the number of store outputs seen so far from the counter.
+        # KNOWN ISSUE: after taking the next value it recreates the counter starting at total minus
+        # 1, so repeated calls do not increase monotonically (they return 0, -1, -2, ...); likely
+        # intended to peek without consuming.
         total = next(self.store_output_ctr)
         self.store_output_ctr = itertools.count(start=total - 1, step=1)
         return total
@@ -636,19 +783,26 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     @property
     @cache_property_on_self
     def num_reduction_dims(self) -> int:
+        # [FUNCTION DOC] Cached property: number of reduction prefixes among the kernel numels.
         return sum(prefix_is_reduction(prefix) for prefix in self.numels)
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Convert a torch dtype to the backend type string; backends must override
+        # (raises NotImplementedError).
         raise NotImplementedError
 
     def get_index_dtype_as_torch_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Return the index dtype chosen from the features as a torch dtype.
         return self._index_dtype
 
     @property
     def index_dtype(self) -> str:
+        # [FUNCTION DOC] Property: index dtype as the backend string via dtype_to_str.
         return self.dtype_to_str(self.get_index_dtype_as_torch_dtype())
 
     def want_no_x_dim(self) -> bool:
+        # [FUNCTION DOC] Whether the kernel drops the x dimension; False by default, subclasses may
+        # override.
         return False
 
     def construct_range_trees(
@@ -659,12 +813,19 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         numels: dict[str, sympy.Expr],
         no_x_dim: bool,
     ) -> list[IterationRangesRoot]:
+        # [FUNCTION DOC] Create the IterationRangesRoot list for the active prefixes (those present
+        # in numels, ordered by all_prefixes). Decides tensor dims (reduction-only if no_x_dim,
+        # pointwise-only if there is no reduction, else pointwise then reduction) and grid dims (x,
+        # y, z), marks reduction trees as loops when the reduction is not persistent, and returns
+        # the trees.
         active_prefixes = OrderedSet(
             prefix for prefix in all_prefixes if prefix in numels
         )
         no_r_dim = not inside_reduction or not is_reduction
 
         def filtered_index_map(seq, mask) -> dict[Any, int]:
+            # [FUNCTION DOC] HELPER: map each element of a sequence that is in the mask to its
+            # position among kept elements.
             return {
                 val: idx for idx, val in enumerate(val for val in seq if val in mask)
             }
@@ -707,6 +868,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return range_trees
 
     def initialize_range_tree(self, pid_cache: dict[str, str]) -> None:
+        # [FUNCTION DOC] Build range trees from kernel state and append them to range_trees.
         range_trees = self.construct_range_trees(
             pid_cache,
             self.inside_reduction,
@@ -717,12 +879,16 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self.range_trees.extend(range_trees)
 
     def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
+        # [FUNCTION DOC] Hook called before codegen with all indices used in the fused kernel; no-op
+        # by default.
         """
         Hook called right before codegen with every index that will be
         used in the fused kernel.
         """
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        # [FUNCTION DOC] Store a reduction result: temporarily clears inside_reduction, delegates to
+        # store, and restores the flag even on error. Returns whatever store returns.
         prior = self.inside_reduction
         self.inside_reduction = False
         try:
@@ -731,12 +897,18 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             self.inside_reduction = prior
 
     def should_use_cooperative_reduction(self) -> bool:
+        # [FUNCTION DOC] Hook: whether to use a cooperative reduction; False here, subclasses
+        # override.
         return False  # defined in subclass
 
     def should_use_persistent_reduction(self) -> bool:
+        # [FUNCTION DOC] Hook: whether to use a persistent reduction; False here, subclasses
+        # override.
         return False  # defined in subclass
 
     def var_ranges(self) -> dict[sympy.Symbol, sympy.Expr]:
+        # [FUNCTION DOC] Return a single mapping of all index variable symbols to their ranges
+        # across all trees.
         return dict(
             itertools.chain.from_iterable(
                 tree.var_ranges.items() for tree in self.range_trees
@@ -744,6 +916,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         )
 
     def combine_modular_indexing_pairs(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] If the index is a modular indexing of a known tree variable, substitute
+        # that variable's defining expression, let sizevars combine nested modular pairs, then map
+        # the root index back to the full range symbol. Otherwise return the index unchanged.
         if not isinstance(index, ModularIndexing):
             return index
         x = index.args[0]
@@ -760,6 +935,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def combine_contiguous_dims(
         self, index: sympy.Expr, tree: IterationRangesRoot
     ) -> sympy.Expr:
+        # [FUNCTION DOC] Merge contiguous dimensions of an index within one tree. When the index is
+        # a sum containing floor divisions, first try expanding the floor division and process the
+        # numerator, re-wrapping with the denominator; otherwise delegate to
+        # _combine_contiguous_dims. Returns the simplified expression.
         if isinstance(index, sympy.Add) and index.has(FloorDiv):
             candidate_vars, _ = tree.vars_and_sizes(index)
         else:
@@ -773,6 +952,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def _combine_contiguous_dims(
         self, index: sympy.Expr, tree: IterationRangesRoot
     ) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: aggressive merge of contiguous dims. Gets the tree's vars and sizes
+        # for the index, asks sizevars to simplify the loop sizes (without reordering) and, if sizes
+        # changed, rebuilds the index with new variables. Integers/symbols and single-size cases are
+        # returned unchanged.
         """
         More aggressive simplification to merge contiguous dims
         """
@@ -791,10 +974,17 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return new_index
 
     def disable_reduction(self) -> contextlib.AbstractContextManager[None]:
+        # [FUNCTION DOC] Return a context manager that temporarily leaves the reduction. If the
+        # kernel has no reduction it just yields (and asserts not inside_reduction). Otherwise, for
+        # loop or cooperative reductions it flushes the body before and after, sets inside_reduction
+        # false inside the context and always sets it back to true on exit. Raises AssertionError on
+        # inconsistency.
         should_flush = self.range_trees[-1].is_loop or self.cooperative_reduction
 
         @contextlib.contextmanager
         def ctx():
+            # [FUNCTION DOC] HELPER: the generator implementing the context manager returned by
+            # disable_reduction.
             if not self.features.is_reduction():
                 if self.inside_reduction:
                     raise AssertionError("expected not self.inside_reduction")
@@ -816,6 +1006,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return ctx()
 
     def set_ranges(self, *lengths: sympy.Expr) -> list[sympy.Symbol]:
+        # [FUNCTION DOC] Create index variables for each range tree from per-tree length lists.
+        # Returns one list of symbols per tree. Raises AssertionError if the number of length lists
+        # differs from the number of trees.
         if len(lengths) != len(self.range_trees):
             raise AssertionError(
                 f"expected len(lengths) == len(self.range_trees), "
@@ -832,6 +1025,13 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     ) -> tuple[
         list[list[sympy.Expr]], list[list[Callable[[list[sympy.Expr]], sympy.Expr]]]
     ]:
+        # [FUNCTION DOC] HELPER: split node iteration lengths over the kernel groups. Greedily
+        # assigns each length to the current group, splitting a length across two or three
+        # consecutive groups when it exceeds the remaining extent (requires divisibility), skipping
+        # groups fully consumed. Returns the new per-group ranges and, for each length group,
+        # getters that reconstruct each original variable from the flat new variables. Raises
+        # CantSplit when a length cannot be tiled or non-unit extents remain. Empty lengths yield
+        # empty results.
         # Special case: if a node's sizes are ([], []), there's nothing to split.
         if all(len(length) == 0 for length in lengths):
             return [[] for group in groups], []
@@ -842,6 +1042,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         var_count = itertools.count()
 
         def add_range(i: int, expr: sympy.Expr) -> int:
+            # [FUNCTION DOC] HELPER: carve a range of the given extent out of group i, requiring
+            # divisibility of what remains (raises CantSplit), update remaining, record it and
+            # return its new variable index.
             expr = sv.simplify(expr)
             if not sv.statically_known_multiple_of(remaining[i], expr):
                 raise CantSplit(remaining[i], expr)
@@ -853,6 +1056,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         def make_combined(
             sizes: list[sympy.Expr], idxs: list[int]
         ) -> Callable[[list[sympy.Expr]], sympy.Expr]:
+            # [FUNCTION DOC] HELPER: build a getter that combines variables at the given indices
+            # into one nested mixed-radix expression using the sizes. Raises AssertionError unless
+            # there is exactly one more index than sizes.
             """
             Builds the nested expression:
               ((...((s1*v[i1] + v[i2]) * s2 + v[i3]) ... ) * sk + v[i(k+1)])
@@ -864,6 +1070,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                 )
 
             def getter(flat_vars: list[sympy.Expr]) -> sympy.Expr:
+                # [FUNCTION DOC] HELPER: fold the selected flat variables into the combined value
+                # using the radix sizes.
                 expr = flat_vars[idxs[0]]
                 for s, idx in zip(sizes, idxs[1:]):
                     expr = s * expr + flat_vars[idx]
@@ -982,6 +1190,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         lengths: Sequence[Sequence[sympy.Expr]],
         reduction_numel: sympy.Expr = sympy.S.One,
     ) -> Sequence[Sequence[sympy.Expr]]:
+        # [FUNCTION DOC] If the lengths have an empty reduction part but the groups' total equals
+        # the pointwise product times the given reduction numel (not one), return the lengths with
+        # reduction numel filled in. Otherwise return lengths unchanged.
         "Fill in the reduction numel of lengths if missing"
         sizevars = V.graph.sizevars
         if len(lengths[1]) == 0 and (
@@ -1002,6 +1213,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         lengths: Sequence[Sequence[sympy.Expr]],
         reduction_numel: sympy.Expr = sympy.S.One,
     ) -> bool:
+        # [FUNCTION DOC] Return True if the node lengths can be split onto the kernel groups (after
+        # filling in the reduction numel); False if the split raises CantSplit.
         lengths = cls.prepare_split_iteration_lengths(groups, lengths, reduction_numel)
 
         try:
@@ -1013,6 +1226,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def split_and_set_ranges(
         self, lengths: Sequence[Sequence[sympy.Expr]]
     ) -> list[list[sympy.Expr]]:
+        # [FUNCTION DOC] Map this kernel's tiling groups onto the node lengths and set the ranges.
+        # Reduction trees are treated as size one when not inside the reduction. Returns the
+        # iteration variable lists per node dimension; side effect: creates range tree entries.
         """
         Split and set iteration ranges for the kernel based on the provided lengths.
 
@@ -1051,6 +1267,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         lengths: Sequence[Sequence[sympy.Expr]],
         set_ranges,
     ) -> list[list[sympy.Expr]]:
+        # [FUNCTION DOC] Classmethod: if the lengths already match the groups element-wise, call
+        # set_ranges on them directly; otherwise split lengths across groups (so a flat loop can
+        # fuse with a tiled kernel), call set_ranges with the new ranges and rebuild each original
+        # variable via the getters. Returns lists of expressions. May raise CantSplit.
         """
         We may want to fuse `for i0 in s0*s1` into a tiled kernel with groups (s0, s1).
 
@@ -1074,10 +1294,16 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return [[fn(itervars) for fn in fns] for fns in return_getters_groups]
 
     def is_indirect_indexing(self, index: sympy.Expr) -> bool:
+        # [FUNCTION DOC] Return True if the index depends on a temporary (loaded) value, i.e.
+        # indirect indexing.
         # tmpX  means indirect indexing
         return free_symbol_is_type(index, SymT.TMP)
 
     def is_broadcasted(self, index: sympy.Expr) -> bool:
+        # [FUNCTION DOC] Return True if the index does not cover all active iteration ranges (so
+        # values are broadcast along some tile dimension). Indirect indices return False. Looks up
+        # each free symbol's tree entry, multiplies lengths per active tree and compares against
+        # tree numels. Raises AssertionError if an entry's parent is not a root.
         # Note. This may not be correct when there is indirect indexing
         if self.is_indirect_indexing(index):
             return False
@@ -1118,6 +1344,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         )
 
     def index_to_str(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] Convert an index expression (or list of them) to kernel source text after
+        # renaming symbols to kernel arguments (rename_indexing registers needed sizes as
+        # parameters).
         """
         Convert an index expr to a string that can be used in output code.
         e.g. a sympy expression "s2" may actually appear as "ks1" in the generated kernel.
@@ -1132,6 +1361,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
     @staticmethod
     def _should_precompute_size_expr(index: sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: decide whether a size-only integer expression is large (more than
+        # the op limit) and should be precomputed on the host. Returns False for numbers, bare
+        # symbols and non-integers.
         if (
             isinstance(index, (int, sympy.Symbol, sympy.Number))
             or index.is_number
@@ -1161,6 +1393,11 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         self,
         index: sympy.Expr,
     ) -> sympy.Expr:
+        # [FUNCTION DOC] Simplify an index and prepare it for codegen: simplify, substitute
+        # precomputed sizes (including ceilings that depend only on sizes), zero out loop variables
+        # of singleton-extent trees, unwrap an Identity wrapper, optionally replace a large size
+        # expression by a precomputed size, then call codegen_indexing. Returns the final
+        # expression. Side effect: may register precomputed sizes.
         index = self.simplify_indexing(index)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         # if simple replacements didn't get rid of floor/ceil, try full subs
@@ -1211,6 +1448,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return self.codegen_indexing(simp_index)
 
     def active_range_trees(self) -> list[IterationRangesRoot]:
+        # [FUNCTION DOC] Return the range trees currently active: all non-reduction trees plus
+        # reduction trees only while inside_reduction.
         # Hide reduction trees outside reduction loops so indexing and mask
         # generation only see axes active in the current stage.
         return [
@@ -1221,6 +1460,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def use_range_trees(
         self, range_trees: Sequence[IterationRangesRoot]
     ) -> Iterator[None]:
+        # [FUNCTION DOC] Context manager that temporarily replaces range_trees with an alternate
+        # family and clears the cached indexing simplification on entry and exit; always restores
+        # the original trees.
         """Temporarily codegen against an alternate range-tree family."""
         saved = self.range_trees
         self.range_trees = list(range_trees)
@@ -1234,6 +1476,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             self.simplify_indexing.cache_clear()
 
     def codegen_indexing(self, expr: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Simplify an expression with the current ranges and ensure that every range
+        # variable in it has its definition emitted. Entries whose defining expressions contain big
+        # size expressions get them replaced with precomputed sizes first. Returns the simplified
+        # expression.
         expr = V.graph.sizevars.simplify_with_ranges(expr, self.var_ranges())
         for sym in sorted(expr.free_symbols, key=str):
             if sym in self.range_tree_nodes:
@@ -1251,6 +1497,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return expr
 
     def codegen_nan_check(self) -> None:
+        # [FUNCTION DOC] Hook for emitting NaN checks; not implemented in the base class (raises
+        # NotImplementedError).
         raise NotImplementedError("NYI: codegen_nan_check")
 
     def iteration_ranges_codegen_header(
@@ -1258,9 +1506,13 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         entry: IterationRangesRoot,
         code: IndentedBuffer,
     ) -> None:
+        # [FUNCTION DOC] Hook that writes the header code of an iteration range tree into a buffer;
+        # subclasses implement it (raises NotImplementedError).
         raise NotImplementedError("NYI: iteration_ranges_codegen_header")
 
     def deallocate_workspaces(self):
+        # [FUNCTION DOC] Emit deallocation code for the kernel's workspace arguments in reverse
+        # order via the wrapper code.
         wrapper = V.graph.wrapper_code
         for ws in reversed(self.args.workspace_args):
             wrapper.generate_workspace_deallocation(ws)
@@ -1268,10 +1520,15 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
     def call_kernel(
         self, name: str, node: IRNode | None = None, deallocate_ws: bool = True
     ) -> None:
+        # [FUNCTION DOC] Hook that emits the kernel call into the wrapper; subclasses implement it
+        # (raises NotImplementedError).
         raise NotImplementedError("NYI: call_kernel")
 
     @contextlib.contextmanager
     def mask_loads(self, mask: str | OpsWrapper, value: int | float) -> Iterator[str]:
+        # [FUNCTION DOC] Context manager adding an extra load mask and fill value. If a mask is
+        # already active the two are logically ANDed. Sets the current load mask and other value,
+        # yields the unwrapped mask, and restores the previous ones on exit.
         """Context manager to add an additional mask to tl.load/store"""
         prior = self._load_mask
         prior_val = self._load_other
@@ -1289,6 +1546,9 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             self._load_other = prior_val
 
     def get_strides_of_load(self, index: sympy.Expr) -> dict[sympy.Symbol, sympy.Expr]:
+        # [FUNCTION DOC] Compute the stride of an index with respect to each range tree variable by
+        # substituting tree-variable definitions and taking the difference between the values at one
+        # and zero. Returns a mapping from tree index symbols to strides.
         """
         This gets the stride of the index for each of the tiling variables
         (technically, it does it at index 0)
@@ -1314,11 +1574,15 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
     @staticmethod
     def _map_tuple_or_scalar(fn, value):
+        # [FUNCTION DOC] HELPER: apply a function to a value, or to each element when the value is a
+        # tuple (returning a tuple).
         if isinstance(value, tuple):
             return tuple(map(fn, value))
         return fn(value)
 
     def estimate_flops(self) -> int | None:
+        # [FUNCTION DOC] Sum the flops estimates of all nodes in the kernel's node schedule,
+        # ignoring nodes with no estimate.
         flops = [
             node.estimate_flops()
             for node in NodeScheduleMarker.only_nodes(self.features.node_schedule)
@@ -1326,6 +1590,11 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return sum(filter(None, flops))
 
     def estimate_kernel_num_bytes(self):
+        # [FUNCTION DOC] Estimate total bytes of kernel input/output traffic. For each call argument
+        # that is accessed, use the buffer size, but when the buffer is larger than the output numel
+        # (sliced inputs) count one output-sized chunk per distinct index dependency. In-place
+        # arguments count twice (read and write). Returns the sum; unaccessed arguments count as
+        # zero.
         """
         Try the best to estimate the total size (in bytes) of the
         kernel's inputs and outputs, which is used for estimating the memory
@@ -1392,6 +1661,11 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return sum(nbytes)
 
     def warn_mix_layout(self, kernel_name):
+        # [FUNCTION DOC] Log (warning level) whether the 4D tensors used by the kernel have a
+        # uniform stride order. Skips single-input/single-output kernels, and tensors with only one
+        # non-unit dim. On the first mismatch logs details (param names, buffers, stride orders,
+        # sizes, sources) and returns; otherwise logs that all layouts are uniform. Side effect:
+        # logging only.
         """
         Print message if the kernel have mixed layout inputs.
         Only care about 4D tensor for now.
@@ -1464,6 +1738,12 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         log.warning(msg)
 
     def welford_reduce_fallback(self, dtype, value):
+        # [FUNCTION DOC] Fallback lowering of a Welford reduction using two sum reductions: compute
+        # the sum, divide by the reduction numel to get the mean (outside reduction), then sum
+        # squared deviations. Returns the unwrapped tuple (mean, m2, rnumel).
+        # KNOWN ISSUE: it sets inside_reduction to false then true unconditionally rather than
+        # restoring the prior value, so a caller that was not inside a reduction ends up with the
+        # flag set.
         sum_ = ops.reduction(dtype, dtype, "sum", value)
         self.inside_reduction = False
         rnumel = ops.index_expr(self.features.reduction_numel, dtype)
@@ -1476,6 +1756,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return OpsWrapper._unwrap((mean, m2, rnumel))
 
     def prepare_softmax_twopass_fallback(self, dtype, value):
+        # [FUNCTION DOC] Fallback for a two-pass softmax: reduce the max, subtract and exponentiate,
+        # then sum. Returns the unwrapped tuple (max, sum).
         vmax = ops.reduction(dtype, dtype, "fmax", value)
         sub = ops.sub(value, vmax)
         exp = ops.exp(sub)
@@ -1483,17 +1765,28 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return OpsWrapper._unwrap((vmax, vsum))
 
     def codegen_kernel(self):
+        # [FUNCTION DOC] Hook that generates the full kernel source; subclasses implement it (raises
+        # NotImplementedError).
         raise NotImplementedError
 
     def codegen_body(self):
+        # [FUNCTION DOC] Hook to flush pending body code (e.g. close a reduction loop); no-op in the
+        # base class.
         pass
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
+        # [FUNCTION DOC] Hook to emit the definition of an iteration range entry variable; no-op in
+        # the base class.
         pass
 
 
 @dataclasses.dataclass(frozen=True)
 class _IterationSpace:
+    # [CLASS DOC] HELPER: immutable description of a source iteration domain used to remap a
+    # pointwise body. groups are the source-domain extents and values are the matching symbolic
+    # index expressions used by the outer kernel (for a grouped reduction body with ranges batch,
+    # columns divided by groups, groups, the values are the concrete symbols the parent kernel uses
+    # for those coordinates). Pure data; no methods.
     """Source domain used to remap a pointwise body.
 
     ``groups`` are source-domain extents. ``values`` are the matching
@@ -1510,6 +1803,11 @@ class _IterationSpace:
 
 @dataclasses.dataclass
 class _DerivedIterationFamily:
+    # [CLASS DOC] HELPER: the set of range trees a nested-reduction consumer stage runs under. Two
+    # modes: reduced-output (derived grouped-axis tree is swapped in and index_subs rewrites body
+    # variables to the active tree symbols) and parent-full (outer trees are reused, no rewriting).
+    # State: range_trees, index_subs and a flag recording whether derived headers were already
+    # emitted. Key methods: remap_index, ensure_active, ensure_headers, activate.
     """Iteration family for a nested-reduction consumer stage.
 
     Two configurations:
@@ -1526,9 +1824,13 @@ class _DerivedIterationFamily:
     _headers_emitted: bool = False
 
     def remap_index(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: rewrite an index expression by substituting the body iteration
+        # variables with the derived tree symbols (index_subs). Returns the new expression.
         return index.subs(self.index_subs)
 
     def is_active_on(self, kernel: SIMDKernel[Any]) -> bool:
+        # [FUNCTION DOC] HELPER: return True if the kernel's current range trees are exactly
+        # (identity-wise) this family's trees, in order.
         if len(kernel.range_trees) != len(self.range_trees):
             return False
         return all(
@@ -1538,6 +1840,8 @@ class _DerivedIterationFamily:
 
     @contextlib.contextmanager
     def ensure_active(self, kernel: SIMDKernel[Any]):
+        # [FUNCTION DOC] HELPER: context manager that activates this family on the kernel only when
+        # it is not already active; otherwise just yields.
         """Activate this family if it isn't already active on ``kernel``."""
         if self.is_active_on(kernel):
             yield
@@ -1546,6 +1850,11 @@ class _DerivedIterationFamily:
                 yield
 
     def ensure_headers(self, kernel: SIMDKernel[Any]) -> None:
+        # [FUNCTION DOC] HELPER: emit the iteration range headers of derived trees once per family.
+        # Looped derived trees inside a reduction go to the loop-local indexing buffer (they depend
+        # on the loop offset); other derived trees go to the kernel body prologue. Sets the emitted
+        # flag; later calls are no-ops. Parent-full families contain no derived trees so nothing is
+        # emitted.
         # Called lazily from activate(). Reduced-output families may activate
         # more than once (the grouped reduction stores through the family, then
         # reduced-output epilogues run inside it), so emit derived headers once.
@@ -1564,6 +1873,9 @@ class _DerivedIterationFamily:
 
     @contextlib.contextmanager
     def activate(self, kernel: SIMDKernel[Any]) -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: context manager that emits headers if needed and then temporarily
+        # switches the kernel to this family's range trees so load/store/indexing interpret indices
+        # in this family's space.
         # Temporarily switch the kernel's active iteration family so normal
         # load/store/indexing code interprets indices in this family's space.
         self.ensure_headers(kernel)
@@ -1573,6 +1885,10 @@ class _DerivedIterationFamily:
 
 @dataclasses.dataclass(frozen=True)
 class _GroupedReductionVars:
+    # [CLASS DOC] HELPER: immutable bundle of the variables used to call the grouped-reduction body:
+    # the iteration and reduction arguments to pass (iter_remapped, reduce_remapped), the unsplit
+    # passthrough variable, the group index variable and expression (variable is None in the single-
+    # group case where the group index is the constant zero) and the local reduction variable.
     """Variables used to call the grouped-reduction body.
 
     ``iter_remapped`` and ``reduce_remapped`` are the iteration/reduction
@@ -1593,6 +1909,11 @@ class _GroupedReductionVars:
 
 @dataclasses.dataclass(frozen=True)
 class _GroupedReductionLayout:
+    # [CLASS DOC] HELPER: geometry of the grouped (consumer) reduction in a nested-reduction pair.
+    # Frozen data: the x tree, the r tree, the local reduction size and whether the local reduction
+    # lives in the r axis. It describes how the 2D tile is reshaped into groups by local reduction
+    # size, which axis is reduced and how reduced values are lifted back to parent resolution;
+    # properties expose derived trees, symbols, shapes and axes. Created via from_kernel.
     """Geometry of the grouped reduction (the consumer reduction in a
     nested-reduction pair). Describes how the outer kernel's tile is
     reshaped into [num_groups, local_reduction_size], which axis is reduced,
@@ -1611,6 +1932,8 @@ class _GroupedReductionLayout:
         local_reduction_size: sympy.Integer,
         local_reduction_in_r: bool,
     ) -> _GroupedReductionLayout:
+        # [FUNCTION DOC] HELPER: build a layout from a kernel that has exactly two range trees, the
+        # first being the x tree. Raises AssertionError otherwise.
         if len(kernel.range_trees) != 2:
             raise AssertionError(
                 f"expected exactly 2 range trees, got {len(kernel.range_trees)}"
@@ -1627,25 +1950,35 @@ class _GroupedReductionLayout:
 
     @property
     def group_tree(self) -> IterationRangesRoot:
+        # [FUNCTION DOC] HELPER: property, the tree that is split into groups and local reduction (r
+        # tree if the local reduction is in r, else x tree).
         """The tree decomposed into [num_groups, local_reduction_size]."""
         return self.r_tree if self.local_reduction_in_r else self.x_tree
 
     @property
     def passthrough_tree(self) -> IterationRangesRoot:
+        # [FUNCTION DOC] HELPER: property, the tree that passes through unchanged (the one not
+        # grouped).
         """The tree that passes through unchanged (not grouped)."""
         return self.x_tree if self.local_reduction_in_r else self.r_tree
 
     @property
     def parent_axis(self) -> int:
+        # [FUNCTION DOC] HELPER: property, axis index of the grouped parent dimension in the 2D tile
+        # (1 if in r else 0).
         # Axis of the grouped parent dimension within the 2D [x, r] tile.
         return 1 if self.local_reduction_in_r else 0
 
     @property
     def group_prefix(self) -> str:
+        # [FUNCTION DOC] HELPER: property, naming prefix for derived constants: nested_ followed by
+        # the upper-cased group tree prefix without its trailing underscore.
         return "nested_" + self.group_tree.prefix.upper().removesuffix("_")
 
     @property
     def local_reduction_size_sym(self) -> sympy.Symbol:
+        # [FUNCTION DOC] HELPER: property, integer-positive symbol named with the group prefix for
+        # the local reduction size.
         return sympy.Symbol(
             f"{self.group_prefix}_LOCAL_REDUCTION_SIZE",
             integer=True,
@@ -1654,6 +1987,8 @@ class _GroupedReductionLayout:
 
     @property
     def reduced_block_sym(self) -> sympy.Symbol:
+        # [FUNCTION DOC] HELPER: property, integer-positive symbol named with the group prefix for
+        # the reduced block size.
         return sympy.Symbol(
             f"{self.group_prefix}_REDUCED_BLOCK",
             integer=True,
@@ -1662,26 +1997,36 @@ class _GroupedReductionLayout:
 
     @property
     def parent_block(self) -> str:
+        # [FUNCTION DOC] HELPER: property, block size string of the group (parent) tree.
         return self.group_tree.block_size_str()
 
     @property
     def passthrough_block(self) -> str:
+        # [FUNCTION DOC] HELPER: property, block size string of the passthrough tree.
         return self.passthrough_tree.block_size_str()
 
     @property
     def num_groups(self) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: property, number of groups: group tree numel divided (floor) by the
+        # local reduction size.
         return FloorDiv(self.group_tree.numel, self.local_reduction_size)
 
     @property
     def num_groups_str(self) -> str:
+        # [FUNCTION DOC] HELPER: property, the number of groups as a string (the reduced block
+        # symbol name, i.e. the per-tile group count).
         return str(self.reduced_block_sym)
 
     @property
     def local_reduction_size_dim(self) -> str:
+        # [FUNCTION DOC] HELPER: property, the local reduction size symbol name as a string.
         return str(self.local_reduction_size_sym)
 
     @property
     def reshape_shape(self) -> tuple[str, str, str]:
+        # [FUNCTION DOC] HELPER: property, shape (three strings) of the tile before the local group
+        # reduction: (passthrough, groups, local) when the local reduction is in r, else (groups,
+        # local, passthrough).
         """Shape used before the local group reduction."""
         if self.local_reduction_in_r:
             return (
@@ -1697,11 +2042,15 @@ class _GroupedReductionLayout:
 
     @property
     def reduce_axis(self) -> int:
+        # [FUNCTION DOC] HELPER: property, the axis reduced in the reshaped tile (2 if local
+        # reduction in r else 1).
         """Axis reduced in [passthrough, num_groups, local_reduction_size]."""
         return 2 if self.local_reduction_in_r else 1
 
     @property
     def output_shape(self) -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: property, shape of the reduced output: (passthrough, groups) if
+        # local reduction in r else (groups, passthrough).
         if self.local_reduction_in_r:
             return (self.passthrough_block, self.num_groups_str)
         return (self.num_groups_str, self.passthrough_block)
@@ -1710,6 +2059,13 @@ class _GroupedReductionLayout:
         self,
         body: Any,
     ) -> _GroupedReductionVars:
+        # [FUNCTION DOC] HELPER: compute the variables for calling the grouped reduction body.
+        # Single-group case: group index is the constant zero and the local reduction variable is
+        # the group tree's full-range symbol. Otherwise the group tree is split into [num_groups,
+        # local size] and its two variables are used. The passthrough axis becomes one variable.
+        # Based on the body having 2 or 1 iteration variables it returns iteration arguments as
+        # [passthrough, group] in axis order or one flattened index. Raises AssertionError for other
+        # counts. Side effect: creates range tree entries.
         if V.graph.sizevars.statically_known_equals(self.num_groups, 1):
             # Degenerate grouped axis: the parent dimension is exactly one
             # group. Reuse the parent full-range symbol for the group lane so
@@ -1759,7 +2115,14 @@ class _GroupedReductionLayout:
         self,
         group_reduction_vars: _GroupedReductionVars,
     ) -> _DerivedIterationFamily:
+        # [FUNCTION DOC] HELPER: build the reduced-output family. Only the grouped axis tree is
+        # replaced by a DerivedIterationRangesRoot (reduced numel, block size, offset and two named
+        # constants); the passthrough tree is reused. Builds index_subs mapping the body's
+        # passthrough variable (and group index variable when present) to the full-range symbols of
+        # the reduced trees. Returns a family over (x, r) trees.
         def build(tree: IterationRangesRoot) -> IterationRangesRoot:
+            # [FUNCTION DOC] HELPER: return a derived root for the group tree (reduced numel, block
+            # size and offset plus named constants) and the tree itself for any other tree.
             if tree is not self.group_tree:
                 # Only the grouped axis changes shape in the reduced-output
                 # family. Reuse the passthrough tree directly so we do not emit
@@ -1811,6 +2174,7 @@ class _GroupedReductionLayout:
     def make_parent_full_family(
         self,
     ) -> _DerivedIterationFamily:
+        # [FUNCTION DOC] HELPER: build the parent-full family that reuses the outer x and r trees.
         return _DerivedIterationFamily(
             range_trees=(self.x_tree, self.r_tree),
         )
@@ -1818,6 +2182,10 @@ class _GroupedReductionLayout:
     def parent_full_iteration_values(
         self, group_reduction_vars: _GroupedReductionVars
     ) -> _IterationSpace:
+        # [FUNCTION DOC] HELPER: describe the parent-full iteration domain as an _IterationSpace.
+        # When the local reduction is not in r, the domain is (num_groups, local size, passthrough
+        # numel) with the group, local and passthrough variables; otherwise (x numel, r numel) with
+        # the full-range symbols of the two trees.
         if not self.local_reduction_in_r:
             source_groups = [
                 self.num_groups,
@@ -1843,6 +2211,10 @@ class _GroupedReductionLayout:
         kernel: TritonKernel,
         value: CSEVariable,
     ) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: lift a loaded value to parent resolution if needed. Requires a
+        # known dtype (raises AssertionError). Values without a shape of at least two dims are
+        # returned unchanged; otherwise delegates to the broadcasting helper without materializing a
+        # singleton parent dim.
         if value.dtype is None:
             raise AssertionError("value must have a known dtype")
         if value.shape is None or len(value.shape) < 2:
@@ -1862,6 +2234,9 @@ class _GroupedReductionLayout:
         kernel: TritonKernel,
         value: CSEVariable,
     ) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: ensure a value has the full parent tile shape before reshaping.
+        # Raises AssertionError if dtype or a shape of at least two dims is unknown. Singleton
+        # parent dims are materialized.
         if value.dtype is None:
             raise AssertionError("value must have a known dtype")
         if not (value.shape is not None and len(value.shape) >= 2):
@@ -1882,6 +2257,12 @@ class _GroupedReductionLayout:
         *,
         materialize_singleton: bool,
     ) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: broadcast a value along the parent axis to parent tile resolution.
+        # Returns the value unchanged if its parent dim already equals the parent block (or is 1 and
+        # materialization is not requested). A size-1 parent dim is expanded to the parent extent; a
+        # reduced (per-group) dim is expanded by reshaping to add a local-size axis, broadcasting,
+        # and reshaping back, via the kernel's emit_broadcast_via_reshape. Raises AssertionError for
+        # unknown dtype or shape. Side effect: emits kernel code.
         if value.dtype is None:
             raise AssertionError("value must have a known dtype")
         if not (value.shape is not None and len(value.shape) >= 2):
@@ -1932,12 +2313,16 @@ class _GroupedReductionLayout:
 
 @dataclasses.dataclass(frozen=True)
 class _ParentFullLoadTransform:
+    # [CLASS DOC] HELPER: immutable transform holding a kernel and a grouped-reduction layout; apply
+    # lifts loaded values to parent-full resolution when needed.
     """Lift loaded values to parent-full resolution when needed."""
 
     kernel: TritonKernel
     layout: _GroupedReductionLayout
 
     def apply(self, value: CSEVariable) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: lift the value to parent resolution through the layout (no
+        # materialization of singletons).
         return self.layout.maybe_broadcast_value_to_parent_resolution(
             self.kernel,
             value,
@@ -1945,6 +2330,11 @@ class _ParentFullLoadTransform:
 
 
 class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
+    # [CLASS DOC] HELPER: ops handler for the grouped-reduction stage. Wraps an inner handler;
+    # reduction reshapes the parent-full tile into [groups, local reduction size], reduces over the
+    # local axis and emits the result; store_reduction remaps the index into the derived family and
+    # stores. Loads go through the normal path and may be lifted to parent resolution first. State:
+    # kernel, layout, family and optional load transform.
     """Group-reduction stage handler: reshape parent-full tile into
     [num_groups, local_reduction_size], reduce over the local axis, and store
     the result.
@@ -1961,6 +2351,8 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
         family: _DerivedIterationFamily,
         load_transform: _ParentFullLoadTransform | None = None,
     ):
+        # [FUNCTION DOC] HELPER: wrap the inner handler and record kernel, layout, family and load
+        # transform.
         super().__init__(inner)
         self._kernel = kernel
         self._layout = layout
@@ -1968,6 +2360,8 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
         self._load_transform = load_transform
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: load through the inner handler and, if a load transform is set,
+        # lift the value to parent-tile resolution.
         value = self._inner.load(name, index)
         if self._load_transform is not None:
             # Used when a nested stage reads reduced values that must be lifted
@@ -1982,6 +2376,11 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
         reduction_type: str,
         value: CSEVariable,
     ) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: handle a reduction op for the grouped stage. Ensures the value has
+        # parent tile resolution, emits the derived headers, reshapes the value to the layout's
+        # reshape shape, increments the kernel's reduction counter and emits the reduce over the
+        # layout's reduce axis with the output shape. Returns the reduced CSE variable. Side
+        # effects: emits kernel code and mutates num_reduction.
         """Reshape the parent-full tile and reduce over the local reduction."""
         k = self._kernel
         value = self._layout.ensure_parent_tile_resolution(k, value)
@@ -2000,12 +2399,18 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
         )
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        # [FUNCTION DOC] HELPER: remap the index into the reduced family and store the value through
+        # the inner handler's store while that family is active.
         remapped_index = self._family.remap_index(index)
         with self._family.ensure_active(self._kernel):
             self._inner.store(name, remapped_index, value)
 
 
 class _PointwiseRemapHandler(WrapperHandler):  # type: ignore[type-arg]
+    # [CLASS DOC] HELPER: ops handler for pure pointwise prologue/epilogue bodies running at a
+    # remapped iteration range. Unlike the grouped-reduction handler it never reshapes or reduces:
+    # loads and stores remap the index through the family and run with the family active; loaded
+    # values may be lifted to parent resolution.
     """Pointwise bodies at a remapped iteration range.
 
     Unlike _GroupedReductionOpsHandler (which performs reshape+reduce), this
@@ -2022,12 +2427,16 @@ class _PointwiseRemapHandler(WrapperHandler):  # type: ignore[type-arg]
         family: _DerivedIterationFamily,
         load_transform: _ParentFullLoadTransform | None = None,
     ):
+        # [FUNCTION DOC] HELPER: wrap the inner handler and record kernel, family and optional load
+        # transform.
         super().__init__(inner)
         self._kernel = kernel
         self._family = family
         self._load_transform = load_transform
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: remap the index, load through the inner handler with the family
+        # active, then apply the optional load transform. Returns the loaded value.
         remapped_index = self._family.remap_index(index)
         with self._family.ensure_active(self._kernel):
             value = self._inner.load(name, remapped_index)
@@ -2042,6 +2451,8 @@ class _PointwiseRemapHandler(WrapperHandler):  # type: ignore[type-arg]
         value: CSEVariable,
         mode: Any = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: remap the index and store through the inner handler with the family
+        # active, passing the mode.
         k = self._kernel
         remapped_index = self._family.remap_index(index)
         with self._family.ensure_active(k):
@@ -2049,6 +2460,11 @@ class _PointwiseRemapHandler(WrapperHandler):  # type: ignore[type-arg]
 
 
 class SIMDScheduling(BaseScheduling):
+    # [CLASS DOC] Parent class for backend schedulers that fuse nodes into SIMD (Triton-like)
+    # kernels. Provides fusion legality (can_fuse), node schedule generation, tiling selection,
+    # kernel codegen for pointwise, reduction, template, combo and mix-order kernels, and kernel
+    # benchmarking hooks. Subclasses set kernel_type to their SIMDKernel subclass and implement
+    # backend specific pieces.
     """
     Single Instruction Multiple Data parent class used for fusion across
     multiple different backends.
@@ -2057,9 +2473,21 @@ class SIMDScheduling(BaseScheduling):
     kernel_type: type[Any] = SIMDKernel  # override in subclass
 
     def group_fn(self, sizes):
+        # [FUNCTION DOC] Return a tuple of the simplified element-count product for each size list
+        # in sizes.
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
     def can_fuse(self, node1, node2):
+        # [FUNCTION DOC] Fusion legality hook called by the Scheduler for two (possibly already
+        # fused) nodes. Returns True/False and records reasons with WhyNoFuse. Foreach nodes
+        # delegate to the foreach rule. Split scans may not fuse with reductions. Two reductions
+        # fuse when numel and rnumel match, or via mix-order or nested reduction rules; native
+        # matmul nodes additionally need compatible loop order. Two pointwise nodes need equal
+        # numel/rnumel (templates may differ if prologue nodes match), templates always fuse, and a
+        # combined tiling check can veto fusion when configured. Pointwise followed by reduction
+        # needs numel equal to numel times rnumel with compatible ranges (and a valid tiling if
+        # configured) or equal numel. A reduction first and pointwise second is handled by swapping
+        # arguments. Raises AssertionError on inconsistent inputs.
         """
         Hook called by Scheduler to determine if the Triton backend
         can fuse node1 and node2.  These nodes might already be
@@ -2245,6 +2673,14 @@ class SIMDScheduling(BaseScheduling):
     can_fuse_horizontal = can_fuse
 
     def generate_node_schedule(self, nodes, numel, rnumel):
+        # [FUNCTION DOC] Order scheduler nodes into a node schedule for one kernel with numel and
+        # rnumel. Returns a list of nodes interleaved with EnableReduction/DisableReduction markers.
+        # Nodes that fit the main body (matching numel/rnumel, or flattened numel with rnumel 1) are
+        # placed inside the reduction loop; nodes with numel and rnumel of 1 (post-reduction, only
+        # when rnumel is not 1) close the current loop first. A new loop starts when a node depends
+        # on a reduction result not yet available; the loop is split in two when a node does not
+        # reuse buffers already read in the loop (memory heuristic). Raises NotImplementedError for
+        # nodes whose group fits neither case, AssertionError on inconsistent state.
         node_schedule: list[Any] = []
         done = OrderedSet[scheduler.BaseSchedulerNode]()
         # Writes with a reduced shape, meaning they are only present once the
@@ -2254,22 +2690,32 @@ class SIMDScheduling(BaseScheduling):
         maybe_split_index: int | None = None
 
         def fits_in_main_body(n):
+            # [FUNCTION DOC] HELPER: True if the node's group matches the main body iteration space
+            # (numel and rnumel, or fully flattened).
             _, (node_numel, node_rnumel) = n.group
             return (node_numel == numel and node_rnumel == rnumel) or (
                 node_numel == numel * rnumel and node_rnumel == 1
             )
 
         def fits_outside_reduction(n):
+            # [FUNCTION DOC] HELPER: True if the node is a pointwise node over numel that belongs
+            # after the reduction (rnumel one while the kernel has a reduction).
             _, (node_numel, node_rnumel) = n.group
             return node_numel == numel and node_rnumel == 1 and rnumel != 1
 
         def expect_improved_memory_usage(n):
+            # [FUNCTION DOC] HELPER: True if the node reads any buffer already read in the current
+            # loop, so putting it in the same loop reuses data.
             for read in n.read_writes.reads:
                 if read.name in current_loop_buffer_usage:
                     return True
             return False
 
         def schedule_node_in_loop(n):
+            # [FUNCTION DOC] HELPER: append the node to the schedule inside the loop, mark it done,
+            # and record its reads as loop buffer usage. Reduction outputs are recorded as not ready
+            # yet (available only after the loop), except scans, whose full output is usable inside
+            # the loop.
             done.add(n)
             node_schedule.append(n)
             current_loop_buffer_usage.update([x.name for x in n.read_writes.reads])
@@ -2288,6 +2734,10 @@ class SIMDScheduling(BaseScheduling):
 
         @contextlib.contextmanager
         def end_current_reduction_loop():
+            # [FUNCTION DOC] HELPER: context manager that closes the current reduction loop (removes
+            # a trailing EnableReduction marker or adds DisableReduction, and inserts a loop split
+            # at the pending split index), yields so the caller can add post-loop nodes, then
+            # reopens with EnableReduction and clears not-ready and loop usage tracking.
             nonlocal maybe_split_index
             if node_schedule and node_schedule[-1] is EnableReduction:
                 node_schedule.pop()
@@ -2303,6 +2753,10 @@ class SIMDScheduling(BaseScheduling):
             current_loop_buffer_usage.clear()
 
         def requires_closing_previous_reduction(node, node_schedule):
+            # [FUNCTION DOC] HELPER: decide whether the previous reduction loop must be closed
+            # before scheduling this node: only when rnumel is not 1, the node depends on a
+            # reduction result not yet ready, and nothing else is pending. Raises AssertionError if
+            # the schedule is empty or ends with a reduction marker in that case.
             if rnumel == 1:
                 return False
             if not not_ready_yet_nodes & node.ancestors:
@@ -2347,6 +2801,9 @@ class SIMDScheduling(BaseScheduling):
         return node_schedule
 
     def codegen_mix_order_reduction(self, node):
+        # [FUNCTION DOC] Generate a fused mix-order reduction kernel for a scheduler node holding
+        # two reductions. Asserts that neither node is an ancestor of the other (AssertionError
+        # otherwise) and delegates to _codegen_mix_order_reduction.
         node1, node2 = node.node1, node.node2
 
         # Make sure there are no producer/consumer relationship
@@ -2359,6 +2816,8 @@ class SIMDScheduling(BaseScheduling):
         self._codegen_mix_order_reduction(node1, node2)
 
     def _split_mix_order_reduction_epilogue(self, node):
+        # [FUNCTION DOC] HELPER: split the sub-nodes of a node into reduction nodes and non-
+        # reduction (epilogue) nodes. Returns (reductions, epilogues).
         # TODO: do more validation here
         nodes = node.get_nodes()
         reductions = []
@@ -2373,6 +2832,13 @@ class SIMDScheduling(BaseScheduling):
     def _generate_kernel_code_for_mix_order_reduction(
         self, kernel_features, split_size, for_benchmark
     ):
+        # [FUNCTION DOC] HELPER: build a persistent mix-order kernel for the features with the given
+        # split size and generate its source. Creates the kernel through create_kernel_choices,
+        # codegens the schedule, allocates a float workspace sized for the partial accumulations per
+        # split (must be at offset zero), emits the body and kernel source. When for_benchmark is
+        # true benchmark mode is enabled and the kernel name placeholder is replaced with a fixed
+        # name. Returns (kernel, workspace name, source code). Raises AssertionError on unexpected
+        # kernel flags or workspace offset.
         """
         for_benchmark:
             True if the generated code is for benchmarking. We need make
@@ -2433,12 +2899,28 @@ class SIMDScheduling(BaseScheduling):
         node_names: OrderedSet[str] | None = None,
         skip_perf_cache: bool = False,
     ) -> tuple[float, str]:
+        # [FUNCTION DOC] Benchmark a loaded kernel module and return (time, extra string); abstract
+        # in this base class, raises NotImplementedError.
         raise NotImplementedError
 
     def _codegen_mix_order_reduction(self, node1, node2):
+        # [FUNCTION DOC] HELPER: generate code for a pair of mix-order reductions. Picks a split
+        # size (config override, else a heuristic from SM count and numel hint clamped to 16..128,
+        # optionally autotuned by benchmarking candidate sizes unless deterministic), converts the
+        # second node's reductions into pointwise nodes with swapped dimensions, generates and
+        # defines the kernel (renaming split-reduction intermediate outputs to the final output and
+        # marking removed buffers/ops), marks nodes run and emits the call. Then emits a final
+        # reduction over the workspace per partial accumulation (slice, view, reduce with the right
+        # op, view to buffer shape, cast to buffer dtype) and marks buffers allocated, deallocates
+        # workspaces, codegens the second node's epilogue and frees scheduler buffers. Side effects:
+        # wrapper code, metrics counter, graph removed buffers. Raises AssertionError if counts
+        # mismatch or no scheduler.
         numel, rnumel = scheduler.MixOrderReduction.get_numel_rnumel(node1)
 
         def _pick_split_size():
+            # [FUNCTION DOC] HELPER: choose the mix-order split size: the config value if set, else
+            # a power of two derived from numel hint divided by eight times the SM count, clamped to
+            # the range 16 to 128.
             # the overridden has highest priority
             if config.triton.mix_order_reduction_split_size is not None:
                 return config.triton.mix_order_reduction_split_size
@@ -2489,6 +2971,8 @@ class SIMDScheduling(BaseScheduling):
         ):
 
             def _bench(candidate_split_size):
+                # [FUNCTION DOC] HELPER: generate benchmark source for a candidate split size, load
+                # it as a module and return its measured time.
                 _, _, src_code = self._generate_kernel_code_for_mix_order_reduction(
                     kernel_features,
                     split_size=candidate_split_size,
@@ -2608,6 +3092,17 @@ class SIMDScheduling(BaseScheduling):
         self.free_buffers_in_scheduler()
 
     def codegen_nested_reduction(self, node):
+        # [FUNCTION DOC] Generate a single kernel that contains an outer reduction, a grouped
+        # (nested) reduction and optional reduced or parent-full pointwise stages for dependent
+        # cross-axis reductions sharing a large input. The local group may split the R tree (reshape
+        # tile into passthrough, R divided by G, G) or the X tree. Steps: classify nested pointwise
+        # nodes by domain, generate schedules for the outer and grouped nodes, build kernel features
+        # and tiling (no y or z allowed), create the Triton kernel with min block set to the group
+        # size, emit the outer reduction through the normal path, flush, then build the layout,
+        # group reduction variables, derived families and iteration sources, emit remapped outer
+        # pointwise nodes and the nested grouped schedule, and finalize and launch the kernel.
+        # Raises AssertionError on unclassifiable domains, missing grouped reduction or tiled
+        # reduction. Side effects: metrics counter, kernel and wrapper codegen.
         """
         Generate a single kernel with an outer reduction, a group
         reduction, and optional reduced/parent-full epilogues for
@@ -2789,6 +3284,9 @@ class SIMDScheduling(BaseScheduling):
         node,
         config_patch_schedule=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: finish a nested reduction kernel: collect config patches from the
+        # schedule, generate source under those patches, define the kernel and store its name and
+        # hash, mark all nodes of the fused node as run, and launch the kernel and clean up buffers.
         config_patches = self._collect_config_patches(
             config_patch_schedule or combined_schedule
         )
@@ -2826,6 +3324,12 @@ class SIMDScheduling(BaseScheduling):
         reduced_output_family,
         parent_full_family,
     ) -> None:
+        # [FUNCTION DOC] HELPER: interpret the grouped reduction schedule with nested emitters.
+        # Skips reduction enable/disable markers, emits the grouped reduction itself via
+        # _codegen_grouped_reduction, and emits each pointwise node under the family and iteration
+        # source chosen by its classified domain (reduced uses the reduced-output family, local-
+        # reduction-input uses the local source, parent-full picks a full-resolution source). Raises
+        # AssertionError for non-scheduler nodes, unclassified or unexpected domains.
         """Interpret the local reduction schedule with nested emitters.
 
         ``local_reduction_source`` is the pre-reduction domain, including the
@@ -2898,6 +3402,9 @@ class SIMDScheduling(BaseScheduling):
         parent_full_source: _IterationSpace,
         local_reduction_source: _IterationSpace,
     ) -> _IterationSpace:
+        # [FUNCTION DOC] HELPER: pick the iteration source for a full-resolution pointwise node: an
+        # exact range match with the parent-full groups, then with the local reduction groups, then
+        # a compatible split with either. Raises AssertionError if none fits.
         sn_ranges = sn.get_ranges()
         if self._ranges_exactly_match_groups(parent_full_source.groups, sn_ranges):
             return parent_full_source
@@ -2916,6 +3423,8 @@ class SIMDScheduling(BaseScheduling):
         groups: Sequence[sympy.Expr],
         ranges: Sequence[Sequence[sympy.Expr]],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: static method returning True when the node ranges have no reduction
+        # part and their iteration ranges statically equal the groups, element by element.
         iter_ranges, reduction_ranges = ranges
         return (
             not reduction_ranges
@@ -2935,6 +3444,10 @@ class SIMDScheduling(BaseScheduling):
         reduce_remapped,
         reduced_output_family,
     ) -> None:
+        # [FUNCTION DOC] HELPER: run the grouped reduction body with an ops handler that reshapes
+        # and reduces locally, with the current node set. The body is called with the remapped
+        # iteration and reduction variables, allowing the same symbol in index expressions. Side
+        # effect: kernel code emission.
         grouped_reduction_body = grouped_reduction._body
         load_transform = _ParentFullLoadTransform(kernel, layout)
         handler = _GroupedReductionOpsHandler(
@@ -2957,6 +3470,10 @@ class SIMDScheduling(BaseScheduling):
         source: _IterationSpace,
         lengths: Sequence[Sequence[sympy.Expr]],
     ) -> list[list[sympy.Expr]]:
+        # [FUNCTION DOC] HELPER: classmethod mapping the source domain's values onto a node's own
+        # loop lengths by splitting each value across the new ranges (decompose_index) via the
+        # kernel group mapping. Raises AssertionError if groups and values differ in length. Returns
+        # lists of expressions per length group.
         groups = source.groups
         values = source.values
         if len(groups) != len(values):
@@ -2967,6 +3484,8 @@ class SIMDScheduling(BaseScheduling):
         def split_values_by_ranges(
             *new_ranges: Sequence[sympy.Expr],
         ) -> list[list[sympy.Expr]]:
+            # [FUNCTION DOC] HELPER: decompose each source value over the corresponding new range
+            # list; returns a list of expression lists.
             return [
                 decompose_index(value, ranges)
                 for value, ranges in zip(values, new_ranges)
@@ -2984,6 +3503,9 @@ class SIMDScheduling(BaseScheduling):
         iter_remapped,
         reduce_remapped,
     ) -> _IterationSpace:
+        # [FUNCTION DOC] HELPER: build an iteration space whose groups are the ranges of the body's
+        # iteration and reduction variables and whose values are the remapped iteration and
+        # reduction variables.
         body_vars = [*body.iter_vars, *body.reduce_vars]
         groups = [body.var_ranges[v] for v in body_vars]
         return _IterationSpace(groups, [*iter_remapped, *reduce_remapped])
@@ -2997,6 +3519,10 @@ class SIMDScheduling(BaseScheduling):
         *,
         load_transform: _ParentFullLoadTransform | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: emit pointwise nodes under a given nested iteration family. For
+        # each node, map the source domain values to the node's loop ranges and run its body with a
+        # remapping ops handler (optional load transform). Raises AssertionError if a node has
+        # reduction variables. Side effect: kernel code emission.
         """Emit pointwise nodes under an explicit nested iteration family.
 
         `source` describes the coordinate space whose values are remapped into
@@ -3026,6 +3552,11 @@ class SIMDScheduling(BaseScheduling):
         nodes: Sequence[scheduler.SchedulerNode],
         coalesce_analysis: CoalesceVarAnalysis | None = None,
     ):
+        # [FUNCTION DOC] HELPER: code-generate a list of scheduler nodes as one kernel. Drops nodes
+        # already removed by the scheduler; returns None if none remain. Uses the group of the
+        # reduction node (or any node) for numel/rnumel, builds the node schedule (logged), and
+        # calls codegen_node_schedule with fresh kernel features. Raises AssertionError without a
+        # scheduler.
         if not self.scheduler:
             raise AssertionError("expected self.scheduler to be set")
         nodes = [
@@ -3045,6 +3576,10 @@ class SIMDScheduling(BaseScheduling):
     def codegen_node(
         self, node: scheduler.FusedSchedulerNode | scheduler.SchedulerNode
     ):
+        # [FUNCTION DOC] Generate a SIMD kernel from pre-fused nodes. Filters out removed ops
+        # (returns None if nothing remains), rebuilds a fused node if some were dropped and coalesce
+        # tiling analysis is enabled, and delegates to _codegen_nodes with the optional coalesce
+        # analysis. Raises AssertionError without a scheduler.
         """
         Given a set of pre-fused nodes, generate a SIMD kernel.
         """
@@ -3074,6 +3609,10 @@ class SIMDScheduling(BaseScheduling):
         numel: sympy.Expr,
         buffers: Iterable[ir.Buffer | ir.TensorBox | ir.TorchBindObject | ir.IRNode],
     ) -> bool:
+        # [FUNCTION DOC] Static method: return True if indexing with 32-bit integers is safe for the
+        # numel and buffers. Requires numel and every tensor buffer (and tensor buffers mutated by
+        # mutation outputs) storage size to fit in 32 bits; if so, installs guards that these values
+        # are at most the int32 maximum. Returns False otherwise. Side effect: guards on sizevars.
         int_max = torch.iinfo(torch.int32).max
 
         if not expr_fits_within_32bit(numel):
@@ -3112,6 +3651,10 @@ class SIMDScheduling(BaseScheduling):
         node_schedule: list[NodeScheduleEntry],
         only_gen_src_code: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Generate code for a node schedule with the given kernel; unless
+        # only_gen_src_code is true, also mark each scheduled node as run under the kernel. Always
+        # merges the kernel's removed buffers and in-place-to-remove sets into the graph. Side
+        # effects: graph state mutation.
         """
         Process a kernel by generating code for its node schedule and updating graph state.
         """
@@ -3124,6 +3667,8 @@ class SIMDScheduling(BaseScheduling):
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
 
     def _collect_config_patches(self, node_schedule: list[Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: merge the config patches reported by all scheduler nodes' IR nodes
+        # in the schedule into one mapping (later nodes win on conflicts) and return it.
         """Collect and merge config_patches from all operations in the node schedule.
 
         This enables scoped config (e.g., coordinate_descent_tuning) for kernels
@@ -3138,6 +3683,15 @@ class SIMDScheduling(BaseScheduling):
         return merged_patches
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
+        # [FUNCTION DOC] Generate and launch the kernel(s) for a node schedule described by
+        # kernel_features. Picks tiling and scores, creates kernel choices, codegens the schedule
+        # into each kernel, merges workspaces for multi-kernel variants, generates source under
+        # merged config patches, defines each kernel (setting name and code hash), wraps several
+        # kernels into a MultiKernel, marks scheduler nodes as run, emits the call via
+        # _launch_kernel_and_cleanup, optionally emits run_intermediate_hooks lines for live outputs
+        # (when the wrapper supports it and the config is on, counting them in counters), then frees
+        # buffers. Raises AssertionError for a live output node without an IR node. Side effects:
+        # wrapper code, graph state, counters.
         """
         Generate code for nodes in kernel_features
         """
@@ -3220,6 +3774,10 @@ class SIMDScheduling(BaseScheduling):
         *,
         free_buffers: bool = True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: emit the kernel call and surrounding bookkeeping. Writes a codegen
+        # comment, optional kernel profile context guards (per cpp config), the kernel call,
+        # optional NaN check and mixed-layout warning, merges the kernel's removed and in-place-
+        # removed buffers into the graph, and frees scheduler buffers unless free_buffers is false.
         self.codegen_comment(base_scheduler_nodes, kernel.kernel_name)
         if config.cpp.enable_kernel_profile:
             V.graph.wrapper_code.write_kernel_context_guard_begin()
@@ -3246,6 +3804,9 @@ class SIMDScheduling(BaseScheduling):
     def create_kernel_choices(
         self, kernel_features: SIMDKernelFeatures, kernel_args, kernel_kwargs
     ) -> list[SIMDKernel]:
+        # [FUNCTION DOC] Return the list of kernel candidates for the features: by default a single
+        # instance of kernel_type built from kernel_args and kernel_kwargs. Subclasses may return
+        # several variants.
         return [
             self.kernel_type(
                 *kernel_args,
@@ -3254,6 +3815,13 @@ class SIMDScheduling(BaseScheduling):
         ]
 
     def codegen_node_schedule_with_kernel(self, node_schedule, kernel):
+        # [FUNCTION DOC] Generate code for a node schedule inside the given kernel in two passes.
+        # The first pass handles reduction markers (entering or closing disable_reduction contexts),
+        # lets each node decide in-place updates, sets ranges and collects all indexing expressions,
+        # then calls finalize_indexing. The second pass repeats the marker handling, applies index
+        # dtype strength reduction and index-expression conversion to each node body, sets ranges
+        # again and calls the node's codegen with the index variables. Side effects: kernel code
+        # emission and node state mutation.
         with kernel:
             stack = contextlib.ExitStack()
             all_indexing = {}
@@ -3298,6 +3866,13 @@ class SIMDScheduling(BaseScheduling):
         *,
         only_gen_src_code=False,
     ):
+        # [FUNCTION DOC] HELPER: codegen one template kernel variant. Groups prologue nodes by the
+        # template-read buffer each group feeds (raises AssertionError if a group is left unfinished
+        # or has more than one buffer), registers prologue-fused inputs on the kernel and drops them
+        # from its input buffers, asks the kernel to generate the template body, optionally wraps it
+        # with benchmark imports and harness, and returns just the source if only_gen_src_code.
+        # Otherwise marks template, fused epilogue (not those left unfused) and prologue nodes as
+        # run, defines the kernel (setting kernel_name) and returns the kernel.
         """
         Helper method to codegen a single template kernel variant
         """
@@ -3370,9 +3945,14 @@ class SIMDScheduling(BaseScheduling):
     def _get_multikernel_shapes(
         self, node: MultiTemplateBuffer
     ) -> tuple[tuple[int, ...], ...]:
+        # [FUNCTION DOC] HELPER: collect the sizes of each input and the output of a multi-template
+        # buffer as a tuple (base tensor size of views; nested sequences become tuples; None for
+        # unknown sizes).
         from ..ir import IRNode
 
         def get_size(arg):
+            # [FUNCTION DOC] HELPER: return the size tuple of an IR node (using the base tensor for
+            # views), or None if not an IR node or size is unknown.
             if not isinstance(arg, IRNode):
                 return None
             if isinstance(arg, ir.BaseView):  # triton templates want the base tensor.
@@ -3390,6 +3970,8 @@ class SIMDScheduling(BaseScheduling):
         return tuple(out)
 
     def _kernel_has_dynamic_shapes(self, node: MultiTemplateBuffer) -> bool:
+        # [FUNCTION DOC] HELPER: True if any known input/output shape of the multi-template buffer
+        # contains a symbolic non-integer dimension.
         shapes = self._get_multikernel_shapes(node)
         return any(
             any(
@@ -3402,6 +3984,8 @@ class SIMDScheduling(BaseScheduling):
     def _make_shape_cache_key(
         self, node: MultiTemplateBuffer, hint: int
     ) -> tuple[tuple[int, ...], ...]:
+        # [FUNCTION DOC] Build the cache key for a size-hint specific kernel: the node's shapes with
+        # every symbolic dimension replaced by the hint.
         """
         Returns cache key for hint-based multi-graph; key is tuple of shapes with hint filled in.
         """
@@ -3425,6 +4009,15 @@ class SIMDScheduling(BaseScheduling):
         only_gen_src_code=False,
         hint_override: int | None = None,
     ) -> str | None:
+        # [FUNCTION DOC] Codegen a triton template node with its prologue and epilogue nodes.
+        # Requires rnumel of one (AssertionError otherwise). With a multi-template buffer that has
+        # several size-hint renders and dynamic shapes, generates a kernel per hint (skipping
+        # runtime-valued hints when emitting for real), stores them keyed by shape, and emits a
+        # size-hint multi kernel call (merging workspaces, removed buffers, freeing buffers) and
+        # returns None; if only_gen_src_code it returns the joined sources instead. Otherwise
+        # creates a single kernel and renders, returning source if only_gen_src_code, else emitting
+        # the call (with the template node), merging removed buffers, freeing buffers and returning
+        # None.
         """
         Codegen a triton template with multi-kernel dispatch support
 
@@ -3533,6 +4126,7 @@ class SIMDScheduling(BaseScheduling):
                 return None
 
     def codegen_sync(self):
+        # [FUNCTION DOC] Emit a debug device synchronization into the wrapper code.
         V.graph.wrapper_code.generate_debug_sync(V.graph.wrapper_code)
 
     def _codegen_standalone_kernel(
@@ -3540,6 +4134,9 @@ class SIMDScheduling(BaseScheduling):
         node_info: NodeInfo,
         only_gen_src_code: bool,
     ) -> tuple[str, TritonKernel]:
+        # [FUNCTION DOC] HELPER: build a standalone kernel from precomputed NodeInfo: apply feature-
+        # required overrides to kwargs, instantiate the kernel with its tiling and scores, process
+        # its schedule via process_kernel, and generate its source. Returns (source, kernel).
         kernel_kwargs: dict[str, Any] = {}
         self.kernel_type.apply_feature_required_overrides(
             node_info.features, kernel_kwargs
@@ -3556,6 +4153,12 @@ class SIMDScheduling(BaseScheduling):
         return src_code, kernel
 
     def _probe_subkernel_heuristic(self, node_info: NodeInfo) -> tuple[list[Any], Any]:
+        # [FUNCTION DOC] HELPER: dry-run a combo subkernel to find its autotune candidate configs.
+        # Builds a kernel (combo mode, no cooperative reductions), codegens its schedule with
+        # benchmark_kernel disabled, computes power-of-two size hints from numels (skipping
+        # reduction prefixes outside a reduction), then calls the persistent reduction, reduction or
+        # pointwise heuristic with return_configs to get the candidate configs. Returns (configs,
+        # kernel).
         from ..runtime.triton_heuristics import (
             persistent_reduction,
             pointwise,
@@ -3621,6 +4224,9 @@ class SIMDScheduling(BaseScheduling):
 
     @staticmethod
     def _stitch_combo_block_config(chosen_configs: list[Any]) -> dict[str, int]:
+        # [FUNCTION DOC] HELPER: static method merging the chosen configs of each subkernel into one
+        # dictionary; every BLOCK kwarg gets a numeric suffix with the subkernel position (e.g.
+        # XBLOCK_0, R0_BLOCK_1).
         """Suffix each subkernel's BLOCK kwargs into one combo config dict
         (XBLOCK -> XBLOCK_0, XBLOCK_1, ...; R0_BLOCK -> R0_BLOCK_0, ...)."""
         return {
@@ -3634,9 +4240,15 @@ class SIMDScheduling(BaseScheduling):
     def _stitch_no_bench_combo_config(
         chosen_configs: list[Any], chosen_nodes: list[Any]
     ) -> Any:
+        # [FUNCTION DOC] HELPER: static method building a combined triton Config without
+        # benchmarking. The subkernel with the largest total memory traffic (by dependency size
+        # hints) wins; its non-BLOCK kwargs, num_warps and num_stages apply to the whole combo,
+        # while all subkernels' BLOCK kwargs are suffixed by position. Imports triton lazily.
         import triton
 
         def node_total_bytes(snode: Any) -> int:
+            # [FUNCTION DOC] HELPER: total bytes read and written by a scheduler node, from
+            # dependency size hints.
             return sum(
                 V.graph.get_dep_size_hint(d, count_bytes=True)
                 for d in itertools.chain(
@@ -3674,6 +4286,16 @@ class SIMDScheduling(BaseScheduling):
     def _autotune_subkernels_compile_time(
         self, group: list[Any], node_schedule_map: dict[Any, NodeInfo]
     ) -> list[Any | None]:
+        # [FUNCTION DOC] HELPER: at compile time, autotune each combo subkernel standalone and
+        # return its winning config (None where compile/benchmark failed, so the caller runs it
+        # standalone). For each partition node it generates benchmark source (cooperative reductions
+        # disabled), loads it, and decides whether benchmarking is needed (skip when already tuned,
+        # duplicate autotuner, or only one config without coordinate descent), submitting async
+        # precompiles when a process pool is used. Then benchmarks in compile-completion order,
+        # picking the first launcher config (or the first config) as winner, counting cached versus
+        # fresh autotunes in counters and falling back (counter plus warning) on failures. Restores
+        # the generated kernel count metric. Raises AssertionError if a non-failed subkernel ended
+        # without a winner.
         """Autotune each combo subkernel standalone at compile time and read back its winning
         config (None for a subkernel whose compile or benchmark failed, which the caller
         carves out to run standalone instead of failing the compile).
@@ -3746,11 +4368,16 @@ class SIMDScheduling(BaseScheduling):
         failed: OrderedSet[int] = OrderedSet()
 
         def fallback(index: int, pn: Any) -> None:
+            # [FUNCTION DOC] HELPER: record that autotuning failed for a subkernel: increment the
+            # fallback counter, log a warning and add the index to the failed set.
             counters["inductor"]["combo_subkernel_autotune_fallback"] += 1
             log.warning("combo compile-time autotune failed for %s; carving out", pn)
             failed.add(index)
 
         def benchmark(index: int) -> None:
+            # [FUNCTION DOC] HELPER: benchmark one subkernel (unless already tuned or single-
+            # config), treating exceptions or inconclusive launchers as failure, count cache hits,
+            # and store its winning config; falls back if no config is available.
             pn, mod, already_tuned, single, _ = work[index]
             autotuner = mod.triton_
             configs = autotuner.configs
@@ -3804,6 +4431,8 @@ class SIMDScheduling(BaseScheduling):
                 pending.setdefault(raw_future, []).append(index)
 
         def resolve_and_benchmark(future: Any, indices: list[int]) -> None:
+            # [FUNCTION DOC] HELPER: wait for a precompile future (any exception makes all its
+            # subkernels fall back), then benchmark each associated subkernel.
             if future is not None:
                 try:
                     # Waiting on the raw pool future (not the LambdaFuture wrapper)
@@ -3843,6 +4472,10 @@ class SIMDScheduling(BaseScheduling):
         per_subkernel_blocks: bool,
         only_gen_src_code: bool,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: build a ComboKernel from the partition nodes: create the combo,
+        # then for each node create a triton subkernel from its NodeInfo (mask optimization disabled
+        # for mixed sizes), add it as a sub kernel and process its node schedule. Returns the combo
+        # kernel.
         """Build a ComboKernel and its sub-kernels from a list of partition nodes."""
         from .triton_combo_kernel import ComboKernel
 
@@ -3871,6 +4504,9 @@ class SIMDScheduling(BaseScheduling):
 
     @staticmethod
     def _combo_launch_candidates(winners: list[Any]) -> list[Any]:
+        # [FUNCTION DOC] HELPER: static method deduplicating subkernel winner configs by (non-BLOCK
+        # kwargs, num_warps, num_stages) and returning a sorted list of ComboLaunchConfig
+        # candidates.
         """Deduplicate the subkernels' winner launch configs (non-block kwargs + num_warps +
         num_stages) into the candidate set for the combo's kernel-level autotune."""
         from .triton_combo_kernel import ComboLaunchConfig
@@ -3891,6 +4527,20 @@ class SIMDScheduling(BaseScheduling):
         only_gen_src_code: bool = False,
         per_subkernel_blocks: bool = False,
     ) -> list[tuple[str | None, Any, Any]]:
+        # [FUNCTION DOC] Generate kernel code for combo kernel partitions of the given subkernel
+        # nodes. Requires kernel_type to be a Triton kernel (AssertionError otherwise). First builds
+        # a NodeInfo per node (node schedule, tiling and scores via per-subkernel analysis or plain
+        # tiling selection, features, persistent-reduction decision), then partitions the nodes
+        # horizontally with ComboKernel. Single-node partitions become standalone kernels (or a
+        # placeholder entry when only source is wanted and results are cached). Multi-node
+        # partitions: with autotune plus per-subkernel blocks plus compile-time autotune, subkernels
+        # are autotuned at compile time, winners with at least two members are fused into one combo
+        # kernel carrying stitched block config and launch candidates, others are carved out to
+        # standalone kernels. In no-benchmark mode each subkernel is probed with the heuristic
+        # configs and fused only if acceptable (few configs or no autotune hints on HIP/XPU); the
+        # rest are carved out and fewer than two fusable nodes means all run standalone. Otherwise
+        # all nodes are fused. Returns a list of (source, kernel, node group) tuples. Side effects:
+        # metrics counters, logging, kernel codegen.
         """
         Generate kernel code for combo kernel partitions.
 
@@ -4095,6 +4745,11 @@ class SIMDScheduling(BaseScheduling):
         return kernel_code_list
 
     def codegen_combo_kernel(self, combo_kernel_node):
+        # [FUNCTION DOC] Codegen a combo kernel node: read subkernel nodes, partition algorithm
+        # flag, autotune flag and per-subkernel blocks from the node, decide mixed sizes from config
+        # (above one, or exactly one with a custom partition algorithm), generate kernel code per
+        # partition, then define each kernel, write a comment, log it and emit its call. Finally
+        # frees buffers in the scheduler.
         subkernel_nodes = combo_kernel_node.get_subkernel_nodes()
         custom_part_algorithm = combo_kernel_node.use_custom_partition_algo
         enable_autotune = combo_kernel_node.enable_autotune
@@ -4123,9 +4778,25 @@ class SIMDScheduling(BaseScheduling):
     @classmethod
     @functools.lru_cache(32)
     def candidate_tilings(cls, node, numel, reduction_numel) -> list[CandidateTiling]:
+        # [FUNCTION DOC] Classmethod cached (last 32 calls): compute candidate tilings for a node
+        # based on stride-1 dependencies. Returns an empty list when the node has at most one
+        # pointwise and one reduction range or has unbacked symbols. Otherwise tiles either the
+        # pointwise ranges (pointwise node) or the reduction ranges, then completes every partial
+        # tiling with the missing dimension. Returns a list of CandidateTiling.
         is_pointwise = reduction_numel == 1
 
         def tile_ranges(is_pointwise: bool, ranges, rw) -> list[CandidateTiling]:
+            # [FUNCTION DOC] HELPER: build tiling candidates from iteration ranges and read/write
+            # dependencies. The first candidate is no tiling. For each memory dependency not on a
+            # removed buffer, find the position after the stride-1 variable, skip if it is the last
+            # position or trailing dims are all broadcast, score by number of non-broadcast elements
+            # (doubled for writes and for each good-sized half), and keep it if the score is at
+            # least the total number of iterations. Raises AssertionError on inconsistent range
+            # vars, dependency types or stride counts.
+            # KNOWN ISSUE: the partial tiling for non-trivial candidates is created with the
+            # reduction numel expression in the position of the boolean flag for pointwise, and a
+            # non-zero expression is truthy, so reduction candidates appear to be built as pointwise
+            # splits.
             """
             Compute tiling candidates by dividing up the iteration ranges.
             """
@@ -4151,6 +4822,7 @@ class SIMDScheduling(BaseScheduling):
             write_names = OrderedSet([dep.name for dep in rw.writes])
 
             def collapse_ranges(ranges: Sequence[sympy.Expr]) -> sympy.Expr:
+                # [FUNCTION DOC] HELPER: simplified product of the given ranges.
                 return V.graph.sizevars.simplify(sympy_product(ranges))
 
             # Default to no tiling.
@@ -4259,6 +4931,9 @@ class SIMDScheduling(BaseScheduling):
     def create_tiling(
         cls, pw_tiling: Sequence[sympy.Expr], reduction_tiling: Sequence[sympy.Expr]
     ) -> immutable_dict[str, sympy.Expr]:
+        # [FUNCTION DOC] Build an immutable tiling mapping from pointwise splits (assigned to the
+        # last of z, y, x) and reduction splits (r0_, r1_). Raises AssertionError if there are more
+        # splits than prefixes.
         """
         Create a tiling dict from pointwise and reduction splits.
         """
@@ -4288,6 +4963,8 @@ class SIMDScheduling(BaseScheduling):
         tiling: Sequence[sympy.Expr],
         is_pointwise: bool,
     ) -> immutable_dict[str, sympy.Expr]:
+        # [FUNCTION DOC] Build a tiling from a split list of only pointwise or only reduction
+        # dimensions, depending on the flag; the other side is empty.
         return cls.create_tiling(
             tiling if is_pointwise else [],
             tiling if not is_pointwise else [],
@@ -4300,6 +4977,9 @@ class SIMDScheduling(BaseScheduling):
         numel: sympy.Expr,
         reduction_numel: sympy.Expr,
     ) -> immutable_dict[str, sympy.Expr]:
+        # [FUNCTION DOC] Given a tiling containing only pointwise (has an x key) or only reduction
+        # dimensions, add the missing side as a single dimension equal to total numel divided by the
+        # product of existing splits. Returns the complete immutable tiling.
         """
         Given a tiling for only pointwise or reduction dimensions, adds the missing one.
         """
@@ -4321,6 +5001,12 @@ class SIMDScheduling(BaseScheduling):
         pointwise_numel,
         reduction_numel,
     ) -> list[immutable_dict[str, sympy.Expr]]:
+        # [FUNCTION DOC] Create N-dimensional tiling candidates by pattern matching modular/division
+        # indexing expressions of memory dependencies. For each scheduler node uses its own ranges
+        # as the default, and for each memory dependency whose leading variable ranges multiply
+        # exactly to the pointwise numel, tiles pointwise and reduction variable ranges separately,
+        # then takes the Cartesian product of per-dependency choices. Returns distinct tilings
+        # sorted by number of dimensions, highest first (stable, so ties keep schedule order).
         """
         Creates N-dimensional tiling candidates, attempting to simplify loads/stores
         by tiling the kernel into higher dimensions.
@@ -4331,6 +5017,9 @@ class SIMDScheduling(BaseScheduling):
         def collapse_dims(
             dims: Sequence[sympy.Expr], fallback_numel: sympy.Expr
         ) -> tuple[sympy.Expr, ...]:
+            # [FUNCTION DOC] HELPER: collapse a list of dimensions down to the allowed maximum
+            # number of tiles (at most two for reduction-only kernels) by merging leading dims into
+            # one. Returns a tuple, or the fallback numel when empty.
             """
             Collapse dimensions to the maximum allowed number of tiles.
             """
@@ -4351,6 +5040,11 @@ class SIMDScheduling(BaseScheduling):
         def tile_var_ranges(
             var_ranges, ranges_to_tile, total_numel
         ) -> tuple[sympy.Expr, ...]:
+            # [FUNCTION DOC] HELPER: for each variable and numel pair, pattern match the part of the
+            # dependency index involving the variable into block dimensions (bounded
+            # dimensionality), default to the full range on failure, drop size-one dims and collapse
+            # to the max number of tiles. Uses the dependency of the enclosing loop. Returns a tuple
+            # of expressions.
             # Pattern match the subexpression pertaining to each index variable.
             tiling = []
             for var, numel in var_ranges:
@@ -4472,6 +5166,18 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel: sympy.Expr,
         coalesce_analysis: CoalesceVarAnalysis,
     ) -> _TilingSelection:
+        # [FUNCTION DOC] Compute a tiling and per-tile scores from the memory coalescing analysis.
+        # Verifies via hints that the analysis ranges match the pointwise and reduction numels
+        # (torch check). Builds candidate splits: the default, one using the suggested split
+        # variable, one per iteration variable with coalesced accesses, and pairs of them for pure
+        # pointwise kernels with up to three tiles. Scores each split by coalesced accesses
+        # (penalizing small blocks), then ranks candidates with a small penalty for poor sizes and
+        # longer tilings plus an uncoalesced penalty. Returns the first candidate that is compatible
+        # with the schedule (or equals the default) and within the max tiles setting (logging a perf
+        # hint when exceeded), as a _TilingSelection with memory coalescing totals; otherwise the
+        # default tiling with no scores.
+        # KNOWN ISSUE: the trailing check that returns when the candidate equals the default tiling
+        # is unreachable, because the earlier condition already includes that case.
         """
         Generates a tiling, and a score of each tile according to each tile's coalesced memory accesses.
         """
@@ -4510,6 +5216,11 @@ class SIMDScheduling(BaseScheduling):
             use_split_var: bool = False,
             is_pointwise: bool = False,
         ) -> _SubSplit:
+            # [FUNCTION DOC] HELPER: compute and cache a _SubSplit (splits, penalized split scores,
+            # total coalesced memory) for pointwise or reduction ranges using the given variables as
+            # split points (optionally splitting the suggested variable by its tiling factor).
+            # Variables not in vars_to_use are merged into the next split. Returns a split with a
+            # single numel (or empty) when there are no ranges.
             """
             Generate a tiling, and a tiling score, given vars to use as splits.
             """
@@ -4652,6 +5363,8 @@ class SIMDScheduling(BaseScheduling):
         )
 
         def score_mod(t):
+            # [FUNCTION DOC] HELPER: sort key for candidate tilings, the negative of the score plus
+            # an uncoalesced penalty, scaled down for each tile dimension with a poor size.
             score_factor = 1.0
             for tile_size in t[0].tiling.values():
                 if not CandidateTiling.is_good_size(tile_size):
@@ -4670,6 +5383,8 @@ class SIMDScheduling(BaseScheduling):
             tiling_score: immutable_dict[str, sympy.Expr],
             coalesced_memory: int,
         ) -> _TilingSelection:
+            # [FUNCTION DOC] HELPER: build a _TilingSelection for a tiling with memory coalescing
+            # totals; uncoalesced is total minus coalesced, clamped at zero.
             return _TilingSelection(
                 tiling,
                 tiling_score,
@@ -4715,6 +5430,8 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel: sympy.Expr,
         tiling: dict[str, sympy.Expr],
     ):
+        # [FUNCTION DOC] Return True if every scheduler node in the schedule can be split onto the
+        # tiling's groups (with the reduction numel). Raises AssertionError if tiling is not a dict.
         if not isinstance(tiling, dict):
             raise AssertionError(f"expected tiling to be a dict, got {type(tiling)}")
         return all(
@@ -4733,6 +5450,8 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel: sympy.Expr,
         ranked_tilings: list[dict[str, sympy.Expr]],
     ):
+        # [FUNCTION DOC] Return the first tiling in the ranked list that is compatible with the
+        # schedule, or None if none is.
         for tiling in ranked_tilings:
             if cls.tiling_is_compatible(node_schedule, numel, reduction_numel, tiling):
                 return tiling
@@ -4747,6 +5466,7 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel=sympy.S.One,
         coalesce_analysis: CoalesceVarAnalysis | None = None,
     ) -> dict[str, sympy.Expr]:
+        # [FUNCTION DOC] Return just the tiling chosen by get_tiling_and_scores.
         return cls.get_tiling_and_scores(
             node_schedule, numel, reduction_numel, coalesce_analysis
         )[0]
@@ -4759,6 +5479,11 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel=sympy.S.One,
         coalesce_analysis: CoalesceVarAnalysis | None = None,
     ) -> tuple[dict[str, sympy.Expr], dict[str, sympy.Expr] | None]:
+        # [FUNCTION DOC] Choose the tiling for a schedule using stride-1 and (optionally) coalescing
+        # analysis. Delegates to select_tiling_with_memory and returns (tiling mapping, tiling
+        # scores or None).
+        # KNOWN ISSUE: the docstring describes the return value as a triple of two tiles and the
+        # reduction numel, but the function returns a tiling mapping and an optional scores mapping.
         """
         Heuristics to decide how to tile kernels.
         Currently, we tile based on stride-1 dimensions.
@@ -4779,6 +5504,15 @@ class SIMDScheduling(BaseScheduling):
         reduction_numel=sympy.S.One,
         coalesce_analysis: CoalesceVarAnalysis | None = None,
     ) -> _TilingSelection:
+        # [FUNCTION DOC] Heuristics to pick a tiling and report memory coalescing when known. Order
+        # of decisions: a native matmul node forces tiling to its (M, N) and K ranges; with
+        # coalescing tiling analysis enabled (and analysis present and nd-tiling not preferred) use
+        # compute_tiling_strategy; if reductions are not tiled by config or max tiles is at most
+        # one, return the default (optionally logging a perf hint about non-contiguous reductions);
+        # otherwise rank candidate tilings by score across nodes (deduplicated by dependency name),
+        # optionally prepend a 3D tiling when max tiles allows, log possibly bad tiling, optionally
+        # prepend nd-tilings, and return the first compatible tiling. Falls back to the default
+        # tiling (single pointwise group and reduction group). Returns a _TilingSelection.
         """
         Heuristics to decide how to tile kernels.
         Currently, we tile based on stride-1 dimensions.
@@ -4865,6 +5599,14 @@ class SIMDScheduling(BaseScheduling):
             def convert_tiling_to_3d(
                 tiling0: dict[str, sympy.Expr], tiling1: dict[str, sympy.Expr]
             ) -> dict[str, sympy.Expr] | None:
+                # [FUNCTION DOC] HELPER: combine two 2D tilings into a 3D tiling (z, y, x, plus
+                # reduction) when the first tiling's y extent is a larger multiple of the second's;
+                # swaps so the larger comes first. Returns None if they are equal or the
+                # divisibility cannot be shown statically. Raises AssertionError if the ordering
+                # assumption breaks.
+                # KNOWN ISSUE: per the in-code TODO, the equality, ordering and divisibility
+                # decisions depend on hints but are not guarded, so a dynamic-shape change could
+                # make the compiled kernel wrong.
                 a0, a1 = tiling0["x"], tiling0.get("y", 1)
                 b0, b1 = tiling1["x"], tiling1.get("y", 1)
 
@@ -4924,9 +5666,11 @@ class SIMDScheduling(BaseScheduling):
         return _TilingSelection(default_tiling, None, None)
 
     def flush(self):
+        # [FUNCTION DOC] No-op: nothing is buffered, so there is nothing to flush.
         pass
 
     def ready_to_flush(self) -> bool:
+        # [FUNCTION DOC] Always False: this scheduler never holds pending work.
         return False
 
     def generate_kernel_code_from_nodes(
@@ -4936,6 +5680,13 @@ class SIMDScheduling(BaseScheduling):
         hint_override: int | None = None,
         coalesce_analysis: CoalesceVarAnalysis | None = None,
     ):
+        # [FUNCTION DOC] Generate source code for fused scheduler nodes without emitting calls. For
+        # non-template nodes: build the node schedule, optionally run memory coalescing analysis,
+        # build features, select tiling, create the kernel with required overrides, codegen the
+        # schedule and generate kernel source under merged config patches with benchmark_kernel set
+        # as requested. For template nodes: split nodes into prologue, template and epilogue and
+        # call codegen_template for source only. Replaces the kernel name placeholder with a fixed
+        # name. Returns the source string.
         if not any(n.is_template() for n in nodes):
             _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
             node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
@@ -4992,11 +5743,16 @@ class SIMDScheduling(BaseScheduling):
         return src_code
 
     def define_kernel(self, src_code, node_schedule, kernel):
+        # [FUNCTION DOC] Hook that registers kernel source with the wrapper and returns its name;
+        # backends implement it (raises NotImplementedError).
         raise NotImplementedError
 
 
 @dataclasses.dataclass(frozen=True)
 class _SubSplit:
+    # [CLASS DOC] HELPER: immutable candidate pointwise or reduction split: the list of split
+    # extents, the per-split intra-kernel ranking scores (penalized for small blocks) and the
+    # absolute coalesced memory total.
     """A candidate pointwise or reduction split, and what it coalesces."""
 
     splits: list[sympy.Expr]
@@ -5012,6 +5768,9 @@ _UNCOALESCED_MEMORY_COST_WEIGHT = 16
 
 @dataclasses.dataclass(frozen=True)
 class MemoryCoalescing:
+    # [CLASS DOC] Immutable record of memory accessed under a tiling, divided into coalesced and
+    # uncoalesced absolute scores (writes weighted double), comparable across kernels such as one
+    # fused versus two separate ones.
     """Memory accessed under a tiling, split by whether it coalesces.
 
     These are absolute memory scores (writes weighted x2, as in
@@ -5023,12 +5782,17 @@ class MemoryCoalescing:
     uncoalesced: int
 
     def weighted_cost(self) -> int:
+        # [FUNCTION DOC] Return coalesced plus the uncoalesced weight times uncoalesced, so
+        # uncoalesced traffic costs more.
         """Total cost, weighting uncoalesced traffic as more expensive."""
         return self.coalesced + _UNCOALESCED_MEMORY_COST_WEIGHT * self.uncoalesced
 
 
 @dataclasses.dataclass(frozen=True)
 class _TilingSelection:
+    # [CLASS DOC] HELPER: immutable result of tiling selection: the tiling mapping, optional per-
+    # tile scores and optional memory coalescing totals (None when the tiling was forced or fell
+    # back without scoring).
     tiling: dict[str, sympy.Expr]
     tiling_scores: dict[str, sympy.Expr] | None
     # None when the tiling was forced or fell back, so memory was never scored.
@@ -5037,22 +5801,32 @@ class _TilingSelection:
 
 @dataclasses.dataclass(frozen=True)
 class CandidateTiling:
+    # [CLASS DOC] Immutable tiling candidate: a tiling mapping, a score (higher is better) and an
+    # optional name (the dependency that produced it, used for deduplication).
     tiling: dict[str, sympy.Expr]
     score: int  # higher is better
     name: str | None = None
 
     @staticmethod
     def is_good_size(s):
+        # [FUNCTION DOC] Static heuristic that boosts scores for some sizes: True when the size hint
+        # (fallback 8192) is at least 32 and a multiple of 32.
         """Somewhat arbitrary heuristic used to boost scores for some sizes"""
         s = V.graph.sizevars.optimization_hint(s, fallback=8192)
         return s >= 32 and (s % 32 == 0)
 
 
 class CantSplit(Exception):
+    # [CLASS DOC] Exception raised when iteration ranges cannot be split evenly onto kernel groups;
+    # carries the expression and the remaining extent and formats a message saying the first is not
+    # divisible by the second.
     def __init__(self, expr, remaining):
+        # [FUNCTION DOC] Store the expression and remaining values on the exception.
         super().__init__()
         self.expr = expr
         self.remaining = remaining
 
     def __str__(self):
+        # [FUNCTION DOC] Return the message stating that the expression is not divisible by the
+        # remaining extent.
         return f"{self.expr} not divisible by {self.remaining}"
