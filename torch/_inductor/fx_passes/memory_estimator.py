@@ -1,3 +1,9 @@
+# [MODULE DOC] Estimates peak GPU memory of FX graphs by tracking tensor storages.
+# Provides StorageKey (hashable storage identity), GraphAliasTracker (which node allocates
+# or uses which storage, and last uses), build_memory_profile for a single graph,
+# get_fwd_bwd_interactions / get_peak_memory for forward+backward pairs, and MemoryTracker
+# for incremental tracking under alternative schedules. CPU storages are ignored.
+# No import-time side effects besides creating the module logger.
 import itertools
 import logging
 from collections import defaultdict
@@ -16,13 +22,19 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class StorageKey:
+    # [CLASS DOC] Frozen dataclass identifying a storage by its underlying storage object and device.
+    # Hash and equality use the raw C data pointer of the storage plus device, so distinct fake
+    # tensor wrappers that share one storage compare equal.
     storage: torch.UntypedStorage
     device: torch.device
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash based on the storage's C data pointer only.
         return self.storage._cdata
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] HELPER: Equal to another StorageKey with the same storage C pointer and device;
+        # returns False for any other type.
         if not isinstance(other, StorageKey):
             return False
         return (
@@ -31,6 +43,12 @@ class StorageKey:
 
 
 class GraphAliasTracker:
+    # [CLASS DOC] Tracks storage allocation and use relationships over an ordered list of FX nodes.
+    # State (built once in the constructor, read-only afterwards): per-node fresh allocations,
+    # storage to allocating node, per-node input storages, storage to using nodes, storage to
+    # last user, per-node storages whose last use is that node, and per-node output storages.
+    # A node's fresh allocations are output storages not yet seen from an earlier node (views
+    # share storage and so allocate nothing). Nodes must be in topological order.
     """
     Tracks storage allocation and usage relationships in an FX graph.
 
@@ -40,6 +58,11 @@ class GraphAliasTracker:
     """
 
     def __init__(self, nodes: list[fx.Node]):
+        # [FUNCTION DOC] Builds all tracking maps from the given nodes. First pass in order: records output
+        # storages from node meta, marks unseen ones as fresh allocations, and records input storages
+        # (union of the outputs of input nodes) and their users. Second pass in reverse order: the
+        # first node seen using a storage is its last user. Raises KeyError if an input node is not
+        # in the list (not processed earlier).
         # Map from node to the fresh storages it allocates (not views/aliases)
         self.node_to_fresh_allocations: dict[fx.Node, OrderedSet[StorageKey]] = {}
 
@@ -95,6 +118,9 @@ class GraphAliasTracker:
 
     @staticmethod
     def _get_output_storages(node: fx.Node) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] HELPER: Static. Returns the ordered set of StorageKeys for all fake tensors found
+        # (possibly nested) in the node's meta value. Empty if there is no value. Non-fake-tensor
+        # leaves are ignored.
         """
         Get all storages from a node's outputs.
 
@@ -107,6 +133,7 @@ class GraphAliasTracker:
         storages: OrderedSet[StorageKey] = OrderedSet()
 
         def collect_storage(tensor: torch._subclasses.FakeTensor) -> None:
+            # [FUNCTION DOC] HELPER: Adds the storage key of the given fake tensor to the enclosing set.
             storages.add(StorageKey(tensor.untyped_storage(), tensor.device))
 
         # Use tree_map_only to handle FakeTensors in nested structures
@@ -115,6 +142,7 @@ class GraphAliasTracker:
         return storages
 
     def _get_input_storages(self, node: fx.Node) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] HELPER: Returns the union of recorded output storages of all input nodes of the node.
         """
         Get all storages from a node's inputs.
         """
@@ -126,10 +154,12 @@ class GraphAliasTracker:
         return input_storages
 
     def get_fresh_allocations(self, node: fx.Node) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] Returns the storages freshly allocated by the node (excludes aliases).
         """Get all fresh storage allocations by this node (not views/aliases)."""
         return self.node_to_fresh_allocations[node]
 
     def get_storage_uses(self, node: fx.Node) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] Returns the storages used as inputs by the node.
         """Get all storages that this node uses as inputs."""
         return self.node_to_storage_uses[node]
 
@@ -137,6 +167,8 @@ class GraphAliasTracker:
         self,
         node: fx.Node,
     ) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] Returns the storages whose final use in the graph order is this node.
+        # Creates an empty entry for nodes without any (defaultdict side effect).
         """
         Get storages whose last use is at this node.
         """
@@ -144,10 +176,12 @@ class GraphAliasTracker:
 
 
 def _size_of_default(num_bytes: int | torch.SymInt) -> int:
+    # [FUNCTION DOC] HELPER: Converts a possibly symbolic byte count to a concrete int using the optimization hint.
     return optimization_hint(num_bytes)
 
 
 def device_filter(device: torch.device) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True for any non-CPU device; used to decide which storages are counted.
     return device.type != "cpu"
 
 
@@ -156,6 +190,12 @@ def build_memory_profile(
     is_releasable: Callable[[fx.Node], bool],
     size_of: Callable[[int | torch.SymInt], int] | None = None,
 ) -> list[int]:
+    # [FUNCTION DOC] Estimates the memory profile of a graph. Starts with the fresh allocations of
+    # placeholder and get_attr nodes, then for each other node (skipping output) appends the memory
+    # after allocating its fresh storages and again after freeing storages whose last use is
+    # that node and whose allocator passes is_releasable. Only non-CPU storages count. Sizes come
+    # from size_of (default: optimization hint). Returns the list of memory values, starting
+    # with the initial value.
     """
     Function to estimate the memory profile of an input FX graph.
 
@@ -219,6 +259,12 @@ def get_fwd_bwd_interactions(
     bwd_graph: fx.Graph,
     size_of: Callable[[int | torch.SymInt], int] | None = None,
 ) -> tuple[int, OrderedSet[str]]:
+    # [FUNCTION DOC] Analyzes forward/backward interaction. Returns the baseline memory (bytes of non-CPU
+    # storages in the forward output but not among backward inputs) and the set of backward placeholder
+    # names that must not be freed (those aliasing primal storages or not sourced from forward output).
+    # Raises an error if the last forward node is not the output node.
+    # KNOWN ISSUE: the forward output node lookup indexes the last node object itself, which a Node does
+    # not support; as written it likely fails (the intent is just the last node).
     """
     Analyze the interactions between the forward (fwd) and backward (bwd) graphs
     to determine memory usage characteristics.
@@ -287,6 +333,7 @@ def get_fwd_bwd_interactions(
 
 
 def _is_releasable(n: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: A node is releasable unless its name starts with primals.
     # Storages of primals cannot be released during fwd or bwd pass.
     return not n.name.startswith("primals")
 
@@ -295,6 +342,9 @@ def get_peak_memory(
     fwd_graph: fx.Graph,
     bwd_graph: fx.Graph,
 ) -> int:
+    # [FUNCTION DOC] Returns the estimated peak memory of a forward/backward pair: the max of the forward
+    # profile peak and the backward profile peak plus the baseline carried over from forward.
+    # Primals and backward inputs flagged as do-not-delete are never released.
     fwd_peak_memory = max(build_memory_profile(fwd_graph, _is_releasable))
 
     bwd_baseline_memory, bwd_do_not_delete = get_fwd_bwd_interactions(
@@ -303,6 +353,7 @@ def get_peak_memory(
     )
 
     def _is_bwd_releasable(n: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Releasable if not a primal and not in the backward do-not-delete set.
         # Storages of nodes in bwd_do_not_delete cannot be released
         # during the bwd pass.
         return _is_releasable(n) and n.name not in bwd_do_not_delete
@@ -317,6 +368,10 @@ def get_peak_memory(
 
 
 class MemoryTracker:
+    # [CLASS DOC] Tracks live memory while nodes of a graph are scheduled in an arbitrary order.
+    # State: alias tracker, set of live storages, current and peak byte counts, set of scheduled nodes,
+    # device filter and releasability predicate. Placeholder/get_attr storages are live from the start.
+    # Key methods: schedule_node, get_current_memory_bytes; peak_memory is updated after allocations.
     """
     Tracks memory usage for alternative scheduling orders of an FX graph.
 
@@ -330,6 +385,9 @@ class MemoryTracker:
         is_releasable: Callable[[fx.Node], bool] | None = None,
         device_filter: Callable[[torch.device], bool] | None = None,
     ):
+        # [FUNCTION DOC] Builds the tracker: stores the graph, node list, device filter (default non-CPU),
+        # releasability predicate (default: not primals), and marks the fresh storages of placeholder and
+        # get_attr nodes live, setting current and peak memory to their total. Logs the initial size at debug level.
         """
         Initialize memory tracker for alternative scheduling of the given graph.
 
@@ -369,6 +427,8 @@ class MemoryTracker:
         )
 
     def schedule_node(self, node: fx.Node) -> None:
+        # [FUNCTION DOC] Marks the node as scheduled and updates memory (allocations, then frees).
+        # Raises an error if the node was already scheduled.
         """
         Schedule a node and update memory tracking for the new scheduling order.
 
@@ -381,15 +441,20 @@ class MemoryTracker:
         self._update_memory_for_node(node)
 
     def get_current_memory_bytes(self) -> int:
+        # [FUNCTION DOC] Returns current live memory in bytes.
         """Get current live memory in bytes under the current scheduling."""
         return self.current_memory_bytes
 
     def _get_storage_size(self, storage_key: StorageKey) -> int:
+        # [FUNCTION DOC] HELPER: Returns the storage size in bytes as a concrete int (optimization hint for symbolic sizes).
         """Get the size of a storage in bytes, handling symbolic shapes."""
         size_bytes = storage_key.storage.nbytes()
         return optimization_hint(size_bytes)
 
     def _get_storages_freed_by_node(self, node: fx.Node) -> OrderedSet[StorageKey]:
+        # [FUNCTION DOC] HELPER: Returns input storages of the node that would be freed once it is scheduled:
+        # on a tracked device, releasable by their allocator, and with all users already scheduled.
+        # Raises an error if a tracked input storage is not currently live.
         """Get storages that would be freed if we schedule this node."""
         freed_storages: OrderedSet[StorageKey] = OrderedSet()
 
@@ -416,6 +481,9 @@ class MemoryTracker:
         return freed_storages
 
     def _update_memory_for_node(self, node: fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Updates memory for a scheduled node (no-op for placeholder, get_attr, output).
+        # Adds fresh non-live tracked storages, updates peak, then frees storages returned by
+        # _get_storages_freed_by_node, and logs the changes at debug level.
         """Update memory tracking when a node is scheduled."""
         if node.op in ("placeholder", "get_attr", "output"):
             return

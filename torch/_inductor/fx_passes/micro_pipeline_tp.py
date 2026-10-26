@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Micro-pipeline tensor-parallel (async TP) pass for Inductor post-grad graphs.
+# Finds all-gather -> matmul and matmul -> reduce-scatter patterns (direct form, or split/cat and
+# slice/cat reassembly forms, optionally with uint8 type erasure) and rewrites them into the
+# symm_mem fused ops (fused_all_gather_matmul, fused_matmul_reduce_scatter and scaled variants).
+# Main contents: match dataclasses (_AllGatherMatch, _ReduceScatterMatch, _Matmul, _ScaledMatmul),
+# pattern finders, the two fuse_* functions, and the entry point micro_pipeline_tp_pass.
+# Import-time side effects: creates the module logger and an empty PatternMatcherPass named patterns.
 import logging
 import operator
 from collections import defaultdict
@@ -28,10 +35,13 @@ patterns = PatternMatcherPass()
 
 
 def _is_last_dim(t: torch.Tensor, dim: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if dim is the last dimension of the tensor (positive or negative index).
     return dim == t.ndim - 1 or dim == -1
 
 
 def _is_backward(graph: torch.fx.Graph) -> bool:
+    # [FUNCTION DOC] HELPER: Heuristic: a graph is a backward graph if its leading placeholder nodes are not all
+    # named with a primal prefix. Returns a bool.
     placeholders = []
     for node in graph.nodes:
         if node.op != "placeholder":
@@ -41,14 +51,19 @@ def _is_backward(graph: torch.fx.Graph) -> bool:
 
 
 def _compute_mm_arithmetic_intensity(M: int, N: int, K: int) -> float:
+    # [FUNCTION DOC] HELPER: Returns FLOPs-per-byte style arithmetic intensity of an MxK by KxN matmul
+    # (M*N*K divided by the sum of the three operand/result element counts).
     return M * N * K / (M * K + N * K + M * N)
 
 
 def _filter_nodes_by_target(nodes: list[torch.fx.Node], target) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Returns the nodes whose target equals the given target.
     return [x for x in nodes if x.target == target]
 
 
 def _find_ancestors(node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Returns the ordered set of all transitive input nodes of the node, including the node
+    # itself, excluding placeholders (found by breadth-first traversal over input nodes).
     ancestors = OrderedSet[torch.fx.Node]()
     ancestors.add(node)
     cur_nodes = [node]
@@ -64,6 +79,8 @@ def _find_ancestors(node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
 
 
 def _get_tensor(node: torch.fx.Node) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns the fake tensor value stored in node meta; raises an error if it is not a tensor
+    # (KeyError if there is no value).
     val = node.meta["val"]
     if not isinstance(val, torch.Tensor):
         raise AssertionError(f"expected node val to be a Tensor, got {type(val)}")
@@ -72,6 +89,10 @@ def _get_tensor(node: torch.fx.Node) -> torch.Tensor:
 
 @dataclass
 class _AllGatherMatch:
+    # [CLASS DOC] Result of matching an all-gather whose gathered result feeds matmuls.
+    # Fields: match (pattern Match or explicit node list to erase), shard_node (input shard), ag_node
+    # (all_gather_into_tensor call), res_node (node holding the final gathered result), gather_dim, group_name.
+    # Methods redirect uses of the result and erase the dead matched nodes.
     match: Match | list[torch.fx.Node]
     shard_node: torch.fx.Node
     ag_node: torch.fx.Node
@@ -80,9 +101,11 @@ class _AllGatherMatch:
     group_name: "torch.distributed.distributed_c10d.GroupName"
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Redirects all users of the gathered result node to the given node.
         self.res_node.replace_all_uses_with(new_node)
 
     def erase(self) -> None:
+        # [FUNCTION DOC] Erases matched nodes in reverse order, but only those that have no remaining users.
         nodes = self.match.nodes if isinstance(self.match, Match) else self.match
         for node in reversed(nodes):
             if len(node.users) == 0:
@@ -90,6 +113,11 @@ class _AllGatherMatch:
 
 
 def find_all_gather_patterns(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Scans the graph in reverse and returns a list of _AllGatherMatch (in forward order) for
+    # all-gathers along dim 0 (wait of all-gather), non-zero dim (all-gather, split, cat), their uint8
+    # type-erased variants (view dtype), and slice/cat reassembly forms (optionally trimmed by a slice).
+    # Each all-gather node is matched at most once; longer patterns are tried first. Does not modify the graph.
+    # Raises an error if a pattern match is not a Match or its all-gather index is wrong.
     """Find all-gather outputs that can fuse with downstream matmul users.
 
     This recognizes both the direct all-gather form and slice/cat reassembly
@@ -99,6 +127,7 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
     split_targets = [aten.split.Tensor, aten.split.sizes, aten.split_with_sizes.default]
 
     def make_zero_dim_all_gather_pattern(shard):
+        # [FUNCTION DOC] HELPER: Builds the pattern for a wait_tensor of an all-gather along dim 0 on the given shard pattern.
         return CallFunction(
             c10d.wait_tensor.default,
             CallFunction(
@@ -113,6 +142,7 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
     zero_dim_all_gather_pattern = make_zero_dim_all_gather_pattern(KeywordArg("shard"))
 
     def make_all_gather_split_pattern(shard):
+        # [FUNCTION DOC] HELPER: Builds the pattern for one item taken from a split of a dim-0 all-gather result.
         return CallFunction(
             operator.getitem,
             CallFunction(
@@ -125,6 +155,7 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
         )
 
     def make_cat_pattern(splits):
+        # [FUNCTION DOC] HELPER: Builds the pattern for concatenating a list of the given split pattern along a captured dim.
         return CallFunction(
             aten.cat.default,
             ListOf(splits),
@@ -186,6 +217,9 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
     def _match_slice_cat_all_gather(
         node: torch.fx.Node,
     ) -> _AllGatherMatch | None:
+        # [FUNCTION DOC] HELPER: Matches the slice/cat all-gather form starting at a result node (optionally an outer
+        # slice trimming a cat). Requires cat inputs to be dim-0 slices of a single wait_tensor of an
+        # all-gather with a known group name and an integer cat dim. Returns an _AllGatherMatch or None.
         res_node = node
         trim_node = None
         if node.target is aten.slice.Tensor:
@@ -302,6 +336,9 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
 
 @dataclass
 class _ReduceScatterMatch:
+    # [CLASS DOC] Result of matching a reduce-scatter whose input is a matmul output.
+    # Fields: match (pattern Match or node list to erase), input_node, reduce_scatter_node, wait_tensor_node,
+    # reduce_op, scatter_dim, group_name. Methods redirect users and erase dead matched nodes.
     match: Match | list[torch.fx.Node]
     input_node: torch.fx.Node
     reduce_scatter_node: torch.fx.Node
@@ -311,6 +348,8 @@ class _ReduceScatterMatch:
     group_name: "torch.distributed.distributed_c10d.GroupName"
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Redirects users of the wait_tensor node to the fused node and, if the raw reduce-scatter
+        # result was saved for backward (graph output), updates that too.
         # Replace all uses of the result node (wait_tensor) with the fused node.
         self.wait_tensor_node.replace_all_uses_with(new_node)
 
@@ -318,6 +357,8 @@ class _ReduceScatterMatch:
         self._update_save_for_backward(new_node)
 
     def _update_save_for_backward(self, new_node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: If the graph output node uses the reduce-scatter node directly, replaces that input with
+        # the fused node; then raises an error if the reduce-scatter node still has other than one user.
         """
         If the output node is a user of the reduce_scatter node (indicating the reduce_scatter
         result is saved for backward), this method will update the output node to use the fused node instead.
@@ -338,6 +379,7 @@ class _ReduceScatterMatch:
                 )
 
     def erase(self) -> None:
+        # [FUNCTION DOC] Erases matched nodes in reverse order, but only those that have no remaining users.
         nodes = self.match.nodes if isinstance(self.match, Match) else self.match
         for node in reversed(nodes):
             if len(node.users) == 0:
@@ -345,6 +387,10 @@ class _ReduceScatterMatch:
 
 
 def find_reduce_scatter_patterns(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Scans the graph in reverse over wait_tensor nodes and returns a list of _ReduceScatterMatch
+    # (forward order). Recognizes slice/cat form, scatter along non-zero dim (cat of split items), and
+    # dim 0, each with one user or two users (result also saved for backward). Does not modify the graph.
+    # Raises an error if a pattern match is not a Match.
     """Find matmul outputs that can fuse with downstream reduce-scatter users.
 
     This recognizes both the direct reduce-scatter form and slice/cat forms
@@ -354,6 +400,8 @@ def find_reduce_scatter_patterns(graph: torch.fx.Graph):
     split_targets = [aten.split.Tensor, aten.split.sizes, aten.split_with_sizes.default]
 
     def reduce_scatter_template(inp: PatternExpr, users: int):
+        # [FUNCTION DOC] HELPER: Builds the pattern for wait_tensor of a reduce_scatter_tensor on the given input pattern,
+        # requiring the given number of users of the reduce-scatter node.
         return CallFunction(
             c10d.wait_tensor.default,
             CallFunction(
@@ -423,6 +471,9 @@ def find_reduce_scatter_patterns(graph: torch.fx.Graph):
     def _match_slice_cat_reduce_scatter(
         wait_node: torch.fx.Node,
     ) -> _ReduceScatterMatch | None:
+        # [FUNCTION DOC] HELPER: Matches the slice/cat reduce-scatter form ending at a wait_tensor node: the reduce-scatter
+        # input must be a dim-0 cat of slices of one input along one common dim. Returns a
+        # _ReduceScatterMatch or None; group name and reduce op are read from kwargs or positional args.
         if wait_node.target is not c10d.wait_tensor.default:
             return None
         reduce_scatter_node = wait_node.args[0]
@@ -554,6 +605,9 @@ def find_reduce_scatter_patterns(graph: torch.fx.Graph):
 
 @dataclass
 class _Matmul:
+    # [CLASS DOC] A matched matmul: either a single 2D mm or scaled mm node, or a reshape -> mm -> reshape triple.
+    # Fields: nodes, arg_ancestor_nodes (non-placeholder ancestors of the non-A operands, computed after init),
+    # A_node, B_node, optional pre/post reshape nodes (unused here, always None). Methods rewire and erase.
     nodes: list[torch.fx.Node]
     arg_ancestor_nodes: OrderedSet[torch.fx.Node] = field(init=False)
     A_node: torch.fx.Node
@@ -562,6 +616,8 @@ class _Matmul:
     post_mm_reshape: torch.fx.Node | None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates that nodes holds one mm/scaled mm or a reshape, mm/scaled mm, reshape triple
+        # (raises an error otherwise) and computes the ancestors of B_node.
         if len(self.nodes) not in (1, 3):
             raise AssertionError(f"expected 1 or 3 nodes, got {len(self.nodes)}")
         if len(self.nodes) == 1:
@@ -581,6 +637,9 @@ class _Matmul:
         self.arg_ancestor_nodes = _find_ancestors(self.B_node)
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Redirects users of the matmul result to the given node. For a triple, the last reshape is
+        # replaced by the new node, and if the mm node has other users it is replaced with a reshape of the new
+        # node to the mm output shape. Raises an error on unexpected node targets.
         """
         Replace the matmul with the new node.
         """
@@ -619,12 +678,15 @@ class _Matmul:
             mm_node.replace_all_uses_with(new_mm_node)
 
     def erase(self) -> None:
+        # [FUNCTION DOC] Erases the matmul nodes in reverse order, skipping those that still have users.
         for node in reversed(self.nodes):
             if len(node.users) == 0:
                 node.graph.erase_node(node)
 
     @classmethod
     def from_match(cls, match: list[torch.fx.Node]) -> "_Matmul":
+        # [FUNCTION DOC] Builds a _Matmul from a matched node list (one mm, or reshape, mm, reshape). A is the first
+        # node's first arg and B the mm node's second arg. Raises an error for bad length or target.
         if len(match) not in (1, 3):
             raise AssertionError(f"expected 1 or 3 nodes, got {len(match)}")
         if match[0].target not in (
@@ -646,6 +708,10 @@ class _Matmul:
 
 @dataclass
 class _ScaledMatmul(_Matmul):
+    # [CLASS DOC] A _Matmul for aten._scaled_mm with extra fields: A_scale_node, B_scale_node, optional bias and
+    # result scale nodes, out_dtype, use_fast_accum, and the pre/post reshape nodes of a
+    # reshape -> scaled_mm -> reshape pattern (where mm operands are 2D). Scale ancestors are added to
+    # arg_ancestor_nodes.
     A_scale_node: torch.fx.Node
     B_scale_node: torch.fx.Node
     bias_node: torch.fx.Node | None
@@ -656,12 +722,16 @@ class _ScaledMatmul(_Matmul):
     post_mm_reshape: torch.fx.Node | None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Runs base validation, then adds the ancestors of both scale nodes to arg_ancestor_nodes.
         super().__post_init__()
         self.arg_ancestor_nodes |= _find_ancestors(self.A_scale_node)
         self.arg_ancestor_nodes |= _find_ancestors(self.B_scale_node)
 
     @classmethod
     def from_match(cls, match: list[torch.fx.Node]) -> "_ScaledMatmul":
+        # [FUNCTION DOC] Builds a _ScaledMatmul from a match of one scaled mm or reshape, scaled mm, reshape.
+        # Reads A, B, scales from the mm node args and optional bias, result scale, out dtype, fast accum
+        # from later args (defaults None/None/None/False). Raises an error for bad length or target.
         if len(match) not in (1, 3):
             raise AssertionError(f"expected 1 or 3 nodes, got {len(match)}")
         if match[0].target not in (
@@ -673,6 +743,7 @@ class _ScaledMatmul(_Matmul):
             )
 
         def get_arg(node: torch.fx.Node, idx: int, default: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Returns positional arg idx of the node or the default if absent.
             if idx >= len(node.args):
                 return default
             return node.args[idx]
@@ -705,6 +776,9 @@ class _ScaledMatmul(_Matmul):
 
 
 def _find_reshape_mm_reshape(node: torch.fx.Node) -> list[_Matmul]:
+    # [FUNCTION DOC] HELPER: For a reshape node, returns matmuls of form reshape -> mm/scaled mm -> reshape where the
+    # second reshape output shape equals input leading dims plus the B last dim. At most one match per mm node.
+    # Returns empty list if node is not a reshape. Raises an error for an unexpected mm target.
     if node.target != aten.reshape.default:
         return []
 
@@ -753,6 +827,8 @@ def _find_reshape_mm_reshape(node: torch.fx.Node) -> list[_Matmul]:
 
 
 def _find_consumer_matmuls(node: torch.fx.Node) -> list[_Matmul]:
+    # [FUNCTION DOC] HELPER: Returns the matmuls (2D mm, scaled mm, or reshape-wrapped ND forms) that use the node as the
+    # left operand, among its direct users.
     """
     Find the matmuls that use `node` as the lhs argument.
     """
@@ -778,6 +854,9 @@ def _insert_fused_all_gather_matmul(
     gather_dim: int,
     group_name: "torch.distributed.distributed_c10d.GroupName",
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Inserts (in the graph, at the current insertion point) a call to the symm_mem fused
+    # all-gather matmul (plain, returning A too) or fused all-gather scaled matmul for the given
+    # matmuls, and returns it. All matmuls must be one type, else an error is raised.
     mm_types = OrderedSet(map(type, matmuls))
     if len(mm_types) != 1:
         raise AssertionError(f"expected exactly one matmul type, got {len(mm_types)}")
@@ -811,6 +890,11 @@ def _insert_fused_all_gather_matmul(
 
 
 def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
+    # [FUNCTION DOC] Rewrites an all-gather and its consumer matmuls into one fused op, mutating the graph.
+    # Does nothing if distributed NCCL/XCCL is unavailable, symmetric memory is not enabled for the group,
+    # no fusible matmuls of a single type exist, or for last-dim gathers when the shard is too narrow (< 1024),
+    # scaled matmuls are present, or the result has non-matmul users. Restrides the shard for non-last dims,
+    # drops the A output if unused, and moves ancestors of non-A operands above the fused node. Returns None.
     """
     Fused the pattern
 
@@ -859,6 +943,7 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
 
         # scaled_mm is not supported yet for last dim
         def _filter_out_scaled_matmul(matmul: _Matmul):
+        # [FUNCTION DOC] HELPER: Filter returning True only for non-scaled matmuls.
             return not isinstance(matmul, _ScaledMatmul)
 
         filter_matmul = _filter_out_scaled_matmul
@@ -946,6 +1031,9 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
 def _scatter_dim_after_reshape(
     reshape_node: torch.fx.Node, orig_scatter_dim: int
 ) -> int:
+    # [FUNCTION DOC] HELPER: Maps a scatter dim of the original (3D+) tensor to the dim after the 3D+ to 2D reshape:
+    # 0 stays 0, the last dim becomes 1, middle dims map to 0 if leading dims were collapsed else 1.
+    # Returns the original dim if there is no reshape. Raises an error if shapes are not 3D+ to 2D.
     """
     Given a reshape node and the original scatter dim for the target tensor,
     returns the new scatter dim for the reshaped tensor.
@@ -988,6 +1076,8 @@ def _scatter_dim_after_reshape(
 
 
 def _find_producer_matmul(node: torch.fx.Node) -> _Matmul | None:
+    # [FUNCTION DOC] HELPER: Finds the matmul (mm, scaled mm, or reshape-wrapped) producing the given node, or None.
+    # Raises an error if a reshape's input is not a node.
     """
     Returns producer matmul node if found, otherwise returns None.
     """
@@ -1028,6 +1118,9 @@ def _insert_fused_matmul_reduce_scatter(
     scatter_dim_after_reshape: int,  # only used for reshape -> scaled_mm -> reshape pattern
     output_shape: list[int],  # only used for reshape -> scaled_mm -> reshape pattern
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Inserts (at the current insertion point) a call to the symm_mem fused matmul-reduce-scatter
+    # (or its scaled variant, with the extra scatter dim after reshape and output shape) and returns the node.
+    # Raises an error for an unknown matmul type.
     if type(matmul) is _Matmul:
         return graph.call_function(
             torch.ops.symm_mem.fused_matmul_reduce_scatter.default,
@@ -1063,6 +1156,12 @@ def _insert_fused_matmul_reduce_scatter(
 
 
 def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch) -> None:
+    # [FUNCTION DOC] Rewrites matmul -> reduce-scatter into one fused op, mutating the graph. Returns None.
+    # Skips (with log messages) if distributed NCCL/XCCL is unavailable, symmetric memory is not enabled,
+    # no producer matmul exists, the matmul result has other users, the wait result is an ancestor of the
+    # matmul, or a scaled matmul is used with a last-dim scatter. Restrides A, computes the scatter dim
+    # after reshape and output shape, replaces the matched nodes, and moves operand ancestors above the fused node.
+    # KNOWN ISSUE: the docstring claims a boolean is returned, but the function always returns None.
     """
     Fused the pattern
 
@@ -1113,6 +1212,7 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch) -> None:
     if _is_last_dim(_get_tensor(input_node), orig_scatter_dim):
         # scaled_mm is not supported yet for last dim mm+rs
         def _filter_out_scaled_matmul(matmul: _Matmul):
+        # [FUNCTION DOC] HELPER: Filter returning True only for non-scaled matmuls.
             return not isinstance(matmul, _ScaledMatmul)
 
         filter_matmul = _filter_out_scaled_matmul
@@ -1216,6 +1316,8 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch) -> None:
 def _get_node_to_ancestors(
     graph: torch.fx.Graph,
 ) -> dict[torch.fx.Node, OrderedSet[torch.fx.Node]]:
+    # [FUNCTION DOC] HELPER: Returns a mapping from each node to the ordered set of all its transitive input nodes,
+    # computed in graph order (assumes topological order).
     """
     Compute the ancestors for all nodes in a graph.
     """
@@ -1231,12 +1333,15 @@ def _get_node_to_ancestors(
 def _get_collective_to_overlappable_nodes(
     graph: torch.fx.Graph,
 ) -> dict[torch.fx.Node, list[torch.fx.Node]]:
+    # [FUNCTION DOC] HELPER: For each all-gather / reduce-scatter node, returns the list of call_function nodes that
+    # are neither its ancestors nor descendants (quadratic in graph size).
     """
     For each collective in the graph, find nodes that are neither ancestors nor
     descendants of the collective.
     """
 
     def is_collective(node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node is an all-gather or reduce-scatter collective.
         # Only consider all-gather and reduce-scatter in the context of
         # micro-pipeline TP.
         return node.target in [
@@ -1261,6 +1366,8 @@ def _get_collective_to_overlappable_nodes(
 
 
 def _get_unexposed_collectives(graph: torch.fx.Graph) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Roughly estimates which collectives are hidden by compute: each collective may use one
+    # overlappable mm node, and each mm can hide only one collective. Returns the list of hidden collectives.
     """
     Find all unexposed collectives in the graph.
 
@@ -1272,6 +1379,7 @@ def _get_unexposed_collectives(graph: torch.fx.Graph) -> list[torch.fx.Node]:
     """
 
     def _is_compute_intensive(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node is an aten mm.
         return node.target is torch.ops.aten.mm.default
 
     collective_to_overlapping_candidates = defaultdict(list)
@@ -1297,6 +1405,10 @@ def _get_unexposed_collectives(graph: torch.fx.Graph) -> list[torch.fx.Node]:
 
 
 def micro_pipeline_tp_pass(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Entry point of the pass: finds all-gather and reduce-scatter patterns, optionally drops those
+    # that simple compute/comm overlap can already hide (when reorder_for_compute_comm_overlap is on),
+    # warns if nothing matched, then fuses each all-gather with matmuls and each matmul with its
+    # reduce-scatter. Mutates the graph in place; returns None.
     all_gathers = find_all_gather_patterns(graph)
     reduce_scatters = find_reduce_scatter_patterns(graph)
 

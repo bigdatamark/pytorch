@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Miscellaneous graph rewrite patterns for Inductor: randperm-based indexing to unsafe
+# indexing, e8m0 (MX format scale) extraction to a fused conversion or bit manipulation, and a
+# pass that normalizes numpy-style keyword names. Import-time side effect: creates the global
+# numpy_compat_normalization pass instance. Patterns are registered lazily by _misc_patterns_init.
 import functools
 
 import torch
@@ -15,6 +19,12 @@ aten = torch.ops.aten
 
 @functools.cache
 def _misc_patterns_init(input_device: torch.device | None = None):
+    # [FUNCTION DOC] HELPER: Cached (per input device) one-time registration of replacement patterns into the
+    # post-grad (medium priority) and joint-graph pattern matchers. Device is the given one, else cuda
+    # if available, else cpu. Registers: randperm+slice+index_add to unsafe index_put; randperm full index
+    # and randperm sliced index to unsafe index; on cuda, float32 e8m0 rounding-up patterns (bit
+    # manipulation form only on SM100+ -> fused cvt prim; log2/ceil form on all cuda, replaced by the prim on
+    # SM100+ or a bit-manipulation fallback otherwise). Side effects: global pattern registries mutated.
     from .joint_graph import patterns as joint_graph_patterns
     from .post_grad import pass_patterns as post_grad_patterns_all
 
@@ -35,10 +45,12 @@ def _misc_patterns_init(input_device: torch.device | None = None):
     # 2. Also, since we are guaranteed that they are completely within bounds,
     # we can use unsafe indexing and skip debug asserts
     def randperm_index_add_pattern(x, y):
+    # [FUNCTION DOC] HELPER: Pattern: random permutation prefix used as unique index in index_add; returns result and index.
         index = torch.randperm(x.shape[0], device=x.device)[: y.shape[0]]
         return torch.index_add(x, dim=0, source=y, index=index), index
 
     def randperm_index_add_replacement(x, y):
+    # [FUNCTION DOC] HELPER: Replacement: same index, but uses unsafe gather plus add and unsafe index_put without accumulation.
         index = torch.randperm(x.shape[0], device=x.device)[: y.shape[0]]
         return (
             torch.ops.aten._unsafe_index_put(
@@ -61,10 +73,12 @@ def _misc_patterns_init(input_device: torch.device | None = None):
     )
 
     def randperm_index_full_pattern(x):
+    # [FUNCTION DOC] HELPER: Pattern: indexing a tensor by a full random permutation; returns result and index.
         index = torch.randperm(x.shape[0], device=x.device)
         return torch.ops.aten.index(x, (index,)), index
 
     def randperm_index_full_replacement(x):
+    # [FUNCTION DOC] HELPER: Replacement: same but with unsafe indexing (permutation is in bounds).
         index = torch.randperm(x.shape[0], device=x.device)
         return torch.ops.aten._unsafe_index(x, (index,)), index
 
@@ -82,10 +96,12 @@ def _misc_patterns_init(input_device: torch.device | None = None):
     )
 
     def randperm_index_pattern(x, slice_shape):
+    # [FUNCTION DOC] HELPER: Pattern: indexing by a sliced random permutation of length slice_shape; returns result and index.
         index = torch.randperm(x.shape[0], device=x.device)[:slice_shape]
         return torch.ops.aten.index(x, (index,)), index
 
     def randperm_index_replacement(x, slice_shape):
+    # [FUNCTION DOC] HELPER: Replacement: same but with unsafe indexing.
         index = torch.randperm(x.shape[0], device=x.device)[:slice_shape]
         return torch.ops.aten._unsafe_index(x, (index,)), index
 
@@ -108,6 +124,8 @@ def _misc_patterns_init(input_device: torch.device | None = None):
     if device.startswith("cuda"):
 
         def e8m0_extra_check(match):
+        # [FUNCTION DOC] HELPER: Extra check for e8m0 patterns: the match must have an input node whose
+        # fake value is a float32 cuda tensor; returns False otherwise.
             inp = match.kwargs.get("inp")
             if inp is None:
                 return False
@@ -125,6 +143,8 @@ def _misc_patterns_init(input_device: torch.device | None = None):
 
             # Pattern 1: Bit manipulation approach (NVIDIA SM100+ only - uses PTX instruction)
             def e8m0_rceil_pattern(inp):
+            # [FUNCTION DOC] HELPER: Pattern (SM100+): reinterprets float32 bits, takes the biased exponent, adds one if the
+            # mantissa is nonzero, clamps to 0..255 and casts to uint8 (e8m0 round toward positive infinity).
                 inp_bits = inp.view(torch.int32)
                 biased_exp = (inp_bits >> 23) & 0xFF
                 mantissa = inp_bits & 0x7FFFFF
@@ -134,6 +154,7 @@ def _misc_patterns_init(input_device: torch.device | None = None):
                 return e8m0_biased.to(torch.uint8)
 
             def e8m0_rceil_replacement(inp):
+            # [FUNCTION DOC] HELPER: Replacement: calls the fused inductor cvt_e8m0_rceil primitive.
                 return inductor_prims.cvt_e8m0_rceil(inp)
 
             register_replacement(
@@ -168,6 +189,7 @@ def _misc_patterns_init(input_device: torch.device | None = None):
         E8M0_BIAS = 127
 
         def e8m0_rceil_log2_pattern(inp):
+        # [FUNCTION DOC] HELPER: Pattern: log2, ceil, clamp to the e8m0 bias range, add bias, cast to uint8.
             log2_val = torch.log2(inp)
             ceil_val = torch.ceil(log2_val)
             clamped = torch.clamp(ceil_val, min=-E8M0_BIAS, max=E8M0_BIAS)
@@ -177,6 +199,7 @@ def _misc_patterns_init(input_device: torch.device | None = None):
         if is_sm100_plus:
 
             def e8m0_rceil_log2_replacement(inp):
+            # [FUNCTION DOC] HELPER: Replacement on SM100+: calls the fused cvt_e8m0_rceil primitive.
                 return inductor_prims.cvt_e8m0_rceil(inp)
 
         else:
@@ -187,6 +210,8 @@ def _misc_patterns_init(input_device: torch.device | None = None):
             # Clamp to [0, 254] to match the satfinite semantics of the original
             # pattern (clamp(ceil_val, -127, 127) + 127 gives at most 254).
             def e8m0_rceil_log2_replacement(inp):
+            # [FUNCTION DOC] HELPER: Replacement on older hardware: exponent-bit extraction with round-up on nonzero mantissa,
+            # clamped to 0..254, cast to uint8.
                 inp_bits = inp.view(torch.int32)
                 biased_exp = (inp_bits >> 23) & 0xFF
                 mantissa = inp_bits & 0x7FFFFF
@@ -214,6 +239,10 @@ def _misc_patterns_init(input_device: torch.device | None = None):
 
 
 class NumpyCompatNormalization:
+    # [CLASS DOC] Graph pass that renames numpy-style keyword arguments (axis, keepdims, x, a, x1, x2) of
+    # torch function calls to the canonical torch names (dim, keepdim, input, other).
+    # State: numpy_compat (canonical name to numpy aliases), inverse_mapping (alias to canonical name),
+    # cache (call target to set of replaceable alias names). Instances are callable on an FX graph.
     numpy_compat: dict[str, tuple[str, ...]] = {
         "dim": ("axis",),
         "keepdim": ("keepdims",),
@@ -224,6 +253,8 @@ class NumpyCompatNormalization:
     cache: dict["torch.fx.graph.Target", OrderedSet[str]]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes an empty cache and builds the inverse mapping from numpy aliases to canonical names.
+        # Raises an error if an alias is mapped twice.
         self.cache = {}  # callable -> tuple of replaceable args e.g. ["axis"]
         self.inverse_mapping = {}
         for actual_kwarg, numpy_kwargs in self.numpy_compat.items():
@@ -235,6 +266,11 @@ class NumpyCompatNormalization:
                 self.inverse_mapping[numpy_kwarg] = actual_kwarg
 
     def __call__(self, graph: torch.fx.Graph):
+        # [FUNCTION DOC] Mutates the graph in place: for each call_function node whose target is a plain torch function
+        # (skips aten op overloads and packets), finds via its signatures which parameters have numpy aliases
+        # (cached per target) and rewrites matching keyword names to the canonical names, keeping values.
+        # Updates node kwargs and increments the inductor numpy_compat_normalization counter for each changed node.
+        # Returns None.
         for node in graph.nodes:
             if node.op != "call_function":
                 continue
