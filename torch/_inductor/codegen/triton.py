@@ -1,3 +1,9 @@
+# [MODULE DOC] Triton backend code generation for Inductor. Defines TritonKernel (a SIMDKernel
+# subclass that emits Triton source for pointwise/reduction/scan/sort kernels), the Triton op
+# overrides and printer, indexing helpers (block pointers, TMA tensor descriptors, masks),
+# TritonScheduling (kernel codegen, autotune/benchmark hooks, caching of generated source) and
+# helpers for reduction/persistent-reduction heuristics. Import-time side effects: creates module
+# loggers (log, perf_hint_log, schedule_log, fusion_log) and a module-level AsyncCompile instance.
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
@@ -160,6 +166,10 @@ async_compile = AsyncCompile()
 
 
 def get_triton_reduction_function(reduction_type):
+    # [FUNCTION DOC] Return the dotted name of the Triton function implementing a reduction type.
+    # any/max/min/prod/fmax come from triton_helpers, others from tl. max/min/fmax map to the
+    # two-argument-style "2" variants, with a "_strict" suffix for max/min when
+    # config.strict_signed_zero is set. Pure; no side effects.
     use_helper = reduction_type in ("any", "max", "min", "prod", "fmax")
     module = "triton_helpers" if use_helper else "tl"
     if reduction_type in ("max", "min", "fmax"):
@@ -174,6 +184,8 @@ def get_triton_reduction_function(reduction_type):
 
 
 def is_sympy_integer_like(expr: object):
+    # [FUNCTION DOC] Return True if expr is a sympy Integer, or an integer-valued sympy expression
+    # with no free symbols; False for non-sympy objects. Pure.
     """
     Is this expression a Sympy Integer or is it an integer sympy Expr
     containing no free symbols. The latter case can happen with Identity expr.
@@ -188,6 +200,11 @@ def is_sympy_integer_like(expr: object):
 def _materialize_trunc_to_float_expr(
     expr: sympy.Expr, dtype: torch.dtype
 ) -> sympy.Expr:
+    # [FUNCTION DOC] HELPER: When materializing a symbolic scalar into a floating dtype, rewrite
+    # TruncToInt nodes that take part in floating computation into TruncToFloat so no premature
+    # cast to the index dtype (which could overflow) happens. Returns expr unchanged for
+    # non-floating dtypes or when no TruncToInt exists. Integer subexpressions and predicates keep
+    # integer semantics. Pure.
     if not dtype.is_floating_point or not expr.has(TruncToInt):
         return expr
 
@@ -201,11 +218,15 @@ def _materialize_trunc_to_float_expr(
         return TruncToFloat(*expr.args)
 
     def is_predicate_expr(node: sympy.Basic) -> bool:
+        # [FUNCTION DOC] HELPER: True if the sympy node is Boolean or Relational.
         return bool(
             getattr(node, "is_Boolean", False) or getattr(node, "is_Relational", False)
         )
 
     def rewrite_float_subexpr(node: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Recursively replace TruncToInt with TruncToFloat in a node,
+        # skipping predicates and integer-valued subtrees; rebuilds the node only if an argument
+        # changed.
         if not node.has(TruncToInt):
             return node
         if node.func is TruncToInt:
@@ -227,6 +248,9 @@ def _materialize_trunc_to_float_expr(
 
 
 class OpDtypeSupport:
+    # [CLASS DOC] Class-level registry (no instances) of which dtypes specific IR ops support in
+    # Triton and whether outputs must be converted back. supported_dtypes maps op name to an
+    # ordered set of dtypes; convert_outputs maps op name to a bool. Populated via register_upcast.
     """
     Some Triton ops such as libdevice and tl.math only support float32 and float64.
     This class records which dtypes are supported by specific IR ops.
@@ -237,6 +261,9 @@ class OpDtypeSupport:
 
     @classmethod
     def register_upcast(cls, func: Callable[..., str], convert_output: bool) -> None:
+        # [FUNCTION DOC] Record that the op named after func only supports float32 and float64
+        # (inputs get upcast), and whether the output should be converted back. Mutates the
+        # class-level registries.
         op_name = func.__name__
         cls.supported_dtypes[op_name] = OrderedSet([torch.float32, torch.float64])
         cls.convert_outputs[op_name] = convert_output
@@ -244,6 +271,9 @@ class OpDtypeSupport:
 
 @lru_cache(None)
 def gen_attr_descriptor_import() -> str:
+    # [FUNCTION DOC] Return the import line for AttrsDescriptor if the installed triton exposes it
+    # in triton.compiler.compiler, else an empty string (also empty when triton is not installed).
+    # Cached; imports triton.compiler.compiler as a side effect.
     """
     import AttrsDescriptor if the triton version is new enough to have this
     class defined.
@@ -262,6 +292,10 @@ def gen_attr_descriptor_import() -> str:
 
 
 class TritonSymbols:
+    # [CLASS DOC] Namespace of class-level sympy symbols used in Triton codegen: block_offsets and
+    # block_sizes map each block symbol type (x/y/z/reduction) to its offset symbol (e.g. xoffset)
+    # and block-size symbol (e.g. XBLOCK). Also classmethods to query block shapes, sizes, offsets
+    # and mask names for symbols. Not instantiated.
     """
     Stores sympy.Symbol instances and constants associated with triton codegen.
     """
@@ -283,6 +317,11 @@ class TritonSymbols:
 
     @classmethod
     def get_block_shape(cls, expr: sympy.Expr) -> BlockShapeType:
+        # [FUNCTION DOC] Compute the broadcasted Triton block shape of a sympy expression by
+        # combining the shapes of its free symbols: TMP symbols use the shape of the CSE variable,
+        # size/index/float symbols are scalars, range-tree symbols give a shape of ones with the
+        # tree's block size at its tensor dim (scalar if the tree has no tensor dim). Reads
+        # V.kernel. Raises AssertionError for an unregistered range symbol.
         # return block shape of sympy Expression
         # e.g.,
         # tmp13 = y1
@@ -334,16 +373,21 @@ class TritonSymbols:
 
     @classmethod
     def get_block_size(cls, tree: IterationRanges) -> sympy.Expr:
+        # [FUNCTION DOC] Return the block-size symbol (e.g. XBLOCK) of the tree's root.
         return tree.root.block_size()
 
     @classmethod
     def get_block_offset(cls, tree: IterationRanges) -> sympy.Expr:
+        # [FUNCTION DOC] Return the block-offset symbol (e.g. xoffset) of the tree's root.
         return tree.root.block_offset()
 
     @classmethod
     def mask_name_for_symbol(
         cls, kernel: TritonKernel, symbol: sympy.Symbol
     ) -> str | None:
+        # [FUNCTION DOC] Return the mask variable name (e.g. xmask) guarding a symbol: from the
+        # owning range-tree root if the kernel registered the symbol, otherwise from the block
+        # symbol type's prefix; None if the symbol is not a block symbol.
         # Prefer the owning range-tree entry when one exists instead of
         # reconstructing xmask/rmask from the symbol prefix.
         if (node := kernel.range_tree_nodes.get(symbol)) is not None:
@@ -357,12 +401,15 @@ class TritonSymbols:
     def is_reduction_index_symbol(
         cls, kernel: TritonKernel, symbol: sympy.Symbol
     ) -> bool:
+        # [FUNCTION DOC] True if the symbol indexes a reduction dimension: uses the owning range
+        # tree when registered, else checks the symbol type against the reduction index types.
         if (node := kernel.range_tree_nodes.get(symbol)) is not None:
             return node.root.is_reduction
         return symbol_is_type(symbol, cls.reduction_types)
 
     @classmethod
     def has_reduction_index_symbol(cls, kernel: TritonKernel, expr: sympy.Expr) -> bool:
+        # [FUNCTION DOC] True if any free symbol of expr is reduction-owned.
         """Return whether any symbol in a composite block shape is reduction-owned."""
         return any(
             cls.is_reduction_index_symbol(kernel, symbol)
@@ -372,6 +419,10 @@ class TritonSymbols:
 
 @dataclasses.dataclass
 class IndexingOptions:
+    # [CLASS DOC] Dataclass describing a pointer-style (tl.load/tl.store) indexing choice:
+    # index_str (rendered index), mask_vars (set of mask names/variables), expand_str and
+    # expand_shape (optional broadcast of the index), _has_rindex (index uses a reduction dim),
+    # and the symbolic index. Query methods report mask/indirect/reduction properties.
     index_str: str
     mask_vars: OrderedSet[str]
     expand_str: str | None
@@ -380,18 +431,24 @@ class IndexingOptions:
     expand_shape: Sequence[int | str] | None
 
     def has_mask(self) -> bool:
+        # [FUNCTION DOC] True if any mask variables are present.
         return bool(self.mask_vars)
 
     def has_indirect(self) -> bool:
+        # [FUNCTION DOC] True if the index depends on a loaded temporary (indirect indexing).
         return free_symbol_is_type(self.index, SymT.TMP)
 
     def has_rindex(self) -> bool:
+        # [FUNCTION DOC] True if the index involves a reduction dimension.
         return self._has_rindex
 
     def has_tmpmask(self) -> bool:
+        # [FUNCTION DOC] True if any mask name starts with "tmp" (mask computed from a temporary).
         return any(str(mask).startswith("tmp") for mask in self.mask_vars)
 
     def has_rmask(self) -> bool:
+        # [FUNCTION DOC] True if any mask belongs to an active reduction range tree of the current
+        # kernel (V.kernel). Masks of reduction trees that are inactive are ignored.
         # Outside the reduction loop we ignore reduction-tree masks, matching
         # the set of axes that indexing generation treats as active.
         return any(
@@ -402,6 +459,8 @@ class IndexingOptions:
 
     @property
     def mask_str(self) -> str:
+        # [FUNCTION DOC] Property: the mask variables sorted by name and joined with " & ", or
+        # "None" when there are no masks.
         # The sorted call is added to make sure the order is still
         # deterministic if self.mask_vars contains mix of string
         # and TritonCSEVariable
@@ -412,6 +471,11 @@ class IndexingOptions:
 
 @dataclasses.dataclass
 class BlockDescriptorOptions:
+    # [CLASS DOC] Dataclass base for block-pointer and TMA tensor-descriptor indexing. Holds the
+    # BlockParameters (shape/strides/offsets/block_shape), constant_offset, dimension order,
+    # mask_vars, the pre-broadcast shape, which dims are broadcast (stride 0), the final kernel
+    # tile shape, a stride_sorter (transposition info), the lazily computed boundary check list and
+    # can_lift (constructor may be hoisted). Built through create(); subclasses implement format().
     """
     This is a base class that describes a block descriptor used in Triton kernels.
     It can be used to create either a tensor descriptor (with TensorDescriptorOptions)
@@ -436,18 +500,22 @@ class BlockDescriptorOptions:
 
     @property
     def shape(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Property: tensor shape from the block parameters.
         return self.params.shape
 
     @property
     def block_shape(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Property: block shape from the block parameters.
         return self.params.block_shape
 
     @property
     def strides(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Property: strides from the block parameters.
         return self.params.strides
 
     @property
     def offsets(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Property: offsets from the block parameters.
         return self.params.offsets
 
     @classmethod
@@ -462,11 +530,19 @@ class BlockDescriptorOptions:
         stride_sorter_cls: type[BlockParameters.StrideSorter],
         can_lift: bool = False,
     ) -> BlockDescriptorOptions:
+        # [FUNCTION DOC] Build an options instance from BlockParameters. Looks up precomputed sizes
+        # for shape/strides, drops size-1 block dims (keeping at least one), computes the final
+        # tile shape from range_trees (dropping x if no_x_dim; adding reduction dims when outside
+        # the reduction loop), optionally sorts dims by stride order, records and strips
+        # stride-0 (broadcast) dims, computes the dim order by sorting strides (falls back to
+        # reversed order for symbolic shapes), then fills the boundary check using get_max_block.
+        # Reads V.graph and V.kernel. Raises AssertionError if no_x_dim and the first tree is not x.
         """Helper to create a BlockDescriptorOptions instance"""
 
         sizevars = V.graph.sizevars
 
         def lookup_size(exprs: Iterable[sympy.Expr]) -> list[sympy.Expr]:
+            # [FUNCTION DOC] HELPER: Map each expression to its precomputed-size symbol if any.
             return [sizevars.lookup_precomputed_size(expr) for expr in exprs]
 
         # Look up precomputed sizes
@@ -565,6 +641,7 @@ class BlockDescriptorOptions:
     def replace_offset(
         self, expr: sympy.Expr, replacement: sympy.Expr, symt: SymT
     ) -> sympy.Expr:
+        # [FUNCTION DOC] Substitute the offset symbol of block type symt in expr with replacement.
         """
         Replaces instances of {symt}_offset with the new expression.
         """
@@ -572,6 +649,7 @@ class BlockDescriptorOptions:
         return sympy_subs(expr, {roffset: replacement})
 
     def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Set all reduction offset symbols in expr to zero and return the result.
         for symt in TritonSymbols.reduction_types:
             expr = self.replace_offset(expr, sympy.Integer(0), symt)
         return expr
@@ -581,6 +659,10 @@ class BlockDescriptorOptions:
         get_max_block: Callable[[str], int],
         range_trees: list[IterationRangesRoot],
     ) -> None:
+        # [FUNCTION DOC] Compute and store (in _boundary_check) the dims needing boundary checks:
+        # dims whose stride is not zero and whose shape is not statically a multiple of the block
+        # shape (also tested with max block sizes substituted), or which depend on YBLOCK when the
+        # y/z grid overflows; dims equal to XBLOCK under no_x_dim are skipped. Mutates self.
         """List of indices to pass to tl.load(boundary_check=...)"""
         sizevars = V.graph.sizevars
 
@@ -629,14 +711,19 @@ class BlockDescriptorOptions:
         ]
 
     def boundary_check(self) -> list[int]:
+        # [FUNCTION DOC] Return the computed boundary-check dim indices; raises AssertionError if
+        # compute_boundary_check has not run.
         if self._boundary_check is None:
             raise AssertionError("_boundary_check must be set")
         return self._boundary_check
 
     def has_indirect(self) -> bool:
+        # [FUNCTION DOC] Always False: block descriptors cannot do indirect indexing.
         return False  # block_ptr can't do indirect indexing
 
     def has_rindex(self) -> bool:
+        # [FUNCTION DOC] True if any block-shape expression involves a reduction index symbol of
+        # the current kernel.
         return any(
             TritonSymbols.has_reduction_index_symbol(
                 cast("TritonKernel", V.kernel), expr
@@ -645,12 +732,15 @@ class BlockDescriptorOptions:
         )
 
     def has_rmask(self) -> bool:
+        # [FUNCTION DOC] Same as has_rindex.
         return self.has_rindex()
 
     def has_tmpmask(self) -> bool:
+        # [FUNCTION DOC] Always False: no indirect indexing for block descriptors.
         return False  # block_ptr can't do indirect indexing
 
     def has_mask(self) -> bool:
+        # [FUNCTION DOC] True if any dimension needs a boundary check.
         return bool(self.boundary_check())
 
     def codegen_broadcast_and_reshape(
@@ -661,6 +751,11 @@ class BlockDescriptorOptions:
         allow_implicit: bool,
         for_store: bool,
     ) -> tuple[str, Sequence[sympy.Expr | int | str]]:
+        # [FUNCTION DOC] Wrap the value expression string in the Triton reshape/broadcast/transpose
+        # calls needed to convert between the block descriptor layout and the kernel tile shape.
+        # Args: value (code string), initial_shape, final_shape, allow_implicit (permit relying on
+        # implicit broadcasting for loads), for_store (direction). Returns the new code string and
+        # the shape it has after the last shape-changing step. Reads V.graph.sizevars.
         """
         Generate a broadcast and a reshape for the block descriptor.
         This restores stride-0 dimensions which were removed from the block descriptor.
@@ -685,6 +780,8 @@ class BlockDescriptorOptions:
             old_shape: Sequence[sympy.Expr | int | str],
             new_shape: Sequence[sympy.Expr | int | str],
         ) -> str:
+            # [FUNCTION DOC] HELPER: Emit a reshape of value from old_shape to new_shape and update
+            # the enclosing current_shape if the rendered dims differ.
             nonlocal current_shape
             result = triton_reshape(value, old_shape, new_shape)
             if triton_shape_dims(old_shape) != triton_shape_dims(new_shape):
@@ -770,7 +867,10 @@ class BlockDescriptorOptions:
 
 @dataclasses.dataclass
 class TensorDescriptorOptions(BlockDescriptorOptions):
+    # [CLASS DOC] Block descriptor options for TMA tensor descriptors; adds no state, only format().
     def format(self, name: str, roffset=True) -> str:
+        # [FUNCTION DOC] Render a tl.make_tensor_descriptor call string for pointer name with
+        # optional constant offset, shape, strides and block_shape. roffset is unused.
         """
         Codegen a call to tl.make_tensor_descriptor()
 
@@ -799,9 +899,13 @@ class TensorDescriptorOptions(BlockDescriptorOptions):
 
 @dataclasses.dataclass
 class BlockPtrOptions(BlockDescriptorOptions):
+    # [CLASS DOC] Block descriptor options for tl.make_block_ptr; adds format() and
+    # advance_roffset() for pointer advancement across reduction loop iterations.
     def replace_offset(
         self, expr: sympy.Expr, replacement: sympy.Expr, symt: SymT
     ) -> sympy.Expr:
+        # [FUNCTION DOC] Substitute the offset symbol of block type symt in expr with replacement
+        # (same as the base class implementation).
         """
         Replaces instances of {symt}_offset with the new expression.
         """
@@ -809,11 +913,15 @@ class BlockPtrOptions(BlockDescriptorOptions):
         return sympy_subs(expr, {roffset: replacement})
 
     def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Set all reduction offset symbols in expr to zero (same as base class).
         for symt in TritonSymbols.reduction_types:
             expr = self.replace_offset(expr, sympy.Integer(0), symt)
         return expr
 
     def format(self, name: str, roffset=True) -> str:
+        # [FUNCTION DOC] Render a tl.make_block_ptr call string for pointer name, including
+        # constant offset, shape, strides, block_shape, order and offsets. If roffset is False the
+        # reduction offsets are zeroed (for use with later advance calls).
         """
         Codegen a call to tl.make_block_ptr()
 
@@ -843,6 +951,9 @@ class BlockPtrOptions(BlockDescriptorOptions):
         return f"tl.make_block_ptr({', '.join(args)})"
 
     def advance_roffset(self, symt: SymT) -> sympy.Expr:
+        # [FUNCTION DOC] Per-dimension amount to advance the block pointer each loop iteration for
+        # reduction type symt: offset with the block size substituted minus offset with zero.
+        # Returns a list of expressions (annotated as a single expression).
         """
         Codegen string to pass to tl.advance(name, ...).
 
@@ -863,6 +974,8 @@ class BlockPtrOptions(BlockDescriptorOptions):
 
 
 def triton_shape_dims(shape: Sequence[sympy.Expr | int | str]) -> list[str]:
+    # [FUNCTION DOC] Render each dimension of a shape to a string: strings pass through, others go
+    # through V.kernel.index_to_str.
     """Format mixed symbolic and pre-rendered Triton shape dimensions.
 
     Nested-reduction codegen builds reshape/broadcast shapes from both sympy
@@ -874,6 +987,7 @@ def triton_shape_dims(shape: Sequence[sympy.Expr | int | str]) -> list[str]:
 
 
 def triton_shape_str(shape: Sequence[sympy.Expr | int | str]) -> str:
+    # [FUNCTION DOC] Render a shape as a bracketed, comma-separated list string.
     return f"[{', '.join(triton_shape_dims(shape))}]"
 
 
@@ -882,6 +996,10 @@ def triton_reshape(
     old_shape: Sequence[sympy.Expr | int | str],
     new_shape: Sequence[sympy.Expr | int | str],
 ) -> str:
+    # [FUNCTION DOC] Return code reshaping value from old_shape to new_shape (both must be lists,
+    # else AssertionError). Identical rendered shapes return value unchanged; if new shape differs
+    # by more than inserted size-1 dims, emit tl.reshape; otherwise emit an indexing expression
+    # with full slices and None for the inserted dims.
     """Workaround https://github.com/triton-lang/triton/issues/2836"""
     if not (isinstance(old_shape, list) and isinstance(new_shape, list)):
         raise AssertionError("old_shape and new_shape must both be lists")
@@ -916,7 +1034,12 @@ def triton_reshape(
 # inconsistent with Python semantics (and consistent with C semantics).  We
 # must override all of these, or it is potential silent correctness problem
 class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
+    # [CLASS DOC] Sympy printer producing Triton source strings. Overrides operators whose Triton
+    # semantics follow C instead of Python (mod, floor division, truncation, rounding, etc.),
+    # routing them to libdevice / triton_helpers. Stateless apart from V.kernel context.
     def _print_TruncToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print truncation to int as libdevice.trunc cast to the kernel's
+        # index dtype. Raises AssertionError unless exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         return (
@@ -925,6 +1048,8 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         )
 
     def _print_TruncToFloat(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print float truncation as libdevice.trunc plus a zeros tensor of
+        # the same shape (normalizes negative zero). Raises AssertionError unless one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
@@ -936,6 +1061,8 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
 
     @staticmethod
     def _get_scalar_float_type() -> str:
+        # [FUNCTION DOC] HELPER: Return "tl.float64" for scalar shape math, or "tl.float32" if the
+        # current device lacks fp64 support.
         """Return the Triton float type for scalar shape math.
 
         Uses tl.float64 by default but falls back to tl.float32 on devices
@@ -946,6 +1073,8 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return "tl.float64"
 
     def _print_Float(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print a float constant: integer-valued floats as plain ints, plain
+        # text under fbcode+HIP, otherwise a scalar tl.full of the scalar float type.
         if expr.is_integer:
             # sympy considers 0.0 to be integer, but triton doesn't.
             # this workaround prints the float as an integer
@@ -959,6 +1088,8 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return ret
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print conversion to float as a cast of the parenthesized argument
+        # to the scalar float type. Raises AssertionError unless one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [bad-argument-type]
@@ -967,6 +1098,8 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return f"{s}.to({float_type})"
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print Python-semantics modulo: plain % when both operands are
+        # known nonnegative, else triton_helpers.remainder_integer.
         quot, div = expr.args
         if quot.is_nonnegative and div.is_nonnegative:
             return self.stringify(expr.args, " % ", PRECEDENCE["Atom"] - 0.5)
@@ -977,6 +1110,9 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return f"triton_helpers.remainder_integer({quot_s}, {div_s})"
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print integer floor division: plain // when both operands are
+        # known nonnegative, else triton_helpers.div_floor_integer. Raises AssertionError if the
+        # expression is not integer.
         if not expr.is_integer:
             raise AssertionError("expr must be integer")
         quot, div = expr.args
@@ -991,11 +1127,15 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
     # TODO: This is wrong, when lhs, rhs > 2**53, Python does a higher
     # precision algorithm, which we would need to replicate here
     def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print integer true division as a plain division.
+        # KNOWN ISSUE: loses precision for operands above 2**53 (see TODO above).
         return self.stringify(expr.args, " / ", PRECEDENCE["Atom"] - 0.5)
 
     # NB: sympy.floor/ceiling produce integers, so we have to do the
     # conversion to index dtype
     def _print_floor(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print floor as libdevice.floor cast to the kernel index dtype.
+        # Raises AssertionError unless exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         return (
@@ -1004,6 +1144,7 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         )
 
     def _print_FloorToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Same output as _print_floor (libdevice.floor cast to index dtype).
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         return (
@@ -1012,22 +1153,30 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         )
 
     def _print_ceiling(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print ceiling as libdevice.ceil cast to the kernel index dtype.
+        # Raises AssertionError unless exactly one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.ceil({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
 
     def _print_CeilToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Same output as _print_ceiling (libdevice.ceil cast to index dtype).
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.ceil({self._print(expr.args[0])}).to({V.kernel.index_dtype})"
 
     def _helper_sqrt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print a correctly-rounded square root of the printed expression
+        # cast to float32.
         # pyrefly: ignore [missing-attribute]
         return f"tl.sqrt_rn(({self._print(expr)}).to(tl.float32))"
 
     def _print_FloatPow(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print a power as libdevice.pow with both operands cast to the
+        # scalar float type (float64, or float32 without fp64 support) since libdevice needs
+        # matching argument types.
         # pyrefly: ignore [missing-attribute]
         base = self._print(expr.args[0])
         # pyrefly: ignore [missing-attribute]
@@ -1039,6 +1188,9 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return f"libdevice.pow(({base}).to({float_type}), ({exp}).to({float_type}))"
 
     def _print_PowByNatural(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print a natural-exponent power as libdevice.pow; integer-literal
+        # base/exponent become scalar tl.full constants of the scalar float type, other operands are
+        # cast to that type.
         float_type = self._get_scalar_float_type()
         if expr.args[0].is_Integer:
             base = f"tl.full([], {float(expr.args[0])}, {float_type})"
@@ -1057,12 +1209,16 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return f"libdevice.pow({base}, {exp})"
 
     def _print_Where(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print a conditional select as tl.where(cond, a, b).
         c = self.doprint(expr.args[0])
         p = self.doprint(expr.args[1])
         q = self.doprint(expr.args[2])
         return f"tl.where({c}, {p}, {q})"
 
     def _print_min_max_helper(self, expr: sympy.Expr, cmp: str) -> str:
+        # [FUNCTION DOC] HELPER: Print n-ary min/max by recursively splitting the arguments in half
+        # and combining with an arithmetic select expression (kept as arithmetic so constexprs
+        # propagate). cmp must be ">" or "<", otherwise AssertionError.
         """
         Helper for max/min code generation.
         cmp: > or <
@@ -1086,78 +1242,95 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         return f"({a} * ({a} {cmp}= {b}) + {b} * ({b} {cmp} {a}))"
 
     def _print_Min(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print min via the shared min/max helper with "<".
         return self._print_min_max_helper(expr, "<")
 
     def _print_Max(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print max via the shared min/max helper with ">".
         return self._print_min_max_helper(expr, ">")
 
     def _print_Abs(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print absolute value as tl_math.abs. Raises AssertionError unless
+        # one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"tl_math.abs({self._print(expr.args[0])})"
 
     def _print_OpaqueUnaryFn_cos(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print cosine via libdevice.cos with the argument cast to float32.
+        # Raises AssertionError unless one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.cos(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_cosh(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print cosh via libdevice.cosh with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.cosh(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_acos(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print acos via libdevice.acos with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.acos(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_sin(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print sin via libdevice.sin with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.sin(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_sinh(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print sinh via libdevice.sinh with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.sinh(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_asin(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print asin via libdevice.asin with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.asin(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_tan(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print tan via libdevice.tan with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.tan(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_tanh(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print tanh via libdevice.tanh with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.tanh(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_atan(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print atan via libdevice.atan with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.atan(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_OpaqueUnaryFn_log2(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print log2 via libdevice.log2 with float32 argument cast.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         # pyrefly: ignore [missing-attribute]
         return f"libdevice.log2(({self._print(expr.args[0])}).to(tl.float32))"
 
     def _print_RoundToInt(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print round-to-int as libdevice.llrint cast to the kernel index
+        # dtype. Raises AssertionError unless one argument.
         if len(expr.args) != 1:
             raise AssertionError(f"expected 1 arg, got {len(expr.args)}")
         return (
@@ -1166,6 +1339,10 @@ class TritonPrinter(PythonPrinter):  # noqa: docstring_linter
         )
 
     def _print_RoundDecimal(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Print rounding to ndigits decimals as nearbyint(10^n * x) * 10^-n.
+        # Integer inputs raise ValueError (only non-negative ndigits would be supported, and
+        # negative ones are expected to have been filtered earlier, else AssertionError).
+        # Raises AssertionError unless two arguments.
         if len(expr.args) != 2:
             raise AssertionError(f"expected 2 args, got {len(expr.args)}")
         number, ndigits = expr.args
@@ -1185,11 +1362,14 @@ texpr = TritonPrinter().doprint
 
 
 def triton_compute_type(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] Triton type string used for computation: the dtype after upcasting
+    # half-precision types to float32.
     """Convert torch.dtype to triton type and upcast [b]float16 to float32"""
     return triton_type(upcast_compute_type(dtype))
 
 
 def triton_store_type(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] Triton type string for storing: bool is stored as int8, others map directly.
     """Convert torch.dtype to triton type, with fix for storing tl.bool"""
     if dtype == torch.bool:
         dtype = torch.int8
@@ -1197,6 +1377,8 @@ def triton_store_type(dtype: torch.dtype) -> str:
 
 
 def upcast_acc_dtype(dtype: torch.dtype) -> torch.dtype:
+    # [FUNCTION DOC] Accumulator dtype for reductions: signed integers of 4 bytes or less become
+    # int32; everything else uses the compute-type upcast.
     """Implicit upcasts used for Triton reduction types"""
     if is_integer_dtype(dtype) and dtype.is_signed and dtype.itemsize <= 4:
         return torch.int32
@@ -1204,15 +1386,19 @@ def upcast_acc_dtype(dtype: torch.dtype) -> torch.dtype:
 
 
 def triton_acc_type(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] Triton type string for reduction accumulation (accumulator upcast, then
+    # compute-type upcast).
     """Convert torch.dtype to triton type, with reduction upcasts"""
     return triton_compute_type(upcast_acc_dtype(dtype))
 
 
 def low_precision_fp(dtype: torch.dtype) -> bool:
+    # [FUNCTION DOC] True for floating dtypes of at most 2 bytes (fp16, bf16, fp8).
     return dtype.itemsize <= 2 and dtype.is_floating_point
 
 
 def low_precision_fp_var(var: CSEVariable | Any) -> bool:
+    # [FUNCTION DOC] True if var is a CSEVariable whose dtype is a low-precision float.
     if not isinstance(var, CSEVariable):
         return False
 
@@ -1221,6 +1407,8 @@ def low_precision_fp_var(var: CSEVariable | Any) -> bool:
 
 
 def triton_arg_dtype(arg: Any) -> torch.dtype | None:
+    # [FUNCTION DOC] Dtype of an op argument: CSEVariable dtype, the dtype of a Python number's
+    # type, or None for anything else.
     if isinstance(arg, CSEVariable):
         return arg.dtype
     if isinstance(arg, torch._prims_common.Number):
@@ -1229,6 +1417,8 @@ def triton_arg_dtype(arg: Any) -> torch.dtype | None:
 
 
 def needs_upcast_to_float32(arg: Any) -> bool:
+    # [FUNCTION DOC] True if config.triton.codegen_upcast_to_fp32 is off and arg is a CSEVariable
+    # of dtype float16 or bfloat16 (so it must be explicitly cast before float32-only ops).
     return (
         not config.triton.codegen_upcast_to_fp32
         and isinstance(arg, CSEVariable)
@@ -1237,6 +1427,8 @@ def needs_upcast_to_float32(arg: Any) -> bool:
 
 
 class TritonCSEVariable(CSEVariable):
+    # [CLASS DOC] CSEVariable for Triton kernels; requires dtype and shape, and tracks mask_vars,
+    # the set of mask names the value needs when used for indirect indexing.
     def __init__(
         self,
         name: str,
@@ -1244,6 +1436,8 @@ class TritonCSEVariable(CSEVariable):
         dtype: torch.dtype,
         shape: BlockShapeType = None,
     ) -> None:
+        # [FUNCTION DOC] Initialize with name, value bounds, dtype and shape; mask_vars starts
+        # empty. Raises AssertionError if dtype or shape is None.
         super().__init__(name, bounds, dtype, shape=shape)
         # We'll use this to track which masks the variable needs when used for indirect indexing
         self.mask_vars: OrderedSet[str] = OrderedSet()
@@ -1253,6 +1447,8 @@ class TritonCSEVariable(CSEVariable):
             raise AssertionError("TritonCSEVariable must have shape")
 
     def update_on_args(self, name, args, kwargs):
+        # [FUNCTION DOC] Propagate mask requirements from op args: union mask_vars of
+        # TritonCSEVariable args and add the mask name for sympy range symbols. Mutates mask_vars.
         for arg in args:
             if isinstance(arg, TritonCSEVariable):
                 self.mask_vars.update(arg.mask_vars)
@@ -1270,6 +1466,8 @@ class TritonCSEVariable(CSEVariable):
 
 @dataclasses.dataclass(frozen=True)
 class TritonOpTraceEntry:
+    # [CLASS DOC] HELPER: Frozen record of one traced op call: op name, args, kwargs (as tuple of
+    # pairs) and result.
     name: str
     args: tuple[Any, ...]
     kwargs: tuple[tuple[str, Any], ...]
@@ -1277,26 +1475,37 @@ class TritonOpTraceEntry:
 
 
 def get_dtype_handler() -> DtypePropagationOpsHandler:
+    # [FUNCTION DOC] HELPER: Create a fresh DtypePropagationOpsHandler (imported lazily).
     from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 
     return DtypePropagationOpsHandler()
 
 
 def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
+    # [FUNCTION DOC] Decorator factory for tl.math/libdevice codegen functions that only support
+    # float32/float64. The wrapped function receives args as strings with an explicit float32 cast
+    # for half-precision variables (when needed), and its result is cast back to the propagated
+    # result dtype if convert_output is set. Registers the function in OpDtypeSupport (side
+    # effect at decoration time).
     """
     Codegen helper to upcast arguments to float32, depending on the config and dtype.
     This decorates tl.math/libdevice codegen functions.
     """
 
     def maybe_upcast_arg(var) -> str:
+        # [FUNCTION DOC] HELPER: Render var as a string, with a float32 cast suffix if needed.
         upcast_string = ".to(tl.float32)" if needs_upcast_to_float32(var) else ""
         return f"{var}{upcast_string}"
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Register func as float32/float64-only and return the wrapper.
         # Record that this function only supports float32 and float64.
         OpDtypeSupport.register_upcast(func, convert_output)
 
         def wrapped(*args, **kwargs) -> str:
+            # [FUNCTION DOC] HELPER: Upcast args, call func, and append a downcast to the dtype
+            # inferred by the dtype-propagation handler when an input was upcast and the result
+            # dtype is not float32.
             # Optionally upcast args to float32.
             upcast_args = [maybe_upcast_arg(arg) for arg in args]
             upcast_kwargs = {key: maybe_upcast_arg(val) for key, val in kwargs.items()}
@@ -1326,6 +1535,10 @@ def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
 
 
 class TritonOverrides(OpOverrides):
+    # [CLASS DOC] Op handler mapping element-wise Inductor ops to Triton expression strings
+    # (static/class methods taking CSE variables or constants and returning code strings). Used
+    # outside kernels for pure element-wise ops; kernel-dependent ops (index_expr, masked, etc.)
+    # raise NotImplementedError here and are implemented in TritonKernelOverrides.
     """Map element-wise ops to Triton e.g., ops.to_dtype(x,...) -> x.to(...)"""
 
     _LOG_2_E = math.log2(math.e)
@@ -1337,6 +1550,11 @@ class TritonOverrides(OpOverrides):
         src_dtype: torch.dtype | None = None,
         use_compute_types=True,
     ):
+        # [FUNCTION DOC] Emit a dtype conversion of x. bool becomes a != 0 test; uint8 from float
+        # goes through int16; fp8 e4m3fn stored as uint8 on CUDA is first decoded to float32;
+        # integer/bool to fp8 goes through float32. Output type is the compute or store type per
+        # use_compute_types. Side effect: raises V.kernel.min_elem_per_thread to the fp8 conversion
+        # requirement. Raises AssertionError for fp8_e4m3 <-> fp8_e5m2 conversion.
         fp8_dtypes = (
             torch.float8_e4m3fn,
             torch.float8_e5m2,
@@ -1345,6 +1563,9 @@ class TritonOverrides(OpOverrides):
         def _get_min_elements_per_thread(
             src_dtype: torch.dtype, dst_dtype: torch.dtype
         ) -> int:
+            # [FUNCTION DOC] HELPER: Minimum elements per thread required for converting
+            # src_dtype to dst_dtype: 4 for float8_e5m2, 2 for float8_e4m3fn, else 0 (also 0 when
+            # equal). Raises AssertionError for conversion between the two fp8 formats.
             if src_dtype == dst_dtype:
                 # No data type conversion is needed. No requirements on min_elem_per_thread.
                 return 0
@@ -1410,6 +1631,9 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype_bitcast(x, dtype: torch.dtype, src_dtype: torch.dtype):
+        # [FUNCTION DOC] Emit a bitcast of x from src_dtype to dtype (item sizes must match, else
+        # AssertionError). Casts x back to src_dtype first if it was upcast, and re-upcasts the
+        # result to the compute type if needed.
         if src_dtype.itemsize != dtype.itemsize:
             raise AssertionError(
                 f"itemsize mismatch: {src_dtype.itemsize} != {dtype.itemsize}"
@@ -1430,6 +1654,10 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def _shaped_constant(value, dtype, shape):
+        # [FUNCTION DOC] HELPER: Emit a tl.full constant of the given shape and compute dtype.
+        # Negative zero is built from its IEEE bit pattern (float32/float64); negative values for
+        # unsigned dtypes are created as the signed type then cast. tl.full is used so subnormal
+        # float32 values keep their type.
         type_ = torch._prims_common.dtype_to_type(dtype)
         triton_val = constant_repr(type_(value))
         triton_type = triton_compute_type(dtype)
@@ -1453,10 +1681,14 @@ class TritonOverrides(OpOverrides):
 
     @classmethod
     def constant(cls, value, dtype):
+        # [FUNCTION DOC] Emit a scalar (empty-shape) constant of the dtype.
         return cls._shaped_constant(value, dtype, shape=[])
 
     @staticmethod
     def sub(x, y):
+        # [FUNCTION DOC] Emit x - y. When both operands are the same floating variable, emit a
+        # select returning 0.0 for finite values and NaN for nan/inf (x * 0.0), to stop LLVM
+        # reassociating tmp - tmp.
         if (
             isinstance(x, CSEVariable)
             and x == y
@@ -1472,6 +1704,8 @@ class TritonOverrides(OpOverrides):
 
     @classmethod
     def _cast_libdevice_arg(cls, arg, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] HELPER: Render arg for a libdevice call at dtype: numbers become constants,
+        # variables already of that dtype pass through, others get an explicit cast.
         if isinstance(arg, torch._prims_common.Number):
             return cls.constant(arg, dtype)
         if triton_arg_dtype(arg) == dtype:
@@ -1482,6 +1716,7 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def abs(x):
+        # [FUNCTION DOC] Emit absolute value (float32-upcast wrapper applies).
         return f"tl_math.abs({x})"
 
     # TODO - register these ops as having divergent dtype
@@ -1489,6 +1724,9 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def truediv(x, y):
+        # [FUNCTION DOC] Emit true division. Uses div_rn for float32/float32 when
+        # config.eager_numerics.division_rounding is set, else a plain division. For half-precision
+        # operands the result is cast to the propagated dtype if that is float16 or float32.
         x_dtype = getattr(x, "dtype", None)
         y_dtype = getattr(y, "dtype", None)
 
@@ -1512,6 +1750,8 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def div_rn(x, y):
+        # [FUNCTION DOC] Emit round-to-nearest division: div_rn for float32/float32 operands, plain
+        # division otherwise, with the same half-precision result cast as truediv.
         """
         Division with round-to-nearest rounding mode.
         Always uses triton.language.div_rn for float32 inputs to match eager CUDA behavior.
@@ -1534,6 +1774,8 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def mod(x, y):
+        # [FUNCTION DOC] Emit x % y, casting back to the propagated dtype (float16/float32) for
+        # half-precision operands.
         out = f"({x} % {y})"
         if low_precision_fp_var(x) or low_precision_fp_var(y):
             out_dtype = get_dtype_handler().mod(x, y)
@@ -1545,6 +1787,8 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def exp(x):
+        # [FUNCTION DOC] Emit exp: tl_math.exp (flush-to-zero variant) when config.use_fast_math,
+        # else libdevice.exp.
         """
         When use_fast_math, use the ftz (flushing to zero) variant
         of exponent computation.
@@ -1560,21 +1804,27 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     @maybe_upcast_float32()
     def exp2(x):
+        # [FUNCTION DOC] Emit libdevice.exp2.
         return f"libdevice.exp2({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     def expm1(x):
+        # [FUNCTION DOC] Emit libdevice.expm1.
         return f"libdevice.expm1({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def sqrt(x):
+        # [FUNCTION DOC] Emit correctly-rounded tl.sqrt_rn.
         return f"tl.sqrt_rn({x})"
 
     @staticmethod
     def relu(x):
+        # [FUNCTION DOC] Emit relu as maximum(0, x). Testing hook: config
+        # triton.inject_relu_bug_TESTING_ONLY can inject a compile error, a runtime assert, or an
+        # accuracy bug (x + 1); any other non-None value raises AssertionError.
         bug = config.triton.inject_relu_bug_TESTING_ONLY
         if bug == "compile_error":
             return "compile error!"
@@ -1594,26 +1844,36 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def minimum(a, b):
+        # [FUNCTION DOC] Emit tl.minimum propagating NaN.
         return f"tl.minimum({a}, {b}, tl.PropagateNan.ALL)"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def maximum(a, b):
+        # [FUNCTION DOC] Emit tl.maximum propagating NaN.
         return f"tl.maximum({a}, {b}, tl.PropagateNan.ALL)"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def fmaximum(a, b):
+        # [FUNCTION DOC] Emit tl.maximum with default NaN handling (non-propagating).
         return f"tl.maximum({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def where(a, b, c):
+        # [FUNCTION DOC] Emit tl.where(condition a, true value b, false value c).
         return f"tl.where({a}, {b}, {c})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def dot(a, b):
+        # [FUNCTION DOC] Lower ops.dot to tl.dot for native-matmul kernels. Zeroes operands outside
+        # the reduction mask when needed (using the kernel CSE), reshapes/transposes/broadcasts the
+        # operands to (Y,R) x (R,X) 2D shapes (ZBLOCK dims treated as 1), and picks tf32 or ieee
+        # input precision from the CUDA matmul fp32 precision. Appends lines to the kernel compute
+        # buffer. Raises AssertionError if the kernel is not native matmul or has fewer than three
+        # dense dims, NotImplementedError for unsupported target shapes.
         """
         Triton code generation for lowering ops.dot to tl.dot.
 
@@ -1645,6 +1905,8 @@ class TritonOverrides(OpOverrides):
         orig_a, orig_b = a, b
 
         def is_where_needed(var):
+            # [FUNCTION DOC] HELPER: True if var carries a non-constant reduction mask and is not
+            # already zero-filled outside the mask (e.g. by a load with other=0.0).
             # Skip if the variable doesn't have a reduction mask
             if not any(map(prefix_is_reduction, var.mask_vars)):
                 return False
@@ -1667,6 +1929,8 @@ class TritonOverrides(OpOverrides):
             return True
 
         def where_cond(var):
+            # [FUNCTION DOC] HELPER: Generate a select replacing masked-out elements of var with
+            # the dot reduction default; exactly one reduction mask is required (AssertionError).
             default = ir.Reduction.default_value("dot", var.dtype)
             reduction_mask = [
                 tree.mask_name() for tree in V.kernel.range_trees if tree.is_reduction
@@ -1702,6 +1966,10 @@ class TritonOverrides(OpOverrides):
             initial_shape: Sequence[sympy.Expr],
             final_shape: Sequence[sympy.Expr],
         ) -> str:
+            # [FUNCTION DOC] HELPER: Convert an operand to the 2D (Y,R) (left) or (R,X) (right)
+            # layout tl.dot needs via reshape, optional transpose and broadcast. Raises
+            # AssertionError if the left operand depends on x or the right on y, and
+            # NotImplementedError for other target shapes.
             """
             Generate a reshape, transpose, and broadcast for the tl.dot.
             tl.dot requires specific shape requirement : (Y,R) x (R,X)
@@ -1809,6 +2077,12 @@ class TritonOverrides(OpOverrides):
         pack=1,
         input_dtypes=None,
     ):
+        # [FUNCTION DOC] Emit tl.inline_asm_elementwise for inputs with the given asm string,
+        # constraints (default: one output register plus one per input), output dtype, purity and
+        # pack factor. Half-register ("h") inputs are cast back to their original dtypes. On HIP
+        # the asm/constraint literals are escaped to survive two nested string layers. With
+        # pack > 1 the call is written to the kernel compute buffer using pack/unpack helpers and
+        # the new result variable is returned; otherwise the expression string is returned.
         # Use the actual dtype, not the compute type — the asm operates on
         # specific register types and Triton needs to know the real output type.
         asm_triton_type = triton_type(dtype)
@@ -1848,6 +2122,7 @@ class TritonOverrides(OpOverrides):
             constraints_literal = f"'{constraints}'"
 
         def asm_call(args):
+            # [FUNCTION DOC] HELPER: Render the inline-asm call string for the given argument text.
             return (
                 f"tl.inline_asm_elementwise({asm_literal}, {constraints_literal}, "
                 f"[{args}], dtype={asm_triton_type}, is_pure={is_pure}, pack={pack})"
@@ -1873,86 +2148,105 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def cos(x):
+        # [FUNCTION DOC] Emit tl_math.cos.
         return f"tl_math.cos({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def sin(x):
+        # [FUNCTION DOC] Emit tl_math.sin.
         return f"tl_math.sin({x})"
 
     @classmethod
     def index_expr(cls, expr, dtype):
+        # [FUNCTION DOC] Always raises NotImplementedError (needs a kernel context).
         raise NotImplementedError("ops.index_expr not implemented outside a kernel")
 
     @classmethod
     def value_expr(cls, expr, dtype):
+        # [FUNCTION DOC] Always raises NotImplementedError (needs a kernel context).
         raise NotImplementedError("ops.value_expr not implemented outside a kernel")
 
     @staticmethod
     def masked(mask, body, other):
+        # [FUNCTION DOC] Always raises NotImplementedError (needs a kernel context).
         raise NotImplementedError("ops.masked not implemented outside a kernel")
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def lgamma(x):
+        # [FUNCTION DOC] Emit libdevice.lgamma.
         return f"libdevice.lgamma({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def erf(x):
+        # [FUNCTION DOC] Emit libdevice.erf.
         return f"libdevice.erf({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def cosh(x):
+        # [FUNCTION DOC] Emit libdevice.cosh.
         return f"libdevice.cosh({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def sinh(x):
+        # [FUNCTION DOC] Emit libdevice.sinh.
         return f"libdevice.sinh({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def acos(x):
+        # [FUNCTION DOC] Emit libdevice.acos.
         return f"libdevice.acos({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def acosh(x):
+        # [FUNCTION DOC] Emit libdevice.acosh.
         return f"libdevice.acosh({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def asin(x):
+        # [FUNCTION DOC] Emit libdevice.asin.
         return f"libdevice.asin({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def asinh(x):
+        # [FUNCTION DOC] Emit libdevice.asinh.
         return f"libdevice.asinh({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def atan2(x, y):
+        # [FUNCTION DOC] Emit libdevice.atan2(x, y).
         return f"libdevice.atan2({x}, {y})"
 
     @staticmethod
     def _f32_const_from_bits(bits: int) -> str:
+        # [FUNCTION DOC] HELPER: Emit a scalar float32 constant built from a 32-bit hex pattern via
+        # a uint32 bitcast.
         return f"tl.full([], 0x{bits:08X}, tl.uint32).to(tl.float32, bitcast=True)"
 
     @staticmethod
     def _inline_asm_f32(asm: str, args: Sequence[Any], shape: BlockShapeType) -> Any:
+        # [FUNCTION DOC] HELPER: Generate (through the kernel CSE, into the compute buffer) an
+        # elementwise inline-asm call with float32 registers for output and every arg; returns the
+        # resulting float32 CSE variable of the given shape.
         constraints = ", ".join(["=f"] + ["f"] * len(args))
         args_str = ", ".join(map(str, args))
         return V.kernel.cse.generate(
@@ -1965,6 +2259,11 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def _cuda_atanf(x: CSEVariable) -> CSEVariable:
+        # [FUNCTION DOC] HELPER: Emit (into the kernel compute buffer) a float32 arctangent that
+        # reproduces CUDA's device atanf: range reduction by reciprocal for |x| > 1, a polynomial
+        # evaluated with fma instructions in exact hex constants, pi/2 reconstruction, sign
+        # restoration and NaN passthrough. Returns the result CSE variable. Used because Triton's
+        # libdevice atan can differ by 1 ULP from CUDA.
         # Match CUDA's device atanf implementation.  This sequence mirrors
         # nvcc-generated PTX for `atan(float)`: abs/reciprocal range reduction,
         # a Horner polynomial in exact f32 hex constants using fma.rn, pi/2
@@ -1975,11 +2274,13 @@ class TritonOverrides(OpOverrides):
         shape = x.shape
 
         def gen(expr: str, dtype: torch.dtype = torch.float32) -> TritonCSEVariable:
+            # [FUNCTION DOC] HELPER: Generate a CSE variable for the expression with the shape of x.
             return V.kernel.cse.generate(
                 V.kernel.compute, expr, dtype=dtype, shape=shape
             )
 
         def fma(a: Any, b: Any, c: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Emit a round-to-nearest float32 fused multiply-add a*b+c.
             return TritonOverrides._inline_asm_f32(
                 "fma.rn.f32 $0, $1, $2, $3;", [a, b, c], shape
             )
@@ -2021,6 +2322,10 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan(x):
+        # [FUNCTION DOC] Emit arctangent. On CUDA (not HIP) for float32 (or upcast half-precision)
+        # CSE variables, uses the CUDA-matching _cuda_atanf sequence, casting back to the original
+        # dtype if upcast; otherwise emits libdevice.atan with an optional float32 cast and
+        # downcast. Registered separately in OpDtypeSupport after the class body.
         dtype = triton_arg_dtype(x)
         needs_upcast = needs_upcast_to_float32(x)
         if (
@@ -2053,97 +2358,119 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def atanh(x):
+        # [FUNCTION DOC] Emit libdevice.atanh.
         return f"libdevice.atanh({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def copysign(x, y):
+        # [FUNCTION DOC] Emit libdevice.copysign(x, y).
         return f"libdevice.copysign({x}, {y})"
 
     @staticmethod
     @maybe_upcast_float32()
     def erfc(x):
+        # [FUNCTION DOC] Emit libdevice.erfc.
         return f"libdevice.erfc({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def erfinv(x):
+        # [FUNCTION DOC] Emit libdevice.erfinv.
         return f"libdevice.erfinv({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def hypot(x, y):
+        # [FUNCTION DOC] Emit libdevice.hypot(x, y).
         return f"libdevice.hypot({x}, {y})"
 
     @staticmethod
     @maybe_upcast_float32()
     def log10(x):
+        # [FUNCTION DOC] Emit libdevice.log10.
         return f"libdevice.log10({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     def log2(x):
+        # [FUNCTION DOC] Emit libdevice.log2.
         return f"libdevice.log2({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ldexp(x, n):
+        # [FUNCTION DOC] Emit libdevice.ldexp with the exponent cast to int32.
         return f"libdevice.ldexp({x}, {n}.to(tl.int32))"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def nextafter(x, y):
+        # [FUNCTION DOC] Emit libdevice.nextafter(x, y).
         return f"libdevice.nextafter({x}, {y})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_and(a, b):
+        # [FUNCTION DOC] Emit bitwise and of the (boolean) operands.
         return f"{a} & {b}"
 
     @staticmethod
     def logical_not(a):
+        # [FUNCTION DOC] Emit a comparison of a with zero (true where a is zero).
         return f"{a} == 0"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_or(a, b):
+        # [FUNCTION DOC] Emit bitwise or of the (boolean) operands.
         return f"{a} | {b}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_xor(a, b):
+        # [FUNCTION DOC] Emit parenthesized bitwise xor of the operands.
         return f"({a} ^ {b})"
 
     @staticmethod
     def bitwise_and(a, b):
+        # [FUNCTION DOC] Emit bitwise and.
         return f"{a} & {b}"
 
     @staticmethod
     def bitwise_not(a):
+        # [FUNCTION DOC] Emit bitwise complement.
         return f"~{a}"
 
     @staticmethod
     def bitwise_or(a, b):
+        # [FUNCTION DOC] Emit bitwise or.
         return f"{a} | {b}"
 
     @staticmethod
     def bitwise_xor(a, b):
+        # [FUNCTION DOC] Emit bitwise xor.
         return f"{a} ^ {b}"
 
     @staticmethod
     def bitwise_left_shift(a, b):
+        # [FUNCTION DOC] Emit left shift of a by b.
         return f"{a} << {b}"
 
     @staticmethod
     def bitwise_right_shift(a, b):
+        # [FUNCTION DOC] Emit right shift of a by b.
         return f"{a} >> {b}"
 
     @staticmethod
     def rand(seed, offset):
+        # [FUNCTION DOC] Emit uniform random generation from seed and offset (cast to uint32): the
+        # 4x-vectorized triton_helpers.rand4x when allowed (1D CUDA non-template kernel without
+        # eager-aligned random), else tl.rand.
         offset = f"({offset}).to(tl.uint32)"
         if TritonOverrides._can_use_4x_random():
             (block,) = V.kernel.dense_size_list()
@@ -2152,6 +2479,9 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def _can_use_4x_random():
+        # [FUNCTION DOC] HELPER: True if the current kernel is a plain TritonKernel (not a template
+        # kernel) on a CUDA device with a one-dimensional tensor shape and config.align_random_eager
+        # off, so the 4x random helpers may be used.
         return (
             isinstance(V.kernel, TritonKernel)
             and not isinstance(
@@ -2164,6 +2494,9 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def rand_eager(seed, base_offset, threads_per_round, tid, vec):
+        # [FUNCTION DOC] Emit a call to the eager-matching random kernel helper, computing the
+        # round offset and truncated thread id from tid, threads_per_round and the vector width
+        # vec (4 for fp32, 8 for fp16/bf16).
         # vec: 4 for fp32, 8 for fp16/bf16
         tid_u32 = f"({tid}).to(tl.uint32)"
         denom = f"(({vec})*({threads_per_round}))"
@@ -2174,6 +2507,8 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def randn(seed, offset):
+        # [FUNCTION DOC] Emit normal random generation: triton_helpers.randn4x when the 4x path is
+        # allowed, else tl.randn; offset is cast to uint32.
         offset = f"({offset}).to(tl.uint32)"
         if TritonOverrides._can_use_4x_random():
             (block,) = V.kernel.dense_size_list()
@@ -2182,17 +2517,20 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def randint64(seed, offset, low, high):
+        # [FUNCTION DOC] Emit a triton_helpers.randint64 call for 64-bit integers in [low, high).
         offset = f"({offset}).to(tl.uint32)"
         return f"triton_helpers.randint64({seed}, {offset}, {low}, {high})"
 
     @staticmethod
     def load_seed(name, offset):
+        # [FUNCTION DOC] Always raises NotImplementedError (needs a kernel context).
         raise NotImplementedError("ops.load_seed not implemented outside a kernel")
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def rsqrt(x):
+        # [FUNCTION DOC] Emit reciprocal square root: tl.rsqrt on HIP, libdevice.rsqrt elsewhere.
         if torch.version.hip:
             return f"tl.rsqrt({x})"
         else:
@@ -2201,18 +2539,23 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     @maybe_upcast_float32()
     def log1p(x):
+        # [FUNCTION DOC] Emit libdevice.log1p.
         return f"libdevice.log1p({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def tan(x):
+        # [FUNCTION DOC] Emit libdevice.tan.
         return f"libdevice.tan({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def tanh(x):
+        # [FUNCTION DOC] Emit tanh. Uses libdevice.fast_tanhf when fast math is on, on HIP with
+        # Triton newer than 3.5, and the variable's known dtype is not float64; otherwise
+        # libdevice.tanh. The dtype is looked up from the kernel CSE by variable name.
         cse_var = V.kernel.cse.varname_map.get(x)
         if cse_var and hasattr(cse_var, "dtype"):
             dtype = cse_var.dtype
@@ -2234,11 +2577,15 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     @maybe_upcast_float32()
     def sigmoid(x):
+        # [FUNCTION DOC] Emit tl.sigmoid.
         return f"tl.sigmoid({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def signbit(x):
+        # [FUNCTION DOC] Emit a sign-bit test: libdevice.signbit for float32/float64 and a
+        # less-than-zero test otherwise; on XPU float64 uses an int64 bitcast sign test instead
+        # because of a libdevice signature bug.
         # x < 0 is wrong for -0.0 in floating point, so use libdevice for supported floating
         # dtypes on CUDA. On XPU, libdevice.signbit has a wrong float64 signature
         # (https://github.com/intel/intel-xpu-backend-for-triton/issues/7345); use a bitcast-based
@@ -2261,10 +2608,15 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def fmod(a, b):
+        # [FUNCTION DOC] Emit libdevice.fmod(a, b) (C remainder semantics).
         return f"libdevice.fmod({a}, {b})"
 
     @classmethod
     def pow(cls, a, b):
+        # [FUNCTION DOC] Emit a power. Integer result dtypes use triton_helpers.pow_integer.
+        # Floating results use libdevice.pow at float32 or float64 (float32 for low-precision
+        # results or when inputs need upcast, float64 otherwise unless the device lacks fp64),
+        # casting both operands and the result as needed.
         result_dtype = get_dtype_handler().pow(a, b)
         if result_dtype is not None and is_integer_dtype(result_dtype):
             base = cls._cast_libdevice_arg(a, result_dtype)
@@ -2308,6 +2660,8 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def log(x):
+        # [FUNCTION DOC] Emit natural log: libdevice.log when config.eager_numerics
+        # .use_pytorch_libdevice is set, else tl_math.log.
         if config.eager_numerics.use_pytorch_libdevice:
             # Strict numerics should use the backend math library entry point.
             # On ROCm this maps to OCML and avoids Triton's generic log lowering.
@@ -2318,28 +2672,36 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32(convert_output=False)
     # pyrefly: ignore [bad-override]
     def isinf(x):
+        # [FUNCTION DOC] Emit an infinity test returning a boolean (int1) value.
         return f"libdevice.isinf({x}).to(tl.int1)"
 
     @staticmethod
     @maybe_upcast_float32(convert_output=False)
     # pyrefly: ignore [bad-override]
     def isnan(x):
+        # [FUNCTION DOC] Emit a NaN test returning a boolean (int1) value.
         return f"libdevice.isnan({x}).to(tl.int1)"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def round(x):
+        # [FUNCTION DOC] Emit round-half-to-even via libdevice.nearbyint.
         return f"libdevice.nearbyint({x})"
 
     @staticmethod
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def floor(x):
+        # [FUNCTION DOC] Emit libdevice.floor.
         return f"libdevice.floor({x})"
 
     @staticmethod
     def floordiv(a, b):
+        # [FUNCTION DOC] Compose integer floor division from other ops (via the ops namespace):
+        # guard b == 0 by substituting 1 and returning 0, negate both operands for negative b,
+        # use bitwise complement to make a negative dividend non-negative, truncating divide, and
+        # complement back. Returns the resulting ops value (not a string).
         # See the comment in lowering.div_mode. a and b are integer type.
         # Notice that // in triton behaves as truncdiv instead of floordiv.
         #
@@ -2369,6 +2731,7 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sign(x):
+        # [FUNCTION DOC] Compose sign as (0 < x) minus (x < 0) in int8, cast to x's dtype.
         z = ops.constant(0, torch.int32)
         left = ops.to_dtype((ops.lt(z, x)), torch.int8)
         right = ops.to_dtype((ops.lt(x, z)), torch.int8)
@@ -2379,11 +2742,13 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def trunc(x):
+        # [FUNCTION DOC] Emit libdevice.trunc.
         return f"libdevice.trunc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def truncdiv(a, b):
+        # [FUNCTION DOC] Emit integer division truncating toward zero (the native operator).
         # See the comment in lowering.div_mode. a and b are integer type.
         # Notice that // in triton behaves as truncdiv instead of floordiv
         return f"{a} // {b}"
@@ -2392,6 +2757,7 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def ceil(x):
+        # [FUNCTION DOC] Emit libdevice.ceil.
         return f"libdevice.ceil({x})"
 
 
@@ -2403,6 +2769,9 @@ TritonOverrides._initialize_pointwise_overrides("triton")
 
 
 class TritonKernelOverrides(TritonOverrides):
+    # [CLASS DOC] Element-wise op handler used inside a TritonKernel body. Adds kernel-dependent
+    # ops (index_expr, value_expr, masked, load_seed, frexp, constants shaped to kernel ndim) and,
+    # at construction, routes ops needing fp64 precision to libdevice or decompositions.
     """Map element-wise ops to Triton within a TritonKernel
 
     Unlike TritonOverrides, these assume the code is going to be inserted into
@@ -2411,6 +2780,8 @@ class TritonKernelOverrides(TritonOverrides):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initialize the parent handler, then install libdevice routing (a cached
+        # one-time class-level patch).
         super().__init__(*args, **kwargs)
 
         # happens in __init__ unlike _initialize_pointwise_overrides
@@ -2420,6 +2791,11 @@ class TritonKernelOverrides(TritonOverrides):
     @classmethod
     @functools.cache
     def _setup_libdevice_routing(cls):
+        # [FUNCTION DOC] HELPER: For each op listed in utils.op_requires_libdevice_fp64, replace the
+        # class attribute with a static wrapper that sends float64 inputs to libdevice (or to the
+        # OpDecompositions implementation for sigmoid) and other dtypes to the original
+        # implementation. Cached so it runs once per class; mutates the class. Raises
+        # AssertionError if a listed op is missing from the class or OpDecompositions lacks sigmoid.
         """Set up routing to libdevice implementations for fp64 inputs."""
 
         from torch._inductor.codegen.common import OpDecompositions
@@ -2430,6 +2806,8 @@ class TritonKernelOverrides(TritonOverrides):
             original_impl = getattr(cls, fn_name)
 
             def decomposition_router(x, _original_impl, _fn_name):
+                # [FUNCTION DOC] HELPER: Use the original op for non-float64 x, else the
+                # OpDecompositions version's value.
                 if x.dtype != torch.float64:
                     return _original_impl(x)
                 else:
@@ -2446,6 +2824,7 @@ class TritonKernelOverrides(TritonOverrides):
                 continue
 
             def dtype_router(x, _original_impl, _fn_name):
+                # [FUNCTION DOC] HELPER: Emit libdevice.<op> for float64 x, else the original op.
                 if x.dtype == torch.float64:
                     return f"libdevice.{_fn_name}({x})"
                 else:
@@ -2459,6 +2838,8 @@ class TritonKernelOverrides(TritonOverrides):
 
     @classmethod
     def constant(cls, value, dtype):
+        # [FUNCTION DOC] Emit a constant shaped with size-1 dims of the kernel tensor rank (an empty
+        # shape is not supported on ROCm).
         # NOTE: Cannot use shape=[] as it's not supported by triton-rocm
         # We could use shape=[1] instead but starting with the correct
         # ndim avoids extra `tt.expand_dim` ops appearing in the triton IR.
@@ -2468,6 +2849,12 @@ class TritonKernelOverrides(TritonOverrides):
 
     @classmethod
     def index_expr(cls, expr, dtype):
+        # [FUNCTION DOC] Materialize a symbolic index expression as a kernel value of dtype:
+        # rewrites truncations for float targets, renders the index via the kernel (no block
+        # pointers), computes its block shape, converts to the kernel index dtype for int32/int64
+        # requests (else the requested dtype), and returns the new CSE variable carrying the
+        # indexing mask_vars. Appends to the compute buffer. Raises AssertionError if indexing
+        # does not yield IndexingOptions.
         expr = _materialize_trunc_to_float_expr(expr, dtype)
         indexing = V.kernel.indexing(
             expr, block_ptr=False, tma_compatibility_checker=None
@@ -2508,6 +2895,9 @@ class TritonKernelOverrides(TritonOverrides):
 
     @classmethod
     def value_expr(cls, expr, dtype):
+        # [FUNCTION DOC] Like index_expr but preserving the requested dtype: temporarily sets the
+        # kernel index dtype (the dtype for int32/int64, else int64), calls index_expr, restores
+        # the index dtype in a finally block, then casts the result to dtype if needed.
         """
         Like :meth:`index_expr`, but honors ``dtype`` by setting the kernel
         index dtype before emitting, and casting the result if needed.
@@ -2531,6 +2921,12 @@ class TritonKernelOverrides(TritonOverrides):
 
     @staticmethod
     def masked(mask, body, other):
+        # [FUNCTION DOC] Run the body subgraph under a load mask. If the body output consists only
+        # of plain loads (not unwrapped scalars and not served from the CSE store cache), the
+        # mask and other value are folded into the loads; otherwise the loads run masked without
+        # other and the result is combined with a full tensor of other via where. On HIP the mask
+        # is first cast to int1. Returns the result variable with the new mask removed from its
+        # mask_vars. Raises AssertionError if the body graph has no output node.
         if mask is not None and torch.version.hip is not None:
             mask = V.kernel.cse.generate(
                 V.kernel.compute,
@@ -2587,6 +2983,8 @@ class TritonKernelOverrides(TritonOverrides):
 
     @staticmethod
     def load_seed(name, offset):
+        # [FUNCTION DOC] Emit a load of the RNG seed from input buffer name at the seed offset
+        # registered with the kernel args (registers the input and offset as a side effect).
         var = V.kernel.args.input(name)
         return (
             f"tl.load({var} + {V.kernel.args.seed_offset('load_seed_offset', offset)})"
@@ -2595,6 +2993,9 @@ class TritonKernelOverrides(TritonOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def frexp(x):
+        # [FUNCTION DOC] Emit a frexp call producing (mantissa, exponent) variables, cached in the
+        # kernel CSE by expression key; mantissa has x's dtype and exponent is int32. Writes one
+        # line to the compute buffer on a cache miss.
         cache_key = f"frexp({x})"
         if cse_val := V.kernel.cse.try_get(cache_key):
             return cse_val
@@ -2615,20 +3016,28 @@ class TritonKernelOverrides(TritonOverrides):
         value: CSEVariable,
         extra_meta: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] Not supported here; always raises NotImplementedError.
         raise NotImplementedError
 
 
 class HelperFunctions:
+    # [CLASS DOC] Ordered, de-duplicated collection of generated Triton helper function sources.
+    # _templates_seen maps template code to the assigned function name; finalized_helpers holds the
+    # formatted definitions in insertion order. Iterable and indexable.
     """An ordered set of helper functions."""
 
     _templates_seen: dict[str, str]  # Template code to function name
     finalized_helpers: list[str]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Start with no helpers.
         self._templates_seen = {}
         self.finalized_helpers = []
 
     def add(self, template_code: str, *, base_name="_triton_helper_fn") -> str:
+        # [FUNCTION DOC] Register a helper definition template whose name is a format field.
+        # Returns the existing name if the same template was added; otherwise names it base_name
+        # plus the current count, stores the formatted source, and returns the new name.
         """This accepts a function definition with the function name
         left as a format specifier e.g.
 
@@ -2651,14 +3060,20 @@ class HelperFunctions:
         return name
 
     def __iter__(self):
+        # [FUNCTION DOC] Iterate over the finalized helper sources in order.
         return iter(self.finalized_helpers)
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC] Return the finalized helper source(s) at the index or slice.
         return self.finalized_helpers[idx]
 
 
 @dataclasses.dataclass
 class BlockParameters:
+    # [CLASS DOC] Dataclass holding parallel per-dimension lists (shape, block_shape, strides,
+    # offsets) describing an N-D block for block-pointer/TMA analysis. Supports concatenation,
+    # dimension removal and stride-based sorting. Nested StrideSorter classes record how dims were
+    # permuted so the permutation can be reverted.
     """
     Class representing ND block dimensions, for block pointer analysis.
     """
@@ -2670,11 +3085,18 @@ class BlockParameters:
 
     @dataclasses.dataclass
     class StrideSorter:
+        # [CLASS DOC] Base record of a dimension permutation: original_strides, sort_idx (indices
+        # giving the sorted order) and the derived revert_sort_idx (inverse permutation). sort and
+        # revert apply the permutation or its inverse to a per-dimension list; identity
+        # permutations are returned untouched. Subclasses implement create().
         original_strides: list[int]
         sort_idx: list[int]
         revert_sort_idx: list[int] = dataclasses.field(init=False)
 
         def __post_init__(self):
+            # [FUNCTION DOC] Validate (non-empty strides, matching lengths; AssertionError
+            # otherwise), record whether sort_idx is the identity, and compute the inverse
+            # permutation revert_sort_idx.
             if len(self.original_strides) <= 0:
                 raise AssertionError("original_strides must be non-empty")
             if len(self.sort_idx) != len(self.original_strides):
@@ -2694,6 +3116,7 @@ class BlockParameters:
 
         @property
         def is_identity(self):
+            # [FUNCTION DOC] Property: True if the permutation leaves order unchanged.
             return self._is_identity
 
         @classmethod
@@ -2701,27 +3124,36 @@ class BlockParameters:
         def create(
             cls, original_strides: list[int | sympy.Expr], shape_env: ShapeEnv
         ) -> BlockParameters.StrideSorter:
+            # [FUNCTION DOC] Abstract factory: build a sorter for the given strides. Subclasses
+            # override it. (The class is not an ABC, so abstractness is not enforced.)
             """Create a `StrideSorter` that can be used to sort block parameters."""
 
         def sort(self, attr):
+            # [FUNCTION DOC] Reorder a per-dimension list by sort_idx (returned unchanged for the
+            # identity permutation).
             if not self.is_identity:
                 return [attr[i] for i in self.sort_idx]
             return attr
 
         def revert(self, attr):
+            # [FUNCTION DOC] Undo sort: reorder a per-dimension list by revert_sort_idx (returned
+            # unchanged for the identity permutation).
             if not self.is_identity:
                 return [attr[i] for i in self.revert_sort_idx]
             return attr
 
     @dataclasses.dataclass
     class IdentityStrideSorter(StrideSorter):
+        # [CLASS DOC] StrideSorter that never reorders dimensions.
         def __post_init__(self):
+            # [FUNCTION DOC] Delegates to the base validation.
             super().__post_init__()
 
         @classmethod
         def create(
             cls, original_strides: list[int | sympy.Expr], shape_env: ShapeEnv
         ) -> BlockParameters.StrideSorter:
+            # [FUNCTION DOC] Return an identity-permutation sorter for the strides.
             return cls(
                 original_strides=original_strides,
                 sort_idx=list(range(len(original_strides))),
@@ -2729,17 +3161,23 @@ class BlockParameters:
 
     @dataclasses.dataclass
     class TensorDecriptorStrideSorter(StrideSorter):
+        # [CLASS DOC] StrideSorter ordering dimensions by descending stride, as TMA tensor
+        # descriptors require. (The class name misspells "Descriptor".)
         """
         Sorts BlockParameters dimensions with strides in descending order.
         """
 
         def __post_init__(self):
+            # [FUNCTION DOC] Delegates to the base validation.
             super().__post_init__()
 
         @classmethod
         def create(
             cls, original_strides: list[int | sympy.Expr], shape_env: ShapeEnv
         ) -> BlockParameters.StrideSorter:
+            # [FUNCTION DOC] Build a sorter using the descending-stride order from argsort_sym with
+            # the shape environment; if strides cannot be compared (symbolic, AssertionError) fall
+            # back to the identity order.
             """
             If the strides are not all known constants or if the strides are already
             sorted in descending order, return identity sort.
@@ -2766,6 +3204,8 @@ class BlockParameters:
             )
 
     def __add__(self, other: BlockParameters) -> BlockParameters:
+        # [FUNCTION DOC] Return new block parameters whose per-field lists are the concatenation of
+        # self's and other's lists (dimensions of other appended).
         """
         Concatenates block parameters.
         """
@@ -2776,6 +3216,8 @@ class BlockParameters:
     def maybe_sort_with_stride_order(
         self, stride_sorter_cls: type[StrideSorter], shape_env: ShapeEnv
     ) -> tuple[BlockParameters, BlockParameters.StrideSorter]:
+        # [FUNCTION DOC] Build a stride sorter of the given class from the strides, apply its
+        # permutation to every field, and return the new parameters plus the sorter (for reverting).
         """
         Sort `BlockParameter` with stride_sorter_cls. Returns block parameters
         as well as a `StrideSorter` which contains information on how the sort
@@ -2791,11 +3233,14 @@ class BlockParameters:
         return params, stride_sorter
 
     def remove_dims(self, removable_dims: list[bool]) -> BlockParameters:
+        # [FUNCTION DOC] Return new parameters with the dimensions flagged True removed from every
+        # field.
         """
         Remove dimensions where removable_dims is True.
         """
 
         def filter_dims(it):
+            # [FUNCTION DOC] HELPER: Keep the items of a per-dimension list not flagged removable.
             return [
                 item
                 for item, is_removable in zip(it, removable_dims)
@@ -2808,12 +3253,17 @@ class BlockParameters:
 
 
 class CooperativeReductionWorkspaceCache:
+    # [CLASS DOC] Tracks reusable scratch workspaces for cooperative reductions. State: args (the
+    # kernel args used to allocate), current_loop and prior_loop (allocations made in each loop),
+    # ready_for_reuse (queues of free buffers keyed by size), loop_count and store_count.
+    # A buffer becomes reusable after two loop ends.
     """
     The scratch space used for cooperative reductions can be reused
     after two reduction loops.  This keeps track of what can be reused.
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Store the kernel args and initialize empty loop/reuse bookkeeping.
         self.args = args
         self.current_loop = []
         self.prior_loop = []
@@ -2822,6 +3272,11 @@ class CooperativeReductionWorkspaceCache:
         self.store_count = 0
 
     def allocate(self, nbytes: sympy.Expr):
+        # [FUNCTION DOC] Return (workspace name, offset) for a buffer of nbytes: reuse a free one of
+        # the same size if any, otherwise request a new workspace from the kernel args and record
+        # it in the current loop.
+        # KNOWN ISSUE: a reused buffer is not recorded in current_loop, so it is never queued for
+        # reuse again.
         cached = self.ready_for_reuse.get(nbytes)
         if cached:
             return cached.popleft()
@@ -2830,6 +3285,9 @@ class CooperativeReductionWorkspaceCache:
         return (ws_name, ws_offset)
 
     def on_loop_end(self):
+        # [FUNCTION DOC] Mark the end of a reduction loop: buffers allocated two loops ago become
+        # reusable, the current loop's allocations become the prior loop's, and loop_count is
+        # incremented.
         # Buffers can be reused after 2 loop ends
         for nbytes, ws_name, ws_offset in self.prior_loop:
             self.ready_for_reuse[nbytes].append((ws_name, ws_offset))
@@ -2838,6 +3296,7 @@ class CooperativeReductionWorkspaceCache:
         self.loop_count += 1
 
     def increment_store_count(self):
+        # [FUNCTION DOC] Return the store count before incrementing it (a running index).
         prior = self.store_count
         self.store_count += 1
         return prior
@@ -2845,12 +3304,16 @@ class CooperativeReductionWorkspaceCache:
 
 @dataclasses.dataclass
 class FixedTritonConfig:
+    # [CLASS DOC] Dataclass wrapping a fixed mapping of config key names to integer values,
+    # offering mapping-style lookup and membership tests.
     config: dict[str, int]
 
     def __getitem__(self, item):
+        # [FUNCTION DOC] Return the value for the key; KeyError if missing.
         return self.config[item]
 
     def __contains__(self, item):
+        # [FUNCTION DOC] True if the key is present.
         return item in self.config
 
 
@@ -2861,6 +3324,8 @@ LoadIndexBases = tuple[LoadIndexBasis | None, ...]
 
 @dataclasses.dataclass(frozen=True)
 class _UnresolvedLoadIndexState:
+    # [CLASS DOC] HELPER: Frozen record of the first live load of a key: its index and result
+    # expressions, with no range analysis done yet.
     """First live load, recorded without performing range analysis."""
 
     index: sympy.Expr
@@ -2869,6 +3334,8 @@ class _UnresolvedLoadIndexState:
 
 @dataclasses.dataclass(frozen=True)
 class _ResolvedLoadIndexState:
+    # [CLASS DOC] HELPER: Frozen record of the latest load's index and result expressions plus the
+    # split bases (per-dimension tuples of range entries, or None) resolved from an earlier load.
     """Last load result plus split bases resolved from an earlier live load."""
 
     index: sympy.Expr
@@ -2880,20 +3347,28 @@ LoadIndexState = _UnresolvedLoadIndexState | _ResolvedLoadIndexState
 
 
 class TritonCSE(CSE[TritonCSEVariable, TritonCSEKey]):
+    # [CLASS DOC] CSE whose cache keys include the active load mask name, preventing reuse across
+    # separate masked blocks. Also keeps _load_index_states, a mapping from cache key to the load
+    # index state used for load-index analysis; cleared on invalidate.
     """
     Subclasses CSE to apply the current load mask to the cache key to avoid CSEing
     variables across separate masked blocks.
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initialize the base CSE and an empty load-index state mapping.
         super().__init__(*args, **kwargs)
         self._load_index_states: dict[TritonCSEKey, LoadIndexState] = {}
 
     def invalidate(self, keep_vars: OrderedSet[CSEVariable]) -> None:
+        # [FUNCTION DOC] Invalidate cached entries except keep_vars (base behavior) and also clear
+        # the recorded load-index states.
         super().invalidate(keep_vars)
         self._load_index_states.clear()
 
     def augment_key(self, cache_key: str) -> TritonCSEKey:
+        # [FUNCTION DOC] Return the key paired with the current load mask name when a load mask is
+        # active on V.kernel, else the key unchanged.
         if mask := V.kernel._load_mask:
             return (cache_key, mask.name)
         else:
@@ -2902,6 +3377,12 @@ class TritonCSE(CSE[TritonCSEVariable, TritonCSEKey]):
 
 @dataclasses.dataclass
 class TMACompatibilityChecker:
+    # [CLASS DOC] Decides whether a load/store can use TMA tensor descriptors. Fields: kernel
+    # (owning TritonKernel), dtype, for_store, force (skip eligibility checks and use hints for
+    # symbolic values) and optional buffer_name. can_use_tma checks device/config/dtype
+    # eligibility; are_block_parameters_compatible checks stride, alignment and minimum block
+    # size rules and may record minimum block sizes on the kernel. All rejections are logged at
+    # debug level with a common prefix.
     """
     Checks if the TMA API can be used for load / store triton operations.
     """
@@ -2914,12 +3395,19 @@ class TMACompatibilityChecker:
     buffer_name: str | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Set the common prefix used in debug logs explaining TMA rejection.
         self.failed_debug_prefix = "Cannot use TMA descriptor for load / store since: "
 
     # Also see Note: TMA API Restrictions for the below
     def can_use_tma(
         self,
     ) -> bool:
+        # [FUNCTION DOC] Return whether TMA is allowed at all for this access. Always True when
+        # forced. On CPU requires the Triton CPU backend, the stable TMA API and
+        # use_tensor_descriptor. Otherwise requires CUDA capability >= 9 with assumed aligned inputs
+        # (or XPU), use_tensor_descriptor and the stable TMA API; rejects stores in no_x_dim or
+        # strict-sum multirow kernels (cannot move 16 bytes) and dtypes without a tensor map
+        # mapping. Reads V.graph device; logs the reason when returning False.
         if self.force:
             return True
 
@@ -2987,6 +3475,16 @@ class TMACompatibilityChecker:
         block_params: BlockParameters,
         constant_offset: sympy.Expr | int = 0,
     ) -> bool:
+        # [FUNCTION DOC] Check block parameters against TMA rules and return True if usable: the
+        # innermost stride must be 1 (using hints when forced); on CPU that is enough; otherwise
+        # outer strides and the constant offset (in bytes) must be 16-byte aligned, the buffer must
+        # not be recorded as unaligned, and the innermost block must be able to cover 16 bytes.
+        # For strict-sum reductions an rblock of 1 rejects; for persistent reductions the fixed
+        # reduction block size is checked directly; otherwise the minimum power-of-two block size
+        # is solved numerically, rejected if above the maximum block, if x is fixed to 1
+        # (no_x_dim or shared combo-kernel XBLOCK), or below a fixed config, else recorded in the
+        # kernel's tma_min_block_sizes (side effect). Raises AssertionError if the innermost block
+        # shape has no block symbol. Unsolvable expressions (ValueError) reject.
         """
         Check if the block parameters are valid for TMA.
         If force, we allow relying on symbolic hints equivalent
@@ -3163,6 +3661,8 @@ class TMACompatibilityChecker:
                     y: sympy.Expr,
                     z: sympy.Expr | None = None,
                 ) -> sympy.Expr:
+                    # [FUNCTION DOC] HELPER: Replacement for FloorDiv/ModularIndexing so sympy
+                    # can solve: true division of x by y, optionally taken modulo z.
                     div = x / y
                     if z:
                         div = div % z
@@ -3259,6 +3759,8 @@ class TMACompatibilityChecker:
         return True
 
     def can_lift(self) -> bool:
+        # [FUNCTION DOC] Return whether the descriptor constructor can be hoisted to the kernel
+        # top: True only when TMA is forced.
         """
         Can you lift the make_tensor_descriptor
         call to the top of the kernel? This requires
@@ -3272,6 +3774,14 @@ class TMACompatibilityChecker:
 
 
 class TritonKernel(SIMDKernel[TritonCSEVariable]):
+    # [CLASS DOC] SIMD kernel that generates Triton source code for fused pointwise, reduction,
+    # scan and sort nodes. Built from a tiling mapping; tracks code buffers (body, prologue,
+    # post_loop_combine, post_loop_store, loads/compute/stores inherited), a TritonCSE, helper
+    # functions, block pointer / TMA descriptor bookkeeping, pointer advancements for reduction
+    # loops, autotune hints, minimum TMA block sizes, optional fixed_config, combo-kernel flags and
+    # an op trace used to compare sub-kernels. Class attributes select the overrides, printer,
+    # TMA checker and descriptor option classes so subclasses can customize them. Key methods:
+    # indexing, load/store/reduction/scan/sort codegen, codegen_kernel and call-site generation.
     """A class to represent a triton kernel and helpers to generate
     triton kernel programmatically
     """
@@ -3298,6 +3808,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         per_subkernel_blocks: bool = False,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC] Initialize the kernel from tiling plus options: optimize_mask (drop
+        # provably-true masks), fixed_config (fixed block sizes), hint_override, combo-kernel flags,
+        # min_elem_per_thread. Calls the SIMD base constructor, installs a TritonCSE, creates the
+        # prologue/post-loop buffers and all TMA, block-pointer, PDL and op-trace bookkeeping, then
+        # emits the reduction numel setup, cooperative-reduction setup (if applicable) and range
+        # tree headers into the body.
         self.optimize_mask: bool = optimize_mask
         self.fixed_config = fixed_config
         self.is_combo_kernel: bool = is_combo_kernel
@@ -3354,21 +3870,30 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @property
     def uses_tma(self) -> bool:
+        # [FUNCTION DOC] Property: True if the kernel uses any host-side TMA descriptor or emitted
+        # device-side TMA.
         return bool(self.host_tma_descriptor_args or self._emitted_device_tma)
 
     @property
     def uses_device_tma(self) -> bool:
+        # [FUNCTION DOC] Property: True if device-side TMA descriptors were emitted.
         return self._emitted_device_tma
 
     def triton_tensor_ndim(self) -> int:
+        # [FUNCTION DOC] Number of tensor dimensions of the kernel: count of range trees that have
+        # a tensor dim.
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
 
     def indexing_size_str(self, i: int) -> str:
+        # [FUNCTION DOC] Render an indexing expression string selecting dimension i with a full
+        # slice and None elsewhere (for broadcasting a 1D value to the tensor rank).
         sizes = ["None"] * self.triton_tensor_ndim()
         sizes[i] = ":"
         return f"[{', '.join(sizes)}]"
 
     def dense_size_list(self) -> list[str]:
+        # [FUNCTION DOC] List of block size strings per tensor dimension: "1" for dims of inactive
+        # trees, the block size string for active ones.
         sizes = ["1"] * self.triton_tensor_ndim()
         for tree in self.active_range_trees():
             if tree.tensor_dim is not None:
@@ -3376,9 +3901,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return sizes
 
     def dense_size_str(self) -> str:
+        # [FUNCTION DOC] The dense block shape as a bracketed, comma-separated string.
         return f"[{', '.join(self.dense_size_list())}]"
 
     def create_constant_mask(self, entry: IterationRangesRoot) -> str:
+        # [FUNCTION DOC] Return a code line defining the always-true mask for a range tree root:
+        # a full dense-shaped tensor when it has no tensor dim, otherwise a block-sized all-true
+        # vector expanded to the tensor rank.
         if entry.tensor_dim is None:
             return (
                 f"{entry.mask_name()} = tl.full({self.dense_size_str()}, True, tl.int1)"
@@ -3392,6 +3921,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def _trace_kernel_arg(self, name: str, *, store: bool) -> str:
+        # [FUNCTION DOC] HELPER: Return the kernel argument name for a buffer: the buffer name
+        # itself if it was removed, otherwise the registered output (store) or input arg name.
+        # Registers the arg as a side effect.
         if name in V.graph.removed_buffers:
             return name
         if store:
@@ -3399,6 +3931,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return self.args.input(name)
 
     def _trace_buffer(self, name: str, *, store: bool) -> str:
+        # [FUNCTION DOC] HELPER: Map a buffer name to a canonical trace name (buffer0, buffer1, ...
+        # by first use), recording its kernel arg name on first sight.
         if name not in self._op_trace_buffer_names:
             self._op_trace_buffer_names[name] = (
                 f"buffer{len(self._op_trace_buffer_names)}"
@@ -3409,6 +3943,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return self._op_trace_buffer_names[name]
 
     def _trace_cse_var(self, var: CSEVariable) -> tuple[str, str, str, Any]:
+        # [FUNCTION DOC] HELPER: Normalize a CSE variable to a tuple of a "cse" tag, canonical name
+        # (tmp0, tmp1, ... by first use), dtype string and normalized shape.
         if var.name not in self._op_trace_cse_names:
             self._op_trace_cse_names[var.name] = f"tmp{len(self._op_trace_cse_names)}"
         return (
@@ -3420,6 +3956,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _trace_symbol_prefix(symbol: sympy.Symbol) -> str | None:
+        # [FUNCTION DOC] HELPER: Return the block/reduction prefix (x, y, z, r0_, r1_) if the symbol
+        # is one of those types, else None.
         for symt in (
             SymT.XBLOCK,
             SymT.YBLOCK,
@@ -3432,6 +3970,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return None
 
     def _trace_symbol(self, symbol: sympy.Symbol) -> sympy.Symbol:
+        # [FUNCTION DOC] HELPER: Return a canonical stand-in symbol for tracing: the canonical
+        # name of a known temp, or prefix plus a per-prefix counter for index symbols; other
+        # symbols are returned unchanged. Results are memoized in _op_trace_symbol_names.
         if symbol in self._op_trace_symbol_names:
             return self._op_trace_symbol_names[symbol]
 
@@ -3453,6 +3994,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return normalized
 
     def _normalize_trace_expr(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Substitute canonical symbols (in name order) into expr and print it
+        # as Triton text.
         replacements = {
             symbol: self._trace_symbol(symbol)
             for symbol in sorted(expr.free_symbols, key=operator.attrgetter("name"))
@@ -3462,6 +4005,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return texpr(expr)
 
     def _normalize_trace_value(self, value: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Recursively convert a traced value to a hashable, name-independent
+        # form: CSE variables, sympy expressions and dtypes become tagged tuples; lists/tuples
+        # become tuples; dicts become sorted key/value tuples; others pass through.
         if isinstance(value, CSEVariable):
             return self._trace_cse_var(value)
         if isinstance(value, sympy.Expr):
@@ -3484,6 +4030,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         kwargs: dict[str, Any],
         result: Any = None,
     ) -> None:
+        # [FUNCTION DOC] For combo kernels only, append a normalized TritonOpTraceEntry for an op
+        # call to op_trace (load/store buffer names and expressions canonicalized, kwargs sorted,
+        # result normalized). No-op for non-combo kernels. Mutates op_trace and the naming maps.
         if not self.is_combo_kernel:
             return
 
@@ -3518,6 +4067,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
+        # [FUNCTION DOC] HELPER: True if the index has stride exactly 1 with respect to some
+        # reduction variable (contiguous reduction dimension). Only evaluated in deterministic mode
+        # or when config.test_configs.force_filter_reduction_configs is set; otherwise returns
+        # False. Division by zero while computing strides yields False.
         # These analysis is only needed in deterministic mode so far
         # to filter triton configs. Return false immediately to avoid
         # increasing compilation time when the mode is off.
@@ -3549,6 +4102,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing: TensorDescriptorOptions,
         dtype: torch.dtype | None = None,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if a host-side TensorDescriptor can be built: the dtype is
+        # not bool and every block shape dim is an integer or a plain symbol.
         """Whether the host launcher can build a TensorDescriptor for this
         access (not a TMA eligibility check -- that's TMACompatibilityChecker).
         """
@@ -3563,6 +4118,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return True
 
     def _prescan_host_tma_materializability(self) -> None:
+        # [FUNCTION DOC] HELPER: Fill _host_tma_non_materializable_buffers by scanning the node
+        # schedule's reads. Buffers are marked non-materializable if a dependency lacks index
+        # variables, an index depends on a temp, uses FloorDiv/ModularIndexing over its own index
+        # variables, or the buffer is read with more than one distinct index. When host TMA is
+        # disabled the set is just set empty. Mutates the kernel set.
         """Populate _host_tma_non_materializable_buffers with buffers that
         can't be expressed as a single host-side TMA descriptor."""
         if not config.triton.use_tensor_descriptor:
@@ -3617,6 +4177,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self._host_tma_non_materializable_buffers.add(buf_name)
 
     def _check_buffer_alignment(self, name: str, var: str, dtype: torch.dtype) -> bool:
+        # [FUNCTION DOC] HELPER: Return True (misaligned, skip host TMA) when the buffer's layout
+        # offset in bytes is not statically a multiple of TMA_ALIGNMENT; only on CUDA with tensor
+        # descriptors enabled, looking through mutation renames. On True, marks var as
+        # non-materializable and drops any recorded host descriptor arg for it. Returns False when
+        # the buffer is unknown or has zero offset.
         """Whether a buffer's layout offset can't be proven TMA-aligned, so
         host-side TMA must be skipped. The CUtensorMap alignment requirement is
         CUDA-specific, so this only applies on CUDA; an offset that is not
@@ -3646,14 +4211,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @property
     def has_store_with_contiguous_rdim(self) -> bool:
+        # [FUNCTION DOC] Property: True if any recorded contiguous-reduction-dim store still has a
+        # live (not removed) buffer.
         return not all(
             is_buffer_removed(name) for name in self.stores_with_contiguous_rdim
         )
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Triton type string for a torch dtype.
         return triton_type(dtype)
 
     def should_use_cooperative_reduction(self) -> bool:
+        # [FUNCTION DOC] True if this reduction should split across blocks cooperatively: never
+        # with a strict-sum block constraint; otherwise inside a reduction and the choice handler
+        # (V.choices) approves for the device and numels.
         if self._strict_sum_rblock() is not None:
             return False
         return self.inside_reduction and V.choices.should_use_cooperative_reduction(
@@ -3663,6 +4234,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def init_cooperative_reduction(self):
+        # [FUNCTION DOC] One-time cooperative reduction setup: shifts every range tree grid dim by
+        # one (program id 0 is the reduction split), allocates the semaphores arg (scaled by the
+        # fixed XBLOCK if any), creates the workspace cache, and splices the RSPLIT constants and
+        # per-split start/end computation into the body (clamping the end when a reduction mask is
+        # not constant). Raises AssertionError if the kernel is not cooperative.
         """One time setup code for cooperative reductions."""
         if not self.cooperative_reduction:
             raise AssertionError("expected cooperative_reduction")
@@ -3701,6 +4277,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
 
     def init_cooperative_reduction_mask(self):
+        # [FUNCTION DOC] Emit code defining rsplit_arange and rsplit_mask in the body: the mask is
+        # None when RSPLIT is a power of two (constant xmask), otherwise bounds-checked (combined
+        # with xmask when x is not constant). Raises AssertionError if no_x_dim is set while xmask
+        # is non-constant.
         rsplit_arange = "tl.arange(0, RSPLIT_NEXT_POWER_OF_2)"
         if not self.no_x_dim:
             rsplit_arange = f"{rsplit_arange}[None, :]"
@@ -3723,6 +4303,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
 
     def codegen_range_tree(self):
+        # [FUNCTION DOC] Emit range-tree setup into the body: headers for non-loop trees, base
+        # variables for loop trees inside reductions, and (for reductions) either the flattened
+        # rbase when loops exist or the reduction index definitions otherwise.
         for tree in self.range_trees:
             # reduction indexing goes inside a loop
             if not tree.is_loop:
@@ -3747,6 +4330,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.codegen_reduction_indices(self.body)
 
     def need_numel_args(self):
+        # [FUNCTION DOC] Always True: benchmark calls pass numels for pointwise/reduction kernels.
         """
         Indicate whether we need provide numel as arguments for the generated
         kernel calls in the benchmark.
@@ -3757,6 +4341,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return True
 
     def should_use_persistent_reduction(self) -> bool:
+        # [FUNCTION DOC] Decide whether to use a persistent (single-pass) reduction: False outside
+        # reductions; forced True when the kernel has a sort op and a persistent block is possible;
+        # otherwise delegates to V.choices with features augmented by tiling scores.
         if not self.inside_reduction:
             return False
         # ops.sort requires persistent reduction (TritonKernel.sort asserts it), so the
@@ -3773,11 +4360,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @cache_on_self
     def _strict_sum_rblock(self) -> int | None:
+        # [FUNCTION DOC] HELPER (cached): The strict-sum reduction block size from the features,
+        # or None when the kernel does not have exactly one reduction dimension.
         if self.num_reduction_dims != 1:
             return None
         return self.features.strict_sum_rblock()
 
     def want_no_x_dim(self):
+        # [FUNCTION DOC] Truthy when the x dimension should be dropped: persistent reduction with
+        # exactly one pointwise numel and a fixed config with XBLOCK equal to 1.
         return (
             self.persistent_reduction
             and len(self.numels) == self.num_reduction_dims + 1
@@ -3787,6 +4378,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @property
     def assert_function(self) -> str:
+        # [FUNCTION DOC] Property: name of the device assertion function, "tl.device_assert".
         return "tl.device_assert"
 
     def indexing(
@@ -3800,6 +4392,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         tma_compatibility_checker: TMACompatibilityChecker | None = None,
         mask_constant_index=False,
     ):
+        # [FUNCTION DOC] Decide how to index memory for a sympy index. Returns either a block
+        # descriptor options object (block pointer or TMA tensor descriptor) when the index matches
+        # an affine or mod/div block pattern per range tree and all conditions hold (no override
+        # mask, no load mask, no indirect indexing, int32 index dtype, masks covered by the dense
+        # masks, TMA/block-ptr allowed), or an IndexingOptions with the index string, mask set and
+        # optional broadcast (expand) string and shape. Integer-literal indices become tl.full
+        # tensors; dense indexing broadcasts the index to the block shape (restricted to needed axes
+        # for native matmul). Args: copy_shape (explicit shape to expand to), dense_indexing,
+        # override_mask (single mask replacing computed ones), block_ptr, tma_compatibility_checker,
+        # mask_constant_index. Raises AssertionError on non-symbol free variables or inconsistent
+        # mask shapes. Side effects: filters masks, may record TMA minimum block sizes.
         """
         Compute the index and mask to pass to tl.load() or tl.store()
         """
@@ -3875,6 +4478,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             def match_affine_block(
                 index: sympy.Expr, range_tree: IterationRangesRoot
             ) -> BlockParameters | None:
+                # [FUNCTION DOC] HELPER: Match an index that is a constant stride times the range
+                # tree symbol; return one-dimensional BlockParameters (numel, block size, stride,
+                # block offset) or None if there is no match.
                 """
                 Matches expressions of the form:
                     idx = s * xindex
@@ -3897,6 +4503,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             def match_mod_div_block(
                 index: sympy.Expr, range_tree: IterationRangesRoot
             ) -> BlockParameters | None:
+                # [FUNCTION DOC] HELPER: Match an index built from FloorDiv/ModularIndexing digits
+                # of the range tree symbol and map the linear block to an N-D block. Bounds the dim
+                # count, strips precomputed replacements, runs the pattern matcher, requires each
+                # slice numel to be a multiple of the max block or a power of two, then builds the
+                # block shape from the linear block size (leading dim by ceiling division, others
+                # clamped to dim sizes) and block offsets from the block offset symbol. Returns
+                # BlockParameters or None.
                 """
                 Matches higher-dimensional blocks coming from FloorDiv and ModularIndexing.
 
@@ -4020,6 +4633,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 expr: sympy.Expr,
                 range_tree: IterationRangesRoot,
             ) -> BlockParameters | None:
+                # [FUNCTION DOC] HELPER: Factor the subexpression for the range tree and try the
+                # affine matcher then the mod/div matcher; return the first match or None.
                 """
                 Match a block indexing subexpression involving a single range tree.
                 """
@@ -4037,6 +4652,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 return None
 
             def match_block_expr() -> BlockDescriptorOptions | None:
+                # [FUNCTION DOC] HELPER: Try to express the whole index as a block descriptor.
+                # Rewrites the index in terms of range tree expressions, splits it per active
+                # range tree (rejecting terms mixing several trees), matches each part, sums the
+                # parameters and keeps leftover terms as a constant offset. Chooses block-pointer
+                # or tensor-descriptor options (descending-stride sorting for TMA when allowed),
+                # creates them, and for TMA also validates compatibility (rebinding the enclosing
+                # tma_compatibility_checker). Returns the options or None if any step fails.
                 index_relative_to_xyr_index = sympy_subs(
                     index, {v: t.expr for v, t in self.range_tree_nodes.items()}
                 )
@@ -4143,6 +4765,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index_str = self.index_to_str(index)
 
         def _get_expand_str():
+            # [FUNCTION DOC] HELPER: Return (expand string, expand shape) for broadcasting: from
+            # the explicit copy_shape (a variable's shape attribute if it is a string), else the
+            # dense block shape.
             if copy_shape:
                 if isinstance(copy_shape, str):
                     return f"{copy_shape}.shape", None
@@ -4286,6 +4911,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         indexing: BlockPtrOptions | TensorDescriptorOptions,
         other="",
     ) -> tuple[str, str]:
+        # [FUNCTION DOC] Produce the block descriptor expression/variable and the adjusted extra
+        # argument string for a load/store. For tensor descriptors: drops the padding argument when
+        # boundary checks exist (only "other=0.0" is allowed, else AssertionError), registers
+        # host-side TMA descriptors (zero offset, materializable) and returns early, otherwise marks
+        # the buffer non-materializable (non-zero offset) and flags device-side TMA. For block
+        # pointers: adds boundary_check/padding arguments (omitted when no check is needed). Inside
+        # a reduction loop with reduction indexing, or when liftable, creates (or reuses via CSE or
+        # the prologue cache) a named descriptor variable defined in the body or prologue and, for
+        # block pointers, records the buffer and per-reduction-type pointer advancements
+        # (AssertionError on duplicates); otherwise returns the inline descriptor expression.
         """Generate a block pointer or tensor descriptor for Triton kernel operations.
 
         This method creates either a block pointer (for regular Triton operations) or
@@ -4419,6 +5054,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return block_descriptor, other
 
     def codegen_block_ptr_store_line(self, name, indexing, block_ptr, value, other=""):
+        # [FUNCTION DOC] Build the store statement for a block pointer or descriptor. Broadcasts
+        # the value to the kernel tile shape, updates the indexing broadcasting_dims (dropping dims
+        # already equal, respecting the stride sort; mutates the options), reshapes/transposes to
+        # the block shape, and casts to the store dtype (taken from the underlying input buffer for
+        # in-place buffers). Returns tl.store for block pointers, or the descriptor store line.
         # Stores require an explicit broadcast. We do this in two phases:
         #  1. Broadcast the operand to the final shape of the range trees, e.g. [ZBLOCK,
         #     YBLOCK, XBLOCK]. This protects against implicit broadcasting from loads.
@@ -4470,10 +5110,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return self.codegen_descriptor_store_line(block_ptr, indexing, value)
 
     def codegen_descriptor_load_line(self, block_descriptor, indexing):
+        # [FUNCTION DOC] Return the descriptor load expression using the indexing offsets;
+        # a hook for backend customization.
         """Generate the descriptor load line. Override for backend customization."""
         return f"{block_descriptor}.load({V.kernel.index_to_str(indexing.offsets)})"
 
     def codegen_descriptor_store_line(self, block_ptr, indexing, value):
+        # [FUNCTION DOC] Return the descriptor store statement using the indexing offsets and the
+        # value; a hook for backend customization.
         """Generate the descriptor store line. Override for backend customization."""
         return f"{block_ptr}.store({V.kernel.index_to_str(indexing.offsets)}, {value})"
 
@@ -4484,6 +5128,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         lower: bool,
         upper: bool,
     ):
+        # [FUNCTION DOC] Emit a runtime bounds assertion for an index expression: it must be at
+        # least 0 if lower and below size if upper, guarded by the index mask when present.
+        # Does nothing if neither bound is requested. Adds the assertion line to the load buffer
+        # via CSE (side effect). Raises AssertionError for non-sympy input or non-plain indexing.
         if not (lower or upper):
             return
 
@@ -4506,6 +5154,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.cse.generate(buffer, line, assignment=False, dtype=torch.int32)
 
     def get_load_buffer(self, indexing):
+        # [FUNCTION DOC] Choose the code buffer for a load: compute buffer for indirect or
+        # temp-masked indexing, the body (hoisted before a reduction loop) when inside a looped
+        # reduction and neither address nor mask depends on the reduction, else the loads buffer.
         if indexing.has_indirect() or indexing.has_tmpmask():
             # Masked loads must come after the mask is computed
             return self.compute
@@ -4521,12 +5172,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return self.loads
 
     def _range_tree_mask_shape(self, mask: str) -> BlockShapeType:
+        # [FUNCTION DOC] HELPER: Shape of a range-tree mask name from the active tree owning it,
+        # or None if no active tree owns it.
         for tree in self.active_range_trees():
             if tree.owns_mask(mask):
                 return tree.mask_shape(self.triton_tensor_ndim())
         return None
 
     def _mask_shape(self, mask: str | TritonCSEVariable) -> BlockShapeType:
+        # [FUNCTION DOC] HELPER: Shape of a mask: a CSE variable's own shape, else the range-tree
+        # mask shape (None if unknown).
         if isinstance(mask, TritonCSEVariable):
             return mask.shape
         return self._range_tree_mask_shape(mask)
@@ -4536,6 +5191,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         shape: BlockShapeType,
         mask_vars: OrderedSet[str | TritonCSEVariable],
     ) -> BlockShapeType:
+        # [FUNCTION DOC] HELPER: Broadcast a shape against every mask's shape; returns None if the
+        # input shape or any mask shape is unknown.
         if shape is None:
             return None
 
@@ -4553,6 +5210,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _enable_pdl_codegen():
+        # [FUNCTION DOC] HELPER: True if programmatic dependent launch (PDL) code should be
+        # emitted: config enabled, current kernel not a template kernel, not HIP, CUDA device with
+        # compute capability >= 9.
         if not torch._inductor.config.triton.enable_pdl:
             return False
         if isinstance(V.kernel, torch._inductor.select_algorithm.TritonTemplateKernel):
@@ -4568,6 +5228,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _handle_pdl_before_access(
         self, wait_buffer, *dependencies, consider_reads=False
     ):
+        # [FUNCTION DOC] HELPER: Emit a PDL grid-dependency wait before accessing the given
+        # buffer names when the previous scheduled node wrote (or, with consider_reads, read) any of
+        # them or there is no previous node. The wait is hoisted to the body before a looped
+        # reduction. No-op when PDL is disabled. Raises AssertionError if dependencies are empty or
+        # nodes are missing when matching.
         if not self._enable_pdl_codegen():
             return
         current_node = V.kernel.current_node
@@ -4576,6 +5241,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
         def matching_dep(dep):
+            # [FUNCTION DOC] HELPER: True if dep equals (after mutation renaming) a buffer written
+            # (or also read, if consider_reads) by the previous node.
             if prev_node is None:
                 raise AssertionError("prev_node must not be None")
             if current_node is None:
@@ -4600,6 +5267,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         wait_buffer.writeline(self.GDC_WAIT)
 
     def _handle_pdl_after_load(self, launch_buffer, result_var):
+        # [FUNCTION DOC] HELPER: After a load result is first created, emit a PDL wait followed by
+        # a launch-dependents call into launch_buffer (post-loop combine buffer for looped
+        # reductions). Skips if PDL is disabled or the result variable has been used more than
+        # once. Redundant waits/launches are removed later by _filter_pdl.
         if not self._enable_pdl_codegen():
             return
         if result_var.use_count > 1:  # we already went through this
@@ -4616,6 +5287,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         launch_buffer.writeline(self.GDC_LAUNCH)
 
     def _filter_pdl(self, code: IndentedBuffer):
+        # [FUNCTION DOC] HELPER: Rewrite the buffer lines in place, keeping only the first PDL wait
+        # and only the last PDL launch-dependents call.
         new_lines = []
         has_wait = False
         previous_launch = None
@@ -4635,6 +5308,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _load_index_split_basis(
         self, index: sympy.Expr, tree: IterationRangesRoot
     ) -> LoadIndexBasis | None:
+        # [FUNCTION DOC] HELPER: Find the tuple of range entries of the tree appearing in the
+        # index that forms a complete mixed-radix decomposition (divisors chain from 1, product of
+        # lengths equals the tree numel, at least two non-unit digits). Returns the ordered tuple
+        # or None if not provable.
         """Find split digits that reconstruct a range tree's flat index.
 
         Each entry is one digit in a mixed-radix index. A complete basis has at
@@ -4675,6 +5352,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return tuple(basis)
 
     def _supports_load_index_basis_reuse(self) -> bool:
+        # [FUNCTION DOC] HELPER: True only for plain TritonKernel instances (exact class) that are
+        # reductions, not cooperative, with no derived range tree roots.
         """Whether this kernel uses a supported shared coordinate scope."""
         return (
             self.__class__ is TritonKernel
@@ -4687,6 +5366,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def _resolve_load_index_bases(self, state: LoadIndexState) -> LoadIndexBases:
+        # [FUNCTION DOC] HELPER: Return the split bases stored in a resolved state, or compute a
+        # per-range-tree basis tuple from the earlier load's index for an unresolved state.
         """Return cached bases or derive them from the prior live load."""
         if isinstance(state, _ResolvedLoadIndexState):
             return state.bases
@@ -4702,6 +5383,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         tree: IterationRangesRoot,
         basis: LoadIndexBasis,
     ) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Substitute, in the index, every full-range entry symbol of the
+        # tree (divisor 1 and length equal to the tree numel) not already in the basis with the sum
+        # of basis digit symbols times their divisors. Returns the index unchanged if nothing
+        # qualifies.
         """Replace a tree's flat symbol with its exact split-coordinate sum."""
         split_index = sum(
             (entry.symbol() * entry.divisor for entry in basis), sympy.S.Zero
@@ -4723,6 +5408,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return sympy_subs(index, replacements) if replacements else index
 
     def _reuse_load_index_basis(self, name: str, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Possibly rewrite a load index to reuse split coordinates seen in an
+        # earlier load of the same buffer in the same CSE scope. Returns the index unchanged where
+        # unsupported or on the first load (state recorded lazily); on a repeated identical index
+        # returns the earlier result; otherwise resolves bases, rewrites each tree, simplifies with
+        # the variable ranges when changed, records the resolved state in the CSE and returns the
+        # result.
         """Rewrite a full-range load coordinate to an observed split basis.
 
         Reduction bodies can use split coordinates while later pointwise work
@@ -4765,11 +5456,25 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def partial_accumulate(
         self, name: str, reduction_type, val, extra_meta: dict[str, Any]
     ):
+        # [FUNCTION DOC] Record a partial accumulation (name, reduction type, value) in the kernel's
+        # saved_partial_accumulate list. extra_meta is unused.
         self.saved_partial_accumulate.append(
             PartialAccumulate(name, reduction_type, val)
         )
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Emit a load of buffer name at a sympy index and return the resulting CSE
+        # variable (shape and mask_vars attached). Steps: register the input arg and count loads;
+        # possibly rewrite the index to reuse earlier split coordinates; decide host-TMA
+        # eligibility and build the indexing (block pointer, tensor descriptor or pointer); pick
+        # the eviction policy (evict_last for broadcast/non-coalesced loads, a deferred decision
+        # for loads inside reductions, none otherwise) and optional skip-L1 cache modifier; pick
+        # the masked "other" value; produce the load expression (unwrapped scalar args are used
+        # directly, integer indices load a scalar then broadcast); upcast half floats to float32
+        # when configured and convert bool loads to int1 (non-HIP); add a debug barrier when
+        # reading back a buffer stored in the loop; emit PDL waits; and when a scalar load was
+        # broadcast apply the mask with a select. Records outside-loop variables. Side effects:
+        # appends to kernel buffers, mutates TMA bookkeeping and load counters.
         """
         Load from the memory location 'name', offset by some indexing expression 'index'.
         """
@@ -4841,6 +5546,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
 
             def decide_later():
+                # [FUNCTION DOC] HELPER: Called lazily when the code is finalized; returns
+                # "evict_last" if the buffer is loaded again later and the load involves a
+                # reduction index or indirect indexing, else "evict_first".
                 if load_counts[name] > expected_count and (
                     has_rindex or indirect_indexing
                 ):
@@ -5009,6 +5717,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Emit a store of value into buffer name at a sympy index, with mode None
+        # (plain store), "atomic_add", or "tma" (forced TMA store); other modes raise
+        # NotImplementedError. Builds indexing (block pointer/tensor descriptor when possible),
+        # adds a debug barrier before broadcast in-place stores (triton bug workaround), scalar
+        # indices are broadcast to the value shape, atomic adds use relaxed semantics and set
+        # atomic_add_found. Cooperative reductions guard the store so only one block writes.
+        # Writes a deferred line to the stores buffer and tracks outside-loop values.
         """
         store the 'value' to the memory location 'name', offset by some indexing expression 'index'.
         """
@@ -5107,9 +5822,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         exit_stack.close()
 
     def device_assert_async(self, cond, msg) -> None:
+        # [FUNCTION DOC] Emit a device assertion line for the condition with the message into the
+        # compute buffer.
         self.compute.writeline(f"tl.device_assert({cond}, {repr(msg)})")
 
     def guard_cooperative_store(self, name, buffer):
+        # [FUNCTION DOC] Write an "if this block's split id equals a rotating index" line into the
+        # buffer (index from the workspace cache store counter) and return the buffer's indent
+        # context manager so following lines are guarded. Mutates the store counter.
         """
         For cooperative reductions only one thread block should write out the result.
         We rotate which thread block does each write for better parallelism
@@ -5119,6 +5839,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return buffer.indent()
 
     def _combine_masks(self, *variables: CSEVariable | None):
+        # [FUNCTION DOC] HELPER: Union the mask_vars of all given variables that have that
+        # attribute (skipping None); returns None if none do.
         masks = None
         for elem in variables:
             if elem is None:
@@ -5140,6 +5862,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: CSEVariable | None = None,
     ) -> CSEVariable:
+        # [FUNCTION DOC] Emit a binary-search bucketize of values against the boundaries buffer
+        # (pointer, size, underlying numel, stride) with optional sorter pointer/stride, returning
+        # indices in int32 or int64 (other dtypes raise NotImplementedError). Adds the one-element
+        # per-thread autotune hint, registers input args, wraps with PDL handling, and sets the
+        # result mask_vars to the union of the input masks.
         """
         See [Note: Inductor bucketize op]
         """
@@ -5190,6 +5917,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return result
 
     def reduction_resize(self, value) -> str:
+        # [FUNCTION DOC] Return an expression restoring the reduced dims of a reduction result as
+        # size-1 dims: promote-to-tensor for 1D kernels, otherwise an index expression with None for
+        # the reduction dims.
         ndims = self.triton_tensor_ndim()
         if ndims == 1:
             return f"triton_helpers.promote_to_tensor({value})"
@@ -5199,6 +5929,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return f"{value}[{', '.join(sizes)}]"
 
     def reduction_resize_and_shape(self, value, shape) -> tuple[str, BlockShapeType]:
+        # [FUNCTION DOC] Like reduction_resize but also returns the resulting shape: the input
+        # shape with reduction dims replaced by 1 (None if the shape is unknown; unchanged for 1D).
         ndims = self.triton_tensor_ndim()
         if ndims == 1:
             return f"triton_helpers.promote_to_tensor({value})", shape
@@ -5213,6 +5945,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def reduction_collapse_dims(
         self, buffer, value: CSEVariable, dtype: torch.dtype
     ) -> CSEVariable:
+        # [FUNCTION DOC] For multi-dimensional reductions, emit a reshape of value that merges all
+        # reduction dims into one RBLOCK dim and return the new CSE variable; for single-reduction
+        # dim kernels returns value unchanged.
         """
         Reshape to RBLOCK, collapsing all reduction dims.
         """
@@ -5237,14 +5972,30 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Emit code reducing value (a CSE variable or a tuple for welford, arg and
+        # online-softmax reductions) over the reduction dims and return the result variable(s).
+        # Half-precision inputs are upcast to float32 and results downcast afterwards. Masks are
+        # built from the range trees and the load mask; values are broadcast to the dense shape.
+        # Persistent reductions mask the value with the reduction default and reduce in one shot
+        # (welford and online softmax may use a fallback); looped reductions create accumulators in
+        # the body, update them in compute with masking, and perform the final reduction in the
+        # post-loop combine buffer (arg reductions keep an index accumulator, strict-sum uses
+        # chunked linear accumulation, dot keeps an (Y,X) accumulator). Cooperative reductions add
+        # a cross-block combine through a shared workspace into post_loop_combine/post_loop_store.
+        # Results are cached in the CSE reduction cache keyed by dtype, type and value, and added
+        # to outside_loop_vars. Raises AssertionError when not inside a reduction or on
+        # inconsistent configuration. dtype is the result dtype and src_dtype the input dtype.
         """
         codegen reduction of value to Triton according the reduction_type
         """
 
         def should_upcast(d: torch.dtype | None) -> bool:
+            # [FUNCTION DOC] HELPER: True for floating dtypes narrower than 4 bytes.
             return d is not None and d.is_floating_point and d.itemsize < 4
 
         def maybe_upcast(value: CSEVariable) -> CSEVariable:
+            # [FUNCTION DOC] HELPER: Convert a low-precision float value to float32 through the
+            # ops handler; other values pass through.
             # Math reductions in small floats are less accurate because the Triton
             # compiler does not automatically promote to FP32 for accumulation.
             # Additionally, max/min reductions do not support FP16/BF16.  Manually
@@ -5344,6 +6095,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             value: CSEVariable,
             result_type: torch.dtype | None,
         ) -> tuple[str, torch.dtype | None, BlockShapeType]:
+            # [FUNCTION DOC] HELPER: Build the final reduction expression for value (collapsing
+            # reduction dims first): the dot case just adds the reduced trailing dims to the (Y,X)
+            # accumulator, others call the Triton reduction function (with inner-tree ordering for
+            # strict sum) and resize back. Optionally casts to result_type. Returns expression,
+            # result dtype (value dtype if none given) and shape.
             """
             Helper to generate a reduction call, e.g. tl.sum.
             """
@@ -5385,6 +6141,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             value: CSEVariable,
             result_type: torch.dtype | None,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Emit a final reduction and an assignment of it to an existing
+            # result variable in the given buffer.
             """
             Generate a reduction and assign it to an existing variable.
             """
@@ -5393,6 +6151,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             buffer.splice(f"{result_var} = {value}")
 
         def final_argreduce(buffer, result_var, value, index, result_kind="index"):
+            # [FUNCTION DOC] HELPER: Emit the final max/min-with-index reduction of value and index
+            # into the buffer. result_kind selects what is assigned: both value and index
+            # variables, only the value, or only the index. Results are resized to restore the
+            # reduced dims. Uses the enclosing root_op (max or min).
             value = self.reduction_collapse_dims(buffer, value, value.dtype)
             index = self.reduction_collapse_dims(
                 buffer,
@@ -5426,6 +6188,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
 
         def argreduce_result_kind():
+            # [FUNCTION DOC] HELPER: Map the enclosing reduction type to the arg-reduce result kind:
+            # value_and_index, value, or index.
             if reduction_type in arg_with_value_reduction_types:
                 return "value_and_index"
             if reduction_type in arg_value_reduction_types:
@@ -5472,6 +6236,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         cond = " & ".join(masks)
 
         def where_cond(tval, fval):
+            # [FUNCTION DOC] HELPER: Select between tval (where all masks hold) and fval; returns
+            # tval directly when there are no masks.
             if not cond:
                 return tval
             return TritonKernelOverrides.where(cond, tval, fval)
@@ -5480,6 +6246,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             default = ir.Reduction.default_value(reduction_type, src_dtype)
 
             def update_constant_dtype(constant, src_dtype, dst_dtype):
+                # [FUNCTION DOC] HELPER: Adapt an integer reduction default that equals the source
+                # dtype's max/min to the destination dtype's max/min; other constants, floats and
+                # bools are unchanged.
                 "update reduction constant mask value to match dst_dtype"
 
                 # int is the only mask which may not fit within lower bitwidth,
@@ -5498,6 +6267,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     return constant
 
             def _mask_value(value, default) -> CSEVariable:
+                # [FUNCTION DOC] HELPER: Replace elements outside the masks with the reduction
+                # default (dtype-adjusted); returns the new CSE variable.
                 default = update_constant_dtype(default, src_dtype, value.dtype)
                 default_str = self._map_tuple_or_scalar(constant_repr, default)
 
@@ -5932,6 +6703,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _online_softmax_reduce(
         self, buffer, accumulator_max, accumulator_sum, dim, dtype: torch.dtype
     ):
+        # [FUNCTION DOC] HELPER: Emit a call to the online-softmax reduce helper over the collapsed
+        # max and sum accumulators, then resize both results; returns the names of the new max and
+        # sum variables. Appears unused in this module.
         accumulator_max = self.reduction_collapse_dims(buffer, accumulator_max, dtype)
         accumulator_sum = self.reduction_collapse_dims(buffer, accumulator_sum, dtype)
         result_max, result_sum = [str(self.cse.newvar(dtype=dtype)) for _ in range(2)]
@@ -5948,6 +6722,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return result_max, result_sum
 
     def _welford(self, buffer, mean, m2, weight, dim, dtype: torch.dtype):
+        # [FUNCTION DOC] HELPER: Emit a welford reduction call over the collapsed mean, m2 and
+        # weight along dim into the buffer. Returns a tuple of three (resized expression, shape)
+        # pairs, one per result.
         """
         Helper to codegen triton_helpers.welford.
         """
@@ -5958,6 +6735,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         welford = f"triton_helpers.welford({mean}, {m2}, {weight}, {dim})"
 
         def reduced_shape(shape):
+            # [FUNCTION DOC] HELPER: The shape with dimension dim removed.
             return tuple(shape[0:dim] + shape[dim + 1 :])
 
         welford_results = [
@@ -5974,6 +6752,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def welford_reduce(
         self, result_var, reduction_type, value, where_cond, acc_type, dtype
     ):
+        # [FUNCTION DOC] Emit a looped welford reduction: creates zero-initialized mean, m2 and
+        # weight accumulators in the body, updates them each iteration in compute (welford_combine
+        # from partial triples or welford_reduce from raw values; masked via where_cond), then does
+        # the final welford reduction in post_loop_combine. Returns the result tuple. Raises
+        # AssertionError for other reduction types.
         """Helper to codegen a welford reduction"""
         dim = self.triton_tensor_ndim() - self.num_reduction_dims
 
@@ -6058,6 +6841,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         dim,
         dtype,
     ):
+        # [FUNCTION DOC] Emit the final welford reduction of mean/m2/weight into buffer and assign
+        # to the given result expressions; any result that is None gets a fresh CSE variable.
+        # Returns the tuple of result variables.
         """Helper to codegen call to triton_helpers.welford"""
         values = list(self._welford(buffer, mean, m2, weight, dim, dtype))
 
@@ -6073,6 +6859,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def online_softmax_reduce_final_reduction(
         self, buffer, result_max, result_sum, peer_max, peer_sum, dim, dtype
     ):
+        # [FUNCTION DOC] Emit the final online-softmax reduction of the max/sum values into buffer,
+        # assigning to result_max and result_sum and resizing them; returns both names.
         accumulator_max = self.reduction_collapse_dims(buffer, peer_max, dtype)
         accumulator_sum = self.reduction_collapse_dims(buffer, peer_sum, dtype)
         buffer.splice(
@@ -6087,6 +6875,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return result_max, result_sum
 
     def max_rsplit(self):
+        # [FUNCTION DOC] Maximum reduction split count: the fixed config RSPLIT if present, else
+        # TRITON_MAX_RSPLIT.
         if self.fixed_config:
             return self.fixed_config["RSPLIT"]
         return TRITON_MAX_RSPLIT
@@ -6094,6 +6884,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def codegen_cooperative_reduction_peer_combine(
         self, result_var, dtype, default_val
     ) -> CSEVariable:
+        # [FUNCTION DOC] Emit the cross-block exchange for cooperative reductions: allocate a
+        # workspace sized by xnumel, element size and max RSPLIT; in post_loop_combine each block
+        # stores its partial value in its column; in post_loop_store every block loads all peers'
+        # columns (masked, with default_val for invalid slots). Returns the CSE variable holding the
+        # [XBLOCK, RSPLIT] peer values.
         """
         Generate code to save a [XBLOCK, RSPLIT] temporary workspace, where each thread block writes a different
         column.  After the barrier, every thread block loads the completed value so that it can compute the final
@@ -6130,6 +6925,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index: sympy.Expr,
         value: CSEVariable,
     ):
+        # [FUNCTION DOC] Emit the store of a reduction result into buffer name at index in the
+        # post-loop store buffer. Temporarily clears inside_reduction while computing indexing
+        # (restored afterwards). Uses a block pointer/descriptor store when available, otherwise a
+        # masked pointer store with scalar indices broadcast to the value shape. Cooperative
+        # reductions guard the store. Raises AssertionError if not inside a reduction.
         if not self.inside_reduction:
             raise AssertionError("expected inside_reduction")
         self.inside_reduction = False
@@ -6196,6 +6996,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         shape: Sequence[sympy.Expr | int | str],
         dtype: torch.dtype,
     ) -> CSEVariable:
+        # [FUNCTION DOC] Emit a reshape of value to the given shape into the compute buffer and
+        # return the new CSE variable with that shape and dtype.
         """Emit a tl.reshape into a new tile shape, returning a CSE var."""
         return self.cse.generate(
             self.compute,
@@ -6212,6 +7014,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         dtype: torch.dtype,
         shape: Sequence[Any],
     ) -> CSEVariable:
+        # [FUNCTION DOC] Emit a Triton reduction of the given type along axis into the compute
+        # buffer; returns the CSE variable with the given dtype and shape.
         """Emit a Triton reduction primitive along `axis`, returning a CSE var."""
         reduce_fn = get_triton_reduction_function(reduction_type)
         return self.cse.generate(
@@ -6230,6 +7034,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         dtype: torch.dtype,
         out_shape: Sequence[Any],
     ) -> CSEVariable:
+        # [FUNCTION DOC] Emit reshape(value, pre_broadcast_shape), broadcast to broadcast_shape,
+        # then reshape to final_shape into the compute buffer; returns the CSE variable with dtype
+        # and out_shape. Used by nested reductions.
         """reshape(broadcast_to(reshape(value, pre_broadcast), broadcast), final).
 
         Used for nested-reduction broadcasts that lift a reduced-resolution
@@ -6252,6 +7059,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         value: CSEVariable,
         shape: Sequence[sympy.Expr | int | str],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Reshape expression for value: a plain reshape when its old shape
+        # is unknown, else the optimized reshape from its recorded shape.
         old_shape = getattr(value, "shape", None)
         if old_shape is None:
             return f"tl.reshape({value}, {triton_shape_str(shape)})"
@@ -6260,6 +7069,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def _lift_helper(
         self, fn, values: tuple[CSEVariable, ...], dtypes: tuple[torch.dtype, ...]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Convert the scan combine function fn into a jitted helper source
+        # taking two tuples of arguments (shapes/dtypes from values and dtypes) by running fn under
+        # a recording ops handler that emits Triton text via TritonOverrides with dtype and shape
+        # propagation. The helper name includes the op names to avoid Triton cache collisions.
+        # Registers the source in helper_functions (side effect) and returns its name.
         # Lift IR function for scan operations into a triton function
         # in the global namespace
         helper = IndentedBuffer()
@@ -6291,9 +7105,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         dtype_handler = DtypePropagationOpsHandler()
 
         class CSEProxy(DefaultHandler):
+            # [CLASS DOC] HELPER: Ops handler that, for every op, computes output dtype and shape
+            # with the propagation handlers, emits the Triton expression from TritonOverrides into
+            # the helper buffer through a local CSE, and appends the op name to helper_name.
             def _default(
                 self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
             ) -> Any:
+                # [FUNCTION DOC] HELPER: Handle one op call as described by the class.
                 nonlocal helper_name
                 helper_name += f"_{name}"
 
@@ -6329,6 +7147,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ],
         values: tuple[CSEVariable, ...],
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Emit an associative scan of values along the reduction dim using a lifted
+        # helper for combine_fn; returns the tuple of scanned CSE variables (mask_vars set).
+        # Values are cast to compute dtypes and broadcast to the dense shape. Persistent kernels do
+        # one scan; looped kernels carry accumulators across iterations: the last element of each
+        # partial scan is selected, combined with the accumulator and the full scan is chosen after
+        # the first iteration. Raises AssertionError when not inside a reduction, for cooperative
+        # reductions (TODO), or inside a masked region.
         """
         Perform an associative scan on 'values'.
         """
@@ -6381,9 +7206,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 accumulators.append(accumulator)
 
         def csv(values):
+            # [FUNCTION DOC] HELPER: Join the values as a space-separated list with trailing commas.
             return " ".join(f"{value}," for value in values)
 
         def cse_multiple(line, values, masks, dtypes):
+            # [FUNCTION DOC] HELPER: CSE a statement producing several results: returns cached
+            # variables if all cache keys exist, otherwise creates one new variable per value,
+            # writes the multi-assignment to compute, sets masks and caches each.
             n = len(values)
             cache_keys = [f"{line}, {i}, {masks}" for i in range(n)]
             if all(self.cse.contains(cache_key) for cache_key in cache_keys):
@@ -6413,6 +7242,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # of repeating the scan op as a reduction, we use sum to select the
             # last scan value
             def _partial_scan_shape(var):
+                # [FUNCTION DOC] HELPER: The variable shape with its last dim set to 1 (None if
+                # unknown).
                 if var.shape is None:
                     return None
                 else:
@@ -6463,6 +7294,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         stable: bool,
         descending: bool,
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Emit a sort of values (exactly two: keys and indices) along the reduction
+        # dim using the sort-with-index helper (stable/descending flags passed through), after
+        # casting/broadcasting to the dense shape. Returns the sorted CSE variables with mask_vars
+        # and bounds copied from the inputs. Raises AssertionError when not inside a persistent
+        # reduction, for cooperative reductions, inside a masked region, if the last range tree is
+        # not a reduction, or for a value count other than two.
         if not self.inside_reduction:
             raise AssertionError("expected inside_reduction")
         if self.cooperative_reduction:
@@ -6493,9 +7330,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ]
 
         def csv(values):
+            # [FUNCTION DOC] HELPER: Join the values as a space-separated list with trailing commas.
             return " ".join(f"{value}," for value in values)
 
         def cse_multiple(line, broadcasted_values, masks, dtypes):
+            # [FUNCTION DOC] HELPER: CSE a statement producing several results (same behavior as the
+            # helper in scan): cached variables when all keys exist, else new variables assigned by
+            # one compute line, with masks set and cached.
             n = len(broadcasted_values)
             cache_keys = [f"{line}, {i}, {masks}" for i in range(n)]
             if all(self.cse.contains(cache_key) for cache_key in cache_keys):
@@ -6533,6 +7374,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return tuple(result_vars)
 
     def codegen_prologue(self, code: IndentedBuffer):
+        # [FUNCTION DOC] Splice the accumulated prologue code into the given buffer and clear the
+        # prologue and its cache; does nothing if the prologue is empty.
         """
         Generate the output from prologue. This should be
         extracted from the subgraph, which is why this is
@@ -6546,6 +7389,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue_cache.clear()
 
     def codegen_body(self):
+        # [FUNCTION DOC] Assemble the kernel body from the per-section buffers (indexing code,
+        # loads, compute, stores, post-loop combine/store) and clear them; no-op if all are empty.
+        # Mix-order reductions emit a loop over x with partial accumulators updated per iteration
+        # and stored to the workspace afterwards (requires persistent reduction). Looped reductions
+        # emit nested loop headers per loop range tree (pipelining stage setting on HIP), the inner
+        # body, and per-level suffixes that advance block pointers (net of inner-level advancement,
+        # skipping zero advances) and invalidate loop-local CSE entries. Other kernels splice
+        # sections directly. Cooperative reductions finish with a grid barrier and advance the
+        # workspace cache loop count.
+        # KNOWN ISSUE: the mix-order path does "import unittest" then uses unittest.mock, which
+        # only works if unittest.mock has been imported elsewhere.
         """
         Concat output code from index_code, loads, compute, stores,
         suffix into self.body.
@@ -6741,6 +7595,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.post_loop_store.clear()
 
     def kernel_benchmark_extra_args(self) -> list[str]:
+        # [FUNCTION DOC] Extra benchmark call arguments: when numel args are needed, the numel
+        # values as strings (ints directly, symbolic ones through optimization hints with the hint
+        # override). Raises ValueError for unsupported numel argument types.
         args = []
         if self.need_numel_args():
             numel_args: list[sympy.Expr] = []
@@ -6765,6 +7622,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return args
 
     def codegen_kernel_benchmark(self, num_gb: float | None) -> IndentedBuffer:
+        # [FUNCTION DOC] Build the source of a standalone benchmark harness for this kernel and
+        # return it as an IndentedBuffer: get_args creates arguments (random strided tensors for
+        # buffers and constants using optimization hints, scalar hints for size args with seed
+        # offsets forced to 0, zero tensors for workspaces, plus numel extras), call runs the
+        # kernel on the current device/stream, benchmark_all_configs delegates to the kernel, and a
+        # main block times the call and prints ms, GB and GB/s using num_gb. Raises KeyError for an
+        # argument that is neither a buffer, constant, size nor workspace.
         """
         Generates Python code for benchmarking this Triton kernel.
         - Creates example inputs (random tensors, constants, sizes).
@@ -6890,6 +7754,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return result
 
     def imports_for_benchmark_kernel(self):
+        # [FUNCTION DOC] Return import lines needed by the benchmark harness: rand_strided, the
+        # device's raw stream getter (aliased get_raw_stream) and torch.
         # Dedent BEFORE substituting get_raw_stream: a multi-line override would
         # otherwise collapse dedent's common prefix and misindent the imports.
         return textwrap.dedent(
@@ -6901,6 +7767,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ).format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
 
     def _get_heuristic(self):
+        # [FUNCTION DOC] HELPER: Name of the triton_heuristics decorator for this kernel: fixed_config,
+        # cooperative_reduction, persistent_reduction (AssertionError if not inside a reduction),
+        # reduction, or pointwise.
         if self.fixed_config:
             return "fixed_config"
         elif self.cooperative_reduction:
@@ -6916,6 +7785,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     @classmethod
     @lru_cache(None)
     def gen_common_triton_imports(cls) -> str:
+        # [FUNCTION DOC] Return (cached per class) the import block at the top of generated kernel
+        # files: triton, triton.language, optional tlx extras when importable, the AttrsDescriptor
+        # import when available, the Inductor triton helpers/heuristics/hints, and the Proton
+        # profiler imports when config.triton.proton_profiling is set.
         imports = IndentedBuffer()
         imports.splice(
             """
@@ -6956,6 +7829,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @classmethod
     def triton_meta_common(cls) -> TritonMeta:
+        # [FUNCTION DOC] Common launch metadata shared by kernels: fp fusion enabled unless
+        # precision casts are emulated, PDL launch flag, and the disable-ftz setting.
         return {
             "enable_fp_fusion": not config.emulate_precision_casts,
             "launch_pdl": cls._enable_pdl_codegen(),
@@ -6964,6 +7839,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @classmethod
     def inductor_meta_common(cls):
+        # [FUNCTION DOC] Build the inductor metadata mapping shared by all kernels from global
+        # config (backend hash, autotune and cache flags, determinism, benchmarking and
+        # coordinate-descent options, HIP/fbcode markers, optional deterministic-algorithms flag).
+        # Reads config and torch state only.
         inductor_meta = {
             "backend_hash": torch.utils._triton.triton_hash_with_backend(),
             "assert_indirect_indexing": config.assert_indirect_indexing,
@@ -7014,6 +7893,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return inductor_meta
 
     def inductor_meta_per_kernel(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Build this kernel's inductor metadata: dimension and op-count info,
+        # autotune hints, mix-order RSPLIT size, contiguous reduction flags, TMA info (min block
+        # sizes, host/device flags, and resolved host descriptor block/tensor shapes where block
+        # symbols are either signature args, fixed persistent sizes, ints, or strings), tiling
+        # scores, min block sizes, persistence markers, strict-sum rblock, and estimated
+        # bytes/flops when benchmarking is enabled. Also used by combo kernels per sub-kernel.
+        # KNOWN ISSUE: estimate_kernel_num_bytes is divided by 1e9 before the None check, so a None
+        # estimate would fail before being tested.
         """
         Used by both standalone codegen_kernel() and ComboKernel.combo_grid_meta()
         (which calls this on each sub_kernel).
@@ -7086,6 +7973,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                                 pass
 
             def _resolve_block_dim(s):
+                # [FUNCTION DOC] HELPER: Resolve a block shape dim to a signature arg name, a fixed
+                # persistent block value, an int, or a string, in that order of preference.
                 s_str = str(s)
                 if s_str in sig_arg_names:
                     return s_str
@@ -7097,6 +7986,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     return s_str
 
             def _resolve_tensor_dim(s):
+                # [FUNCTION DOC] HELPER: Resolve a shape/stride dim to an int if possible, else its
+                # string form.
                 try:
                     return int(s)
                 except (TypeError, ValueError):
@@ -7115,6 +8006,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @functools.cached_property
     def add_persistent_rblock(self) -> bool:
+        # [FUNCTION DOC] Cached property: True if an extra persistent-size config should be added
+        # to a looped 2D-tiled reduction. Requires: contiguous (inner) reduction, memory saved by
+        # going persistent of at least 1.3x, reduction numel statically in (2048, 32768], and at
+        # most 10 memory ops per thread. Otherwise False.
         # Bail on 3d tiling, which has more complicated coalesce patterns
         looped_red = self.features.is_reduction() and not self.persistent_reduction
         tiling_scores = self.tiling_scores
@@ -7165,6 +8060,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return False
 
     def codegen_kernel(self, name=None) -> str:
+        # [FUNCTION DOC] Produce the full Python source of the Triton kernel and return it as a
+        # string. With no name given (a standalone file) it starts with the imports and the
+        # CPU/GPU driver setup and, when benchmarking, the benchmark imports. It computes size
+        # hints, the argument signature (replacing precomputed-size expressions, adding numel args
+        # and BLOCK/RSPLIT constexprs), mutated argument names (including zero-on-call
+        # workspaces), triton_meta (signature, device properties -- rank index dropped under
+        # compile-on-one-rank --, native matmul and cooperative-grid flags) and inductor_meta
+        # (stored on the kernel as triton_meta and inductor_meta, side effects). It then generates
+        # the prologue and body, refreshes TMA fields of the metadata after body codegen, filters
+        # PDL lines, computes launch configs (HIP atomics/pointer-range handling), emits helper
+        # functions, the heuristics decorator for the kernel kind (fixed config, reduction, or
+        # pointwise with tile hint), the jitted function with static numels, aliases and body, and
+        # the benchmark harness when enabled.
         """
         Convert the TritonKernel from Inductor SIMD IR to triton code, including inductor triton heuristics, imports,
         metadata, and benchmarking infra.
@@ -7255,6 +8163,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # argdefs.append(f"{tree.prefix}numel: tl.constexpr")
 
         def add_constexpr_arg(arg_name):
+            # [FUNCTION DOC] HELPER: Add a constexpr argument to the kernel argdefs, and to the
+            # signature too for Triton versions that require constexprs there.
             # new versions (but not old versions) of Triton need constexprs included in the signature
             if triton_version_uses_attrs_dict():
                 signature.append(ConstexprArg(arg_name))
@@ -7445,6 +8355,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _get_persistent_RBLOCK(rnumel):
+        # [FUNCTION DOC] HELPER: The persistent reduction block size for rnumel: next power of two
+        # for static integers; for symbolic values the smallest power of two statically known to
+        # bound it. Raises ValueError if no bound up to 16384 can be shown.
         rnumel = V.graph.sizevars.simplify(rnumel)
         if isinstance(rnumel, (sympy.Integer, int)):
             val = int(rnumel)
@@ -7461,6 +8374,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return val
 
     def _get_native_matmul_persistent_rblock(self) -> int | None:
+        # [FUNCTION DOC] HELPER: For persistent, non-cooperative native-matmul kernels, the product
+        # over reduction trees of the native-matmul persistent block adjusted size; None otherwise
+        # or when there are no reduction trees.
         if (
             not self.is_native_matmul
             or not self.persistent_reduction
@@ -7476,6 +8392,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return math.prod(rblocks) if rblocks else None
 
     def _get_persistent_reduction_block(self, rnumel) -> int:
+        # [FUNCTION DOC] HELPER: Persistent reduction block for rnumel: the planned strict-sum
+        # block when present (AssertionError if it does not cover rnumel), else the power-of-two
+        # persistent block.
         if (rblock := self._strict_sum_rblock()) is not None:
             if V.graph.sizevars.statically_known_geq(rblock, rnumel):
                 return rblock
@@ -7487,6 +8406,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def has_persistent_RBLOCK(rnumel):
+        # [FUNCTION DOC] True if a static persistent block size can be derived for rnumel (no
+        # ValueError from the block computation).
         try:
             TritonKernel._get_persistent_RBLOCK(rnumel)
             return True
@@ -7497,6 +8418,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def apply_feature_required_overrides(
         kernel_features: SIMDKernelFeatures, kernel_kwargs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC] Mutate kernel_kwargs with overrides the features require: sort ops and
+        # strict-sum multirow reductions force persistent reduction and disable cooperative
+        # reduction; if no static persistent block can be derived for the reduction numel,
+        # persistent reduction is disabled (AssertionError if it had been explicitly overridden to
+        # true).
         # ops.sort only works with persistent reduction, and is not bandwidth
         # bound anyway so taking the hit of non-coalesced loads is okay.
         if (
@@ -7514,6 +8440,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             kernel_kwargs["override_persistent_reduction"] = False
 
     def codegen_static_numels(self, code):
+        # [FUNCTION DOC] Write constant assignments at the top of the kernel body into code: static
+        # integer numels (for pointwise trees, or reduction trees when inside a reduction), the
+        # persistent reduction block constants (cooperative reductions use a power of two of the
+        # per-split numel; native matmul uses at least 16), and XBLOCK = 1 when the x dim is
+        # dropped.
         """
         We get a small speedup from hard coding numels if they are static.
 
@@ -7532,6 +8463,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         """
 
         def is_static_integer(expr: sympy.Expr) -> bool:
+            # [FUNCTION DOC] HELPER: True if expr is a sympy Integer or Python int.
             return isinstance(expr, (sympy.Integer, int))
 
         for tree in self.range_trees:
@@ -7556,6 +8488,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 code.writeline("XBLOCK: tl.constexpr = 1")
 
     def _get_grid_type(self) -> type[triton_heuristics.GridExpr]:
+        # [FUNCTION DOC] HELPER: Choose the launch grid class from the number of pointwise range
+        # trees: mix-order and cooperative reductions need exactly one (AssertionError otherwise)
+        # and use their dedicated grids; 1 gives Grid1D, 2 gives Grid2D (with y/z overflow variant
+        # when needed), 3 gives Grid3D (or the batch-matmul grid for native matmul). Raises
+        # ValueError for other counts.
         n = sum([int(not tree.is_reduction) for tree in self.range_trees])
         if self.mix_order_reduction:
             if n != 1:
@@ -7578,6 +8515,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         raise ValueError(f"Unsupported number of dimensions: {n}")
 
     def add_numel_to_call_args(self, name, call_args, arg_types):
+        # [FUNCTION DOC] Append each range tree's numel expression (reduction trees only when inside
+        # a reduction) and its type to the call_args and arg_types lists (mutated in place); symbolic
+        # non-trivial numels are generated via the wrapper code.
         # TODO(jansel): if there are constants, we shouldn't bother passing them as args
         for tree in self.range_trees:
             if isinstance(tree.numel, (sympy.Integer, sympy.Symbol)):
@@ -7592,6 +8532,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def call_kernel(
         self, name: str, node: IRNode | None = None, deallocate_ws: bool = True
     ):
+        # [FUNCTION DOC] Emit the host-side launch of the kernel into the wrapper code: write the
+        # triton header once, gather call args and numel args, allocate workspaces, generate the
+        # kernel call with the triton and inductor meta, and release workspaces if deallocate_ws.
         wrapper = V.graph.wrapper_code
         wrapper.write_triton_header_once()
         _, call_args, _, arg_types = self.args.python_argdefs()
@@ -7613,6 +8556,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.deallocate_workspaces()
 
     def codegen_nan_check(self) -> None:
+        # [FUNCTION DOC] Emit runtime NaN/Inf checks into the wrapper for every tensor argument of
+        # the kernel: a C++ check call under the C++ wrapper, otherwise two assertion lines.
         wrapper = V.graph.wrapper_code
         _, call_args, arg_signatures, _ = self.args.python_argdefs()
         for arg, arg_signature in zip(call_args, arg_signatures):
@@ -7628,9 +8573,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     wrapper.writeline(line)
 
     def create_cse_var(self, *args, **kwargs) -> TritonCSEVariable:
+        # [FUNCTION DOC] Factory hook: construct a TritonCSEVariable from the given arguments.
         return TritonCSEVariable(*args, **kwargs)
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
+        # [FUNCTION DOC] Emit the assignment of a range entry's variable from its index expression.
+        # It goes to indexing_code when the root is a loop (or x in mix-order reductions),
+        # otherwise to the body (lifted outside loops).
         line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
 
         # mix order reduction introduces an extra loop across the x
@@ -7642,6 +8591,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             self.body.writeline(line)
 
     def iteration_ranges_ranges_code(self, entry: IterationRangesRoot) -> str:
+        # [FUNCTION DOC] Code for the arange vector of a range root: arange over its block size,
+        # expanded along its tensor dim (not expanded for batch matmul z), cast to the index dtype
+        # when not int32, and offset by the split start for persistent cooperative reductions.
+        # Raises AssertionError if the root has no tensor dim.
         if entry.tensor_dim is None:
             raise AssertionError("entry.tensor_dim must not be None")
         size = self.indexing_size_str(entry.tensor_dim)
@@ -7666,12 +8619,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def iteration_ranges_scalar_code(
         self, entry: IterationRangesRoot, value: Any
     ) -> str:
+        # [FUNCTION DOC] Code for a scalar placed in every position of a rank-matching all-ones
+        # shape, typed as the index dtype (entry is unused).
         index_dtype = self.index_dtype
         ndim = self.triton_tensor_ndim()
         size = [1] * ndim
         return f"tl.full({size}, {value}, {index_dtype})"
 
     def iteration_ranges_get_pid(self, entry: IterationRangesRoot) -> str:
+        # [FUNCTION DOC] Code for the program id of a range root's grid dimension: combines y and
+        # z program ids when the y grid overflows, reverses the axis mapping for 4D native
+        # matmul (batch on x), uses the root's cached pid if any, and casts to the index dtype
+        # when not int32. Raises AssertionError if the root has no grid dim.
         if entry.grid_dim is None:
             raise AssertionError("entry.grid_dim must not be None")
         key = f"tl.program_id({entry.grid_dim})"
@@ -7696,6 +8655,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return pid
 
     def needs_yz_grid_overflow(self, entry: IterationRangesRoot) -> bool:
+        # [FUNCTION DOC] True if the root is the y grid dimension, has no z dimension, the kernel
+        # is not cooperative, and its numel is not statically within the max y grid size (so the
+        # z grid dimension must absorb overflow). Always False for combo kernels with per-subkernel
+        # blocks.
         # Combo kernels use flattened dispatch where y_pid_offset is computed
         # from the flattened pid, so YZ overflow is not needed
         if self.is_combo_kernel and self.per_subkernel_blocks:
@@ -7708,11 +8671,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         )
 
     def max_block(self, prefix: str) -> int:
+        # [FUNCTION DOC] Maximum block size for a range prefix: from the fixed config when present,
+        # else the global TRITON_MAX_BLOCK table.
         if self.fixed_config:
             return self.fixed_config[f"{prefix.upper()}BLOCK"]
         return TRITON_MAX_BLOCK[prefix.upper()]
 
     def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
+        # [FUNCTION DOC] HELPER: True if the tree's mask is provably always true so it can be
+        # dropped. Requires mask support, mask optimization enabled, and for native matmul a numel
+        # of at least 16. Passes when the fixed block is 1, the numel is 1 (non-combo, not
+        # persistent reduction), or the numel is a multiple of the maximal block (persistent
+        # reduction block, 1 for dropped x, max block, scaled by max RSPLIT for cooperative
+        # reductions; persistent blocks below the warp size are rejected); y trees additionally
+        # require staying under the max y grid.
         if not tree.supports_constant_mask():
             return False
 
@@ -7775,12 +8747,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return False
 
     def _has_constant_xmask(self) -> bool:
+        # [FUNCTION DOC] HELPER: Whether the first range tree (which must have prefix x, else
+        # AssertionError) has a provably always-true mask.
         xtree = self.range_trees[0]
         if xtree.prefix != "x":
             raise AssertionError(f"expected xtree prefix 'x', got {xtree.prefix!r}")
         return self._has_constant_mask(xtree)
 
     def filter_masks(self, mask_vars: OrderedSet[str]) -> None:
+        # [FUNCTION DOC] Remove from the mask_vars set (in place) the masks of trees whose mask is
+        # constant, and the literal "None" entry.
         for tree in self.range_trees:
             if self._has_constant_mask(tree):
                 mask_vars.discard(tree.mask_name())
@@ -7789,12 +8765,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @cache_on_self
     def get_reduction_prefixes(self) -> list[str]:
+        # [FUNCTION DOC] Cached list of the reduction prefixes (r0_, r1_, ...) in use, one per
+        # reduction dimension of the kernel.
         return [
             prefix_str[symt]
             for symt in list(TritonSymbols.reduction_types)[: self.num_reduction_dims]
         ]
 
     def codegen_reduction_numels(self, buffer: IndentedBuffer) -> None:
+        # [FUNCTION DOC] Write into buffer the definitions of rnumel (product of the per-tree
+        # reduction numels) and the constexpr RBLOCK (product of the reduction block sizes).
         """
         Generates code that flattens ND reduction numels, block sizes, etc. into 1D.
         """
@@ -7813,6 +8793,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         buffer.splice(f"RBLOCK: tl.constexpr = {self.kexpr(rblock)}")
 
     def _get_reduction_symbols(self, suffix: str, **kwargs) -> list[sympy.Symbol]:
+        # [FUNCTION DOC] HELPER: One sympy symbol per reduction prefix named prefix plus suffix,
+        # created with the given assumptions.
         """
         Helper to initialize symbols like rn_numel, rn_base, etc.
         """
@@ -7821,6 +8803,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @cache_on_self
     def _get_reduction_index_coeffs(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] HELPER (cached): Row-major flattening coefficients for the reduction dims:
+        # each is the product of the later reduction numels, with 1 for the last.
         """
         Compute coefficients to convert ND reduction indices to linear indices.
         For example:
@@ -7833,6 +8817,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ] + [sympy.Integer(1)]
 
     def _flatten_reduction_indices(self, multi_inds: list[sympy.Expr]) -> sympy.Expr:
+        # [FUNCTION DOC] HELPER: Combine per-dimension reduction indices into one linear index using
+        # the flattening coefficients (dot product).
         """
         Compute linear reduction indices from N dimensional ones.
         """
@@ -7840,6 +8826,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return sympy_dot(coeffs, multi_inds)
 
     def codegen_reduction_indices(self, buffer: IndentedBuffer) -> None:
+        # [FUNCTION DOC] Write into buffer the definitions of the linear reduction offset (roffset)
+        # and index (rindex) computed from the per-dimension offset and index symbols.
         """
         Generates code that converts ND reduction indices into linear indices.
         """
@@ -7860,6 +8848,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         entry: IterationRangesRoot,
         code: IndentedBuffer,
     ) -> None:
+        # [FUNCTION DOC] Write into code the per-range-root setup: for roots with a custom header
+        # the named constants, the index (block offset plus arange) and its mask (AssertionError for
+        # derived reduction roots under persistent cooperative reductions). Otherwise: loop roots
+        # compute index from offset and base; roots without grid dim use a plain arange with zero
+        # offset; grid roots compute offset from the program id times block size (RSPLIT_SIZE for
+        # mix-order reductions) and the index from the arange or scalar. Finally emits a constant
+        # mask or a bounds mask (skipped for x in mix-order reductions, where it is generated in
+        # the loop).
         if entry.has_custom_codegen_header():
             if (
                 self.cooperative_reduction
@@ -7911,6 +8907,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
 
 class FusedUserDefinedTritonKernel(TritonKernel):
+    # [CLASS DOC] TritonKernel used to fuse epilogue nodes into a user-defined Triton kernel. Holds
+    # the scheduler node, the user kernel IR node and the original stored-value expression text.
+    # load replaces loads of the mutated buffer by that expression, store records the epilogue's
+    # new value (new_store_cse_var), and codegen rewrites the user kernel AST so its single store
+    # writes the new value, with the epilogue load/compute lines injected before the store.
     """
     When fusing a user-defined triton kernel with epilogues, we use this class to generate the modified triton kernel source
     """
@@ -7921,6 +8922,10 @@ class FusedUserDefinedTritonKernel(TritonKernel):
         features: SIMDKernelFeatures,
         scheduler_node: FusedExternTritonKernelSchedulerNode,
     ) -> None:
+        # [FUNCTION DOC] Initialize the kernel (no fixed config, not combo) and validate the user
+        # kernel: it must be a UserDefinedTritonKernel that can fuse an epilogue with exactly one
+        # mutable store (AssertionError otherwise); records the unparsed stored expression with
+        # newlines removed.
         super().__init__(
             tiling,
             features=features,
@@ -7952,6 +8957,10 @@ class FusedUserDefinedTritonKernel(TritonKernel):
         self.original_stored_expr = self.original_stored_expr.replace("\n", "")
 
     def load(self, name: str, index: sympy.Expr) -> TritonCSEVariable:
+        # [FUNCTION DOC] Handle an epilogue load: only the user kernel's single mutated buffer may
+        # be loaded, and the load is replaced by the expression the user kernel stored (emitted as
+        # a CSE variable of the buffer dtype with the indexing-derived shape). Any other buffer, or
+        # an unexpected number of mutable args, raises AssertionError.
         # must be true because `self.ir_node.can_fuse_epilogue()`
         if len(self.ir_node.mutable_args) != 1:
             raise AssertionError(
@@ -7981,6 +8990,10 @@ class FusedUserDefinedTritonKernel(TritonKernel):
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Handle the epilogue store: only the epilogue's own destination buffer may
+        # be stored; the value is cast to the buffer dtype and kept as new_store_cse_var for
+        # codegen. index and mode are unused. Raises AssertionError for other buffers or
+        # non-ComputedBuffer/Layout nodes.
         if not isinstance(self.scheduler_node.fused_epilogue.node, ir.ComputedBuffer):
             raise AssertionError(
                 f"expected ComputedBuffer, got {type(self.scheduler_node.fused_epilogue.node)}"
@@ -8006,6 +9019,12 @@ class FusedUserDefinedTritonKernel(TritonKernel):
 
     # returns a str which is the src code of a modified version of the user kernel that includes the epilogues
     def codegen(self) -> str:
+        # [FUNCTION DOC] Generate the modified user kernel source with fused epilogue. Runs the
+        # epilogue codegen under this kernel (setting ranges), deep-copies the kernel AST, replaces
+        # the value argument of its single store call with the epilogue result variable, unparses,
+        # re-locates the store line, and inserts the epilogue load and compute lines (indented to
+        # the store column) before it. Returns the source text. Raises AssertionError if the kernel
+        # does not have exactly one store.
         with self:
             index_vars = self.split_and_set_ranges(
                 self.scheduler_node.fused_epilogue.get_ranges()
@@ -8032,6 +9051,9 @@ class FusedUserDefinedTritonKernel(TritonKernel):
             positional_index: int,
             new_arg,
         ):
+            # [FUNCTION DOC] HELPER: In the call node, replace the positional argument at the given
+            # index (if present) and any keyword argument with the given name by new_arg (mutates the
+            # AST).
             if len(call_node.args) > positional_index:
                 call_node.args[positional_index] = new_arg
 
@@ -8070,6 +9092,12 @@ class FusedUserDefinedTritonKernel(TritonKernel):
 
 
 class TritonScheduling(SIMDScheduling):
+    # [CLASS DOC] SIMD scheduling backend for Triton: selects TritonKernel as the kernel type and
+    # advertises backend features (foreach, bucketize, inplace buffers, masked scatter, scan, sort,
+    # Triton templates, tuple reductions, plus reduce-to-single-element when cooperative reductions
+    # are configured). Adds kernel naming/registration in the wrapper, comments and provenance,
+    # fused-node and combo-kernel benchmarking with a .kernel_perf disk memo, and multi-kernel
+    # choice creation.
     """Scheduling backend for Triton kernel code generation."""
 
     kernel_type: type[Any] = TritonKernel
@@ -8087,6 +9115,9 @@ class TritonScheduling(SIMDScheduling):
     )
 
     def __init__(self, scheduler: Scheduler | None) -> None:
+        # [FUNCTION DOC] Initialize the base scheduling; when a scheduler with nodes is given, set
+        # the debug device string function on every scheduler/fused-scheduler node so debug output
+        # shows Triton code (mutates those nodes).
         super().__init__(scheduler)
         if scheduler is None or not hasattr(scheduler, "nodes"):
             return
@@ -8096,6 +9127,9 @@ class TritonScheduling(SIMDScheduling):
 
     @classmethod
     def get_backend_features(cls, device: torch.device):
+        # [FUNCTION DOC] Return the supported backend feature set for the device (device unused):
+        # the class features, plus reduce-to-single-element when cooperative reductions are
+        # enabled or forced in config.
         if (
             config.triton.cooperative_reductions
             or config.triton.force_cooperative_reductions
@@ -8106,6 +9140,10 @@ class TritonScheduling(SIMDScheduling):
         return cls.backend_features
 
     def codegen_comment(self, node_schedule, kernel_name=None):
+        # [FUNCTION DOC] Write origin comments for the scheduled nodes into the wrapper code; with
+        # config.debug_fusion also a fused node name list (skipped when the schedule contains
+        # foreach nodes); with a kernel_name, records post-grad provenance tracing and writes the
+        # provenance debug handle.
         wrapper = V.graph.wrapper_code
         origins, _detailed_origins = get_kernel_metadata(node_schedule, wrapper)
         if origins:
@@ -8149,6 +9187,12 @@ class TritonScheduling(SIMDScheduling):
         kernel_path,
         get_kernel_metadata,
     ):
+        # [FUNCTION DOC] HELPER: Emit the kernel definition into the wrapper unless the kernel's
+        # emit_kernel_override handles it. Otherwise builds the compile wrapper text (an
+        # async_compile triton call around the source and the device type), warms the process pool
+        # compile when available (side effect), rewrites the kernel path relative to the cache dir
+        # under compile-on-one-rank, and defines the kernel with a metadata comment of the path and
+        # origins.
         """Emit kernel to wrapper, with support for external template handlers."""
         # External template handlers (e.g. Helion) can override kernel emission
         if kernel.emit_kernel_override(
@@ -8190,6 +9234,12 @@ class TritonScheduling(SIMDScheduling):
         wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), metadata_comment)
 
     def define_kernel(self, src_code, node_schedule, kernel):
+        # [FUNCTION DOC] Register kernel source in the wrapper and return its name. Reuses the name
+        # of identical previously defined source. Otherwise builds a name (category, descriptive
+        # fused name, unique suffix, optional model-name prefix), records it, substitutes the
+        # kernel name placeholders in the source (a generic name when unique names are off),
+        # normalizes pragma comments, computes the cache path, emits the kernel to the wrapper and
+        # logs metadata when the kernel_metadata metric table is enabled.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -8246,6 +9296,8 @@ class TritonScheduling(SIMDScheduling):
         return kernel_name
 
     def benchmark_fused_nodes(self, nodes, n_spills_threshold=8) -> tuple[float, str]:
+        # [FUNCTION DOC] Generate benchmarkable kernel source for the nodes, load it as a module
+        # and benchmark it; returns (time in ms, source file path).
         """
         Benchmark fused list of nodes and return the execution time
         in milliseconds on randomly generated inputs.
@@ -8263,6 +9315,13 @@ class TritonScheduling(SIMDScheduling):
         node_names: OrderedSet[str] | None = None,
         skip_perf_cache: bool = False,
     ) -> tuple[float, str]:
+        # [FUNCTION DOC] Benchmark a loaded kernel module and return (ms, module file). Unless
+        # skip_perf_cache, a stored time from the .kernel_perf file next to the module is returned
+        # first. Otherwise runs once to compile (a compile failure yields infinite time unless the
+        # testing flag re-raises it), requires exactly one launcher, treats register spills above
+        # n_spills_threshold as infinite time, else times the call on cloned args (subtracting the
+        # clone overhead if the kernel mutates args), logs, and stores the time to the memo file.
+        # Runs under preserved RNG state and the current device.
         """Benchmark an already compiled module.
 
         skip_perf_cache: don't serve the result from the .kernel_perf memo. Callers that
@@ -8277,15 +9336,20 @@ class TritonScheduling(SIMDScheduling):
             ms = None
 
             def cache_file_path():
+                # [FUNCTION DOC] HELPER: Path of the .kernel_perf memo file beside the module file;
+                # AssertionError if the module has no file.
                 if mod.__file__ is None:
                     raise AssertionError("mod.__file__ must not be None")
                 return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
 
             def store_cache():
+                # [FUNCTION DOC] HELPER: Atomically write the current ms value to the memo file.
                 path = cache_file_path()
                 write_atomic(path, str(ms))
 
             def load_cache():
+                # [FUNCTION DOC] HELPER: Read the memoized time from the memo file, or None if it
+                # does not exist.
                 path = cache_file_path()
                 if os.path.exists(path):
                     with open(path) as fd:
@@ -8363,6 +9427,10 @@ class TritonScheduling(SIMDScheduling):
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
     ) -> list[TritonKernel]:
+        # [FUNCTION DOC] Create the candidate kernels for the features. Split scans use
+        # TritonSplitScanKernel; scans disable cooperative reduction (kernel_kwargs is mutated);
+        # required feature overrides are applied; the choices handler may adjust the kwargs; the
+        # kernel is constructed and extra multi-kernel variants are added. Returns the list.
         is_scan = kernel_features.contains_op("scan")
         is_split_scan = is_scan and any(
             node.is_split_scan() for node in kernel_features.scheduler_nodes()
@@ -8391,6 +9459,12 @@ class TritonScheduling(SIMDScheduling):
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
     ) -> list[TritonKernel]:
+        # [FUNCTION DOC] Given a primary kernel, return it plus alternative variants when
+        # config.triton.multi_kernel is on: a non-persistent variant if persistence was not forced,
+        # a non-cooperative variant (only for reduction numel statically up to 65536) if
+        # cooperation was not forced, and the combined non-cooperative non-persistent variant when
+        # applicable. Variants share the primary's must_keep_buffers and the list is sorted so
+        # persistent kernels are generated last.
         kernels: list[TritonKernel] = [kernel]
         if not config.triton.multi_kernel:
             return kernels
@@ -8439,6 +9513,14 @@ class TritonScheduling(SIMDScheduling):
         return kernels
 
     def benchmark_combo_kernel(self, node_list, node_benchmark_results):
+        # [FUNCTION DOC] Benchmark the partitions of a combo kernel and return (total ms, total
+        # input-clone ms, list of module files). Single-node partitions reuse the given per-node
+        # results. Multi-node partitions are compiled from generated source, looked up in a
+        # .kernel_perf memo (two floats), else run once and timed (infinite time on register
+        # spills), with the clone overhead timed separately, and the memo is written. Graph
+        # removed_buffers and inplaced_to_remove are swapped for copies during the throwaway
+        # codegen and restored in a finally block. Raises AssertionError on missing source or a
+        # launcher count other than one.
         """
         Benchmark combo kernel partitions and return total execution time.
 
@@ -8453,11 +9535,15 @@ class TritonScheduling(SIMDScheduling):
         ms_clone: float
 
         def cache_file_path():
+            # [FUNCTION DOC] HELPER: Path of the .kernel_perf memo file beside the current module;
+            # AssertionError if the module has no file.
             if mod.__file__ is None:
                 raise AssertionError("mod.__file__ must not be None")
             return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
 
         def load_cache():
+            # [FUNCTION DOC] HELPER: Read the memoized (ms, clone ms) pair, or (None, None) when
+            # the memo file does not exist.
             path = cache_file_path()
             if os.path.exists(path):
                 with open(path) as fd:
@@ -8465,6 +9551,8 @@ class TritonScheduling(SIMDScheduling):
             return (None, None)
 
         def store_cache():
+            # [FUNCTION DOC] HELPER: Atomically write the current ms and ms_clone values to the
+            # memo file.
             path = cache_file_path()
             write_atomic(path, str(ms) + " " + str(ms_clone))
 
@@ -8567,6 +9655,11 @@ class TritonScheduling(SIMDScheduling):
 
 
 def debug_triton_code(node: BaseSchedulerNode) -> list[str]:
+    # [FUNCTION DOC] Produce debug text lines for a scheduler node: a note for unfinalized multi
+    # template buffers, otherwise the node's Triton code generated by its device's SIMD (or CUDA/
+    # XPU combined) scheduling backend, indented, under the current device, without changing the
+    # generated kernel count metric. Raises AssertionError for unexpected template node types,
+    # missing device, or unsupported backend types.
     lines = []
     multi_template = node.get_template_node()
     if not (
