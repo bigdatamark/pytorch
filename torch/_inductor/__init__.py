@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC]
+# Public entry point of TorchInductor. Exposes thin wrappers: compile (FX graph
+# to compiled callable), aoti_compile_and_package / aoti_load_package / aot_compile
+# (ahead-of-time compilation to .pt2 packages), standalone_compile and
+# compile_to_python / load_from_python (re-exported from standalone_compile),
+# list_mode_options / list_options, and cudagraph_mark_step_begin.
+# Heavy submodules (compile_fx, package, debug, cudagraph_trees) are imported
+# lazily inside functions. Import-time side effects: creates the module logger
+# and defines lite_mode_options. Also defines the private _CudagraphAnnotation dataclass.
 from __future__ import annotations
 
 import dataclasses
@@ -44,6 +53,11 @@ def compile(
     example_inputs: list[InputType],
     options: dict[str, Any] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Compiles an FX graph module with TorchInductor by delegating to compile_fx
+    # (imported lazily). Args: gm, example_inputs (list of tensors), options
+    # (optional mapping of inductor config overrides passed as config_patches).
+    # Returns a callable with the same behavior as gm. Errors come from compile_fx.
     """
     Compile a given FX graph with TorchInductor.  This allows compiling
     FX graphs captured without using TorchDynamo.
@@ -69,6 +83,15 @@ def aoti_compile_and_package(
     package_path: FileLike | None = None,
     inductor_configs: dict[str, Any] | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Compiles an ExportedProgram with AOTInductor and packages the result into a
+    # .pt2 artifact. Validates: input must be an ExportedProgram (ValueError
+    # otherwise); example_inputs must be set (RuntimeError); package_path must be
+    # None, a writable+seekable buffer, or a path ending in .pt2 (AssertionError);
+    # the aot_inductor.output_path config must not be set (RuntimeError). Warns if
+    # the deprecated args/kwargs are passed. Forces the aot_inductor.package config
+    # on (mutating the passed config mapping) and runs the inner compile through
+    # the minifier wrapper. Returns the package path.
     """
     Compiles the exported program with AOTInductor, and packages it into a .pt2
     artifact specified by the input package_path. To load the package, you can
@@ -177,6 +200,12 @@ def _aoti_compile_and_package_inner(
     package_path: str | io.BytesIO | None = None,
     inductor_configs: dict[str, Any] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Inner worker for aoti_compile_and_package, also used by the
+    # minifier. Requires gm to be an fx GraphModule (AssertionError otherwise) and kwargs
+    # to be empty when check_accuracy is set. Runs aot_compile, then packages the files
+    # into package_path (derived from the first .so, or .cpp, file name plus .pt2 when
+    # not given). If load_and_run or check_accuracy is set, loads the package and either
+    # runs it or compares it to gm, raising AccuracyError on mismatch. Returns the path.
     """
     See docstring for aoti_compile_and_package.
 
@@ -257,6 +286,10 @@ def _aoti_compile_and_package_inner(
 def aoti_load_package(
     path: FileLike, run_single_threaded: bool = False, device_index: int = -1
 ) -> AOTICompiledModel:
+    # [FUNCTION DOC]
+    # Loads the default model from a .pt2 package by delegating to
+    # torch._inductor.package.load_package, forwarding run_single_threaded and
+    # device_index (-1 means the default device). Returns the compiled model.
     """
     Loads the model from the PT2 package.
 
@@ -294,6 +327,13 @@ def aot_compile(
     *,
     options: dict[str, Any] | None = None,
 ) -> str | list[str | Weights] | torch.fx.GraphModule:
+    # [FUNCTION DOC]
+    # Ahead-of-time compiles an FX graph module with Inductor. Side effect: if gm
+    # has a _guards_fn attribute, its call node is erased from the graph, the
+    # attribute is deleted and gm is recompiled (mutating the caller's module).
+    # Flattens args/kwargs into flat example inputs and options, then calls
+    # compile_fx_aot under the compiling-state context. Returns a shared library
+    # path, or a list of generated files when aot_inductor.package is enabled.
     """
     Ahead-of-time compile a given FX graph with TorchInductor into a shared library.
 
@@ -354,6 +394,11 @@ lite_mode_options = {
 def list_mode_options(
     mode: str | None = None, dynamic: bool | None = None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns the config-override mapping for a torch.compile mode (default, lite,
+    # reduce-overhead, max-autotune-no-cudagraphs, max-autotune), or the mapping of
+    # all modes when mode is empty. Raises RuntimeError for an unknown mode.
+    # The dynamic argument is accepted but unused.
     r"""Returns a dictionary describing the optimizations that each of the available
     modes passed to `torch.compile()` performs.
 
@@ -396,6 +441,10 @@ def list_mode_options(
 
 
 def list_options() -> list[str]:
+    # [FUNCTION DOC]
+    # Returns the names of all inductor config options, taken from a copy of the
+    # current inductor config.
+    # KNOWN ISSUE: the docstring says it returns a dictionary, but it returns a list of names.
     r"""Returns a dictionary describing the optimizations and debug configurations
     that are available to `torch.compile()`.
 
@@ -414,6 +463,9 @@ def list_options() -> list[str]:
 
 
 def cudagraph_mark_step_begin():
+    # [FUNCTION DOC]
+    # Marks the start of a new training/inference iteration for CUDA graph trees
+    # by calling cudagraph_trees.mark_step_begin (global cudagraph tree state change).
     "Indicates that a new iteration of inference or training is about to begin."
     from .cudagraph_trees import mark_step_begin
 
@@ -430,6 +482,11 @@ def standalone_compile(
     donate_graph_module: bool = False,
     fake_mode: FakeTensorMode | None = None,
 ) -> CompiledArtifact:
+    # [FUNCTION DOC]
+    # Precompiles a graph module with Inductor into a CompiledArtifact that can be
+    # saved and reloaded. Normalizes missing options to an empty mapping and
+    # forwards everything (dynamic_shapes mode, aot flag, donate_graph_module,
+    # optional fake_mode) to standalone_compile.standalone_compile.
     """
     Precompilation API for inductor.
 
@@ -478,5 +535,7 @@ def standalone_compile(
 
 @dataclasses.dataclass
 class _CudagraphAnnotation:
+    # [CLASS DOC] HELPER: Dataclass holding optional per-region cudagraph flags:
+    # fwd and bwd (True/False/None meaning forward/backward cudagraph choice, or unset).
     fwd: bool | None
     bwd: bool | None

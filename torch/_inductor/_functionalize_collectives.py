@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# FX graph pass that rewrites inplace c10d collectives (currently only allreduce_)
+# found in make_fx graphs into the functional _c10d_functional op, followed by
+# wait_tensor and aten copy_, so Inductor can lower them. Also provides a pass that
+# unboxes ProcessGroup torchbind graph attributes into Python ProcessGroup objects.
+# Main entry points: _functionalize_inplace_collectives and
+# _unbox_process_group_torchbinds. No import-time side effects beyond imports and
+# defining a callable type alias.
 """Rewrite raw ``c10d.{op}_`` inplace ops produced by ``make_fx`` into
 ``_c10d_functional.{op}`` + ``wait_tensor`` + ``aten.copy_`` form so
 ``standalone_compile`` (and Inductor's collective machinery underneath) can
@@ -26,6 +34,10 @@ from torch.fx.graph_module import _assign_attr, _del_attr, _get_attr
 def _resolve_reduce_op_str(
     gm: torch.fx.GraphModule, arg: torch.fx.node.Argument
 ) -> str:
+    # [FUNCTION DOC] HELPER: Resolves a ReduceOp graph argument to its lower-case string name
+    # via the functional-collectives reduce-op table. The arg must be a get_attr node;
+    # otherwise raises NotImplementedError. Reads the attribute from gm and converts a
+    # torchbind ScriptObject into the ReduceOp enum type first. Returns the string.
     """Get the lower-case op string (``"sum"``/``"avg"``/...) for a c10d
     ReduceOp ``get_attr`` arg, converting from the torchbind ScriptObject
     form if needed.
@@ -58,6 +70,10 @@ def _emit_collective_chain(
     pg_arg: torch.fx.Node,
     custom: Any,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Inserts, just before node `before`, a functional collective call
+    # (input, extra_args, pg_arg), a wait_tensor on it, and a copy_ of the wait result
+    # into output_t. Copies output_t's "val" metadata and the given custom annotation
+    # onto all three new nodes when present. Mutates the graph; returns the wait node.
     """Insert ``_c10d_functional.<op>(input, *extra_args, pg_arg)`` ->
     ``wait_tensor`` -> ``aten.copy_(output, wait)`` immediately before
     ``before`` and return the ``wait_tensor`` node.
@@ -87,6 +103,11 @@ def _redirect_inplace_collective_uses(
     node: torch.fx.Node,
     wait_nodes: list[torch.fx.Node],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rewires users of an inplace collective node whose output is a
+    # (tensor list, work handle) tuple. Every user must be a getitem; index 0 users'
+    # own getitem users are replaced by the matching entry of wait_nodes and erased,
+    # index 1 (work handle) users are erased if unused. Raises AssertionError for
+    # non-getitem users or a work handle that still has users. Mutates the graph.
     """Re-route uses for an inplace c10d op with output schema
     ``(Tensor[], Work)`` — e.g. ``allreduce_``, ``broadcast_``,
     ``reduce_scatter_``, ``alltoall_``.
@@ -139,6 +160,11 @@ def _redirect_inplace_collective_uses(
 
 
 def _rewrite_allreduce_(gm: torch.fx.GraphModule, node: torch.fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites one inplace allreduce node: for each tensor in the list
+    # argument emits a functional all_reduce / wait / copy chain (using the reduce op
+    # string resolved from the third arg and the process-group node), then redirects
+    # the original node's users to the wait nodes. Raises AssertionError if the tensor
+    # list or process group args have unexpected types. Does not erase the node itself.
     """Reference rewrite — use this as a template for new collectives.
 
     Schema: ``c10d::allreduce_(Tensor[] tensors, ProcessGroup pg, ReduceOp op,
@@ -191,6 +217,8 @@ _InplaceCollectiveRewrite = Callable[[torch.fx.GraphModule, torch.fx.Node], None
 
 
 def _inplace_c10d_rewrites() -> dict[Any, _InplaceCollectiveRewrite] | None:
+    # [FUNCTION DOC] HELPER: Returns a mapping from inplace c10d op targets to their rewrite
+    # functions (only allreduce_ today), or None if torch.distributed is unavailable.
     """Map inplace ``c10d.{op}_`` op targets to per-op rewrite functions.
 
     Returns ``None`` if ``torch.distributed`` is not available.
@@ -209,6 +237,11 @@ def _inplace_c10d_rewrites() -> dict[Any, _InplaceCollectiveRewrite] | None:
 def _functionalize_inplace_collectives(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Pass over gm: for every call_function node whose target has a
+    # registered rewrite, applies it, erases the original (impure) node, and removes
+    # get_attr args that became unused along with their module attributes. Recompiles
+    # gm if anything changed. Mutates gm in place and returns it; returns gm unchanged
+    # when torch.distributed is unavailable.
     """Rewrite raw ``torch.ops.c10d.{op}_`` inplace calls in ``gm`` into
     ``_c10d_functional.{op}`` + ``wait_tensor`` + ``aten.copy_`` form so
     Inductor's collective machinery can recognize and lower them.
@@ -250,6 +283,10 @@ def _functionalize_inplace_collectives(
 def _unbox_process_group_torchbinds(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: For each get_attr node whose attribute is a torchbind ScriptObject
+    # of the c10d ProcessGroup class, replaces the stored attribute on gm with the
+    # unboxed Python ProcessGroup (graph structure unchanged). Returns gm; no-op when
+    # torch.distributed is unavailable.
     """Replace ProcessGroup torchbind attrs with their unboxed Python
     ``dist.ProcessGroup``.
 

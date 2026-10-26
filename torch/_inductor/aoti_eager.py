@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Support for AOTI eager mode: compiles a single op to a kernel library with
+# AOTInductor, caches it on disk per namespace and device together with a JSON file of
+# per-argument metadata (shapes, dtypes, scalar values, ...), and loads that cache back.
+# Contains a registry of per-device-type compile/load backends, the metadata extraction
+# helpers for each argument kind, a file-lock helper, and the compile-with-cache
+# and cache loading entry points. Import-time side effects: creates the module logger
+# and the empty backend registry.
 import json
 import logging
 import os
@@ -19,6 +27,8 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class AOTICompileBackend:
+    # [CLASS DOC] Pair of callables for a device type: compile_fn compiles an op and returns the
+    # kernel library path, load_fn loads cached metadata items for an op (namespace, op name, device type).
     compile_fn: Callable[..., str]
     load_fn: Callable[[str, str, str], list[dict[str, Any] | None]]
 
@@ -31,6 +41,8 @@ def register_aoti_compile_backend(
     compile_fn: Callable[..., str],
     load_fn: Callable[[str, str, str], list[dict[str, Any] | None]],
 ) -> None:
+    # [FUNCTION DOC] Registers (or replaces) the compile and load callables used for a device type
+    # in the module-level backend registry (global state mutation).
     _aoti_compile_backends[device_type] = AOTICompileBackend(
         compile_fn=compile_fn,
         load_fn=load_fn,
@@ -38,10 +50,15 @@ def register_aoti_compile_backend(
 
 
 def aoti_eager_cache_dir(namespace: str, device: str) -> Path:
+    # [FUNCTION DOC] Returns the cache directory path for a namespace and device: the inductor
+    # cache dir joined with aoti_eager, namespace and device. Does not create it.
     return Path(cache_dir()) / "aoti_eager" / namespace / device
 
 
 def aoti_eager_op_conf_lock(op_func_name_with_overload: str) -> Any:
+    # [FUNCTION DOC] Returns a file lock (not yet acquired; use as a context manager) guarding the
+    # op's JSON config, located in the inductor lock directory with the op name plus a
+    # lock suffix and the standard lock timeout. Imports lazily to avoid a circular import.
     # Avoid circular import
     from torch._inductor.codecache import get_lock_dir, LOCK_TIMEOUT
     from torch.utils._filelock import FileLock
@@ -54,6 +71,13 @@ def aoti_eager_op_conf_lock(op_func_name_with_overload: str) -> Any:
 def load_aoti_eager_cache(
     ns: str, op_func_name_with_overload: str, device_type: str
 ) -> list[dict[str, Any] | None]:
+    # [FUNCTION DOC]
+    # Loads cached kernel metadata for an op. A registered backend for the device type
+    # takes over completely. Otherwise reads the op's JSON config under the file lock,
+    # makes each kernel path absolute, converts stored dtype/layout/memory-format name
+    # strings into torch objects and sets device index -1 for cpu. Returns an empty list
+    # if the config or any kernel library is missing, or on any error (including the
+    # NotImplementedError for dynamic-shape entries), which is logged, not raised.
     backend = _aoti_compile_backends.get(device_type)
     if backend:
         return backend.load_fn(ns, op_func_name_with_overload, device_type)
@@ -108,15 +132,20 @@ def load_aoti_eager_cache(
 
 
 def supported_builtin_dtype_torch_dtype() -> dict[type, torch.dtype]:
+    # [FUNCTION DOC] Returns the mapping from supported Python scalar types to torch dtypes (int to int32, float to float32, bool to bool).
     return {int: torch.int32, float: torch.float, bool: torch.bool}
 
 
 def supported_scalar_types() -> tuple[type, ...]:
+    # [FUNCTION DOC] Returns the tuple of Python scalar types accepted as op arguments (int, float, bool).
     type_to_torch_dtype = supported_builtin_dtype_torch_dtype()
     return tuple(type_to_torch_dtype.keys())
 
 
 def extract_tensor_metadata(dynamic: bool, input: torch.Tensor) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds the cache metadata mapping for a tensor: dynamic flag, device type and
+    # index (-1 for cpu), dtype string, sizes, strides, requires_grad and raw dispatch key
+    # set. Raises AssertionError if input is not a tensor.
     metadata: dict[str, Any] = {}
     metadata["is_dynamic"] = dynamic
 
@@ -139,6 +168,8 @@ def extract_tensor_list_metadata(
     dynamic: bool,
     input: list[torch.Tensor],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata for a tensor list: a mapping with key tensor_list holding the
+    # per-tensor metadata. Raises AssertionError if any item is not a tensor.
     metadata_list = []
     for item in input:
         if not isinstance(item, torch.Tensor):
@@ -151,6 +182,9 @@ def extract_tensor_list_metadata(
 
 
 def extract_scalar_metadata(device_type: str, input: Any) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata for a Python int/float/bool: static, given device type (index
+    # -1 for cpu else 0), mapped dtype string and the scalar value. Raises AssertionError
+    # for unsupported types.
     if not isinstance(input, supported_scalar_types()):
         raise AssertionError(f"expected a supported scalar type, got {type(input)}")
     metadata: dict[str, Any] = {}
@@ -165,6 +199,7 @@ def extract_scalar_metadata(device_type: str, input: Any) -> dict[str, Any]:
 
 
 def extract_string_metadata(input: str) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata with the string value; AssertionError if input is not a str.
     if not isinstance(input, str):
         raise AssertionError(f"expected str, got {type(input)}")
     metadata: dict[str, Any] = {}
@@ -173,6 +208,7 @@ def extract_string_metadata(input: str) -> dict[str, Any]:
 
 
 def extract_dtype_metadata(input: torch.dtype) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata with the dtype stored as a string; AssertionError if not a dtype.
     if not isinstance(input, torch.dtype):
         raise AssertionError(f"expected torch.dtype, got {type(input)}")
     metadata: dict[str, Any] = {}
@@ -181,6 +217,7 @@ def extract_dtype_metadata(input: torch.dtype) -> dict[str, Any]:
 
 
 def extract_device_metadata(input: torch.device) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata with the device type string and device index; AssertionError if not a device.
     if not isinstance(input, torch.device):
         raise AssertionError(f"expected torch.device, got {type(input)}")
     metadata: dict[str, Any] = {}
@@ -190,6 +227,7 @@ def extract_device_metadata(input: torch.device) -> dict[str, Any]:
 
 
 def extract_layout_metadata(input: torch.layout) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata with the layout stored as a string; AssertionError if not a layout.
     if not isinstance(input, torch.layout):
         raise AssertionError(f"expected torch.layout, got {type(input)}")
     metadata: dict[str, Any] = {}
@@ -198,6 +236,8 @@ def extract_layout_metadata(input: torch.layout) -> dict[str, Any]:
 
 
 def extract_int_list_metadata(input: list[int]) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds metadata with the list of ints copied under int_list_value. Input must be
+    # a list or tuple of non-bool ints (an empty one is allowed), else AssertionError.
     if not (
         isinstance(input, (list, tuple))
         and all(isinstance(item, int) and not isinstance(item, bool) for item in input)
@@ -222,6 +262,18 @@ def aoti_compile_with_persistent_cache(
     remove_runtime_assertions: bool = False,
     disable_constraint_solver: bool = False,
 ) -> str:
+    # [FUNCTION DOC]
+    # Compiles an op function with AOTInductor and records it in the on-disk eager cache.
+    # A registered backend for the device type handles everything. Otherwise: dynamic shapes
+    # raise AssertionError; unsupported argument types (or lists of non-tensors) raise
+    # NotImplementedError. Creates the cache and lib directories, compiles with the inductor
+    # cache dir redirected to the lib directory via a temporary environment patch, builds
+    # per-argument metadata (None args skipped; each tagged with its arg order), and under the
+    # file lock appends a new entry (kernel path relative to the cache plus metadata) to the
+    # op JSON file unless identical metadata exists. Returns the kernel library path.
+    # Any failure while compiling or writing is logged and yields an empty string.
+    # KNOWN ISSUE: the None skip and the compile-failure empty-string result mean callers must
+    # check for an empty path; None args are rejected by the earlier type check anyway.
     """
     Compile the given function with persistent cache for AOTI eager mode.
     """

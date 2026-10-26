@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Analysis of Chrome/Perfetto JSON profiler traces: estimates per-kernel FLOPs and
+# memory traffic from op input shapes (using adapters registered per aten op and the
+# flop counter registry), joins them to kernel events through External ids, computes
+# achieved FLOPS and bandwidth percentages versus datasheet peak numbers
+# (analysis.device_info), and renders text tables for one profile or a diff of two.
+# Main contents: ProfileEvent, KernelStats, Device, JsonProfile, ParseException, the
+# adapter registry (adapters_map / register_adapter) and a command line main with
+# diff, analysis, augment_trace and combine modes. Import-time side effects: builds
+# the adapter registry via decorators and defines the dtype name table.
 import json
 import logging
 import math
@@ -22,6 +32,8 @@ ATEN_PREFIX = "aten::"
 
 @dataclass
 class ProfileEvent:
+    # [CLASS DOC] Plain record of one profiled event: category, key (name), self device
+    # time in milliseconds, and the run-averaged call count. Not used elsewhere in this module.
     category: str
     key: str
     self_device_time_ms: float
@@ -37,7 +49,11 @@ adapters_map: dict[str, AdapterType] = {}
 
 
 def parse_list(lst: str) -> list[int]:
-    lst = lst.replace("[", "").replace("]", "")
+    # [FUNCTION DOC]
+    # Parses a string such as a bracketed comma separated list of integers into a list
+    # of ints by stripping brackets and splitting on commas. Raises ValueError on
+    # non-integer items (including an empty list string).
+    lst =lst.replace("[", "").replace("]", "")
     substrings = lst.split(",")
 
     return [int(substring.strip()) for substring in substrings]
@@ -49,7 +65,13 @@ def register_adapter(
     [AdapterType],
     AdapterType,
 ]:
+    # [FUNCTION DOC]
+    # Decorator factory: registers the decorated adapter function in the module-level
+    # adapters_map under one aten op name or each name in a list. The decorator
+    # returns the function unchanged. Side effect: mutates adapters_map.
     def decorator(func: AdapterType) -> AdapterType:
+        # [FUNCTION DOC] HELPER: Performs the registration described above and returns func.
+        # KNOWN ISSUE: declares a global named _adapters_map that does not exist and is unused.
         # pyrefly: ignore [unknown-name]
         global _adapters_map
 
@@ -67,6 +89,9 @@ def register_adapter(
 def _slow_conv2d_adapter(
     shapes: tuple[Any, ...], concrete: tuple[Any, ...]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for slow conv2d forward: appends a False "transposed" flag to
+    # the shapes, copies the fifth concrete input (stride) into the fourth slot, and
+    # delegates to conv_adapter. Raises ParseException if fewer than 5 concrete inputs.
     tmp = list(shapes)
     tmp.append(False)
     tmp2 = list(concrete)
@@ -82,6 +107,12 @@ def _slow_conv2d_adapter(
 def conv_adapter(
     shapes: tuple[Any, ...], concrete: tuple[Any, ...]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for convolution ops. With 4 shapes the conv is treated as
+    # non-transposed; with more than 6 the transposed flag is read from index 6 and
+    # normalized to a bool; any other count raises ParseException. For non-transposed
+    # convs, computes the output spatial dims from input, kernel and the stride parsed
+    # from concrete input 3, and passes the full output shape as the out_val keyword.
+    # Returns (positional shapes, keyword args) for the flop counter function.
     tmp = list(shapes)
     if len(tmp) == 4:
         transposed = False
@@ -95,6 +126,7 @@ def conv_adapter(
     if not transposed:
         # calculate output shape if not transposed.
         def conv_out_dims(x: int, kernel: int, stride: int) -> int:
+            # [FUNCTION DOC] HELPER: Output length along one axis: (x - kernel) // stride + 1 (no padding or dilation).
             return (x - kernel) // stride + 1
 
         stride = parse_list(concrete[3])
@@ -110,6 +142,7 @@ def conv_adapter(
 def default_adapter(
     shapes: tuple[Any], concrete: tuple[Any]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Fallback adapter: passes the shapes through unchanged with no keyword args.
     return shapes, {}
 
 
@@ -117,6 +150,7 @@ def default_adapter(
 def addmm_adapter(
     shapes: tuple[Any], concrete: tuple[Any]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for addmm: keeps only the first three input shapes, no kwargs.
     tmp = list(shapes)[:3]
     return tuple(tmp), {}
 
@@ -125,6 +159,7 @@ def addmm_adapter(
 def bmm_adapter(
     shapes: tuple[Any], concrete: tuple[Any]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for bmm: keeps only the first two input shapes, no kwargs.
     tmp = list(shapes)
     return tuple(tmp[:2]), {}
 
@@ -133,6 +168,7 @@ def bmm_adapter(
 def baddbmm_adapter(
     shapes: tuple[Any], concrete: tuple[Any]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for baddbmm: keeps only the first three input shapes, no kwargs.
     tmp = list(shapes)[:3]
     return tuple(tmp), {}
 
@@ -141,10 +177,16 @@ def baddbmm_adapter(
 def mm_adapter(
     shapes: tuple[Any], concrete: tuple[Any]
 ) -> tuple[tuple[Any], dict[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Adapter for mm: passes the shapes through unchanged, no kwargs.
     return shapes, {}
 
 
 def _parse_kernel_name(name: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Maps a trace event name to an aten op name: strips the aten prefix
+    # when present, otherwise guesses from substrings (conv, addmm, bmm, baddbmm, _mm);
+    # returns None when nothing matches.
+    # KNOWN ISSUE: the baddbmm branch is unreachable because a name containing baddbmm
+    # also contains bmm, which is tested first.
     """
     parse the name of the kernel from the event name.
     """
@@ -165,6 +207,11 @@ def _parse_kernel_name(name: str) -> str | None:
 
 
 def _calculate_flops(event: dict[str, Any]) -> int:
+    # [FUNCTION DOC] HELPER: Estimates FLOPs for a trace event. Returns a nonzero kernel_flop arg
+    # if already present. Otherwise parses the op name, looks the aten op up in the flop
+    # registry, requires Input Dims and Concrete Inputs args, converts them with the
+    # registered adapter (or the default one) and calls the registry flop function.
+    # Returns 0 for unknown ops, missing args, or a ParseException (logged as warning).
     """
     This function has to parse the kernel name, which is error prone. There doesn't seem to be another solution that
     will support all the different backends that can generate kernels, so make sure to update this function when new
@@ -205,6 +252,8 @@ def _calculate_flops(event: dict[str, Any]) -> int:
 
 
 def _get_size_from_string(type_string: str) -> int:
+    # [FUNCTION DOC] HELPER: Returns the element size in bytes of the torch dtype with the given
+    # attribute name, or 1 when torch has no such attribute.
     if not hasattr(torch, type_string):
         return 1
     else:
@@ -212,6 +261,9 @@ def _get_size_from_string(type_string: str) -> int:
 
 
 def _default_estimate_gb(event: dict[str, Any]) -> float:
+    # [FUNCTION DOC] HELPER: Default memory estimate in GB: sums, over all inputs, the element
+    # count (product of the flattened dims) times element size from the type name,
+    # divided by 1e9. Requires Input Dims and Input type args (KeyError otherwise).
     sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input type"])
     bw = 0
     for size, typ in sizes_and_types:
@@ -221,6 +273,13 @@ def _default_estimate_gb(event: dict[str, Any]) -> float:
 
 
 def _estimate_gb(event: dict[str, Any]) -> float:
+    # [FUNCTION DOC] HELPER: Best-effort GB of memory traffic for an event. Uses a nonzero
+    # kernel_num_gb arg if present; returns 0 without Input type / Input Dims args;
+    # uses op-specific formulas for addmm, mm, baddbmm, bmm and convolution variants
+    # (matmul formulas count reads of both operands plus the output, conv assumes
+    # weights are read once) and falls back to the default input-size estimate.
+    # Raises AssertionError when matmul operand shapes are inconsistent.
+    # KNOWN ISSUE: the matmul formula multiplies the byte total by 2, so it is not a plain read count.
     """
     Our best effort to estimate the gb, should be refactored soon with MemoryCounter.
     """
@@ -243,6 +302,8 @@ def _estimate_gb(event: dict[str, Any]) -> float:
 
     # NOTE these will be refactored into a similar object to FlopCounter soon
     def mm_formula(M: int, N: int, K: int, size: int) -> int:
+        # [FUNCTION DOC] HELPER: Bytes for an M x K by K x N matmul: twice the sum of the three
+        # matrix element counts times the element size.
         return 2 * (M * K + N * K + M * N) * size
 
     if op_name == "addmm":
@@ -298,6 +359,7 @@ def _estimate_gb(event: dict[str, Any]) -> float:
         concrete = event["args"]["Concrete Inputs"]
 
         def conv_out_dim(x: int, kernel: int, stride: int) -> int:
+            # [FUNCTION DOC] HELPER: Output length along one axis: (x - kernel) // stride + 1 (no padding or dilation).
             return (x - kernel) // stride + 1
 
         stride = parse_list(
@@ -319,6 +381,8 @@ def _estimate_gb(event: dict[str, Any]) -> float:
 def _create_extern_mapping(
     data: dict[str, Any],
 ) -> defaultdict[int, list[dict[str, Any]]]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from External id to the list of cpu_op trace events
+    # carrying it. Raises ParseException if two cpu_op events share an External id.
     """
     compute a mapping from external ids to non kernels, which contain the information we need to estimate flops etc
     """
@@ -337,6 +401,11 @@ def _create_extern_mapping(
 
 
 def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Annotates a trace in place. For each kernel event with an External id,
+    # finds the matching cpu op, computes FLOPs (falling back to the kernel event) and
+    # estimated GB, and stores kernel_flop and kernel_num_gb in both events' args.
+    # Kernels without External id are skipped (logged); a kernel without args raises
+    # ParseException. KNOWN ISSUE: a kernel whose External id has no cpu_op yields an IndexError.
     extern_mapping = _create_extern_mapping(data)
 
     for event in data["traceEvents"]:
@@ -385,6 +454,9 @@ _dtype_map: dict[str, torch.dtype] = {
 
 @dataclass(frozen=True)
 class KernelStats:
+    # [CLASS DOC] Immutable (hashable) per-kernel-launch statistics: achieved flops and
+    # bandwidth rates (per second and GB/s), latency in microseconds, and achieved
+    # flops/bandwidth as percent of device peak. Stored in ordered sets per kernel name.
     flops: int
     bw: float
     latency: float  # us
@@ -397,12 +469,16 @@ KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
 
 @dataclass(frozen=False)
 class Device:
+    # [CLASS DOC] Mutable record of one device in a trace: name, index (trace device id),
+    # optional datasheet DeviceInfo (None if unknown), and stats mapping kernel name
+    # to the set of KernelStats observed.
     name: str
     index: int
     info: DeviceInfo | None
     stats: KernelNameMap
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a short string with the device name, index and datasheet info.
         return f"Device({self.name}, {self.index}): {self.info}"
 
 
@@ -411,6 +487,11 @@ Table = tuple[list[str], dict[str, list[str]]]
 
 
 class JsonProfile:
+    # [CLASS DOC] Wrapper around a loaded Chrome/Perfetto JSON trace. State: path, data
+    # (parsed JSON), events (the traceEvents list), benchmark_name, dtype (default dtype
+    # used when an event gives none) and _devices (device id -> Device). Methods augment
+    # the trace with flop/memory estimates, compute per-kernel stats, build text
+    # reports (single or side-by-side diff with another profile), dump and combine.
     _devices: DeviceMap
 
     def __init__(
@@ -419,6 +500,11 @@ class JsonProfile:
         benchmark_name: str | None = None,
         dtype: torch.dtype | str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Loads the JSON trace at path (I/O; errors from open/json propagate), keeps its
+        # events, and resolves dtype: None stays None, a torch dtype is kept, a string
+        # is looked up in the dtype name table (unknown names give None). Then builds
+        # the device table from the trace's deviceProperties.
         """
         Convenience class for running common operations on chrome/perfetto json traces.
         """
@@ -438,6 +524,14 @@ class JsonProfile:
         self._create_devices()
 
     def convert_dtype(self, event: dict[str, Any]) -> torch.dtype | None:
+        # [FUNCTION DOC]
+        # Picks a single dtype for an event. Without shape/type/concrete-input args, guesses
+        # bfloat16 or float16 from the event name, else None. Otherwise requires the three
+        # arg lists to have equal length (AssertionError) and be non-empty (RuntimeError),
+        # picks the non-concrete input with the largest size, and maps its type name
+        # through the dtype table (RuntimeError for unknown names).
+        # KNOWN ISSUE: "size" is the sum of the dims, not their product, and is parsed with
+        # parse_list, which expects a string while Input Dims entries are lists in JSON.
         """
         Each op has a list of dtypes for each input arg. We need to convert these into a single dtype for flop estimation.
         Issues:
@@ -491,6 +585,8 @@ class JsonProfile:
         raise RuntimeError(f"Unknown type: {ret_type}. Please add to _dtype_map.")
 
     def _create_devices(self) -> None:
+        # [FUNCTION DOC] HELPER: Fills the device map from deviceProperties, looking up datasheet
+        # info by name (logs when unsupported; the Device is still created with no info).
         self._devices = {}
         for dev in self.data["deviceProperties"]:
             name = dev["name"]
@@ -506,15 +602,26 @@ class JsonProfile:
             )
 
     def calculate_flops(self, event: dict[str, Any]) -> int:
+        # [FUNCTION DOC] Public wrapper returning the estimated FLOPs for a trace event.
         return _calculate_flops(event)
 
     def estimate_gb(self, event: dict[str, Any]) -> float:
+        # [FUNCTION DOC] Public wrapper returning the estimated GB of memory traffic for an event.
         return _estimate_gb(event)
 
     def augment_trace(self) -> None:
+        # [FUNCTION DOC] Annotates kernel and cpu op events of the loaded trace with kernel_flop
+        # and kernel_num_gb (mutates the data in place; may raise ParseException).
         self.data = _augment_trace_helper(self.data)
 
     def _compute_stats(self) -> None:
+        # [FUNCTION DOC] HELPER: For each kernel event on a known device, derives flops/s and GB/s
+        # from kernel_flop / kernel_num_gb and the duration (AssertionError if the duration is
+        # 0 while those args exist), and percent-of-peak values when datasheet info exists
+        # (RuntimeError if no dtype can be determined; KeyError if the dtype has no peak
+        # entry). Adds a KernelStats to the device's per-name set. Mutates device stats.
+        # KNOWN ISSUE: the check for a name key looks in the event args instead of the
+        # event itself, so events whose args lack a name are silently skipped.
         """populates the name -> stats map"""
         for event in self.events:
             if "cat" not in event or "args" not in event or event["cat"] != "kernel":
@@ -572,6 +679,10 @@ class JsonProfile:
             )
 
     def _create_single_table(self, dev: Device) -> Table:
+        # [FUNCTION DOC] HELPER: Builds (headers, rows) for one device: per kernel name, the launch
+        # count and the averages (over launches with nonzero values) of flops, bandwidth,
+        # latency, achieved flops percent and achieved bandwidth percent, formatted as
+        # strings with four decimals. Raises AssertionError on an empty stats set.
         """Create a table with the devices mapped to indices."""
         headers = [
             "Kernel Name",
@@ -585,6 +696,7 @@ class JsonProfile:
         rows: dict[str, list[str]] = {}
 
         def safe_div_format(x: float, y: float) -> str:
+            # [FUNCTION DOC] HELPER: Formats x divided by y with four decimals; returns "0.0" when y is zero.
             if y == 0:
                 return "0.0"
             return f"{x / y:.4f}"
@@ -623,11 +735,15 @@ class JsonProfile:
         return headers, rows
 
     def _create_tables(self, devs: DeviceMap) -> dict[int, Table]:
+        # [FUNCTION DOC] HELPER: Builds one stats table per device id.
         return {idx: self._create_single_table(dev) for idx, dev in devs.items()}
 
     def _combine_tables(
         self, table1: Table, table1_name: str, table2: Table, table2_name: str
     ) -> Table:
+        # [FUNCTION DOC] HELPER: Merges two tables side by side keyed by kernel name; headers get the
+        # given table name prefixes, and a kernel missing in one table is filled with
+        # "Empty" placeholders. Returns the combined (headers, rows).
         new_headers = (
             ["Kernel Name"]
             + [f"{table1_name} {head}" for head in table1[0][1:]]
@@ -653,9 +769,15 @@ class JsonProfile:
     def report(
         self, other: Optional["JsonProfile"] = None, name_limit: int = 40
     ) -> str:
+        # [FUNCTION DOC]
+        # Computes stats and returns a text report: one table per device, each titled by
+        # the device. With another profile, tables of both are combined side by side using
+        # their benchmark names (or "Table 1"/"Table 2"); both must have identical device
+        # ids (AssertionError otherwise). Kernel names are truncated to name_limit chars.
         def create_ret(
             table_headers: list[str], table_rows: dict[str, list[str]]
         ) -> str:
+            # [FUNCTION DOC] HELPER: Renders a headers/rows table as text with truncated kernel names.
             table_flattened = [
                 [kernel_name[:name_limit], *kernel_vals]
                 for kernel_name, kernel_vals in table_rows.items()
@@ -708,10 +830,16 @@ class JsonProfile:
         return "\n".join(ret)
 
     def dump(self, out: str) -> None:
+        # [FUNCTION DOC] Writes the (possibly augmented) trace data as JSON to the file at out (I/O).
         with open(out, "w") as f:
             json.dump(self.data, f)
 
     def combine_with(self, other: "JsonProfile") -> "JsonProfile":
+        # [FUNCTION DOC]
+        # Returns a new JsonProfile whose trace events are the concatenation of both
+        # profiles, device properties are merged without duplicate ids, and other top-level
+        # keys come from self. Round-trips through a temporary JSON file (deleted afterwards);
+        # the benchmark name joins both names and dtype is self's or else other's.
         """
         Combine this profile with another profile by merging their trace events.
         Returns a new JsonProfile object with combined data.
@@ -762,10 +890,18 @@ class JsonProfile:
 
 
 class ParseException(RuntimeError):
+    # [CLASS DOC] Error raised when trace event data cannot be parsed into op arguments
+    # (bad input counts, duplicate external ids, kernels without args).
     pass
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Command line entry point. Options: diff (two traces plus names and dtype; prints a
+    # side-by-side report), analysis (one trace; prints report), augment_trace (writes an
+    # annotated trace), combine (merges two or more traces into the last-named output file;
+    # prints an error message and returns if fewer than two inputs), name_limit. Prints to
+    # stdout and writes files; multiple modes can run in one invocation.
     """
     Main function for the profile analysis script.
     """

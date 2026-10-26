@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Static datasheet table of theoretical peak throughput (TFLOPS per dtype), DRAM
+# bandwidth (GB/s) and DRAM size (GB) for known NVIDIA, AMD and Intel GPUs, plus
+# lookup helpers (lookup_device_info, datasheet_tops, datasheet_dram_bw_gbs) used by
+# profile analysis. Import-time side effects: builds the module-level mapping
+# _device_mapping, adds alias entries, then rebuilds it with upper-cased keys.
+# KNOWN ISSUE: several entries repeat the float8_e8m0fnu dtype key in the same
+# literal (harmless, later duplicates overwrite earlier ones).
 import logging
 from dataclasses import dataclass
 
@@ -9,6 +17,11 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DeviceInfo:
+    # [CLASS DOC] Immutable record of datasheet numbers for one device: tops maps a
+    # dtype (or the string key for tf32) to peak TFLOPS, dram_bw_gbs is memory
+    # bandwidth in GB/s, dram_gb is memory capacity, and tops_sparsity_factor
+    # (default 1) is the divisor needed to convert listed tensor-core numbers
+    # (which may include 2:4 sparsity) to dense throughput.
     """
     Theoretical numbers from data sheet.  When a data sheet reports both
     Tensor/Matrix-Core and non-Tensor-Core numbers, the higher (Tensor Core)
@@ -259,6 +272,11 @@ _device_mapping = {k.upper(): v for k, v in _device_mapping.items()}
 
 
 def lookup_device_info(name: str) -> DeviceInfo | None:
+    # [FUNCTION DOC]
+    # Returns the DeviceInfo for a device name (upper-cased before the lookup in the
+    # static mapping), or None if the device is unknown. No side effects.
+    # KNOWN ISSUE: the docstring refers to DeviceInfo.get_device_info, which does not exist.
+    # KNOWN ISSUE: the NVIDIA L4 entry lists a DRAM bandwidth equal to the H100 value (looks copy-pasted).
     """
     Problem: when diffing profiles between amd and nvidia, we don't have access to the device information
     of the other one. Also, since the analysis is static, we should be able to do it on another device unrelated
@@ -273,6 +291,12 @@ def lookup_device_info(name: str) -> DeviceInfo | None:
 def datasheet_tops(
     dtype: torch.dtype, is_tf32: bool = False, device_name: str | None = None
 ) -> float | None:
+    # [FUNCTION DOC]
+    # Returns the dense peak TFLOPS for a dtype. Device is device_name if given, else
+    # the current CUDA, then XPU device; returns None (with an info log) if no device,
+    # the device is not in the table, or the dtype has no entry. For float32 with
+    # is_tf32 set, the tf32 entry is used. The value is divided by the device's
+    # sparsity factor. Does not raise.
     """
     Get the theoretical *dense* TFLOPS of the device for a given dtype.
 
@@ -318,6 +342,10 @@ def datasheet_tops(
 
 
 def datasheet_dram_bw_gbs(device_name: str | None = None) -> float | None:
+    # [FUNCTION DOC]
+    # Returns the datasheet DRAM bandwidth in GB/s for device_name, or for the current
+    # CUDA/XPU device when not given. Returns None (with an info log) when no device is
+    # available or the device is not in the table. Does not raise.
     """
     Get the theoretical DRAM bandwidth (GB/s) of a device from the datasheet,
     or None if the device is not present.
