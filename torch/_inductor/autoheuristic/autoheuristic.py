@@ -1,3 +1,6 @@
+# [MODULE DOC] AutoHeuristic data-collection and decision front end for inductor. Defines AutoHeuristic (collect feedback per choice into a
+# per-GPU log file, or consult learned heuristics to pick a choice), AutoHeuristicSelectAlgorithm (variant for kernel choice selection hooked
+# into select_algorithm timings), LocalFeedback and the InconsistentMetadata error. No import-time side effects.
 import json
 import os
 from collections.abc import Callable
@@ -24,6 +27,7 @@ from torch._inductor.utils import get_gpu_shared_memory
 
 
 class LocalFeedback:
+    # [CLASS DOC] Wraps a callable that maps a choice to measured feedback so AutoHeuristic can run it immediately for each choice. Holds only feedback_fn.
     """
     To be able to collect data for a choice, a function providing feedback given a choice has to be provided.
     LocalFeedback can be used when AutoHeuristic should immediately run the function to collect feedback for each choice
@@ -31,13 +35,16 @@ class LocalFeedback:
     """
 
     def __init__(self, feedback_fn: Callable[[Choice], Feedback]) -> None:
+        # [FUNCTION DOC] Stores the feedback callable.
         self.feedback_fn = feedback_fn
 
     def __call__(self, choice: Choice) -> Feedback:
+        # [FUNCTION DOC] Invokes the stored feedback callable for the choice and returns its feedback value.
         return self.feedback_fn(choice)
 
 
 class InconsistentMetadata(Exception):
+    # [CLASS DOC] Raised when the metadata line in an existing log file differs from the metadata AutoHeuristic would write for the current run.
     """
     Exception that is thrown when AutoHeuristic tries to log data to a file where the metadata stored in the file does
     not match the metadata it would store if the file didn't exist.
@@ -45,6 +52,9 @@ class InconsistentMetadata(Exception):
 
 
 class AutoHeuristic:
+    # [CLASS DOC] Collects (context, choice, feedback) rows to a text log and/or queries learned heuristics. State: fallback callable, choices, optional LocalFeedback,
+    # context, name, collected_feedback mapping, optional context augmentations, metadata (GPU shared memory, capability, choices, name), optional
+    # precondition and log_path (only set when the precondition holds). Key methods: get_choice, get_top_k_choices, save_data.
     """
     AutoHeuristic is a framework that allows one to collect data, learn a heuristic (i.e. a regression tree) and
     generate the heuristic to code. This class allows one to collect data. The collected data can then be used to train
@@ -63,6 +73,9 @@ class AutoHeuristic:
         augment_context: list[AHOperation] | None = None,
         precondition: Callable[[AHMetadata, AHContext], bool] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the arguments, builds metadata from GPU shared memory and device capability (0,0 without CUDA) and, if the precondition holds,
+        # determines the log path (default or configured). If data collection is enabled for this name and a LocalFeedback exists, runs it for every choice
+        # and saves each result (file I/O).
         """
         Initializes an instance of the AutoHeuristic class.
 
@@ -106,11 +119,14 @@ class AutoHeuristic:
                     self.save_data(choice, feedback_val)
 
     def satisfies_precondition(self) -> bool:
+        # [FUNCTION DOC] Returns True when no precondition was given or when the precondition accepts the metadata and context.
         return self.precondition is None or self.precondition(
             self.metadata, self.context
         )
 
     def get_choice(self) -> Choice:
+        # [FUNCTION DOC] Returns the fallback choice unless the precondition holds, learned heuristics are enabled for this name in config, and the controller returns a
+        # decision that is among the allowed choices (applying context augmentations first). Otherwise returns fallback(). Mutates the context when augmenting.
         """
         Returns the chosen option based on the value of autoheuristic_use.
         If self.name is one of the comma separated strings in autoheuristic_use,
@@ -138,6 +154,8 @@ class AutoHeuristic:
     def get_top_k_choices(
         self, top_k: int, always_included: list[str] | None = None
     ) -> list[Choice] | None:
+        # [FUNCTION DOC] Returns up to top_k ranked choices from the learned heuristic (after optional context augmentation), appending any always_included
+        # choices not already present. Returns None when the precondition fails, learned heuristics are disabled for this name, or no ranking exists.
         if not self.satisfies_precondition():
             return None
         if torch._inductor.config.use_autoheuristic(self.name):
@@ -158,10 +176,12 @@ class AutoHeuristic:
         return None
 
     def get_collected_feedback(self, choice: Choice) -> Any:
+        # [FUNCTION DOC] Returns the feedback recorded for the choice during data collection or None if none.
         return self.collected_feedback.get(choice, None)
 
     @staticmethod
     def get_device_identifier() -> str:
+        # [FUNCTION DOC] Returns the CUDA device name with spaces replaced by underscores, or a fixed string when CUDA is unavailable. Used to separate logs per GPU model.
         # a heuristic might work well for one GPU, but not for another
         # we store the collected data per GPU model and learn a heuristic per GPU model
 
@@ -172,6 +192,7 @@ class AutoHeuristic:
         return "non_cuda_device"
 
     def get_default_log_path(self) -> str:
+        # [FUNCTION DOC] Returns the default log file path under the inductor cache directory, per device and heuristic name; creates the directory (side effect).
         device_name = self.get_device_identifier()
         path = f"{cache_dir()}/autoheuristic/{device_name}/"
         os.makedirs(path, exist_ok=True)
@@ -179,6 +200,7 @@ class AutoHeuristic:
         return path
 
     def serialize_metadata(self) -> str:
+        # [FUNCTION DOC] Returns a JSON string of the metadata dict extended with the context's numerical and categorical feature name lists.
         metadata_dict = self.metadata.to_dict()
         (
             num_features,
@@ -189,6 +211,8 @@ class AutoHeuristic:
         return json.dumps(metadata_dict)
 
     def save_data(self, choice: Choice, feedback_val: Feedback) -> None:
+        # [FUNCTION DOC] Records feedback in collected_feedback and appends a CSV row (context feature values, choice, feedback) to the log file. If the file is new, also
+        # writes the metadata JSON line and a header line first. If it exists, checks its first line equals the current metadata and raises InconsistentMetadata otherwise. I/O side effect.
         self.collected_feedback[choice] = feedback_val
         log_path = self.log_path
 
@@ -218,6 +242,8 @@ class AutoHeuristic:
 
 
 class AutoHeuristicSelectAlgorithm(AutoHeuristic):
+    # [CLASS DOC] AutoHeuristic specialization for choosing among ChoiceCaller objects: maps each choice's autoheuristic id to the caller (choicestr2choice),
+    # keeps the input nodes, and uses a fallback that yields the string unsure when the fallback has no choice. Registers a global feedback saver when collecting.
     """
     AutoHeuristicSelectAlgorithm is a subclass of AutoHeuristic that allows one to collect data and learn a heuristic
     when one wants to use AutoHeuristic for kernel choice selection.
@@ -233,6 +259,8 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
         augment_context: list[AHOperation] | None = None,
         precondition: Callable[[AHMetadata, AHContext], bool] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the id-to-caller mapping, wraps the fallback to return an id string, and initializes the base class with string choices and no local
+        # feedback. If collecting is enabled for this name and the precondition holds, registers global feedback. Args must match those of the select_algorithm call.
         """
         The arguments choices, input_nodes and name have to match the ones used in the call to
         autotune_select_algorithm(), e.g. if the following call is made
@@ -246,6 +274,7 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
         choices_str = list(self.choicestr2choice.keys())
 
         def fallback_str() -> str:
+            # [FUNCTION DOC] HELPER: Calls the fallback; returns the resulting caller's autoheuristic id, or unsure if the fallback returned None.
             fallback_choice = fallback()
             if fallback_choice is None:
                 # TODO: Find a nicer way to handle this
@@ -271,6 +300,8 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
     def register_global_feedback(
         self, input_nodes: list[Any], choices: list[ChoiceCaller]
     ) -> None:
+        # [FUNCTION DOC] Registers a feedback saver with select_algorithm so that each time algorithms are timed with matching inputs and choices, the
+        # timings are logged. Builds keys from the input nodes and choices and adds the saver as a partial; mutates select_algorithm's saver registry.
         """
         Registers a callback in select_algorithm, which is called with the timing of each choice.
         """
@@ -291,6 +322,8 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
             profiled_time: Callable[[], dict[ChoiceCaller, float]],
             precompile_times: dict[ChoiceCaller, float],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Callback invoked by select_algorithm with timings of all choices. Ignores the event unless the inputs key and precompile key match
+            # those captured at registration; otherwise saves each choice's timing via save_data keyed by autoheuristic id. Other args are unused.
             current_inputs_key = create_inputs_key(input_nodes)
             if current_inputs_key != ah_inputs_key:
                 return
@@ -308,12 +341,14 @@ class AutoHeuristicSelectAlgorithm(AutoHeuristic):
         add_feedback_saver(feedback_saver)
 
     def get_choice_caller(self) -> ChoiceCaller | None:
+        # [FUNCTION DOC] Returns the ChoiceCaller for the chosen id, or None if the chosen id has no caller (for example unsure).
         choice = self.get_choice()
         return self.choicestr2choice.get(choice, None)
 
     def get_top_k_choices_caller(
         self, top_k: int, always_included: list[str] | None = None
     ) -> list[ChoiceCaller] | None:
+        # [FUNCTION DOC] Returns the ChoiceCallers for the top-k ranked choice ids (plus always_included ids), or None if no ranking is available.
         choices = self.get_top_k_choices(top_k, always_included)
         if choices is None:
             return None

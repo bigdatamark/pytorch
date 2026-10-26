@@ -1,3 +1,6 @@
+# [MODULE DOC] Discovers learned heuristics generated under the artifacts package and exposes LearnedHeuristicController, which picks the
+# first applicable heuristic for a given optimization name and returns its decision(s). Heuristic modules are imported lazily on first use,
+# not at import time of this module.
 import importlib
 import inspect
 import pkgutil
@@ -15,6 +18,8 @@ from torch._inductor.autoheuristic.learnedheuristic_interface import LearnedHeur
 def find_and_instantiate_subclasses(
     package_name: str, base_class: Any
 ) -> list[LearnedHeuristic]:
+    # [FUNCTION DOC] HELPER: Imports every module in the given package whose last name component starts with an underscore, instantiates each class that is a
+    # strict subclass of base_class with no arguments, and returns the instances. Errors while importing or instantiating a module are printed and skipped (not raised).
     instances = []
 
     package = importlib.import_module(package_name)
@@ -44,6 +49,8 @@ def find_and_instantiate_subclasses(
 
 
 class LearnedHeuristicController:
+    # [CLASS DOC] Finds, caches (class-level mapping from optimization name to heuristic list, plus an initialized flag) and queries learned heuristics.
+    # An instance holds the AHMetadata and AHContext of the current query.
     """
     Class that finds and instantiates all learned heuristics. It also provides
     a way to get the decision of a learned heuristic.
@@ -66,10 +73,13 @@ class LearnedHeuristicController:
         metadata: AHMetadata,
         context: AHContext,
     ) -> None:
+        # [FUNCTION DOC] Stores the metadata and context for later queries.
         self.metadata = metadata
         self.context = context
 
     def get_heuristics(self, name: str) -> list[LearnedHeuristic]:
+        # [FUNCTION DOC] Returns heuristics registered for the optimization name. On first call (class-wide) imports and instantiates all heuristics in the artifacts
+        # package, groups them by their reported name and marks initialization done. Mutates class-level state.
         """
         Returns a list of learned heuristics for the given optimization name.
         """
@@ -94,6 +104,8 @@ class LearnedHeuristicController:
         return LearnedHeuristicController.existing_heuristics[name]
 
     def get_decision(self) -> Choice | None:
+        # [FUNCTION DOC] Takes the first heuristic for the metadata name whose precondition accepts the metadata and context and returns its decision among the metadata
+        # choices; returns None if none applies or the heuristic is unsure.
         """
         Returns the decision made by the learned heuristic or None if no heuristic was found or the heuristic is unsure
         which choice to make.
@@ -106,6 +118,8 @@ class LearnedHeuristicController:
         return None
 
     def get_decisions_ranked(self, top_k: int) -> list[Choice] | None:
+        # [FUNCTION DOC] Takes the first applicable heuristic and returns its ranked choices filtered to those present in the metadata choices, truncated to top_k.
+        # Returns None if no heuristic applies or the heuristic provides no ranking.
         heuristics = self.get_heuristics(self.metadata.name)
         for heuristic in heuristics:
             if heuristic.check_precondition(self.metadata, self.context):

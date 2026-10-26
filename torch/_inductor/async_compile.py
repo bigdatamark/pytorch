@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor async compilation front end. Provides AsyncCompile, which compiles generated kernels (Triton, C++, CUDA/ROCm/XPU,
+# Halide, CuteDSL, Pallas, NV universal GEMM, Metal) on thread pools or a subprocess pool and returns futures that wait() later
+# swaps into the generated module's scope. Also holds the process-pool lifecycle helpers, compile-time metrics, and an in-memory
+# cache of compiled Triton kernels. Import-time side effects: creates module globals for pools and metrics, registers an after-fork
+# hook (where supported) and an atexit hook that shuts down compile workers.
 from __future__ import annotations
 
 import atexit
@@ -87,6 +92,8 @@ size_hints_regex = re.compile(
 
 
 def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
+    # [FUNCTION DOC] HELPER: Returns a mapping of cache-directory related environment variable names (inductor cache dir, triton cache dir, cutlass dir)
+    # to their current values (None if unset), so workers can reproduce the parent's settings.
     env_vars = [
         "TORCHINDUCTOR_CACHE_DIR",
         "TRITON_CACHE_DIR",
@@ -96,6 +103,8 @@ def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
 
 
 def pre_fork_setup():
+    # [FUNCTION DOC] Prepares state before forking/spawning compile workers: caches device properties for all available devices and
+    # precomputes the Triton key (slow) when Triton is available, so children inherit the cached results. No return value.
     """
     Setup that must be done prior to forking with a process pool.
     """
@@ -112,12 +121,16 @@ def pre_fork_setup():
 
 
 def caching_device_properties():
+    # [FUNCTION DOC] For each registered device interface that is available, queries and thereby caches the device properties via its Worker.
+    # Called before forking so workers need not recompute them. No return value.
     for _, device_interface in get_registered_device_interfaces():
         if device_interface.is_available():
             device_interface.Worker.get_device_properties()
 
 
 def _compile_start() -> None:
+    # [FUNCTION DOC] HELPER: Marks the start of a compile phase: records the start timestamp if not already set and initializes the per-kernel Triton metrics
+    # mapping if absent. Mutates module globals.
     global _t0, _triton_kernel_metrics
     if _t0 is None:
         _t0 = time()
@@ -126,6 +139,8 @@ def _compile_start() -> None:
 
 
 def _compile_end() -> None:
+    # [FUNCTION DOC] HELPER: Ends a compile phase: adds elapsed time since the start timestamp to the cumulative compile time and clears the timestamp.
+    # If Triton kernel metrics were collected, emits them (sorted by kernel name) as a JSON structured-trace artifact and resets them. Mutates module globals.
     global _cumulative_compile_time, _t0, _triton_kernel_metrics
     if _t0 is not None:
         t1 = time()
@@ -147,6 +162,7 @@ def _compile_end() -> None:
 
 
 def _add_triton_kernel_info(kernel_name: str, info: dict[str, Any]):
+    # [FUNCTION DOC] HELPER: Records info for a kernel in the metrics mapping; silently ignored if called outside a compile phase (mapping is None).
     global _triton_kernel_metrics
     # Must be called between _compile_start and _compile_end
     if _triton_kernel_metrics is not None:
@@ -158,6 +174,8 @@ def _emit_triton_kernel_compile_metric(
     kernel_name: str,
     elapsed_us: int,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Records the compile time in microseconds for a kernel: stores it in the kernel's autotune cache info (a throwaway dict if none) and sends it to the
+    # triton kernel metrics map and to the metrics context top-N list. Args: kernel, kernel_name, elapsed_us.
     """Emit per-kernel ``compile_time_us`` to both the dynamo
     ``_triton_kernel_metrics`` map and the ``MetricsContext`` top-N.
 
@@ -183,6 +201,8 @@ _pool_set = OrderedSet[AnyPool]()
 
 
 def shutdown_compile_workers() -> None:
+    # [FUNCTION DOC] Shuts down every pool recorded in the module pool set, then resets AsyncCompile's ready future and clears pool state via after_fork.
+    # Registered with atexit so workers can clean up (avoids leaked semaphore warnings).
     """Shut down all outstanding compile-worker pools."""
     for pool in _pool_set:
         pool.shutdown()
@@ -191,6 +211,8 @@ def shutdown_compile_workers() -> None:
 
 
 def after_fork():
+    # [FUNCTION DOC] Resets pool bookkeeping without shutting pools down: clears the pool set, drops the ready future and clears the cached process pool.
+    # Registered as an after-fork-in-child hook so children do not reuse the parent's pools.
     """Reset pools to initial state without shutting them down"""
     _pool_set.clear()
     AsyncCompile._ready_future = None
@@ -204,6 +226,8 @@ except AttributeError:
 
 
 def get_compile_threads() -> int:
+    # [FUNCTION DOC] Returns the number of compile threads, lazily computing config.compile_threads on first use and storing it back into config.
+    # Side effect: mutates the config value when it was None.
     """
     Temporary for internal rollout. Assign config.compile_threads lazily and return it.
     TODO: remove after rollout.
@@ -214,6 +238,8 @@ def get_compile_threads() -> int:
 
 
 def _process_pool_allowed() -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if a process pool may be created: either the worker start method is subprocess (the sidecar is not affected by the
+    # daemon restriction) or the current multiprocessing process is not a daemon.
     # Multiprocessing daemons are not allowed to create child processes. This
     # only applies to direct multiprocessing modes: SubprocPool starts its
     # sidecar with subprocess.Popen, so the sidecar does not inherit the
@@ -226,6 +252,8 @@ def _process_pool_allowed() -> bool:
 
 @clear_on_fresh_cache
 class CompiledTritonKernels:
+    # [CLASS DOC] In-memory registry (class-level mapping from key to future) of compiled Triton kernels. Keys are hashes of the full kernel source combined
+    # with the torch key. Never instantiated; all methods are static. Cleared when a fresh cache is requested (via clear_on_fresh_cache).
     """
     In memory cache for storing compiled triton kernels.
 
@@ -239,6 +267,7 @@ class CompiledTritonKernels:
 
     @staticmethod
     def key(kernel_src: str):
+        # [FUNCTION DOC] Returns the cache key for a kernel: the code hash of the source string mixed with the torch key. Pure function.
         """
         Generates a cache key given a triton kernel's full source code.
         This source includes the inductor meta, compilation metadata, the kernel itself, etc.
@@ -249,6 +278,7 @@ class CompiledTritonKernels:
 
     @staticmethod
     def save(kernel_src: str, future: CodeCacheFuture):
+        # [FUNCTION DOC] Stores the future in the class-level cache under the key computed from the source, replacing any previous entry.
         """
         Saves a compiled triton kernel to the cache.
         TODO: We store a LambdaFuture as that's the callable returned by async_compile.triton,
@@ -262,15 +292,18 @@ class CompiledTritonKernels:
 
     @staticmethod
     def get(kernel_src: str) -> CodeCacheFuture | None:
+        # [FUNCTION DOC] Returns the cached future for the given source or None if absent. No side effects.
         key = CompiledTritonKernels.key(kernel_src)
         return CompiledTritonKernels._cache.get(key, None)
 
     @staticmethod
     def cache_clear():
+        # [FUNCTION DOC] Replaces the class-level cache with a new empty mapping.
         CompiledTritonKernels._cache = {}
 
     @staticmethod
     def remove_future(kernel_src: str) -> None:
+        # [FUNCTION DOC] Deletes the cache entry for the given source if present; no error if absent.
         key = CompiledTritonKernels.key(kernel_src)
 
         # Delete the LambdaFuture if there is one
@@ -279,6 +312,9 @@ class CompiledTritonKernels:
 
 
 class AsyncCompile:
+    # [CLASS DOC] Entry point used by generated code to compile kernels asynchronously. Holds class-level state: the pool-readiness future and the list of
+    # registered Metal kernel sources (kernel name, source, headers). Instances are stateless apart from that. Methods per backend return
+    # either a ready kernel (serial mode, compile threads <= 1) or a future; wait() resolves futures in a scope mapping and compiles Metal.
     """
     Utilities to compile in thread pools or subprocess pools (in the case of Triton).
     """
@@ -287,11 +323,13 @@ class AsyncCompile:
     _metal_sources: list[tuple[str, str, list[str]]] | None = None
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] No-op constructor.
         pass
 
     @staticmethod
     @functools.lru_cache(1)
     def pool() -> ThreadPoolExecutor:
+        # [FUNCTION DOC] Returns the cached (single instance) thread pool sized by the compile thread count. Raises AssertionError if the thread count is 1 or less.
         if get_compile_threads() <= 1:
             raise AssertionError(
                 f"expected get_compile_threads() > 1, got {get_compile_threads()}"
@@ -300,12 +338,17 @@ class AsyncCompile:
 
     @staticmethod
     def _get_ready():
+        # [FUNCTION DOC] HELPER: Trivial task submitted to the process pool; returns the string ready. Its completion indicates workers are up.
         """No-op function to help mark when the subprocess pool is ready."""
         return "ready"
 
     @staticmethod
     @functools.lru_cache(1)
     def process_pool() -> AnyPool:
+        # [FUNCTION DOC] Creates (once, cached) and returns the compile process pool: a SubprocPool for the subprocess start method, otherwise a tracked
+        # ProcessPoolExecutor using the configured multiprocessing context (after pre_fork_setup; sets an env var to disable warm pools in spawned children).
+        # Raises AssertionError if compile threads <= 1 and RuntimeError in daemonic multiprocessing processes. Side effects: resets the ready future,
+        # logs, registers a finalizer to shut the pool down at exit, and adds the pool to the module pool set.
         if get_compile_threads() <= 1:
             raise AssertionError(
                 f"expected get_compile_threads() > 1, got {get_compile_threads()}"
@@ -354,6 +397,8 @@ class AsyncCompile:
 
     @classmethod
     def warm_pool(cls) -> None:
+        # [FUNCTION DOC] Eagerly creates the process pool (inside a compile start/end bracket) unless compile threads <= 1 or process pools are not allowed.
+        # For a SubprocPool only the sidecar starts; its executor starts on wakeup or first job.
         if get_compile_threads() <= 1 or not _process_pool_allowed():
             return
         _compile_start()
@@ -365,18 +410,23 @@ class AsyncCompile:
 
     @classmethod
     def wait_pool_ready(cls, timeout=120) -> None:
+        # [FUNCTION DOC] Calls use_process_pool (which submits the readiness probe if needed) then blocks up to timeout seconds on the ready future.
+        # Propagates any timeout or pool error from waiting on the future.
         cls.use_process_pool()
         if cls._ready_future is not None:
             cls._ready_future.result(timeout=timeout)
 
     @classmethod
     def submit(cls, task: Callable[..., Any]) -> Any:
+        # [FUNCTION DOC] Runs the task immediately and returns its result when compile threads <= 1; otherwise submits it to the thread pool and returns the future.
         if get_compile_threads() <= 1:
             return task()
         return cls.pool().submit(task)
 
     @classmethod
     def use_process_pool(cls):
+        # [FUNCTION DOC] Non-blocking check whether the process pool can be used. Returns False when threads <= 1, pools are disallowed or proton profiling
+        # is enabled. Otherwise lazily submits a readiness probe (creating the pool) and returns whether that probe has finished.
         if get_compile_threads() <= 1 or not _process_pool_allowed():
             return False
 
@@ -395,6 +445,8 @@ class AsyncCompile:
 
     @classmethod
     def wait_process_pool_ready(cls, timeout: float = 120) -> bool:
+        # [FUNCTION DOC] Blocking variant of use_process_pool: waits up to timeout seconds for the readiness probe. Returns True if the pool is usable,
+        # False if unavailable/disabled, on timeout, or if the pool is broken/closed (these cases log a warning and degrade to serial rather than raise).
         """Block (up to ``timeout`` s) until the process pool is ready, returning
         whether it's usable.
 
@@ -429,6 +481,7 @@ class AsyncCompile:
 
     @classmethod
     def wakeup(cls) -> None:
+        # [FUNCTION DOC] If the process pool is usable and is a SubprocPool, tells the sidecar to start its executor. Otherwise does nothing.
         """
         If using a SubprocPool, signal the sidecar process to start up its
         ProcessPoolExecutor.
@@ -440,6 +493,14 @@ class AsyncCompile:
             pool.wakeup()
 
     def triton(self, kernel_name: str, source_code: str, device_str: str = "cuda"):
+        # [FUNCTION DOC] Compiles a Triton kernel from source. Increments cache-miss counter and logs the source. If TRITON_INTERPRET is 1, loads the module
+        # through PyCodeCache and returns the named attribute. Checks CompiledTritonKernels first: on hit returns the cached future (parallel)
+        # or its result (serial). On miss with a usable process pool: submits a worker compile task (passing selected env vars and config,
+        # including a filtered autotune lookup table entry), wraps it in a LambdaFuture that on result restores and precompiles the kernel
+        # in the parent, records compile metrics, and stores that future in the cache. Otherwise compiles synchronously in-process (setting
+        # ptxas/libdevice paths) and returns the precompiled kernel, logging triton build failures. Args: kernel_name, source_code, device_str
+        # (unused). Returns a future or a kernel. Raises the underlying compile exception, or the subprocess exception renamed with the kernel name.
+        # KNOWN ISSUE: device_str is accepted but never used.
         """
         Async_compile.triton is more complicated than the other backends because
         we're trying to optimize compile time as much as possible for this hot callsite.
@@ -466,6 +527,7 @@ class AsyncCompile:
         )
 
         def reload_kernel_in_parent():
+            # [FUNCTION DOC] HELPER: Reloads the kernel from source in the parent process, timed under the reload_kernel_in_parent event; returns the loaded kernel.
             # Benchmark how often this happens
             with dynamo_timed("reload_kernel_in_parent"):
                 return load_kernel()
@@ -543,6 +605,8 @@ class AsyncCompile:
             )
 
             def get_result() -> CachingAutotuner:
+                # [FUNCTION DOC] HELPER: Waits for the worker compile, re-raising subprocess errors with the kernel name; then sets compile info, drops the cached future,
+                # restores unpickled state, precompiles in the parent and emits compile-time metrics. Returns the ready kernel.
                 try:
                     kernel, elapsed_us = task.result()
                 except SubprocException as e:
@@ -574,6 +638,8 @@ class AsyncCompile:
                 log_waitcounter=True,
                 waitcounter_name_override="compile_triton",
             ):
+                # [FUNCTION DOC] Logs ROCm source and submits a task that optionally AOT-compiles an object file (recorded in the ROCm cache), optionally builds a test runner executable
+                # when config requests it, then loads and returns the first loaded result. Returns the submit result.
                 fail = None
                 try:
                     start_ns = time_ns()
@@ -595,17 +661,20 @@ class AsyncCompile:
                     log_triton_builds(fail=fail)
 
     def multi_kernel(self, *args, **kwargs) -> Any:
+        # [FUNCTION DOC] Builds and returns a MultiKernelCall from the arguments (imported lazily). Not parallelized since sub-kernels are already compiled in parallel.
         from torch._inductor.codegen.multi_kernel import MultiKernelCall
 
         # no need to call this in parallel since the sub-kernels are already parallel tasks
         return MultiKernelCall(*args, **kwargs)
 
     def size_hint_multi_kernel(self, *args, **kwargs) -> Any:
+        # [FUNCTION DOC] Builds and returns a SizeHintMultiKernelCall from the arguments (imported lazily).
         from torch._inductor.codegen.multi_kernel import SizeHintMultiKernelCall
 
         return SizeHintMultiKernelCall(*args, **kwargs)
 
     def cpp(self, source_code: str):
+        # [FUNCTION DOC] Compiles C++ kernel source. Serial mode returns the loaded kernel entry; otherwise returns a LambdaFuture that yields the kernel entry once the async load finishes.
         kernel_code_log.info("CPP Kernel:\n%s", source_code)
         if get_compile_threads() <= 1:
             return CppCodeCache.load(source_code).kernel
@@ -614,6 +683,7 @@ class AsyncCompile:
             return LambdaFuture(lambda: get_result().kernel)
 
     def cpp_pybinding(self, argtypes: list[str], source_code: str):
+        # [FUNCTION DOC] Compiles C++ source with Python bindings for the given argument types. Serial mode returns the loaded binding directly; otherwise a LambdaFuture over the async load.
         kernel_code_log.info("CPP+Bindings Kernel:\n%s", source_code)
         if get_compile_threads() <= 1:
             return CppPythonBindingsCodeCache.load_pybinding(argtypes, source_code)
@@ -624,7 +694,10 @@ class AsyncCompile:
             return LambdaFuture(get_result)
 
     def cutlass(self, cache_cls, source_code, dst_file_ext, aot_compile=False):
+        # [FUNCTION DOC] Submits a task that, using the given code cache class, optionally (aot_compile) compiles an object file and records its path in the
+        # class's aot kernel list, then loads and returns the first element of the loaded result. Returns the submit result (value or future).
         def task():
+            # [FUNCTION DOC] HELPER: Worker body: optionally AOT-compiles an object file via the cache class and records its path, then loads and returns the kernel.
             if aot_compile:
                 # We rely on JITInductor to compile the CUDA code,
                 # so that we can load it into AOTInductor.
@@ -635,10 +708,12 @@ class AsyncCompile:
         return self.submit(task)
 
     def cuda(self, source_code, dst_file_ext, aot_compile=False):
+        # [FUNCTION DOC] Logs the CUDA source and compiles it through the CUDA code cache via the cutlass helper.
         kernel_code_log.info("CUDA Kernel:\n%s", source_code)
         return self.cutlass(CUDACodeCache, source_code, dst_file_ext, aot_compile)
 
     def xpu(self, source_code, dst_file_ext, aot_compile=False):
+        # [FUNCTION DOC] Logs the XPU source and compiles it through the XPU code cache via the cutlass helper.
         kernel_code_log.info("XPU Kernel:\n%s", source_code)
         return self.cutlass(XPUCodeCache, source_code, dst_file_ext, aot_compile)
 
@@ -648,9 +723,13 @@ class AsyncCompile:
         dst_file_ext,
         aot_compile=False,
     ):
+        # [FUNCTION DOC] Compiles an NVIDIA Universal GEMM kernel. With a usable process pool, submits a worker task and returns a LambdaFuture that loads the wrapper
+        # when done (re-raising subprocess errors with the kernel name). Otherwise writes and loads the source through PyCodeCache and returns an
+        # NVUniversalGemmKernelWrapper. Raises RuntimeError if the main function is missing in the serial path. Args: kernel_name, source_code, precompile_metadata.
         kernel_code_log.info("ROCm Kernel:\n%s", source_code)
 
         def task():
+            # [FUNCTION DOC] HELPER: Worker body: optionally AOT-compiles an object and builds an executable test runner, then loads and returns the kernel.
             if aot_compile:
                 output_path, *_ = ROCmCodeCache.compile(source_code, dst_file_ext="o")
                 ROCmCodeCache.aot_kernels_o.append(output_path)
@@ -661,6 +740,7 @@ class AsyncCompile:
         return self.submit(task)
 
     def halide(self, meta: HalideMeta, source_code: str):
+        # [FUNCTION DOC] Compiles a Halide kernel. Serial mode generates and returns it directly; otherwise returns a LambdaFuture over the async generation.
         kernel_code_log.info("Halide Kernel:\n%r\n%s", meta, source_code)
         if get_compile_threads() <= 1:
             return HalideCodeCache.generate_halide(meta, source_code)
@@ -671,12 +751,17 @@ class AsyncCompile:
             return LambdaFuture(get_result)
 
     def _load_kernel_wrapper(self, kernel_name, main_suffix, wrapper_cls, key, path):
+        # [FUNCTION DOC] HELPER: Loads the module from PyCodeCache by key and path, looks up the entry function named kernel name plus suffix, and returns it wrapped
+        # in wrapper_cls with the kernel path.
         """Reload a kernel module from PyCodeCache and wrap the entry point."""
         mod = torch._inductor.codecache.PyCodeCache.load_by_key_path(key, path)
         main_func_name = f"{kernel_name}_{main_suffix}"
         return wrapper_cls(getattr(mod, main_func_name), kernel_path=path)
 
     def cutedsl(self, kernel_name: str, source_code: str, precompile_metadata=None):
+        # [FUNCTION DOC] Compiles a CuteDSL kernel. With a usable process pool, submits a worker task and returns a LambdaFuture that loads the wrapper once done
+        # (re-raising subprocess errors with the kernel name). Otherwise writes the source via PyCodeCache, loads it and returns a CuteDSLKernelWrapper.
+        # Raises RuntimeError if the expected main function is missing in the serial path. Brackets with compile start; logs the source.
         """
         Compile CuteDSL (CUTLASS Python DSL) kernels.
 
@@ -713,6 +798,7 @@ class AsyncCompile:
             )
 
             def get_result() -> CuteDSLKernelWrapper:
+                # [FUNCTION DOC] HELPER: Waits for the subprocess compile (re-raising errors with the kernel name), logs the elapsed time and loads the kernel wrapper from the written module.
                 try:
                     key, path, elapsed_us = subprocess_task.result()
                 except SubprocException as e:
@@ -741,6 +827,8 @@ class AsyncCompile:
             return CuteDSLKernelWrapper(getattr(mod, main_func_name), kernel_path=path)
 
     def pallas(self, kernel_name: str, source_code: str):
+        # [FUNCTION DOC] Compiles a Pallas kernel by writing and loading the source via PyCodeCache and wrapping the main entry in a PallasKernelWrapper.
+        # Runs inline when compile threads <= 1, otherwise on the thread pool, returning a LambdaFuture. Raises RuntimeError if the main function is missing.
         """
         Compile Pallas (JAX experimental) kernels.
 
@@ -757,6 +845,7 @@ class AsyncCompile:
         kernel_code_log.info("Pallas Kernel:\n%s", source_code)
 
         def task():
+            # [FUNCTION DOC] HELPER: Worker body: writes the source via PyCodeCache, loads the module, and returns a PallasKernelWrapper; raises RuntimeError if the main function is absent.
             key, path = torch._inductor.codecache.PyCodeCache.write(source_code)
             mod = torch._inductor.codecache.PyCodeCache.load_by_key_path(key, path)
 
@@ -779,6 +868,8 @@ class AsyncCompile:
     def nv_universal_gemm(
         self, kernel_name: str, source_code: str, precompile_metadata=None
     ):
+        # [FUNCTION DOC] Submits NVGEMM kernel precompilation to the process pool (subprocess isolation for a thread-unsafe compile) with the given kernel/variant,
+        # accumulator type, tensor metadata, scale/swizzle types, epilogue flags and CUDA context. Returns the pool future; the artifact is written to the disk cache.
         """
         Compile NVIDIA Universal GEMM kernels.
 
@@ -817,6 +908,7 @@ class AsyncCompile:
             )
 
             def get_result() -> NVUniversalGemmKernelWrapper:
+                # [FUNCTION DOC] HELPER: Waits for the subprocess compile (re-raising errors with the kernel name), logs the elapsed time and loads the kernel wrapper from the written module.
                 try:
                     key, path, elapsed_us = subprocess_task.result()
                 except SubprocException as e:
@@ -895,12 +987,16 @@ class AsyncCompile:
         )
 
     def metal(self, kernel_name: str, source: str, headers: list[str]) -> None:
+        # [FUNCTION DOC] Registers a Metal kernel (name, source, headers) in the class-level pending list, creating it if needed. Compilation happens later in wait().
+        # KNOWN ISSUE: the list is assigned on the instance, not the class, so registrations are per AsyncCompile instance.
         """Register a Metal kernel body; wait() compiles all registered kernels into one library."""
         if self._metal_sources is None:
             self._metal_sources = []
         self._metal_sources.append((kernel_name, source, headers))
 
     def wait(self, scope: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Resolves all pending work: when threads > 1 waits for every future in scope (timed); then compiles all registered Metal shaders and
+        # merges the resulting kernels into scope, clearing the list; finally ends the compile phase (flushes metrics). Mutates scope.
         if get_compile_threads() > 1:
             with dynamo_timed(
                 "async_compile.wait",
@@ -920,6 +1016,8 @@ class AsyncCompile:
         _compile_end()
 
     def _wait_futures(self, scope: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Replaces each future value in scope with its result, showing a progress bar. Uses config.compile_worker_wait_timeout (0 means no timeout).
+        # Raises RuntimeError on timeout (hinting an env var) or when a compile subprocess died (hinting to run with one compile thread).
         kernels = {
             key: value
             for key, value in scope.items()
@@ -961,6 +1059,7 @@ class AsyncCompile:
 
 
 def maybe_warm_pool() -> None:
+    # [FUNCTION DOC] Starts and wakes the compile pool early unless disabled by environment (TNT in use, warm pool turned off), Triton missing, or fbcode. No return value.
     if (
         os.environ.get("TORCH_TNT_IN_USE", "0") == "1"
         or os.environ.get("TORCH_WARM_POOL", "1") != "1"

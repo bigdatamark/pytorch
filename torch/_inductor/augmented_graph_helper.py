@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines AugmentedGraphHelper, a utility for scheduling passes that need to reason about an FX graph plus extra
+# dependency edges and sets of nodes merged into equivalence classes (used for coalescing, e.g. overlap scheduling of collectives).
 import logging
 from collections import defaultdict
 
@@ -12,6 +14,9 @@ log = logging.getLogger(__name__)
 
 
 class AugmentedGraphHelper:
+    # [CLASS DOC] Wraps an fx.Graph with: merge_sets (mapping of each node to the shared ordered set of nodes it is merged with; every node starts
+    # in a singleton set), extra_deps / extra_uses (forward and reverse maps of added dependency edges, kept in sync), and optional
+    # node_ancestors (precomputed ancestor info reflecting only the original graph). Supports cycle detection and reachability queries.
     """
     Graph helper that augments the original graph with additional
     dependencies and uses, plus tracks node equivalences for coalescing.
@@ -25,6 +30,7 @@ class AugmentedGraphHelper:
         graph: fx.Graph,
         node_ancestors: BitsetAncestors | None = None,
     ):
+        # [FUNCTION DOC] Builds the singleton merge sets for all graph nodes, empty extra dependency maps and stores the optional ancestors object.
         # Each node starts in its own singleton set
         self.graph = graph
         self.merge_sets = {node: OrderedSet([node]) for node in graph.nodes}
@@ -38,16 +44,19 @@ class AugmentedGraphHelper:
         self.node_ancestors = node_ancestors
 
     def add_extra_dep(self, *, n: fx.Node, dep: fx.Node) -> None:
+        # [FUNCTION DOC] Records that n depends on dep (dep must run first), updating both the dependency and use maps.
         """Add extra dependency: node depends on dep."""
         self.extra_deps[n].add(dep)
         self.extra_uses[dep].add(n)
 
     def remove_extra_dep(self, *, n: fx.Node, dep: fx.Node) -> None:
+        # [FUNCTION DOC] Removes the extra dependency of n on dep from both maps if present; no-op otherwise.
         if dep in self.extra_deps[n]:
             self.extra_deps[n].discard(dep)
             self.extra_uses[dep].discard(n)
 
     def merge_to_set(self, existing_node: fx.Node, new_node: fx.Node) -> None:
+        # [FUNCTION DOC] Merges new_node into existing_node's merge set and repoints it. Raises AssertionError if new_node's set is not a singleton.
         """
         Merge new_node into existing_node's set. The new node must be a singleton set.
         """
@@ -66,6 +75,7 @@ class AugmentedGraphHelper:
             self.merge_sets[node] = existing_set
 
     def unmerge_node(self, node: fx.Node) -> None:
+        # [FUNCTION DOC] Removes node from its merge set and gives it a fresh singleton set; no-op if already a singleton.
         """Remove a node from its merge set, making it singleton."""
         old_set = self.merge_sets[node]
 
@@ -80,6 +90,7 @@ class AugmentedGraphHelper:
         self.merge_sets[node] = OrderedSet([node])
 
     def get_merged_deps(self, node: fx.Node) -> OrderedSet[fx.Node]:
+        # [FUNCTION DOC] Returns the union of data inputs and extra dependencies over all nodes in node's merge set (may include nodes of the same set).
         """
         Get all dependencies of a node considering merges and extra deps.
         Combines:
@@ -98,11 +109,13 @@ class AugmentedGraphHelper:
         return deps
 
     def has_cycle(self) -> bool:
+        # [FUNCTION DOC] Returns whether the graph plus current extra deps contains a cycle, delegating to the dynamo graph deduplication cycle checker.
         return torch._dynamo.graph_deduplication._has_cycle(
             self.graph, self.get_all_extra_deps()
         )
 
     def _get_all_ancestors(self, node: fx.Node) -> OrderedSet[fx.Node]:
+        # [FUNCTION DOC] HELPER: Depth-first collects all transitive ancestors of node following both data inputs and extra deps (merge sets are ignored).
         """Transitive ancestors through both data deps and extra deps."""
         ancestors: OrderedSet[fx.Node] = OrderedSet()
         stack: list[fx.Node] = list(node.all_input_nodes)
@@ -116,6 +129,8 @@ class AugmentedGraphHelper:
         return ancestors
 
     def has_path(self, source: fx.Node, target: fx.Node) -> bool:
+        # [FUNCTION DOC] Returns whether source (or any node merged with it) is reachable backwards from target using merged deps. Raises AssertionError if both share a
+        # merge set. Prunes dependencies that are original ancestors of source (when ancestor info is given) since a path through them would form a cycle.
         """Check if there's a path from source to target."""
         # we should not be checking path from node to itself
         if self.merge_sets[source] is self.merge_sets[target]:
@@ -158,6 +173,9 @@ class AugmentedGraphHelper:
     def transfer_erased_node_deps(
         self, erased_to_new: dict[fx.Node, fx.Node | None]
     ) -> None:
+        # [FUNCTION DOC] Rewires extra dependencies when nodes are erased: erased_to_new maps each erased node (and its merge-set peers) to a replacement or None
+        # (drop). Edges to/from replaced nodes are moved to the replacement, skipping self edges and edges whose reverse already exists as extra or data dep
+        # (avoids intra-bucket cycles). Edges referencing dropped nodes are removed. Finally clears the erased nodes' edges and deletes their merge sets.
         """
         Transfer all extra dependencies from erased nodes to their replacements, handling
         cross-dependencies between erased nodes correctly.
@@ -218,6 +236,7 @@ class AugmentedGraphHelper:
             del self.merge_sets[old_node]
 
     def remove_erased_extra_deps(self) -> None:
+        # [FUNCTION DOC] Drops extra dependencies where either endpoint node has been erased from the graph.
         """Remove extra deps referencing erased nodes."""
         for node in list(self.extra_deps):
             if node._erased:
@@ -231,6 +250,9 @@ class AugmentedGraphHelper:
     def check_and_maybe_autofix_cyclic_extra_deps(
         self, *, autofix: bool = False
     ) -> None:
+        # [FUNCTION DOC] Detects extra deps that create cycles (only if the graph has a cycle). Each extra dep whose dependency has the node among its
+        # ancestors is removed and logged (warning plus a structured-trace artifact). Args: autofix. Raises RuntimeError (naming the config flag) after
+        # removal when autofix is False, so root causes get investigated; with autofix True it silently continues. Returns nothing when no cycle.
         """Check for and optionally remove extra deps that create cycles.
 
         Args:
@@ -270,6 +292,7 @@ class AugmentedGraphHelper:
             )
 
     def get_all_extra_deps(self) -> dict[fx.Node, OrderedSet[fx.Node]]:
+        # [FUNCTION DOC] Returns a copy of the extra dependency map containing only nodes with non-empty dependency sets, for use in topological sorting.
         """
         Get all extra dependencies in a format suitable for topological sort.
         Returns a copy to avoid external modifications.
