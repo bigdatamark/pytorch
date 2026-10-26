@@ -1,3 +1,10 @@
+# [MODULE DOC] Result classes for AOT Autograd compilation, analogous to inductor's
+# OutputCode. Defines per-graph "loadable" wrappers (InductorOutput subclasses) that
+# either reference FxGraphCache entries or bundle compiled code directly, forward and
+# backward holders, a serialized graph module helper, and GenericAOTAutogradResult with
+# its concrete subclasses, whose wrap_post_compile rebuilds the original runtime callable
+# from a cached/precompiled result. Also has the precompile deserialization entry point
+# and a cache artifact class. Import-time side effects: creates loggers and type variables.
 """
 This module provides result classes for AOT Autograd compilation.
 
@@ -66,6 +73,9 @@ TOut = TypeVar("TOut", bound=OutputCode)
 
 
 class InductorOutput(ABC, Generic[TOut]):
+    # [CLASS DOC] Abstract interface for one compiled inductor artifact: pre_save prepares it for serialization,
+    # load turns it into an OutputCode given example inputs, and post_compile finishes it using the fx config.
+    # The abstract methods are one-line stubs with no behavior.
     """
     Class representing a single inductor output
     """
@@ -85,6 +95,9 @@ TOutputCode = TypeVar("TOutputCode", bound=OutputCode)
 
 @dataclass
 class BundledOutputCodeLoadable(InductorOutput[TOutputCode], Generic[TOutputCode]):
+    # [CLASS DOC] Dataclass holding an OutputCode object directly (field result) so it is serialized with the cache
+    # entry instead of being looked up in FxGraphCache. load stores example inputs on the instance (not a declared
+    # field) and returns the bundled result; post_compile must be called after load.
     """
     A generic wrapper for OutputCode objects that are bundled directly in the cache
     (rather than looked up via FxGraphCache).
@@ -95,18 +108,26 @@ class BundledOutputCodeLoadable(InductorOutput[TOutputCode], Generic[TOutputCode
     result: TOutputCode
 
     def pre_save(self) -> None:
+        # [FUNCTION DOC] Replaces the held result with a shallow copy that has had prepare_for_serialization applied,
+        # so the saved form is serializable without altering the original object.
         disk_result = copy(self.result)
         disk_result.prepare_for_serialization()
         self.result = disk_result
         return
 
     def load(self, example_inputs: Sequence[Any]) -> TOutputCode:
+        # [FUNCTION DOC] Remembers the example inputs on the instance and returns the bundled result unchanged.
+        # KNOWN ISSUE: example_inputs is set dynamically and is not a declared dataclass field.
         self.example_inputs = example_inputs
         return self.result
 
     def post_compile(
         self, result: TOutputCode, fx_config: _CompileFxKwargs
     ) -> TOutputCode:
+        # [FUNCTION DOC] Finishes a bundled result after load. For a CompiledFxGraph, reruns the FxGraphCache cache-hit
+        # post-compile step (RuntimeError if it yields no graph), logs a bundled-hit artifact, and records the
+        # compile region name from fx_config. Then calls the result's own post_compile with the stored example inputs
+        # and constants, and finally lets the inductor cudagraph policy, if any, wrap the output. Returns the result.
         constants = CompiledFxGraphConstants()
 
         # Special handling for CompiledFxGraph - needs FxGraphCache.cache_hit_post_compile
@@ -152,16 +173,27 @@ CompiledFxGraphLoadable: type[BundledOutputCodeLoadable[CompiledFxGraph]] = (
 
 @dataclass
 class FxGraphCacheLoadable(InductorOutput[CompiledFxGraph]):
+    # [CLASS DOC] Dataclass for a compiled graph stored in FxGraphCache: holds the cache key with debug lines and the
+    # exact guard expression saved with it. load looks the entry up by key (local plus optional remote cache),
+    # requiring an identical guard expression; post_compile finalizes the graph. Subclasses define _is_backward.
     fx_graph_cache_info: tuple[str, list[str]]
     fx_graph_guard_expr: str | None
 
     def pre_save(self) -> None:
+        # [FUNCTION DOC] No-op: only a cache key is stored, so nothing needs preparing.
         return
 
     def _is_backward(self) -> bool:
+        # [FUNCTION DOC] HELPER: Whether this entry is a backward graph; the base class says no.
         return False
 
     def load(self, example_inputs: Sequence[Any]) -> CompiledFxGraph:
+        # [FUNCTION DOC] Loads the compiled graph from FxGraphCache using the stored key, requiring the cached entry's guard
+        # expression to equal the stored one. Clears the compiled Triton kernel cache first, uses the remote cache if
+        # enabled, logs a structured hit or miss artifact, and remembers example inputs and constants on the instance.
+        # Raises FXGraphCacheMiss if no entry is found. Returns the CompiledFxGraph.
+        # KNOWN ISSUE: the long comment block mid-function ends in a truncated sentence, and the miss artifact is
+        # labeled with a comment saying always a hit.
         from .autograd_cache import FXGraphCacheMiss
 
         # [Note: AOTAutogradCache and FXGraphCache Guard interactions]
@@ -183,6 +215,8 @@ class FxGraphCacheLoadable(InductorOutput[CompiledFxGraph]):
         (cache_key, debug_lines) = self.fx_graph_cache_info
 
         def check_exact_guard_match(guard_expr: str, _hints: Any) -> bool:
+            # [FUNCTION DOC] HELPER: Guard evaluator passed to the cache loader; returns True only if the candidate guard
+            # expression equals the stored one. The hints argument is ignored.
             """
             AOTAutogradCache tracks its own guards, so we just need to treat these guard expressions as a second
             cache key of sorts: we just check for equality, i.e. the FXGraphCache entry with
@@ -229,6 +263,9 @@ class FxGraphCacheLoadable(InductorOutput[CompiledFxGraph]):
     def post_compile(
         self, result: CompiledFxGraph, fx_config: _CompileFxKwargs
     ) -> CompiledFxGraph:
+        # [FUNCTION DOC] Sets the compile region name from fx_config on the loaded graph, runs its post_compile with the
+        # saved example inputs and constants (which mutates fx_config-related boxed values), and applies the inductor
+        # cudagraph policy wrapper if one is set. Returns the possibly wrapped result.
         """
         Called after FXGraphCacheLoadable.load, mutates fx_config
         """
@@ -248,21 +285,28 @@ class FxGraphCacheLoadable(InductorOutput[CompiledFxGraph]):
 
 @dataclass
 class CompiledForward(FxGraphCacheLoadable):
+    # [CLASS DOC] FxGraphCache-backed entry for a forward graph; only reports that it is not a backward graph.
     """
     Cacheable entry for a forward function
     """
 
     def _is_backward(self) -> bool:
+        # [FUNCTION DOC] HELPER: Returns False (forward graph).
         return False
 
 
 @dataclass
 class GenericCompiledBackward(InductorOutput[TOut]):
+    # [CLASS DOC] Mixin-style dataclass for backward outputs, adding backward_state_indices and the count of symints
+    # saved for backward (used by AOTDispatchAutograd). Its post_compile delegates to the loadable class next in
+    # the MRO and then wraps the result with dynamo disable so the backward is not traced.
     # Used by AOTDispatchAutograd.post_compile
     backward_state_indices: list[int]
     num_symints_saved_for_bw_: int
 
     def post_compile(self, result: TOut, fx_config: _CompileFxKwargs) -> TOut:
+        # [FUNCTION DOC] Calls the next class's post_compile, then returns the result wrapped by torch dynamo disable
+        # (reason: do not trace generated backwards pass), reapplying what the bw compiler wrapper does on a cache miss.
         # The concrete post_compile comes from the loadable mixin in each subclass MRO.
         compiled_bw = super().post_compile(  # pyrefly: ignore[missing-attribute]
             result, fx_config
@@ -277,11 +321,13 @@ class GenericCompiledBackward(InductorOutput[TOut]):
 
 @dataclass
 class CompiledBackward(GenericCompiledBackward[CompiledFxGraph], FxGraphCacheLoadable):
+    # [CLASS DOC] FxGraphCache-backed backward entry: combines backward metadata with FxGraphCache loading.
     """
     Cacheable entry for a backward function
     """
 
     def _is_backward(self) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True (backward graph).
         return True
 
 
@@ -290,6 +336,7 @@ class CompiledBackward(GenericCompiledBackward[CompiledFxGraph], FxGraphCacheLoa
 class BundledCompiledForward(
     BundledOutputCodeLoadable[TOutputCode], Generic[TOutputCode]
 ):
+    # [CLASS DOC] Bundled forward entry: a BundledOutputCodeLoadable for any OutputCode type. No extra behavior.
     """
     Generic forward function for bundled compilation.
     Works with any OutputCode type (CompiledFxGraph, RegionalOutputCode, etc.)
@@ -302,6 +349,7 @@ class BundledCompiledBackward(
     BundledOutputCodeLoadable[TOutputCode],
     Generic[TOutputCode],
 ):
+    # [CLASS DOC] Bundled backward entry: backward metadata plus bundled OutputCode loading. No extra behavior.
     """
     Generic backward function for bundled compilation.
     Works with any OutputCode type (CompiledFxGraph, RegionalOutputCode, etc.)
@@ -310,13 +358,18 @@ class BundledCompiledBackward(
 
 @dataclass
 class SerializedGraphModule:
+    # [CLASS DOC] Picklable snapshot of a GraphModule, stored as the reconstruction function and arguments from the
+    # module's reduce protocol. deserialize rebuilds the GraphModule on demand.
     fn: Callable[[dict[Any, Any], str], torch.nn.Module]
     args: tuple[Any, ...]
 
     def __init__(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] Captures the reconstruction function and args from the module's reduce method.
         self.fn, self.args = gm.__reduce__()
 
     def deserialize(self) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Calls the stored function with the stored args and returns the GraphModule.
+        # Raises AssertionError if the result is not a GraphModule.
         gm = self.fn(*self.args)
         if not isinstance(gm, torch.fx.GraphModule):
             raise AssertionError(f"expected fx.GraphModule, got {type(gm)}")
@@ -324,6 +377,8 @@ class SerializedGraphModule:
 
 
 def serialize_graph_module(gm: torch.fx.GraphModule) -> SerializedGraphModule:
+    # [FUNCTION DOC] Clears the metadata of the graph module and of all its nodes (mutating them), then returns a
+    # SerializedGraphModule of it.
     # NOTE: mutates the graph module
     gm.meta = {}
     for node in gm.graph.nodes:
@@ -338,6 +393,10 @@ TBackward = TypeVar("TBackward", bound="GenericCompiledBackward[Any]")
 
 @dataclass
 class GenericAOTAutogradResult(Generic[TForward, TBackward]):
+    # [CLASS DOC] Dataclass capturing everything needed to rebuild AOT Autograd's compiled callable from a cache or
+    # precompile artifact: the forward and optional backward InductorOutputs, logged graph strings, runtime
+    # metadata, dispatch wrappers, subclass metadata, detach indices, timings, a sanitized AOT config, guard
+    # expression and an optional serialized backward module. Key methods: pre_save and wrap_post_compile.
     """A single result from AOT Autograd compilation, genericized by Forward and Backward types.
 
     A TForward is always an InductorOutput of some sort, which represents the
@@ -390,6 +449,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
     serialized_bw_module: SerializedGraphModule | None
 
     def pre_save(self) -> None:
+        # [FUNCTION DOC] Calls pre_save on the forward output and on the backward output if present.
         """
         Perform any preparations to make the result ready for serialization.
         """
@@ -398,6 +458,9 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
             self.compiled_bw.pre_save()
 
     def _log_cached_graphs(self, aot_config: AOTConfig | CacheableAOTConfig) -> None:
+        # [FUNCTION DOC] HELPER: When logging is enabled in the config, replays structured-trace and logger output for the
+        # stored joint, forward (plus metadata artifacts), backward graph strings and min-cut info, noting they came
+        # from cache. The forward graph is labeled an inference graph when there is no backward string.
         if not aot_config.enable_log:
             return
 
@@ -465,6 +528,10 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         args: list[torch.Tensor],
         fx_config: _CompileFxKwargs,
     ) -> tuple[Callable[..., Any], Callable[..., Any] | None, bool]:
+        # [FUNCTION DOC] HELPER: Loads forward (and backward if present) from their cache entries, records the dispatch mode
+        # (autograd or inference) in the compile event log, then runs post_compile on each with fx configs marked
+        # is_backward accordingly, only after both loads succeeded. Returns (forward callable, backward callable or
+        # None, needs_autograd flag). Cache misses propagate as exceptions from load.
         from torch._dynamo.utils import CompileEventLogger
 
         compiled_fw_func = self.compiled_fw.load(args)
@@ -514,6 +581,11 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         needs_autograd: bool,
         aot_config: AOTConfig,
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] HELPER: Reapplies the runtime wrapper stack to the loaded callables: subclass wrapper, functionalized
+        # RNG wrapper, then either AOTDispatchAutograd post_compile (building a compile spec with no bw compiler and no
+        # cache-save callback, and a lazy backward from the serialized module if present) or the plain RuntimeWrapper,
+        # and finally the saved dispatch wrappers. Records subclass dispatch in the event log. Returns the final callable.
+        # Raises AssertionError if autograd is needed but no backward entry exists.
         from torch._dynamo.utils import CompileEventLogger
 
         compiled_fw_func = AOTDispatchSubclassWrapper(
@@ -590,6 +662,8 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         return compiled_function
 
     def _check_guards(self, args: list[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: If a guard expression is stored, evaluates it against the backed symints found in args via
+        # AOTAutogradCache and raises AssertionError when it is not exactly true. Does nothing otherwise.
         if self.guards_expr:
             from .autograd_cache import AOTAutogradCache
 
@@ -605,6 +679,10 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
         aot_config: AOTConfig | CacheableAOTConfig,
         fx_config: _CompileFxKwargs,
     ) -> Callable[..., Any]:
+        # [FUNCTION DOC] Reconstructs the callable AOT Autograd originally returned. Replays cached graph logging, loads and
+        # post-compiles forward/backward under a dynamo timer, applies the runtime wrappers using the (narrowed) AOT
+        # config, then checks guards against args. Returns the callable. May raise the cache-miss exception from load or
+        # AssertionError from the guard check.
         """
         This function takes a result and carefully reconstructs the original callable
         that AOTAutograd returned the first time it was run. It does this by running the various
@@ -646,6 +724,7 @@ class GenericAOTAutogradResult(Generic[TForward, TBackward]):
 
 
 class AOTAutogradResult(GenericAOTAutogradResult[CompiledForward, CompiledBackward]):
+    # [CLASS DOC] Result variant whose forward/backward are FxGraphCache references. No added behavior.
     """
     Regular AOTAutogradResult: saves the forward/backward FxGraphCache keys
     and looks them up in FxGraphCache on load
@@ -658,6 +737,8 @@ class BundledAOTAutogradResult(
     ],
     Generic[TOutputCode],
 ):
+    # [CLASS DOC] Result variant that bundles the full OutputCode for forward and backward in the entry itself,
+    # for any OutputCode subclass, so no FxGraphCache lookup is required. No added behavior.
     """
     Generic AOTAutogradResult where we bundle the entire OutputCode directly
     (rather than looking it up via FxGraphCache).
@@ -697,6 +778,13 @@ class BundledAOTAutogradResult(
 def deserialize_bundled_cache_entry(
     entry: BundledAOTAutogradResult[Any],
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Turns a bundled result into a runnable, still-serializable function for precompile. Clears the guard
+    # expression (dynamo already serialized guards), deep-copies the entry for later re-serialization, and under the
+    # current tracing context (or a fresh fake-tensor context if none) calls wrap_post_compile with empty example
+    # args and a minimal fx config (cudagraphs flag from inductor config, empty device index). Wraps the result in
+    # SerializableCompiledFunction and returns a forward function taking positional args that calls it with a list,
+    # carrying the serialize attribute. Raises AssertionError if serialize is missing.
+    # KNOWN ISSUE: per its TODO, cudagraphs config is not shared and flat_params are ignored.
     from copy import deepcopy
 
     from torch._inductor.cudagraph_utils import BoxedDeviceIndex
@@ -739,6 +827,7 @@ def deserialize_bundled_cache_entry(
     # if inline_builtin_nn_modules=False
     @simple_wraps(compiled_fn)
     def forward(*runtime_args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the compiled function with the runtime args packed into a list (boxed calling convention).
         return compiled_fn(list(runtime_args))
 
     if not hasattr(compiled_fn, "serialize"):
@@ -751,6 +840,8 @@ def deserialize_bundled_cache_entry(
 @dataclass
 # pyrefly: ignore [implicit-any]
 class BundledAOTAutogradCacheArtifact(BackendCacheArtifact[Callable]):
+    # [CLASS DOC] Backend cache artifact for a bundled AOT Autograd result; deserialization yields a runnable function.
     # pyrefly: ignore [implicit-any]
     def after_deserialization(self) -> Callable:
+        # [FUNCTION DOC] Builds the runnable callable from the stored content using deserialize_bundled_cache_entry.
         return deserialize_bundled_cache_entry(self.content)

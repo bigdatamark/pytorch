@@ -1,3 +1,10 @@
+# [MODULE DOC] Graph passes that offload saved activations to CPU in the forward graph
+# and reload them in the backward graph, for graphs from AOT Autograd partitioners or
+# make_fx. Two flavors: a synchronous one using device_put nodes, and an async one using
+# the ao.offload / ao.reload / ao.wait_tensor ops from offload_ops. Also provides
+# selection of offloadable nodes (marked via node metadata), sinking of offload waits,
+# and prefetching of reloads by reordering nodes using benchmarked compute times.
+# Import-time side effects: importing offload_ops registers the ao ops; creates a logger.
 """Activation offloading for memory optimization during compilation.
 
 This module provides functionality to offload activations to CPU during the forward
@@ -34,6 +41,8 @@ GPU_RELOAD_PREFIX = "gpu_reload_"
 
 
 def _find_all_effective_users(node: fx.Node, op_types: OpTypes) -> OrderedSet[fx.Node]:
+    # [FUNCTION DOC] HELPER: Returns the ordered set of non-output users of the node, recursively including users
+    # of any user that is a view op (since views keep the original storage alive).
     """Find all effective users of a node, where view ops extend the lifetime
     of the original node. If a user is a view op, recursively find users of
     the view."""
@@ -49,6 +58,9 @@ def _find_all_effective_users(node: fx.Node, op_types: OpTypes) -> OrderedSet[fx
 
 @dataclass
 class ReloadNodeInfo:
+    # [CLASS DOC] Record describing one backward reload: the nodes forming the reload (group), the node that
+    # waits for completion, and the estimated transfer size in bytes and time in milliseconds.
+    # Plain data holder with no behavior; reload_group_nodes are moved together when prefetching.
     """
     Information about backward reload related nodes for each reload operation.
 
@@ -68,6 +80,8 @@ class ReloadNodeInfo:
 
 @dataclass
 class ReloadQueueEntry:
+    # [CLASS DOC] Queue item used while reordering for prefetch: a ReloadNodeInfo plus the remaining
+    # milliseconds of compute overlap still required before the reload may be placed. Plain data holder.
     """
     Entry in the reload queue for prefetch scheduling.
 
@@ -81,6 +95,10 @@ class ReloadQueueEntry:
 
 
 def offload_activation_fw(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Synchronous forward-side offload. For each graph output node flagged saved_for_offloading,
+    # inserts a non-blocking device_put-to-CPU node (named with the cpu_offload prefix, with val and tensor_meta
+    # metadata set) after the node's last effective user (or the node itself), and replaces that output with it.
+    # Mutates the graph in place; returns nothing. Assumes the graph has a single output node holding a tuple.
     """
     Insert CPU offload operations in the forward pass graph.
 
@@ -140,6 +158,10 @@ def offload_activation_fw(graph: fx.Graph) -> None:
 
 
 def reload_activation_bw(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Synchronous backward-side reload. For each placeholder flagged saved_for_offloading, inserts a
+    # non-blocking device_put node back to the placeholder's original_device metadata, placed before its first user
+    # (or before output if no users), and rewires all other users to the new node. The new node is named by
+    # swapping the cpu_offload prefix for the gpu_reload prefix. Mutates the graph in place.
     """
     Insert GPU reload operations in the backward pass graph.
 
@@ -186,6 +208,10 @@ def reload_activation_bw(graph: fx.Graph) -> None:
 
 
 def offload_activation_fw_async(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Async forward-side offload. For each output node flagged saved_for_offloading, inserts after its
+    # last effective user an ao.offload node followed by an ao.wait_tensor node that keeps the GPU tensor alive
+    # (keepalive), sets val and tensor_meta metadata on both, and replaces the output with the wait node.
+    # Returns early without changes if no output is flagged. Mutates the graph in place.
     """Insert async CPU offload operations in the forward pass graph.
 
     Uses ao.offload + ao.wait_tensor ops which encapsulate stream management
@@ -246,6 +272,10 @@ def offload_activation_fw_async(graph: fx.Graph) -> None:
 
 
 def reload_activation_bw_async(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Async backward-side reload. For each placeholder flagged saved_for_offloading, inserts before its
+    # first user an ao.reload node (using original_device, original_size and original_stride metadata) and an
+    # ao.wait_tensor node with the CPU placeholder as keepalive, then rewires the other users to the wait node.
+    # Raises RuntimeError if a flagged placeholder has no users. Mutates the graph in place.
     """Insert async GPU reload operations in the backward pass graph.
 
     Uses ao.reload + ao.wait_tensor ops which encapsulate stream management internally,
@@ -313,6 +343,9 @@ def can_offload(
     model_outputs: OrderedSet[fx.Node],
     static_lifetime_input_nodes: OrderedSet[fx.Node],
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the node may be offloaded: it must be in the forward outputs and must not be a
+    # model output, a static-lifetime input, a view op, a getitem, or a non-contiguous tensor (per its val
+    # metadata). Logs the reason for each rejection at debug level. No other side effects.
     """
     Determine if a node can be offloaded to CPU.
 
@@ -385,6 +418,10 @@ def choose_offload_sets(
     num_fwd_outputs: int,
     static_lifetime_input_nodes: OrderedSet[fx.Node],
 ) -> bool:
+    # [FUNCTION DOC] Walks the forward graph and sets saved_for_offloading metadata to true on each node that has
+    # should_offload metadata and passes can_offload. The first num_fwd_outputs forward outputs are treated as
+    # model outputs. Returns True if at least one node was marked.
+    # KNOWN ISSUE: the docstring lists a bwd_module argument that the function does not take.
     """
     Decide which nodes will be offloaded based on the marked nodes and feasibility.
     Marks nodes with "saved_for_offloading" if they should and can be offloaded.
@@ -420,6 +457,11 @@ def offload_chosen_sets(
     fwd_module: fx.GraphModule,
     bwd_module: fx.GraphModule,
 ) -> None:
+    # [FUNCTION DOC] Applies synchronous offloading to a partitioned pair of graphs: inserts offload nodes in the
+    # forward graph, then for each forward output with the cpu_offload prefix replaces the matching backward
+    # placeholder with a new placeholder carrying the forward node's metadata plus original device, size and
+    # stride, and finally inserts reload nodes in the backward graph. Mutates both graphs in place.
+    # Raises KeyError if a matching backward placeholder name is not found.
     """
     Add offload and reload nodes to the forward and backward graphs.
     This function adds device_put operations without any stream handling.
@@ -460,6 +502,9 @@ def offload_chosen_sets_async(
     fwd_module: fx.GraphModule,
     bwd_module: fx.GraphModule,
 ) -> None:
+    # [FUNCTION DOC] Same flow as offload_chosen_sets but using the async ao ops: async offload in the forward graph,
+    # placeholder swap in the backward graph (with original device, size, stride recorded), then async reload
+    # insertion. Mutates both graphs in place. Raises KeyError if a matching backward placeholder is missing.
     """
     Add async offload and reload nodes using ao ops.
 
@@ -497,6 +542,9 @@ def offload_chosen_sets_async(
 
 
 def activation_offload_sink_wait_async(fwd_module: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Moves every ao.wait_tensor node whose first argument is an ao.offload node to just before the
+    # forward graph's output node, so compute can overlap the D2H copy. Delays freeing the source GPU tensors
+    # until the end of the graph. Mutates the graph in place.
     """Sink ao.wait_tensor operations for offload completion to the end of the graph.
 
     This allows computation to overlap with offload operations.
@@ -526,6 +574,9 @@ def activation_offload_sink_wait_async(fwd_module: fx.GraphModule) -> None:
 
 
 def activation_reload_prefetch_async(bwd_module: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Finds each ao.reload node that has an ao.wait_tensor user, records its transfer size and
+    # estimated time in a ReloadNodeInfo, and calls reorder_for_prefetch to move reloads earlier. Mutates the
+    # backward graph in place.
     """
     Prefetch backward reload operations by moving ao.reload nodes earlier
     in the graph to overlap data transfer with computation, while keeping
@@ -560,6 +611,8 @@ def activation_reload_prefetch_async(bwd_module: fx.GraphModule) -> None:
 
 
 def _calculate_transfer_size(device_put_node: fx.Node) -> int:
+    # [FUNCTION DOC] HELPER: Returns the byte size of the tensor in the first argument of an ao.offload or ao.reload
+    # node (via the partitioner size helper). Raises ValueError for any other target.
     """Calculate the size in bytes of data being transferred."""
 
     # ao.offload(tensor) -> tensor at args[0]
@@ -573,6 +626,8 @@ def _calculate_transfer_size(device_put_node: fx.Node) -> int:
 
 
 def _estimate_transfer_time_in_ms(transfer_size_bytes: int) -> float:
+    # [FUNCTION DOC] HELPER: Converts bytes to gibibytes and divides by the configured CPU-GPU bandwidth to give
+    # milliseconds. Raises ZeroDivisionError if the configured bandwidth is zero.
     """Estimate transfer time in milliseconds based on size and bandwidth.
 
     Uses config.activation_offload_cpu_gpu_bw (GB/s) which should be set by
@@ -586,6 +641,12 @@ def _estimate_transfer_time_in_ms(transfer_size_bytes: int) -> float:
 def identify_reload_patterns(
     graph: fx.Graph, nodes_list: list[fx.Node], node_to_idx: dict[fx.Node, int]
 ) -> dict[fx.Node, ReloadNodeInfo]:
+    # [FUNCTION DOC] Legacy stream-based pattern finder. For each device_put node named with the gpu_reload prefix whose
+    # input is a placeholder, takes the two preceding and three following nodes by graph position as the
+    # fork, wait_stream, record_event, join and wait_event nodes, validates them, and returns a mapping from the
+    # reload node to its ReloadNodeInfo (with transfer size and time).
+    # KNOWN ISSUE: calls _validate_pattern_nodes, which is not defined or imported in this module (noqa marked),
+    # so this raises NameError whenever any reload node matches.
     """
     Identify backward reload patterns in the graph.
 
@@ -662,6 +723,11 @@ def reorder_for_prefetch(
     nodes_list: list[fx.Node],
     reload_patterns: dict[fx.Node, ReloadNodeInfo],
 ) -> None:
+    # [FUNCTION DOC] Reorders graph nodes so reloads start earlier. Iterates nodes in reverse: a reload is queued with
+    # its transfer time; for other nodes the first queued reload's remaining time is reduced by the benchmarked
+    # runtime of compute nodes, and once it reaches zero the reload's group nodes are placed just before the
+    # current node (in order). At a placeholder, all still-queued reloads are placed after it and the loop ends.
+    # Mutates the graph via prepend and append; returns nothing.
     """
     Reorder nodes to prefetch reload operations by directly manipulating the graph.
 
@@ -717,6 +783,9 @@ def reorder_for_prefetch(
 
 
 def activation_offload_sink_wait(fwd_module: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Legacy stream-based variant: for every cpu_offload device_put node, takes the node three
+    # positions later as its wait_event node and moves all of them to just before the output node.
+    # Raises ValueError if that node is not a streams wait_event call. Mutates the graph in place.
     """
     Sink wait_event operations for offload completion to the end of the graph.
 
@@ -763,6 +832,8 @@ def activation_offload_sink_wait(fwd_module: fx.GraphModule) -> None:
 
 
 def activation_reload_prefetch(bwd_module: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Legacy stream-based variant: identifies reload patterns with identify_reload_patterns and
+    # reorders them for prefetch via reorder_for_prefetch. Mutates the backward graph in place.
     """
     Prefetch backward reload operations by moving them earlier in the graph
     to overlap communication with computation.
@@ -794,6 +865,10 @@ def enable_activation_offloading(
     num_fwd_outputs: int,
     static_lifetime_input_nodes: OrderedSet[fx.Node],
 ) -> None:
+    # [FUNCTION DOC] Entry point. Chooses and marks offload candidates; if none, returns. Otherwise, when the
+    # separate-stream config is on, applies async offloading (optionally sinking waits and prefetching reloads per
+    # config flags), else the synchronous device_put offloading. Finally lints both graphs.
+    # Mutates both graph modules in place.
     """
     Main entry point for activation offloading.
 

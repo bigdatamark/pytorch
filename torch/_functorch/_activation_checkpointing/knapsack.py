@@ -1,9 +1,20 @@
+# [MODULE DOC] Knapsack solvers used by the min-cut/memory-budget activation
+# checkpointing logic. Each solver takes per-item memory and runtime lists and a
+# memory budget, and returns (total saved runtime, indices of items to save,
+# indices of items allowed to be recomputed). Provides a greedy heuristic, an
+# exact ILP (scipy), a dense DP, and a low-memory divide-and-conquer DP.
+# No import-time side effects beyond importing torch.
 import torch
 
 
 def greedy_knapsack(
     memory: list[float], runtimes: list[float], max_memory: float
 ) -> tuple[float, list[int], list[int]]:
+    # [FUNCTION DOC] Greedy 0-1 knapsack heuristic. Sorts items by runtime/memory
+    # ratio (descending; memory must be nonzero or division raises) and saves
+    # each item that still fits in max_memory, otherwise marks it recomputable.
+    # Returns (total runtime of saved items, saved indices, recomputable indices).
+    # Not optimal. No side effects.
     n = len(runtimes)
     items = list(range(n))
 
@@ -28,6 +39,10 @@ def greedy_knapsack(
 def ilp_knapsack(
     memory: list[float], runtimes: list[float], max_memory: float
 ) -> tuple[float, list[int], list[int]]:
+    # [FUNCTION DOC] Exact 0-1 knapsack via scipy mixed-integer linear programming:
+    # maximizes saved runtime subject to total saved memory <= max_memory.
+    # Returns (optimal runtime, saved indices, recomputable indices).
+    # Raises RuntimeError if scipy is not installed or the solver fails.
     import numpy as np
 
     try:
@@ -64,6 +79,12 @@ def ilp_knapsack(
 def dp_knapsack(
     memory: list[float], runtime: list[float], max_memory: float
 ) -> tuple[float, list[int], list[int]]:
+    # [FUNCTION DOC] Exact (up to quantization) 0-1 knapsack via a full dynamic
+    # programming table on CPU. Memory values are scaled by 10000 and rounded to
+    # integers, so results are approximate to that resolution. The table costs
+    # O(items * quantized budget) memory. Zero-memory items are always saved.
+    # Backtracks to recover which items were saved. Returns (max runtime, saved
+    # indices in ascending order, recomputable indices in descending order).
     # Scaling factor to convert floating point weights to integers
     S = 10000
 
@@ -124,6 +145,15 @@ def dp_knapsack(
 def dp_knapsack_sliding_hirschberg(
     memory: list[float], runtime: list[float], max_memory: float
 ) -> tuple[float, list[int], list[int]]:
+    # [FUNCTION DOC] Same problem and quantization as dp_knapsack, but uses
+    # Hirschberg-style divide and conquer with a sliding single-row DP profile,
+    # so memory is O(quantized budget) instead of O(items * budget). Uses an
+    # explicit stack of (start, end, capacity) segments: each segment is split in
+    # half, forward profiles are computed for both halves, and the capacity split
+    # maximizing their sum is chosen; single-item segments decide save/recompute.
+    # Returns (sum of runtimes of saved items, sorted saved indices, recomputable
+    # indices in descending order); empty input returns (0.0, [], []).
+    # Note that items with nonpositive runtime are never saved.
     # Scaling factor to convert floating point weights to integers
     S = 10000
 

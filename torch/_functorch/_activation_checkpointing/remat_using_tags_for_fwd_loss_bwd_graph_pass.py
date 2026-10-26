@@ -1,3 +1,9 @@
+# [MODULE DOC] Activation-checkpoint rematerialization pass for a joint
+# forward-loss-backward graph. For backward regions that consume nodes tagged
+# must-recompute, it copies those forward nodes into the backward region, rebuilds
+# the graph, then runs dead code elimination and raise_getitems so the unused
+# forward copies disappear. Interoperates with the CPU offloading pass via the
+# cpu_offload_reload_node metadata. Import-time side effect: creates a module logger.
 """AC rematerialize pass: Duplicates recompute nodes for backward, then DCE removes unused forward versions."""
 
 import itertools
@@ -22,6 +28,11 @@ _EMPTY_CUSTOM_META: dict[str, object] = {}
 
 
 def is_impure_node_for_dce(node: fx.Node) -> bool:
+    # [FUNCTION DOC] Impurity predicate for dead code elimination. Collective ops (per
+    # is_not_collective being false) are treated as pure so unused ones can be removed;
+    # all other nodes use the node's own impurity check, where random ops count as impure
+    # unless a tracing context exists, in which case inductor's fallback_random config decides.
+    # Returns True if the node must be kept.
     # Check for special collectives that should be treated as pure
     if not is_not_collective(node):
         # It's a collective (wait_tensor, all_gather_into_tensor, etc.)
@@ -37,6 +48,9 @@ def is_impure_node_for_dce(node: fx.Node) -> bool:
 
 
 def _is_backward_node(node: fx.Node, use_phase: bool = False) -> bool:
+    # [FUNCTION DOC] HELPER: True if the node is in the backward region. With use_phase, checks the
+    # user custom metadata phase equals backward; otherwise reads the autograd_backward
+    # metadata flag (default False).
     """Check if node is in backward region.
 
     If use_phase is True, only checks custom["phase"] == "backward"
@@ -50,6 +64,7 @@ def _is_backward_node(node: fx.Node, use_phase: bool = False) -> bool:
 
 
 def _has_user_phase_annotation(gm: fx.GraphModule) -> bool:
+    # [FUNCTION DOC] HELPER: True if any graph node has custom metadata phase equal to backward.
     """Check if any node has the user-level phase: backward annotation."""
     return any(
         node.meta.get("custom", _EMPTY_CUSTOM_META).get("phase") == "backward"
@@ -65,6 +80,10 @@ def _collect_backward_regions(
     Regions are maximal contiguous runs of backward nodes, as [start, end)
     indices into the graph node list.
     """
+    # [FUNCTION DOC] HELPER: Scans graph nodes in order and returns one (start, end, needs_remat)
+    # tuple per maximal contiguous run of backward nodes (end exclusive). needs_remat is True
+    # if any node in the run has an input node tagged must-recompute. Requires recompute tags
+    # to have been normalized already. No side effects.
     regions: list[tuple[int, int, bool]] = []
     bwd_start: int | None = None
     needs_remat = False
@@ -102,6 +121,14 @@ def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModul
     skipped. Only one region may require remat; if multiple do, we error
     and ask the user to annotate which region to rematerialize.
     """
+    # [FUNCTION DOC] Rewrites a forward-loss-backward graph so that must-recompute forward nodes needed
+    # by the backward region are duplicated (named with a recomputed suffix, marked as backward)
+    # just before their first backward user. Returns the input unchanged if there are no
+    # recomputable ops or no backward region needing remat; otherwise returns a new recompiled
+    # GraphModule after dead code elimination and raise_getitems. Normalizes recompute tags and
+    # forces saving of backward-mutation sources via the partitioner helpers (mutating gm tags).
+    # Raises RuntimeError if recompute regions contain RNG ops, if multiple user-annotated
+    # backward regions exist, or if more than one region needs recomputation.
     if not has_recomputable_ops(gm):
         return gm
 
@@ -164,6 +191,8 @@ def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModul
         ``env`` yet (e.g. layer-boundary nodes whose reload is in a later
         backward region). This helper copies the chain on demand.
         """
+        # [FUNCTION DOC] HELPER: Recursively copies a node and its inputs into the new graph if not
+        # already mapped, records the copies in the environment mapping, and returns the copy.
         if node in env:
             return env[node]
         for dep in node.all_input_nodes:
@@ -177,6 +206,9 @@ def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModul
     def remat_input(x: Any) -> Any: ...
 
     def remat_input(x: object) -> object:
+        # [FUNCTION DOC] HELPER: Argument mapper used when copying backward nodes. Non-node values pass
+        # through; a node recomputed earlier maps to its recomputed copy; a node with offload reload
+        # metadata maps to its (lazily copied) reload node; otherwise to its copy in the environment.
         if not isinstance(x, fx.Node):
             return x
         if x in recomputed_nodes:
@@ -187,9 +219,13 @@ def remat_using_tags_for_fwd_loss_bwd_graph(gm: fx.GraphModule) -> fx.GraphModul
         return env[x]
 
     def gather_recompute_deps(node: fx.Node) -> set[fx.Node]:
+        # [FUNCTION DOC] HELPER: Returns the set of not-yet-recomputed must-recompute nodes reachable
+        # through input edges from the given node (the node itself is not included).
         deps: set[fx.Node] = set()
 
         def _gather(n: fx.Node) -> None:
+            # [FUNCTION DOC] HELPER: Depth-first walk adding must-recompute nodes to the enclosing set,
+            # stopping at nodes already collected, already recomputed, or not marked must-recompute.
             if n in deps or n in recomputed_nodes or not must_recompute(n):
                 return
             deps.add(n)

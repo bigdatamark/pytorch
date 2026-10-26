@@ -1,3 +1,8 @@
+# [MODULE DOC] Offline evaluator for activation-checkpointing (knapsack) decisions.
+# Defines KnapsackEvaluator, which uses a GraphInfoProvider to estimate the
+# recomputation runtime and peak memory of a chosen save/recompute split, to
+# sweep memory budgets for a knapsack solver, and to pick a knee-point budget.
+# Imports networkx at import time; no other import-time side effects.
 import operator
 from collections import deque
 from collections.abc import Callable
@@ -10,6 +15,10 @@ from torch._functorch._activation_checkpointing.graph_info_provider import (
 
 
 class KnapsackEvaluator:
+    # [CLASS DOC] Evaluates a checkpointing strategy over a GraphInfoProvider.
+    # State: the provider (private attribute), which supplies node names, memories,
+    # runtimes and the recomputable-node graph. Methods are read-only analyses that
+    # return numbers or dictionaries; the provider is never modified.
     """
     This class evaluates the theoretical runtime and peak memory usage of a given checkpointing strategy.
     It takes in a graph and a list of nodes that are saved and recomputed, and then simulates the
@@ -20,6 +29,7 @@ class KnapsackEvaluator:
         self,
         graph_info_provider: GraphInfoProvider,
     ) -> None:
+        # [FUNCTION DOC] Stores the GraphInfoProvider used by all evaluation methods. No other side effects.
         self._graph_info_provider = graph_info_provider
 
     def _get_backward_memory_from_topologically_sorted_graph(
@@ -29,6 +39,15 @@ class KnapsackEvaluator:
         saved_nodes_set: set[str],
         peak_memory_after_forward_pass: float,
     ) -> list[tuple[float, str]]:
+        # [FUNCTION DOC] HELPER: Simulates backward-pass memory over the recomputable node graph.
+        # Starts from the given post-forward memory, walks nodes in reverse topological order;
+        # saved or already recomputed nodes just release their memory, other nodes add their
+        # memory, then every unsaved, not-yet-recomputed transitive predecessor (breadth-first)
+        # is recomputed and adds its memory, and finally the node is dropped. Returns a list of
+        # (running memory, description) steps; the caller takes the maximum. No side effects.
+        # KNOWN ISSUE: the docstring omits node_memories and mentions a full-graph option that
+        # does not exist; the dependencies_computed set is filled and cleared but never read.
+        # Predecessors are never released after use, so memory can only grow within one node's chain.
         """
         Simulates the backward pass and keeps track of the peak memory usage.
 
@@ -112,6 +131,9 @@ class KnapsackEvaluator:
     def _validate_all_indexes_accounted_for_in_provided_output(
         self, saved_nodes_idxs: list[int], recomputable_node_idxs: list[int]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks that saved and recomputable index lists are disjoint and that
+        # their union equals every index of the provider's recomputable banned nodes.
+        # Raises AssertionError on overlap or on missing/extra indices. No other side effects.
         """
         Validate that all indexes are accounted for in the provided output.
         This function checks that the union of saved nodes and recomputable nodes
@@ -145,6 +167,13 @@ class KnapsackEvaluator:
         recomputable_node_idxs: list[int],
         account_for_backward_pass: bool = False,
     ) -> dict[str, float]:
+        # [FUNCTION DOC] Scores a save/recompute split given as index lists into the provider's
+        # recomputable banned nodes. Validates the split, sums runtimes of recomputed nodes, and
+        # computes peak memory either as the sum of saved-node memories or, if
+        # account_for_backward_pass is set, as the maximum from the backward simulation.
+        # Returns a dict with peak_memory, recomputation_runtime, non_ac_peak_memory,
+        # theoretical_max_runtime and the two percentage ratios against those baselines.
+        # Raises AssertionError for an invalid split; division by zero if a baseline is zero.
         """
         Evaluate the theoretical runtime and peak memory usage of a given checkpointing strategy.
         Args:
@@ -201,6 +230,10 @@ class KnapsackEvaluator:
         ],
         memory_budget_values: list[float],
     ) -> list[dict[str, float]]:
+        # [FUNCTION DOC] For each memory budget, runs the knapsack algorithm on the provider's memory
+        # and runtime inputs, evaluates the resulting split (without backward simulation), and
+        # returns a list of result dicts (as in evaluate_knapsack_output) each with an added
+        # memory_budget entry. No side effects.
         """
         Evaluates the distribution of results for a given knapsack algorithm.
         Args:
@@ -231,6 +264,11 @@ class KnapsackEvaluator:
         min_mem_budget: float = 0.001,
         iterations: int = 100,
     ) -> float:
+        # [FUNCTION DOC] Evaluates the algorithm over evenly spaced budgets from min_mem_budget to
+        # max_mem_budget (iterations points), normalizes the runtime and memory percentages to
+        # 0..1, and returns the budget whose point is closest to the origin. If either metric is
+        # constant across budgets, returns max_mem_budget.
+        # KNOWN ISSUE: iterations equal to 1 divides by zero when building the budget list.
         """
         Finds the memory budget at the knee point in the Pareto frontier.
 

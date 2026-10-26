@@ -1,3 +1,11 @@
+# [MODULE DOC] Custom ops (namespace ao) for asynchronous activation offloading
+# between accelerator and pinned CPU memory: ao.offload (D2H copy), ao.reload
+# (H2D copy) and ao.wait_tensor (synchronizes the transfer and frees the source).
+# Transfers run on one lazily created transfer stream per device; completion
+# events are tracked in a module-level registry keyed by output data pointer.
+# Also holds an optional pinned-memory buffer pool. Import-time side effects:
+# registers the ops, fake implementations, and a side-effect marker for wait_tensor
+# on the "ao" library.
 """Custom ops for async activation offloading between GPU and CPU.
 
 These ops encapsulate stream management internally, producing a clean 2-node
@@ -33,6 +41,7 @@ _transfer_streams: dict[torch.device, torch.Stream] = {}
 
 
 def _get_or_create_transfer_stream(device: torch.device) -> torch.Stream:
+    # [FUNCTION DOC] HELPER: Returns the cached transfer stream for the device, creating and storing a new one in the module-level mapping on first use.
     if device not in _transfer_streams:
         _transfer_streams[device] = torch.Stream(device=device)
     return _transfer_streams[device]
@@ -50,6 +59,9 @@ _pool_managed_ptrs: set[int] = set()
 
 
 def _maybe_pool_alloc(numel: int, dtype: torch.dtype) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns a flat pinned CPU buffer of numel elements. When pooling is enabled, pops a
+    # cached buffer for the (numel, dtype) key or allocates one, and records its data pointer as pool-managed;
+    # otherwise always allocates fresh pinned memory.
     """Get a pinned CPU buffer from the pool (if enabled), or allocate fresh."""
     if _pool_enabled:
         key = (numel, dtype)
@@ -65,6 +77,8 @@ def _maybe_pool_alloc(numel: int, dtype: torch.dtype) -> torch.Tensor:
 
 
 def _pool_free(buf: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: If the buffer's data pointer is pool-managed, appends it to the pool bucket for
+    # its (element count, dtype); otherwise releases it by resizing its storage to zero (if non-empty).
     """Return a pinned buffer to the pool, or free its storage if pool disabled."""
     ptr = buf.data_ptr()
     if ptr in _pool_managed_ptrs:
@@ -77,6 +91,7 @@ def _pool_free(buf: torch.Tensor) -> None:
 
 
 def _pool_clear() -> None:
+    # [FUNCTION DOC] HELPER: Empties the pinned pool and the set of managed pointers, dropping buffer references.
     """Free all cached pinned buffers."""
     _pinned_pool.clear()
     _pool_managed_ptrs.clear()
@@ -87,6 +102,9 @@ import contextlib
 
 @contextlib.contextmanager
 def pinned_memory_pool(enabled: bool = True):
+    # [FUNCTION DOC] Context manager toggling the global pooling flag for its duration; yields nothing.
+    # On exit restores the previous flag, and if pooling was previously off, also clears the pool
+    # (freeing cached pinned buffers). Nestable.
     """Context manager that controls pinned memory pooling for offload ops.
 
     Without this context manager, ``ao.offload`` allocates a fresh pinned
@@ -120,6 +138,8 @@ _wait_registry: dict[int, tuple[torch.Event, torch.device]] = {}
 
 
 def _register_wait(tensor: torch.Tensor, device: torch.device) -> torch.Event:
+    # [FUNCTION DOC] HELPER: Creates a new event, stores (event, device) in the wait registry under the
+    # tensor's data pointer (overwriting any prior entry), and returns the event.
     """Create an event for an async transfer and register it for wait_tensor."""
     event = torch.Event()
     _wait_registry[tensor.data_ptr()] = (event, device)
@@ -127,6 +147,8 @@ def _register_wait(tensor: torch.Tensor, device: torch.device) -> torch.Event:
 
 
 def _pop_wait(tensor: torch.Tensor) -> tuple[torch.Event, torch.device]:
+    # [FUNCTION DOC] HELPER: Removes and returns the (event, device) registered for the tensor's data pointer.
+    # Raises RuntimeError if no transfer is pending (wait without matching offload or reload).
     key = tensor.data_ptr()
     try:
         return _wait_registry.pop(key)
@@ -138,11 +160,17 @@ def _pop_wait(tensor: torch.Tensor) -> tuple[torch.Event, torch.device]:
 
 
 def _clear_wait_registry() -> None:
+    # [FUNCTION DOC] HELPER: Drops all pending wait entries.
     _wait_registry.clear()
 
 
 @custom_op("ao::offload", mutates_args=())
 def offload(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Custom op ao::offload. Makes the transfer stream wait for the current stream, then on the
+    # transfer stream allocates a pinned CPU buffer shaped like the input, registers a completion event keyed
+    # by its data pointer, issues a non-blocking copy, records the event, and restores the current stream.
+    # Returns the CPU tensor, whose data is valid only after a matching ao.wait_tensor.
+    # Side effects: stream switching, wait registry insertion, pooled buffer use.
     """Async offload a GPU tensor to CPU on the dedicated transfer stream.
 
     Callers MUST pair this with an ``ao.wait_tensor`` that passes the source GPU
@@ -171,6 +199,7 @@ def offload(tensor: torch.Tensor) -> torch.Tensor:
 
 @offload.register_fake
 def _(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Fake (meta) implementation of ao::offload: returns an empty CPU tensor of the input's shape and dtype.
     return torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
 
 
@@ -181,6 +210,11 @@ def reload(
     original_size: list[int] | None = None,
     original_stride: list[int] | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Custom op ao::reload. Allocates an uninitialized device tensor (on the compute stream) with the
+    # given original size and stride, or the input's own when those are None. Registers a completion event for it,
+    # then on the transfer stream issues a non-blocking host-to-device copy and records the event.
+    # Returns the device tensor, valid only after a matching ao.wait_tensor. Side effects: stream switching,
+    # wait registry insertion.
     """Async reload a CPU tensor to GPU on the dedicated transfer stream.
 
     The GPU tensor is allocated on the compute stream to avoid cross-stream
@@ -216,6 +250,8 @@ def _(
     original_size: list[int] | None = None,
     original_stride: list[int] | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Fake (meta) implementation of ao::reload: returns an empty strided tensor on the target device using the
+    # original size and stride when given, otherwise the input's.
     size = original_size if original_size is not None else list(tensor.shape)
     stride = original_stride if original_stride is not None else list(tensor.stride())
     return torch.empty_strided(size, stride, dtype=tensor.dtype, device=device)
@@ -260,6 +296,11 @@ def _ao_wait_tensor(
     keepalive: torch.Tensor | None = None,
     last_use_of_storage: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Implementation of ao::wait_tensor. Pops the pending event for the tensor (RuntimeError if none),
+    # makes the current stream of the event's device wait on it, then if keepalive is given releases its
+    # memory: pinned tensors go back to the pinned pool (or are freed), others have their storage resized to zero.
+    # Returns the input tensor (aliased). last_use_of_storage is accepted only to create a graph dependency
+    # and is otherwise unused.
     completion_event, device = _pop_wait(tensor)
     current_stream = torch.accelerator.current_stream(device)
 
@@ -281,6 +322,7 @@ def _ao_wait_tensor_fake(
     keepalive: torch.Tensor | None = None,
     last_use_of_storage: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Fake (meta) implementation of ao::wait_tensor: returns the input unchanged.
     return tensor
 
 
@@ -292,5 +334,6 @@ def wait_tensor(
     keepalive: torch.Tensor | None = None,
     last_use_of_storage: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Thin Python wrapper that calls the ao wait_tensor op overload with the given arguments and returns its result.
     """Callable wrapper so ``wait_tensor`` can be imported by name for op registration."""
     return torch.ops.ao.wait_tensor.default(tensor, keepalive, last_use_of_storage)
