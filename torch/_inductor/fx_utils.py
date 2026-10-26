@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FX graph utilities for Inductor: pattern matching of module+function node pairs, fake tensor
+# metadata comparison, FakeTensorUpdater (incremental re-propagation of node.meta['val'] after graph edits,
+# including HOP subgraphs), helpers to fetch fake values/storages from nodes, realization and flop counting helpers.
+# No import-time side effects beyond imports.
 import contextlib
 import operator
 import warnings
@@ -45,6 +49,9 @@ def matches_module_function_pattern(
     node: torch.fx.Node,
     modules: dict[str, torch.nn.modules.Module],
 ) -> bool:
+    # [FUNCTION DOC] Return True if node matches a (module class, function/method) pattern: node's first arg is a
+    # call_module node whose module type is exactly pattern[0], node is a call_function/call_method targeting pattern[1],
+    # and the module output has no other users. Pure predicate, no mutation.
     if len(node.args) == 0:
         return False
     if not isinstance(node.args[0], torch.fx.Node) or not isinstance(
@@ -81,6 +88,10 @@ def _is_fake_tensor_same(
     node: torch.fx.Node | None = None,
     recursive_ids: OrderedSet[tuple[int, int]] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether new and old fake values are equivalent. Handles None, collections (recursive,
+    # with a visited-pair set to cut cycles), symbolic ints/floats/bools, and tensors (layout, dtype, shape, device, optionally
+    # strides, storage offset and storage identity). Non-tensor leaves compare by equality. When storage differs, still
+    # returns True if the old storage was unique, the new one is fresh, and no user of node may alias it. Returns a bool.
     """Validate that two FakeTensors (or iterables thereof) are the same, including
     storage locations if enabled.
 
@@ -92,6 +103,7 @@ def _is_fake_tensor_same(
     be supplied by users of this function."""
 
     def is_intlist_same(new, old):
+        # [FUNCTION DOC] HELPER: Compare two size/stride sequences, using a fast identity/concrete-int check first and falling back to symbolic static equality.
         # sym_eq builds a symbolic conjunction and statically_known_true then
         # evaluates it, which is a lot of work for the common case where the
         # two sizes/strides are the very same objects. Identity, or equality
@@ -176,6 +188,9 @@ def _is_fake_tensor_same(
         return False
 
     def any_user_may_alias(node):
+    # [FUNCTION DOC] HELPER: Conservatively decide whether any user of node may alias its output storage. Returns True for
+    # non-tensor values, non-operator users, or unresolvable args; otherwise runs fake propagation for each non-HOP user
+    # under the fake mode (ignoring fresh unbacked symbols) and checks whether the result shares storage with the node.
         if not isinstance(node.meta["val"], torch.Tensor):
             # analysis too complicated on lists, can support in the future
             return True
@@ -240,6 +255,10 @@ def _extract_subgraphs_and_args(
     *args: Any,
     **kwargs: Any,
 ) -> Generator[tuple[torch.fx.GraphModule, tuple[Any, ...] | None]]:
+    # [FUNCTION DOC] HELPER: Generator that, for a higher-order-op node, yields pairs of (subgraph, args to feed its
+    # placeholders) for every subgraph the HOP invokes, restricted to valid_subgraphs where noted. The second element is None
+    # when the args cannot be determined (unknown HOP, a warning is emitted and all contained valid subgraphs are yielded).
+    # Raises an error if flex_attention subgraph signatures differ from expectations or control_deps is given kwargs.
     """HOPs that invoke subgraphs take a number of different forms.  This function
     regularizes them, yielding subgraphs from the args and kwargs coupled with
     appropriate args to update those subgraphs.
@@ -250,11 +269,13 @@ def _extract_subgraphs_and_args(
     def get_subgraph_args(
         subgraph: torch.fx.GraphModule,
     ) -> tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] HELPER: Return the fake values of all placeholder nodes of a subgraph as a tuple.
         return tuple(
             get_fake(n, subgraph) for n in subgraph.graph.find_nodes(op="placeholder")
         )
 
     def is_integer(d: torch.dtype) -> bool:
+        # [FUNCTION DOC] HELPER: True if the dtype is neither floating point nor complex.
         return not d.is_floating_point and not d.is_complex
 
     if node.target is torch.ops.higher_order.associative_scan:
@@ -404,6 +425,7 @@ def _extract_subgraphs_and_args(
             wrapped_node = wrapped_nodes[0]
 
             def replace_placeholder(item: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Replace a node that is a subgraph placeholder with its bound argument; other items pass through unchanged.
                 if isinstance(item, torch.fx.Node):
                     return placeholder_to_arg.get(item, item)
                 return item
@@ -434,6 +456,7 @@ def _extract_subgraphs_and_args(
 
 @dataclass(frozen=True)
 class _FxNodeHash:
+    # [CLASS DOC] HELPER: Frozen record of a node, its target, and hashes of its args and kwargs; used to detect changed nodes.
     node: torch.fx.Node
     target: torch.fx.node.Target
     arg_hashes: tuple[int, ...]
@@ -441,6 +464,10 @@ class _FxNodeHash:
 
 
 class FakeTensorUpdater:
+    # [CLASS DOC] Incrementally maintains fake tensor metadata (node.meta['val']) of a GraphModule as it is transformed.
+    # State: processed_hashes (node hashes seen in last update), tracked_node_ids (ids of nodes seen), gm, and
+    # subgraph_updaters (one child updater per subgraph module). incremental_update re-runs fake propagation only for
+    # changed nodes and their transitive users. Outer graph IO semantics are assumed fixed; subgraphs may change strides.
     """
     The main idea here is that it's difficult to maintain accurate fake
     tensors (our primary form of metadata) for each node in our graph as we
@@ -466,6 +493,8 @@ class FakeTensorUpdater:
     """
 
     def __init__(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] Record hashes and ids of all current nodes of gm and recursively create updaters for its subgraphs
+        # (imported lazily to avoid a circular import).
         self.processed_hashes = OrderedSet[_FxNodeHash]()
         self.tracked_node_ids: OrderedSet[int] = OrderedSet()
         self.gm = gm
@@ -483,13 +512,16 @@ class FakeTensorUpdater:
             self.tracked_node_ids.add(id(node))
 
     def hash_node(self, node: torch.fx.Node) -> _FxNodeHash:
+        # [FUNCTION DOC] Build an _FxNodeHash for node from its target and hashes of args and kwargs items (ids used for unhashable values).
         def get_hash_or_ids(n_iter: Iterable[Any]) -> tuple[int, ...]:
+            # [FUNCTION DOC] HELPER: Hash each item of an iterable, falling back to id for unhashable items; returns a tuple of ints.
             """Replace unhashable items from the input with the ids of those items, and
             hash all other items.  This is kludgy, but allows us to attempt to account
             for unhashable classes like torch.fx.Node when hashing args and kwargs for
             other nodes."""
 
             def get_hash_or_id(o: object) -> int:
+                # [FUNCTION DOC] HELPER: Return hash of the object, or its id if hashing raises.
                 try:
                     return hash(o)
                 except Exception:
@@ -505,6 +537,11 @@ class FakeTensorUpdater:
         )
 
     def incremental_update(self) -> int:
+        # [FUNCTION DOC] Walk the graph in order and recompute fake tensors of nodes whose hash changed, whose inputs changed,
+        # or which invoke subgraphs; changed nodes mark their users for processing. Subgraph placeholders are updated (stride
+        # changes only) and subgraphs updated recursively. Nodes with Inductor lowering functions use metadata hooks or are
+        # only validated. Mutates node.meta (val, unbacked_bindings) and refreshes processed_hashes/tracked_node_ids.
+        # Returns the count of nodes updated. Raises errors for unsupported lowering-node changes or inconsistent subgraph args.
         """Update FakeTensors on self.graph. We will try to do the minimum amount of work.
 
         Returns the number of nodes updated, including recursive updates on subgraphs."""
@@ -514,6 +551,7 @@ class FakeTensorUpdater:
                 existing_storages[storage] += 1
 
         def should_process_node(node: torch.fx.Node) -> bool:
+            # [FUNCTION DOC] HELPER: True if node target is callable and not a clean Inductor lowering function.
             return (
                 callable(node.target)
                 # Dirty Inductor lowerings are handled by the guard below. Clean
@@ -524,6 +562,7 @@ class FakeTensorUpdater:
         def node_invokes_subgraph(
             node: torch.fx.Node, *args: Any, **kwargs: Any
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if a call_function node (excluding auto_functionalized) has args containing a tracked subgraph.
             return (
                 node.op == "call_function"
                 and node.target
@@ -542,6 +581,9 @@ class FakeTensorUpdater:
             )
 
         def update_node_fake_tensor(node: torch.fx.Node, new_fake_tensor: Any) -> bool:
+            # [FUNCTION DOC] HELPER: Store new_fake_tensor as the node's val if it differs from the existing one; rebinds unbacked
+            # symbols, refreshes unbacked bindings and storage counts, and schedules users for reprocessing (except for
+            # storage-only changes feeding lowering nodes that ignore input storage). Returns True if the node was updated.
             if "val" in node.meta and _is_fake_tensor_same(
                 new_fake_tensor, node.meta["val"], existing_storages, node=node
             ):
@@ -593,6 +635,8 @@ class FakeTensorUpdater:
         def get_lowering_input_metadata(
             node: torch.fx.Node, input_name: int | str
         ) -> Any:
+            # [FUNCTION DOC] HELPER: Fetch fake values for a positional or keyword input of a lowering node. Raises RuntimeError
+            # if any input node has no fake metadata.
             raw_input = (
                 node.args[input_name]
                 if isinstance(input_name, int)
@@ -600,6 +644,7 @@ class FakeTensorUpdater:
             )
 
             def has_missing_fake_metadata(input_node: torch.fx.Node) -> bool:
+                # [FUNCTION DOC] HELPER: True if the node has no val, example_value, or resolvable get_attr value.
                 return not (
                     "val" in input_node.meta
                     or "example_value" in input_node.meta
@@ -811,10 +856,12 @@ class FakeTensorUpdater:
 
 
 def get_storage(t: torch.Tensor) -> int:
+    # [FUNCTION DOC] Return the C-level identifier (cdata) of the tensor's untyped storage as an int.
     return t.untyped_storage()._cdata
 
 
 def get_node_storage(node: torch.fx.Node) -> int | None:
+    # [FUNCTION DOC] Return the storage id of the node's fake value, or None if it has no tensor val or the tensor has no storage.
     if "val" not in node.meta:
         return None
     if not isinstance(node.meta["val"], torch.Tensor):
@@ -825,6 +872,8 @@ def get_node_storage(node: torch.fx.Node) -> int | None:
 
 
 def get_fake(x: Any, gm: torch.fx.GraphModule | None) -> Any:
+    # [FUNCTION DOC] Resolve a node to its fake value (val, then example_value, then module attribute for get_attr);
+    # returns None if unresolvable; non-node inputs are returned as is.
     """Return a fake tensor from the meta values of an input FX node.  If the input node
     is a get_attr node, we attempt to resolve it as a member of gm."""
     if isinstance(x, torch.fx.Node):
@@ -845,6 +894,8 @@ def get_fake(x: Any, gm: torch.fx.GraphModule | None) -> Any:
 def get_fake_args_kwargs(
     x: torch.fx.Node, gm: torch.fx.GraphModule | None = None
 ) -> tuple[bool, tuple[Any, ...], dict[str, Any]]:
+    # [FUNCTION DOC] Map node args and kwargs to fake values. Returns (is_valid, args, kwargs) where is_valid is False if
+    # any Node remains unresolved.
     """
     First value returns a boolean if any of the input nodes don't have a faketensor and
     weren't resolved from gm.
@@ -858,6 +909,8 @@ def get_fake_args_kwargs(
 
 
 def is_node_realized(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Heuristically decide if the node is always realized in Inductor IR: buffers (placeholders, outputs,
+    # fallback kernels, getitems of such) or nodes with a user that needs realized inputs. May give false negatives.
     """Returns true if a node is always realized when lowered to inductor IR.
 
     NOTE: This may return some false negatives. e.g. it doesn't
@@ -867,6 +920,7 @@ def is_node_realized(node: torch.fx.Node) -> bool:
     from torch._inductor.lowering import fallbacks, needs_realized_inputs
 
     def is_buffer(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if node is a placeholder/output/fallback op, following getitem to its source node.
         if node.op == "call_function" and node.target is operator.getitem:
             # For nodes with multiple outputs, we get the fx graph:
             #     foo = torch.ops.aten.foo(...)
@@ -880,6 +934,7 @@ def is_node_realized(node: torch.fx.Node) -> bool:
         return True
 
     def realizes_inputs(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if node is an output or a target that needs realized inputs.
         return node.op == "output" or node.target in needs_realized_inputs
 
     if any(realizes_inputs(user) for user in node.users):
@@ -890,6 +945,8 @@ def is_node_realized(node: torch.fx.Node) -> bool:
 
 
 def count_flops_fx(node: torch.fx.Node) -> int | None:
+    # [FUNCTION DOC] Count flops of an FX node via fake inputs (flex_attention uses registered formulas, others use
+    # FlopCounterMode). Returns an int, or None if not countable or inputs lack fake values.
     if not countable_fx(node) or isinstance(node.target, str):
         return None
     with FakeTensorMode(allow_non_fake_inputs=True):
@@ -917,6 +974,7 @@ def count_flops_fx(node: torch.fx.Node) -> int | None:
 
 
 def countable_fx(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] True if the node's target (or its overload packet) has a flop formula registered. Raises an error if not a Node.
     """
     Whether or not we can count the flops of an FX node.
     """
