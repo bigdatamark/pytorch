@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# C++ FlexAttention template for Inductor's CPU backend. Holds Jinja/C++ source strings
+# (softmax fusion helpers, VNNI pack helpers, buffer allocation, parameter setup, the
+# flash-attention loop and the flash-decoding loop) and CppFlexAttentionTemplate, which
+# assembles them with user score_mod/mask_mod subgraphs compiled to C++ loop code.
+# Import-time side effects: creates the module logger and constant strings only.
 # mypy: allow-untyped-defs
 import contextlib
 import logging
@@ -1060,6 +1066,12 @@ FLEX_DECODING_TEMPLATE = r"""
 
 
 class CppFlexAttentionTemplate(CppTemplate):
+    # [CLASS DOC] CPU template generating C++ for FlexAttention. State: scale, score_mod
+    # and mask_mod subgraph buffers (registered in the graph, with numeric name indices),
+    # kv/q block sizes, decoding partition size, extra "other" buffer bookkeeping
+    # (offsets, lengths, other_ptr_data mapping of pointer names), fake buffers for dtype
+    # patching, and extra size variables. Picks the flash-attention or flash-decoding
+    # body at render time. Key methods: render, modification, choose_flex_template.
     """
     CPP template based FlexAttention CPP Template.
 
@@ -1087,6 +1099,14 @@ class CppFlexAttentionTemplate(CppTemplate):
         kernel_input_name_to_buffer,
         block_vars,
     ) -> None:
+        # [FUNCTION DOC] Stores all configuration and calls the base template constructor
+        # (name flex_attention, parallel thread count). Registers score_mod/mask_mod in the
+        # graph to get buffer names and extracts their numeric indices. Computes the
+        # input offset of other buffers (0 if no full kv block, else 2), the extra size
+        # variables (sympy symbols among kernel inputs), and the slices of input nodes for
+        # score and mask other buffers (None if there are none).
+        # Raises an error if the layout dtype is not float32, bfloat16 or float16, or a
+        # buffer name has no digits. Side effect: V.graph.register_buffer.
         if layout.dtype not in [torch.float, torch.bfloat16, torch.float16]:
             raise AssertionError(f"unsupported layout dtype: {layout.dtype}")
         super().__init__("flex_attention", input_nodes, layout, parallel_num_threads())
@@ -1101,6 +1121,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         )
 
         def get_idx(buf_name):
+            # [FUNCTION DOC] HELPER: Returns the first run of digits in the buffer name as
+            # a string; raises an error if there is none.
             match = re.search(r"\d+", buf_name)
             if not match:
                 raise AssertionError(f"incorrect score buf name: {buf_name}")
@@ -1153,6 +1175,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         self.other_ptr_data = {}  # type: ignore[var-annotated]
 
     def update_kernel_args(self, kernel_args):
+        # [FUNCTION DOC] Adds every non-symbol entry of the kernel input name to buffer
+        # mapping to kernel_args (mutated in place) and returns it.
         kernel_args.update(
             {
                 key: value
@@ -1163,15 +1187,24 @@ class CppFlexAttentionTemplate(CppTemplate):
         return kernel_args
 
     def generate_other_buffer(self, buf_list, start_offset, len_attr, kernel_args):
+        # [FUNCTION DOC] Emits C++ pointer aliases for the extra buffers used by score/mask
+        # mods. Returns an empty string if there are no other buffers. A start_offset of -1
+        # means after the score buffers. For each buffer (count read from the attribute
+        # named by len_attr) it records, if new, a pointer name (numbered from index 5 plus
+        # offset) mapped to the kernel arg name and buffer; returns declarations for ALL
+        # recorded pointers, joined by newlines. Mutates other_ptr_data.
         kernel_input_name_to_buffer_name = {
             key: value if isinstance(value, sympy.Symbol) else value.get_name()
             for key, value in self.kernel_input_name_to_buffer.items()
         }
 
         def get_arg(name):
+            # [FUNCTION DOC] HELPER: Looks up the buffer name (or symbol) for an input key.
             return kernel_input_name_to_buffer_name.get(name)
 
         def get_arg_name(name):
+            # [FUNCTION DOC] HELPER: Returns the kernel argument name for an input key,
+            # from sizevars for symbols or from input buffers otherwise.
             if isinstance(get_arg(name), sympy.Symbol):
                 return kernel_args.sizevars.get(get_arg(name))
             return kernel_args.input_buffers.get(get_arg(name))
@@ -1197,6 +1230,13 @@ class CppFlexAttentionTemplate(CppTemplate):
         )
 
     def modification(self, subgraph_buffer, output_name, output_idx):
+        # [FUNCTION DOC] Compiles a score/mask modification subgraph (must be a computed
+        # buffer, else an error is raised) into C++ loop code. Sets up a kernel group whose
+        # inputs are score, b, h, q_idx, kv_idx pointers plus other buffers, and whose
+        # output is out_ptr<output_idx>; builds a loop body that stores the subgraph
+        # result, checks all loaded buffers are known inputs, generates unparallelized
+        # loops, and rewrites the symbolic q/kv block size variables back to the runtime
+        # names cur_qSplitSize and cur_kvSplitSize. Returns the code string.
         if not isinstance(subgraph_buffer, ir.ComputedBuffer):
             raise AssertionError(
                 f"expected ir.ComputedBuffer, got {type(subgraph_buffer)}"
@@ -1247,6 +1287,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         output_index = dst_layout.make_indexer()([*var_ranges.keys()])
 
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Loop body function; stores the subgraph value loaded
+            # at the given indices into the output buffer at the layout-derived index.
             V.ops.store(
                 output_name,
                 output_index,
@@ -1277,6 +1319,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         cpp_kernel_proxy.codegen_loop_bodies(bodies, var_sizes_list)
 
         def max_parallel_depth():
+            # [FUNCTION DOC] HELPER: Patched replacement that reports zero parallel depth
+            # so the generated loop is not parallelized.
             return ParallelDepth(parallel_depth=0, start_depth=0)
 
         # This loop is not parallelized since it is not the outermost loop.
@@ -1322,10 +1366,15 @@ class CppFlexAttentionTemplate(CppTemplate):
         kernel_input_name_to_buffer,
         block_vars,
     ):
+        # [FUNCTION DOC] Static method: wraps this template class with identity pre- and
+        # post-processors in a DataProcessorTemplateWrapper using all given settings,
+        # appends it as a choice to the choices collection (mutated), and returns the wrapper.
         def preprocessor(input_nodes, layout):
+            # [FUNCTION DOC] HELPER: Identity; returns inputs and layout unchanged.
             return input_nodes, layout
 
         def postprocessor(output):
+            # [FUNCTION DOC] HELPER: Identity; returns output unchanged.
             return output
 
         template = DataProcessorTemplateWrapper(
@@ -1352,6 +1401,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         return template
 
     def apply_score_mod(self, score, b, h, q_idx, kv_idx):
+        # [FUNCTION DOC] Runs the score_mod graph module on the given score and indices
+        # and returns the resulting scalar via item conversion.
         return self.score_mod.graph_module(score, b, h, q_idx, kv_idx).item()
 
     def choose_flex_template(
@@ -1360,6 +1411,10 @@ class CppFlexAttentionTemplate(CppTemplate):
         key: ir.Buffer,
         num_threads,
     ):
+        # [FUNCTION DOC] Returns the C++ body template: flash attention by default; flash
+        # decoding only if all of batch, heads, q length, k length and thread count are
+        # static numbers, the partition size is a multiple of the kv block size, the q
+        # length is 1, and k length per batch is at least max(2 * partition size, 512).
         # choose from FLEX_ATTENTION or FLEX_DECODING
         FLEX_TEMPLATE = FLEX_ATTENTION_TEMPLATE
         q_batch_size, q_num_heads, q_seq_len, _ = query.data.data.layout.size  # type: ignore[attr-defined]
@@ -1387,6 +1442,13 @@ class CppFlexAttentionTemplate(CppTemplate):
         epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC] Renders the full C++ kernel source. Raises NotImplementedError if
+        # epilogue nodes are given. Permutes query/key/value to batch, seq, heads, dim
+        # layout, sets accumulate dtype to float32 and input dtype from query, builds the
+        # option mapping (inputs, optional full kv inputs, mods, block sizes, thread
+        # count, buffer names), then with fake buffer dtypes patched renders the shared
+        # parameter-setup template followed by the chosen attention/decoding template.
+        # Side effects: sets accumulate_dtype and input_dtype on the instance.
         if epilogue_nodes is not None and epilogue_nodes != []:
             raise NotImplementedError(
                 "Unsupported for `epilogue_nodes` in CppFlexAttentionTemplate."
@@ -1451,18 +1513,23 @@ class CppFlexAttentionTemplate(CppTemplate):
             )
 
     def codegen_softmax_fusion(self, kernel_name: str):
+        # [FUNCTION DOC] Renders the softmax fusion helper C++ functions, prefixed by kernel_name.
         # TODO: use inductor IR to rewrite those fusions
         return self._template_from_string(SOFTMAX_FUSIONS).render(
             dict(kernel_name=kernel_name)
         )
 
     def codegen_brgemm_pack_function(self, kernel_name: str):
+        # [FUNCTION DOC] Renders the C++ copy-with-padding helper used for packing, prefixed by kernel_name.
         # TODO: make them general for common bmm templates
         return self._template_from_string(BRGEMM_PACK_FUNCTIONS).render(
             dict(kernel_name=kernel_name)
         )
 
     def codegen_allocate_buffer(self, buffer_name: str, buffer_dtype, buffer_size):
+        # [FUNCTION DOC] Renders C++ code that allocates a CPU work buffer of the given
+        # element count and dtype (item size 2 for reduced floats, else 4) and declares a
+        # typed pointer named buffer_name. Returns the code string.
         return self._template_from_string(ALLOCATE_BUFFER).render(
             dict(
                 buffer_name=buffer_name,
@@ -1472,6 +1539,11 @@ class CppFlexAttentionTemplate(CppTemplate):
         )
 
     def micro_gemm_define(self, kernel_name: str):
+        # [FUNCTION DOC] Builds two FP32 vector micro gemms with 1x16x1 blocking (one with
+        # transposed B, named with a transpose_b suffix, and one plain) using input and
+        # accumulate dtypes, generates their C++ definitions in a temporary template
+        # kernel under the current graph handler, and returns the plain code followed by
+        # the transposed code.
         from torch._inductor.codegen.cpp_gemm_template import (
             CppTemplateKernel,
             parallel_num_threads,
@@ -1510,6 +1582,8 @@ class CppFlexAttentionTemplate(CppTemplate):
         return code + code_trans
 
     def codegen_micro_gemm(self, kernel_name: str):
+        # [FUNCTION DOC] Inserts the micro gemm definitions into the micro gemm template
+        # placeholder and renders it; returns the C++ code string.
         micro_gemm = self.micro_gemm_define(kernel_name)
         GEMM_SOURCE_CODE = MICRO_GEMM_TEMPLATE.replace("GEMM_DEFINE", micro_gemm)
         return self._template_from_string(GEMM_SOURCE_CODE).render()

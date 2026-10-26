@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# C++ batched matrix multiply (BMM) template for Inductor's CPU backend. It reuses the
+# GEMM template: a single-threaded and a multi-threaded GEMM function are emitted, and a
+# driver loop over the batch dimension calls them with a symbolic batch index.
+# Main contents: stub/driver Jinja template strings and the CppBmmTemplate class.
+# No import-time side effects beyond defining constants and the class.
 # mypy: allow-untyped-defs
 import contextlib
 import itertools
@@ -79,6 +85,11 @@ extern "C"
 
 
 class CppBmmTemplate(CppGemmTemplate):
+    # [CLASS DOC] Batched matmul template built on CppGemmTemplate. Holds a symbolic
+    # batch index (b_index) used to slice the 3D inputs/outputs into 2D GEMM operands,
+    # so the GEMM template is reused unchanged. Renders a single-thread GEMM for most
+    # batches and a multi-thread GEMM for the remainder (batch count modulo threads).
+    # Key methods: get_options, render, get_gemm_function_call, codegen_*_gemm.
     def __init__(
         self,
         input_nodes,
@@ -92,6 +103,9 @@ class CppBmmTemplate(CppGemmTemplate):
         should_block_weights: bool = False,
         name="bmm",
     ):
+        # [FUNCTION DOC] Forwards all arguments to the GEMM template constructor, then
+        # creates the integer, nonnegative sympy symbol b_index used to index the batch
+        # dimension. Stores it on the instance. No return value.
         """
         In order to simplify the implementation and increase code reuse, the BMM template implements
         two versions of the GEMM kernel: a single-threaded version and a multi-threaded version.
@@ -118,6 +132,10 @@ class CppBmmTemplate(CppGemmTemplate):
 
     @staticmethod
     def get_padded_size(n, block_n, k, should_block_weight):
+        # [FUNCTION DOC] Computes the reshaped size of the weight and padded N. If
+        # blocking is requested, defers to the GEMM version and prepends a batch
+        # dimension of -1 (inferred); otherwise returns the size (-1, k, n) with n
+        # unchanged. Returns (new_size list, padded_n).
         if should_block_weight:
             # Tensor is constant or not contiguous, so we will pad and block
             new_size, padded_n = CppGemmTemplate.get_padded_size(
@@ -132,6 +150,13 @@ class CppBmmTemplate(CppGemmTemplate):
 
     @staticmethod
     def check_if_block_weight(W, micro_gemm):
+        # [FUNCTION DOC] Decides whether weight W must be padded and blocked. True if W
+        # is not contiguous, is a graph constant, or its last dim is not a multiple of
+        # the micro gemm block_n while the micro gemm B layout is not NORMAL.
+        # Raises an error if W is not an IR node.
+        # KNOWN ISSUE: the comparison uses the get_b_layout method object itself
+        # (not a call result) against LayoutType.NORMAL, so it is always unequal and
+        # that clause reduces to a pure divisibility test.
         if not isinstance(W, ir.IRNode):
             raise AssertionError(f"expected W to be an ir.IRNode, got {type(W)}")
         _, n = W.get_size()[-2:]
@@ -152,6 +177,11 @@ class CppBmmTemplate(CppGemmTemplate):
         placeholder: str,
         b_index: str,
     ) -> str:
+        # [FUNCTION DOC] Registers a deferred render hook on the kernel under the given
+        # placeholder and returns the placeholder. When the hook runs, it builds a call
+        # statement to function_name with the kernel's argument names, substituting the
+        # batch-index argument with the caller supplied b_index text.
+        # Raises an error if the placeholder already has a hook. Mutates kernel.render_hooks.
         """
         Similar to 'def_kernel' in cpp_template_kernel, but instead of generating a function definition,
         generate a function call for the GEMM kernel.
@@ -161,6 +191,8 @@ class CppBmmTemplate(CppGemmTemplate):
         """
 
         def hook():
+            # [FUNCTION DOC] HELPER: Render-time callback; returns the C++ call string
+            # with the batch-index argument replaced by the b_index text.
             arg_defs, call_args, _, _ = kernel.args.python_argdefs()
             for i, buf in enumerate(call_args):
                 if buf == self.b_index:
@@ -174,7 +206,10 @@ class CppBmmTemplate(CppGemmTemplate):
         return placeholder
 
     def get_default_reindexers(self, epilogues):
+        # [FUNCTION DOC] Returns one reindexer per epilogue node; each maps the 2D index
+        # arguments to the 3D range of the epilogue by prepending the batch index.
         def reindexer(args):
+            # [FUNCTION DOC] HELPER: Returns a list with b_index followed by args.
             # if epilogue nodes exist, they have 3D ranges but args are 2D, so add 0 index
             return [self.b_index] + args
 
@@ -188,6 +223,11 @@ class CppBmmTemplate(CppGemmTemplate):
         epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Builds Jinja render options. Calls the GEMM version, keeps the
+        # original 3D X/W/Y as BX/BW/BY (and BY_2d), then replaces X, W, GemmOut, Y_2d
+        # with views selected at b_index along dim 0 and sets their C++ dtype entries.
+        # Also adds b_index, BY_sizevars (free symbols of BY sizes and strides) and
+        # kernel_name. Returns the options mapping.
         options = super().get_options(
             kernel=kernel,
             template_buffer_node=template_buffer_node,
@@ -222,6 +262,11 @@ class CppBmmTemplate(CppGemmTemplate):
         epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC] Renders the full BMM C++ source. Builds options, stores them in
+        # render_options, renders BMM_TEMPLATE with fake buffer dtypes patched into the
+        # graph, finalizes the placeholders for the single/multi-thread GEMM hooks (those
+        # named for BMM), then removes those hooks and the b_index sizevar from the kernel.
+        # Returns the code string. Mutates kernel.render_hooks and kernel.args.sizevars.
         options = self.get_options(
             kernel=kernel,
             template_buffer_node=template_buffer_node,
@@ -251,6 +296,8 @@ class CppBmmTemplate(CppGemmTemplate):
             return result
 
     def codegen_single_thread_gemm(self):
+        # [FUNCTION DOC] Returns the kernel-definition stub for the single-thread GEMM
+        # followed by the GEMM template rendered with one thread.
         stub = self._template_from_string(GEMM_SINGLE_THREAD_MM_STUB).render(
             self.render_options
         )
@@ -259,6 +306,8 @@ class CppBmmTemplate(CppGemmTemplate):
         )
 
     def codegen_multi_thread_gemm(self):
+        # [FUNCTION DOC] Returns the kernel-definition stub for the threaded GEMM
+        # followed by the GEMM template rendered with the stored render options.
         stub = self._template_from_string(GEMM_THREADED_MM_STUB).render(
             self.render_options
         )
@@ -267,4 +316,5 @@ class CppBmmTemplate(CppGemmTemplate):
         )
 
     def codegen_gemm_stub_def(self):
+        # [FUNCTION DOC] Override that returns an empty string: BMM emits its own stubs.
         return ""
