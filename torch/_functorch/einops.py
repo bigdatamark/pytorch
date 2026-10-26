@@ -1,3 +1,7 @@
+# [MODULE DOC] Native einops-style "rearrange" exposed as torch.func.rearrange.
+# Defines only the public rearrange function; the pattern parsing and callable
+# construction live in functorch.einops.rearrange, imported lazily at call time
+# to avoid a circular import. No import-time side effects beyond decorator registration.
 from __future__ import annotations
 
 import torch
@@ -13,6 +17,12 @@ def rearrange(
     pattern: str,
     **axes_lengths: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Rearranges a tensor (or a list/tuple of same-shaped tensors, which are
+    # first stacked along a new leading dimension) according to an einops pattern string.
+    # axes_lengths supplies sizes for named axes that cannot be inferred from the pattern.
+    # Builds a rearrange callable for the tensor's rank, pattern and axis lengths, applies it
+    # and returns the resulting tensor. Errors for malformed patterns come from the callable
+    # builder. No global side effects.
     r"""A native implementation of `einops.rearrange`, a reader-friendly smart element reordering for multidimensional
     tensors. This operation includes functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
     stack, concatenate and other operations.

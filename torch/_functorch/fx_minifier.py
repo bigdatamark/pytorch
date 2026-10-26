@@ -1,3 +1,10 @@
+# [MODULE DOC] FX graph minifier: shrinks a failing torch.fx GraphModule (and its inputs) to a
+# smaller graph that still fails a user-supplied predicate. Contains ConcreteProp (an
+# interpreter that records concrete per-node values, optionally offloaded to disk), helpers
+# that turn nodes into placeholders or load_tensor calls, a ReproState dataclass, and the
+# minifier driver with its strategies (truncate suffix, remove outputs, remove unused inputs,
+# eliminate dead code, delta debugging, consolidate inputs). Progress is printed to stderr.
+# No import-time side effects other than defining a module-level sentinel is_tuple.
 from __future__ import annotations
 
 import copy
@@ -26,6 +33,8 @@ is_tuple = object()
 
 @dataclass
 class LoadTensorMeta:
+    # [CLASS DOC] HELPER: Lightweight record (size, stride, dtype, device) describing a tensor that
+    # was offloaded to disk, stored in node metadata so it can be reloaded via load_tensor.
     size: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: torch.dtype
@@ -33,6 +42,11 @@ class LoadTensorMeta:
 
 
 class ConcreteProp(torch.fx.Interpreter):
+    # [CLASS DOC] FX interpreter that runs a graph on real inputs and records each node's concrete
+    # result in node.meta under concrete_value: the tensor itself, a LoadTensorMeta (if offloaded
+    # through a ContentStoreWriter), None (aliasing tensors that cannot be offloaded) or the
+    # is_tuple sentinel for non-tensor results. State: writer, skip_offload, the set of seen
+    # storages (weak refs, used to detect aliasing) and a progress bar set during propagate.
     def __init__(
         self,
         mod: fx.GraphModule,
@@ -40,6 +54,9 @@ class ConcreteProp(torch.fx.Interpreter):
         writer: ContentStoreWriter | None = None,
         skip_offload: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initializes the interpreter for mod and stores the optional disk writer,
+        # the skip_offload flag (assume tensors are already on disk), an empty seen-storage set
+        # and an unset progress bar.
         super().__init__(mod)
         self.writer = writer
         self.skip_offload = skip_offload
@@ -47,6 +64,12 @@ class ConcreteProp(torch.fx.Interpreter):
         self.pbar: Any = None
 
     def run_node(self, n: fx.Node) -> Any:
+        # [FUNCTION DOC] Executes one node, advances the progress bar, and records the result in
+        # the node's metadata. Tensors: stored directly when there is no writer; with a writer,
+        # tensors sharing storage with an already seen tensor get None (not offloaded, to keep
+        # aliasing contracts), otherwise the tensor is written to disk under the eager directory
+        # (unless skip_offload) and a LoadTensorMeta is stored. Non-tensors get the is_tuple
+        # sentinel. Returns the real result. Requires self.pbar set by propagate.
         self.pbar.update(1)
         r = super().run_node(n)
         name = n.name
@@ -72,6 +95,10 @@ class ConcreteProp(torch.fx.Interpreter):
         return r
 
     def propagate(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Runs the whole module on args under a progress bar (disabled when there
+        # is no writer), populating concrete values on every node. Raises an error if the module
+        # is not a GraphModule. Returns the module output; updates the bar text after saving
+        # unless offloading is skipped.
         mod = self.module
         if not isinstance(mod, fx.GraphModule):
             raise AssertionError(f"expected fx.GraphModule, got {type(mod)}")
@@ -90,6 +117,7 @@ class ConcreteProp(torch.fx.Interpreter):
 
 
 def is_load_tensor_node(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the node is a call to the debugprims load_tensor op.
     return (
         node.op == "call_function"
         and node.target is torch.ops.debugprims.load_tensor.default
@@ -100,6 +128,12 @@ def is_load_tensor_node(node: fx.Node) -> bool:
 def _convert_node_to_placeholder(
     graph: fx.Graph, node: fx.Node, inps: list[torch.Tensor]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Mutates node in place to cut the graph at it, based on its recorded
+    # concrete value. Output, placeholder and load_tensor nodes are left alone (False). A tensor
+    # value turns the node into a placeholder and appends the tensor to inps (True). A missing
+    # value (None) does nothing. The tuple sentinel recurses into the node's users (node itself
+    # is not erased to keep iteration valid), returning True if any user changed. A LoadTensorMeta
+    # turns the node into a load_tensor call with the stored size/stride/device/dtype (True).
     if node.op == "output" or node.op == "placeholder":
         return False
 
@@ -150,6 +184,9 @@ def _convert_node_to_placeholder(
 def create_minified_hlo_graph(
     minified_fx_graph: fx.GraphModule, inputs: Sequence[torch.Tensor]
 ) -> None:
+    # [FUNCTION DOC] Converts a minified FX module to StableHLO via torch_xla and saves it into
+    # an hlo_files directory under the current working directory (created if missing). Side
+    # effects: filesystem writes; imports torch_xla lazily, so it raises ImportError if absent.
     """
     Takes minified FX graph as primary input, and ports it to HLO via StableHLO
     Provides minified HLO graph as output, and archive them to local directory
@@ -163,6 +200,9 @@ def create_minified_hlo_graph(
 
 
 def dump_state(fx_g: fx.GraphModule, inps: Sequence[torch.Tensor]) -> None:
+    # [FUNCTION DOC] Default state dumper: prints to stdout a runnable repro snippet containing the
+    # node count, input shapes/dtypes/devices, code to create dummy inputs (zeros/ones) and the
+    # graph's generated source. No return value.
     print(
         f"""
 # Working Repro with {len(fx_g.graph.nodes)} nodes
@@ -174,6 +214,7 @@ inps = [torch.zeros(())] + [torch.ones(shape, dtype=dtype, device=device) for (s
 
 
 def is_power_of_two(n: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if n is a positive power of two (zero gives False).
     if n == 0:
         return False
     return (n & (n - 1)) == 0
@@ -181,10 +222,14 @@ def is_power_of_two(n: int) -> bool:
 
 @dataclass
 class ReproState:
+    # [CLASS DOC] HELPER: A candidate minimization state: an FX graph plus its input tensors.
+    # Invariant (checked on construction): one input per placeholder node.
     graph: fx.Graph
     inps: Sequence[torch.Tensor]
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Validates that the number of placeholders equals the number of
+        # inputs; raises an assertion error otherwise.
         ph_nodes = get_placeholders(self.graph)
         if len(ph_nodes) != len(self.inps):
             raise AssertionError(
@@ -204,6 +249,20 @@ def minifier(
     skip_sanity: bool = False,
     max_granularity: int | None = None,
 ) -> tuple[fx.GraphModule, Sequence[torch.Tensor]]:
+    # [FUNCTION DOC] Minimizes a failing graph module while module_fails stays true. Steps: validate
+    # max_granularity (power of two, else RuntimeError); optionally create a ContentStoreWriter in
+    # save_dir (required when offload_to_disk); run ConcreteProp to record concrete values; unless
+    # skip_sanity, check the original graph fails (else RuntimeError). Then loop: at granularity
+    # equal to the largest power of two not above the node count (capped by max_granularity) try
+    # strategies (remove outputs when outputs are many, dead code elimination, unused-input
+    # removal, input consolidation, suffix truncation, delta debugging); on success restart,
+    # otherwise retry at halved granularities without the non-granular strategies, finally try
+    # removing outputs one at a time. Calls dump_state on every iteration and at the end. Raises
+    # RuntimeError if the final graph no longer fails. If the XLA_HLO_DEBUG environment variable
+    # is set, also writes minified HLO files. Prints progress and query counts to stderr.
+    # Returns the minimized GraphModule and its inputs.
+    # KNOWN ISSUE: the docstring example calls minimize, but the function is named minifier;
+    # the final message claims output was written to repro.py though dump_state only prints.
     """
     Minimizes a FX graph with given inputs, such that the resulting FX graph still returns True for module_fails.
 
@@ -228,9 +287,14 @@ def minifier(
     num_queries = 0
 
     def deepcopy_fx_graph(fx_graph: fx.Graph) -> fx.Graph:
+        # [FUNCTION DOC] HELPER: Returns an independent deep copy of an FX graph (via a temporary
+        # GraphModule built on fail_f).
         return fx.GraphModule(fail_f, copy.deepcopy(fx_graph)).graph
 
     def graph_fails(graph: fx.Graph, inps: Sequence[torch.Tensor]) -> bool:
+        # [FUNCTION DOC] HELPER: Oracle query. Deep-copies the graph, increments the query counter,
+        # builds and lints a GraphModule, and returns module_fails on it with the given inputs.
+        # Lint errors propagate.
         nonlocal num_queries
         graph = copy.deepcopy(graph)
         num_queries += 1
@@ -253,8 +317,15 @@ def minifier(
         strategy: Callable[[fx.Graph, Sequence[torch.Tensor], int], ReproState | None],
         name: str,
     ) -> Callable[[ReproState, int], ReproState | None]:
+        # [FUNCTION DOC] HELPER: Wraps a graph-level strategy into a state-level one that logs the
+        # attempt, runs the strategy on a copy of the state, reports node/input/output reductions,
+        # and re-verifies the result fails.
         @wraps(strategy)
         def new_func(old_state: ReproState, granularity: int = 1) -> ReproState | None:
+            # [FUNCTION DOC] HELPER: Runs the strategy at the given granularity on a copy of
+            # old_state. Returns None if the strategy found nothing, or if the new graph no longer
+            # fails (warning printed). Raises RuntimeError if the strategy claimed success without
+            # fewer nodes, more inputs or fewer outputs. Otherwise returns the new state.
             print(file=sys.stderr)
             print(
                 f"Strategy: {name} (G: {granularity}) "
@@ -313,12 +384,19 @@ def minifier(
         [Callable[[fx.Graph, Sequence[torch.Tensor], int], ReproState | None]],
         Callable[[ReproState, int], ReproState | None],
     ]:
+        # [FUNCTION DOC] HELPER: Returns a decorator that registers a strategy under the given name
+        # by partially applying the strategy wrapper.
         return partial(_register_strategy, name=name)
 
     @register_strategy("Truncate suffix")
     def remove_suffix(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Strategy "Truncate suffix". Copies nodes one by one into a new graph;
+        # at indices that are multiples of granularity but not of twice granularity (the latter
+        # were tried at a coarser level), temporarily makes the current node the sole output and
+        # checks whether the shorter graph still fails. Returns the first failing truncated state,
+        # or None if none fails.
         tested: set[int] = set()
         new_graph = fx.Graph()
         env: dict[fx.Node, fx.Node] = {}
@@ -346,6 +424,11 @@ def minifier(
     def remove_outputs(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Strategy "Remove outputs". Works on graphs whose output is a
+        # sequence of nodes. Sorts outputs by graph position and tries dropping chunks of size
+        # half the granularity (at least one) from the output list, returning the first state
+        # that still fails. Returns None if there is no output node, a single output, or no
+        # removal keeps the failure. Mutates cur_graph (annotates node idx, rewrites output args).
         granularity = max(1, granularity // 2)
         output: fx.Node | None = None
         for idx, node in enumerate(cur_graph.nodes):
@@ -380,6 +463,10 @@ def minifier(
         return None
 
     def remove_unused_inputs_unchecked(cur_state: ReproState) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Erases placeholder nodes with no users from the state's graph
+        # (mutating it) and drops the matching inputs. Returns the new state if any input was
+        # removed, otherwise None. Does not test the failure predicate. Raises an assertion
+        # error if placeholder and input counts differ.
         cur_graph = cur_state.graph
         cur_inps = cur_state.inps
         ph_nodes = list(get_placeholders(cur_graph))
@@ -399,6 +486,8 @@ def minifier(
         return None
 
     def remove_unused_inputs_checked(cur_state: ReproState) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Removes unused inputs and returns the new state only if the result
+        # still fails the predicate; otherwise None.
         new_state = remove_unused_inputs_unchecked(cur_state)
         if new_state is not None and graph_fails(new_state.graph, new_state.inps):
             return new_state
@@ -407,6 +496,8 @@ def minifier(
     def _remove_unused_wrapper(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Adapter giving the checked unused-input removal the strategy
+        # signature; granularity is ignored.
         return remove_unused_inputs_checked(ReproState(cur_graph, cur_inps))
 
     remove_unused_inputs = register_strategy("Remove unused inputs")(
@@ -417,6 +508,9 @@ def minifier(
     def eliminate_dead_code(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Strategy "Eliminate dead code". Removes dead nodes from the graph;
+        # if anything was removed and the graph still fails, returns the new state, else None.
+        # Granularity is ignored.
         if cur_graph.eliminate_dead_code() and graph_fails(cur_graph, cur_inps):
             return ReproState(cur_graph, cur_inps)
         return None
@@ -424,6 +518,10 @@ def minifier(
     def _consolidate_placeholders(
         cur_graph: fx.Graph, inps: list[torch.Tensor]
     ) -> fx.Graph:
+        # [FUNCTION DOC] HELPER: Builds a new graph with all placeholders first. Leading load_tensor
+        # nodes (before any other non-placeholder node) are converted to placeholders and the
+        # tensors they load are appended to inps (mutated). The remaining nodes are copied after,
+        # preserving order. Returns the new graph.
         new_graph = fx.Graph()
         env = {}
         seen_non_placeholder = False
@@ -455,6 +553,11 @@ def minifier(
     def delta_debugging(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Strategy "Delta Debugging". For each window of granularity
+        # consecutive node positions, copies the graph and turns window nodes into placeholders or
+        # load_tensor nodes using recorded concrete values. If something changed, eliminates dead
+        # code, consolidates placeholders, drops unused inputs, and returns the state if it still
+        # fails. Returns None if no window works.
         num_nodes = len(cur_graph.nodes)
         for start_range in range(0, num_nodes, granularity):
             is_removing = False
@@ -481,6 +584,11 @@ def minifier(
     def consolidate_inputs(
         cur_graph: fx.Graph, cur_inps: Sequence[torch.Tensor], granularity: int
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Strategy "Consolidate Inputs". Moves placeholders to the front and
+        # converts leading load_tensor nodes to inputs, returning the new state if it still fails.
+        # KNOWN ISSUE: the growth check compares the length of the original input sequence with
+        # itself (cur_inps, not the extended new_inps), so it is never true and this strategy
+        # always returns None.
         old_len = len(cur_inps)
         new_inps = list(cur_inps[:])
         cur_graph = _consolidate_placeholders(cur_graph, new_inps)
@@ -493,6 +601,10 @@ def minifier(
     def try_granularity(
         failing_state: ReproState, granularity: int, use_non_granular: bool
     ) -> ReproState | None:
+        # [FUNCTION DOC] HELPER: Tries the strategy list at one granularity, in order: remove outputs
+        # (only if outputs exceed half the node count), then, if use_non_granular, dead code
+        # elimination, unused-input removal and input consolidation, then suffix truncation and
+        # delta debugging. Returns the first successful new state, or None.
         print(f"Trying granularity {granularity}", file=sys.stderr)
 
         strategies = []

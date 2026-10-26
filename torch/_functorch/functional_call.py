@@ -1,3 +1,7 @@
+# [MODULE DOC] Functional-call utilities for torch.func: functional_call (run an nn.Module
+# with substituted parameters/buffers), stack_module_state (stack per-model state for
+# ensembling with vmap) and a helper to stack one parameter/buffer. No import-time side
+# effects other than exposed_in registration of the two public functions.
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -19,6 +23,12 @@ def functional_call(
     tie_weights: bool = True,
     strict: bool = False,
 ) -> Any:
+    # [FUNCTION DOC] Calls module with its parameters/buffers replaced by the given values.
+    # parameter_and_buffer_dicts is one mapping of names to tensors or a sequence of mappings
+    # that are merged. Raises ValueError if a sequence contains a non-mapping, if a key appears
+    # in more than one mapping, or if the argument is neither mapping nor sequence. Delegates
+    # to the stateless functional call helper with args, kwargs, tie_weights and strict, and
+    # returns the module's output. In-place changes by the module hit the passed tensors.
     r"""Performs a functional call on the module by replacing the module parameters
     and buffers with the provided ones.
 
@@ -165,6 +175,11 @@ def functional_call(
 def stack_module_state(
     models: Sequence[nn.Module] | nn.ModuleList,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    # [FUNCTION DOC] Stacks the parameters and buffers of several same-class modules into two
+    # name-keyed mappings (params, buffers), each value stacked along a new leading dimension.
+    # Raises RuntimeError if models is empty, if modules differ in training/eval mode, or if
+    # they are not all exactly the same class. Names are taken from the first model; a model
+    # missing a name raises a key error. Does not modify the models.
     """stack_module_state(models) -> params, buffers
 
     Prepares a list of torch.nn.Modules for ensembling with :func:`vmap`.
@@ -252,6 +267,10 @@ def stack_module_state(
 def construct_stacked_leaf(
     tensors: tuple[Tensor, ...] | list[Tensor], name: str
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Stacks same-named tensors from each model along a new leading
+    # dimension. Raises RuntimeError if requires_grad is not uniform across the tensors. If all
+    # require grad, the result is detached and made a fresh leaf requiring grad (unrelated to
+    # the originals); otherwise a plain stacked tensor is returned.
     all_requires_grad = all(t.requires_grad for t in tensors)
     none_requires_grad = all(not t.requires_grad for t in tensors)
     if not all_requires_grad and not none_requires_grad:
