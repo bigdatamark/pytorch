@@ -1,3 +1,8 @@
+# [MODULE DOC] Bridges Inductor epilogue source code to CUTLASS Epilogue Visitor Trees (EVT). Defines
+# type aliases and, only when the CUTLASS python library can be imported, helpers to build example CUTLASS
+# tensors from Inductor buffers, trace epilogue source into an EVT, emit the collective epilogue C++ code,
+# and render the C++ argument initializer for the EVT. Import-time side effect: tries to import cutlass.
+# When cutlass is unavailable the helper definitions are skipped entirely.
 from collections.abc import Callable
 from typing import Any
 
@@ -61,12 +66,18 @@ if try_import_cutlass():
     _CUTLASS_C_DTYPES = OrderedSet(dtype2ctype.values())  # type: ignore[var-annotated]
 
     class EVTArgRenames:
+        # [CLASS DOC] Maps Inductor buffer names to generated C++ pointer variable names.
+        # State: buf_renames, an insertion-ordered mapping from buffer name to a name of the form ptr_N,
+        # where N is the allocation order. Names are stable once assigned.
         """Handles mapping buffer names to variable names in the cpp kernel signature and body"""
 
         def __init__(self) -> None:
+            # [FUNCTION DOC] Creates an empty rename mapping.
             self.buf_renames: dict[str, str] = {}
 
         def new_name(self, name: str) -> str:
+            # [FUNCTION DOC] Returns the existing rename for the buffer name, or allocates and records the
+            # next ptr_N name (N is the current mapping size). Mutates the mapping on first sight.
             if name in self.buf_renames:
                 return self.buf_renames[name]
             else:
@@ -75,6 +86,8 @@ if try_import_cutlass():
                 return new_name
 
         def get(self, name: str) -> str:
+            # [FUNCTION DOC] Returns the renamed variable for the buffer name, or the name itself if it
+            # has not been renamed. Does not mutate.
             return self.buf_renames.get(name, name)
 
     def create_example_tensors(
@@ -82,9 +95,16 @@ if try_import_cutlass():
         name_to_buffer: dict[str, Buffer],
         size_hint_fn: Callable[[Expr | int], int],
     ) -> dict[str, CutlassTensor]:
+        # [FUNCTION DOC] Builds example CUTLASS tensors for tracing an epilogue. Takes a mapping from
+        # epilogue variable name to buffer name, a mapping from buffer name to Inductor buffer, and a
+        # function resolving symbolic sizes to integer hints. Returns a mapping from variable name to
+        # CUTLASS tensor with the hinted shape, row or column major layout and the buffer's element type.
+        # Raises RuntimeError if a buffer is neither row-major nor column-major contiguous.
         def cutlass_tensor_from_buffer(
             buffer: Buffer,
         ) -> CutlassTensor:
+            # [FUNCTION DOC] HELPER: Converts one buffer into a CUTLASS tensor using size hints for shape
+            # and strides; picks row major or column major from contiguity, else raises RuntimeError.
             shape = buffer.get_layout().size
             stride = buffer.get_layout().stride
             shape = tuple(size_hint_fn(x) for x in shape)
@@ -125,6 +145,13 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
         device_type: str = "cuda",
         **kwargs: dict[str, Any],
     ) -> tuple[str, str, str, EVTArgRenames]:
+        # [FUNCTION DOC] Traces the epilogue source into a CUTLASS EVT and emits its C++ pieces.
+        # Inputs: epilogue source text, example tensors, accumulator and output data types, tile
+        # description, epilogue schedule, buffer lookup, size hint function, optional kernel schedule (used
+        # for SM100+), and device type (cuda or xpu). Returns (EVT type name, C++ argument initializer
+        # string, EVT C++ code, argument rename helper). Raises AssertionError for CUDA arch below 90 and
+        # NotImplementedError when no emitter exists for the arch (pre-SM100 and xpu use a per-arch
+        # emitter; SM100+ uses the SM100 collective epilogue).
         arch = int(cutlass_arch(device_type))
         if device_type == "cuda" and arch < 90:
             raise AssertionError("For CUDA, only SM90+ is supported for EVT")
@@ -174,8 +201,15 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
         cc: int,
         **kwargs: Any,
     ) -> EpilogueFunctor:
+        # [FUNCTION DOC] HELPER: Runs the CUTLASS python AST frontend over epilogue source text (rather than
+        # a real function, since source inspection fails for runtime-defined functions). Takes source,
+        # example tensors, compute capability and extra frontend kwargs; returns the traced functor.
         class EpilogueFunctor(PythonASTFrontend):
+            # [CLASS DOC] HELPER: PythonASTFrontend subclass that parses a stored dedented source string
+            # instead of inspecting a function. State: source (the dedented text) and, after parse,
+            # example_inputs and ast.
             def __init__(self, cc: int, **kwargs: Any):
+                # [FUNCTION DOC] HELPER: Stores dedented epilogue source then initializes the base frontend.
                 self.source = textwrap.dedent(fn_src)
                 super().__init__(cc, **kwargs)
 
@@ -183,6 +217,8 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
                 self,
                 example_inputs: dict[str, CutlassTensor],
             ) -> None:
+                # [FUNCTION DOC] HELPER: Records the example inputs, parses the source into a syntax tree
+                # and visits it so the base frontend builds its graph. Mutates self.
                 self.example_inputs = example_inputs
                 self.ast = ast.parse(self.source)
                 # pyrefly: ignore [missing-attribute]
@@ -197,11 +233,17 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
         name_to_buffer: dict[str, Buffer],
         size_hint_fn: Callable[[Expr | int], int],
     ) -> tuple[str, EVTArgRenames]:
+        # [FUNCTION DOC] HELPER: Renders the nested brace-initializer C++ text for the EVT thread
+        # arguments by walking the functor's thread type fields recursively. Takes the traced functor,
+        # buffer lookup and size hint function. Returns (argument text, rename helper that records
+        # pointer names used). Raises RuntimeError for unrecoverable immediate constants.
         epilogue_thread_type = epilogue_functor.epilogue_thread_type
         arg_renames = EVTArgRenames()
 
         # Fragile, but this is the only way to guarantee t is expected type because t is a local class
         def is_nested_visitor_type(t: type) -> bool:
+            # [FUNCTION DOC] HELPER: True if the type is CUTLASS's locally-defined visitor type, detected
+            # by comparing its module and qualified name string.
             return (
                 ".".join([t.__module__, t.__qualname__])
                 == "cutlass_cppgen.backend.c_types.visitor_factory.<locals>.VisitorType"
@@ -211,6 +253,10 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
         with buffer.set_tabwidth(2):
 
             def get_constant_value(name: str) -> float | int | None:
+                # [FUNCTION DOC] HELPER: Finds the constant value for a node name. First consults the
+                # dag metadata for a tensor marked constant; otherwise parses names of the form imm_value_kidx
+                # (first underscore in the value stands for the decimal point). Returns None if not a
+                # recoverable constant.
                 dag_ir = getattr(epilogue_functor, "dag_ir", None)
                 if dag_ir is not None:
                     try:
@@ -244,6 +290,10 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
                 t: CutlassArgType,
                 constant_value: float | int | None = None,
             ) -> None:
+                # [FUNCTION DOC] HELPER: Writes one argument line to the output buffer. Nodes that are
+                # neither buffers nor constants become an empty struct, except unresolved imm_ nodes, which
+                # raise RuntimeError. Empty-byte types also give an empty struct; other struct types emit
+                # each field via the argument-from-node helper.
                 if constant_value is None and name not in name_to_buffer:
                     # An imm_* node is an immediate constant whose value we
                     # failed to recover (dag_ir meta missing AND name parsing
@@ -284,6 +334,8 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
                     buffer.writeline(f"{{{', '.join(field_strs)}}}, /* {name} */")
 
             def render_thread_type(name: str, t: CutlassArgType) -> None:
+                # [FUNCTION DOC] HELPER: Recursively writes a nested visitor type as a braced block with
+                # a name comment, or writes a leaf argument with its constant value if any.
                 if is_nested_visitor_type(t):
                     buffer.writeline(f"{{ /* {name} */")
                     with buffer.indent():
@@ -314,6 +366,12 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
         arg_renames: EVTArgRenames,
         constant_value: float | int | None = None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Renders one C++ initializer string for a ctypes field type. Stride tuple
+        # types give up to three strides (padded with zero, 0 and 1 rendered as compile-time constants);
+        # pointer types give a typed pointer expression with offset (nullptr for constants) and register the
+        # rename; element dtype types give the constant or a zero of the buffer dtype; empty byte gives
+        # empty braces. Raises AssertionError on missing node or long strides and NotImplementedError for
+        # constants with tuple types or unsupported types.
         from ..template import CUTLASSTemplate
 
         # Today, arguments are either a pointer to the
@@ -340,6 +398,7 @@ non-contiguous layout, received stride: {stride} and shape: {shape}"
                 stride.append(0)
 
             def render_stride(x: int) -> str:
+                # [FUNCTION DOC] HELPER: Renders a stride value; 0 and 1 become compile-time constant tokens.
                 # Handle EBO for 0 and 1
                 if x == 0:
                     return "_0{}"

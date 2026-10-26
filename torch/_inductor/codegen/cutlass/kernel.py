@@ -1,3 +1,8 @@
+# [MODULE DOC] Kernel-side codegen for CUTLASS templates in Inductor. Defines LayoutArg (a record tying a
+# layout symbol such as M, N, K, lda to a node size or stride), CUTLASSKernel (tracks named nodes and layout
+# symbols), CUTLASSTemplateKernel (renders the C++ signature, template hook helpers and the wrapper call)
+# and CUTLASSTemplateCaller (a ChoiceCaller used for autotuning and producing the template buffer).
+# Import-time side effects: creates a module logger and a C++ expression printer.
 # mypy: allow-untyped-defs
 import functools
 import itertools
@@ -55,6 +60,8 @@ cexpr = CppPrinter().doprint
 
 
 def _normalize_idx(index: int, total_length: int) -> int:
+    # [FUNCTION DOC] HELPER: Converts a possibly negative index into a non-negative one by adding the
+    # total length when negative; non-negative values are returned unchanged. No bounds check.
     return index if index >= 0 else index + total_length
 
 
@@ -64,16 +71,23 @@ ValidLayoutAttrs = Literal["size", "stride"]
 
 @dataclass(frozen=True)
 class LayoutArg:
+    # [CLASS DOC] HELPER: Immutable record linking a layout symbol (M, N, K, B, lda, ldb, ldc, ldd) to
+    # one dimension of either the size or the stride of an IR node. Fields: node, symbol, attr, dim.
     node: IRNode
     symbol: ValidLayoutSymbols
     attr: ValidLayoutAttrs
     dim: int
 
     def matches(self, node, attr, dim) -> bool:
+        # [FUNCTION DOC] HELPER: True when this record refers to the same node, attribute and dimension.
         return self.node == node and self.attr == attr and self.dim == dim
 
 
 class CUTLASSKernel(Kernel):
+    # [CLASS DOC] Base class for CUTLASS kernels. State: layout_args (mapping from layout symbol to list of
+    # LayoutArg records), size_args (extra symbolic size arguments), named_nodes (mapping from template
+    # argument name such as X, W, Bias, Y to IR node). Key methods find layout symbols, register them from
+    # the GEMM operands, and produce the runtime shape and offset argument lists.
     """
     Baseclass for Cutlass based Kernels
     """
@@ -81,6 +95,7 @@ class CUTLASSKernel(Kernel):
     overrides = OpOverrides  # type: ignore[assignment]
 
     def __init__(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Initializes the base kernel and empty layout_args, size_args and named_nodes.
         super().__init__(*args, **kwargs)
         self.layout_args: dict[str, list[LayoutArg]] = defaultdict(list)
         self.size_args: list[Expr | int] = []
@@ -88,12 +103,18 @@ class CUTLASSKernel(Kernel):
         self.named_nodes: dict[str, IRNode] = {}
 
     def find_symbol(self, node: IRNode, attr: ValidLayoutAttrs, dim: int) -> str | None:
+        # [FUNCTION DOC] Returns the layout symbol name registered for the given node, attribute and
+        # dimension, or None if none is registered. Delegates to find_layout_arg.
         arg = self.find_layout_arg(node, attr, dim)
         return arg.symbol if arg else None
 
     def find_layout_arg(
         self, node: IRNode, attr: ValidLayoutAttrs, dim: int
     ) -> LayoutArg | None:
+        # [FUNCTION DOC] Looks up the registered layout record for a node attribute dimension. First tries
+        # an exact match; all exact matches must be identical else AssertionError. If none, falls back to a
+        # record on a node with the same name and attribute whose dimension holds an equal expression.
+        # Returns None if the dimension is out of range or nothing matches.
         matches = [
             arg
             for arg in itertools.chain.from_iterable(self.layout_args.values())
@@ -136,10 +157,15 @@ class CUTLASSKernel(Kernel):
     def add_layout_arg(
         self, symbol: ValidLayoutSymbols, node: IRNode, attr: ValidLayoutAttrs, dim: int
     ):
+        # [FUNCTION DOC] Registers a layout record under the symbol, appending to that symbol's list.
         arg = LayoutArg(node, symbol, attr, dim)
         self.layout_args[symbol].append(arg)
 
     def init_layout_args(self) -> None:
+        # [FUNCTION DOC] Registers layout symbols from the named nodes X, W, Y and optional Bias: M, K, N
+        # from sizes of the last two dims, B from the leading dim of X when X has more than two dims, and
+        # leading-dimension strides lda, ldb, ldc (only if Bias exists), ldd. Requires X, W, Y present in
+        # named_nodes (KeyError otherwise). Mutates layout_args.
         X = self.named_nodes["X"]
         W = self.named_nodes["W"]
         Y = self.named_nodes["Y"]
@@ -170,6 +196,9 @@ class CUTLASSKernel(Kernel):
         self.add_layout_arg("ldd", Y, "stride", ldd_dim)
 
     def get_layout_args(self) -> tuple[Expr | int, ...]:
+        # [FUNCTION DOC] Returns the actual values (M, N, K, B, LDA, LDB, LDC, LDD) from the nodes X, W,
+        # Y and optional Bias. B is 1 for operands with two dims; LDC is 0 without Bias. Leading
+        # dimensions come from the stride picked by find_ld_idx.
         X = self.named_nodes["X"]
         W = self.named_nodes["W"]
         Y = self.named_nodes["Y"]
@@ -179,6 +208,7 @@ class CUTLASSKernel(Kernel):
         kdim = _normalize_idx(-1, len(X.get_size()))
 
         def get_ld(node) -> Expr | int:
+            # [FUNCTION DOC] HELPER: Returns the leading-dimension stride of the node.
             dim = self.find_ld_idx(node)
             return node.get_stride()[dim]
 
@@ -193,13 +223,18 @@ class CUTLASSKernel(Kernel):
         return (M, N, K, B, LDA, LDB, LDC, LDD)
 
     def get_dynamic_shape_args(self) -> list[Expr | int]:
+        # [FUNCTION DOC] Returns the layout argument values followed by any extra symbolic size args.
         return [*self.get_layout_args(), *self.size_args]
 
     def get_offset_args(self) -> list[Expr]:
+        # [FUNCTION DOC] Returns the layout offset of each named node, in named_nodes order.
         return [node.get_layout().offset for node in self.named_nodes.values()]
 
     @staticmethod
     def find_ld_idx(node: IRNode) -> int:
+        # [FUNCTION DOC] Static. Returns the stride index holding the leading dimension: the second to
+        # last index when the last stride is statically 1, else the last index, in which case the second
+        # to last stride must be statically 1 (AssertionError otherwise).
         strides = node.get_stride()
         # Handle 1D tensor case
         if V.graph.sizevars.statically_known_equals(strides[-1], 1):
@@ -211,6 +246,11 @@ class CUTLASSKernel(Kernel):
 
 
 class CUTLASSTemplateKernel(CUTLASSKernel):
+    # [CLASS DOC] Kernel for CUTLASS C++ templates. State: kernel_name, runtime_arg_info and
+    # runtime_arg_values (extra runtime arguments), device_type with its device op overrides, the extra C++
+    # parameter text (workspace size, workspace, stream) and, after def_kernel, the C++ signature string.
+    # Provides template hooks (def_kernel, size, stride, ptr, dtype and similar) and call_kernel for
+    # emitting the wrapper call.
     """
     Template kernels defined by Cutlass in C++.
     """
@@ -222,6 +262,8 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         runtime_arg_values: list[Any],
         device_type: str = "cuda",  # type: ignore[assignment]
     ) -> None:
+        # [FUNCTION DOC] Stores the kernel name, runtime argument info and values and device type, looks
+        # up device op overrides and builds the extra C++ parameter text for workspace and stream.
         """
         Initializes a new instance of the CUTLASSTemplateKernel class.
 
@@ -237,6 +279,9 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         self._EXTRA_CPP_ARGS = f"size_t* workspace_size, uint8_t* workspace, {self.device_codegen.cpp_stream_type()} stream"
 
     def check_not_null(self, node: IRNode) -> str:
+        # [FUNCTION DOC] Template hook. Returns C++ text that throws a runtime error if the node's pointer
+        # argument is null while its size is nonzero. Returns an empty string when the node is None or has
+        # no argument name.
         """
         Generates code to check that a node is not null.
         """
@@ -265,9 +310,12 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return res.getvalue()
 
     def get_signature(self) -> str:
+        # [FUNCTION DOC] Returns the C++ signature stored by def_kernel (attribute missing before that).
         return self.signature
 
     def _collect_unbound_layout_free_symbols(self, node: IRNode) -> OrderedSet[Expr]:
+        # [FUNCTION DOC] HELPER: Collects free symbolic variables appearing in sizes and strides of the node
+        # that are not already covered by a registered layout symbol. Returns them as an ordered set.
         free_symbols: OrderedSet[Expr] = OrderedSet()
         for attr_name, values in (
             ("size", node.get_size()),
@@ -290,6 +338,12 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         names_str: str = "",
         input_reorder: list[int] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Template hook that builds the C++ kernel signature. Maps names in names_str to
+        # inputs (optionally reordered by input_reorder) and outputs, filling named_nodes and the argument
+        # registries, then registers layout args and gathers leftover free symbols into size_args. The
+        # signature lists buffer args, integer size args, per-node offset args, runtime args and the extra
+        # workspace and stream params. Raises RuntimeError on a name count mismatch and AssertionError on
+        # a reorder length mismatch. Stores and returns the signature.
         """
         Hook called from template code to generate function definition and
         needed args.
@@ -362,6 +416,12 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         name: str,
         node: "CUTLASSTemplateBuffer",  # type: ignore[name-defined]
     ) -> None:
+        # [FUNCTION DOC] Emits the wrapper-code call to the kernel. Collects buffer args, dynamic shape
+        # args, offsets and runtime values, converts unspecialized scalar args via item and tensors to
+        # data pointers for the Python wrapper, appends a null workspace-size argument and a workspace
+        # pointer (allocating and later deallocating a workspace when the node needs one). In cpp wrapper
+        # mode registers the kernel with the wrapper and patches the signature name. Raises AssertionError
+        # if the cpp wrapper is not a CppWrapperCpu.
         """
         Generates code to call the kernel through V.graph.wrapper_code.
         used from within torch._inductor.wrapper.PythonWrapperCodegen
@@ -446,6 +506,8 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
             wrapper.generate_workspace_deallocation(ws)
 
     def dtype(self, node: IRNode) -> str | None:
+        # [FUNCTION DOC] Template hook. Returns the C++ type name for the node dtype ("void" for None;
+        # None if the dtype has no mapping).
         """
         Generates code which represents dtype of a given node.
         """
@@ -455,6 +517,8 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return DTYPE_TO_CPP.get(node.get_layout().dtype)
 
     def cutlass_dtype(self, node: IRNode, default_dtype="void") -> str | None:
+        # [FUNCTION DOC] HELPER: Returns the CUTLASS type string for the node dtype, or default_dtype
+        # when the node is None. Raises KeyError for unmapped dtypes.
         # Helper method, called into from CUTLASSGemmTemplate
         if node is None:
             return default_dtype
@@ -463,6 +527,8 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return CUTLASSTemplate._DTYPE_TO_CUTLASS[node.get_layout().dtype]
 
     def max_valid_index(self, node: IRNode, default=-1):
+        # [FUNCTION DOC] HELPER: Returns the largest valid linear element offset of the node, computed as
+        # the sum over dims of (size minus one) times stride; default when the node is None.
         # Helper method, called into from CUTLASSGemmTemplate
         if node is None:
             return default
@@ -472,6 +538,8 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return max_valid_offset
 
     def ptr(self, node: IRNode) -> str:
+        # [FUNCTION DOC] Template hook. Returns the C++ pointer expression (argument name plus its offset
+        # variable), or the null pointer literal when the node or its argument name is missing.
         """
         Generates code which represents pointer of a given node.
         """
@@ -490,6 +558,11 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         end_index: int | None = None,
         default_value: int = 0,
     ) -> str:
+        # [FUNCTION DOC] Template hook. Returns the product of node sizes over the inclusive range from
+        # start_index to end_index (end defaults to start; negatives are normalized), using layout symbols
+        # where registered. Returns default_value as text for a None node or empty range.
+        # KNOWN ISSUE: the docstring says the range excludes the end index and the return annotation says
+        # str, but the code includes the end index and returns a sympy expression for non-empty ranges.
         """
         Hook called from template code to get the size of an arg.
         Generates code which represents size of a given node in [start_index, end_index).
@@ -517,6 +590,9 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return val
 
     def stride(self, node: IRNode, index: int, default_value: int = 0) -> str:
+        # [FUNCTION DOC] Template hook. Returns the stride at the given (normalized) index as text: the
+        # literal value if statically at most 1, else the registered layout symbol, else the numeric
+        # stride. Returns default_value text for a None node or a negative index after normalization.
         """
         Hook called from template code to get the stride of an arg.
         Generates code which represents stride of a given node at index.
@@ -538,6 +614,9 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         return self.find_symbol(node, "stride", dim=index) or str(stride)
 
     def batch_stride(self, node: IRNode, default_value: int = 0) -> str:
+        # [FUNCTION DOC] Template hook. Returns the batch stride text; default for None or nodes with
+        # fewer than three dims; the literal when statically at most 1; otherwise the product of the
+        # size of dim 1 and dim 2 (symbol or number), assuming a contiguous batch.
         """
         Hook called from template code to get the batch stride of an arg.
         Returns 0 if batch dim is not present.
@@ -561,6 +640,10 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
         )
 
     def row_or_column_stride(self, node: IRNode, default_value: int = 0) -> str:
+        # [FUNCTION DOC] Template hook. Returns the leading stride as C++ text: second to last stride if
+        # the last stride equals 1 (row major), last stride if the second to last equals 1 (column
+        # major). Returns default text for None or fewer than two dims; raises RuntimeError if neither
+        # stride is 1.
         """
         Hook called from template code to get the row or column stride of an arg.
         This is required by some CUTLASS 2.X APIs.
@@ -585,12 +668,16 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
             )
 
     def load(self, name: str, index: Expr, mode: Any = None) -> CSEVariable:
+        # [FUNCTION DOC] Mock load used for memory planning; creates and returns a CSE variable with
+        # unknown value range. Emits no code.
         """
         Mock load function for memory planning to optimize allocations properly.
         """
         return self.create_cse_var(name, bounds=ValueRanges.unknown())
 
     def store(self, name: str, index: Expr, value: Any, mode: Any = None) -> None:
+        # [FUNCTION DOC] Mock store used for memory planning; records the buffer name in
+        # store_buffer_names. Emits no code.
         """
         Mock store function for memory planning to optimize allocations properly.
         """
@@ -598,6 +685,9 @@ class CUTLASSTemplateKernel(CUTLASSKernel):
 
 
 class CUTLASSTemplateCaller(ChoiceCaller):
+    # [CLASS DOC] ChoiceCaller for a CUTLASS template kernel used in autotuning. State: category,
+    # make_kernel_render, bmreq (benchmark request), supports_epilogue_fusion, template and info_kwargs.
+    # Benchmarks via the request, reports hash keys and info, and builds the template buffer output node.
     """
     CUTLASSTemplateCaller
 
@@ -625,6 +715,8 @@ class CUTLASSTemplateCaller(ChoiceCaller):
         info_kwargs: dict[str, PrimitiveInfoType | list[PrimitiveInfoType]] | None,  # type: ignore[type-arg]
         description: str,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base ChoiceCaller and stores category, kernel render factory,
+        # benchmark request, epilogue fusion support flag, template and info kwargs.
         super().__init__(name, input_nodes, layout, description)
         self.category = category
         self.make_kernel_render = make_kernel_render
@@ -634,11 +726,15 @@ class CUTLASSTemplateCaller(ChoiceCaller):
         self.info_kwargs = info_kwargs
 
     def precompile(self) -> None:
+        # [FUNCTION DOC] Precompiles the benchmark request; AssertionError if there is no request.
         if self.bmreq is None:
             raise AssertionError("expected self.bmreq to not be None")
         self.bmreq.precompile()
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Benchmarks the kernel on the given inputs and output tensor and returns the
+        # time. Uses profiler based timing when the config flag is set, else the request's own benchmark.
+        # AssertionError if there is no request.
         if self.bmreq is None:
             raise AssertionError("expected self.bmreq to not be None")
         if config.profile_bandwidth_with_do_bench_using_profiling:
@@ -647,12 +743,15 @@ class CUTLASSTemplateCaller(ChoiceCaller):
         return self.bmreq.benchmark(*args, out=out)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a description naming the benchmark request's source file.
         return f"CUTLASSTemplateCaller(source_file={self.bmreq.source_file})"
 
     def call_name(self) -> str:
+        # [FUNCTION DOC] Returns the dotted name used to call this kernel in generated code.
         return f"cutlass_template_kernels.{self.name}"
 
     def kernel_hash_key(self) -> str:
+        # [FUNCTION DOC] Returns a key joining the category and the request hash key (no swizzle).
         """
         Return kernel hash key that does not depend on swizzle.
         """
@@ -664,6 +763,9 @@ class CUTLASSTemplateCaller(ChoiceCaller):
         )
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Returns a key joining category, request hash key and the swizzle value from
+        # info_kwargs (the text None if unavailable).
+        # KNOWN ISSUE: the docstring claims the key does not depend on swizzle, but it includes it.
         """
         Return kernel hash key that does not depend on swizzle.
         """
@@ -681,6 +783,9 @@ class CUTLASSTemplateCaller(ChoiceCaller):
         )
 
     def info_dict(self) -> dict[str, PrimitiveInfoType | list[PrimitiveInfoType]]:
+        # [FUNCTION DOC] Returns a description mapping for the autotune log: backend, op type, config
+        # name, arch, tile shape, schedules, accumulator, op name, instruction shape and swizzle when an
+        # op is present in info_kwargs; otherwise just backend and an unknown op type.
         """
         Information returned here is logged to the autotune log file when that is enabled.
 
@@ -708,6 +813,9 @@ class CUTLASSTemplateCaller(ChoiceCaller):
             return {"backend": "CUDA", "op_type": "unknown"}
 
     def output_node(self) -> TensorBox:
+        # [FUNCTION DOC] Updates the workspace size from the request, builds a CUTLASS template buffer
+        # from layout, inputs, render factory and workspace size, copies any ktc annotation onto it, and
+        # returns it wrapped in a TensorBox.
         self.bmreq.update_workspace_size()
         buffer = CUTLASSTemplateBuffer(
             layout=self.layout,
