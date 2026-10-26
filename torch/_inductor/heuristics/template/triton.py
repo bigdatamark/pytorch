@@ -1,6 +1,6 @@
 # [MODULE DOC] Triton GEMM/conv/flex-attention config heuristics for Inductor autotuning templates.
-Defines config dataclasses (Gemm, Blackwell, Conv, Flex, ROCm variants), per-device singleton heuristic classes (CPU, CUDA, ROCm, XPU, MTIA) holding candidate tile configs, template mixins that turn configs into template keyword dicts, and concrete heuristic classes registered per template uid and device.
-Import-time side effects: reads meta-WS enablement, detects ROCm, optionally imports the origami package (ROCm with max_autotune and origami enabled), and registers heuristics via register_template_heuristic.
+# Defines config dataclasses (Gemm, Blackwell, Conv, Flex, ROCm variants), per-device singleton heuristic classes (CPU, CUDA, ROCm, XPU, MTIA) holding candidate tile configs, template mixins that turn configs into template keyword dicts, and concrete heuristic classes registered per template uid and device.
+# Import-time side effects: reads meta-WS enablement, detects ROCm, optionally imports the origami package (ROCm with max_autotune and origami enabled), and registers heuristics via register_template_heuristic.
 from __future__ import annotations
 
 import dataclasses
