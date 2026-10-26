@@ -1,3 +1,4 @@
+# [PACKAGE DOC] Package for Inductor device-scoped heuristics: dispatches template (compile-time) and triton codegen (runtime) heuristics per device. This file only holds a docstring; no code or exports.
 """
 Unified device-scoped heuristic module for PyTorch Inductor.
 
