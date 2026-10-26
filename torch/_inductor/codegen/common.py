@@ -1,3 +1,12 @@
+# [MODULE DOC] Shared base infrastructure for Inductor code generation backends (Triton, C++, Halide, MPS, Pallas, ...).
+# Defines: the backend registry (device -> scheduling / wrapper codegen / device op overrides), kernel argument
+# bookkeeping (KernelArgs, TensorArg, SizeArg, WorkspaceArg, ...), common subexpression elimination (CSE,
+# CSEVariable), the Kernel base class and the CSEProxy ops handler that routes ops calls to a kernel, default
+# pointwise op decompositions/overrides (OpDecompositions, OpOverrides, pointwise_overrides_data), dtype
+# propagation over loop bodies, and the KernelTemplate base class.
+# Import-time side effects: creates module loggers and the empty global registries (device_codegens,
+# device_op_overrides_dict, custom_backend_passes, custom_backend_codegen_configs); actual backends are
+# registered lazily by init_backend_registration.
 from __future__ import annotations
 
 import atexit
@@ -88,12 +97,16 @@ log = logging.getLogger(__name__)
 
 
 def data_type_logger(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Logs a data type propagation message at debug level on the schedule artifact logger, only when debug is enabled.
     if schedule_log.isEnabledFor(logging.DEBUG):
         schedule_log.debug("Data type propagation: %s", msg)
 
 
 @dataclasses.dataclass
 class FileBackedGraphModule:
+    # [CLASS DOC] Result of FX wrapper codegen. Wraps a GraphModule plus its compiled callable and mimics the module interface
+    # (file name, source value, call). On creation it writes the graph code to a temporary python file so debugging
+    # tools can find a source file; the file is removed at interpreter exit.
     """
     Output of FX wrapper codegen. Exposes the same methods as ModuleType, but these
     map back to a GraphModule instead of Python source.
@@ -103,6 +116,9 @@ class FileBackedGraphModule:
     compiled_fn: Callable[..., Any]
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Dataclass post-init hook. Creates a named temporary file (not auto deleted) with a .py suffix, registers an
+        # exit handler to remove it, and writes the module source (the graph module code) into it. Side effects: file I/O
+        # and atexit registration. Stores the open handle in the tempfile attribute.
         # Write the code to a file for compatibility with debugging utilities.
         # The file is deleted upon program termination.
         self.tempfile = tempfile.NamedTemporaryFile(  # noqa: SIM115
@@ -114,23 +130,30 @@ class FileBackedGraphModule:
 
     @property
     def __file__(self) -> str:
+        # [FUNCTION DOC] Property returning the path of the temporary file holding the generated source, so the object looks like a module with a file attribute.
         return self.tempfile.name
 
     def call(self, args: list[Any]) -> Any:
+        # [FUNCTION DOC] Calls the compiled function with the given list of arguments unpacked positionally and returns its result.
         return self.compiled_fn(*args)
 
     @property
     def value(self) -> str:
+        # [FUNCTION DOC] Property returning the python source code of the wrapped GraphModule as a string.
         return self.gm.code
 
 
 class WorkspaceZeroMode(enum.Enum):
+    # [CLASS DOC] Enum describing when a workspace buffer must be zeroed: uninitialized (no zeroing needed), zero on call (kernel
+    # may leave the workspace dirty) and zero per graph (kernel must re-zero it itself). Provides combine and from_bool helpers.
     UNINITIALIZED = 0
     ZERO_ON_CALL = 1  # kernel may leave workspace dirty
     ZERO_PER_GRAPH = 2  # must be re-zeroed by kernel
 
     @staticmethod
     def combine(a: WorkspaceZeroMode, b: WorkspaceZeroMode) -> WorkspaceZeroMode:
+        # [FUNCTION DOC] Merges two zero modes. Returns the first if both are equal or the second is uninitialized, returns the second
+        # if the first is uninitialized, otherwise raises NotImplementedError (conflicting modes).
         if a == b or b == WorkspaceZeroMode.UNINITIALIZED:
             return a
         if a == WorkspaceZeroMode.UNINITIALIZED:
@@ -139,27 +162,35 @@ class WorkspaceZeroMode(enum.Enum):
 
     @staticmethod
     def from_bool(zero_fill: bool) -> WorkspaceZeroMode:
+        # [FUNCTION DOC] Maps a zero fill flag to a mode: zero on call if true, uninitialized if false.
         if zero_fill:
             return WorkspaceZeroMode.ZERO_ON_CALL
         return WorkspaceZeroMode.UNINITIALIZED
 
 
 class CodegenSymbol(ABC):
+    # [CLASS DOC] Abstract base for IR objects that may correspond to a variable in the wrapper code; requires a name and an example value.
     """
     An IR object possibly corresponding to a variable in the wrapper code.
     """
 
     @abstractmethod
     def get_name(self) -> str:
+        # [FUNCTION DOC] Abstract: returns the name of the symbol in the generated code.
         pass
 
     @abstractmethod
     def get_example(self) -> torch.Tensor | sympy.Symbol:
+        # [FUNCTION DOC] Abstract: returns an example tensor or sympy symbol representing this object.
         pass
 
 
 @ir_dataclass(frozen=True)
 class WorkspaceArg(CodegenSymbol):
+    # [CLASS DOC] A temporary per-kernel scratch buffer (frozen IR dataclass), not registered as a real buffer so it is never
+    # dead-code eliminated. Fields: count (element count as sympy expression), zero_mode, device, outer_name (name in
+    # the wrapper), inner_name (kernel argument name, default ws_ptr) and dtype (default uint8). Implements enough of the
+    # buffer interface (layout, size, stride, dtype, device, name) for allocation code to treat it like a buffer.
     """A temporary buffer used for a single kernel, then discarded.
 
     Not registered as a traditional buffer since there are no users,
@@ -180,16 +211,19 @@ class WorkspaceArg(CodegenSymbol):
 
     @staticmethod
     def unique_name(prefix: str = "workspace_") -> str:
+        # [FUNCTION DOC] Returns a fresh graph-unique workspace name by appending the next value of the graph's workspace id counter to the prefix. Mutates the counter.
         return f"{prefix}{next(V.graph.workspace_id)}"
 
     @staticmethod
     def can_join(a: WorkspaceArg, b: WorkspaceArg) -> bool:
+        # [FUNCTION DOC] Returns true when two workspace args can be merged: same inner name, dtype and device.
         return (
             a.inner_name == b.inner_name and a.dtype == b.dtype and a.device == b.device
         )
 
     @staticmethod
     def join(a: WorkspaceArg, b: WorkspaceArg) -> WorkspaceArg:
+        # [FUNCTION DOC] Returns a new WorkspaceArg whose count is the sum of both counts and whose zero mode is the combination of both modes; other fields come from the first arg.
         return WorkspaceArg(
             count=a.count + b.count,
             zero_mode=WorkspaceZeroMode.combine(a.zero_mode, b.zero_mode),
@@ -201,6 +235,8 @@ class WorkspaceArg(CodegenSymbol):
 
     @staticmethod
     def maximum(a: WorkspaceArg, b: WorkspaceArg) -> WorkspaceArg:
+        # [FUNCTION DOC] Returns a new WorkspaceArg whose count is the symbolic max of the two counts and zero mode the combination of both.
+        # Raises AssertionError if dtype, device or inner name differ.
         if not (
             a.dtype == b.dtype and a.device == b.device and a.inner_name == b.inner_name
         ):
@@ -218,17 +254,21 @@ class WorkspaceArg(CodegenSymbol):
 
     # These methods let WorkspaceArg pretend it is a buffer to reuse allocation code
     def get_device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the device of the workspace (buffer interface shim).
         return self.device
 
     get_device_or_error = get_device
 
     def get_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Returns the dtype of the workspace (buffer interface shim).
         return self.dtype
 
     def get_example(self) -> torch.Tensor | sympy.Symbol:
+        # [FUNCTION DOC] Returns the example value of the fixed layout built from this workspace.
         return self.get_layout().get_example()
 
     def get_layout(self) -> FixedLayout:
+        # [FUNCTION DOC] Builds and returns a FixedLayout with this device and dtype, a single dimension of size count and stride one.
         from ..ir import FixedLayout
 
         return FixedLayout(
@@ -240,6 +280,7 @@ class WorkspaceArg(CodegenSymbol):
 
     @property
     def layout(self) -> FixedLayout:
+        # [FUNCTION DOC] Property alias returning the fixed layout of this workspace.
         return self.get_layout()
 
     get_output_spec = get_layout
@@ -247,35 +288,45 @@ class WorkspaceArg(CodegenSymbol):
     maybe_get_layout = get_layout
 
     def get_offset(self) -> sympy.Expr:
+        # [FUNCTION DOC] Returns the storage offset, always zero.
         return sympy.S.Zero
 
     def get_size(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Returns the size as a one element list containing count.
         return [self.count]
 
     def get_stride(self) -> list[sympy.Expr]:
+        # [FUNCTION DOC] Returns the stride as a one element list containing one.
         return [sympy.S.One]
 
     def get_name(self) -> str:
+        # [FUNCTION DOC] Returns the outer (wrapper level) name of the workspace.
         return self.outer_name
 
     def get_is_pinned(self) -> bool:
+        # [FUNCTION DOC] Returns false; a workspace is never pinned memory.
         return False
 
     def get_inputs_that_alias_output(self) -> list[str]:
+        # [FUNCTION DOC] Returns an empty list; a workspace never aliases kernel inputs and outputs.
         return []
 
 
 class TritonScratchWorkspace:
+    # [CLASS DOC] Describes a Triton scratch (global scratch) workspace: holds its size and a callable used to produce the dtype string for it.
     def __init__(self, size: int, generate_dtype_str: Callable[..., str]):
+        # [FUNCTION DOC] Stores the workspace size and the callable that generates the dtype string.
         self.size = size
         self._generate_dtype_str = generate_dtype_str
 
     def generate_dtype_str(self) -> str:
+        # [FUNCTION DOC] Calls the stored callable and returns the dtype string it produces.
         return self._generate_dtype_str()
 
 
 @dataclasses.dataclass
 class TensorArg:
+    # [CLASS DOC] Dataclass describing a tensor kernel argument: kernel arg name, backing buffer name, dtype, an offset (used by C++ only, default zero) and an alias_of name (used by Halide only).
     name: str
     buffer: str
     dtype: torch.dtype
@@ -285,21 +336,25 @@ class TensorArg:
 
 @dataclasses.dataclass
 class SizeArg:
+    # [CLASS DOC] Dataclass describing a scalar size kernel argument: its name and the sympy expression it carries.
     name: str
     expr: sympy.Expr
 
     @property
     def alias_of(self) -> str | None:
+        # [FUNCTION DOC] Property returning None; size args never alias another argument.
         return None
 
 
 @dataclasses.dataclass
 class ConstexprArg:
+    # [CLASS DOC] Dataclass for a compile-time constant (constexpr) kernel argument; holds only its name.
     name: str
 
 
 @dataclasses.dataclass
 class TMADescriptorArg:
+    # [CLASS DOC] Dataclass describing a TMA descriptor kernel argument: name, api type (experimental or stable), block shape and dtype (the last two only needed for the stable API).
     name: str
     api_type: str  # "experimental" or "stable"
     block_shape: list[sympy.Expr] | None  # only needed for "stable"
@@ -308,6 +363,8 @@ class TMADescriptorArg:
 
 @dataclasses.dataclass
 class DeviceCodegen:
+    # [CLASS DOC] Dataclass bundling per-device codegen constructors registered for a device: scheduling constructor, Python wrapper
+    # codegen class, and optional C++ wrapper and FX wrapper codegen classes.
     scheduling: SchedulingConstructor
     wrapper_codegen: WrapperConstructor
     cpp_wrapper_codegen: WrapperConstructor | None = None
@@ -325,19 +382,29 @@ device_codegens: dict[str, DeviceCodegen] = {}
 
 
 class DeviceOpOverrides:
+    # [CLASS DOC] Base interface producing device specific code snippets (strings) for streams, device guards, kernel headers
+    # and drivers used by the wrapper. Methods raise NotImplementedError unless noted; backends subclass and register
+    # an instance per device with register_device_op_overrides.
     def import_get_raw_stream_as(self, name: str) -> str:
+        # [FUNCTION DOC] Returns python code text for importing the raw stream getter under the given alias. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def set_device(self, device_idx: DeviceIdx) -> str:
+        # [FUNCTION DOC] Returns python code text for setting the current device to the given index. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def synchronize(self) -> str:
+        # [FUNCTION DOC] Returns python code text for synchronizing the device. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def device_guard(self, device_idx: DeviceIdx) -> str:
+        # [FUNCTION DOC] Returns python code text for a python device guard context for the given index. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def current_device_idx_expr(self) -> str:
+        # [FUNCTION DOC] Returns a runtime expression (string) that evaluates to the current device index, used under compile-on-one-rank
+        # so the wrapper is rank agnostic. The base version raises RuntimeError with an actionable message naming the
+        # subclass; only CUDA/ROCm provide an implementation.
         # Runtime expression evaluating to the current device index. Used under
         # compile-on-one-rank so the wrapper resolves its device at run time
         # (rank-agnostic) instead of baking the compile-time index. Only CUDA/ROCm
@@ -351,50 +418,66 @@ class DeviceOpOverrides:
         )
 
     def current_stream(self) -> str:
+        # [FUNCTION DOC] Returns python code text for obtaining the current stream. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def stream_handle(self, stream_name: str) -> str:
+        # [FUNCTION DOC] Returns the code text for the native handle of the named stream: the stream name followed by the native_handle attribute. Overridable.
         return f"{stream_name}.native_handle"
 
     def cpp_device_guard(self) -> str:
+        # [FUNCTION DOC] Returns code text for a C++ device guard. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_aoti_device_guard(self) -> str:
+        # [FUNCTION DOC] Returns code text for an AOTI C++ device guard. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_stream_guard(self) -> str:
+        # [FUNCTION DOC] Returns code text for a C++ stream guard. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_aoti_stream_guard(self) -> str:
+        # [FUNCTION DOC] Returns code text for an AOTI C++ stream guard. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_getStreamFromExternal(self) -> str:
+        # [FUNCTION DOC] Returns code text for the C++ call that obtains a stream from an external handle. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def kernel_header(self) -> str:
+        # [FUNCTION DOC] Returns code text for the kernel source header. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def kernel_driver(self) -> str:
+        # [FUNCTION DOC] Returns code text for the kernel driver helper code. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_stream_type(self) -> str:
+        # [FUNCTION DOC] Returns code text for the C++ stream type name. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def aoti_get_stream(self) -> str:
+        # [FUNCTION DOC] Returns code text for the AOTI call that obtains the stream. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_kernel_type(self) -> str:
+        # [FUNCTION DOC] Returns code text for the C++ kernel (function handle) type name. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_device_ptr(self) -> str:
+        # [FUNCTION DOC] Returns code text for the C++ device pointer type name. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def tma_descriptor_helpers(self) -> str:
+        # [FUNCTION DOC] Returns code text for TMA descriptor helper code. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def cpp_scratch(
         self, idx: int, workspace: TritonScratchWorkspace, prefix: str | None = None
     ) -> tuple[list[str], str] | None:
+        # [FUNCTION DOC] Optionally returns a pair of (list of scratch definition lines, argument name) for a Triton scratch workspace
+        # at the given index with an optional name prefix. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         # optionally return (scratch definition, arg name)
         raise NotImplementedError
 
@@ -437,6 +520,10 @@ def register_backend_for_device(
     device_custom_pass: CustomGraphModulePass | None = None,
     device_custom_config: ConfigModule | None = None,
 ) -> None:
+    # [FUNCTION DOC] Registers the codegen components for a device name: stores a DeviceCodegen record (scheduling, python wrapper,
+    # optional C++ and FX wrappers) in the global device_codegens map, stores the optional custom graph pass and custom
+    # config in their global maps. Raises AssertionError if a custom config is given that is not a ConfigModule or is the
+    # default inductor config. Mutates global registries.
     device_codegens[device] = DeviceCodegen(
         device_scheduling,
         device_wrapper_codegen,
@@ -456,6 +543,7 @@ def register_backend_for_device(
 
 
 class BackendFeature(Enum):
+    # [CLASS DOC] Enum of optional features a backend may support (foreach, bucketize, inplace buffers, masked scatter, scan, sort, tuple reduction, store loop order preference, triton templates, reduce to single element).
     FOREACH = auto()
     BUCKETIZE = auto()
     INPLACE_BUFFERS = auto()
@@ -471,6 +559,10 @@ class BackendFeature(Enum):
 def get_backend_features(
     device: torch.device | str | None,
 ) -> OrderedSet[BackendFeature]:
+    # [FUNCTION DOC] Returns the set of BackendFeature values supported for a device (given as a torch device or device type string).
+    # Returns an empty set for None. Ensures backends are registered, builds the scheduling object for the device type with
+    # no scheduler and asks it for its features. Raises AssertionError for a bad argument type or when no scheduling is
+    # registered for that device type.
     if device is None:
         return OrderedSet()
     init_backend_registration()
@@ -491,6 +583,7 @@ def get_backend_features(
 def has_backend_feature(
     device: torch.device | str | None, feature: BackendFeature
 ) -> bool:
+    # [FUNCTION DOC] Returns true if the given feature is in the backend feature set of the device. Raises AssertionError if feature is not a BackendFeature. See also the graph level has_feature.
     """See also V.graph.has_feature"""
     if not isinstance(feature, BackendFeature):
         raise AssertionError(f"expected BackendFeature, got {type(feature)}")
@@ -498,12 +591,17 @@ def has_backend_feature(
 
 
 def get_scheduling_for_device(device: str) -> SchedulingConstructor | None:
+    # [FUNCTION DOC] Returns the registered scheduling constructor for the device name, or None if the device is not registered.
     return device_codegens[device].scheduling if device in device_codegens else None
 
 
 def get_wrapper_codegen_for_device(
     device: str, cpp_wrapper: bool = False, fx_wrapper: bool = False
 ) -> WrapperConstructor | None:
+    # [FUNCTION DOC] Returns the wrapper codegen class registered for a device, or None if unregistered. Selects the FX wrapper if
+    # fx_wrapper is set, else the C++ wrapper if cpp_wrapper is set (swapping in the array-ref CPU C++ wrapper when the
+    # device is cpu, the AOTI stack allocation config is enabled and the registered class is the plain CPU C++ wrapper),
+    # else the Python wrapper. Reads config at call time.
     if device in device_codegens:
         wrapper_codegen_obj: DeviceCodegen = device_codegens[device]
         if fx_wrapper:
@@ -526,15 +624,21 @@ def get_wrapper_codegen_for_device(
 
 
 def get_custom_backend_pass_for_device(device: str) -> CustomGraphModulePass | None:
+    # [FUNCTION DOC] Returns the custom graph pass registered for the device, or None.
     return custom_backend_passes.get(device)
 
 
 def get_custom_backend_config_for_device(device: str) -> ConfigModule | None:
+    # [FUNCTION DOC] Returns the custom codegen config registered for the device, or None.
     return custom_backend_codegen_configs.get(device)
 
 
 @functools.cache
 def init_backend_registration() -> None:
+    # [FUNCTION DOC] Cached, runs once. Lazily imports backend modules and registers default scheduling and wrapper codegens for
+    # cpu, cuda, tpu, xpu, mps and mtia if not already registered, using config to choose the backend implementation
+    # (cpu_backend, cuda_backend, tpu_backend). Also registers a privateuse1 custom backend if its module provides
+    # Scheduling and wrapper classes (a RuntimeError during lookup is ignored). Mutates global registries.
     """
     Register the backend for different devices, including the scheduling
     for kernel code generation and the host side wrapper code generation.
@@ -662,6 +766,7 @@ def index_prevent_reordering(
     index_vars: Sequence[sympy.Expr],
     sizes: Sequence[sympy.Expr],
 ) -> list[sympy.Expr]:
+    # [FUNCTION DOC] Returns the list of index expressions with one extra appended: the dot product of the index variables with the contiguous strides of sizes. The extra term prevents the indexing from being reordered.
     from ..ir import FlexibleLayout
 
     # added contiguous index prevents reordering
@@ -671,11 +776,15 @@ def index_prevent_reordering(
 def register_device_op_overrides(
     device: str, device_op_overrides: DeviceOpOverrides
 ) -> None:
+    # [FUNCTION DOC] Stores the DeviceOpOverrides object for a device name in the global map while holding the lock.
     with device_op_overrides_lock:
         device_op_overrides_dict[device] = device_op_overrides
 
 
 def _initialize_device_op_overrides():
+    # [FUNCTION DOC] HELPER: Thread safe, run-once initializer of the device op overrides map. Uses a flag (not the map contents) with double
+    # checked locking; imports the MPS, CPU, CUDA, MTIA and XPU override modules (import triggers their registration)
+    # and registers no-op CPU style overrides for tpu.
     # Use a flag rather than checking device_op_overrides_dict, since external/test
     # code may partially populate it before we are called.
     global _device_op_overrides_initialized
@@ -699,6 +808,7 @@ def _initialize_device_op_overrides():
 
 
 def get_device_op_overrides(device: str) -> DeviceOpOverrides:
+    # [FUNCTION DOC] Returns the DeviceOpOverrides registered for a device name after making sure defaults are initialized. Raises AssertionError if device is not a string, KeyError if unregistered.
     if not isinstance(device, str):
         raise AssertionError(type(device))
     _initialize_device_op_overrides()
@@ -732,6 +842,10 @@ def deduce_output_dtype_by_name(
     *args: Any,
     **kwargs: Any,
 ) -> torch.dtype | None:
+    # [FUNCTION DOC] Deduces the output dtype of an inductor op from its name and arguments. Returns bool for boolean ops, the dtype
+    # argument (keyword or positional) for type conversion, index/value expr, reduction, constant and bitcast ops, float
+    # for rand and randn, int64 for index, seed and 64-bit random ops, the graph recorded dtype of the buffer for load,
+    # store and store_reduction, and None when unknown.
     """
     Given op name and a list of input dtypes, deduce the output dtype
     """
@@ -771,6 +885,7 @@ def deduce_output_dtype_by_name(
 
 
 def _is_runtime_triton_assert_target() -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the current backend is triton, the current device is not cpu and the active kernel has a triton tensor rank attribute, i.e. runtime Triton asserts can be emitted.
     return (
         get_current_backend() == "triton"
         and V.graph.get_current_device_or_throw().type != "cpu"
@@ -781,6 +896,10 @@ def _is_runtime_triton_assert_target() -> bool:
 def check_dtype(
     buffer: IndentedBuffer, var: CSEVariableType, dtype: torch.dtype
 ) -> None:
+    # [FUNCTION DOC] Emits a dtype check into the buffer for a CSE variable. For Triton on a GPU with the runtime dtype assert test
+    # config, writes a static assert on the variable dtype. For the C++ backend with the static dtype assert config, writes
+    # a C++ static assert comparing the variable type to the expected type (handling vector, mask and bool cases).
+    # Raises AssertionError if the variable is not a C++ CSE variable in the C++ case. Writes to the buffer.
     backend = get_current_backend()
     if (
         config.test_configs.runtime_triton_dtype_assert
@@ -810,6 +929,7 @@ def check_dtype(
 def check_shape(
     buffer: IndentedBuffer, var: CSEVariableType, shape: BlockShapeType
 ) -> None:
+    # [FUNCTION DOC] With the runtime Triton shape assert config enabled for a GPU Triton kernel, writes a static assert of the variable shape into the buffer. Raises AssertionError if shape is None.
     if shape is None:
         raise AssertionError("expected shape to be not None")
     if (
@@ -823,6 +943,7 @@ def check_shape(
 
 
 def check_nan(buffer: IndentedBuffer, var: CSEVariableType) -> None:
+    # [FUNCTION DOC] For the Triton backend, writes a device assert into the buffer that the variable is neither NaN nor infinite; does nothing for other backends.
     backend = get_current_backend()
     if backend == "triton":
         msg = "NaN or Inf found"
@@ -832,7 +953,10 @@ def check_nan(buffer: IndentedBuffer, var: CSEVariableType) -> None:
 
 
 class DataTypePropagation:
+    # [CLASS DOC] Propagates dtypes through the FX graphs of a LoopBody (root graph plus subblocks). Stores each node's dtype in
+    # an OptimizationContext in node meta. Holds the mapping of graph key to FX graph.
     def __init__(self, body: LoopBody) -> None:
+        # [FUNCTION DOC] Stores the loop body and builds the mapping from graph keys to graphs: the root block graph under root plus every subblock graph.
         self.body = body
         self.graphs: dict[Callable[..., Any] | str, Any] = {
             "root": body.root_block.graph
@@ -841,6 +965,8 @@ class DataTypePropagation:
             self.graphs[k] = v.graph
 
     def deduce_node_dtype_by_inputs(self, node: torch.fx.Node) -> torch.dtype | None:
+        # [FUNCTION DOC] Returns the promoted dtype of the node's non-placeholder input nodes, or None when there are no such inputs or
+        # any of them has no propagated dtype yet.
         inputs = node.all_input_nodes
         input_nodes = [
             n for n in inputs if isinstance(n, torch.fx.Node) and n.op != "placeholder"
@@ -862,6 +988,7 @@ class DataTypePropagation:
         )
 
     def deduce_node_dtype_by_subgraph(self, node: torch.fx.Node) -> torch.dtype:
+        # [FUNCTION DOC] Looks up the node's target subgraph, propagates dtypes through it and returns its dtype. Raises AssertionError if no dtype results.
         sub_graph = self.graphs[node.target]
         dtype = self.propagate_graph(sub_graph)
         if not dtype:
@@ -869,6 +996,9 @@ class DataTypePropagation:
         return dtype
 
     def deduce_node_dtype(self, node: torch.fx.Node) -> torch.dtype | None:
+        # [FUNCTION DOC] Returns the dtype of an FX node or None. Placeholders and multi-argument outputs give None; getitem uses the
+        # dtype of its source node; masked subblock calls use the subgraph dtype; otherwise tries the name based deduction and
+        # falls back to input promotion. Raises AssertionError for unexpected node target types.
         if node.op == "placeholder":
             return None
 
@@ -900,6 +1030,9 @@ class DataTypePropagation:
         return self.deduce_node_dtype_by_inputs(node)
 
     def propagate_graph(self, graph: torch.fx.Graph) -> torch.dtype | None:
+        # [FUNCTION DOC] Walks the graph nodes in order, computing each node dtype and storing it in the node's OptimizationContext (created
+        # if missing). Returns the dtype of the output node (used as the dtype of masked subblocks), possibly None.
+        # Raises AssertionError for an empty graph. Mutates node meta.
         if not graph.nodes:
             raise AssertionError("expected graph to have nodes")
         graph_dtype: torch.dtype | None = None
@@ -919,14 +1052,17 @@ class DataTypePropagation:
         return graph_dtype
 
     def propagate(self) -> torch.dtype | None:
+        # [FUNCTION DOC] Runs dtype propagation over the root graph and returns its output dtype.
         return self.propagate_graph(self.graphs["root"])
 
     @classmethod
     def propagate_loopbody(cls, body: LoopBody) -> torch.dtype | None:
+        # [FUNCTION DOC] Class method: builds a propagator for the loop body, runs it and returns the root output dtype.
         return cls(body).propagate()
 
     @classmethod
     def propagate_scheduler_node(cls, node: SchedulerNode) -> torch.dtype | None:
+        # [FUNCTION DOC] Class method: propagates dtypes over a SchedulerNode's loop body and returns the result. Raises AssertionError if the node is not a SchedulerNode or its body is not a LoopBody.
         from ..loop_body import LoopBody
         from ..scheduler import SchedulerNode
 
@@ -938,15 +1074,18 @@ class DataTypePropagation:
 
 
 class PythonPrinter(_PythonPrinter):
+    # [CLASS DOC] Sympy to python source printer that simplifies expressions with the graph sizevars before printing and parenthesizes Mod terms to keep correct precedence.
     def doprint(
         self, expr: sympy.Expr, *, simplify: bool = True, p: bool = True
     ) -> str:
+        # [FUNCTION DOC] Prints a sympy expression as python source. If simplify is set and the expression is a sympy expression and the graph has sizevars, it is simplified first. Returns the string.
         # TODO: why are people passing strings to the printer here :think:
         if simplify and isinstance(expr, sympy.Expr) and hasattr(V.graph, "sizevars"):
             expr = V.graph.sizevars.simplify(expr)
         return super().doprint(expr)
 
     def parenthesize(self, item: sympy.Expr, level: int, strict: bool = False) -> str:
+        # [FUNCTION DOC] Wraps Mod expressions in parentheses to enforce precedence (works around wrong output for negatives times Mod in one sympy version); other items use the base behavior.
         if isinstance(item, sympy.Mod):
             # use parenthesis to enforce precedence.
             # in sympy 1.13.3, -2*Mod(x,y) becomes -2*x%y, which is wrong.
@@ -957,91 +1096,112 @@ class PythonPrinter(_PythonPrinter):
 
 
 class OpDecompositions:
+    # [CLASS DOC] Collection of static methods that decompose some inductor ops into other ops (via the ops dispatcher): reciprocal, square, erfc, expm1, log10, log2, exp2, log1p, sigmoid, relu, fma, rounding to int, remainder, etc.
     """
     Decomposes inductor ops
     """
 
     @staticmethod
     def identity(value: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] HELPER: Returns the value unchanged; used to trigger common subexpression elimination.
         # used to trigger cse
         return value
 
     @staticmethod
     def reciprocal(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes reciprocal as float32 constant one divided by x.
         # Use float32 constant so that div_rn can be applied when
         # eager_numerics.division_rounding is enabled
         return ops.truediv(ops.constant(1.0, torch.float32), x)
 
     @staticmethod
     def square(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes square as x multiplied by x.
         return ops.mul(x, x)
 
     @staticmethod
     def erfc(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes erfc as one minus erf of x.
         return ops.sub(ops.constant(1, torch.float32), ops.erf(x))
 
     @staticmethod
     def erfcx(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes erfcx as exp of the square of x times erfc of x.
         return ops.mul(ops.exp(ops.square(x)), ops.erfc(x))
 
     @staticmethod
     def expm1(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes expm1 as exp of x minus one.
         return ops.sub(ops.exp(x), ops.constant(1, torch.float32))
 
     @staticmethod
     def log10(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes log10 as natural log of x times one over ln 10.
         return ops.mul(ops.log(x), ops.constant(1 / math.log(10), torch.float32))
 
     @staticmethod
     def log2(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes log2 as natural log of x times one over ln 2.
         return ops.mul(ops.log(x), ops.constant(1 / math.log(2), torch.float32))
 
     @staticmethod
     def exp2(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes exp2 as exp of x times ln 2.
         return ops.exp(ops.mul(x, ops.constant(math.log(2), torch.float32)))
 
     @staticmethod
     def log1p(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes log1p as log of x plus one.
         return ops.log(ops.add(x, ops.constant(1, torch.int32)))
 
     @staticmethod
     def sigmoid(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes sigmoid as one over one plus exp of negative x.
         one = ops.constant(1, torch.int32)
         return ops.truediv(one, ops.add(one, ops.exp(ops.neg(x))))
 
     @staticmethod
     def relu(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes relu as the maximum of x and zero.
         return ops.maximum(x, ops.constant(0, torch.int32))
 
     @staticmethod
     def fma(x: OpVarT, y: OpVarT, z: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes fused multiply add as x times y plus z; fallback for backends that do not override it (Halide).
         # for backends that don't override this (halide)
         return ops.add(ops.mul(x, y), z)
 
     @staticmethod
     def mul_rn(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes multiply with round-to-nearest as a plain multiply; fallback when a backend has no special version.
         # for backends that don't override this, just use regular mul
         return ops.mul(x, y)
 
     @staticmethod
     def div_rn(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes divide with round-to-nearest as a plain true division; fallback when a backend has no special version.
         # for backends that don't override this, just use regular div
         return ops.truediv(x, y)
 
     @staticmethod
     def floor_to_int(a: OpVarT, dtype: torch.dtype) -> OpVarT:
+        # [FUNCTION DOC] Decomposes floor to int as floor then conversion to the given dtype.
         return ops.to_dtype(ops.floor(a), dtype)
 
     @staticmethod
     def ceil_to_int(a: OpVarT, dtype: torch.dtype) -> OpVarT:
+        # [FUNCTION DOC] Decomposes ceil to int as ceil then conversion to the given dtype.
         return ops.to_dtype(ops.ceil(a), dtype)
 
     @staticmethod
     def trunc_to_int(a: OpVarT, dtype: torch.dtype) -> OpVarT:
+        # [FUNCTION DOC] Decomposes trunc to int as trunc then conversion to the given dtype.
         return ops.to_dtype(ops.trunc(a), dtype)
 
     @staticmethod
     def remainder(a: OpVarT, b: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Decomposes remainder with the sign of the divisor: computes mod, and where the result is nonzero and its sign bit
+        # differs from the divisor's sign bit, adds the divisor back.
         r = ops.mod(a, b)
         cond = ops.and_(
             ops.ne(r, ops.constant(0, torch.int32)),
@@ -1051,6 +1211,7 @@ class OpDecompositions:
 
     @staticmethod
     def round_to_int(a: OpVarT, dtype: torch.dtype) -> OpVarT:
+        # [FUNCTION DOC] Decomposes round to int as round then conversion to the given dtype.
         return ops.to_dtype(ops.round(a), dtype)
 
 
@@ -1058,6 +1219,9 @@ _RE_PAREN_NOT_NEEDED = re.compile(r"[a-z0-9_.]+|\([^)]*\)|", flags=re.IGNORECASE
 
 
 def _all_in_parens(string: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the string is entirely enclosed by one matching pair of outer parentheses (the opening paren at the start
+    # pairs with the final character). Raises AssertionError if parentheses are unbalanced.
+    # KNOWN ISSUE: indexes the first character, so an empty string would raise an IndexError.
     if string[0] != "(" or len(string) < 2:
         return False
     count = 1
@@ -1075,8 +1239,13 @@ def _all_in_parens(string: str) -> bool:
 
 # pyrefly: ignore [inconsistent-inheritance]
 class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
+    # [CLASS DOC] Default string-producing ops handler for backends: inherits math mixin and decompositions and the ops handler
+    # interface. Provides code text for bitwise and logical ops, and stubs that raise for ops that must be handled by
+    # CSEProxy (load, store, reduction, scan, sort, bucketize, ...) or only by specific backends. Pointwise overrides are
+    # attached to subclasses dynamically by _initialize_pointwise_overrides.
     @staticmethod
     def paren(string: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns the string unchanged if it is a CSEVariable, a simple token or already fully parenthesized; otherwise returns it wrapped in parentheses.
         if (
             isinstance(string, CSEVariable)
             or _RE_PAREN_NOT_NEEDED.fullmatch(string)
@@ -1089,46 +1258,56 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
 
     @staticmethod
     def constant(value: bool | float | int, dtype: torch.dtype) -> OpVarT:
+        # [FUNCTION DOC] Returns the textual representation of the constant value; the dtype is ignored.
         return repr(value)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_not(x: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for bitwise not of the parenthesized operand.
         return f"~{OpOverrides.paren(x)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_not(a: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text testing that the parenthesized operand equals zero.
         return f"{OpOverrides.paren(a)} == 0"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_and(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for bitwise and of the two parenthesized operands.
         return f"{OpOverrides.paren(x)} & {OpOverrides.paren(y)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_or(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for bitwise or of the two parenthesized operands.
         return f"{OpOverrides.paren(x)} | {OpOverrides.paren(y)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_xor(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for bitwise exclusive or of the two parenthesized operands.
         return f"{OpOverrides.paren(x)} ^ {OpOverrides.paren(y)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_left_shift(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for left shift of x by y with parenthesized operands.
         return f"{OpOverrides.paren(x)} << {OpOverrides.paren(y)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def bitwise_right_shift(x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Returns code text for right shift of x by y with parenthesized operands.
         return f"{OpOverrides.paren(x)} >> {OpOverrides.paren(y)}"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def int_truediv(a: OpVarT, b: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Implements integer true division by delegating to true division of the ops dispatcher.
+        # KNOWN ISSUE: marked as wrong in the source; it is only exact for values up to 2 to the 53rd power.
         # TODO: this is wrong
         # TODO: an easy bandaid is to generate runtime asserts that it's
         # <= 2**53, which is when this equation is correct
@@ -1136,6 +1315,7 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
 
     @staticmethod
     def load_seed(name: str, offset: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Loads the seed from buffer name at the integer offset via the ops dispatcher and returns the loaded variable.
         return ops.load(name, sympy.Integer(offset))
 
     def indirect_indexing(
@@ -1145,16 +1325,19 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         check: bool = True,
         wrap_neg: bool = True,
     ) -> sympy.Symbol:
+        # [FUNCTION DOC] Returns a sympy index symbol named after the variable; check and wrap_neg are ignored here (handled by CSEProxy).
         return sympy_index_symbol(str(var))
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
+        # [FUNCTION DOC] Raises NotImplementedError: bounds checks are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: check_bounds should be handled by CSEProxy"
         )
 
     def load(self, name: str, index: sympy.Expr) -> OpVarT:
+        # [FUNCTION DOC] Raises NotImplementedError: loads are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: load should be handled by CSEProxy"
         )
@@ -1162,16 +1345,19 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
     def store(
         self, name: str, index: sympy.Expr, value: OpVarT, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Raises NotImplementedError: stores are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: store should be handled by CSEProxy"
         )
 
     def device_assert_async(self, cond: CSEVariable, msg: str) -> None:
+        # [FUNCTION DOC] Raises NotImplementedError: asynchronous device asserts are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: device_assert_async should be handled by CSEProxy"
         )
 
     def store_reduction(self, name: str, index: sympy.Expr, value: OpVarT) -> None:
+        # [FUNCTION DOC] Raises NotImplementedError: store reductions are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: store_reduction should be handled by CSEProxy"
         )
@@ -1183,6 +1369,7 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         reduction_type: ReductionType,
         value: OpVarT | tuple[OpVarT, ...],
     ) -> OpVarT | tuple[OpVarT, ...]:
+        # [FUNCTION DOC] Raises NotImplementedError: reductions are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: reduction should be handled by CSEProxy"
         )
@@ -1196,6 +1383,7 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         ],
         values: tuple[OpVarT, ...],
     ) -> tuple[OpVarT, ...]:
+        # [FUNCTION DOC] Raises NotImplementedError: scans are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: scan should be handled by CSEProxy"
         )
@@ -1207,6 +1395,7 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         stable: bool,
         descending: bool,
     ) -> tuple[OpVarT, ...]:
+        # [FUNCTION DOC] Raises NotImplementedError: sorts are handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: sort should be handled by CSEProxy"
         )
@@ -1221,16 +1410,19 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: OpVarT | None = None,
     ) -> OpVarT:
+        # [FUNCTION DOC] Raises NotImplementedError: bucketize is handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: bucketize should be handled by CSEProxy"
         )
 
     def halide_clamp(self, value: OpVarT, size: sympy.Expr, check: bool) -> OpVarT:
+        # [FUNCTION DOC] Raises NotImplementedError: clamp is implemented only for the Halide backend.
         raise NotImplementedError(
             f"{type(self).__name__}: halide_clamp only implemented for Halide backend"
         )
 
     def dot(self, x: OpVarT, y: OpVarT) -> OpVarT:
+        # [FUNCTION DOC] Raises NotImplementedError: dot is implemented only for the Triton backend.
         raise NotImplementedError(
             f"{type(self).__name__}: dot only implemented for Triton backend"
         )
@@ -1245,23 +1437,28 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         pack: int = 1,
         input_dtypes: tuple[torch.dtype, ...] | None = None,
     ) -> OpVarT:
+        # [FUNCTION DOC] Raises NotImplementedError: inline assembly elementwise is implemented only for the Triton backend.
         raise NotImplementedError(
             f"{type(self).__name__}: inline_asm_elementwise only implemented for Triton backend"
         )
 
     def output(self, *args: OpVarT) -> None:
+        # [FUNCTION DOC] Raises AssertionError: the output op must not appear at codegen time.
         raise AssertionError(
             f"{type(self).__name__}: ops.output should not appear at codegen time"
         )
 
     def placeholder(self, index: int) -> OpVarT:
+        # [FUNCTION DOC] Raises AssertionError: the placeholder op must not appear at codegen time.
         raise AssertionError(
             f"{type(self).__name__}: ops.placeholder should not appear at codegen time"
         )
 
     @staticmethod
     def _unimplemented(name: str) -> Callable[..., OpVarT]:
+        # [FUNCTION DOC] HELPER: Builds and returns a function standing in for an unsupported op name; calling it raises NotImplementedError naming the class and op. The function is named after the op and flagged as unimplemented.
         def unimplemented(self: OpOverrides, *args: Any, **kwargs: Any) -> OpVarT:
+            # [FUNCTION DOC] HELPER: Raises NotImplementedError saying the handler class does not implement the op.
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement ops.{name}"
             )
@@ -1272,12 +1469,17 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
 
     @classmethod
     def _is_unimplemented(cls, name: str) -> bool:
+        # [FUNCTION DOC] HELPER: Class method: returns true when the named op is missing, equals the default from the base ops handler, or carries the unimplemented marker.
         fn = getattr(cls, name, None)
         default_fn = getattr(OpsHandler, name, None)
         return not fn or fn == default_fn or getattr(fn, "is_unimplemented", False)
 
     @classmethod
     def _initialize_pointwise_overrides(cls, target: str) -> None:
+        # [FUNCTION DOC] HELPER: Class method: installs pointwise op implementations for a backend target (triton, cpp, cppvec, halide or mps) as
+        # static methods from pointwise_overrides_data. Ops with no implementation for the target get an unimplemented stub if
+        # not already implemented. Raises AssertionError for an unknown target or when the class already defines an op that is
+        # also being installed. Mutates the class; sets the implementation function's name.
         if target not in ("triton", "cpp", "cppvec", "halide", "mps"):
             raise AssertionError(target)
 
@@ -1297,6 +1499,8 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
 
 @dataclasses.dataclass
 class OverridesData:
+    # [CLASS DOC] Dataclass describing one pointwise op override: name, C++ implementation callable (required), optional Triton, C++
+    # vectorized, Halide and MPS callables (None means not implemented), and the elementwise type promotion kind.
     name: str
     cpp: Callable[..., str]
     # None when not impl in libdevice/triton
@@ -1311,6 +1515,7 @@ class OverridesData:
 
 
 def _triton_bessel(order: int, kind: str, x: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns Triton code text for a Bessel function of the given order and kind (j or y) from libdevice, yielding NaN in the input dtype for infinite inputs to match eager.
     # PyTorch eager returns NaN for +/-inf, while libdevice returns
     # the mathematical limit. x - x yields NaN in x's dtype
     # (avoids fp32 literal promotion under tl.where for float64 inputs)
@@ -1322,6 +1527,7 @@ def _triton_bessel(order: int, kind: str, x: str) -> str:
 
 
 def _triton_cyl_bessel_i(order: int, x: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns Triton code text for the modified cylindrical Bessel i function of the given order, yielding NaN in the input dtype for infinite inputs to match eager.
     # PyTorch's Cephes-derived kernels return NaN for infinities; libdevice
     # returns signed infinities, so synthesize a same-dtype NaN with x - x.
     return (
@@ -1579,6 +1785,7 @@ pointwise_overrides_data: dict[str, OverridesData] = dict(
 
 
 def is_buffer_removed(name: str) -> bool:
+    # [FUNCTION DOC] Returns true if the buffer name is in any removed or in-place-to-remove set of the current graph or the current kernel.
     return any(
         name in x
         for x in (
@@ -1591,27 +1798,34 @@ def is_buffer_removed(name: str) -> bool:
 
 
 class DeferredLine(DeferredLineBase):
+    # [CLASS DOC] A deferred code line that is dropped (evaluates to None) if its associated buffer name has been removed. Holds the buffer name and the line text.
     """A line that can be 'unwritten' by adding name to V.graph.removed_buffers"""
 
     def __init__(self, name: str, line: str):
+        # [FUNCTION DOC] Stores the buffer name and line text. Raises AssertionError if the line is itself a deferred line.
         super().__init__(line)
         self.name = name
         if isinstance(line, DeferredLineBase):
             raise AssertionError("line must not be a DeferredLineBase")
 
     def __call__(self) -> str | None:
+        # [FUNCTION DOC] Returns the line text unless the buffer has been removed, in which case returns None.
         if not is_buffer_removed(self.name):
             return self.line
         return None
 
     def _new_line(self, line: str) -> DeferredLine:
+        # [FUNCTION DOC] HELPER: Builds a new DeferredLine with the same buffer name and the given line text.
         return DeferredLine(self.name, line)
 
 
 class BracesBuffer(IndentedBuffer):
+    # [CLASS DOC] Indented buffer that emits braces: entering an indent context writes an opening brace and increases indentation; leaving writes a closing brace and decreases it (the reverse for negative offsets).
     def indent(self, offset: int = 1) -> contextlib.AbstractContextManager[None]:
+        # [FUNCTION DOC] Returns a context manager that, for a positive offset, writes opening braces and indents on entry and dedents with closing braces on exit; negative offsets do the opposite. Mutates indentation and buffer contents.
         @contextlib.contextmanager
         def ctx() -> Iterator[None]:
+            # [FUNCTION DOC] HELPER: Generator based context manager implementing the brace and indent logic described by the enclosing indent method.
             for _ in range(offset):
                 self.writeline("{")
                 self._indent += 1
@@ -1630,22 +1844,27 @@ class BracesBuffer(IndentedBuffer):
 
 
 class InplacedBuffer(NamedTuple):
+    # [CLASS DOC] Named tuple for an in-place kernel buffer: the inner kernel argument name and the list of outer buffer names that share it.
     inner_name: str
     other_names: list[str]
 
 
 @dataclasses.dataclass
 class ArgName:
+    # [CLASS DOC] Dataclass for a kernel argument name with a flag for whether it should be declared as a Triton constexpr.
     name: str
     # is_constexpr=True is used to attach a " : tl.constexpr" into the argument list
     is_constexpr: bool = False
 
     def full_name(self) -> str:
+        # [FUNCTION DOC] Returns the name, followed by a constexpr annotation if the flag is set.
         return f"{self.name}{' : tl.constexpr' if self.is_constexpr else ''}"
 
 
 class RemovedArg:
+    # [CLASS DOC] Sentinel type marking a kernel argument that has been removed; its string form is REMOVED.
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the text REMOVED.
         return "REMOVED"
 
 
@@ -1653,12 +1872,17 @@ REMOVED = RemovedArg()
 
 
 class KernelArgs:
+    # [CLASS DOC] Tracks the arguments of a generated kernel. State: input_buffers (outer name to inner arg name), output_buffers
+    # (outer name to inner name or removed marker), inplace_buffers (outer name to InplacedBuffer or removed marker),
+    # sizevars (sympy expr to arg name) and workspace_args. Provides name allocation, in-place merging, removal and
+    # argument definition generation for C++ and Python/Triton.
     @staticmethod
     def _lookup(
         prefix: str,
         odict: dict[_T, str | RemovedArg] | dict[_T, str],
         name: _T,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the name stored for the key in the dict; if missing or marked removed, allocates a new name from the prefix and the current dict length, stores and returns it. Mutates the dict.
         result: str | RemovedArg = odict.get(name, REMOVED)
         if isinstance(result, RemovedArg):
             odict[name] = new_result = f"{prefix}{len(odict)}"
@@ -1666,6 +1890,7 @@ class KernelArgs:
         return result
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes empty input, output, in-place and size variable maps and an empty workspace argument list.
         self.input_buffers: dict[str, str] = {}
         self.output_buffers: dict[str, str | RemovedArg] = {}
         self.inplace_buffers: dict[str, InplacedBuffer | RemovedArg] = {}
@@ -1673,6 +1898,7 @@ class KernelArgs:
         self.workspace_args: list[WorkspaceArg] = []
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a string showing the input, output, in-place and size maps.
         return "KernelArgs({})".format(
             ", ".join(
                 map(
@@ -1689,10 +1915,14 @@ class KernelArgs:
 
     @staticmethod
     def _buffer_is_marked_removed(name: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true if the given value is the removed marker (needed by MTIA).
         # this function is needed by MTIA
         return isinstance(name, RemovedArg)
 
     def input(self, name: str) -> str:
+        # [FUNCTION DOC] Returns the kernel argument name to use when reading a buffer. Resolves mutation aliases through the scheduler if
+        # present; reuses the output or in-place name if the buffer is already one; otherwise allocates a seed or in_ptr name.
+        # Raises AssertionError if the buffer was removed. May mutate input_buffers.
         if V.graph.scheduler:
             name = V.graph.scheduler.mutation_real_name.get(name, name)
         if name in V.graph.removed_buffers:
@@ -1706,6 +1936,8 @@ class KernelArgs:
         return self._lookup("in_ptr", self.input_buffers, name)
 
     def output(self, name: str) -> str:
+        # [FUNCTION DOC] Returns the kernel argument name to use when writing a buffer. Resolves mutation aliases through the scheduler; reuses
+        # the in-place name if present; otherwise allocates an out_ptr name. Raises AssertionError if the buffer was removed.
         if V.graph.scheduler:
             name = V.graph.scheduler.mutation_real_name.get(name, name)
         if name in V.graph.removed_buffers:
@@ -1715,6 +1947,9 @@ class KernelArgs:
         return self._lookup("out_ptr", self.output_buffers, name)
 
     def make_inplace(self, input_name: str, output_name: str) -> None:
+        # [FUNCTION DOC] Makes output_name share memory with input_name as an in-place kernel argument. Propagates unaligned status from input
+        # to output in the graph. If the input is already in-place, adds the output to its group; otherwise creates a new
+        # in_out_ptr group with both names. Raises AssertionError if the output is already in-place or an existing group is removed.
         if input_name in V.graph.unaligned_buffers:
             V.graph.unaligned_buffers.add(output_name)
         if output_name in self.inplace_buffers:
@@ -1747,6 +1982,10 @@ class KernelArgs:
     def workspace(
         self, nelem: sympy.Expr, zero_fill: bool, dtype: torch.dtype = torch.uint8
     ) -> tuple[str, str, int]:
+        # [FUNCTION DOC] Allocates or extends a workspace buffer of nelem elements with the given zero fill and dtype. Creates a new
+        # WorkspaceArg on the current device; if an existing workspace arg can be joined with it (same inner name, dtype,
+        # device) the two are merged and the offset (the previous count) is returned. Returns (inner name, outer name,
+        # offset). Raises AssertionError on name clashes. Mutates workspace_args.
         """
         Allocate or extend a workspace buffer of nelem elements.
 
@@ -1793,6 +2032,12 @@ class KernelArgs:
         return arg.inner_name, arg.outer_name, 0
 
     def semaphores(self, min_size: sympy.Expr) -> str:
+        # [FUNCTION DOC] Lazily adds a graph wide semaphore buffer workspace argument (int32-sized elements, zeroed per graph) of at least
+        # min_size on the current device and returns its inner kernel argument name. The outer name includes the device type
+        # and, unless compile-on-one-rank is enabled, the device index. Raises AssertionError if a different semaphore arg
+        # is already present. Mutates workspace_args.
+        # KNOWN ISSUE: the docstring says repeated calls return the same buffer, but the arg is appended on every call, so
+        # duplicates can accumulate in workspace_args; the dtype used is uint32, not int32.
         """
         Lazily allocate a graph-wide semaphores buffer with at least min_size.  This is a single buffer shared by
         all kernels and zero initialized once at graph start.  Each kernel must leave the buffer zeroed on exit.
@@ -1828,6 +2073,7 @@ class KernelArgs:
         return arg.inner_name
 
     def seed_offset(self, name: str, value: int) -> str:
+        # [FUNCTION DOC] Lifts an integer seed offset constant into a kernel size argument to improve cache hits. Returns the existing arg name if the value is already present; otherwise registers it under the given name (made unique by a count suffix on name collisions). Raises AssertionError for non-int values.
         if not isinstance(value, int):
             raise AssertionError((type(value), value))
         # here we are lifting a constant integer into an arg to the kernel to try to get additional cache hits
@@ -1842,6 +2088,7 @@ class KernelArgs:
         return name
 
     def size(self, name: sympy.Symbol) -> str:
+        # [FUNCTION DOC] Returns the kernel argument name for a sympy symbol size variable, allocating a ks name when new; the seed symbol keeps the fixed name seed. Raises AssertionError if not a sympy Symbol.
         if not isinstance(name, sympy.Symbol):
             raise AssertionError((type(name), name))
         if name.name == "seed":
@@ -1850,11 +2097,13 @@ class KernelArgs:
         return self._lookup("ks", self.sizevars, name)
 
     def call_names(self) -> Iterator[str]:
+        # [FUNCTION DOC] Returns an iterator over the outer names of input buffers, output buffers and size variables, in that order.
         return chain(
             self.input_buffers.keys(), self.output_buffers.keys(), self.sizevars.keys()
         )
 
     def arg_name(self, name: str) -> str | None:
+        # [FUNCTION DOC] Returns the inner kernel argument name for an outer buffer name, looking in in-place, output and input maps in that order, or None if absent or removed.
         """
         Returns inner name of a given outer name.
         """
@@ -1867,14 +2116,20 @@ class KernelArgs:
         return self.input_buffers.get(name, None)
 
     def wrap_ptr_arg(self, buf: str, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Returns the buffer name unchanged; subclasses may wrap pointer arguments.
         return buf
 
     def wrap_size_arg(self, size: SymbolLike) -> str:
+        # [FUNCTION DOC] Returns the size argument converted to a string; subclasses may wrap it.
         return str(size)
 
     def cpp_argdefs(
         self, dtype_to_cpp_type: dict[torch.dtype, str] | None = None
     ) -> tuple[list[str], list[str], list[str]]:
+        # [FUNCTION DOC] Builds C++ kernel parameters. Returns (argument definitions, call arguments, argument types) for in-place buffers
+        # (non-const pointers), inputs (const pointers), outputs (pointers) and size variables (float for unbacked floats,
+        # otherwise the index type). Uses the given dtype to C++ type map or the default. Ensures size variables are computed
+        # in the wrapper. Raises AssertionError if workspace args exist (unsupported on CPU).
         from .cpp_utils import INDEX_TYPE
 
         if dtype_to_cpp_type is None:
@@ -1930,6 +2185,9 @@ class KernelArgs:
     def python_argdefs(
         self,
     ) -> tuple[list[ArgName], list[str], list[KernelArgType], list[Any]]:
+        # [FUNCTION DOC] Builds Python/Triton kernel parameters. Returns (ArgName list, call argument names, precompile arg descriptors,
+        # argument types) covering in-place buffers, inputs and outputs (skipping removed ones), size variables (also ensuring
+        # they are computed in the wrapper) and workspace args.
         arg_defs: list[ArgName] = []
         call_args: list[str] = []
         arg_types: list[Any] = []
@@ -1979,6 +2237,7 @@ class KernelArgs:
         return arg_defs, call_args, precompile_args, arg_types
 
     def aliases(self) -> Iterator[tuple[str, str]]:
+        # [FUNCTION DOC] Generator yielding pairs of (kernel argument name, in-place argument name) for each input or output that shares an in-place buffer, skipping buffers scheduled for in-place removal.
         for inplaced in unique(self.inplace_buffers.values()):
             if isinstance(inplaced, RemovedArg):
                 continue
@@ -1994,6 +2253,7 @@ class KernelArgs:
                     yield cast(str, self.output_buffers[other]), inplaced.inner_name
 
     def is_removed(self, name: str) -> bool:
+        # [FUNCTION DOC] Returns true if the buffer is marked removed in both the output buffers and in-place buffers maps.
         return isinstance(
             self.output_buffers.get(name, REMOVED), RemovedArg
         ) and isinstance(self.inplace_buffers.get(name, REMOVED), RemovedArg)
@@ -2002,6 +2262,7 @@ class KernelArgs:
     # after you do a call into this kernel, which buffers actually contain
     # updated data?  Modeled off of python_argdefs.
     def live_output_buffers(self) -> OrderedSet[str]:
+        # [FUNCTION DOC] Returns the ordered set of outer buffer names whose data is updated after calling the kernel: the last name of each live in-place group plus non-removed non-in-place outputs.
         live_outs: OrderedSet[str] = OrderedSet()
         for inplaced in unique(self.inplace_buffers.values()):
             if isinstance(inplaced, RemovedArg):
@@ -2015,6 +2276,9 @@ class KernelArgs:
 
 
 class CSEVariable:
+    # [CLASS DOC] A named expression in generated code, with annotation hooks for backends (overridden through the kernel's variable
+    # factory). State: name, bounds (value ranges), use_count (starts at one), dtype and shape. Equality and hashing are
+    # by name only.
     """A CSEVariable is just a name for an expression but it is useful to be able to annotate them on a backend dependent basis.
     To do so, the backends can simply overload `Kernel.create_cse_var`
     The "CSEVariable.update_on_args" method gives you a hook for annotations
@@ -2028,6 +2292,7 @@ class CSEVariable:
         dtype: torch.dtype | None = None,
         shape: BlockShapeType = None,
     ):
+        # [FUNCTION DOC] Stores name, bounds, dtype and shape and starts the use count at one. Raises AssertionError if bounds is not a ValueRanges.
         super().__init__()
         if not isinstance(bounds, ValueRanges):
             raise AssertionError(type(bounds))
@@ -2038,18 +2303,23 @@ class CSEVariable:
         self.shape = shape
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the variable name.
         return self.name
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hashes the variable name.
         return hash(self.name)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal to another object if it is a CSEVariable with the same name.
         return isinstance(other, CSEVariable) and other.name == self.name
 
     def update_on_args(self, name: str, args: Any, kwargs: Any) -> None:
+        # [FUNCTION DOC] Hook called with the op name and its arguments after the variable is created; the default does nothing, backends override to annotate variables.
         pass
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a representation with the class name and variable name.
         return f"{self.__class__.__name__}({self.name!r})"
 
 
@@ -2065,6 +2335,10 @@ if TYPE_CHECKING:
 
 
 class CSE(Generic[CSEVariableType, AugmentedKeyT]):
+    # [CLASS DOC] Common subexpression elimination state for kernel code generation. Holds the code prefix and suffix text added
+    # around generated assignments, the name prefix and counter for new variables, the expression cache, a store cache
+    # (buffer name to value), a reduction cache, invalidated stores and a name to variable map. Caches can be shared across
+    # clones and scoped copies.
     """Common subexpression elimination"""
 
     def __init__(
@@ -2078,6 +2352,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         | None = None,
         varname_map: dict[str, CSEVariableType] | None = None,
     ):
+        # [FUNCTION DOC] Initializes prefix, suffix, name prefix, empty expression cache, and store and reduction caches, variable counter and name map (reusing the given objects when provided).
         self.prefix = prefix
         self.suffix = suffix
         self._cache: MutableMapping[AugmentedKeyT, CSEVariableType] = {}
@@ -2091,6 +2366,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         self.varname_map: dict[str, CSEVariableType] = varname_map or {}
 
     def invalidate(self, keep_vars: OrderedSet[CSEVariable]) -> None:
+        # [FUNCTION DOC] Drops cached store entries and cached expressions whose variables are not in keep_vars; dropped store names are recorded as invalidated stores. Mutates caches.
         for name, tmp in [*self.store_cache.items()]:
             if tmp not in keep_vars:
                 del self.store_cache[name]
@@ -2101,6 +2377,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
             self._cache = {}
 
     def clone(self) -> Self:
+        # [FUNCTION DOC] Returns a new CSE of the same class sharing the store cache, reduction cache, variable counter and name map, but with a fresh expression cache.
         return type(self)(
             prefix=self.prefix,
             suffix=self.suffix,
@@ -2112,6 +2389,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         )
 
     def scoped_copy(self) -> Self:
+        # [FUNCTION DOC] Returns a clone whose expression, reduction and store caches are scoped dictionaries layered over the current ones, so additions are not visible in the original.
         """Return a copy of using ScopedDict so changes to *_cache aren't visible in self"""
         new_cse = self.clone()
         new_cse._cache = ScopedDict(self._cache)
@@ -2120,19 +2398,24 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         return new_cse
 
     def augment_key(self, cache_key: str) -> AugmentedKeyT:
+        # [FUNCTION DOC] Returns the cache key used for lookups; the default is the key itself. Backends override to add backend specific information.
         "Override this method to augment cache key with backend specifics"
         return cast(AugmentedKeyT, cache_key)
 
     def put(self, cache_key: str, val: CSEVariableType) -> None:
+        # [FUNCTION DOC] Stores the value in the expression cache under the augmented key.
         self._cache[self.augment_key(cache_key)] = val
 
     def contains(self, cache_key: str) -> bool:
+        # [FUNCTION DOC] Returns true if the augmented key is present in the expression cache.
         return self.augment_key(cache_key) in self._cache
 
     def try_get(self, cache_key: str) -> CSEVariableType | None:
+        # [FUNCTION DOC] Returns the cached variable for the key or None.
         return self._cache.get(self.augment_key(cache_key), None)
 
     def get(self, cache_key: str) -> CSEVariableType:
+        # [FUNCTION DOC] Returns the cached variable for the key. Raises KeyError if absent.
         return self._cache[self.augment_key(cache_key)]
 
     def generate(
@@ -2146,6 +2429,12 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         dtype: torch.dtype | None = None,
         shape: BlockShapeType = None,
     ) -> CSEVariableType:
+        # [FUNCTION DOC] Returns a CSE variable for an expression. A CSEVariable argument has its bounds tightened and use count raised and
+        # is returned. Otherwise the cache key is derived from the string, indented buffer text, or deferred line text; on a
+        # cache hit the cached variable gets tightened bounds and a higher use count. On a miss a new variable is created and
+        # cached, and if write is set the assignment (or bare expression) is written to the buffer with prefix and suffix,
+        # preceded by originating node info; runtime dtype assertions may be emitted. Raises AssertionError for invalid
+        # combinations (neither write nor assignment, deferred line without assignment, non-string expression).
         if isinstance(expr, OpsValue):
             expr = expr.value
 
@@ -2221,6 +2510,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         dtype: torch.dtype | None = None,
         shape: BlockShapeType = None,
     ) -> CSEVariableType:
+        # [FUNCTION DOC] Creates a new variable named with the name prefix and the next counter value via the kernel's variable factory, records it in the name map and returns it.
         var_name = f"{self.name_prefix}{next(self.iter_buffer_ids)}"
         var = cast(
             "CSEVariableType", V.kernel.create_cse_var(var_name, bounds, dtype, shape)
@@ -2235,6 +2525,7 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
         dtype: torch.dtype | None = None,
         shape: BlockShapeType = None,
     ) -> CSEVariableType:
+        # [FUNCTION DOC] Creates a variable with a caller chosen name via the kernel's variable factory and records it in the name map. Raises an error through the check if the name already exists.
         torch._check_value(
             name not in self.varname_map, lambda: f"duplicate name: {name}"
         )
@@ -2246,19 +2537,28 @@ class CSE(Generic[CSEVariableType, AugmentedKeyT]):
 
 
 class CodeGen:
+    # [CLASS DOC] Base class that is a context manager owning an exit stack, used to scope handlers installed while generating code.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the exit stack.
         super().__init__()
         self.exit_stack = contextlib.ExitStack()
 
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Enters the exit stack and returns self.
         self.exit_stack.__enter__()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # [FUNCTION DOC] Exits the exit stack, unwinding anything entered through it.
         self.exit_stack.__exit__(exc_type, exc_val, exc_tb)
 
 
 class Kernel(CodeGen, Generic[CSEVariableType]):
+    # [CLASS DOC] Base class for generated kernels and code buffers. State: kernel args, load/compute/store code buffers, a CSE
+    # object, counters of loads, stores and reductions, sets of kept and stored buffer names, removed and in-place-to-remove
+    # buffer names, the current scheduler node and its value bounds, in-place update hints, and kernel name. As a context
+    # manager it installs the CSEProxy ops handler and itself as the active kernel; on exit it removes kernel-local buffers.
+    # Class attributes: variable prefix, suffix and the overrides factory. Subclasses implement load, store, reductions, etc.
     """Base class for generated kernels and their code buffers."""
 
     newvar_prefix: str = ""
@@ -2268,6 +2568,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     def __init__(
         self, args: KernelArgs | None = None, increase_kernel_count: bool = True
     ) -> None:
+        # [FUNCTION DOC] Initializes the kernel: bumps the global generated kernel count unless disabled, creates args (if not given), the three code buffers, the CSE object, counters and bookkeeping sets and maps.
         super().__init__()
         if increase_kernel_count:
             # pyrefly: ignore [bad-assignment]
@@ -2304,6 +2605,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
 
     @contextlib.contextmanager
     def set_current_node(self, node: SchedulerNode) -> Iterator[None]:
+        # [FUNCTION DOC] Context manager that makes the node the current node and loads its computed value bounds, restoring the previous current node on exit (the bounds are not restored). Reads the node loop body.
         prior = self.current_node
         self.current_node = node
         self.node_to_bounds = node._body.bounds().get_bounds()
@@ -2319,6 +2621,9 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         cb: IndentedBuffer | None = None,
         sb: IndentedBuffer | None = None,
     ) -> Iterator[None]:
+        # [FUNCTION DOC] Context manager that temporarily replaces the load, compute and store buffers (compute defaults to the load buffer; if no
+        # store buffer is given a scratch one is used) and switches to a scoped copy of CSE. Restores all on exit. Raises
+        # AssertionError if code was stored into the scratch store buffer.
         if cb is None:
             cb = lb
         if disallow_stores := sb is None:
@@ -2352,6 +2657,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         kernel_path: str,
         get_kernel_metadata,
     ) -> bool:
+        # [FUNCTION DOC] Hook letting external template handlers override how the kernel is emitted into the wrapper. The default does nothing and returns false meaning use the default path.
         """Override kernel emission. Return True if overridden, False to use default.
 
         External template handlers (e.g. Helion) can override this method
@@ -2360,9 +2666,11 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         return False
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def indirect_load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] Loads a value whose index depends on a previously loaded value: temporarily redirects the load buffer to the compute buffer (loads may have dependencies), performs the load, and restores. Returns the loaded variable.
         """A load that depends on an index we have read"""
         prior = self.loads
         try:
@@ -2373,14 +2681,17 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
             self.loads = prior
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def device_assert_async(self, cond: CSEVariable, msg: str) -> None:
+        # [FUNCTION DOC] Raises NotImplementedError: should be handled by CSEProxy.
         raise NotImplementedError(
             f"{type(self).__name__}: device_assert_async should be handled by CSEProxy"
         )
@@ -2392,6 +2703,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def partial_accumulate(
@@ -2401,6 +2713,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         value: CSEVariable,
         extra_meta: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def scan(
@@ -2411,6 +2724,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         ],
         values: tuple[CSEVariable, ...],
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def sort(
@@ -2420,9 +2734,11 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         stable: bool,
         descending: bool,
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def var_ranges(self) -> dict[sympy.Symbol, sympy.Expr]:
+        # [FUNCTION DOC] Returns the mapping of iteration variables to ranges. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def bucketize(
@@ -2435,6 +2751,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: CSEVariable | None = None,
     ) -> CSEVariable:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it. See the bucketize note in CSEProxy.
         """
         See [Note: Inductor bucketize op]
         """
@@ -2442,6 +2759,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
 
     @property
     def assert_function(self) -> str:
+        # [FUNCTION DOC] Property returning the name of the device assert function used for index checks. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def indirect_assert(
@@ -2451,6 +2769,9 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         upper: str | None,
         mask: CSEVariable | str | None = None,
     ) -> str:
+        # [FUNCTION DOC] Builds and returns the text of an assert statement that var lies in the half open range from lower (inclusive, optional)
+        # to upper (exclusive, optional), optionally masked so masked-off lanes pass; message says index out of bounds.
+        # Raises AssertionError for bad argument types or when both bounds are missing.
         if isinstance(var, CSEVariable):
             var = str(var)
         if not isinstance(var, str):
@@ -2481,12 +2802,15 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
+        # [FUNCTION DOC] Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def index_to_str(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] Converts an index expression to code text. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         raise NotImplementedError
 
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Enters the base context, then installs the CSEProxy wrapping this kernel's overrides as the ops handler and this kernel as the active kernel handler. Raises AssertionError if no overrides factory is set.
         super().__enter__()
         if not self.overrides:
             raise AssertionError("expected overrides to be set")
@@ -2497,10 +2821,15 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # [FUNCTION DOC] Removes kernel-local buffers, then exits the exit stack.
         self.remove_kernel_local_buffers()
         super().__exit__(exc_type, exc_val, exc_tb)
 
     def remove_kernel_local_buffers(self) -> None:
+        # [FUNCTION DOC] Removes buffers that are stored in this kernel and whose last use is also in this fusion group (not must-keep, not
+        # an input, and removable through fusion per the scheduler), decrementing the store count. Handles in-place buffers
+        # specially (removes the in-place entry only if every alias is removed). Does nothing without a scheduler (template kernels).
+        # Mutates args and removed sets.
         """
         Any buffers that are both created and have a last use in the
         same kernel can be removed.
@@ -2541,6 +2870,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
                 self.remove_buffer(name)
 
     def remove_buffer(self, name: str) -> None:
+        # [FUNCTION DOC] Marks the output buffer as removed (keeps the dict entry so argument name numbering stays unique) and records it in the removed set.
         # Assign a special value instead of deleting the entry
         # because we still rely on output_buffers's length to
         # generate unique arg name.
@@ -2549,6 +2879,7 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         self.removed_buffers.add(name)
 
     def remove_inplace_buffer(self, name: str) -> None:
+        # [FUNCTION DOC] Marks the in-place buffer as removed and records it in the removed set.
         log.debug("removing_inplace_buffer(%r)", name)
         self.args.inplace_buffers[name] = REMOVED
         self.removed_buffers.add(name)
@@ -2556,6 +2887,9 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
     def rename_indexing(
         self, index: list[sympy.Expr] | tuple[sympy.Expr, ...] | sympy.Expr
     ) -> sympy.Expr:
+        # [FUNCTION DOC] Simplifies an index expression (or each of a list or tuple of them) and replaces size-like free symbols (unbacked ints,
+        # sizes, precomputed sizes, unbacked floats) by kernel argument names, adding kernel args as needed. Returns the new
+        # expression, or a list for sequence input.
         # adds the necessary kernel args for index expressions
         # and renames variables in index expressions to kernel arg names
         if isinstance(index, (list, tuple)):
@@ -2578,9 +2912,11 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         return sympy_subs(index, replacements)
 
     def create_cse_var(self, *args: Any, **kwargs: Any) -> CSEVariable:
+        # [FUNCTION DOC] Creates and returns a plain CSEVariable from the given arguments; backends override to return annotated variables.
         return CSEVariable(*args, **kwargs)
 
     def arg_name(self, node: IRNode) -> str | None:
+        # [FUNCTION DOC] Returns the kernel argument name of an IR node's buffer, or None if node is None or unknown.
         """
         Returns arg name of a given input or output node.
         """
@@ -2595,11 +2931,13 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         kwargs: dict[str, Any],
         result: Any = None,
     ) -> None:
+        # [FUNCTION DOC] Hook called for each traced op with name, arguments and result; the default does nothing.
         pass
 
 
 @dataclasses.dataclass
 class OptimizationContext:
+    # [CLASS DOC] Dataclass stored in FX node meta under the key opt_ctx: carries the node's propagated dtype and an op name.
     key: ClassVar[str] = "opt_ctx"
 
     dtype: torch.dtype | None = None
@@ -2608,6 +2946,7 @@ class OptimizationContext:
 
 @functools.cache
 def jinja2_env() -> Any:
+    # [FUNCTION DOC] Cached; returns a jinja2 environment with strict undefined handling, or None if jinja2 is not installed.
     try:
         import jinja2
 
@@ -2619,6 +2958,7 @@ def jinja2_env() -> Any:
 
 
 class KernelTemplate:
+    # [CLASS DOC] Base class for kernel templates (children: Triton and CUTLASS templates). Holds a name and an optional source hash; provides jinja template helpers and choice generation wrappers that catch NotImplementedError.
     """
     Base class for defining kernel templates.
 
@@ -2629,6 +2969,7 @@ class KernelTemplate:
     def indent_except_first(
         source: str, num_indents: int, indents_spacing: int = 4
     ) -> str:
+        # [FUNCTION DOC] Returns the source with every line except the first prefixed by the given number of indentation levels of spaces.
         lines = source.splitlines(True)
         if len(lines) > 1:
             lines[1:] = [
@@ -2638,6 +2979,8 @@ class KernelTemplate:
 
     @staticmethod
     def _template_from_string(source: str) -> Any:
+        # [FUNCTION DOC] HELPER: Compiles jinja source text with a registered indent_except_first filter and returns the template, or None if jinja2
+        # is unavailable. Template syntax errors are re-raised as a detailed error showing the failing line and column context.
         env = jinja2_env()
         if env is None:
             return None
@@ -2649,7 +2992,9 @@ class KernelTemplate:
         except TemplateSyntaxError as e:
 
             class DetailedTemplateSyntaxError(TemplateSyntaxError):
+                # [CLASS DOC] Template syntax error subclass that keeps the original error and formats a message with the failing line and surrounding source lines.
                 def __init__(self, original_error: TemplateSyntaxError) -> None:
+                    # [FUNCTION DOC] Copies message, line number, name and filename from the original error and keeps the original.
                     super().__init__(
                         original_error.message,
                         original_error.lineno,
@@ -2659,6 +3004,7 @@ class KernelTemplate:
                     self.original_error = original_error
 
                 def __str__(self) -> str:
+                    # [FUNCTION DOC] Returns a multi-line description: the error line, message and a context window of nearby source lines, marking the failing line and column when available.
                     error_info = f"Error in template at line {self.lineno}\n"
                     error_info += f"Error message: {self.message}\n"
                     if hasattr(self.original_error, "source"):
@@ -2685,6 +3031,7 @@ class KernelTemplate:
     def _fake_get_dtype(
         fake_outs: list[Buffer] | Buffer,
     ) -> Callable[[str], torch.dtype]:
+        # [FUNCTION DOC] HELPER: Returns a dtype lookup function that answers from the given fake output buffers and falls back to the graph's real lookup for other names.
         _get_dtype_real = V.graph.get_dtype
         if isinstance(fake_outs, (list, tuple)):
             lookup = {buf.get_name(): buf.get_dtype() for buf in fake_outs}
@@ -2692,6 +3039,7 @@ class KernelTemplate:
             lookup = {fake_outs.get_name(): fake_outs.get_dtype()}
 
         def get_dtype(name: str) -> torch.dtype:
+            # [FUNCTION DOC] HELPER: Returns the dtype from the fake buffers map if present, else the real graph lookup.
             result = lookup.get(name)
             if result is not None:
                 return result
@@ -2700,11 +3048,13 @@ class KernelTemplate:
         return get_dtype
 
     def __init__(self, name: str, hash: str | None = None) -> None:
+        # [FUNCTION DOC] Stores the template name and optional source hash.
         self.name = name
         self._hash = hash
 
     @property
     def uid(self) -> str:
+        # [FUNCTION DOC] Property returning a unique, reproducible id for the template (defaults to its name); override to add a prefix.
         """
         entry point to override for templates to ensure a uid e.g. through a prefix
 
@@ -2716,6 +3066,7 @@ class KernelTemplate:
 
     @property
     def src_hash(self) -> str | None:
+        # [FUNCTION DOC] Property returning the optional source hash used to detect template changes; override if detection differs.
         """
         source hash for a Template.
 
@@ -2726,6 +3077,7 @@ class KernelTemplate:
         return self._hash
 
     def choice_or_none(self, **kwargs: Any) -> ChoiceCaller | None:
+        # [FUNCTION DOC] Tries to generate a ChoiceCaller with the given keyword arguments; returns it, or None if generation failed with NotImplementedError.
         """
         Maybe generates a new ChoiceCaller and returns it, or None if generation fails.
 
@@ -2740,6 +3092,7 @@ class KernelTemplate:
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
+        # [FUNCTION DOC] Tries to generate a choice and append it to the list; returns None on success or the NotImplementedError (logged at info level) on failure.
         """
         Maybe generates a new ChoiceCaller and appends it into existing choices.
         Returns None if success, otherwise returns the error.
@@ -2761,6 +3114,7 @@ class KernelTemplate:
             return e
 
     def generate(self, **kwargs: Any) -> ChoiceCaller:
+        # [FUNCTION DOC] Generates a ChoiceCaller from the arguments. Not implemented in the base class; raises NotImplementedError. Subclasses/backends override it.
         """
         Generates a ChoiceCaller instance from the given arguments.
         """
@@ -2769,6 +3123,10 @@ class KernelTemplate:
 
 
 class CSEProxy(DefaultHandler):
+    # [CLASS DOC] Ops handler used while generating a kernel: forwards every op to the parent (backend) handler, performs common
+    # subexpression elimination of the result via the kernel's CSE, attaches value bounds, dtype and shape, optionally emits
+    # dtype/shape/NaN asserts, and records op traces. Loads, stores, reductions, scans, sorts and bucketize are routed to the
+    # kernel with bookkeeping of counts and the store cache.
     """A ops handler that proxies calls to `kernel` and its
     handler and returns `CSEVariable`s with correct shape and dtype.
     """
@@ -2776,6 +3134,7 @@ class CSEProxy(DefaultHandler):
     name = "CSEProxy"
 
     def __init__(self, kernel: Kernel[Any], parent_handler: OpsHandler[Any]):
+        # [FUNCTION DOC] Stores the kernel and the parent handler and creates a value range analysis object.
         super().__init__()
         from ..bounds import ValueRangeAnalysis
 
@@ -2784,6 +3143,10 @@ class CSEProxy(DefaultHandler):
         self.parent_handler = parent_handler
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Default handler for any op: computes value bounds, calls the parent handler op, determines output dtype and shape
+        # (from the kernel for masked ops on triton/cpp, otherwise from the dtype and shape propagation handlers for the
+        # triton, cpp and mps backends), then maps CSE generation over the (possibly nested) result with checks. Raises
+        # AssertionError if the dtype is missing on triton or cpp. Records an op trace and returns the CSE'd result.
         bounds = self._bound_variable(name, *args, **kwargs)
 
         value = getattr(self.parent_handler, name)(*args, **kwargs)
@@ -2818,6 +3181,9 @@ class CSEProxy(DefaultHandler):
         output_idx = 0
 
         def do_cse(v: str | CSEVariable) -> CSEVariable:
+            # [FUNCTION DOC] HELPER: Converts one result value into a CSE variable: picks its dtype and shape from the outputs (by running index), fills
+            # missing dtype/shape on existing variables, generates via the CSE with bounds, updates the variable with op arguments,
+            # and emits dtype, shape and NaN asserts when the test configs enable them.
             # we tree_map over the output, so we need to fetch corresponding dtype
             nonlocal output_idx
             var_dtype: torch.dtype | None = (
@@ -2876,6 +3242,9 @@ class CSEProxy(DefaultHandler):
         return result
 
     def _bound_variable(self, name: str, *args: Any, **kwargs: Any) -> ValueRanges[Any]:
+        # [FUNCTION DOC] HELPER: Returns value ranges for the op result. Unknown for template kernels or when no interpreter is active; the FX node
+        # bound if the current node is this op; otherwise, if configured, computed from the argument bounds with the value range
+        # analysis (unknown for set_indirect, reduction and scan nodes). Raises AssertionError on unexpected state or keyword args.
         """
         If the variable comes from an FX node, we forward the bound we have already computed
         Else, if the variable when codegen'ing another op, we try to compute its bounds
@@ -2912,6 +3281,7 @@ class CSEProxy(DefaultHandler):
                 raise AssertionError("expected no kwargs")
 
             def arg_to_bound(x: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Converts an argument to its bounds: CSE variable bounds, sympy expression bounds, or the value itself.
                 if isinstance(x, CSEVariable):
                     return x.bounds
                 elif isinstance(x, sympy.Expr):
@@ -2930,6 +3300,10 @@ class CSEProxy(DefaultHandler):
         check: bool = True,
         wrap_neg: bool = True,
     ) -> sympy.Symbol:
+        # [FUNCTION DOC] Converts a tensor variable to a sympy index symbol, wrapping negative indices (adding size, using a where when mixed) if
+        # wrap_neg, and tightening the variable's bounds. Then asks the parent handler for the index symbol and, when assertions
+        # are generated for check, requests lower/upper bound checks from the kernel unless value ranges prove them unnecessary.
+        # Raises AssertionError if size is not an integer or sympy expression.
         if isinstance(size, int):
             size = sympy.Integer(size)
         if not isinstance(size, sympy.Expr):
@@ -2988,9 +3362,13 @@ class CSEProxy(DefaultHandler):
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
+        # [FUNCTION DOC] Delegates bounds checking to the kernel.
         return self.kernel.check_bounds(expr, size, lower, upper)
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] Loads a buffer at an index. Marks the buffer must-keep if it was invalidated; indirect loads (index containing temporary
+        # variables) go to the kernel's indirect load; if a value for the buffer is in the store cache it is returned; otherwise
+        # loads through the kernel, counts the load when the variable is new and records an op trace. Returns the variable.
         if name in self.kernel.cse.invalidated_stores:
             # A load from an invalidated store requires us to
             # keep the actual buffer around
@@ -3009,6 +3387,7 @@ class CSEProxy(DefaultHandler):
         return out
 
     def _update_store_cache(self, name: str, value: CSEVariable) -> None:
+        # [FUNCTION DOC] HELPER: Records the value as the latest stored value of the buffer in the store cache, and for buffers known to the graph also for every buffer that mutates it.
         self.kernel.cse.store_cache[name] = value
         if self.kernel.current_node and name in V.graph.name_to_buffer:
             buf = self.kernel.current_node.get_output(name)
@@ -3018,6 +3397,8 @@ class CSEProxy(DefaultHandler):
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: StoreMode = None
     ) -> None:
+        # [FUNCTION DOC] Stores a value: records the buffer in stored names, updates the store cache unless the mode is atomic add, and when the
+        # buffer is not removed performs the kernel store and counts it. Records an op trace.
         self.kernel.store_buffer_names.add(name)
         # Update store cache when mode is None or "tma"
         if mode != "atomic_add":
@@ -3028,14 +3409,17 @@ class CSEProxy(DefaultHandler):
         self.kernel.record_op_trace("store", (name, index, value, mode), {})
 
     def device_assert_async(self, cond: CSEVariable, msg: str) -> None:
+        # [FUNCTION DOC] Forwards an asynchronous device assert to the kernel and records an op trace.
         self.kernel.device_assert_async(cond, msg)
         self.kernel.record_op_trace("device_assert_async", (cond, msg), {})
 
     # pyrefly: ignore [bad-override]
     def partial_accumulate(self, *args: Any) -> None:
+        # [FUNCTION DOC] Forwards partial accumulation to the kernel.
         self.kernel.partial_accumulate(*args)
 
     def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        # [FUNCTION DOC] Records the stored name and cache value, and if the buffer is not removed counts a store and forwards to the kernel's store reduction (returning its result).
         self.kernel.store_buffer_names.add(name)
         self._update_store_cache(name, value)
 
@@ -3050,6 +3434,7 @@ class CSEProxy(DefaultHandler):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Counts a reduction and forwards to the kernel's reduction, returning its result.
         self.kernel.num_reduction += 1
         return self.kernel.reduction(dtype, src_dtype, reduction_type, value)
 
@@ -3062,6 +3447,7 @@ class CSEProxy(DefaultHandler):
         ],
         values: tuple[CSEVariable, ...],
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Forwards to the kernel's scan and returns its result.
         return self.kernel.scan(dtypes, combine_fn, values)
 
     def sort(
@@ -3071,6 +3457,7 @@ class CSEProxy(DefaultHandler):
         stable: bool,
         descending: bool,
     ) -> tuple[CSEVariable, ...]:
+        # [FUNCTION DOC] Forwards to the kernel's sort and returns its result.
         return self.kernel.sort(dtypes, values, stable, descending)
 
     def bucketize(
@@ -3083,6 +3470,7 @@ class CSEProxy(DefaultHandler):
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: CSEVariable | None = None,
     ) -> CSEVariable:
+        # [FUNCTION DOC] Forwards to the kernel's bucketize and returns the bucket index variable. The long docstring defines the inputs, boundaries and sorter semantics.
         """
         [Note: Inductor bucketize op]
 

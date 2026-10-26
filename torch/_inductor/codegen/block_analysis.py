@@ -1,3 +1,6 @@
+# [MODULE DOC] Sympy pattern matching of Inductor index expressions into block
+# (multi-dimensional, strided) form for Triton block pointers. Contains
+# BlockPatternMatcher. No import-time side effects.
 import collections
 import functools
 import textwrap
@@ -13,6 +16,10 @@ from ..virtualized import V
 
 
 class BlockPatternMatcher:
+    # [CLASS DOC] Stateless namespace of classmethods/staticmethods that recognize
+    # index expressions built from FloorDiv/ModularIndexing of a single index variable
+    # and recover implied block dimensions and strides. Class attributes are two
+    # factories for sympy Wild symbols constrained to integers (signed / nonnegative).
     """
     Matches block indexing expressions.
     """
@@ -26,6 +33,9 @@ class BlockPatternMatcher:
 
     @classmethod
     def get_subexpr_involving_symbol(cls, expr: Expr, symbol: Symbol) -> Expr:
+        # [FUNCTION DOC] Preprocesses expr (non-multiplicative expansion), then sums only
+        # the additive terms that contain the given symbol and returns that sum (zero if
+        # none). Pure.
         """
         Given a sympy expression, return the subexpression comprised only of terms
         involving the specified symbol.
@@ -40,6 +50,9 @@ class BlockPatternMatcher:
 
     @staticmethod
     def factor_index_expr(expr: sympy.Expr, index_var: Symbol) -> sympy.Expr:
+        # [FUNCTION DOC] Collects the terms of expr around every FloorDiv or
+        # ModularIndexing sub-expression whose first argument is index_var, and around
+        # index_var itself, returning the factored expression. Pure.
         """
         Given an index expression, factor the expression around
         - FloorDiv(index_var, ...)
@@ -64,6 +77,9 @@ class BlockPatternMatcher:
 
     @staticmethod
     def get_slice_numels(dims: list[Expr]) -> list[Expr]:
+        # [FUNCTION DOC] Returns a list the same length as dims where each entry is the
+        # product of all later dimension sizes (the last entry is one); dims[0] is never
+        # used. Pure.
         """
         Compute the cumulative size of each dimension's slice.
         This proceeds from the last dim up to the second.
@@ -76,6 +92,8 @@ class BlockPatternMatcher:
 
     @staticmethod
     def _preprocess(expr: Expr) -> Expr:
+        # [FUNCTION DOC] HELPER: expands identity-wrapped terms of expr without expanding
+        # products or multinomials so structural matching still works. Returns new expr.
         # Remove any Identity nodes, e.g. expand x + (5 * y) to x + 5 * y.
         # Disable mul and multinomial as those expansions affect op trees:
         # e.g. sympy expects to match Mul(a, b), but expansion has simplified
@@ -91,6 +109,16 @@ class BlockPatternMatcher:
         numel: Expr,
         num_dims: int,
     ) -> tuple[list[Expr], list[Expr], list[Expr]] | None:
+        # [FUNCTION DOC] Tries to express index as a strided sum over num_dims block
+        # dimensions, where the first dimension index is a floor division of index_var and
+        # the rest are modular indexing terms, using sympy Wild matching. For 5 or more
+        # dims a cheap per-term pre-check rejects non-matching shapes first (at most one
+        # FloorDiv term, all others ModularIndexing). Unmatched trailing dims default to
+        # size one and stride zero; the leading dim is solved as numel divided by the
+        # product of the others. Returns (dims, strides, block_index_exprs), or None if the
+        # pattern does not match or numel is not statically known to be a multiple.
+        # Raises AssertionError if the leading dim was matched, or if the recovered index
+        # is not statically equal to the input index. Reads V.graph.sizevars.
         """
         Matches modular indexing expressions, converting them to implied block dimensions and strides.
         See triton.py for more information.
@@ -209,6 +237,8 @@ class BlockPatternMatcher:
         index: Expr,
         index_var: Symbol,
     ) -> Expr | None:
+        # [FUNCTION DOC] Matches index against a product of index_var and a stride that
+        # does not depend on index_var; returns the stride, or None if no match. Pure.
         """
         Matches simple expressions of the form stride * index, returning the
         stride.
