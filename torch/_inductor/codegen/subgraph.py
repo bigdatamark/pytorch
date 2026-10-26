@@ -1,3 +1,8 @@
+# [MODULE DOC] Subgraph autotuning support for Inductor: inline_subgraph_to_ir_nodes lowers a
+# GraphModule into IR nodes, SubgraphChoiceCaller wraps an arbitrary traced subgraph as an
+# autotuning choice (compiled and benchmarked as its own module), and SubgraphTemplate
+# builds such choices, including multiple custom-op decomposition variants.
+# No import-time side effects besides creating the module logger.
 import contextlib
 import functools
 import itertools
@@ -38,6 +43,10 @@ log = logging.getLogger(__name__)
 def inline_subgraph_to_ir_nodes(
     gm: torch.fx.GraphModule, inputs: list[Any], name: str
 ) -> Any:
+    # [FUNCTION DOC] Lower the FX graph module gm with the given input IR values into individual
+    # fusable IR nodes via the lowering module's subgraph processing, returning the resulting
+    # TensorBox. While processing, V.graph.module is temporarily set to gm and always restored,
+    # even on error. The name argument is unused.
     """Inline a subgraph by converting its FX operations to individual IR nodes.
 
     This converts a subgraph to multiple ComputedBuffer nodes (fusable),
@@ -58,6 +67,12 @@ def inline_subgraph_to_ir_nodes(
 
 
 class SubgraphChoiceCaller(ir.ChoiceCaller):
+    # [CLASS DOC] Autotuning choice backed by an FX subgraph. State: gm (traced graph from
+    # symbolic inputs), example_inputs (symbolic trace inputs), benchmark_inputs (concrete
+    # tensors), sym_inputs and sym_input_values (symbolic dim vars and their benchmark values),
+    # decomposition and decomposition_kwargs (for range dispatch), config_patches (applied while
+    # compiling), and cached compiled module and benchmark request. Key methods: benchmark,
+    # benchmark_collective, output_node, hash_key.
     """
     Represents a Subgraph Autotuning choice, and the subgraph can be any arbitrary
     GraphModule. Compiles the Subgraph down to a module for benchmarking.
@@ -72,6 +87,12 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         make_fx_graph: Callable[..., Any],
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Build the choice: freeze input layouts, create symbolic trace inputs and
+        # benchmark inputs (from input_gen_fns when given, else concrete hinted tensors) under
+        # the fake mode, trace make_fx_graph on the symbolic inputs to get gm, and compute
+        # symbolic input values. If config.pipeline_max_autotune_gemm is on, eagerly compile the
+        # module and create the benchmark request. Raises AssertionError if any input size or
+        # stride has unbacked symbols. Side effects: freezes input node layouts.
         super().__init__(name, input_nodes, layout, description)
 
         # Create inputs for tracing and benchmarking:
@@ -132,6 +153,9 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
                 self._bmreq = self._create_benchmark_request()
 
     def _compute_sym_input_values(self) -> list[int]:
+        # [FUNCTION DOC] HELPER: For each symbolic input, return an int: the size of the matching
+        # dimension in the corresponding benchmark tensor when the symbol appears in an input
+        # node's size, otherwise the shape env optimization hint (fallback 1).
         """Extract concrete dimension values for sym_inputs from benchmark_inputs.
 
         The compiled module expects symbolic dimension values as runtime arguments.
@@ -166,14 +190,21 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
     def cache_decomposition(
         self, decomposition: Callable[..., Any], kwargs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC] Remember the decomposition callable and its kwargs on this choice.
         """Cache decomposition function and kwargs for range-based dispatch lookup."""
         self.decomposition = decomposition
         self.decomposition_kwargs = kwargs
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return a short display string containing the choice name.
         return f"SubgraphCaller({self.name})"
 
     def _compile_for_benchmarking(self) -> Any:
+        # [FUNCTION DOC] HELPER: Lower self.gm with a fresh GraphLowering (inheriting settings from
+        # the current V.graph) and compile it to a module. Symbolic example inputs are used when
+        # there are sym_inputs, else the concrete benchmark inputs. Config is patched to disable
+        # nested autotuning and fusion benchmarking, plus self.config_patches. Returns the
+        # compiled module. Raises AssertionError if gm is unset.
         """Compile the subgraph for benchmarking, returns the compiled module."""
         from torch._inductor.graph import GraphLowering
 
@@ -223,6 +254,9 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
     def _create_benchmark_request(
         self,
     ) -> SubgraphGPUBenchmarkRequest | SubgraphCPUBenchmarkRequest:
+        # [FUNCTION DOC] HELPER: Build a CPU or GPU subgraph benchmark request (by layout device
+        # type) from tensor metadata of inputs and output, the compiled module path and key, and
+        # sym_input_values. Raises AssertionError if the module is not compiled yet.
         """Create a benchmark request for async autotuning."""
         if self._compiled_module is None:
             raise AssertionError(
@@ -250,6 +284,8 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
     def bmreq(
         self,
     ) -> SubgraphGPUBenchmarkRequest | SubgraphCPUBenchmarkRequest:
+        # [FUNCTION DOC] Property: return the pre-created benchmark request. Raises AssertionError
+        # if none was created (pipelined autotuning was off at construction).
         """Benchmark request for async autotuning. Pre-compiled when pipeline_max_autotune_gemm is enabled."""
         if self._bmreq is None:
             raise AssertionError(
@@ -258,17 +294,25 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         return self._bmreq
 
     def _ensure_compiled(self) -> None:
+        # [FUNCTION DOC] HELPER: Compile the module lazily on first use and cache it.
         """Ensure the module is compiled. Used for lazy compilation in non-async path."""
         if self._compiled_module is None:
             self._compiled_module = self._compile_for_benchmarking()
 
     def benchmark(self, *args: list[Any], out: torch.Tensor) -> float:
+        # [FUNCTION DOC] Compile if needed and time the compiled module on the given args (with
+        # sym input values prepended). Uses CUDA-graph GPU benchmarking when
+        # _benchmark_with_cudagraphs is set, profiling-based timing when the config flag is on,
+        # else the standard benchmarker on the inferred device. Returns time as a float. The out
+        # argument is unused.
         """Regular benchmarking: compile if needed, then use benchmarker."""
         self._ensure_compiled()
         bm_func = self._compiled_module.call
         sym_inputs = self.sym_input_values
 
         def fn() -> Any:
+            # [FUNCTION DOC] HELPER: Closure that calls the compiled module once with sym inputs
+            # followed by args, returning its result.
             return bm_func([*sym_inputs, *args])
 
         if self._benchmark_with_cudagraphs:
@@ -282,11 +326,15 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         )
 
     def benchmark_collective(self, *args: list[Any], out: torch.Tensor) -> None:
+        # [FUNCTION DOC] Compile if needed and run the module once (no timing), for collective
+        # benchmarking where the caller handles synchronization. The out argument is unused.
         """Run once for collective benchmarking (barrier sync handled by caller)."""
         self._ensure_compiled()
         self._compiled_module.call([*self.sym_input_values, *args])
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Return a string key joining the name prefix (before the last underscore),
+        # input sizes, input strides and the printed FX graph. Raises AssertionError if gm is unset.
         if self.gm is None:
             raise AssertionError("expected self.gm to be set")
         return "-".join(
@@ -299,6 +347,9 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         )
 
     def output_node(self) -> ir.TensorBox:
+        # [FUNCTION DOC] Return a TensorBox wrapping a SubgraphBuffer built from this choice's
+        # layout, inputs, gm, example inputs, name and config patches (None if empty).
+        # Raises AssertionError if gm is unset.
         if self.gm is None:
             raise AssertionError("expected self.gm to be set")
         return ir.TensorBox.create(
@@ -313,6 +364,7 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         )
 
     def info_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a mapping with backend "subgraph" and the kernel name for autotune logs.
         """Information returned here is logged to the autotune log file when that is enabled."""
         return {
             "backend": "subgraph",
@@ -320,10 +372,14 @@ class SubgraphChoiceCaller(ir.ChoiceCaller):
         }
 
     def autoheuristic_id(self) -> str:
+        # [FUNCTION DOC] Return an autoheuristic identifier derived from the choice name.
         return f"subgraph_{self.name}"
 
 
 class SubgraphTemplate(KernelTemplate):
+    # [CLASS DOC] KernelTemplate that produces SubgraphChoiceCallers. Class-level index_counter
+    # (shared iterator) makes generated choice names unique. Key methods: generate (one
+    # choice) and generate_custom_op_choices (one choice per decomposition).
     """
     A template for subgraph evaluation to be used in autotuning.
 
@@ -338,6 +394,8 @@ class SubgraphTemplate(KernelTemplate):
         self,
         name: str,
     ):
+        # [FUNCTION DOC] Initialize the base template with the given name.
+        # KNOWN ISSUE: the docstring lists a graph argument that the signature does not have.
         """
         Initialize a subgraph template.
 
@@ -357,6 +415,9 @@ class SubgraphTemplate(KernelTemplate):
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
         **kwargs: Any,
     ) -> SubgraphChoiceCaller:
+        # [FUNCTION DOC] Create one SubgraphChoiceCaller, appending the next global counter value to
+        # the name to make it unique. Extra kwargs are accepted and ignored. Side effect:
+        # advances the shared counter.
         """
         Generate a SubgraphChoiceCaller instance for autotuning.
 
@@ -392,6 +453,13 @@ class SubgraphTemplate(KernelTemplate):
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
         config_patches_list: list[dict[str, Any]] | None = None,
     ) -> list[SubgraphChoiceCaller]:
+        # [FUNCTION DOC] Build choices for each custom-op decomposition. Returns an empty list if
+        # none are given; raises AssertionError if decompositions and non_tensor_args differ in
+        # length. Infers each decomposition's output layout, verifies they match, then for each
+        # one traces it with symbolic make_fx (erroring on new shape guards) and creates a
+        # choice named with a variant suffix. Decompositions adding guards are skipped, logged,
+        # and counted in the custom_op_decomp_guard_skips counter. Each kept choice stores its
+        # decomposition, kwargs and config patches.
         """
         Generate multiple SubgraphChoiceCaller instances for custom op autotuning.
 
@@ -448,6 +516,10 @@ class SubgraphTemplate(KernelTemplate):
                 decomp: Callable[..., Any] = decomp,
                 decomp_kwargs: dict[str, Any] = decomp_kwargs,
             ) -> Any:
+                # [FUNCTION DOC] HELPER: Trace the bound decomposition (with its kwargs fixed) over
+                # the given args using make_fx in symbolic mode with the Inductor decomposition
+                # table, inside the fake mode shape env's error-on-new-guards context when a
+                # shape env exists. Returns the traced GraphModule; raises if new guards appear.
                 # decomp_kwargs contains all merged parameters: CustomOpConfig params + runtime kwargs
 
                 from torch.fx.experimental.proxy_tensor import make_fx
@@ -502,6 +574,9 @@ class SubgraphTemplate(KernelTemplate):
     def _generate_variant_name(
         self, decomp: Callable[..., Any], kwargs: dict[str, Any]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return the decomposition's function name, followed (when kwargs
+        # exist) by each sorted key and its value sanitized into identifier-safe characters
+        # (non-alphanumeric replaced by underscore, leading digit prefixed with underscore).
         """Generate a descriptive name for a decomposition variant with its parameters."""
         import re
 
@@ -510,6 +585,8 @@ class SubgraphTemplate(KernelTemplate):
             return base_name
 
         def sanitize_value(v: Any) -> str:
+            # [FUNCTION DOC] HELPER: Convert a value to its string form with non-alphanumeric
+            # characters replaced by underscores and a leading underscore if it starts with a digit.
             """Convert a value to a valid Python identifier component."""
             s = str(v)
             # Replace invalid characters with underscores
@@ -525,6 +602,7 @@ class SubgraphTemplate(KernelTemplate):
         return f"{base_name}_{param_suffix}"
 
     def _validate_non_tensor_kwargs(self, kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Raise AssertionError if any kwarg value is a tensor or IR Buffer.
         """Validate that kwargs contains only non-tensor arguments."""
         for key, value in kwargs.items():
             if isinstance(value, (torch.Tensor, Buffer)):
@@ -540,6 +618,9 @@ class SubgraphTemplate(KernelTemplate):
         decompositions: list[Callable[..., Any]],
         layouts: list[Layout],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Check every layout equals the first in device, dtype, size and
+        # stride; raises AssertionError naming the mismatching decomposition otherwise. An
+        # empty list passes.
         """Ensure all layouts have consistent stride, device, dtype, and sizes for fair autotuning."""
         if not layouts:
             return
@@ -568,6 +649,11 @@ class SubgraphTemplate(KernelTemplate):
         default_impl: Callable[..., Any] | None = None,
         input_gen_fns: dict[int, Callable[[Any], torch.Tensor]] | None = None,
     ) -> Layout:
+        # [FUNCTION DOC] HELPER: Run the decomposition (kwargs bound) once on fake example inputs
+        # and return a FixedLayout matching the output tensor's device, dtype, shape and
+        # stride. Inputs come from input_gen_fns when given, else empty strided fake tensors
+        # from hinted sizes/strides. Raises AssertionError for tensor-valued kwargs or when the
+        # output is not a single tensor. default_impl is unused.
         """Infer output layout for custom ops using the default implementation when available.
         Note that the Subgraph assumes custom ops return exactly one tensor output.
         TODO: Add support for multiple output custom ops.
