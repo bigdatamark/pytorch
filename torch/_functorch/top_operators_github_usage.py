@@ -1,3 +1,9 @@
+# [MODULE DOC] Static data of GitHub usage counts for torch operators: top_torch and
+# top_nn_functional (name, count pairs), top_nn_module (module name, count, optional
+# functional equivalent) and method_only_ops (names without ranking). Provides
+# get_nn_functional_top_list, which merges module counts into functional counts.
+# Import-time side effect: builds the module-level usage_count mapping of operator name to
+# count from the merged functional list updated with top_torch (torch entries win on conflict).
 from __future__ import annotations
 
 
@@ -610,6 +616,9 @@ method_only_ops: list[str] = [
 
 
 def get_nn_functional_top_list() -> list[tuple[str, int]]:
+    # [FUNCTION DOC] Builds a mapping from top_nn_functional, then adds each nn module's count to
+    # its functional equivalent (summing if already present, skipping modules without one and
+    # torch.flatten). Returns (name, count) pairs sorted by count, descending.
     top_nn_functional_: dict[str, int] = dict(top_nn_functional)
     for _, count, functional_name in top_nn_module:
         if functional_name is None:

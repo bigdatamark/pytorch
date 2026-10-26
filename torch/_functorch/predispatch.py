@@ -4,6 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Pre-dispatch wrappers around functorch/forward-AD C++ primitives (batch dim
+# add/remove, vmap and jvp nesting, dual levels, unwrap for grad) plus lazy loading of vmap
+# decompositions. Each wrapper checks for an active pre-dispatch export mode; if present the
+# call is routed through the torch function protocol so it is recorded in the exported graph,
+# otherwise the underlying C++ implementation runs directly.
+# Import-time side effects: none beyond imports; module globals track decomposition loading.
 """
 This module contains pre-dispatch wrappers for functorch operations
 that enable proper tracing in PT2 non-strict export/compile fx graph.
@@ -38,6 +44,10 @@ if TYPE_CHECKING:
 
 
 def _add_batch_dim(self: torch.Tensor, batch_dim: int, level: int) -> torch.Tensor:
+    # [FUNCTION DOC] Wraps a tensor as batched at the given vmap level, with batch_dim being
+    # the dimension to treat as the batch dimension (negative values count from the end).
+    # Returns the batched tensor. Under a pre-dispatch export mode it dispatches through
+    # handle_torch_function so the call is traced; otherwise calls the C++ implementation.
     """
     Thin wrapper around torch._C._add_batch_dim that is used to proxy in
     PT2 export/compile fx graph
@@ -59,6 +69,9 @@ def _add_batch_dim(self: torch.Tensor, batch_dim: int, level: int) -> torch.Tens
 def _remove_batch_dim(
     self: torch.Tensor, level: int, batch_size: int, out_dim: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Removes the batch dimension of the given vmap level from a tensor, placing
+    # it at out_dim with the given batch_size. Returns the unbatched tensor. Traced through
+    # handle_torch_function under a pre-dispatch export mode, else calls the C++ implementation.
     """
     Thin wrapper around torch._C._remove_batch_dim that is used to proxy in
     PT2 export/compile fx graph
@@ -77,6 +90,9 @@ def _remove_batch_dim(
 
 
 def _vmap_increment_nesting(batch_size: int, randomness: str) -> int:
+    # [FUNCTION DOC] Enters a new vmap nesting level for the given batch_size and randomness
+    # mode; returns the new level as an int. Side effect: pushes a functorch dynamic layer.
+    # Traced under a pre-dispatch export mode, else calls the C++ implementation.
     """
     Thin wrapper around torch._C._vmap_increment_nesting that is used
     to proxy in export/compile graph
@@ -94,6 +110,10 @@ def _vmap_increment_nesting(batch_size: int, randomness: str) -> int:
 
 
 def _vmap_decrement_nesting() -> int:
+    # [FUNCTION DOC] Exits the innermost vmap nesting level and returns the level that was
+    # popped. Side effect: pops a functorch dynamic layer. Traced under a pre-dispatch export
+    # mode, else calls the C++ implementation.
+    # KNOWN ISSUE: the docstring says it wraps the increment function; it wraps the decrement one.
     """
     Thin wrapper around torch._C._vmap_increment_nesting that is used
     to proxy in export/compile graph
@@ -117,6 +137,13 @@ VMAP_DECOMPOSITIONS_LIB: torch.library.Library | None = None
 
 
 def lazy_load_decompositions() -> None:
+    # [FUNCTION DOC] Registers Python decompositions (mse/smooth_l1/huber loss backward, nll_loss
+    # forward/backward in 1d and 2d, addr) for the FuncTorchBatched dispatch key, at most once.
+    # Uses a lazily created lock with double-checked flag to be thread safe. Skipped (flag set,
+    # nothing registered) unless PYTORCH_JIT is "1" and asserts are enabled. Under a pre-dispatch
+    # export mode it only dispatches through handle_torch_function. Mutates module globals
+    # DECOMPOSITIONS_LOADED, DECOMPOSITIONS_LOCK, VMAP_DECOMPOSITIONS_LIB. Returns None.
+    # Raises RuntimeError if a decomposition is missing from the decomposition table.
     """
     Lazy loading of vmap decompositions with pre-dispatch support.
     """
@@ -159,6 +186,9 @@ def lazy_load_decompositions() -> None:
         from torch._decomp import decomposition_table
 
         def _register_python_decomposition_vmap(decomp: torch._ops.OpOverload) -> None:
+            # [FUNCTION DOC] HELPER: Registers the table decomposition of an operator overload as
+            # its FuncTorchBatched implementation in the vmap library. Raises AssertionError if the
+            # library is unset and RuntimeError if the overload has no decomposition.
             if VMAP_DECOMPOSITIONS_LIB is None:
                 raise AssertionError("VMAP_DECOMPOSITIONS_LIB must not be None")
             if decomp in decomposition_table:
@@ -183,6 +213,9 @@ def lazy_load_decompositions() -> None:
 def _make_dual(
     tensor: torch.Tensor, tangent: torch.Tensor, *, level: int = 0
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Creates a forward-AD dual tensor from a primal tensor and tangent at the
+    # given dual level; returns the dual tensor. Traced under a pre-dispatch export mode,
+    # else calls the C++ implementation.
     """
     Thin wrapper around torch._VF._make_dual that is used to proxy in
     PT2 export/compile fx graph for forward-mode AD.
@@ -202,6 +235,8 @@ def _make_dual(
 def _unpack_dual(
     tensor: torch.Tensor, *, level: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Splits a dual tensor into its (primal, tangent) pair at the given dual
+    # level. Traced under a pre-dispatch export mode, else calls the C++ implementation.
     """
     Thin wrapper around torch._VF._unpack_dual that is used to proxy in
     PT2 export/compile fx graph for forward-mode AD.
@@ -219,6 +254,8 @@ def _unpack_dual(
 
 
 def _jvp_increment_nesting() -> int:
+    # [FUNCTION DOC] Enters a new jvp nesting level and returns the new level as an int.
+    # Side effect: pushes a functorch dynamic layer. Traced under a pre-dispatch export mode.
     """
     Thin wrapper around torch._C._functorch._jvp_increment_nesting that is
     used to proxy in export/compile graph for forward-mode AD.
@@ -236,6 +273,8 @@ def _jvp_increment_nesting() -> int:
 
 
 def _jvp_decrement_nesting() -> int:
+    # [FUNCTION DOC] Exits the innermost jvp nesting level and returns the popped level.
+    # Side effect: pops a functorch dynamic layer. Traced under a pre-dispatch export mode.
     """
     Thin wrapper around torch._C._functorch._jvp_decrement_nesting that is
     used to proxy in export/compile graph for forward-mode AD.
@@ -253,6 +292,8 @@ def _jvp_decrement_nesting() -> int:
 
 
 def _unwrap_for_grad(tensor: torch.Tensor, level: int) -> torch.Tensor:
+    # [FUNCTION DOC] Unwraps a tensor from the grad wrapper of the given level, returning the
+    # inner tensor. Traced under a pre-dispatch export mode, else calls the C++ implementation.
     """
     Thin wrapper around torch._C._functorch._unwrap_for_grad that is used
     to proxy in PT2 export/compile fx graph for functorch transforms (grad, vjp, jvp).
@@ -270,6 +311,8 @@ def _unwrap_for_grad(tensor: torch.Tensor, level: int) -> torch.Tensor:
 
 
 def _enter_dual_level() -> int:
+    # [FUNCTION DOC] Enters a new forward-AD dual level and returns its integer level.
+    # Side effect: changes global forward-AD state. Traced under a pre-dispatch export mode.
     """
     Thin wrapper around torch._C._enter_dual_level that is used to proxy in
     PT2 export/compile fx graph for forward-mode AD.
@@ -284,6 +327,8 @@ def _enter_dual_level() -> int:
 
 
 def _exit_dual_level(*, level: int) -> None:
+    # [FUNCTION DOC] Exits the given keyword-only forward-AD dual level; returns None.
+    # Side effect: changes global forward-AD state. Traced under a pre-dispatch export mode.
     """
     Thin wrapper around torch._C._exit_dual_level that is used to proxy in
     PT2 export/compile fx graph for forward-mode AD.

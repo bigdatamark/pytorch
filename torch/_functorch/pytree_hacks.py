@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Deprecated shim re-exporting tree_map_ and treespec_pprint from
+# torch.utils._pytree. Import-time side effect: always emits a DeprecationWarning
+# (warning filter forced to "always" within a local catch block) pointing to torch.utils._pytree.
 import warnings
 
 # TODO: remove this file when the migration of the pytree utility is done
