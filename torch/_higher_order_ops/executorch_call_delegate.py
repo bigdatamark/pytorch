@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Defines the executorch_call_delegate higher-order operator, which represents
+# a call into a lowered (backend-delegated) ExecuTorch module inside a traced graph, and
+# registers its implementations: eager/CPU fallback, autograd, proxy tracing, fake tensor and
+# functionalization. Import-time side effects: creates the global operator instance and
+# sets fallthrough for the PythonDispatcher, PythonTLSSnapshot, ADInplaceOrView and
+# AutocastCPU dispatch keys.
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -26,10 +33,15 @@ from torch.utils._pytree import tree_flatten
 
 
 class ExecutorchCallDelegate(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator named executorch_call_delegate; first argument is a
+    # lowered backend module, the rest are its runtime inputs. Stateless.
     def __init__(self):
+        # [FUNCTION DOC] Registers the operator under the name executorch_call_delegate.
         super().__init__("executorch_call_delegate")
 
     def __call__(self, lowered_module, *args):
+        # [FUNCTION DOC] Dispatches the call through the base HigherOrderOperator machinery
+        # with the lowered module and inputs; returns the delegate's outputs.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(lowered_module, *args)
 
@@ -45,8 +57,16 @@ LOWERED_BACKEND_MODULE_TYPE = "LoweredBackendModule"
 
 # pyre-ignore
 def trace_call_delegate(proxy_mode, func_overload, lowered_module, *args):
+    # [FUNCTION DOC] Records the delegate call in the graph being traced by proxy_mode.
+    # Verifies lowered_module is a lowered backend module (raises ValueError otherwise),
+    # runs the CPU implementation with proxy tracing disabled to compute real outputs,
+    # registers the lowered module as a new submodule on the tracer root (side effect), creates a
+    # call_function proxy node with the unwrapped proxy arguments, and returns the outputs
+    # tracked against that proxy.
     # pyre-ignore
     def _unwrap_proxy(e):
+        # [FUNCTION DOC] HELPER: Returns the proxy slot for tensors/symbolic ints/floats from
+        # the tracer; other values are returned unchanged.
         if not isinstance(e, (torch.Tensor, torch.SymInt, torch.SymFloat)):
             return e
         return get_proxy_slot(
@@ -77,6 +97,9 @@ def trace_call_delegate(proxy_mode, func_overload, lowered_module, *args):
 @executorch_call_delegate.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
 # pyre-ignore
 def call_delegate_cpu(lowered_module, *args):
+    # [FUNCTION DOC] Eager implementation: converts FX immutable dicts/lists inside args into
+    # plain dicts/lists, then runs the original (pre-lowering) module of lowered_module on
+    # them and returns the result.
     # FX creates this immutable_dict/list concept. Get rid of this.
     map_types: dict[type, type] = {
         torch.fx.immutable_collections.immutable_dict: dict,
@@ -94,6 +117,10 @@ def call_delegate_cpu(lowered_module, *args):
 @executorch_call_delegate.py_autograd_impl
 # pyre-ignore
 def call_delegate_autograd(lowered_module, *args):
+    # [FUNCTION DOC] Autograd key implementation (autograd is not truly supported). Checks
+    # whether any tensor input requires grad, re-invokes the operator with AutogradCPU
+    # excluded, and if grad was required returns the outputs detached with requires_grad
+    # set on floating/complex tensors, so outputs have a grad_fn-less leaf marked as requiring grad.
     # TODO: support autograd
     flat_operands, _ = tree_flatten([lowered_module, *args])
     requires_grad = any(
@@ -112,6 +139,8 @@ def call_delegate_autograd(lowered_module, *args):
 
             # pyre-ignore
             def fake_requires_grad(var):
+                # [FUNCTION DOC] HELPER: Detaches a tensor (None passes through) and sets
+                # requires_grad on it if floating point or complex; returns it.
                 if var is not None:
                     var = var.detach()
                     if torch.is_floating_point(var) or torch.is_complex(var):
@@ -126,6 +155,8 @@ def call_delegate_autograd(lowered_module, *args):
 @executorch_call_delegate.py_impl(ProxyTorchDispatchMode)
 # pyre-ignore
 def call_delegate_proxy_torch_dispatch_mode(mode, lowered_module, *args):
+    # [FUNCTION DOC] ProxyTorchDispatchMode implementation: traces the call into the graph
+    # via trace_call_delegate and returns the tracked outputs.
     res = trace_call_delegate(mode, executorch_call_delegate, lowered_module, *args)
     return res
 
@@ -133,12 +164,16 @@ def call_delegate_proxy_torch_dispatch_mode(mode, lowered_module, *args):
 @register_fake(executorch_call_delegate, skip_cache=True)
 # pyre-ignore
 def call_delegate_fake_tensor_mode(lowered_module, *args):
+    # [FUNCTION DOC] Fake tensor implementation (caching skipped): runs the CPU implementation
+    # on the fake inputs to obtain fake outputs.
     return call_delegate_cpu(lowered_module, *args)
 
 
 @executorch_call_delegate.py_functionalize_impl
 # pyre-ignore
 def call_delegate_functionalize(ctx, lowered_module, *args):
+    # [FUNCTION DOC] Functionalization implementation: unwraps the tensor arguments, redispatches
+    # the operator to the next key, and wraps the result tensors back. No mutation handling.
     unwrapped_args = tuple(ctx.unwrap_tensors(arg) for arg in args)
     with ctx.redispatch_to_next():
         res = executorch_call_delegate(lowered_module, *unwrapped_args)
@@ -147,6 +182,8 @@ def call_delegate_functionalize(ctx, lowered_module, *args):
 
 # pyre-ignore: Missing parameter annotation [2]: Parameter `obj` must have a type other than `Any`.Pyre
 def is_lowered_module(obj: Any) -> bool:
+    # [FUNCTION DOC] Returns True if the class name of obj equals the lowered backend module
+    # type name. Name-based check to avoid a circular import.
     """
     This function is added to avoid using isinstance(obj,
     LoweredBackendModule) as it will import LoweredBackendModule, which may
@@ -160,6 +197,9 @@ def get_lowered_module_name(
     # pyre-ignore: Undefined or invalid type [11]: Annotation `LoweredBackendModule` is not defined as a type.
     lowered_module: LOWERED_BACKEND_MODULE_TYPE,  # type: ignore[valid-type]
 ) -> str:
+    # [FUNCTION DOC] Picks the first unused attribute name of the form lowered_module_N
+    # (N counting from 0) on root, adds lowered_module as a submodule under it (mutates root),
+    # and returns that name.
     """
     Adds the given lowered_module into the given root module and returns the
     name of the module added.

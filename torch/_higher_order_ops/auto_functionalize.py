@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Auto-functionalization of mutable custom ops and HOPs. Defines the
+# auto_functionalized and auto_functionalized_v2 higher-order operators (which run a
+# functional version of a mutating op by cloning mutated inputs and returning the op output
+# plus the new values), the helper classes that record how mutated views relate to their base
+# tensors (ViewInfo family), functions to write/read that view information in kwargs, the
+# eligibility check can_auto_functionalize, the functionalization drivers
+# do_auto_functionalize / do_auto_functionalize_v2, and the dense/fake/proxy/functionalize
+# implementations of the operators. Import-time side effects: registers pytree constant
+# SchemaHolder, creates the global operator instances, sets autograd fallthroughs, and
+# registers implementations.
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
@@ -29,17 +39,25 @@ from torch.fx.experimental.proxy_tensor import (
 
 
 class SchemaHolder:
+    # [CLASS DOC] Wrapper around a FunctionSchema registered as a pytree constant so that the
+    # schema can travel inside a TreeSpec (which is proxable in a graph). Equality and hash
+    # follow the wrapped schema; attribute schema holds it.
     def __init__(self, schema: torch.FunctionSchema):
+        # [FUNCTION DOC] Stores the schema.
         self.schema = schema
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Equal if the wrapped schemas are equal (other must have a schema attribute).
         return self.schema == other.schema
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the wrapped schema.
         return hash(self.schema)
 
     @classmethod
     def from_tree_spec(cls, tree_spec: pytree.TreeSpec):
+        # [FUNCTION DOC] Recovers a SchemaHolder from a tree spec by unflattening an empty leaf
+        # list and wrapping the held schema. Raises AssertionError if tree_spec is None.
         if tree_spec is None:
             raise AssertionError("tree_spec cannot be None")
         return cls(pytree.tree_unflatten([], tree_spec).schema)
@@ -52,6 +70,8 @@ pytree.register_constant(SchemaHolder)
 
 
 def get_base(tensor):
+    # [FUNCTION DOC] Returns the base tensor of a view: the inference-mode base when
+    # inference mode is enabled, otherwise the regular base (None if not a view).
     if torch.is_inference_mode_enabled():
         return tensor._inference_mode_base
     else:
@@ -59,29 +79,38 @@ def get_base(tensor):
 
 
 class ViewInfo(ABC):
+    # [CLASS DOC] Abstract record of how a mutated argument relates to a base tensor: base_index
+    # is the position of its base in a list of bases. Subclasses implement regenerate_view to
+    # rebuild the argument from the bases list.
     base_index: int
 
     def __init__(self, base_index):
+        # [FUNCTION DOC] Stores the index of the base tensor.
         self.base_index = base_index
 
     @abstractmethod
     def regenerate_view(self, bases_list: list[Tensor]):
+        # [FUNCTION DOC] Abstract: rebuild the view from the list of base tensors.
         pass
 
 
 @dataclass
 class AsStridedViewInfo(ViewInfo):
+    # [CLASS DOC] View record describing a view by explicit size, stride and storage offset
+    # relative to the base tensor at base_index.
     size: Sequence[int | torch.SymInt]
     stride: Sequence[int | torch.SymInt]
     storage_offset: int
 
     def __init__(self, base_index, size, stride, storage_offset):
+        # [FUNCTION DOC] Stores the base index, size, stride and storage offset.
         super().__init__(base_index)
         self.size = size
         self.stride = stride
         self.storage_offset = storage_offset
 
     def regenerate_view(self, bases_list: list[Tensor]):
+        # [FUNCTION DOC] Returns an as-strided view of the selected base with the stored geometry.
         return torch.as_strided(
             bases_list[self.base_index],
             self.size,
@@ -92,17 +121,21 @@ class AsStridedViewInfo(ViewInfo):
 
 @dataclass
 class SliceViewInfo(ViewInfo):
+    # [CLASS DOC] View record describing a view as a slice of the base at base_index along
+    # dimension dim from start to end.
     dim: int | torch.SymInt
     start: int | torch.SymInt
     end: int | torch.SymInt
 
     def __init__(self, base_index, dim, start, end):
+        # [FUNCTION DOC] Stores the base index, dimension, start and end.
         super().__init__(base_index)
         self.dim = dim
         self.start = start
         self.end = end
 
     def regenerate_view(self, bases_list: list[Tensor]):
+        # [FUNCTION DOC] Returns the slice of the selected base along dim between start and end.
         return torch.ops.aten.slice.Tensor(
             bases_list[self.base_index], self.dim, self.start, self.end
         )
@@ -110,23 +143,31 @@ class SliceViewInfo(ViewInfo):
 
 @dataclass
 class AliasViewInfo(ViewInfo):
+    # [CLASS DOC] View record for an argument that is a full alias (same geometry) of its base.
     def __init__(self, base_index):
+        # [FUNCTION DOC] Stores the base index.
         super().__init__(base_index)
 
     def regenerate_view(self, bases_list: list[Tensor]):
+        # [FUNCTION DOC] Returns an alias of the selected base tensor.
         return torch.ops.aten.alias.default(bases_list[self.base_index])
 
 
 @dataclass
 class NotView(ViewInfo):
+    # [CLASS DOC] Record for an argument that is not a view, i.e. is itself a base tensor.
     def __init__(self, base_index):
+        # [FUNCTION DOC] Stores the base index.
         super().__init__(base_index)
 
     def regenerate_view(self, bases_list: list[Tensor]):
+        # [FUNCTION DOC] Returns the selected base tensor itself.
         return bases_list[self.base_index]
 
 
 def is_alias(base, tensor):
+    # [FUNCTION DOC] Returns True if tensor and base statically have the same storage offset,
+    # strides and sizes (symbolic-aware comparison), i.e. the tensor is a full alias of base.
     from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 
     return all(
@@ -141,6 +182,10 @@ def is_alias(base, tensor):
 
 # return None or (dim, start, end)
 def try_use_slice(base, tensor):
+    # [FUNCTION DOC] Tries to express tensor as a slice of base. Returns (dim, start, end) when
+    # strides and rank match, exactly one dimension differs in size, and the storage offset is
+    # a multiple of that dimension's stride; returns (0, 0, first size) if it is a full alias;
+    # otherwise returns None.
     from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 
     # This condition should never be triggered.
@@ -175,6 +220,12 @@ def write_view_information_to_args(
     kwargs: dict[str, Any],
     arg_to_base_index: dict[str, Any],
 ):
+    # [FUNCTION DOC] Encodes, for each mutable argument, how it relates to its base tensor by
+    # adding extra entries to kwargs (mutated in place). Tensor args get a base index entry plus
+    # either nothing (not a view), an alias flag, slice dim/start/end, or as-strided
+    # size/stride/storage_offset entries; tensor-list args get a length entry and per-element
+    # entries; None values are recorded as such. Raises AssertionError if a key to be written
+    # already exists, and RuntimeError for argument types that are neither tensor nor tensor list.
     """
     This function writes the view information into kwargs. It reads mutable_args from kwargs.
     and uses arg_to_base_index and tensor information to write ViewInfo into kwargs.
@@ -186,6 +237,10 @@ def write_view_information_to_args(
     """
 
     def write_single_view(prefix: str, tensor: Tensor, base_index: int):
+        # [FUNCTION DOC] HELPER: Writes the view entries for one tensor under the given key
+        # prefix into kwargs, after asserting none of the keys already exist. A None tensor
+        # records a None base index; a non-view records only the base index; otherwise alias,
+        # slice or as-strided information is also recorded (in that order of preference).
         if f"{prefix}_base_index" in kwargs:
             raise AssertionError(f"{prefix}_base_index already in kwargs")
         if f"{prefix}_size" in kwargs:
@@ -203,16 +258,19 @@ def write_view_information_to_args(
             raise AssertionError(f"{prefix}_slice_end already in kwargs")
 
         def use_as_strided(tensor):
+            # [FUNCTION DOC] HELPER: Records the tensor's size, stride and storage offset in kwargs.
             kwargs[f"{prefix}_size"] = tensor.size()
             kwargs[f"{prefix}_stride"] = tensor.stride()
             kwargs[f"{prefix}_storage_offset"] = tensor.storage_offset()
 
         def use_slice(dim, start, end):
+            # [FUNCTION DOC] HELPER: Records slice dim, start and end in kwargs.
             kwargs[f"{prefix}_slice_dim"] = dim
             kwargs[f"{prefix}_slice_start"] = start
             kwargs[f"{prefix}_slice_end"] = end
 
         def use_alias():
+            # [FUNCTION DOC] HELPER: Records an alias flag in kwargs.
             kwargs[f"{prefix}_alias"] = True
 
         # The start if the function
@@ -260,6 +318,11 @@ def read_view_information_from_args(
     kwargs: dict[str, Any],
     all_bases: list[Tensor],
 ):
+    # [FUNCTION DOC] Inverse of write_view_information_to_args: for each mutable argument,
+    # removes (pops) its view entries from kwargs and builds a ViewInfo (or a list of them for
+    # tensor lists, or None for None values). Returns a mapping from argument name to that info.
+    # Mutates kwargs. Raises RuntimeError for unsupported argument types. The all_bases
+    # parameter is unused.
     """
     This reads the view information added by `write_view_information_to_args` from kwargs, pop them,
     and returns a dict arg_name -> ViewInfo | [ViewInfo](if the input is list). that maps each mutable arg
@@ -270,9 +333,13 @@ def read_view_information_from_args(
     """
 
     def get_arg(name):
+        # [FUNCTION DOC] HELPER: Removes and returns the named entry from kwargs.
         return kwargs.pop(name)
 
     def read_single_view(prefix):
+        # [FUNCTION DOC] HELPER: Reads and pops the entries for one tensor under the prefix and
+        # returns None (None base index), AliasViewInfo, AsStridedViewInfo, SliceViewInfo, or
+        # NotView depending on which entries are present.
         base_index = get_arg(f"{prefix}_base_index")
         if base_index is None:
             return None
@@ -336,6 +403,10 @@ def read_view_information_from_args(
 
 
 class AutoFunctionalized(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator auto_functionalized (cacheable): given a mutable
+    # OpOverload and its arguments as kwargs, runs a functional version and returns the op
+    # output together with the new values of the mutated arguments. Stateless; one global
+    # instance auto_functionalized exists.
     """auto_functionalized(_mutable_op, **kwargs)
 
     This HOP runs a "functional" version of _mutable_op.
@@ -354,6 +425,7 @@ class AutoFunctionalized(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the cacheable operator under the name auto_functionalized.
         super().__init__("auto_functionalized", cacheable=True)
 
     def __call__(
@@ -362,6 +434,9 @@ class AutoFunctionalized(HigherOrderOperator):
         _mutable_op: OpOverload,
         **kwargs: Any,
     ) -> tuple[Any, tuple[Tensor, ...]]:
+        # [FUNCTION DOC] Raises AssertionError if the op cannot be auto-functionalized or kwargs
+        # is not a dict; otherwise dispatches and returns the op output followed by the new
+        # values of the mutated arguments.
         if not can_auto_functionalize(_mutable_op):
             raise AssertionError(f"Cannot auto-functionalize op {_mutable_op}")
         if not isinstance(kwargs, dict):
@@ -381,6 +456,10 @@ _MutableOpType = OpOverload | HigherOrderOperator
 
 
 class AutoFunctionalizedV2(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator auto_functionalized_v2 (cacheable): like
+    # AutoFunctionalized but handles view arguments via explicit base tensors and accepts either
+    # an OpOverload or a HigherOrderOperator (with schema passed in an op-schema kwarg tree
+    # spec). Stateless; one global instance auto_functionalized_v2 exists.
     """auto_functionalized_v2(_mutable_op, **kwargs)
 
     This HOP runs a "functional" version of _mutable_op.
@@ -389,6 +468,7 @@ class AutoFunctionalizedV2(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the cacheable operator under the name auto_functionalized_v2.
         super().__init__("auto_functionalized_v2", cacheable=True)
 
     def __call__(
@@ -397,6 +477,10 @@ class AutoFunctionalizedV2(HigherOrderOperator):
         _mutable_op: _MutableOpType,
         **kwargs: Any,
     ) -> tuple[Any, tuple[Tensor, ...]]:
+        # [FUNCTION DOC] For a HOP, builds a HopInstance from the schema carried in the op-schema
+        # kwarg; for an OpOverload uses it directly. Raises AssertionError if the op cannot be
+        # auto-functionalized or kwargs is not a dict; otherwise dispatches and returns the
+        # op output followed by new values of mutated bases.
         _op_to_check: OpOverload | HopInstance | None = None
         if isinstance(_mutable_op, HigherOrderOperator):
             _op_to_check = HopInstance(
@@ -426,6 +510,12 @@ auto_functionalized_v2.fallthrough(DispatchKey.AutogradCUDA)
 def can_auto_functionalize(
     op: OperatorBase | HopInstance,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether an op can be auto-functionalized. A HOP instance needs a
+    # schema generator; otherwise it must be a non-builtin OpOverload. The schema must be
+    # mutable, every written-to argument must be a tensor or tensor list, and the returns must
+    # be a single None, or (for non-out, non-inplace OpOverloads) all plain non-aliased
+    # tensors; OpOverloads that have a Functionalize kernel are rejected. Returns a bool,
+    # no side effects.
     if isinstance(op, HopInstance):
         # HOPs that implement gen_schema and schema is not functional are auto_functionalizable.
         if not _has_gen_schema(op._op):
@@ -482,6 +572,8 @@ def can_auto_functionalize(
 def get_mutable_args_from_schema(
     schema: torch.FunctionSchema,
 ) -> tuple[list[str], list[torch.Type]]:
+    # [FUNCTION DOC] Returns two parallel lists: names and types of schema arguments that are
+    # written to (have write alias info).
     """
     Returns the list of argument names that get mutated according to the
     schema and their types.
@@ -501,6 +593,7 @@ def get_mutable_args_from_schema(
 
 
 def get_mutable_args(op: OpOverload) -> tuple[list[str], list[torch.Type]]:
+    # [FUNCTION DOC] Returns the mutated argument names and types of the op's schema.
     return get_mutable_args_from_schema(op._schema)
 
 
@@ -510,6 +603,14 @@ def do_auto_functionalize(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] Functionalizes a call to a mutable op under the python functionalization
+    # mode. Normalizes args/kwargs into kwargs by schema (using defaults for missing ones),
+    # warns if an argument is named self or self_, unwraps tensors and calls the
+    # auto_functionalized operator below functionalization. Splits its result into actual
+    # outputs (reshaped to match schema returns; AssertionError on mismatch) and new values of
+    # mutated args, then for each mutated tensor or tensor list replaces, commits and syncs the
+    # original functional tensor with the new value (mutating the functional tensors; None
+    # entries skipped, RuntimeError for other types). Returns the wrapped actual outputs.
     """Functionalizes a call to op(*args, **kwargs) by emitting a call to
     `outs = auto_functionalized(op, normalized_kwargs)`
     and replacing the mutated (args, kwargs) with the corresponding outputs.
@@ -579,6 +680,8 @@ def do_auto_functionalize(
 
         # We only handle Tensor or List[Tensor] here for now.
         def sync_update(o, orig_arg):
+            # [FUNCTION DOC] HELPER: Replaces the functional tensor orig_arg's value with o,
+            # commits the update and syncs it.
             ctx.replace(orig_arg, o)
             ctx.commit_update(orig_arg)
             ctx.sync(orig_arg)
@@ -612,12 +715,21 @@ def do_auto_functionalize(
 # from Functional mode -> fake mode for multiple invoke_subgraph calls that share,
 # the same inner graph module, we can hit the cache.
 class FunctionalCallableWithEpilogue:
+    # [CLASS DOC] Wraps a callable (typically a graph module) so that calling it runs it under
+    # python functionalization with input mutations propagated, inlining the copy epilogue.
+    # State: orig_callable and _boxed_call (whether the original takes a single list of
+    # inputs). Hashed by the identity of the original so caches are shared across wrappers.
     def __init__(self, orig_callable: Callable):
+        # [FUNCTION DOC] Stores the callable and copies its boxed-call flag (default False).
         self.orig_callable = orig_callable
         # Propagate so callers pass inputs as a list, enabling input deallocation.
         self._boxed_call = getattr(orig_callable, "_boxed_call", False)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Functionalizes the original callable with a fresh functional tensor
+        # mode (propagating input mutations) and calls it. For boxed callables the inputs are
+        # passed as one list (the argument is accepted either as a single list or as separate
+        # args) and the result is returned as a tuple; otherwise args and kwargs are forwarded.
         # Functionalize to inline the epilogue graph (copy_ ops) for better fusion.
         # Python functionalization so mutable custom ops reach auto_functionalized_v2.
         from torch._subclasses.functional_tensor import (
@@ -639,6 +751,8 @@ class FunctionalCallableWithEpilogue:
         return functionalized(*args, **kwargs)
 
     def __hash__(self):
+        # [FUNCTION DOC] Hash is the identity of the original callable, so wrappers around the
+        # same callable hash equal-ish (no equality method is defined).
         return id(self.orig_callable)
 
 
@@ -648,6 +762,13 @@ def do_auto_functionalize_v2(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] Functionalizes a call to a mutable OpOverload or HOP instance (v2 path)
+    # under the python functionalization mode. Wraps callable arguments that the schema types as
+    # any-type (subgraph args) in FunctionalCallableWithEpilogue, normalizes args/kwargs into
+    # kwargs by schema (defaults for missing), and then dispatches by kind: out= overloads,
+    # inplace overloads, or generic mutable ops/HOPs, each to its own helper. Raises
+    # AssertionError if the op is neither an OpOverload nor a HigherOrderOperator. Returns the
+    # wrapped op outputs; mutated functional tensors are updated as a side effect.
     from torch._subclasses.functional_tensor import PythonFunctionalizeAPI
 
     ctx = PythonFunctionalizeAPI(mode=mode)
@@ -669,6 +790,8 @@ def do_auto_functionalize_v2(
     }
 
     def _maybe_functionalize(name: str, arg: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Wraps the argument in FunctionalCallableWithEpilogue if its
+        # name is a subgraph (any-typed) schema argument and it is callable; else returns it.
         if name in subgraph_arg_names and callable(arg):
             return FunctionalCallableWithEpilogue(arg)
         return arg
@@ -712,6 +835,11 @@ def _do_auto_functionalize_v2_for_out_operator(
     schema: Any,
     normalized_kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Functionalizes an out= op. Remembers the original out functional
+    # tensors, replaces each out argument in the kwargs by entries encoding its size, stride,
+    # dtype and device (mutating normalized_kwargs), calls auto_functionalized_v2 with an empty
+    # bases list below functionalization, then writes each returned tensor back into the
+    # matching original out tensor (replace, commit, sync). Returns the wrapped results.
     """Handle functionalization for out= operators.
 
     Out= operators have write-only mutable args. These are not inputs to
@@ -759,6 +887,11 @@ def _do_auto_functionalize_v2_for_inplace_operator(
     schema: Any,
     normalized_kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Functionalizes an inplace op whose first mutated argument is self.
+    # Takes self's base (or self if not a view) as the single base, records view information
+    # for self in the kwargs, removes self from the kwargs, calls auto_functionalized_v2 with
+    # that base, then writes the returned mutated base back into the original base (replace,
+    # commit, sync). Returns the wrapped op result (first element of the HOP output).
     """Handle functionalization for inplace operators.
 
     Inplace operators mutate their first positional argument (self) and return
@@ -807,6 +940,17 @@ def _do_auto_functionalize_v2_for_generic_mutable_operator(
     schema: Any,
     normalized_kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Functionalizes a generic mutable op or HOP. Collects the distinct
+    # base tensors (by identity of the underlying tensor) of all mutated arguments and maps each
+    # argument to its base index, writes view information into the kwargs, removes the mutated
+    # args from the kwargs, warns for arguments named self or self_, and calls
+    # auto_functionalized_v2 with the unwrapped kwargs and bases (for a HOP, also passing the
+    # schema as a tree spec). Splits the output into actual outputs (checked against the schema
+    # returns; AssertionError on mismatch) and updated bases, and syncs each original base with
+    # its new value. Returns the wrapped actual outputs.
+    # KNOWN ISSUE: for a tensor-list argument containing None the code calls an append method
+    # on a mapping it created as a dict, which would fail. Also the duplicate-key check uses
+    # the name _ops_schema while the key actually written is _op_schema.
     """Handle functionalization for generic mutable operators via the
     auto_functionalized_v2 HOP."""
     mutable_args_names, mutable_args_types = get_mutable_args_from_schema(schema)
@@ -819,9 +963,14 @@ def _do_auto_functionalize_v2_for_generic_mutable_operator(
     arg_to_base_index: dict[str, Any] = {}
 
     def update_dict(tensor, arg_name, index=None):
+        # [FUNCTION DOC] HELPER: Finds the tensor's base (itself if not a view), appends it to
+        # the bases list if not already present (tracked by underlying address), and records
+        # its base index in the argument-to-base-index mapping (under the element index for
+        # list arguments).
         base = tensor if get_base(tensor) is None else get_base(tensor)
 
         def set_result(base_index):
+            # [FUNCTION DOC] HELPER: Stores base_index for the argument (or its list element).
             if index is None:
                 arg_to_base_index[arg_name] = base_index
             else:
@@ -932,6 +1081,8 @@ def _do_auto_functionalize_v2_for_generic_mutable_operator(
 
         # We only handle Tensor or List[Tensor] here for now.
         def sync_update(o, orig_arg):
+            # [FUNCTION DOC] HELPER: Replaces the functional tensor orig_arg's value with o,
+            # commits the update and syncs it.
             ctx.replace(orig_arg, o)
             ctx.commit_update(orig_arg)
             ctx.sync(orig_arg)
@@ -962,6 +1113,10 @@ def auto_functionalized_dense(
     _only_clone_these_tensors: tuple[str, ...] | None = None,
     **kwargs: Any,
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Dense implementation of auto_functionalized. Clones (preserving strides)
+    # each mutable argument (tensor or tensor list; None kept) except those not listed in
+    # _only_clone_these_tensors when that is given, calls the op with the new kwargs, and
+    # returns the op output(s) followed by the (cloned) mutable arguments.
     new_kwargs = dict(**kwargs)
     result = []
 
@@ -996,6 +1151,8 @@ def auto_functionalized_fake(
     _mutable_op: OpOverload,
     **kwargs: Any,
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Fake tensor implementation (caching skipped): runs the dense
+    # implementation cloning all mutable tensors and returns its result.
     result = auto_functionalized_dense(
         _mutable_op, _only_clone_these_tensors=None, **kwargs
     )
@@ -1008,6 +1165,9 @@ def auto_functionalized_proxy(
     _mutable_op: OpOverload,
     **kwargs: Any,
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Proxy tracing implementation: computes the real result with tracing
+    # disabled, then emits a call_function node for auto_functionalized with the op and the
+    # unwrapped proxy kwargs, and returns the result tracked to that node.
     with disable_proxy_modes_tracing():
         out = auto_functionalized(_mutable_op, **kwargs)
 
@@ -1024,6 +1184,8 @@ def auto_functionalized_proxy(
 
 @auto_functionalized.py_functionalize_impl
 def auto_functionalized_func(ctx, _mutable_op, **kwargs):
+    # [FUNCTION DOC] Functionalization implementation: unwraps tensor kwargs, redispatches
+    # auto_functionalized to the next key and wraps the result tensors.
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
     with ctx.redispatch_to_next():
         result = auto_functionalized(_mutable_op, **unwrapped_kwargs)
@@ -1037,6 +1199,13 @@ def auto_functionalized_v2_dense(
     _only_clone_these_bases: tuple[int, ...] | None = None,
     **kwargs: Any,
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Dense implementation of auto_functionalized_v2. Pops the bases list (and,
+    # for a HOP, the schema tree spec) from kwargs, clones the bases selected by
+    # _only_clone_these_bases (all by default), regenerates the mutable arguments as views of
+    # the new bases, and calls the op or HOP instance. For out= ops (bases empty) it creates
+    # empty out tensors from encoded metadata and returns the op output directly; otherwise
+    # returns the op output(s) followed by the new bases. Raises AssertionError if a HOP's
+    # schema is not a HopSchema. Mutates kwargs by popping entries.
     _all_bases: list[Tensor] = kwargs.pop("_all_bases", [])
     if _only_clone_these_bases is None:
         _only_clone_these_bases = tuple(range(len(_all_bases)))
@@ -1083,6 +1252,12 @@ def auto_functionalized_v2_dense(
 def _generate_new_op_kwargs_from_bases(
     schema, kwargs, all_bases, _only_clone_these_bases, _is_out
 ):
+    # [FUNCTION DOC] HELPER: Builds the real kwargs for the underlying op and the new bases.
+    # For out= ops, pops the encoded size/stride/dtype/device per out argument, allocates
+    # empty strided tensors for them, and returns the new kwargs with the created tensors.
+    # Otherwise reads (pops) view information from kwargs, clones the selected bases keeping
+    # strides (None stays None), regenerates each mutable arg (None, list, or single) as views of
+    # the new bases, and returns (new kwargs, new bases list).
     mutable_args_names, mutable_args_types = get_mutable_args_from_schema(schema)
 
     if _is_out:
@@ -1105,6 +1280,8 @@ def _generate_new_op_kwargs_from_bases(
     )
 
     def maybe_copy(i, t):
+        # [FUNCTION DOC] HELPER: Returns None for None, a stride-preserving clone if index i is
+        # in the set to clone, else the tensor itself.
         if t is None:
             return None
         if i in _only_clone_these_bases:
@@ -1144,6 +1321,8 @@ def auto_functionalized_v2_fake(
     _mutable_op: _MutableOpType,
     **kwargs: dict[str, Any],
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Fake tensor implementation (caching skipped): runs the v2 dense
+    # implementation cloning all bases and returns its result.
     result = auto_functionalized_v2_dense(
         _mutable_op, _only_clone_these_bases=None, **kwargs
     )
@@ -1156,6 +1335,12 @@ def auto_functionalized_v2_proxy(
     _mutable_op: _MutableOpType,
     **kwargs: Any,
 ) -> tuple[Any, tuple[Tensor, ...]]:
+    # [FUNCTION DOC] Proxy tracing implementation of v2. For a HOP, first replaces callable
+    # kwargs that the schema types as subgraphs by traced graph modules (raising AssertionError
+    # if a callable cannot be materialized as a GraphModule), mutating kwargs. Then computes the
+    # real result with tracing disabled, registers any graph module kwargs on the tracer root
+    # under fresh names, emits a call_function node for auto_functionalized_v2 and returns the
+    # result tracked to that node.
     if isinstance(_mutable_op, HigherOrderOperator):
         # Note [materialize callable inputs as graph]
         # Below code materializes the callable inputs to the hop as graph modules.
@@ -1216,6 +1401,8 @@ def auto_functionalized_v2_proxy(
     if isinstance(_mutable_op, HigherOrderOperator):
 
         def _maybe_register_subgraph(val: Any):
+            # [FUNCTION DOC] HELPER: If val is a GraphModule, registers it on the tracer root
+            # under a fresh auto_functionalized_subgraph name; returns val unchanged.
             if isinstance(val, torch.fx.GraphModule):
                 _, graph_name = unique_graph_id(
                     mode, prefix="auto_functionalized_subgraph"
@@ -1238,6 +1425,8 @@ def auto_functionalized_v2_proxy(
 
 @auto_functionalized_v2.py_functionalize_impl
 def auto_functionalized_v2_func(ctx, _mutable_op, **kwargs):
+    # [FUNCTION DOC] Functionalization implementation: unwraps tensor kwargs, redispatches
+    # auto_functionalized_v2 to the next key and wraps the result tensors.
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
     with ctx.redispatch_to_next():
         result = auto_functionalized_v2(_mutable_op, **unwrapped_kwargs)

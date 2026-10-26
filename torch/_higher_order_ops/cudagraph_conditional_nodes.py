@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Support for lowering torch.cond and torch.while_loop to CUDA graph
+# conditional nodes. Provides two dispatch modes (one for capture, one for warming up
+# control-flow subgraphs before capture) and the node-building helpers if_else_node and
+# while_loop_node, plus small validation helpers. No import-time side effects.
 from collections.abc import Generator
 from contextlib import contextmanager
 
@@ -8,13 +12,20 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 
 class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode active during CUDA graph capture that intercepts the cond and
+    # while_loop higher-order operators and builds CUDA graph conditional nodes for them
+    # instead of executing them. All other ops pass through. Opts in to seeing higher-order
+    # operators via the supports_higher_order_operators flag set in the constructor.
     @classmethod
     def ignore_compile_internals(cls) -> bool:
+        # [FUNCTION DOC] Always returns True: the compiler should ignore this mode.
         return True
 
     def __init__(
         self,
     ) -> None:
+        # [FUNCTION DOC] Sets the flag allowing higher-order operators to reach this mode,
+        # then initializes the base dispatch mode.
         self.supports_higher_order_operators = True
         super().__init__()
 
@@ -25,6 +36,10 @@ class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
         args=(),
         kwargs=None,
     ):
+        # [FUNCTION DOC] For the cond operator: rejects kwargs (RuntimeError), re-enters this
+        # mode and builds an if/else conditional node from the positional args, returning the
+        # branch output. For while_loop: same, building a while conditional node. Any other
+        # func is simply called with args and kwargs.
         kwargs = {} if kwargs is None else kwargs
         if func is torch.ops.higher_order.cond:
             # Re-enter the mode to support nested conditionals
@@ -40,6 +55,10 @@ class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
 
 
 class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode used before CUDA graph capture to warm up cond branches and
+    # while_loop bodies. State: capture_stream, a dedicated CUDA stream on which throwaway
+    # relaxed-mode captures are recorded (the resulting graphs are discarded), and the flag
+    # allowing higher-order operators. After warmup the real operator is executed normally.
     """Warm up control-flow subgraphs before CUDA graph capture.
 
     Data-dependent control flow does not necessarily execute every subgraph, so
@@ -53,11 +72,14 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
 
     @classmethod
     def ignore_compile_internals(cls) -> bool:
+        # [FUNCTION DOC] Always returns True: the compiler should ignore this mode.
         return True
 
     def __init__(
         self,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base mode, sets the flag allowing higher-order
+        # operators, and creates the dedicated CUDA stream used for warmup captures.
         super().__init__()
         self.supports_higher_order_operators = True
         self.capture_stream = torch.cuda.Stream()
@@ -69,6 +91,12 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         args=(),
         kwargs=None,
     ):
+        # [FUNCTION DOC] For cond and while_loop: rejects kwargs (RuntimeError). If the current
+        # stream is already capturing (nested control flow) it re-enters the mode and builds
+        # the conditional node directly, returning its result. Otherwise it performs a throwaway
+        # relaxed-mode capture on capture_stream that builds the node (warming every cond
+        # branch, or the while body once), discards the graph, then runs the real operator
+        # and returns its result. Other ops are called unchanged.
         kwargs = {} if kwargs is None else kwargs
 
         # Warm up both sides of this torch.cond()
@@ -119,11 +147,13 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
 
 
 def _check_no_cond_kwargs(kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError if any keyword arguments were given to cond.
     if kwargs:
         raise RuntimeError("CUDA graph conditional torch.cond does not support kwargs")
 
 
 def _check_no_while_loop_kwargs(kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError if any keyword arguments were given to while_loop.
     if kwargs:
         raise RuntimeError(
             "CUDA graph conditional torch.while_loop does not support kwargs"
@@ -131,6 +161,7 @@ def _check_no_while_loop_kwargs(kwargs) -> None:
 
 
 def _is_boolean_scalar_cuda_tensor(pred: object) -> bool:
+    # [FUNCTION DOC] HELPER: True only if pred is a zero-dimensional bool tensor on a CUDA device.
     return (
         isinstance(pred, torch.Tensor)
         and pred.size() == torch.Size([])
@@ -141,6 +172,9 @@ def _is_boolean_scalar_cuda_tensor(pred: object) -> bool:
 
 @contextmanager
 def _if_body(pred: torch.Tensor) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager. On entry begins capturing into a new if
+    # conditional node on the currently capturing CUDA graph, controlled by pred; on exit
+    # (even on error) ends the capture into the conditional node.
     current_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
     current_cuda_graph.begin_capture_to_if_node(pred)
     try:
@@ -150,6 +184,11 @@ def _if_body(pred: torch.Tensor) -> Generator[None, None, None]:
 
 
 def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
+    # [FUNCTION DOC] Captures an if/else as two if conditional nodes (the second guarded by the
+    # logical negation of pred). Raises ValueError if pred is not on CUDA. Each branch function
+    # is called with the operands inside its node; the false branch outputs are copied in place
+    # into the true branch outputs so later graph nodes see a single fixed output. Returns the
+    # true branch output structure.
     if not pred.is_cuda:
         raise ValueError(
             "Conditions must be on a cuda device to use conditional node in cuda graphs"
@@ -180,6 +219,9 @@ def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
 
 @contextmanager
 def _while_body(pred: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Context manager. On entry begins capturing into a new while
+    # conditional node on the currently capturing CUDA graph, controlled by pred, and yields
+    # that graph; on exit (even on error) ends the capture into the conditional node.
     current_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
     current_cuda_graph.begin_capture_to_while_node(pred)
     try:
@@ -194,6 +236,14 @@ def while_loop_node(
     carried_inputs,
     additional_inputs,
 ):
+    # [FUNCTION DOC] Captures a while loop as a while conditional node. Carried inputs must
+    # all be tensors (RuntimeError otherwise); they are cloned into loop-carried buffers.
+    # cond_fn is evaluated before the loop and again at the end of each body iteration and
+    # must return a boolean scalar CUDA tensor (RuntimeError otherwise). body_fn must return
+    # the same pytree structure of tensors as carried_inputs (RuntimeError otherwise); its
+    # outputs are copied into the loop-carried buffers when they do not share memory, and
+    # the updated predicate is set as the node's conditional handle. Returns the loop-carried
+    # buffers (same structure as carried_inputs).
     flat_carried_inputs, carried_spec = pytree.tree_flatten(carried_inputs)
     if not all(isinstance(inp, torch.Tensor) for inp in flat_carried_inputs):
         raise RuntimeError(

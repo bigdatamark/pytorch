@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements effect-token threading for side-effectful ops. Defines the
+# with_effects higher-order operator (token, op, args -> new token plus op results), helpers
+# to look up/register an op's effect type in the library registry, and handle_effects which
+# wraps an effectful op call with the proper token during functionalization/tracing.
+# Import-time side effects: registers ORDERED effects for aten::_print,
+# aten::_linalg_check_errors, torchbind calls, hop print and invoke_leaf_function, clears the
+# effect for the profiler record-function-exit op, creates the global with_effects operator,
+# and registers its dense, fake, proxy, functionalize implementations and autograd fallthroughs.
 from typing import Any, cast, Union
 
 import torch
@@ -32,6 +40,9 @@ _EffectType = EffectType
 
 
 def _get_op_qualname(op: _op_identifier) -> str:
+    # [FUNCTION DOC] HELPER: Maps an op identifier to its qualified name string: the name of
+    # an OpOverload, namespace::name for a HigherOrderOperator, the qualname of a CustomOpDef,
+    # or the string itself. Raises ValueError for any other input.
     """Convert an op identifier to a qualified string key."""
     if isinstance(op, torch._ops.OpOverload):
         return op._name
@@ -48,6 +59,9 @@ def _get_op_qualname(op: _op_identifier) -> str:
 def _register_effectful_op(
     op: _op_identifier, effect: EffectType | None
 ) -> RegistrationHandle:
+    # [FUNCTION DOC] HELPER: Looks up the op's entry in the global simple registry and registers
+    # the given effect type (or None to clear) on it. Mutates global registry state; returns
+    # the registration handle that can be used to undo it.
     qualname = _get_op_qualname(op)
     entry = torch._library.simple_registry.singleton.find(qualname)
     handle = entry.effect.register(effect)
@@ -55,6 +69,8 @@ def _register_effectful_op(
 
 
 def _get_effect(op: _op_identifier) -> _EffectType | None:
+    # [FUNCTION DOC] HELPER: Returns the effect type registered for the op in the global simple
+    # registry, or None if it has none.
     qualname = _get_op_qualname(op)
     entry = torch._library.simple_registry.singleton.find(qualname)
     return entry.effect.effect
@@ -71,6 +87,10 @@ _register_effectful_op(invoke_leaf_function, _EffectType.ORDERED)
 
 
 class WithEffects(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator named with_effects. Takes an effect token, an op and
+    # that op's arguments, runs the op, and returns a new token followed by the op results so
+    # that data dependence through tokens keeps side-effectful ops ordered. Stateless; one
+    # global instance with_effects exists.
     """
     with_effects(token, op, args, kwargs) -> (new_token, op_results)
 
@@ -85,6 +105,7 @@ class WithEffects(HigherOrderOperator):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name with_effects.
         super().__init__("with_effects")
 
     def __call__(
@@ -94,6 +115,10 @@ class WithEffects(HigherOrderOperator):
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Validates the call then dispatches. Raises AssertionError if op is
+        # not a HigherOrderOperator or OpOverload, if the op has aliasing in its schema, or
+        # if kwargs is not a dict. Otherwise dispatches through the base operator and returns
+        # a tuple of the new token followed by the op's outputs.
         if not isinstance(op, (torch._ops.HigherOrderOperator, torch._ops.OpOverload)):
             raise AssertionError(
                 f"op must be HigherOrderOperator or OpOverload, got {type(op)}"
@@ -110,6 +135,8 @@ with_effects = WithEffects()
 
 
 def has_aliasing(op: OpType):
+    # [FUNCTION DOC] Returns True if any argument or return in the op's schema carries alias
+    # info (always False for a HigherOrderOperator, which has no schema checked here).
     # NOT FOR PUBLIC USE
     if isinstance(op, torch._ops.HigherOrderOperator):
         return False
@@ -124,6 +151,8 @@ def has_aliasing(op: OpType):
 
 
 def has_effects(op) -> bool:
+    # [FUNCTION DOC] True if op is a HigherOrderOperator or OpOverload, has no aliasing, and
+    # has a registered effect type.
     return (
         isinstance(op, (torch._ops.HigherOrderOperator, torch._ops.OpOverload))
         and not has_aliasing(op)
@@ -132,6 +161,7 @@ def has_effects(op) -> bool:
 
 
 def new_token_tensor() -> torch.Tensor:
+    # [FUNCTION DOC] Creates a fresh empty tensor used as an effect token.
     return torch.tensor([])
 
 
@@ -142,6 +172,10 @@ def with_effects_dense(
     *args: tuple[Any, ...],
     **kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Eager implementation: runs the op, creates a new token, and returns a
+    # tuple of the new token followed by the op's outputs. A tuple output is spread into the
+    # result; any other output (including a list) is appended as a single element, matching
+    # the op schema. The input token is ignored.
     out = op(*args, **kwargs)
     new_token = new_token_tensor()
     # [NOTE: with_effects return type]
@@ -162,6 +196,8 @@ def with_effects_fake(
     *args: tuple[Any, ...],
     **kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Fake tensor implementation (caching skipped): delegates to the dense
+    # implementation on fake inputs and returns its (token, outputs) tuple.
     result = with_effects_dense(token, op, *args, **kwargs)
     return result
 
@@ -174,6 +210,10 @@ def with_effects_proxy(
     *args: tuple[Any, ...],
     **kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Proxy-tracing implementation: computes real outputs with proxy tracing
+    # disabled, marks the op as having a side effect (so dead-code elimination keeps it, a
+    # global graph-node registry mutation), emits a call_function node for with_effects with
+    # the token, op and unwrapped proxy args/kwargs, and returns the outputs tracked to it.
     with disable_proxy_modes_tracing():
         out = with_effects(token, op, *args, **kwargs)
 
@@ -209,6 +249,9 @@ def with_effects_functional(
     *args: tuple[Any, ...],
     **kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Functionalization implementation: unwraps tensors in token/args/kwargs,
+    # redispatches with_effects to the next key and wraps the result back. No mutation
+    # handling is needed because the operator is already functional.
     # with_effects is already functional, so just re-emit it.
     unwrapped_token, unwrapped_args, unwrapped_kwargs = ctx.unwrap_tensors(
         [token, args, kwargs]
@@ -222,6 +265,9 @@ _EFFECTFUL_HOPS_WITH_SCHEMA = {hop_print, invoke_leaf_function}
 
 
 def _get_schema(op, args, kwargs: dict | None = None) -> torch.FunctionSchema:
+    # [FUNCTION DOC] HELPER: Returns the schema for an op call: the overload's schema, the
+    # schema of the bound torchbind method (found from the first two args), or a generated
+    # schema for the effectful HOPs with schemas. Raises RuntimeError for any other op.
     if isinstance(op, torch._ops.OpOverload):
         return op._schema
     elif op == call_torchbind:
@@ -240,6 +286,14 @@ def handle_effects(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
+    # [FUNCTION DOC] Calls an effectful op through with_effects while threading its effect
+    # token. Finds the effect key of op (AssertionError if None). If tokens has no token for
+    # the key: raises AssertionError when discovery is not allowed; otherwise creates one,
+    # and under an active proxy mode adds a tangents_token placeholder input to the graph
+    # being traced. Runs with_effects redispatched below functionalization, normalizes the
+    # outputs according to the schema returns (none -> None, one -> unwrapped single value,
+    # many -> tuple; AssertionError on count mismatch), stores the new token back into the
+    # tokens mapping (mutation), and returns the wrapped outputs.
     """
     Args:
         allow_token_discovery: Whether or not we are discovering tokens. If this

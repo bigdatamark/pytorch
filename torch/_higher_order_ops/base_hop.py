@@ -1,5 +1,10 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Defines BaseHOP, a base class for higher-order operators of the form
+# hop(subgraph, *operands, **kwargs) whose semantics are just calling the subgraph on the
+# operands, with default autograd, functionalization, proxy tracing, fake and dense
+# implementations. Also defines BaseHOPFunction (autograd function used for backward) and
+# FunctionWithNoFreeVars (marker wrapper for plain callables). No import-time side effects.
 import abc
 
 import torch
@@ -24,6 +29,11 @@ from torch.fx.experimental.proxy_tensor import (
 
 
 class BaseHOP(HigherOrderOperator, abc.ABC):
+    # [CLASS DOC] Abstract base for subgraph-calling higher-order operators. Subclasses give a
+    # name via the constructor; the constructor registers default implementations
+    # (autograd, functionalize, proxy mode, fake, dense) as bound methods, which subclasses may
+    # override. Kwargs are config options and are never passed to the subgraph. Must only be
+    # subclassed in tree.
     """
     This is the "Base" HOP implementation for a HOP that looks like:
 
@@ -58,6 +68,9 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
     """
 
     def __init__(self, hop_name) -> None:
+        # [FUNCTION DOC] Creates the operator with the given name and registers the default
+        # autograd, functionalization, proxy-mode, fake-tensor (cache skipped) and
+        # CompositeExplicitAutograd implementations on this instance.
         super().__init__(hop_name)
 
         # Set up the registrations
@@ -71,6 +84,9 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         )
 
     def __call__(self, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] Entry point. Raises RuntimeError unless subgraph is a GraphModule,
+        # a FunctionWithNoFreeVars, or a FunctionalCallableWithEpilogue; then dispatches via the
+        # base operator and returns the subgraph's outputs.
         if not isinstance(
             subgraph,
             (
@@ -88,6 +104,10 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         return super().__call__(subgraph, *operands, **kwargs)
 
     def _call_Autograd(self, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] HELPER: Autograd implementation: applies the custom autograd function
+        # wrapping this hop, subgraph, kwargs and operands. Assumes no input mutation or
+        # aliasing in the subgraph. Returns the hop outputs.
+        # KNOWN ISSUE: the GraphModule check below is a no-op (its body is just pass).
         if isinstance(subgraph, torch.fx.GraphModule):
             pass
 
@@ -96,6 +116,9 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         return BaseHOPFunction.apply(self, subgraph, kwargs, *operands)
 
     def _call_CompositeExplicitAutograd(self, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] HELPER: Dense implementation: asserts no dispatch mode is active
+        # (AssertionError otherwise), then simply calls the subgraph on the operands and
+        # returns its result. Kwargs are ignored.
         from torch.utils._python_dispatch import _get_current_dispatch_mode
 
         mode = _get_current_dispatch_mode()
@@ -104,6 +127,11 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         return subgraph(*operands)
 
     def _call_ProxyTorchDispatchMode(self, proxy_mode, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] HELPER: Proxy tracing implementation. Traces the subgraph into a new
+        # graph module, registers it on the tracer root under a fresh name starting with
+        # subgraph (side effect), emits a call_function node of this hop with the traced
+        # graph, operands and kwargs, runs the hop for real outputs, and returns the outputs
+        # tracked to the node. Raises AssertionError if the tracer is not an FX tracer.
         traced_graph = reenter_make_fx(subgraph)(*operands)
         if not isinstance(proxy_mode.tracer, torch.fx.Tracer):
             raise AssertionError(
@@ -128,6 +156,7 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
         )
 
     def _fake_impl(self, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake tensor implementation: calls the subgraph on the operands.
         return subgraph(*operands)
 
     # NOTE [Support input mutation of hops]
@@ -149,6 +178,12 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
     #      copies the mutated inputs to the hop if necessary and call the hop.
     # After these steps, the rest of the inductor stack knows how to fuse the copy_ in subgraph with other ops.
     def _call_Functionalize(self, ctx, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] HELPER: Functionalization implementation. Except for the
+        # invoke_quant_packed hop, builds a hop instance and, if it can be auto-functionalized
+        # (subgraph mutates inputs), returns the auto-functionalize v2 result. Otherwise unwraps
+        # the operands, functionalizes the subgraph and re-invokes this hop below
+        # functionalization, returning the re-wrapped outputs. Assumes no mutation/aliasing in
+        # that fallback path.
         from torch._higher_order_ops.auto_functionalize import (
             can_auto_functionalize,
             do_auto_functionalize_v2,
@@ -175,6 +210,11 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, subgraph, *operands, **kwargs):
+        # [FUNCTION DOC] Builds a HopSchema for a call. Materializes the subgraph as a graph,
+        # analyses input/output aliasing and mutated input indices, and emits a warning (not
+        # an error) if any aliasing exists. The schema has the subgraph argument, one
+        # positional argument per operand (marked mutated when mutated), keyword-only
+        # arguments for kwargs (defaulting to their given values), and the graph outputs.
         from .schema import HopSchemaGenerator
 
         subgraph = materialize_as_graph(subgraph, operands)
@@ -218,9 +258,14 @@ class BaseHOP(HigherOrderOperator, abc.ABC):
 
 
 class BaseHOPFunction(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function used by BaseHOP. Forward stores the hop, subgraph,
+    # kwargs and operands on the context and runs the hop below autograd; backward builds a
+    # joint forward/backward graph for the subgraph and calls the same hop on it.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, hop, subgraph, kwargs, *operands):
+        # [FUNCTION DOC] HELPER: Saves hop, operands, subgraph and kwargs on ctx (plain
+        # attributes), then calls the hop with autograd disabled below this key; returns its outputs.
         ctx.hop = hop
         ctx.operands = operands
         ctx.subgraph = subgraph
@@ -231,6 +276,11 @@ class BaseHOPFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] HELPER: Builds, with functionalization and proxy tracing disabled, a
+        # joint forward/backward graph of the saved subgraph from the operands and incoming
+        # gradients, wraps a function that runs it and keeps only the input gradients, and
+        # calls the saved hop on that function with operands and grad outputs. Returns None for
+        # the hop, subgraph and kwargs inputs followed by the operand gradients.
         subgraph = ctx.subgraph
         operands = ctx.operands
         kwargs = ctx.kwargs
@@ -255,6 +305,9 @@ class BaseHOPFunction(torch.autograd.Function):
         # The joint graph returns (*grad_inputs, *fwd_outputs).
         # We only need the grad_inputs.
         def bwd_fn(*args):
+            # [FUNCTION DOC] HELPER: Splits args into operands and grad outputs (by the count
+            # of grad_outputs), runs the joint graph, and returns the result minus its trailing
+            # forward outputs, i.e. the input gradients.
             operands = args[: -len(grad_outputs)]
             grad_outs = args[-len(grad_outputs) :]
             result = joint_graph(*operands, *grad_outs)
@@ -272,8 +325,12 @@ class BaseHOPFunction(torch.autograd.Function):
 
 
 class FunctionWithNoFreeVars:
+    # [CLASS DOC] Thin wrapper marking a callable as having no free variables, so BaseHOP
+    # accepts it as a subgraph. Holds the callable in attribute fn.
     def __init__(self, fn):
+        # [FUNCTION DOC] Stores the wrapped callable.
         self.fn = fn
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped callable with the arguments and returns the result.
         return self.fn(*args, **kwargs)

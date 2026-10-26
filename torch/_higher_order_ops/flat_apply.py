@@ -1,3 +1,9 @@
+# [MODULE DOC] Defines the flat_apply higher-order operator, which lets a call whose
+# arguments contain non-graphable pytree/constant values be stored in an FX graph as
+# (func, in_spec, *flat_args). Also provides helpers to flatten/unflatten arguments into
+# graphable leaves, wrap plain callables as pytree constants, and validate outputs.
+# Import-time side effects: registers the _ConstantFunction class as a pytree constant
+# and creates the global flat_apply operator instance.
 import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -18,6 +24,9 @@ _Ts = TypeVarTuple("_Ts")
 
 
 def is_graphable(val: object) -> TypeIs[torch.fx.node.BaseArgumentTypes]:
+    # [FUNCTION DOC] Returns True if the value is an instance of an FX base argument type,
+    # a FakeScriptObject, or an instance of a registered opaque custom class; i.e. it may
+    # be an input/output of an FX node. Pure predicate, no side effects.
     """Definition: a graphable type is a type that is an acceptable input/output type to a FX node."""
     return isinstance(
         val, (*torch.fx.node.base_types, FakeScriptObject)
@@ -25,6 +34,8 @@ def is_graphable(val: object) -> TypeIs[torch.fx.node.BaseArgumentTypes]:
 
 
 def is_graphable_type(typ: type[object]) -> bool:
+    # [FUNCTION DOC] Type-level version of is_graphable: True if the given class is a
+    # subclass of an FX base type or FakeScriptObject, or is a registered opaque custom class.
     """Return whether the given type is graphable."""
     return (
         issubclass(typ, torch.fx.node.base_types)
@@ -34,6 +45,9 @@ def is_graphable_type(typ: type[object]) -> bool:
 
 
 def to_graphable(stuff: pytree.PyTree) -> tuple[list[object], pytree.TreeSpec]:
+    # [FUNCTION DOC] Flattens a pytree into (list of leaves, TreeSpec) and checks that every
+    # leaf is graphable. Raises RuntimeError naming the offending leaf type if any leaf is
+    # not graphable (suggesting register_constant or pytree registration).
     """Flattens stuff into a flat list of graphable types."""
     # We can consider preserving things like List[int] to improve
     # perf and readability (right now that is all flattened out)
@@ -51,6 +65,8 @@ def to_graphable(stuff: pytree.PyTree) -> tuple[list[object], pytree.TreeSpec]:
 def from_graphable(
     flat_args: tuple[Unpack[_Ts]], spec: pytree.TreeSpec
 ) -> pytree.PyTree:
+    # [FUNCTION DOC] Inverse of to_graphable: rebuilds the original pytree from the flat
+    # leaves and the TreeSpec. No validation is done.
     """The inverse of to_graphable."""
     stuff = pytree.tree_unflatten(flat_args, spec)
     return stuff
@@ -59,6 +75,10 @@ def from_graphable(
 def func_to_graphable(
     func: Callable[..., object],
 ) -> tuple[list[object], pytree.TreeSpec]:
+    # [FUNCTION DOC] Wraps the callable in a constant-function holder and flattens it,
+    # returning (leaves, TreeSpec). Since the holder is a registered pytree constant, the
+    # function lives inside the spec, so the spec can be passed as the func argument of
+    # flat_apply. Returns an empty leaf list in practice.
     """
     Pack and flatten a function type into graphable types.
     This is useful for legalizing the function argument of `flat_apply`.
@@ -68,9 +88,13 @@ def func_to_graphable(
 
 @dataclass(frozen=True, slots=True)
 class _ConstantFunction(Generic[_P, _R]):
+    # [CLASS DOC] HELPER: Frozen dataclass holding a single callable (field func). Registered
+    # as a pytree constant so a function can be embedded in a TreeSpec; calling the
+    # instance forwards all arguments to the held function.
     func: Callable[_P, _R]
 
     def __call__(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Calls the wrapped function with the given args and returns its result.
         return self.func(*args, **kwargs)
 
 
@@ -90,7 +114,12 @@ _FXOutput = _Base | Sequence["_FXOutput"]
 
 
 class FlatApply(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator named flat_apply. Calling it applies func to
+    # arguments reconstructed from flat leaves plus an input TreeSpec, so calls with
+    # pytree/constant arguments can be recorded in an FX graph. Stateless; a single global
+    # instance flat_apply is created below.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the operator under the name flat_apply.
         super().__init__("flat_apply")
 
     def __call__(
@@ -103,6 +132,10 @@ class FlatApply(HigherOrderOperator):
         checked_output: bool = True,
         **_unused: object,
     ) -> object:
+        # [FUNCTION DOC] Operator entry point. Validates that func is an op type, an opaque
+        # custom-class callable, or a pytree constant holder (TreeSpec), and that no extra
+        # keyword arguments were passed (raises AssertionError otherwise). Then delegates to
+        # impl with the flat args and the checked_output flag. Returns the function's output.
         """
         Functions that take in non-graphable types cannot directly be put into FX graph.
 
@@ -146,6 +179,8 @@ def is_valid_output(x: Sequence[object]) -> TypeIs[Sequence[_FXOutput]]: ...
 
 
 def is_valid_output(x: object) -> bool:
+    # [FUNCTION DOC] Returns True if x is graphable or a (nested) tuple/list whose
+    # elements are all valid outputs. Recurses through tuples and lists only.
     if isinstance(x, (tuple, list)):
         return all(map(is_valid_output, x))
     return is_graphable(x)
@@ -157,6 +192,11 @@ def impl(
     flat_args: tuple[Unpack[_Ts]],
     checked_output: bool,
 ) -> _FXOutput:
+    # [FUNCTION DOC] Eager implementation of flat_apply. If func is a TreeSpec, retrieves
+    # the constant it holds (must be a _ConstantFunction, else AssertionError). Unflattens
+    # flat_args with in_spec into args and kwargs (via the leaf-function module-aware
+    # context manager), calls func, and when checked_output is set asserts the result is
+    # graphable or a nested list/tuple of graphables (AssertionError otherwise). Returns the result.
     if isinstance(func, pytree.TreeSpec):
         # assume _ConstantFunction
         func = pytree._retrieve_constant(func)
