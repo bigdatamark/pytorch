@@ -1,3 +1,8 @@
+# [MODULE DOC] Freezing-time pass that folds a binary pointwise op (add, sub, mul, div with a constant
+# operand) into the preceding convolution, addmm or mm (optionally followed by a reshape) by rewriting the
+# constant weight/bias. Also provides helpers that mark computation nodes allowed to fold with mixed
+# precision constants and later restore their original dtype. Pattern registration happens lazily when
+# binary_folding_init is called (cached); import itself has no side effects beyond defining names.
 # mypy: allow-untyped-defs
 import functools
 import itertools
@@ -15,6 +20,10 @@ prims = torch.ops.prims
 
 
 def mark_mixed_dtype(computation_node):
+    # [FUNCTION DOC] Marks a conv/mm/addmm node as allowed to fold with a higher precision constant. Applies only when
+    # the node output is float16/bfloat16, has a single user whose value is a float32 tensor, and following
+    # a chain of single-user binary ops ends in a convert_element_type. If so, stores the original dtype in the
+    # node meta under the mixed dtype folding key. Otherwise returns without change.
     computation_node_dtype = computation_node.meta["val"].dtype
     if computation_node_dtype not in (torch.float16, torch.bfloat16):
         return
@@ -42,6 +51,8 @@ def mark_mixed_dtype(computation_node):
 
 
 def mark_mixed_dtype_allowed_computation_ops(gm):
+    # [FUNCTION DOC] Runs mark_mixed_dtype over every convolution, addmm and mm node of the graph module so binary
+    # folding may happen in higher precision. Mutates node meta only.
     """
     Mark convolutions/linear which we will binary fold even with mixed precision constants. We constant fold in the higher precision
     for better accuracy and then recover the original precision after.
@@ -52,6 +63,9 @@ def mark_mixed_dtype_allowed_computation_ops(gm):
 
 
 def recover_original_precision_folded_computation_ops(gm):
+    # [FUNCTION DOC] After folding, for each marked convolution/addmm/mm node, inserts a convert_element_type to the
+    # recorded original dtype before the node on its weight/bias inputs (convolution args 1,2; addmm args 0,2;
+    # mm arg 1), skipping None inputs, and rewires the node to use them. Unmarked nodes are untouched.
     """
     After binary folding conv/linear weights and biases to a higher dtype, recover the original precision they were in.
     """
@@ -85,6 +99,10 @@ _binary_ops = [aten.add.Tensor, aten.sub.Tensor, aten.mul.Tensor, aten.div.Tenso
 
 @functools.cache
 def binary_folding_init():
+    # [FUNCTION DOC] Cached one-time initializer. Builds the patterns for each of conv, addmm, mm (each also
+    # followed by reshape for addmm/mm) combined with every binary op, defines the legality checks and rewrite
+    # helpers as closures, and registers one binary-folding pattern per combination with the freezing pattern
+    # registry. Returns None. Side effect: mutates global pattern registry.
     _conv_args = [Arg() for _ in range(9)]
     _addmm_args = [Arg() for _ in range(3)]
     _mm_args = [Arg() for _ in range(2)]
@@ -126,6 +144,9 @@ def binary_folding_init():
     """
 
     def _op_not_broadcasting_with_conv(weight_tensor, other_tensor):
+        # [FUNCTION DOC] HELPER: Decides whether a constant tensor broadcasts against the conv weight only along the output
+        # channel dimension (mirrors the C++ frozen conv folding check). Returns False if the constant has more
+        # dims than the weight; otherwise True only if all dims are 1 except the channel position.
         # According to opDoesNotBroadCastWithConv of frozen_conv_folding.cpp
         weight_shape = weight_tensor.shape
         other_shape = other_tensor.shape
@@ -148,6 +169,8 @@ def binary_folding_init():
         return True
 
     def _op_not_broadcasting_with_linear(weight_tensor, other_tensor, has_reshape):
+        # [FUNCTION DOC] HELPER: Returns True if the constant shape is one of the allowed shapes for folding into a linear
+        # (in-features vector, 1 by in-features, 1, 1 by 1, plus 3-d variants when a reshape follows).
         weight_shape = weight_tensor.shape
         other_shape = other_tensor.shape
         other_shapes = [
@@ -174,6 +197,10 @@ def binary_folding_init():
         return other_shape in other_shapes
 
     def _check_conv_and_broadcast_op(conv_node, other):
+        # [FUNCTION DOC] HELPER: Precondition check for folding a binary op into a conv. Requires weight and bias (if any)
+        # to be get_attr, the constant to be a number or get_attr, the weight to have a single user and be floating
+        # point, no unsupported type promotion (unless mixed dtype folding is allowed), and compatible broadcast
+        # shape. Returns bool.
         # According to checkConvAndBroadcastingOpPreConditions of frozen_conv_folding.cpp.
         # conv.weight
         if conv_node.args[1].op != "get_attr":
@@ -224,6 +251,9 @@ def binary_folding_init():
         return True
 
     def _check_linear_and_broadcast_op(linear_node, other, has_reshape):
+        # [FUNCTION DOC] HELPER: Same kind of precondition check as for conv but for addmm/mm: locates weight (and bias for
+        # addmm), requires get_attr constants, a single weight user, floating dtype, acceptable promotion, and an
+        # allowed broadcast shape for the constant. Returns bool.
         weight_node = (
             linear_node.args[2]
             if linear_node.target is aten.addmm.default
@@ -280,6 +310,9 @@ def binary_folding_init():
         return True
 
     def _is_foldable_pattern(match):
+        # [FUNCTION DOC] HELPER: Extra check for a pattern match. Finds the computation node, the constant operand and
+        # whether a reshape sits between them, handling either operand order, then dispatches to the conv check or,
+        # for addmm/mm, requires the linear binary folding config flag and the linear check. Returns bool.
         binary_node = match.output_node()
         has_reshape = False
         if binary_node.args[0].target in _computation_ops:
@@ -307,6 +340,10 @@ def binary_folding_init():
         return False
 
     def resize_scalar_or_tensor_to_shape(graph, other, shape, weight):
+        # [FUNCTION DOC] HELPER: Creates graph nodes that turn a float scalar (registered as a new buffer on the owning
+        # module) or a tensor into the requested shape: scalars and single-element tensors are reshaped to one
+        # element then expanded; other tensors are reshaped. Returns the new node. Side effect: registers a buffer
+        # named other_tensor for float scalars (repeated use overwrites that name).
         if isinstance(other, float):
             with torch.utils._python_dispatch._disable_current_modes():
                 other_tensor = torch.tensor(
@@ -345,6 +382,10 @@ def binary_folding_init():
         return res
 
     def _create_new_conv_node(graph, conv_node, binary_node, other):
+        # [FUNCTION DOC] HELPER: Builds a new convolution node with the constant folded in. For add/sub the bias becomes
+        # bias (or zero) combined with the constant per output channel. For mul/div the weight is scaled per output
+        # channel and the bias (if present) too. Copies meta for new weight and bias. Returns the new conv node.
+        # Raises AssertionError on unexpected targets.
         if conv_node.target is not aten.convolution.default:
             raise AssertionError(
                 f"expected aten.convolution.default, got {conv_node.target}"
@@ -398,6 +439,10 @@ def binary_folding_init():
         return graph.create_node("call_function", conv_node.target, tuple(conv_args))
 
     def _create_new_linear_node(graph, linear_node, binary_node, other):
+        # [FUNCTION DOC] HELPER: Builds the replacement addmm/mm node with the constant folded in. For add/sub it makes an
+        # addmm with a combined bias. For mul/div it scales the weight along its second dimension (and bias if
+        # present), producing addmm when a bias exists, otherwise mm. Returns the new node.
+        # Raises AssertionError on unexpected targets.
         if linear_node.target not in [aten.addmm.default, aten.mm.default]:
             raise AssertionError(f"expected addmm or mm, got {linear_node.target}")
         input_node = (
@@ -477,6 +522,10 @@ def binary_folding_init():
             extra_check=_is_foldable_pattern,
         )
         def folded_op(match, *args, **kwargs):
+            # [FUNCTION DOC] Rewrite handler for a matched pattern. Increments the binary folding counters, locates the
+            # computation node, optional reshape and constant, inserts the folded computation node before the reshape
+            # or binary node, copies meta, redirects users to it (or to the reshape), then erases the binary node and
+            # the original computation node. Raises AssertionError on unexpected node targets.
             counters["inductor"]["binary_folding"] += 1
             other = kwargs.get("other")
             binary_node = match.output_node()

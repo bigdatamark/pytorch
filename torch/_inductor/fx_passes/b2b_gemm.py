@@ -1,3 +1,11 @@
+# [MODULE DOC] Back-to-back GEMM fusion pass. Finds a chain of two matrix multiplies with a pointwise subgraph
+# applied to the inner product (A @ f(B @ C) or f(A @ B) @ C), checks via a load-ratio cost model that fusing
+# is profitable on CUDA/XPU 2-d tensors, and replaces the chain with a single autotuned call that offers
+# two Triton templates (left or right associative) plus an unfused fallback. Contains the Triton template
+# sources, the block-size config list, the cost model, and the pattern handler registered on
+# B2B_GEMM_PASS. Import-time side effects: creates the pass object, the two TritonTemplate objects, and
+# registers the mm graph pattern.
+# KNOWN ISSUE: both templates convert the accumulator to float16 before storing regardless of input dtype.
 # mypy: allow-untyped-defs
 import functools
 from collections import deque
@@ -40,6 +48,8 @@ B2B_GEMM_PASS = PatternMatcherPass(
 
 @SymbolicGridFn
 def b2b_gemm_grid(M, P, meta, *, cdiv):
+    # [FUNCTION DOC] HELPER: Grid function for the Triton templates: returns a 3-tuple whose first entry is the number of
+    # M blocks times the number of P blocks (using the block sizes from meta) and the others are 1.
     return (cdiv(M, meta["BLOCK_SIZE_M"]) * cdiv(P, meta["BLOCK_SIZE_P"]), 1, 1)
 
 
@@ -214,6 +224,9 @@ b2b_gemm_right_template = TritonTemplate(
 def load_ratio_left(
     M: int, N: int, O: int, P: int, m: int, n: int, o: int, p: int
 ) -> float:
+    # [FUNCTION DOC] HELPER: Cost model for left-associative fusion ((A @ B) @ C). Returns the ratio of estimated
+    # loads of the unfused baseline to the fused kernel for matrix sizes M, N, O, P and block sizes
+    # m, n, o, p (values above 1 mean the fused kernel loads less). Pure computation.
     """
     compute the ratio of estimated numbers of loads in baseline and b2bgemm
     M, N, O, P are matrix sizes
@@ -236,6 +249,8 @@ def load_ratio_left(
 def load_ratio_right(
     M: int, N: int, O: int, P: int, m: int, n: int, o: int, p: int
 ) -> float:
+    # [FUNCTION DOC] HELPER: Cost model for right-associative fusion (A @ (B @ C)). Returns the ratio of estimated loads of
+    # the unfused baseline to the fused kernel for the given sizes and block sizes. Pure computation.
     """
     compute the ratio of estimated numbers of loads in baseline and b2bgemm
     M, N, O, P are matrix sizes
@@ -364,6 +379,10 @@ def is_b2b_gemm_good_on(
     B_node: torch.fx.Node,
     C_node: torch.fx.Node,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether fusing is profitable. Returns False unless A, B, C all have fake tensor values,
+    # are all on CUDA or all on XPU, are 2-d and have compatible shapes (A cols equal B rows, B cols equal
+    # C rows). Otherwise computes the load ratio for every block config with the left or right cost model,
+    # takes the geometric mean of the three best, and returns True if it exceeds 1.
     """
     checks whether the sizes are good for b2b_gemm
     """
@@ -379,6 +398,7 @@ def is_b2b_gemm_good_on(
     A, B, C = fake_tensors
 
     def check_all_attr_true(objects, attr):
+        # [FUNCTION DOC] HELPER: Returns True if every object has the attribute and it is truthy.
         return all(hasattr(obj, attr) and getattr(obj, attr) for obj in objects)
 
     if not check_all_attr_true(fake_tensors, "is_cuda") and not check_all_attr_true(
@@ -435,12 +455,16 @@ def _make_unoptimized_b2b_gemm_choice(
     input_nodes: list[TensorBox],
     layout: FixedLayout,
 ):  # -> SubgraphChoiceCaller (local import)
+    # [FUNCTION DOC] HELPER: Builds the fallback autotuning choice (a SubgraphChoiceCaller) that runs the unfused
+    # computation: two mm calls with the epilogue subgraph in between, in the order given by is_left_assoc.
+    # The graph is traced lazily with symbolic shapes and the inductor decomposition table. Returns the choice.
     from ..codegen.subgraph import SubgraphChoiceCaller
 
     tag = "left" if is_left_assoc else "right"
     epilogue = subgraph.graph_module
 
     def make_fx_graph(*args: torch.Tensor) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Traces the unfused mm / epilogue / mm computation on the given three tensors into an FX graph module.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         from ..decomposition import select_decomp_table
@@ -448,6 +472,7 @@ def _make_unoptimized_b2b_gemm_choice(
         A, B, C = args
 
         def computation(A, B, C):
+            # [FUNCTION DOC] HELPER: Runs the two matmuls with the epilogue applied to the inner product, in the chosen association order.
             if is_left_assoc:
                 return torch.mm(epilogue(torch.mm(A, B)), C)
             else:
@@ -473,6 +498,12 @@ def build_subgraph_buffer(
     args: list[TensorBox],
     subgraph: Subgraph,
 ):
+    # [FUNCTION DOC] HELPER: Lowers the subgraph into an inductor ComputedBuffer to be inlined in the template. Walks the
+    # subgraph nodes in order: placeholders bind to the given args in order, call_function nodes use the
+    # registered lowerings, and the output node is converted into a ComputedBuffer with flexible layout. Returns
+    # that buffer (mapped over the output structure). Raises ValueError if there is no output node and
+    # AssertionError if the output is not a TensorBox over a StorageBox.
+    # KNOWN ISSUE: the AssertionError is constructed with a tuple instead of a message string.
     """
     This function is adapted from ../kernel/flex_attention.py.
     The goal is to take in the required args and produce the subgraph buffer
@@ -496,6 +527,7 @@ def build_subgraph_buffer(
         elif node.op == "output":
 
             def convert_output_node_to_buffer(output):
+                # [FUNCTION DOC] HELPER: Converts one subgraph output into a ComputedBuffer, or returns None for a None output.
                 if output is None:
                     return None
                 output_node = output
@@ -537,6 +569,7 @@ def build_subgraph_buffer(
 def create_placeholder(
     name: str, dtype: torch.dtype, device: torch.device
 ) -> TensorBox:
+    # [FUNCTION DOC] HELPER: Creates a scalar-shaped input buffer with the given name, dtype and device, wrapped as a TensorBox.
     """
     Creates a placeholder input buffers for producing subgraph_output
     """
@@ -553,6 +586,10 @@ def tuned_b2b_gemm(
     *,
     layout=None,
 ) -> torch._inductor.ir.TensorBox:
+    # [FUNCTION DOC] Lowering function for the fused op. Realizes A, B, C, builds the output layout (rows of A by columns of
+    # C), lowers the subgraph with a placeholder for the inner product, adds one template choice per block
+    # config for the chosen association order plus the unfused fallback, and autotunes. Returns the selected
+    # TensorBox. Side effects: realizes inputs, may benchmark kernels. The layout argument is overwritten.
     # call .realize() to get rid of Pointwise
     A.realize()
     B.realize()
@@ -603,9 +640,15 @@ def tuned_b2b_gemm(
     pass_dict=B2B_GEMM_PASS,
 )
 def b2b_gemm_handler(match: Match, mat1: torch.fx.Node, mat2: torch.fx.Node) -> None:
+    # [FUNCTION DOC] Pattern handler on the matched inner mm. Follows its users through pointwise nodes to find an outer mm,
+    # verifies all paths reach it with no outside inputs and that only one use remains, copies the in-between
+    # nodes into a new subgraph (with an input placeholder and an output), determines left or right
+    # association, checks profitability, and then replaces the outer mm with a call to the tuned fused function
+    # and erases the old nodes. Returns without change when any check fails. Increments the b2b_gemm counter.
     # match.args: list[torch.fx.Node]
 
     def is_pointwise_node(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True for call_function nodes whose op overload is tagged pointwise.
         return (
             node.op == "call_function"
             and isinstance(node.target, torch._ops.OpOverload)
@@ -613,6 +656,7 @@ def b2b_gemm_handler(match: Match, mat1: torch.fx.Node, mat2: torch.fx.Node) -> 
         )
 
     def is_mm(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the node targets the default aten mm.
         return node.target is torch.ops.aten.mm.default
 
     # the inner MM
@@ -645,6 +689,10 @@ def b2b_gemm_handler(match: Match, mat1: torch.fx.Node, mat2: torch.fx.Node) -> 
         src: torch.fx.Node,
         dst: torch.fx.Node,
     ) -> tuple[bool, OrderedSet[torch.fx.Node]]:
+        # [FUNCTION DOC] HELPER: Breadth-first walk from src checking that every path reaches dst through pointwise nodes only
+        # and that every visited intermediate (and dst) has no inputs from outside the visited set (tracked by
+        # counting down input counts). Returns a pair: whether the check passed, and the visited node set
+        # (meaningful only when it passed).
         """
         check whether every user path from src reaches dst via pointwise nodes,
         with no other input nodes for the intermediates and dst;

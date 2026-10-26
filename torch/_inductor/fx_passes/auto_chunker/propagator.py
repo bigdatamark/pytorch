@@ -1,3 +1,9 @@
+# [MODULE DOC] Chunking metadata propagation for the auto chunker. Starting from an amplifier node (an op whose
+# output is much larger than its inputs), propagates ChunkingMeta forward to users and backward to
+# arguments through per-aten-op rules held in the propagate_rules registry, using a work queue until a
+# fixed point, then runs a separate scale_by pass. Rules return a PropagateStatus (or a forward/backward
+# pair of them). Raises CantChunk when a node cannot be chunked. Import-time side effects: creates a
+# logger, and registers rules for many aten/prims ops into the module-level registry.
 import functools
 import logging
 import math
@@ -73,6 +79,8 @@ https://gist.github.com/shunting314/324e57881f168009784991300acab852
 
 
 class PropagateStatus(Enum):
+    # [CLASS DOC] Result of applying one propagation rule: SUCCEED_NO_CHANGE, SUCCEED_WITH_CHANGE (metadata was
+    # modified so neighbors must be revisited), or FAIL (the node cannot be chunked).
     SUCCEED_NO_CHANGE = 0
     SUCCEED_WITH_CHANGE = 1
     FAIL = 2
@@ -91,11 +99,18 @@ def _register_propagate_rule(
     aten_op: torch._ops.OpOverload | Sequence[torch._ops.OpOverload],
     handler: _HandlerType,
 ) -> _HandlerType:
+    # [FUNCTION DOC] HELPER: Registers handler for one op or a list of ops in the propagate_rules registry. Wraps the
+    # handler so that a pair of forward/backward statuses is merged into one status: FAIL if either failed,
+    # else WITH_CHANGE if either changed, else NO_CHANGE (a single status passes through). Logs the pair at
+    # debug level. Returns the wrapper. Raises AssertionError if the handler returns a malformed pair or an
+    # entry is not an OpOverload. Side effect: mutates the global registry.
     if not isinstance(aten_op, (list, tuple)):
         aten_op = [aten_op]  # type: ignore[assignment, list-item]
 
     @functools.wraps(handler)
     def wrapper(node: Node, *args: Any, **kwargs: Any) -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Calls the handler for the node and merges its forward/backward statuses into one
+        # PropagateStatus (see the registering function).
         fwd_bwd_status = handler(node, *args, **kwargs)
         if isinstance(fwd_bwd_status, PropagateStatus):
             return fwd_bwd_status
@@ -131,14 +146,18 @@ def _register_propagate_rule(
 def register_propagate_rule(
     aten_op: torch._ops.OpOverload | Sequence[torch._ops.OpOverload],
 ) -> Callable[[_HandlerType], _HandlerType]:
+    # [FUNCTION DOC] Decorator factory: returns a decorator that registers the decorated handler as the propagation
+    # rule for the given aten op overload(s).
     return functools.partial(_register_propagate_rule, aten_op)
 
 
 def _is_success(*statuslist: PropagateStatus) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if none of the given statuses is FAIL.
     return not any(status == PropagateStatus.FAIL for status in statuslist)
 
 
 def _enqueue(queue: Queue, item: Node) -> None:  # type: ignore[type-arg]
+    # [FUNCTION DOC] HELPER: Puts the node on the work queue and logs it at debug level.
     """
     Have a function to make it easier to do debug logging in a central place
     """
@@ -149,6 +168,10 @@ def _enqueue(queue: Queue, item: Node) -> None:  # type: ignore[type-arg]
 def can_reach_amplified_node(
     graph: Graph, amplifier_node: Node, is_fwd: bool
 ) -> dict[Node, bool]:
+    # [FUNCTION DOC] For every node in the graph computes whether it can reach a node with the same element count as
+    # the amplifier node: walking in reverse order when is_fwd is True (following users), else in graph order
+    # (following args). Output nodes and nodes without a fake tensor never reach. In the backward direction,
+    # tangent placeholders count as reached. Returns a mapping node to bool used to prune propagation.
     """
     A amplified node means a node with the same numel as `amplifier_node`
     """
@@ -179,6 +202,11 @@ def can_reach_amplified_node(
 
 
 def propagate(amplifier_node: Node) -> None:
+    # [FUNCTION DOC] Entry point: runs full metadata propagation from the amplifier node, chunking its dim 0.
+    # Builds forward and backward reachability filters, asserts no node has chunking metadata yet, sets
+    # the metadata on the amplifier, then drains a queue calling propagate_single_node, and finally runs the
+    # scale_by pass over all nodes with metadata. Prints the result when debug logging is on.
+    # Raises CantChunk from rules; mutates node meta.
     log.debug("amplifier_node is %s", amplifier_node.format_node())
     # Chunk the batch dimension (dim 0) of the amplifier_node
     graph = amplifier_node.graph
@@ -212,6 +240,10 @@ def propagate(amplifier_node: Node) -> None:
 def propagate_single_node(
     queue: Queue, fwd_filter: dict[Node, bool], bwd_filter: dict[Node, bool], node: Node
 ) -> None:  # type: ignore[type-arg]
+    # [FUNCTION DOC] Applies the registered rule for one node. Raises CantChunk if the node is not a call_function, has
+    # no rule, or the rule reports FAIL. On a change, enqueues argument nodes that pass the backward filter
+    # (tangent placeholders instead get scale_by set to themselves; other placeholders are not traversed)
+    # and, if the node passes the forward filter, its users. Mutates node meta and the queue.
     log.debug("Propagate_single_node: %s", node.format_node())
 
     if node.op != "call_function":
@@ -258,6 +290,7 @@ def propagate_single_node(
 
 
 def _bool_to_status(changed: bool) -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Maps a changed flag to SUCCEED_WITH_CHANGE or SUCCEED_NO_CHANGE.
     """
     Return the variant of the success flag depending on whether there is any change.
     """
@@ -270,9 +303,15 @@ def _bool_to_status(changed: bool) -> PropagateStatus:
 
 @register_propagate_rule(aten.addmm.default)
 def propagate_addmm(addmm_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for addmm. Forward: requires bias and weight to have only nop metadata and input chunked on
+    # dim 0; then output copies input metadata and bias and weight get nop metadata (so they join the chunk
+    # subgraph); otherwise FAIL unless nothing is chunked. Backward: if the output is chunked on dim 0, input
+    # copies it, weight gets nop, bias gets the metadata only when it is not broadcast (same ndim as input),
+    # else nop; any other chunking FAILs. Returns the (forward, backward) status pair.
     bias_node, input_node, weight_node = addmm_node.args
 
     def propagate_addmm_fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the addmm rule; raises AssertionError if an arg is not a Node.
         if not isinstance(bias_node, Node):
             raise AssertionError(
                 f"expected bias_node to be a Node, got {type(bias_node)}"
@@ -305,6 +344,7 @@ def propagate_addmm(addmm_node: Node) -> _HandlerRetType:
         return PropagateStatus.FAIL
 
     def propagate_addmm_bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the addmm rule; raises AssertionError on non-Node args or missing fake tensors.
         if not isinstance(bias_node, Node):
             raise AssertionError(
                 f"expected bias_node to be a Node, got {type(bias_node)}"
@@ -348,9 +388,15 @@ def propagate_addmm(addmm_node: Node) -> _HandlerRetType:
 
 @register_propagate_rule(aten.mm.default)
 def propagate_mm(mm_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for mm. Forward: both inputs nop gives no change; only lhs chunked (rhs nop) copies lhs
+    # metadata to the output and gives rhs nop; chunking on the reduction dim (lhs dim 1 or rhs dim 0) makes
+    # the output unchunked with need_sum set and updates the inputs; else FAIL. Backward: a 2-d output
+    # chunked on dim 0 chunks lhs and gives rhs nop; an output needing a sum chunks lhs on 1 and rhs on 0;
+    # else FAIL. Returns the (forward, backward) pair.
     lhs_node, rhs_node = mm_node.args[:2]
 
     def fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the mm rule; raises AssertionError on non-Node args.
         if not isinstance(lhs_node, Node):
             raise AssertionError(
                 f"expected lhs_node to be a Node, got {type(lhs_node)}"
@@ -387,6 +433,7 @@ def propagate_mm(mm_node: Node) -> _HandlerRetType:
         return PropagateStatus.FAIL
 
     def bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the mm rule; no change when the output has no metadata; FAIL for unsupported cases.
         if not isinstance(lhs_node, Node):
             raise AssertionError(
                 f"expected lhs_node to be a Node, got {type(lhs_node)}"
@@ -441,6 +488,12 @@ def propagate_mm(mm_node: Node) -> _HandlerRetType:
 def propagate_general_copy_metadata(
     out_node: Node, ignore_broadcast: bool = False
 ) -> _HandlerRetType:
+    # [FUNCTION DOC] General rule used for pointwise-like ops: metadata is copied among all non-scalar Node args and the
+    # output. Scalar (single element) args may only have nop metadata. Unless ignore_broadcast, args with
+    # fewer dims than the output (broadcast) are not allowed to be chunked, and the chunk dim must not fall
+    # into the broadcast dims, else FAIL. Forward: all non-scalar args must end up with identical metadata,
+    # copied to the output. Backward: output metadata is copied to args (nop for broadcast args), scalar args
+    # get nop metadata so propagation reaches tangents. Returns (forward, backward) statuses.
     """
     A general propagation rules that basically copy around the chunking
     metadata.
@@ -461,12 +514,14 @@ def propagate_general_copy_metadata(
         return PropagateStatus.FAIL
 
     def _chunk_broadcasted_tensor(chunk_dim: int) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if some non-scalar arg has fewer dims than the output and chunk_dim lies in the dims it lacks.
         for node in non_scalar_args:
             if node_ndim[node] != out_ndim and chunk_dim >= out_ndim - node_ndim[node]:
                 return True
         return False
 
     def propagate_fwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Forward half of the general copy rule.
         if len(node_args) == 0:
             return PropagateStatus.FAIL
 
@@ -504,6 +559,7 @@ def propagate_general_copy_metadata(
         return _bool_to_status(changed)
 
     def propagate_bwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Backward half of the general copy rule.
         if not (meta := get_chunking_meta(out_node)):
             return PropagateStatus.SUCCEED_NO_CHANGE
 
@@ -553,6 +609,7 @@ def propagate_general_copy_metadata(
     ]
 )
 def propagate_general_copy_metadata_ignore_broadcast(out_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for squeeze, gather, scatter and similar ops: the general copy rule with broadcast handling disabled.
     return propagate_general_copy_metadata(out_node, ignore_broadcast=True)  # type: ignore[call-arg]
 
 
@@ -563,9 +620,15 @@ def propagate_general_copy_metadata_ignore_broadcast(out_node: Node) -> _Handler
     ]
 )
 def propagate_reduce(reduce_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for amax and sum over dims. Forward: if the chunk dim is not reduced the output copies the
+    # metadata; if a sum reduces exactly the chunk dim the output becomes unchunked with need_sum set; else
+    # FAIL. Backward: a chunked output (which must not have the chunk dim in the reduced dims) copies metadata
+    # to the input; an output that needs a sum with a single reduced dim makes the input chunked on that dim;
+    # else FAIL. Raises AssertionError on unexpected arg types.
     arg_node, reduce_dims = reduce_node.args[0:2]
 
     def propagate_fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the reduce rule.
         if not isinstance(arg_node, Node):
             raise AssertionError(
                 f"expected arg_node to be a Node, got {type(arg_node)}"
@@ -593,6 +656,7 @@ def propagate_reduce(reduce_node: Node) -> _HandlerRetType:
         return PropagateStatus.FAIL
 
     def propagate_bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the reduce rule.
         if not isinstance(arg_node, Node):
             raise AssertionError(
                 f"expected arg_node to be a Node, got {type(arg_node)}"
@@ -629,9 +693,14 @@ def propagate_reduce(reduce_node: Node) -> _HandlerRetType:
 
 @register_propagate_rule(aten.permute.default)
 def propagate_permute(permute_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for permute. Forward maps the input chunk dim to its position in the output (inverse of
+    # the permutation); backward maps the output chunk dim to the input dim through the permutation. An
+    # unchunked (None chunk dim) side FAILs; a missing side means no change. Existing metadata on the other
+    # side is sanity-checked (AssertionError on mismatch).
     input_node, order = permute_node.args[:2]
 
     def propagate_fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the permute rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -664,6 +733,7 @@ def propagate_permute(permute_node: Node) -> _HandlerRetType:
         )
 
     def propagate_bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the permute rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -704,10 +774,13 @@ def propagate_permute(permute_node: Node) -> _HandlerRetType:
     ]
 )
 def propagate_nop(node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for ops with no tensor inputs (full): never changes anything in either direction.
     def fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half; always no change.
         return _bool_to_status(False)
 
     def bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half; always no change.
         return _bool_to_status(False)
 
     return fwd(), bwd()
@@ -715,6 +788,10 @@ def propagate_nop(node: Node) -> _HandlerRetType:
 
 @register_propagate_rule(aten.unsqueeze.default)
 def propagate_unsqueeze(unsqueeze_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for unsqueeze. Normalizes a negative dim, then forward shifts the input chunk dim up by one
+    # if it is at or after the inserted dim, and backward shifts the output chunk dim down by one if it is
+    # after the inserted dim. Unchunked metadata (None chunk dim) is simply copied. Raises AssertionError
+    # if the input is not a Node or the dim is not an int.
     input_node, unsqueeze_dim = unsqueeze_node.args[:2]
     if not isinstance(input_node, Node):
         raise AssertionError(
@@ -731,6 +808,7 @@ def propagate_unsqueeze(unsqueeze_node: Node) -> _HandlerRetType:
     )
 
     def fwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Forward half of the unsqueeze rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -750,6 +828,7 @@ def propagate_unsqueeze(unsqueeze_node: Node) -> _HandlerRetType:
         )
 
     def bwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Backward half of the unsqueeze rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -773,6 +852,9 @@ def propagate_unsqueeze(unsqueeze_node: Node) -> _HandlerRetType:
 def _find_chunk_dim_after_reshape(
     old_shape: Sequence[int], new_shape: Sequence[int], chunk_dim: int
 ) -> int | None:
+    # [FUNCTION DOC] HELPER: Given a reshape from old_shape to new_shape and a chunk dim of the old shape, finds the
+    # dim of the new shape with the same size and the same product of preceding sizes. Returns that index,
+    # or None if the dim is split or merged by the reshape.
     """
     Find the equivalent chunk_dim position after a reshape by matching
     the prefix product (number of elements before the dimension) and
@@ -797,6 +879,9 @@ def _find_chunk_dim_after_reshape(
 
 @register_propagate_rule(aten.view.default)
 def propagate_view(view_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for view. Maps the chunk dim through the reshape in both directions using the shapes of the
+    # fake tensors; FAIL if the chunked dim is merged or split; unchunked metadata is copied. Raises
+    # AssertionError if the input is not a Node.
     input_node = view_node.args[0]
     if not isinstance(input_node, Node):
         raise AssertionError(
@@ -806,6 +891,7 @@ def propagate_view(view_node: Node) -> _HandlerRetType:
     output_shape = list(get_fake_tensor_from_node_arg(view_node).shape)  # type: ignore[union-attr]
 
     def fwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Forward half of the view rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -825,6 +911,7 @@ def propagate_view(view_node: Node) -> _HandlerRetType:
         )
 
     def bwd() -> PropagateStatus:
+    # [FUNCTION DOC] HELPER: Backward half of the view rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -852,6 +939,11 @@ def propagate_view(view_node: Node) -> _HandlerRetType:
     ]
 )
 def propagate_expand(expand_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for expand. A single-element input only gives its input nop metadata when the output has
+    # metadata. Otherwise metadata is copied both ways unless the chunk dim is a broadcast dim (newly added
+    # leading dim or an input dim of size 1), which FAILs. Raises AssertionError if fake tensors are missing.
+    # KNOWN ISSUE: the forward copy keeps the same chunk dim number although expand may add leading dims
+    # which would shift it; the offset is not applied when copying.
     input_node = expand_node.args[0]
     if not isinstance(input_node, Node):
         raise AssertionError(
@@ -878,10 +970,12 @@ def propagate_expand(expand_node: Node) -> _HandlerRetType:
     dim_offset = len(output_shape) - len(input_shape)
 
     def is_expand_dim(out_dim: int) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the output dim is newly added by expand or has input size 1.
         """Check if out_dim is a broadcast dimension (newly added or size 1 in input)."""
         return out_dim < dim_offset or input_shape[out_dim - dim_offset] == 1
 
     def fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the expand rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -897,6 +991,7 @@ def propagate_expand(expand_node: Node) -> _HandlerRetType:
         return _bool_to_status(copy_chunking_meta(expand_node, input_meta))
 
     def bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the expand rule.
         if not isinstance(input_node, Node):
             raise AssertionError(
                 f"expected input_node to be a Node, got {type(input_node)}"
@@ -918,6 +1013,11 @@ def propagate_expand(expand_node: Node) -> _HandlerRetType:
     ]
 )
 def propagate_sum_to_scalar(sum_node: Node) -> _HandlerRetType:
+    # [FUNCTION DOC] Rule for sum to a scalar. Forward: nop input gives no change; an input chunked on some dim marks
+    # the output as needing a sum; unchunked non-nop input FAILs. Backward: nop output gives no change; an
+    # output that needs a sum with a chunked input gives no change; anything else FAILs.
+    # KNOWN ISSUE: the forward update passes a chunk_by keyword, which looks like a possible misspelling of
+    # chunk_dim.
     input_node = sum_node.args[0]
     if not isinstance(input_node, Node):
         raise AssertionError(
@@ -925,6 +1025,7 @@ def propagate_sum_to_scalar(sum_node: Node) -> _HandlerRetType:
         )
 
     def fwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Forward half of the sum-to-scalar rule.
         input_meta = get_chunking_meta(input_node)  # pyrefly: ignore[bad-argument-type]
         if has_nop_chunking_meta(input_node):  # pyrefly: ignore[bad-argument-type]
             return _bool_to_status(False)
@@ -937,6 +1038,7 @@ def propagate_sum_to_scalar(sum_node: Node) -> _HandlerRetType:
         return PropagateStatus.FAIL
 
     def bwd() -> PropagateStatus:
+        # [FUNCTION DOC] HELPER: Backward half of the sum-to-scalar rule.
         input_meta = get_chunking_meta(input_node)  # pyrefly: ignore[bad-argument-type]
         if has_nop_chunking_meta(sum_node):
             return _bool_to_status(False)
