@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Template and choice-caller classes for CuteDSL kernels in Inductor autotuning.
+# CuteDSLTemplate renders a Jinja source into a kernel, builds a benchmark
+# request and wraps it in a CuteDSLTemplateCaller (a ChoiceCaller) that can
+# produce the IR output node. Keeps a class-level registry of templates by name.
+# Import-time side effect: creates a logger only.
 import functools
 import itertools
 import logging
@@ -19,6 +25,13 @@ log = logging.getLogger(__name__)
 
 
 class CuteDSLTemplate(KernelTemplate):
+    # [CLASS DOC]
+    # KernelTemplate for CuteDSL kernels. Holds the source, compiled Jinja
+    # template, and optional subgraph and mask functions. Class attributes:
+    # kernel_type (kernel class used for rendering), caller_type (optional
+    # override of the caller class), a shared counter for unique kernel names,
+    # and all_templates, a registry by name. Invariant: a name maps to one
+    # source. Key methods: generate and maybe_append_choice.
     """Template for generating CuteDSL (CUTLASS Python DSL) kernels.
 
     Subclasses may override ``caller_type`` to attach template-specific
@@ -38,6 +51,11 @@ class CuteDSLTemplate(KernelTemplate):
         subgraph_fn: Any | None = None,
         mask_fn: Any | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores the source and optional subgraph/mask functions, compiles the
+        # (cached) Jinja template, and registers this instance in the global
+        # template registry by name. Re-registering an existing name with the
+        # same source is allowed; a different source raises AssertionError.
         super().__init__(name)
         self.source = source
         self.subgraph_fn = subgraph_fn
@@ -56,11 +74,18 @@ class CuteDSLTemplate(KernelTemplate):
     @functools.lru_cache(None)
     # pyrefly: ignore [bad-override]
     def _template_from_string(source: str) -> Any:
+        # [FUNCTION DOC] HELPER: Memoized wrapper that compiles a template
+        # source string using the base class implementation.
         return KernelTemplate._template_from_string(source)
 
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
+        # [FUNCTION DOC]
+        # Tries to generate a choice from the keyword arguments and appends it
+        # to the given list. Returns None on success. On failure does not
+        # raise: returns the NotImplementedError itself, or wraps any other
+        # exception in a NotImplementedError; failures are logged at debug level.
         """
         Maybe generates a new ChoiceCaller and appends it into existing choices.
         Returns None if success, otherwise returns the error.
@@ -76,6 +101,16 @@ class CuteDSLTemplate(KernelTemplate):
             return NotImplementedError(f"CuteDSL template failed: {e}")
 
     def generate(self, **kwargs: Any) -> ChoiceCaller:
+        # [FUNCTION DOC]
+        # Builds a ChoiceCaller for autotuning. Pops input_nodes, layout,
+        # mutated_inputs and subgraphs from the arguments; the rest are
+        # template kwargs. Renders the kernel against a fake output buffer
+        # (patching graph dtype lookup), verifies template inputs are
+        # registered before captured buffers, resolves captured buffers to
+        # nodes, checks argument order, collects extra dynamic scalar args as
+        # optimization hints, and creates a benchmark request. Returns a caller
+        # holding a factory that re-renders the kernel for a final output node.
+        # Raises RuntimeError if Jinja is missing or argument ordering changed.
         """Generate the CuteDSL kernel caller for template autotuning."""
         input_nodes = kwargs.pop("input_nodes")
         layout = kwargs.pop("layout")
@@ -149,6 +184,9 @@ class CuteDSLTemplate(KernelTemplate):
             )
 
             def make_kernel_render(out_node, hint_override: int | None = None):
+                # [FUNCTION DOC] Creates a kernel for the given output node and
+                # returns (kernel, render callable) where the callable renders the
+                # template source. hint_override is unused.
                 """
                 Factory function that creates a kernel renderer for the final output.
 
@@ -165,6 +203,8 @@ class CuteDSLTemplate(KernelTemplate):
                 render_kernel.set_capture_input_nodes(capture_nodes_by_name)
 
                 def render():
+                    # [FUNCTION DOC] HELPER: Renders the template source with the
+                    # captured template kwargs and returns the result.
                     return render_kernel.render(self.template, **kwargs)
 
                 return render_kernel, render
@@ -183,6 +223,11 @@ class CuteDSLTemplate(KernelTemplate):
 
 
 class CuteDSLTemplateCaller(ChoiceCaller):
+    # [CLASS DOC]
+    # ChoiceCaller for one generated CuteDSL template configuration. Holds the
+    # kernel render factory, the benchmark request, the owning template and the
+    # mutated inputs. Provides benchmarking, IR output node creation, hash key
+    # and info for the autotuner.
     """Caller for CuteDSL templates that integrates with the autotuning system."""
 
     def __init__(
@@ -196,6 +241,9 @@ class CuteDSLTemplateCaller(ChoiceCaller):
         mutated_inputs: Iterable[IRNode] | None = None,
         template_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base ChoiceCaller with a description
+        # derived from the name and template kwargs, and stores the render
+        # factory, benchmark request, template and mutated inputs.
         description = self._build_description(name, template_kwargs)
         super().__init__(
             name=name,
@@ -211,19 +259,28 @@ class CuteDSLTemplateCaller(ChoiceCaller):
     def _build_description(
         self, name: str, template_kwargs: dict[str, Any] | None
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns a human-readable description: the
+        # template name, followed by the template kwargs as name=value pairs if any.
         if not template_kwargs:
             return f"CuteDSL template {name}"
         kwargs_desc = ", ".join(f"{k}={v}" for k, v in template_kwargs.items())
         return f"CuteDSL template {name} ({kwargs_desc})"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a short string naming the class and choice name.
         return f"CuteDSLTemplateCaller({self.name})"
 
     def benchmark(self, *args, out) -> float:
+        # [FUNCTION DOC] Runs the benchmark request on the given inputs and
+        # output tensor and returns the measured time.
         """Benchmark the kernel execution."""
         return self.bmreq.benchmark(*args, out=out)
 
     def output_node(self) -> TensorBox:
+        # [FUNCTION DOC] Creates a CuteDSLTemplateBuffer IR node from this
+        # choice's layout, inputs, render factory, template and mutated inputs,
+        # copies the "ktc" annotation if present, and returns it wrapped in a
+        # TensorBox.
         """Create the output node for this template choice."""
         buffer = CuteDSLTemplateBuffer(
             layout=self.layout,
@@ -238,14 +295,20 @@ class CuteDSLTemplateCaller(ChoiceCaller):
         return TensorBox.create(buffer)
 
     def call_name(self) -> str:
+        # [FUNCTION DOC] Returns the kernel name of this choice.
         """Return the kernel call name."""
         return self.name
 
     def to_callable(self) -> Any:
+        # [FUNCTION DOC] Returns the kernel render factory.
+        # KNOWN ISSUE: despite the docstring, this returns the render factory,
+        # not a callable that executes the kernel.
         """Return callable that can execute this kernel."""
         return self.make_kernel_render
 
     def hash_key(self) -> str:
+        # [FUNCTION DOC] Returns a key joining the choice name without its
+        # trailing numeric index and the benchmark request's module cache key.
         """Return unique hash key for this choice."""
         return "-".join(
             [
@@ -255,6 +318,8 @@ class CuteDSLTemplateCaller(ChoiceCaller):
         )
 
     def info_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a mapping with the choice name, backend label
+        # "CuteDSL" and the template name.
         """Return information about this kernel."""
         return {
             "name": self.name,

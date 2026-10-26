@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Scheduler backend for CuteDSL (CUTLASS Python DSL) template kernels. Defines
+# CuteDSLScheduling, which renders a CuteDSL template node into kernel source,
+# registers it with the wrapper code as an async_compile.cutedsl call, and emits
+# the kernel launch. Fusion is not supported. No import-time side effects
+# besides creating a logger.
 import hashlib
 import logging
 from collections.abc import Sequence
@@ -26,6 +32,11 @@ log = logging.getLogger(__name__)
 
 
 class CuteDSLScheduling(BaseScheduling):
+    # [CLASS DOC]
+    # BaseScheduling implementation for CuteDSL template kernels, used through
+    # the CUDA combined scheduler. Stateless itself; it advertises no backend
+    # features, never fuses, and generates code only for single template nodes
+    # via codegen_template, with define_kernel emitting the compile wrapper.
     """
     Scheduling implementation for CuteDSL (CUTLASS Python DSL) kernels.
     This class is intended to be used in combination with other schedulers,
@@ -34,22 +45,32 @@ class CuteDSLScheduling(BaseScheduling):
 
     @classmethod
     def get_backend_features(cls, device) -> OrderedSet[BackendFeature]:
+        # [FUNCTION DOC] Returns an empty set: this backend advertises no
+        # optional backend features for any device.
         return OrderedSet()
 
     @staticmethod
     def is_cutedsl_template(node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] Returns True if the node is a plain SchedulerNode whose
+        # underlying IR node is a CuteDSLTemplateBuffer.
         """Check if a node is a CuteDSL template."""
         return isinstance(node, SchedulerNode) and isinstance(
             node.node, CuteDSLTemplateBuffer
         )
 
     def is_cutedsl_fused_template(self, node: BaseSchedulerNode) -> bool:
+        # [FUNCTION DOC] Returns True if the node is a FusedSchedulerNode that
+        # also satisfies the template check.
+        # KNOWN ISSUE: the template check requires a plain SchedulerNode, which
+        # a FusedSchedulerNode is not, so this can never return True.
         """Check if a node is a fused CuteDSL template."""
         return isinstance(node, FusedSchedulerNode) and self.is_cutedsl_template(node)
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Always returns False: vertical fusion with CuteDSL
+        # templates is not supported.
         """
         TODO CuteDSL doesn't support vertical fusion yet.
         This could be extended in the future for epilogue fusion.
@@ -59,12 +80,22 @@ class CuteDSLScheduling(BaseScheduling):
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
+        # [FUNCTION DOC] Always returns False: horizontal fusion is not supported.
         """CuteDSL doesn't support horizontal fusion yet."""
         return False
 
     def define_kernel(
         self, src_code_str: str, node_schedule, precompile_metadata=None
     ) -> str:
+        # [FUNCTION DOC]
+        # Registers kernel source with the wrapper code and returns its name.
+        # If the exact source was already defined, reuses the cached name.
+        # Otherwise builds a name from an optional descriptive fused name plus
+        # an 8 char sha256 of the source, substitutes the kernel name
+        # placeholder in the source, wraps the source in an async_compile.cutedsl
+        # call (appending optional precompile metadata), and defines the kernel
+        # on the wrapper with a metadata comment of path and origins.
+        # Mutates the wrapper's source-to-kernel mapping.
         """Produce the kernel string
         Args:
             src_code_str: The finalized kernel code string
@@ -123,6 +154,14 @@ class CuteDSLScheduling(BaseScheduling):
         epilogue_nodes: Sequence[BaseSchedulerNode],
         prologue_nodes: Sequence[BaseSchedulerNode],
     ):
+        # [FUNCTION DOC]
+        # Generates code for one CuteDSL template node. Raises AssertionError
+        # if the node is not a CuteDSL template or if epilogue or prologue
+        # nodes are given. Renders the kernel (finalizing a partial render),
+        # builds precompile metadata, defines the kernel under the kernel
+        # handler context, emits the comment and launch call, records removed
+        # buffers on the graph, and frees scheduler buffers. Has side effects
+        # on the wrapper code and graph state.
         """
         Codegen a CuteDSL template. Currently doesn't support fusion.
         """
@@ -162,6 +201,11 @@ class CuteDSLScheduling(BaseScheduling):
         self.free_buffers_in_scheduler()
 
     def _build_precompile_metadata(self, kernel, ctb):
+        # [FUNCTION DOC] HELPER: Builds a mapping with concrete shapes, strides
+        # and dtypes for each template input and the output, plus device index,
+        # device capability (if CUDA is available) and optional hw_info. Returns
+        # None if the kernel has no recorded template inputs or if sizes are
+        # symbolic (conversion errors are caught and logged at debug level).
         """Extract shapes and dtypes from kernel inputs/output for subprocess precompilation.
 
         Returns None if shapes are symbolic (dynamic shapes), in which case the
@@ -222,6 +266,11 @@ class CuteDSLScheduling(BaseScheduling):
 
     @staticmethod
     def _build_hw_info(kernel) -> tuple[int, int] | None:
+        # [FUNCTION DOC] HELPER: Returns (sm_count, max_active_clusters) using
+        # the CUTLASS HardwareInfo query for cluster size one and for the
+        # product of the template's cluster M and N values. Returns None if
+        # the kernel has no template kwargs, lacks either cluster value, or any
+        # error occurs (logged at debug level).
         """Compute (sm_count, max_active_clusters) in the main process.
 
         Reads CLUSTER_M/N from kernel template kwargs and queries

@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Local/remote disk cache lookup for pre-enumerated CUTLASS operation configs.
+# Builds a cache key from the cutlass version, arch, toolkit version,
+# instantiation level and hashes of the serialization/utils sources, and loads
+# and deserializes the saved op list. Exports get_config_request_key and
+# maybe_fetch_ops. No import-time side effects besides creating a logger.
 import functools
 import hashlib
 import inspect
@@ -29,12 +35,20 @@ def get_config_request_key(
     toolkit_version: str,
     instantiation_level: str,
 ) -> str:
+    # [FUNCTION DOC]
+    # Computes an 8 hex character cache key for the full op list. The key is a
+    # truncated sha256 over the cutlass key, arch, toolkit version,
+    # instantiation level, and content hashes of the serialization and utils
+    # modules (so edits to those files invalidate the cache). Reads those two
+    # source files from disk. Returns the key string.
     """
     Return a key for the full ops, based on cutlass key, arch, toolkit version, instantiation level, and serialization.py file hash.
     """
 
     # Get hash of serialization.py and cutlass_utils.py files using their module file paths
     def get_file_hash(file_module):
+        # [FUNCTION DOC] HELPER: Returns the sha256 hex digest of the source file
+        # backing the given module; raises on I/O failure.
         file_path = inspect.getfile(file_module)
         with open(file_path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
@@ -56,6 +70,8 @@ def get_config_request_key(
 
 
 def _generate_config_filename(request_key: str) -> str:
+    # [FUNCTION DOC] HELPER: Builds the json cache filename from the configs
+    # prefix and the request key.
     """
     Generate a filename for the full ops.
     """
@@ -65,6 +81,13 @@ def _generate_config_filename(request_key: str) -> str:
 @clear_on_fresh_cache
 @functools.cache
 def maybe_fetch_ops(device_type: str) -> list[Any] | None:
+    # [FUNCTION DOC]
+    # Tries to load the cached, pre-enumerated CUTLASS ops for a device type.
+    # Returns None if caches are force-disabled, no cache file exists (in
+    # fbcode a remote fetch is attempted), or the local file is unreadable or
+    # not a list (a warning is logged). Otherwise deserializes each entry with
+    # the CUTLASS operation serializer and returns the list. Memoized per
+    # device type and cleared on fresh cache; reads the cache directory and logs.
     """
     Fetch ops from databases.
     """
