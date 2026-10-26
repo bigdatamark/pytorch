@@ -1,3 +1,8 @@
+# [MODULE DOC] Distributed autotuning of GEMM kernels for Inductor. When enabled via
+# config.distributed_max_autotune_gemm, each rank autotunes only a share of the mm ops
+# and the other ranks receive placeholder buffers; after scheduling, results are exchanged
+# with an all-gather and the placeholders are replaced by real autotuned buffers.
+# Holds module-level state: a lazily created autotune process group. No import-time side effects.
 from __future__ import annotations
 
 import contextlib
@@ -38,6 +43,9 @@ _AUTOTUNE_PG: dist.ProcessGroup | None = None
 
 @dataclasses.dataclass
 class _DistributedAutotuneState:
+    # [CLASS DOC] HELPER: Per-graph counters stored in the virtualized distributed-autotune state.
+    # autotuned_index is the running operator index used to pick the owning rank (round robin);
+    # autotuned_local_count counts ops this rank tuned, used as a sanity check later.
     """
     State used to track autotuning during a graph_context()
     """
@@ -53,11 +61,15 @@ class _DistributedAutotuneState:
 
 @dataclasses.dataclass
 class _DistributedAutotuneInfo:
+    # [CLASS DOC] HELPER: Metadata attached to an FX node: the global op index and whether this rank tunes it.
     index: int
     local: bool
 
 
 def get_autotune_pg() -> dist.ProcessGroup | None:
+    # [FUNCTION DOC] Return the dedicated autotune process group, creating it on first use under a fixed tag.
+    # Returns None if torch.distributed is unavailable or not initialized. Raises an error if the
+    # created group does not include this rank. Caches the group in a module global.
     if dist.is_available() and dist.is_initialized():
         global _AUTOTUNE_PG
         if _AUTOTUNE_PG is None:
@@ -73,6 +85,9 @@ def get_autotune_pg() -> dist.ProcessGroup | None:
 
 
 def schedule(scheduler: torch._inductor.scheduler.Scheduler) -> None:
+    # [FUNCTION DOC] Finish distributed autotuning for a scheduler: autotune this rank's nodes, all-gather the
+    # results from all ranks, then replace remote placeholder nodes with real buffers.
+    # Raises an error if the distributed_max_autotune_gemm config is off. Mutates scheduler nodes.
     """
     Finish the distributed autotuning by propagating the autotuning results
     between the ranks and then replacing the placeholder with the real Buffer.
@@ -86,6 +101,9 @@ def schedule(scheduler: torch._inductor.scheduler.Scheduler) -> None:
 
 @contextlib.contextmanager
 def graph_context() -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager wrapped around graph processing. Installs a fresh distributed autotune
+    # state in the virtualized state and resets it to a null handler on exit (even on error).
+    # Raises an error if a state is already active (nesting is not allowed).
     """
     Wrapped around processing a graph, sets up figuring out which ranks tune
     which shapes.
@@ -107,6 +125,11 @@ def graph_context() -> Generator[None, None, None]:
 def maybe_autotune_remote(
     name: str, choices: list[ChoiceCaller], inputs: list[Buffer], layout: Layout
 ) -> TensorBox | None:
+    # [FUNCTION DOC] Called by an op such as mm to decide where to autotune. Returns None when the feature is
+    # off, no autotune group exists, there is at most one choice, or this rank owns the op
+    # (round robin on the running index versus group rank). Otherwise returns a TensorBox wrapping
+    # a placeholder buffer for a remote rank. Side effects: bumps the state's index (and local
+    # count when local) and records index/local info in the current FX node's metadata.
     """
     Used by an op (like `mm`) to determine if the op should be autotuned
     locally (returns None) or remotely (returns a placeholder Buffer).
@@ -138,6 +161,9 @@ def maybe_autotune_remote(
 
 
 class _DistributedAutotuneBuffer(MultiTemplateBuffer):
+    # [CLASS DOC] A MultiTemplateBuffer placeholder for a kernel being autotuned on another rank.
+    # Stores the kernel name; has no real choices. After scheduling, autotune() builds the real
+    # buffer from serialized results and the scheduler swaps it in.
     """
     A MultiTemplateBuffer which represents a kernel being autotuned on a
     different rank. When `schedule` is called this will be replaced by the
@@ -153,6 +179,8 @@ class _DistributedAutotuneBuffer(MultiTemplateBuffer):
         inputs: list[Buffer],
         layout: Layout,
     ) -> None:
+        # [FUNCTION DOC] Create the placeholder buffer with empty choices and a timing function that always fails;
+        # records the kernel name.
         super().__init__(
             layout,
             inputs,
@@ -166,11 +194,17 @@ class _DistributedAutotuneBuffer(MultiTemplateBuffer):
     def _dummy_choice_timings(
         self, _hint_override: int | None
     ) -> dict[ChoiceCaller, float]:
+        # [FUNCTION DOC] HELPER: Timing callback that must never run; raises NotImplementedError because a remote
+        # autotune placeholder was never filled in.
         # This should never get called. It means that a remote autotune was
         # scheduled but never filled in.
         raise NotImplementedError
 
     def autotune(self, ser_choice: _SerializedChoice) -> TensorBox:
+        # [FUNCTION DOC] Build the final TensorBox from a serialized choice received from another rank.
+        # Temporarily clears the graph scheduler, rebuilds the choice for this buffer's layout and
+        # original inputs, runs the algorithm selection with that single choice, and returns the
+        # result. Raises an error if the layout is not a Layout or the result is not a TensorBox.
         """
         Given a _SerializedChoice (autotune results from another rank)
         compute the final TensorBox.
@@ -196,6 +230,9 @@ class _DistributedAutotuneBuffer(MultiTemplateBuffer):
 
 # Can we make this async?
 def _sync(autotune_results: list[_SerializedChoice]) -> Sequence[_SerializedChoice]:
+    # [FUNCTION DOC] HELPER: All-gather every rank's serialized autotune results over the autotune group and
+    # return them as one list indexed by op index. Raises an error if the group is missing,
+    # an entry has the wrong type, an index is duplicated, or the counts disagree.
     """
     Perform the all_gather to collect the autotune results from all the ranks.
     """
@@ -228,6 +265,9 @@ def _sync(autotune_results: list[_SerializedChoice]) -> Sequence[_SerializedChoi
 
 
 class _SerializedChoice:
+    # [CLASS DOC] HELPER: Picklable form of an autotune choice (op index, template uid, parsed kwargs),
+    # since the real choice object cannot be serialized. get_choice() reconstructs it later.
+    # Only the mm extern kernel and the mm Triton template are supported.
     """
     This is a serializer for the autotune choice. KernelTemplateChoice can't
     be serialized directly (the template and inputs prevent this) so we need to
@@ -235,11 +275,16 @@ class _SerializedChoice:
     """
 
     def __init__(self, index: int, choice: ChoiceCaller) -> None:
+        # [FUNCTION DOC] HELPER: Record the op index, derive the template uid from the choice, and parse the
+        # choice description into keyword arguments.
         self.index = index
         self.template_uid = _SerializedChoice._template_uid_from_choice(choice)
         self.kwargs = self._compute_kwargs(choice.description)
 
     def get_choice(self, layout: Layout, inputs: KernelInputs) -> ChoiceCaller | None:
+        # [FUNCTION DOC] Rebuild the ChoiceCaller for the given layout and kernel inputs from stored template uid
+        # and kwargs. If BLOCK_K is present, computes the EVEN_K flag from the K dimension of the first
+        # input. Returns the choice of the reconstructed template choice.
         """
         Deserialize the ChoiceCaller and return it.
         """
@@ -267,6 +312,10 @@ class _SerializedChoice:
 
     @staticmethod
     def _compute_kwargs(description: str) -> dict[str, int | str | bool]:
+        # [FUNCTION DOC] HELPER: Parse a comma separated key=value description into a mapping. Values are
+        # booleans, digit-only integers, or single-quoted strings (quotes stripped). Empty
+        # description gives an empty mapping. Raises an error for an unquoted non-numeric value.
+        # KNOWN ISSUE: negative or non-integer numeric values are not digits and would hit the quote check.
         """
         Given a template description turn it into input kwargs.
         """
@@ -295,6 +344,8 @@ class _SerializedChoice:
 
     @staticmethod
     def _template_uid_from_choice(choice: ChoiceCaller) -> str:
+        # [FUNCTION DOC] HELPER: Map a choice to a dotted template path: the extern mm kernel or the mm Triton
+        # template. Raises RuntimeError for any other kernel or choice type.
         """
         Given a ChoiceCaller figure out which template represents it. This
         is reversed by _template_from_uid().
@@ -313,6 +364,8 @@ class _SerializedChoice:
             raise RuntimeError(f"TODO: {type(choice)}")
 
     def _template_from_uid(self) -> Any:
+    # [FUNCTION DOC] HELPER: Resolve the dotted template uid by looking up the first part in module globals
+    # and following the rest as attributes. Returns the template object.
         """
         See _template_uid_from_choice().
         """
@@ -326,6 +379,10 @@ class _SerializedChoice:
 def _autotune_local_nodes(
     scheduler: torch._inductor.scheduler.Scheduler,
 ) -> list[_SerializedChoice]:
+    # [FUNCTION DOC] HELPER: Autotune the multi-template buffers this rank owns (marked local in node metadata),
+    # skipping remote placeholders and unmarked nodes, forcing selection of the minimum choice.
+    # Returns serialized choices. Raises an error if the number found differs from the count
+    # recorded during lowering.
     """
     Go through the nodes in the scheduler and autotune the kernels which
     should be autotuned by this rank.
@@ -382,6 +439,9 @@ def _autotune_remote_nodes(
     scheduler: torch._inductor.scheduler.Scheduler,
     choices_by_index: Sequence[_SerializedChoice],
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each scheduler node holding a remote placeholder buffer, autotune it using the
+    # gathered choice for its index and replace the node in the scheduler. Raises an error on
+    # missing origin node, wrong buffer types, or a layout mismatch.
     """
     Go through the nodes in the scheduler and autotune the nodes that were
     autotuned on remote ranks.

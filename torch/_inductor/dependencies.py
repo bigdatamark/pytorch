@@ -1,3 +1,8 @@
+# [MODULE DOC] Dependency tracking for Inductor IR. Defines dependency types between buffers
+# (MemoryDep with index expression and loop vars, StarDep on a whole buffer, WeakDep for ordering),
+# IndexExprDep, the ReadWrites summary, ops handlers that record loads/stores/index expressions
+# or collect free symbols, and extraction helpers (extract_read_writes, extract_free_symbols, ...).
+# Import-time side effects: creates a module logger and a compiled regex for indirect names.
 import abc
 import dataclasses
 import itertools
@@ -35,6 +40,9 @@ is_indirect = re.compile(r"indirect|tmp").search
 
 
 class Dep(abc.ABC):
+    # [CLASS DOC] Abstract base for a dependency of an IR node on a named buffer. Attributes: name (buffer
+    # name) and index (sympy index expression). Subclasses implement renaming, element counts and
+    # size hints, free symbol queries, and contiguity checks.
     name: str
     index: sympy.Expr
 
@@ -42,38 +50,50 @@ class Dep(abc.ABC):
     def get_free_symbol_uses(
         self, unbacked_only: bool = False
     ) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Return the free sympy symbols used by this dependency (only unbacked ones if requested).
         pass
 
     @abc.abstractmethod
     def rename(self, renames: dict[str, str]) -> Self:
+        # [FUNCTION DOC] Return a copy of this dependency with its buffer name mapped through the renames mapping.
         pass
 
     @abc.abstractmethod
     def get_numel(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the number of elements touched by this dependency as a sympy expression.
         pass
 
     @abc.abstractmethod
     def numbytes_hint(self) -> int:
+        # [FUNCTION DOC] Return an estimate of bytes touched (element hint times dtype size).
         pass
 
     @abc.abstractmethod
     def numel_hint(self) -> int:
+        # [FUNCTION DOC] Return an estimate of the number of elements touched.
         pass
 
     @abc.abstractmethod
     def has_unbacked_symbols(self) -> bool:
+        # [FUNCTION DOC] Return whether the element count involves unbacked symbols.
         pass
 
     @abc.abstractmethod
     def is_contiguous(self) -> bool:
+        # [FUNCTION DOC] Return whether the access is contiguous.
         pass
 
     def normalize_with_stride_order(self, prefix: str = "t") -> Self:
+        # [FUNCTION DOC] Default: return self unchanged; subclasses may reorder loops by stride to canonicalize.
         return self
 
 
 @dataclasses.dataclass(frozen=True)
 class MemoryDep(Dep):
+    # [CLASS DOC] Frozen dependency on a specific access pattern of a buffer: buffer name, sympy index
+    # expression over loop variables var_names with sizes size, and optional store mode (such as
+    # atomic add). Hashable, so used in sets. Key methods: normalization of loop order, offset,
+    # numel, contiguity, scalar and indirect-indexing checks, renaming.
     # pyrefly: ignore [bad-override]
     name: str
     # pyrefly: ignore [bad-override]
@@ -85,6 +105,7 @@ class MemoryDep(Dep):
     def get_free_symbol_uses(
         self, unbacked_only: bool = False
     ) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Union of free symbols (optionally unbacked only) of the index, sizes and var names.
         return (
             get_free_symbols(self.index, unbacked_only)
             | get_free_symbols(self.size, unbacked_only)
@@ -92,6 +113,7 @@ class MemoryDep(Dep):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Readable form with name, index, ranges mapping, and mode when present.
         maybe_mode = ""
         if self.mode is not None:
             maybe_mode = f", {self.mode}"
@@ -99,9 +121,14 @@ class MemoryDep(Dep):
 
     @property
     def num_vars(self) -> int:
+        # [FUNCTION DOC] Number of loop variables.
         return len(self.var_names)
 
     def decide_loop_order_to_match(self, other: "MemoryDep") -> list[int] | None:
+        # [FUNCTION DOC] Given another MemoryDep with the same number of loop vars, derive a loop order (list of
+        # positions) that aligns this dep's strides with the other's. Returns None when undecidable:
+        # broadcast (index missing vars), any size 0 or 1, duplicate stride values, or differing stride
+        # sets. Raises an error if var counts differ or the result is not a permutation. Logs at debug level.
         """
         Can return None if not able to decide loop orders.
         """
@@ -165,12 +192,14 @@ class MemoryDep(Dep):
         return order
 
     def get_offset(self) -> sympy.Expr:
+        # [FUNCTION DOC] Return the constant offset of the index by substituting zero for every loop variable.
         """
         Return the offset by setting every variable to be 0.
         """
         return sympy_subs(self.index, dict.fromkeys(self.var_names, 0))
 
     def normalize(self) -> "MemoryDep":
+        # [FUNCTION DOC] Return a new MemoryDep with loops merged and canonical variables (no reordering by stride).
         """
         Normalize by merging loops. The difference from normalize_with_stride_order is,
         this method does not reorder loops while normalize_with_stride_order reorders
@@ -183,6 +212,9 @@ class MemoryDep(Dep):
         )
 
     def normalize_with_stride_order(self, prefix: str = "t") -> "MemoryDep":
+        # [FUNCTION DOC] Return a canonical MemoryDep: sort loops by decreasing stride, simplify/merge loops, and
+        # rename variables with the given prefix, so deps differing only in loop order compare equal.
+        # Uses the current graph's sizevars; imports ir lazily to avoid a cycle.
         r"""
         Used to decide if two MemoryDep does not equal due to different loop orders.
         More specifically, when dep1 and dep2 are not equal, we can normalize
@@ -228,10 +260,12 @@ class MemoryDep(Dep):
 
     @property
     def ranges(self) -> dict[sympy.Symbol, sympy.Expr]:
+        # [FUNCTION DOC] Mapping from loop variable to its size, in order.
         """{c0: 128, c1: 512, ...}"""
         return dict(zip(self.var_names, self.size))
 
     def simplify_with_ranges(self) -> "MemoryDep":
+        # [FUNCTION DOC] Return a copy whose index is simplified using the known variable ranges.
         return MemoryDep(
             name=self.name,
             index=V.graph.sizevars.simplify_with_ranges(self.index, self.ranges),
@@ -241,6 +275,8 @@ class MemoryDep(Dep):
         )
 
     def get_numel(self) -> sympy.Expr:
+        # [FUNCTION DOC] Number of elements: for indirect indexing the full buffer numel from the graph; otherwise the
+        # product of sizes for loop variables that actually appear in the index.
         if self.is_indirect():
             numel = V.graph.get_numel(self.name)
         else:
@@ -252,6 +288,7 @@ class MemoryDep(Dep):
         return numel  # type: ignore[return-value]
 
     def rename(self, renames: dict[str, str]) -> "MemoryDep":
+        # [FUNCTION DOC] Return a copy with the buffer name replaced if it is in renames, else self.
         if self.name in renames:
             return MemoryDep(
                 renames[self.name],
@@ -263,6 +300,8 @@ class MemoryDep(Dep):
         return self
 
     def numbytes_hint(self) -> int:
+        # [FUNCTION DOC] Estimated bytes: numel hint (fallback 0) times dtype size of the buffer; 0 for layouts
+        # without storage (NotImplementedError).
         try:
             return V.graph.sizevars.optimization_hint(
                 self.get_numel(), fallback=0
@@ -271,20 +310,26 @@ class MemoryDep(Dep):
             return 0
 
     def numel_hint(self) -> int:
+        # [FUNCTION DOC] Estimated element count (fallback 0); 0 if the layout has no numel (NotImplementedError).
         try:
             return V.graph.sizevars.optimization_hint(self.get_numel(), fallback=0)
         except NotImplementedError:  # NoneLayout
             return 0
 
     def has_unbacked_symbols(self) -> bool:
+        # [FUNCTION DOC] True if the element count has free unbacked symbols.
         return len(free_unbacked_symbols(self.get_numel())) > 0
 
     def is_contiguous(self) -> bool:
+        # [FUNCTION DOC] True if the index is an integer constant or just a single loop variable.
         if isinstance(self.index, sympy.Integer):
             return True
         return isinstance(self.index, sympy.Symbol) and self.index in self.var_names
 
     def stride1_for_last_dim(self, result_for_complex_expression: bool = True) -> bool:
+        # [FUNCTION DOC] Whether the last loop dimension has stride 1. True when there are no loop vars or a term
+        # equals the last var; False when a term is an integer constant greater than 1 times the last
+        # var; otherwise the supplied default for complex expressions.
         """
         Whether the stride for the last dimension is 1.
         """
@@ -314,16 +359,20 @@ class MemoryDep(Dep):
         return result_for_complex_expression
 
     def is_scalar(self) -> bool:
+        # [FUNCTION DOC] True for a constant index, or a plain non-loop, non-indirect symbol index.
         if isinstance(self.index, sympy.Symbol):
             return self.index not in self.var_names and not self.is_indirect()
         return isinstance(self.index, (int, sympy.Integer))
 
     def is_indirect(self) -> bool:
+        # [FUNCTION DOC] True if any free symbol in the index has an indirect or tmp style name.
         return any(is_indirect(v.name) for v in self.index.free_symbols)  # type: ignore[attr-defined]
 
 
 @dataclasses.dataclass(frozen=True)
 class StarDep(Dep):
+    # [CLASS DOC] Frozen dependency on an entire buffer (no index), with an optional mode. Used when the
+    # exact access pattern is unknown or irrelevant.
     # pyrefly: ignore [bad-override]
     name: str
     mode: str | None = None
@@ -332,12 +381,15 @@ class StarDep(Dep):
     @property
     # pyrefly: ignore [bad-override]
     def index(self) -> sympy.Expr:
+        # [FUNCTION DOC] Always raises NotImplementedError since a whole-buffer dependency has no index.
         raise NotImplementedError("StarDep does not have an index")
 
     def get_numel(self) -> sympy.Expr:
+        # [FUNCTION DOC] Element count of the whole buffer, from the current graph.
         return V.graph.get_numel(self.name)  # type: ignore[return-value]
 
     def rename(self, renames: dict[str, str]) -> "StarDep":
+        # [FUNCTION DOC] Return a renamed copy if the name is in renames, else self.
         if self.name in renames:
             return StarDep(renames[self.name], self.mode)
         return self
@@ -345,9 +397,11 @@ class StarDep(Dep):
     def get_free_symbol_uses(
         self, unbacked_only: bool = False
     ) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Always empty: a whole-buffer dependency has no free symbols of its own.
         return OrderedSet()
 
     def numbytes_hint(self) -> int:
+        # [FUNCTION DOC] Estimated bytes of the whole buffer; 0 when the layout has no size (NotImplementedError).
         try:
             return V.graph.sizevars.optimization_hint(
                 self.get_numel(), fallback=0
@@ -356,21 +410,26 @@ class StarDep(Dep):
             return 0  # NoneLayout, MultiOutputLayout, etc
 
     def numel_hint(self) -> int:
+        # [FUNCTION DOC] Estimated element count of the whole buffer; 0 when unavailable.
         try:
             return V.graph.sizevars.optimization_hint(self.get_numel(), fallback=0)
         except NotImplementedError:
             return 0  # NoneLayout, MultiOutputLayout, etc
 
     def has_unbacked_symbols(self) -> bool:
+        # [FUNCTION DOC] True if the buffer numel has unbacked symbols.
         return len(free_unbacked_symbols(self.get_numel())) > 0
 
     def is_contiguous(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
     def is_scalar(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
     def is_indirect(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
 
@@ -384,6 +443,9 @@ class StarDep(Dep):
 # materialize that buffer
 @dataclasses.dataclass(frozen=True)
 class WeakDep(Dep):
+    # [CLASS DOC] Frozen ordering-only dependency: a buffer that is read and a buffer (mutating_buf) that
+    # mutates it, so the mutation is ordered after the read. is_fake marks extra deps added only to
+    # force ordering (such as collectives) which may be dropped when other passes guarantee order.
     # Fake dependency on unused buffer
     # pyrefly: ignore [bad-override]
     name: str
@@ -399,36 +461,46 @@ class WeakDep(Dep):
     def get_free_symbol_uses(
         self, unbacked_only: bool = False
     ) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Always empty.
         return OrderedSet()
 
     @property
     # pyrefly: ignore [bad-override]
     def index(self) -> sympy.Expr:
+        # [FUNCTION DOC] Always raises NotImplementedError since a weak dependency has no index.
         raise NotImplementedError("WeakDep does not have an index")
 
     def get_numel(self) -> sympy.Expr:
+        # [FUNCTION DOC] Always one element (symbolic one).
         return sympy.S.One
 
     def rename(self, renames: dict[str, str]) -> "WeakDep":
+        # [FUNCTION DOC] Return a renamed copy (keeping mutating_buf and is_fake) if the name is in renames, else self.
         if self.name in renames:
             return WeakDep(renames[self.name], self.mutating_buf, self.is_fake)
         return self
 
     def numbytes_hint(self) -> int:
+        # [FUNCTION DOC] Always 1: purely an ordering dependency, not real traffic.
         return 1  # Purely inserted for ordering, not an actual dep
 
     def numel_hint(self) -> int:
+        # [FUNCTION DOC] Always 1: purely an ordering dependency.
         return 1  # Purely inserted for ordering, not an actual dep
 
     def has_unbacked_symbols(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
     def is_contiguous(self) -> bool:
+        # [FUNCTION DOC] Always False.
         return False
 
 
 @dataclasses.dataclass(frozen=True)
 class IndexExprDep:
+    # [CLASS DOC] Frozen record of an index expression used as a value (not a memory access), with its loop
+    # variables and sizes.
     index: sympy.Expr  # type: ignore[assignment]
     var_names: tuple[sympy.Symbol, ...]
     size: tuple[sympy.Expr, ...]
@@ -436,6 +508,8 @@ class IndexExprDep:
 
 @dataclasses.dataclass
 class ReadWrites:
+    # [CLASS DOC] Summary of what a node reads and writes: ordered sets of reads and writes (Dep), index
+    # expressions used as values, and optionally the loop range variables and their ranges.
     reads: OrderedSet[Dep]
     writes: OrderedSet[Dep]
     index_exprs: OrderedSet[IndexExprDep]
@@ -443,6 +517,7 @@ class ReadWrites:
     var_ranges: VarRanges | None = None
 
     def rename(self, renames: dict[str, str]) -> "ReadWrites":
+        # [FUNCTION DOC] Return a new ReadWrites with all dep buffer names renamed through the renames mapping.
         return ReadWrites(
             OrderedSet(dep.rename(renames) for dep in self.reads),
             OrderedSet(dep.rename(renames) for dep in self.writes),
@@ -452,6 +527,8 @@ class ReadWrites:
         )
 
     def with_read(self, dep: Dep | OrderedSet[Dep]) -> "ReadWrites":
+        # [FUNCTION DOC] Return a new ReadWrites with an additional read dep (or set of deps) added. Raises an
+        # error if the argument is not a WeakDep, StarDep or OrderedSet.
         if not isinstance(dep, (WeakDep, StarDep, OrderedSet)):
             raise AssertionError(
                 f"expected WeakDep, StarDep, or OrderedSet, got {type(dep)}"
@@ -467,6 +544,8 @@ class ReadWrites:
         )
 
     def merge(self, other: "ReadWrites") -> "ReadWrites":
+        # [FUNCTION DOC] Merge with another ReadWrites: union of writes and index expressions, and reads minus
+        # writes. Range vars and var ranges are dropped in the result.
         reads = OrderedSet.union(self.reads, other.reads)
         writes = OrderedSet.union(self.writes, other.writes)
         index_exprs = OrderedSet.union(self.index_exprs, other.index_exprs)
@@ -474,12 +553,14 @@ class ReadWrites:
 
     @staticmethod
     def merge_list(read_writes: list["ReadWrites"]) -> "ReadWrites":
+        # [FUNCTION DOC] Merge many ReadWrites like merge: union of all writes, reads not written, and index exprs.
         all_writes = OrderedSet.union(*[rw.writes for rw in read_writes])
         all_reads = OrderedSet.union(*[rw.reads for rw in read_writes]) - all_writes
         all_index_exprs = OrderedSet.union(*[rw.index_exprs for rw in read_writes])
         return ReadWrites(all_reads, all_writes, all_index_exprs)
 
     def remove_reads(self, rem_reads: OrderedSet[Dep]) -> "ReadWrites":
+        # [FUNCTION DOC] Return a copy with the given reads removed from the read set.
         return ReadWrites(
             self.reads - rem_reads,
             self.writes,
@@ -489,9 +570,12 @@ class ReadWrites:
         )
 
     def reads_and_writes(self) -> Iterable[Dep]:
+        # [FUNCTION DOC] Iterate over all reads followed by all writes.
         return itertools.chain(self.reads, self.writes)
 
     def buffer_names(self, ignore_integer_index: bool = True) -> OrderedSet[str]:
+        # [FUNCTION DOC] Names of buffers accessed through MemoryDeps; integer constant indices (used by load_seed)
+        # are skipped unless ignore_integer_index is False.
         """
         Integer index is used for load_seed.
         """
@@ -508,6 +592,7 @@ class ReadWrites:
     def get_free_symbol_uses(
         self, unbacked_only: bool = False
     ) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Union of free symbols over all read and write deps.
         result: OrderedSet[sympy.Symbol] = OrderedSet()
 
         for dep in self.reads_and_writes():
@@ -516,7 +601,11 @@ class ReadWrites:
 
 
 class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] HELPER: Ops handler that records buffer loads, stores and index expressions into sets of
+    # MemoryDep, StarDep and IndexExprDep while running or replaying a function. State: _reads,
+    # _writes, _index_exprs, the loop variable ranges, and whether to normalize the index.
     def __init__(self, var_ranges: VarRanges, normalize: bool) -> None:
+        # [FUNCTION DOC] HELPER: Initialize empty read/write/index-expression sets and store ranges and normalize flag.
         super().__init__()
         self._reads: OrderedSet[Dep] = OrderedSet()
         self._writes: OrderedSet[MemoryDep] = OrderedSet()
@@ -530,6 +619,8 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         var_names: list[sympy.Expr],
         sizes: list[sympy.Expr],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Mutate var_names and sizes in place, dropping trailing loop vars not used by the
+        # index (reduction dims). Does nothing if the index is a plain int.
         """
         Reduction has last (reduced) dim in its sizes, but
         downstream users won't.  Normalize this away.
@@ -546,6 +637,8 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
     def _normalize(
         cls, index: sympy.Expr, var_ranges: VarRanges
     ) -> tuple[sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+        # [FUNCTION DOC] HELPER: Simplify and merge loops of an index, rename variables with the canonical prefix,
+        # and drop unused trailing vars. Returns (index, var names tuple, sizes tuple).
         # Try to further simplify the indexes even if simplify_loops didn't
         # convert it to the simplest form because of the interference from
         # different indexing formulas.
@@ -571,6 +664,8 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
     def canonicalize(
         self, index: sympy.Expr
     ) -> tuple[sympy.Expr, tuple[sympy.Symbol, ...], tuple[sympy.Expr, ...]]:
+        # [FUNCTION DOC] HELPER: Convert an index to (index, var names, sizes). Without normalization, drops size-1
+        # loops and unused trailing vars; with normalization, simplifies sizes and merges loops.
         if not self._should_normalize:
             sizes = [V.graph.sizevars.simplify(x) for x in self._var_ranges.values()]
             var_names = [k for k, v in zip(self._var_ranges.keys(), sizes) if v != 1]
@@ -588,9 +683,11 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         return self._normalize(index, var_ranges)
 
     def load(self, name: str, index: sympy.Expr) -> None:
+        # [FUNCTION DOC] HELPER: Record a read MemoryDep for the buffer at the canonicalized index.
         self._reads.add(MemoryDep(name, *self.canonicalize(index)))
 
     def load_seed(self, name: str, index: int) -> None:
+        # [FUNCTION DOC] HELPER: Record a read of a seed buffer at an integer index. Raises an error if not an int.
         if not isinstance(index, int):
             raise AssertionError(f"expected index to be int, got {type(index)}")
         self.load(name, sympy.Integer(index))
@@ -598,15 +695,19 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
     def store(
         self, name: str, index: sympy.Expr, value: str, mode: str | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Record a write MemoryDep (with mode) for the buffer at the canonicalized index.
         self._writes.add(MemoryDep(name, *self.canonicalize(index), mode=mode))
 
     def store_reduction(self, name: str, index: sympy.Expr, value: str) -> None:
+        # [FUNCTION DOC] HELPER: Record a reduction store as an ordinary store.
         self.store(name, index, f"store_reduction({value})")
 
     def index_expr(self, index: sympy.Expr, dtype: torch.dtype | None) -> None:
+        # [FUNCTION DOC] HELPER: Record an index expression use.
         self._index_exprs.add(IndexExprDep(*self.canonicalize(index)))
 
     def value_expr(self, index: sympy.Expr, dtype: torch.dtype | None) -> None:
+        # [FUNCTION DOC] HELPER: Record a value expression use (same as an index expression).
         self._index_exprs.add(IndexExprDep(*self.canonicalize(index)))
 
     def bucketize(
@@ -619,6 +720,7 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: T | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Record StarDeps on the boundaries buffer and the sorter buffer if present.
         """Records the names of the buffers that bucketize will read from."""
         self._reads.add(StarDep(boundaries[0]))
         if sorter is not None:
@@ -626,7 +728,10 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
 
 
 class RecordLoadStore(V.KernelFormatterHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] HELPER: Kernel-formatting ops handler wrapping _RecordLoadStoreInner; its parent_handler
+    # holds the recorded dependencies.
     def __init__(self, var_ranges: VarRanges, normalize: bool) -> None:
+        # [FUNCTION DOC] HELPER: Build the inner recording handler and pass it as the parent handler.
         parent_handler = _RecordLoadStoreInner(
             var_ranges=var_ranges, normalize=normalize
         )
@@ -635,10 +740,14 @@ class RecordLoadStore(V.KernelFormatterHandler):  # type: ignore[name-defined]
 
 # TODO: check call sites
 def var_builder(prefix: str) -> tuple[VarRanges, Callable[[sympy.Expr], sympy.Symbol]]:
+    # [FUNCTION DOC] HELPER: Return a (mapping, add_var) pair; add_var creates a new index symbol named with
+    # the prefix and a running counter, records its length in the mapping, and returns it.
+    # Mutates the returned mapping.
     cnt = itertools.count()
     var_ranges: VarRanges = {}
 
     def add_var(length: sympy.Expr) -> sympy.Symbol:
+        # [FUNCTION DOC] HELPER: Create the next prefixed symbol, register its length, and return it.
         v = sympy_index_symbol(f"{prefix}{next(cnt)}")
         var_ranges[v] = length
         return v
@@ -649,6 +758,8 @@ def var_builder(prefix: str) -> tuple[VarRanges, Callable[[sympy.Expr], sympy.Sy
 def index_vars_no_squeeze(
     *argsizes: Sequence[sympy.Expr], prefix: str
 ) -> tuple[list[list[sympy.Symbol]], VarRanges]:
+    # [FUNCTION DOC] Create fresh variables for each size list under one prefix, without squeezing size-1 dims.
+    # Returns (variable lists per size list, mapping of variable to size).
     var_ranges, add_var = var_builder(prefix)
     args: list[list[sympy.Symbol]] = [list(map(add_var, size)) for size in argsizes]
     return args, var_ranges
@@ -657,6 +768,8 @@ def index_vars_no_squeeze(
 def index_vars_squeeze(
     *argsizes: Sequence[sympy.Expr], prefix: str = "d"
 ) -> tuple[list[Sequence[sympy.Expr]], VarRanges]:
+    # [FUNCTION DOC] Like index_vars_no_squeeze but squeezes size-1 dims via SqueezeView; the returned variable
+    # lists are reindexed to the original shape. Returns (index lists, var ranges).
     from .ir import SqueezeView
 
     var_ranges, add_var = var_builder(prefix)
@@ -674,6 +787,9 @@ def extract_read_writes(
     prefix: str = "d",
     hidden_args: Sequence[list[sympy.Expr]] = (),
 ) -> ReadWrites:
+    # [FUNCTION DOC] Compute the ReadWrites of fn called on index variables built from argsizes (plus hidden
+    # args). A LoopBody takes a fast path using recorded memory usage; any other callable is traced
+    # under a RecordLoadStore ops handler (calls fn). With normalize, range_vars is empty.
     args, var_ranges = index_vars_squeeze(*argsizes, prefix=prefix)
 
     from .loop_body import LoopBody
@@ -715,6 +831,9 @@ def extract_loop_body_with_args(
     var_ranges: VarRanges,
     normalize: bool = False,
 ) -> _RecordLoadStoreInner:
+    # [FUNCTION DOC] HELPER: Fast path to record loads, seed loads, stores, reduction stores, index exprs and
+    # bucketize buffers of a LoopBody without tracing, resolving indices from args and mapping
+    # indirect vars to tmp symbols. Returns the recording handler. Bounds checks are skipped.
     from .loop_body import MemoryUsageType
 
     # Fast path to avoid tracing when we already have a LoopBody
@@ -760,6 +879,12 @@ def extract_loop_body_with_args(
 def extract_input_node_reduction_ranges(
     input_node: "torch._inductor.ir.IRNode",
 ) -> tuple[list[sympy.Expr] | None, list[sympy.Expr] | None]:
+    # [FUNCTION DOC] Find the (size, reduction size) shared by the reduction inputs feeding input_node. If the
+    # node is a realized ComputedBuffer return its sizes if it has a reduction else (None, None); if
+    # not Loops return (None, None); otherwise walk back through reads until reductions are found,
+    # returning (None, None) if they disagree.
+    # KNOWN ISSUE: the fixpoint test compares the reads container with a list, which may never be equal
+    # for non-list types; also views between nodes are ignored (noted in code).
     """
     Returns the size and reduction size of all inputs, if the sizes and reduction_sizes (if exist) are all the same.
     It's possible that a node has multiple inputs, some are Reduction nodes and others are Pointwise nodes.
@@ -825,18 +950,23 @@ def extract_input_node_reduction_ranges(
 
 
 def canonicalization_prefix() -> str:
+    # [FUNCTION DOC] HELPER: Return the prefix used for canonicalized variables.
     return "c"
 
 
 # ops handler which computes all the free symbols for an IR
 class FreeSymbolsOpsHandler(DefaultHandler):
+    # [CLASS DOC] Ops handler that evaluates a function and accumulates free (by default unbacked) symbols
+    # of all sympy arguments in the symbols set, ignoring values otherwise.
     symbols: OrderedSet[sympy.Symbol]
 
     def __init__(self, unbacked_only: bool = True) -> None:
+        # [FUNCTION DOC] Initialize empty symbols set and choose the symbol function (unbacked only or all).
         self.symbols = OrderedSet()
         self.get_symbols = free_unbacked_symbols if unbacked_only else free_symbols
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] Default op: add free symbols of every sympy expression or boolean argument.
         for a in itertools.chain(args, kwargs.values()):
             if isinstance(a, (sympy.Expr, sympy.logic.boolalg.Boolean)):
                 self.symbols |= self.get_symbols(a)
@@ -848,6 +978,8 @@ class FreeSymbolsOpsHandler(DefaultHandler):
         check: bool = True,
         wrap_neg: bool = True,
     ) -> sympy.Symbol:
+        # [FUNCTION DOC] Collect free symbols of size and return a placeholder index symbol named after index_var.
+        # Raises an error if index_var is itself a sympy expression.
         if isinstance(index_var, (sympy.Expr, sympy.logic.boolalg.Boolean)):
             raise AssertionError(
                 f"index_var must not be a sympy Expr or Boolean, got {type(index_var)}"
@@ -856,16 +988,19 @@ class FreeSymbolsOpsHandler(DefaultHandler):
         return sympy_index_symbol(f"({str(index_var)})")
 
     def frexp(self, x: Any) -> tuple[None, ...]:
+        # [FUNCTION DOC] Return two None placeholders for frexp's two outputs.
         return (None,) * 2
 
     def scan(
         self, dtypes: Any, combine_fn: Any, values: Sequence[Any]
     ) -> tuple[None, ...]:
+        # [FUNCTION DOC] Return one None per value.
         return (None,) * len(values)
 
     def sort(
         self, dtypes: Any, values: Sequence[Any], stable: Any, descending: Any
     ) -> tuple[None, ...]:
+        # [FUNCTION DOC] Return one None per value.
         return (None,) * len(values)
 
     def reduction(
@@ -875,10 +1010,13 @@ class FreeSymbolsOpsHandler(DefaultHandler):
         reduction_type: ReductionType,
         value: None | tuple[None, ...],
     ) -> None | tuple[None, ...]:
+        # [FUNCTION DOC] Return a tuple of None per output for multi-output reductions, otherwise None.
         num_values = reduction_num_outputs(reduction_type)
         return (None,) * num_values if num_values > 1 else None
 
     def masked(self, mask: Any, body: Callable[..., Any], other: Any) -> None:
+        # [FUNCTION DOC] Run the body callable (it may issue more ops such as indirect indexing). Raises an error
+        # if body is not callable.
         if not callable(body):
             raise AssertionError("masked body must always be callable.")
         # The body can make additional calls, for e.g. ops.indirect_indexing
@@ -891,6 +1029,8 @@ def extract_free_symbols(
     rindex: Sequence[sympy.Expr] | None = None,
     unbacked_only: bool = True,
 ) -> OrderedSet[sympy.Symbol]:
+    # [FUNCTION DOC] Return the free symbols used when running fn on index (and reduction index) lists, via
+    # FreeSymbolsOpsHandler. Temporarily patches FlexibleLayout to allow indexing (calls fn).
     from .ir import FlexibleLayout
 
     args = [index, rindex] if rindex is not None else [index]
@@ -906,13 +1046,17 @@ def extract_free_symbols(
 
 
 class SymbolUsageCollectorOpsHandler(DefaultHandler):
+    # [CLASS DOC] Ops handler recording the names of ops that receive a given symbol directly as an
+    # argument or keyword value; results in the usages set.
     usages: OrderedSet[str]
 
     def __init__(self, symbol: sympy.Symbol) -> None:
+        # [FUNCTION DOC] Store the symbol to look for and an empty usages set.
         self.symbol = symbol
         self.usages = OrderedSet()
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] Add the op name to usages when the symbol is directly among its args or kwarg values.
         used_here = self.symbol in args or self.symbol in kwargs.values()
         if used_here:
             self.usages.add(name)

@@ -1,3 +1,10 @@
+# [MODULE DOC] Inductor decomposition table. Builds the mapping from ATen/prim operators to
+# decomposition functions used when tracing for Inductor: core ATen decompositions plus a curated
+# list, minus an exclusion list. Defines Inductor-specific decompositions (matmul variants, cat, lerp,
+# random ops, pooling, quantized ops, ...) registered into that table via register_decomposition,
+# plus select_decomp_table to pick the table by config. A decomposition returning NotImplemented
+# means: keep the original op. Import-time side effects: builds and mutates the module-global
+# decompositions table, registers decompositions, and conditionally registers a distributed one.
 # mypy: allow-untyped-decorators
 import functools
 import logging
@@ -154,6 +161,8 @@ remove_decompositions(decompositions, decomps_to_exclude)
 def register_decomposition(
     ops: _GenericOperator | list[_GenericOperator],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Decorator factory registering a decomposition for one op or a list of ops into the Inductor
+    # table. Logs a warning for ops already present (duplicates). Returns the registering decorator.
     for op in ops if isinstance(ops, list) else [ops]:
         if op in decompositions:
             log.warning("duplicate decomp: %s", ops)
@@ -169,6 +178,10 @@ if torch.distributed.is_available():
         shard_dim: int,
         group_name: str,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Decompose the DTensor shard_dim_alltoall op into view, movedim, clone, all_to_all_single, wait
+        # and view steps. Returns NotImplemented when disabled by config, input is complex, dims are out
+        # of range or equal, the group size lookup fails, or the shard dim is not provably divisible by
+        # the group size. Side effect: increments an inductor counter. Dims may be negative.
         if not config.decompose_shard_dim_alltoall:
             return NotImplemented
         if inp.dtype.is_complex:
@@ -228,6 +241,9 @@ if torch.distributed.is_available():
 
 @register_decomposition([aten.lerp.Scalar])
 def _lerp_scalar(start: torch.Tensor, end: torch.Tensor, weight: float) -> torch.Tensor:
+    # [FUNCTION DOC] Decompose lerp with scalar weight into a subtraction plus add with alpha, so FMA is used.
+    # Converts end to start's suggested memory format; uses the end-based formula when weight
+    # magnitude is at least one half, else the start-based formula.
     # Decompose into sub + add(alpha=weight) so that the add lowering emits FMA,
     # matching eager CUDA's dual-formula (see aten/src/ATen/native/Lerp.h).
     # Convert end to start's memory format so the output preserves start's layout,
@@ -245,6 +261,8 @@ def _lerp_scalar(start: torch.Tensor, end: torch.Tensor, weight: float) -> torch
 def _lerp_tensor(
     start: torch.Tensor, end: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Decompose lerp with tensor weight into subtraction plus addcmul, choosing per element the
+    # end-based or start-based formula depending on weight magnitude (half or more).
     # Same dual-formula as foreach_lerp polyfill: decompose into sub + addcmul.
     # Convert end to start's memory format so the output preserves start's layout.
     fmt = suggest_memory_format(start)
@@ -266,6 +284,8 @@ def _embedding_dense_backward(
     padding_idx: int,
     scale_grad_by_freq: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Embedding dense backward: returns NotImplemented on XPU (fallback), else defers to the
+    # generic decomposition.
     # TODO: check if XE4 still need this fallback
     # check torch.xpu.get_device_properties(grad_output.device).architecture
     if grad_output.is_xpu:
@@ -284,6 +304,7 @@ def _native_layer_norm(
     bias: torch.Tensor | None,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Layer norm: returns NotImplemented on MTIA (fallback), else defers to the reference decomposition.
     if input.is_mtia:
         return NotImplemented
     # We can write a util function to update decomp table if we have more ops to fallback.
@@ -297,6 +318,7 @@ def sym_constrain_range_for_size(
     min: torch.types.Number | None = None,
     max: torch.types.Number | None = None,
 ) -> None:
+    # [FUNCTION DOC] No-op decomposition for sym_constrain_range_for_size; returns None.
     return
 
 
@@ -307,6 +329,7 @@ def clamp(
     min: torch.types.Number | None = None,
     max: torch.types.Number | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Clamp as clamp_min followed by clamp_max, applying each bound only if given.
     if min is not None:
         x = x.clamp_min(min)
     if max is not None:
@@ -320,6 +343,7 @@ def clamp(
 @register_decomposition([aten.silu])
 @pw_cast_for_opmath
 def silu(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] SiLU computed as x divided by one plus exp of negative x, to match eager numerics (computed in opmath type).
     return x / (1 + x.neg().exp())
 
 
@@ -329,6 +353,8 @@ def full(
     fill_value: torch.types.Number,
     **kwargs: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Full: if no dtype is given, infer it from the Python type of fill_value and call full again;
+    # otherwise returns NotImplemented.
     dtype = kwargs.get("dtype")
     if dtype is None:
         kwargs["dtype"] = type_to_dtype(type(fill_value))
@@ -345,6 +371,8 @@ def index_add(
     *,
     alpha: torch.types.Number = 1,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Index_add via the generic decomposition (out of place, with alpha); returns NotImplemented for
+    # bfloat16 outside fbcode so the kernel is used.
     # If we are not in fbcode and dtype is bfloat16
     # fallback to index_add kernel
     # see https://github.com/pytorch/pytorch/issues/137425 for details
@@ -364,6 +392,8 @@ def empty_permuted(
     physical_layout: list[int],
     **kwargs: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Empty_permuted: empty tensor directly for identity layout, otherwise allocate in physical
+    # order and permute back, so the strides follow the physical layout.
     is_identity = list(physical_layout) == list(range(len(physical_layout)))
 
     if is_identity:
@@ -389,6 +419,9 @@ def convolution_backward(
     groups: int,
     output_mask: list[bool],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Convolution backward: only handles the case where the bias gradient is requested on a GPU
+    # device (else NotImplemented). Computes bias grad by summing (zeros if input channels are 0),
+    # and calls the op again without the bias grad. Returns (grad_input, grad_weight, grad_bias).
     if not output_mask[2] or not is_gpu(grad_output.device.type):
         return NotImplemented
     if statically_known_true(input.size(1) == 0) and statically_known_true(
@@ -416,6 +449,7 @@ def convolution_backward(
 
 @register_decomposition([aten.round.decimals])
 def round_dec(x: torch.Tensor, decimals: int = 0) -> torch.Tensor:
+    # [FUNCTION DOC] Round with decimals: scale by ten to the decimals, round, scale back.
     ten_pow_decimals = 10.0**decimals
     return aten.round(x * ten_pow_decimals) * (1.0 / ten_pow_decimals)
 
@@ -427,6 +461,9 @@ def bmm(
     batch2: torch.Tensor,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Batched matmul. Handles outer-product case via broadcast multiply; with coordinate descent
+    # tuning on non CPU/MPS uses multiply and sum for vector cases; on CPU uses it for a single
+    # row times single column (bumps a counter). Otherwise NotImplemented. out_dtype is unused.
     # Outer-product specialization: [B, M, 1] x [B, 1, N] -> [B, M, N].
     # This avoids introducing a reduction and maps directly to broadcasted mul.
     if statically_known_true(self.shape[2] == 1) and statically_known_true(
@@ -463,7 +500,11 @@ def addmm(
     beta: torch.types.Number = 1,
     alpha: torch.types.Number = 1,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Addmm decomposition for degenerate shapes: on non CPU/MPS device with inner dim 1 uses a
+    # broadcast multiply (not for beta zero on CUDA); on CPU uses multiply and sum for 1xK by Kx1 or
+    # tiny matrices. Applies alpha and beta. Otherwise NotImplemented. Bumps a counter. out_dtype unused.
     def add_input(out: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Apply alpha to the product and add the input scaled by beta.
         if alpha != 1:
             out = alpha * out
         if beta != 1:
@@ -509,6 +550,9 @@ def mm(
     input2: torch.Tensor,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Mm decomposition: with coordinate descent tuning uses multiply and sum for vector cases; for
+    # inner dim 1 uses a broadcast multiply (always off CPU/MPS, tiny equal-dtype inputs on CPU);
+    # on CPU single row by single column uses multiply and sum. Otherwise NotImplemented. out_dtype unused.
     # Our matrix vector multiplies only achieve peak bandwidth with coordinate descent tuning.
     # todo: Look into why and fix it (hopefully)
 
@@ -554,7 +598,11 @@ def cat(
     tensors: list[torch.Tensor],
     dim: int = 0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Cat normalization: drops empty inputs (guarded, legacy empty 1-D tensors); with one tensor left
+    # returns a clone or dtype-promoted copy; if some were dropped, re-calls cat; if one tensor is
+    # repeated, uses expand and flatten; else NotImplemented (no more decomposition needed).
     def non_empty_tensor(x: torch.Tensor) -> bool:
+        # [FUNCTION DOC] HELPER: True unless the tensor is an empty 1-D tensor or empty along the cat dimension (guard-free).
         # For better or worse, this is a valid cat:
         #
         #   torch.cat([torch.randn(2, 2, 4), torch.randn(0), torch.randn(3, 2, 4)])
@@ -613,6 +661,8 @@ def cat(
 
 @register_decomposition([aten.angle])
 def angle(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Angle: for complex input, atan2 of imag and real (nan where real is nan); for real input,
+    # pi for negatives, 0 otherwise, nan preserved (float result dtype via int-to-float promotion).
     if x.is_complex():
         return torch.where(
             torch.isnan(x.real), float("nan"), torch.atan2(x.imag, x.real)
@@ -638,6 +688,9 @@ def add(
     *,
     alpha: torch.types.Number | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Add for complex tensors only (NotImplemented otherwise or if last stride is not 1): views as
+    # real pairs, adds in real form (alpha applied to y), and views back as complex. Handles 0-dim
+    # inputs by reshaping and indexing result. Adds zero first to resolve conjugation.
     # Require both x and y to be complex tensors.
     x_is_complex_tensor = torch.is_tensor(x) and x.is_complex()
     y_is_complex_tensor = torch.is_tensor(y) and y.is_complex()
@@ -645,6 +698,7 @@ def add(
         return NotImplemented
 
     def _requires_fallback(tensor: torch.Tensor) -> bool:
+        # [FUNCTION DOC] HELPER: True for non-scalar tensors whose last stride is not 1 (cannot be viewed as real).
         if tensor.ndim == 0:
             return False
         # Viewing complex tensors as their real dtype requires the last stride to be 1.
@@ -670,6 +724,8 @@ def add(
     # For complex typed `x`, `x.view(x.real.dtype)` doubles the last dimension and can cause problem
     # when broadcasting the add.
     def reshape_tensor_complex(tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: View a real-typed tensor with an even last dim as shape (..., last/2, 2). Raises an
+        # error if the last dimension is odd.
         """Reshape tensor from [*initial_dims, last_dim] to *initial_dims, last_dim/2, 2]"""
         # Get the current shape of the tensor
         *initial_dims, last_dim = tensor.shape
@@ -701,6 +757,7 @@ def add(
 
 @register_decomposition([aten.conj_physical])
 def conj_physical(self: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Conj_physical: NotImplemented for complex input; identity for real input.
     if self.is_complex():
         return NotImplemented
     return self
@@ -708,16 +765,19 @@ def conj_physical(self: torch.Tensor) -> torch.Tensor:
 
 @register_decomposition([aten.lift, aten.detach_])
 def lift(self: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Lift and detach_: return the input unchanged.
     return self
 
 
 @register_decomposition([aten.fmin, prims.fmin])
 def fmin(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Fmin: choose self when other is NaN or greater than self, else other (NaN-ignoring minimum).
     return torch.where(torch.isnan(other) | (other > self), self, other)
 
 
 @register_decomposition([aten.fmax, prims.fmax])
 def fmax(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Fmax: choose self when other is NaN or less than self, else other (NaN-ignoring maximum).
     return torch.where(torch.isnan(other) | (other < self), self, other)
 
 
@@ -732,6 +792,8 @@ def normal(
     requires_grad: bool,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Prim normal: sample standard normal values of the given shape (optionally with a generator),
+    # scale by std and shift by mean.
     if generator is None:
         normal_samples = torch.randn(
             shape,
@@ -756,6 +818,7 @@ def amax(
     dim: int | None = None,
     keepdim: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Amax: for bool input uses any over the dims; otherwise NotImplemented.
     if self.dtype == torch.bool:
         return torch.any(self, dim=dim, keepdim=keepdim)
     return NotImplemented
@@ -767,6 +830,7 @@ def amin(
     dim: int | None = None,
     keepdim: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Amin: for bool input uses all over the dims; otherwise NotImplemented.
     if self.dtype == torch.bool:
         return torch.all(self, dim=dim, keepdim=keepdim)
     return NotImplemented
@@ -779,6 +843,7 @@ def narrow_copy(
     start: int,
     length: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Narrow_copy: narrow then clone with contiguous format so strides are correct.
     # Use memory_format=torch.contiguous_format to ensure correct strides.
     # For empty tensors, a plain clone() preserves the input view's strides.
     return torch.narrow(self, dim, start, length).clone(
@@ -791,6 +856,7 @@ def view_copy_default(
     self: torch.Tensor,
     size: list[int | torch.SymInt],
 ) -> torch.Tensor:
+    # [FUNCTION DOC] View_copy (size): view then clone.
     return aten.view(self, size).clone()
 
 
@@ -799,12 +865,15 @@ def view_copy_dtype(
     self: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] View_copy (dtype): clone then reinterpret as the dtype.
     return self.clone().view(dtype)
 
 
 def _get_shape_permutation_like(
     self: torch.Tensor,
 ) -> tuple[utils.ShapeType, utils.StrideType]:
+    # [FUNCTION DOC] HELPER: For a tensor return (shape in physical dimension order, permutation back to logical order),
+    # using the elementwise output physical layout.
     physical_layout, _ = utils.compute_elementwise_output_logical_to_physical_perm(self)
     shape = [self.shape[l] for l in physical_layout]
 
@@ -827,6 +896,9 @@ def full_like(
     requires_grad: bool = False,
     memory_format: torch.memory_format = torch.preserve_format,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Full_like: with a non-preserve memory format, make a full tensor and convert it; otherwise
+    # make a full tensor in physical shape and permute back to match input strides (clone). Defaults
+    # dtype, layout and device from self. Raises an error if layout is not strided.
     dtype = self.dtype if dtype is None else dtype
     layout = self.layout if layout is None else layout
     device = self.device if device is None else device
@@ -870,6 +942,9 @@ def _rand_like(
     memory_format: torch.memory_format = torch.preserve_format,
     **kwargs: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Shared implementation for random-like ops: build the random tensor in physical shape
+    # with rand_fn and permute/clone to match self's layout, or convert to a requested memory format.
+    # Defaults dtype and device from self.
     dtype = self.dtype if dtype is None else dtype
     device = self.device if device is None else device
 
@@ -895,16 +970,19 @@ def _rand_like(
 
 @decomp.register_decomposition([aten.rand_like], extra_random_decomps)
 def rand_like(self: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] Rand_like via the shared helper with uniform random values.
     return _rand_like(torch.rand, self, **kwargs)
 
 
 @decomp.register_decomposition([aten.randn_like], extra_random_decomps)
 def randn_like(self: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] Randn_like via the shared helper with normal random values.
     return _rand_like(torch.randn, self, **kwargs)
 
 
 @decomp.register_decomposition([aten.randint_like.default], extra_random_decomps)
 def randint_like(self: torch.Tensor, high: int, **kwargs: Any) -> torch.Tensor:
+    # [FUNCTION DOC] Randint_like with low zero and given high via the shared helper.
     return _rand_like(functools.partial(aten.randint.low, 0, high), self, **kwargs)
 
 
@@ -912,6 +990,7 @@ def randint_like(self: torch.Tensor, high: int, **kwargs: Any) -> torch.Tensor:
 def randint_like_low(
     self: torch.Tensor, low: int, high: int, **kwargs: Any
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Randint_like with explicit low and high via the shared helper.
     return _rand_like(functools.partial(aten.randint.low, low, high), self, **kwargs)
 
 
@@ -921,6 +1000,7 @@ def randint(
     size: list[int | torch.SymInt],
     **kwargs: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Randint with default low of zero: calls the low/high variant.
     return aten.randint.low(0, high, size, **kwargs)
 
 
@@ -935,6 +1015,8 @@ def uniform(
     stride: list[int | torch.SymInt],
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Prim uniform: sample random values for the required storage length of the given strides,
+    # scale to [low, high) (optionally with a generator), and view as strided with shape and stride.
     storage_len = utils.compute_required_storage_length(
         cast(list[int], shape), cast(list[int], stride), 0
     )
@@ -955,6 +1037,8 @@ def linear_dynamic_fp16_unpacked_weight(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Dynamic fp16 linear with unpacked weight: pack the weight with the fbgemm fp16 packer, then
+    # run the fp16 weight linear with the output channel count taken from the weight's first dim.
     packed_weight = torch.ops._quantized.wrapped_fbgemm_pack_gemm_matrix_fp16(weight)
     return torch.ops._quantized.wrapped_fbgemm_linear_fp16_weight(
         input, packed_weight, bias, weight.size()[0]
@@ -974,6 +1058,8 @@ def wrapped_quantized_linear(
     out_zero_point: torch.Tensor,
     out_channel: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Wrapped quantized linear: prepack the weight with its scale, zero point and bias, then
+    # call the prepacked quantized linear with input and output quantization parameters.
     packed_weight = torch.ops._quantized._wrapped_linear_prepack(
         weight, weight_scale, weight_zero_point, bias
     )
@@ -990,7 +1076,11 @@ def wrapped_quantized_linear(
 
 @register_decomposition(torch.ops.quantized.embedding_bag_byte_unpack)
 def q_embedding_bag_byte_unpack_decomp(packed: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Decompose embedding_bag byte unpack: split the last 8 bytes of each row into float32 scale
+    # and offset (bitcast from bytes, honoring byte order) and dequantize the remaining bytes.
     def bitcast_u8_to_f32(u8: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Combine four uint8 slices into int32 and reinterpret as float32 with a trailing axis,
+        # respecting system byte order.
         x, y, z, w = (u8[..., n].to(torch.int32) for n in (0, 1, 2, 3))
         if sys.byteorder == "little":
             return (x + (y << 8) + (z << 16) + (w << 24)).view(torch.float32)[..., None]
@@ -1011,6 +1101,9 @@ def grid_sampler_2d(
     padding_mode: int = 0,
     align_corners: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Grid_sampler_2d via the generic decomposition. Chooses to skip expanding the grid for CPU
+    # bilinear contiguous inputs (performance hack), otherwise expands it.
+    # KNOWN ISSUE: a trailing comment about foreach addcmul/addcdiv sits after the return and is unreachable.
     # We do not expand the grid (_expand_grid=False) on cpu for performance reasons
     # Experimenting locally it was found that compiled CUDA code is accelerated by ~5x
     # and CPU code by ~2x on bicubic mode, if we expand the grid from (N, H, W, 2) into (N, C, H, W, 2)
@@ -1042,12 +1135,19 @@ def _foreach_lerp_scalar(
     end_tensors: list[torch.Tensor],
     weight: torch.types.Number,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Foreach lerp with a scalar weight. Uses foreach sub and addcmul when all tensors share a
+    # dtype and device and are not half precision; otherwise computes per tensor in opmath type
+    # with the end-based formula for weights of large magnitude. Handles complex weights by
+    # casting to the tensor dtype. Returns a list of results.
     def opmath_dtype(t: torch.Tensor) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Float32 for half/bfloat16 tensors, else the tensor's dtype.
         if t.dtype in (torch.float16, torch.bfloat16):
             return torch.float32
         return t.dtype
 
     def cast_weight(dtype: torch.dtype) -> float | complex:
+        # [FUNCTION DOC] HELPER: Weight as a Python number cast to dtype; drops the imaginary part for non-complex
+        # dtypes (using it when nonzero).
         if isinstance(weight, complex) and not dtype.is_complex:
             if weight.imag != 0:
                 return torch.tensor(weight, dtype=dtype).item()
@@ -1055,6 +1155,8 @@ def _foreach_lerp_scalar(
         return torch.tensor(weight, dtype=dtype).item()
 
     def use_high_formula(dtype: torch.dtype) -> bool:
+        # [FUNCTION DOC] HELPER: Whether to use the end-based formula: magnitude at least one half (squared magnitude
+        # at least a quarter for complex weights) after casting to dtype.
         casted_weight = cast_weight(dtype)
         if isinstance(casted_weight, complex):
             return (
@@ -1067,6 +1169,8 @@ def _foreach_lerp_scalar(
     def scalar_tensor(
         dtype: torch.dtype, device: torch.device, high_weight: bool
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Weight as a scalar tensor in dtype/device, replaced by minus (one minus weight) for
+        # the high-weight formula.
         if isinstance(weight, complex) and not dtype.is_complex:
             if weight.imag != 0:
                 weight_tensor = torch.tensor(weight, dtype=dtype, device=device)
@@ -1119,6 +1223,7 @@ def _foreach_lerp_scalarlist(
     end_tensors: list[torch.Tensor],
     scalars: list[torch.types.Number],
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Foreach lerp with per-tensor scalars: start plus (end minus start) times scalar via foreach ops.
     return aten._foreach_add.List(
         start_tensors,
         aten._foreach_mul.ScalarList(
@@ -1139,6 +1244,8 @@ def miopen_batch_norm(
     exponential_average_factor: float,
     epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] MIOpen batch norm via native batch norm. Returns the three outputs in training mode; in
+    # eval mode the saved mean and var outputs are replaced with empty tensors.
     a, b, c = aten.native_batch_norm(
         input,
         weight,
@@ -1161,12 +1268,17 @@ def miopen_batch_norm(
 
 @functools.cache
 def fast_random_decomps() -> dict[Any, Callable[..., Any]]:
+    # [FUNCTION DOC] Cached table: the Inductor decompositions merged with the extra random decompositions.
     return {**decompositions, **extra_random_decomps}
 
 
 # TODO(aakhundov): replace this (and the above) Any by more
 # specific type and fix all the cascading mypy errors
 def select_decomp_table() -> dict[Any, Callable[..., Any]]:
+    # [FUNCTION DOC] Return the decomposition table by config: plain table if fallback_random is set; if
+    # fallback_embedding_bag_byte_unpack is set, removes that op's decomposition from the shared
+    # table (in place) and returns it; otherwise the cached table including random decompositions.
+    # KNOWN ISSUE: the removal permanently mutates the global table for later callers.
     """decomps can change based on config"""
     if config.fallback_random:
         return decompositions
@@ -1184,6 +1296,9 @@ def masked_scatter(
     mask: torch.Tensor,
     source: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Masked_scatter when the backend supports masked scatter with index: broadcast, compute source
+    # positions with a cumulative sum of the mask, gather with an unsafe masked index, and select.
+    # Otherwise NotImplemented.
     from .codegen.common import BackendFeature, has_backend_feature
 
     if has_backend_feature(self.device, BackendFeature.MASKED_SCATTER_WITH_INDEX):
@@ -1205,6 +1320,8 @@ def choose_qparams_tensor(
     eps: float,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Quantized choose_qparams: compute scale from min/max with eps floor, zero point clamped to the
+    # quantization range. Returns (scale as float64, zero point as int64).
     min_val, max_val = torch.aminmax(input)
     scale = (max_val - min_val) / float(quant_max - quant_min)
     scale = torch.max(scale, torch.Tensor([eps]))
@@ -1220,6 +1337,7 @@ def put(
     source: torch.Tensor,
     accumulate: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Put: flatten self, index_put at flat indices with the reshaped source, reshape back.
     flattened = self.flatten()
     flattened = torch.index_put(
         flattened, [index], source.reshape(index.shape), accumulate
@@ -1234,6 +1352,7 @@ def put_(
     source: torch.Tensor,
     accumulate: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] In-place put: compute out of place put and copy into self; returns self.
     out = aten.put(self, index, source, accumulate=accumulate)
     return self.copy_(out)
 
@@ -1246,6 +1365,9 @@ def _softmax_backward_data(
     dim: int,
     input_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Softmax backward: grad times output minus output times its sum along dim (using FMA), cast
+    # to input_dtype if different, and made contiguous.
+    # KNOWN ISSUE: commented-out CPU special case remains in the body.
     new_grad_output = grad_output * output
     sum_new_grad = torch.sum(new_grad_output, dim=dim, keepdim=True)
     # grad_input = new_grad_output - output * sum_new_grad
@@ -1270,6 +1392,9 @@ def index_reduce(
     *,
     include_self: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Index_reduce: checks all tensors are on one device (raises an error otherwise). For mean
+    # (when atomic add is usable) uses index_add and counts; if scatter fallback applies returns
+    # NotImplemented; otherwise expands the index and uses scatter_reduce.
     torch._check(
         self.device == index.device and self.device == src.device,
         lambda: (
@@ -1331,6 +1456,9 @@ def _max_pool_with_indices(
     ceil_mode: bool,
     dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Shared max pool with indices via low memory prims (values with offsets, offsets
+    # converted to indices). Normalizes dilation, padding, stride and kernel to dim-length lists.
+    # Returns NotImplemented if lowering requires fallback or the window exceeds the int8 maximum.
     if dilation == 1:
         dilation = [1] * dim
 
@@ -1387,6 +1515,7 @@ def max_pool2d_with_indices(
     dilation: int | list[int] = 1,
     ceil_mode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Max_pool2d_with_indices using the shared helper with two spatial dims.
     return _max_pool_with_indices(
         x, kernel_size, stride, padding, dilation, ceil_mode, dim=2
     )
@@ -1401,6 +1530,7 @@ def max_pool3d_with_indices(
     dilation: int | list[int] = 1,
     ceil_mode: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Max_pool3d_with_indices using the shared helper with three spatial dims.
     return _max_pool_with_indices(
         x, kernel_size, stride, padding, dilation, ceil_mode, dim=3
     )
@@ -1416,6 +1546,7 @@ def searchsorted_scalar(
     side: str | None = None,
     sorter: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Searchsorted for a scalar value: search a one-element tensor and take the first result.
     return aten.searchsorted(
         sorted_sequence,
         torch.tensor([self], device=sorted_sequence.device),
@@ -1434,6 +1565,7 @@ def bucketize_scalar(
     out_int32: bool = False,
     right: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Bucketize for a scalar value: bucketize a one-element tensor and squeeze the result.
     return aten.bucketize(
         torch.tensor([self], device=boundaries.device),
         boundaries,
@@ -1451,6 +1583,8 @@ def rrelu_with_noise_functional(
     training: bool = False,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Functional rrelu with noise: in training, samples uniform slopes for non-positive inputs and
+    # returns (output, noise); otherwise leaky relu with the mean slope and an empty noise tensor.
     if training:
         not_positive = self <= 0
         r = aten.uniform(self, lower, upper, generator=generator)
@@ -1467,6 +1601,9 @@ def repeat_interleave_Tensor(
     repeat: torch.Tensor,
     output_size: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Repeat_interleave with repeats tensor: only with a known int output_size, not under compile-time
+    # autotune, not on MPS; uses cumulative sum and searchsorted over positions, clamped to the last
+    # index. Otherwise NotImplemented. Raises an error if repeat is not 1-D int32/int64.
     if config.triton.autotune_at_compile_time:
         # We can't compile-time auto-tune this because
         # it expects specific data in `repeat`
@@ -1499,6 +1636,9 @@ def conv1d_to_conv2d(
     dilation: tuple[int] = (1,),
     groups: int = 1,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Not registered. Rewrite a 1-D convolution as 2-D by adding a trailing unit dim to
+    # input and weight and using scalar stride, padding and dilation from the 1-tuples, then
+    # squeeze it. Raises an error unless input and weight are 3-D.
     # Shapes:
     # input:  (N, C_in, L_in)
     # weight: (C_out, C_in // groups, K)
