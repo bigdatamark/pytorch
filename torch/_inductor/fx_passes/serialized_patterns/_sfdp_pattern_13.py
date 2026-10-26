@@ -2,6 +2,10 @@
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
 # cd ~/pytorch && python torchgen/fuse/gen_patterns.py
+# [MODULE DOC] Auto-generated serialized pattern-matcher definitions for scaled-dot-product-attention pattern 13 (plain softmax attention).
+# Builds CallFunction/KeywordArg expression trees at import time and wraps them in the following module-level pattern objects:
+# _sfdp_pattern_13_inference, _sfdp_pattern_13_half_inference.
+# Keyword inputs: key, query, value. Consumed by the fuse_attention pass; do not edit by hand (regenerate with gen_patterns).
 
 import torch
 import torch._inductor

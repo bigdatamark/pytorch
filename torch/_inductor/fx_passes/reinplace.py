@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor FX pass that turns functional ops into in-place variants when it is safe: index_put, generalized
+# view-scatter ops, philox RNG, collectives, foreach ops, auto_functionalized (v1/v2), with_effects wrappers and
+# functional triton kernel wrappers. Also canonicalizes view_scatter ops into a generalized scatter and decomposes it back.
+# Main entry point: reinplace_inplaceable_ops. Import time builds the tables inplaceable_ops, inplaceable_foreach_ops,
+# inplaceable_triton_ops and META_ONLY_OPS (collective ops only if torch.ops._c10d_functional exists).
 import itertools
 import logging
 import operator
@@ -42,12 +47,15 @@ aten = torch.ops.aten
 
 @dataclass(frozen=True)
 class InplaceableOp:
+    # [CLASS DOC] Frozen record pairing an out-of-place op's in-place replacement with the argument index (or tuple of indices)
+    # it mutates. extra_check is a predicate on the node that must also hold before reinplacing (default: always true).
     inplace_op: Callable[..., Any]
     mutated_arg: int | tuple[int, ...]  # Single index or tuple of indices
     extra_check: Callable[[torch.fx.Node], bool] = lambda node: True
 
     @property
     def mutated_args(self) -> tuple[int, ...]:
+        # [FUNCTION DOC] Returns mutated_arg normalized to a tuple of indices (wraps a single int).
         """Return mutated_arg as a tuple for uniform handling."""
         if isinstance(self.mutated_arg, int):
             return (self.mutated_arg,)
@@ -64,6 +72,9 @@ _VIEW_OP_TO_SCATTER = {v: k for k, v in _SCATTER_OP_TO_VIEW.items()}
 
 
 def graph_call_function(graph: torch.fx.Graph, fn, *args, **kwargs):
+    # [FUNCTION DOC] Appends a call_function node to graph while computing its fake output value: argument nodes are replaced
+    # by their meta val, fn is run under V.fake_mode, and the result is stored in node.meta val.
+    # If the fake mode has a shape env and the result has unbacked symbols, stores unbacked_bindings in meta. Returns the node.
     fake_args, fake_kwargs = pytree.tree_map(
         lambda node: node.meta["val"] if isinstance(node, torch.fx.Node) else node,
         (args, kwargs),
@@ -84,6 +95,7 @@ def graph_call_function(graph: torch.fx.Graph, fn, *args, **kwargs):
 
 @dataclass
 class ViewOp:
+    # [CLASS DOC] Plain record of one view operation: target OpOverload plus its extra args and kwargs (excluding the viewed tensor).
     target: torch._ops.OpOverload
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
@@ -92,6 +104,9 @@ class ViewOp:
 def _inplace_generalized_scatter(
     inp: torch.Tensor, src: torch.Tensor, view_ops: list[ViewOp]
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reference semantics of the in-place generalized scatter: applies each ViewOp in sequence to inp
+    # (arguments are fake values from node metadata, with fresh unbacked symbols ignored), then copies src into the final view.
+    # Raises RuntimeError with a shape message if src cannot broadcast into the view. Returns inp (mutated).
     tmp = inp
     for view in view_ops:
         fake_args, fake_kwargs = pytree.tree_map(
@@ -119,6 +134,7 @@ def _inplace_generalized_scatter(
 def _generalized_scatter(
     inp: torch.Tensor, src: torch.Tensor, view_ops: list[ViewOp]
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional generalized scatter: clones inp, then applies the in-place version. Used as a graph target; returns the updated clone.
     out = inp.clone()
     return _inplace_generalized_scatter(out, src, view_ops)
 
@@ -129,6 +145,9 @@ def _decompose_scatter_functional_helper(
     src: torch.Tensor,
     view_ops: list[ViewOp],
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Recursively emits graph nodes for a functional scatter: for a chain of view ops, creates the first view of inp,
+    # recursively scatters src into that view, then emits the matching view_scatter op for the first view with the result.
+    # Returns the final node (the updated inp).
     view_op, view_ops_tail = view_ops[0], view_ops[1:]
 
     if view_ops_tail:
@@ -150,6 +169,8 @@ def _decompose_scatter_functional_helper(
 def _decompose_scatter_functional(
     graph: torch.fx.Graph, node: torch.fx.Node
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Expands a _generalized_scatter node into nested view and view_scatter ops (see docstring example).
+    # Raises AssertionError if node.target is not _generalized_scatter. Returns the new node standing for the updated input.
     """Decompose _generalized_scatter to a sequence of view_scatter operations
 
     e.g. _generalized_scatter(inp, src, [(aten.slice, 0, 0, 10), (aten.slice, 1, 10, -10)])
@@ -170,6 +191,9 @@ def _decompose_scatter_functional(
 def _decompose_scatter_mutating(
     graph: torch.fx.Graph, node: torch.fx.Node
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Expands a generalized scatter node into mutation: clone of inp (only for the functional variant), a chain of views,
+    # and a copy_ of src into the last view. Raises AssertionError for unexpected target or if the node has kwargs.
+    # Returns the (cloned or original) input node which holds the updated value.
     """Decompose _generalized_scatter using mutations
 
     e.g. _generalized_scatter(inp, src, [(aten.slice, 0, 0, 10), (aten.slice, 1, 10, -10)])
@@ -210,6 +234,8 @@ _ALWAYS_MUTATING_SCATTER_OPS = OrderedSet(
 
 
 def scatter_always_uses_mutation(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] True if any view op in the scatter node's view list is an OpOverload in _ALWAYS_MUTATING_SCATTER_OPS (as_strided, diagonal),
+    # whose scatter lowering mutates anyway. Reads the view list from the node's third arg.
     _, _, view_ops = node.args
     view_ops = cast(Sequence[torch.fx.node.Argument], view_ops)
     return any(
@@ -220,6 +246,9 @@ def scatter_always_uses_mutation(node: torch.fx.Node) -> bool:
 
 
 def should_reinplace_scatter(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Decides whether a generalized scatter should be reinplaced (mutating) rather than kept functional.
+    # True if it always mutates, if both input and output are realized, or if the input is a placeholder/get_attr that is copied back
+    # by a user copy_. Otherwise False, assuming fusion makes the functional form cheaper.
     """Choose between mutating and functional scatter decompositions
 
     Reinplacing view scatter ops can be pessimising as it blocks fusion with the
@@ -248,6 +277,9 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
 
 
 def decompose_generalized_scatter(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Replaces every remaining _generalized_scatter and _inplace_generalized_scatter node with ordinary aten ops, using the
+    # mutating decomposition for in-place or always-mutating scatters and the functional one otherwise.
+    # Rewires all uses to the new node and erases the old one. Mutates graph.
     """Replace _generalized_scatter with normal aten ops"""
     for node in itertools.chain(
         graph.find_nodes(op="call_function", target=_generalized_scatter),
@@ -269,6 +301,10 @@ def decompose_generalized_scatter(graph: torch.fx.Graph) -> None:
 
 
 def canonicalize_view_scatter_ops(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Rewrites view_scatter ops (diagonal/select/slice/as_strided scatter) into _generalized_scatter nodes and fuses
+    # a scatter whose source is a generalized scatter of a nested view of the same base into one scatter with a combined view list,
+    # re-creating the intermediate view from the fused result if still used. Tracks per-node view base and view-op chains while
+    # walking the graph. Mutates graph; returns None. Raises AssertionError on malformed scatter nodes.
     """
     This canonicalizes view scatter ops into a generalized form, defined as:
       def scatter(inp, src, views):
@@ -292,6 +328,7 @@ def canonicalize_view_scatter_ops(graph: torch.fx.Graph) -> None:
     node_to_view_op: dict[torch.fx.Node, list[ViewOp]] = defaultdict(list)
 
     def handle_views(node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: Records for a view node its root base and the accumulated list of ViewOps from that base.
         inp = node.args[0]
         node_to_view_base[node] = node_to_view_base.get(inp, inp)  # type: ignore[arg-type, assignment]
         node_to_view_op[node] = [
@@ -304,6 +341,9 @@ def canonicalize_view_scatter_ops(graph: torch.fx.Graph) -> None:
         ]
 
     def handle_view_scatter(node: torch.fx.Node):
+        # [FUNCTION DOC] HELPER: Converts one view scatter node into a generalized scatter node, fusing with a source generalized scatter when can_fuse holds.
+        # Replaces uses and erases the old node (and the fused source node); recreates the source view for remaining users.
+        # Raises AssertionError if args are too few or the target is not an OpOverload.
         if len(node.args) < 2:
             raise AssertionError(f"expected at least 2 args, got {len(node.args)}")
         inp, src = node.args[:2]
@@ -319,6 +359,7 @@ def canonicalize_view_scatter_ops(graph: torch.fx.Graph) -> None:
         )
 
         def can_fuse():
+            # [FUNCTION DOC] HELPER: True if src is a generalized scatter on the same view base whose view chain equals the input's chain plus this scatter's view op.
             if src.target is not _generalized_scatter:  # type: ignore[union-attr]
                 return False
             src_inp, _src_src, _src_scatter_view_op = src.args  # type: ignore[union-attr]
@@ -426,6 +467,7 @@ META_ONLY_OPS = OrderedSet(
 
 
 def _get_view_base(node: torch.fx.Node) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Follows first arguments through view ops and returns the root non-view node (stops if the first arg is not a Node).
     while _is_view_op(node.target) and node.args:
         base = node.args[0]
         if not isinstance(base, torch.fx.Node):
@@ -435,15 +477,18 @@ def _get_view_base(node: torch.fx.Node) -> torch.fx.Node:
 
 
 def _same_tensor_metadata(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: True if both nodes have tensor fake values with statically known equal sizes, strides and storage offset; False otherwise.
     lhs_val = lhs.meta.get("val")
     rhs_val = rhs.meta.get("val")
     if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
         return False
 
     def same_value(lhs_value, rhs_value) -> bool:
+        # [FUNCTION DOC] HELPER: True if the two possibly symbolic values are statically known to be equal.
         return statically_known_true(sym_eq(lhs_value, rhs_value))
 
     def same_sequence(lhs_values, rhs_values) -> bool:
+        # [FUNCTION DOC] HELPER: True if two sequences have equal length and all elements pairwise statically equal.
         return len(lhs_values) == len(rhs_values) and all(
             same_value(lhs_value, rhs_value)
             for lhs_value, rhs_value in zip(lhs_values, rhs_values)
@@ -462,6 +507,8 @@ def _is_layout_preserving_view_copy_back(
     mutated_arg: torch.fx.Node,
     src_base: torch.fx.Node,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the base of the written view matches the mutated arg in layout and the source matches the destination in layout,
+    # so that copying the view back into a graph input is equivalent to mutating that input in place.
     return _same_tensor_metadata(src_base, mutated_arg) and _same_tensor_metadata(
         src, dst
     )
@@ -470,6 +517,8 @@ def _is_layout_preserving_view_copy_back(
 def _is_control_deps_ordering_only_use(
     user: torch.fx.Node, view: torch.fx.Node
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if user is a control_deps higher-order call in which view appears only in the ordering-only deps tuple (first arg)
+    # and not among the passed-through arguments, i.e. not a real data use.
     """Check if view appears only in control_deps' ordering-only additional_deps tuple.
 
     control_deps schema (control_dependencies.py): control_deps(additional_deps, subgraph, *args)
@@ -487,6 +536,12 @@ def _is_control_deps_ordering_only_use(
 
 
 def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Core reinplacing pass over graph (mutated in place). First scans for copy_ nodes writing into placeholders/get_attr and builds
+    # node order, storage-to-nodes maps and copy-back tables (direct and via views). Then visits each node: ops in inplaceable_ops are retargeted to
+    # their in-place op when all mutated args can be reinplaced and extra_check holds; auto_functionalized (v1/v2) and triton wrappers get a reduced
+    # clone list in metadata or kwargs; with_effects wrappers get the inner op swapped and getitem uses redirected; foreach ops are retargeted
+    # when every arg is copied back. Finally redundant copy_ and getitem nodes are replaced and erased. A tensor is reinplaceable only if no later use
+    # of any aliasing view observes it (inputs also need a copy_ epilogue). Raises AssertionError on inconsistent inputs or unknown triton kernel type.
     """
     Reinplaces in-placeable operations.
     If there are no uses of a view of the mutated arg after the current node,
@@ -558,10 +613,13 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                             ] = node
 
     def any_use_of_views_after_node(node, shared_view_nodes, *, copy_node, mutated_arg):
+        # [FUNCTION DOC] HELPER: True if some user of the given aliasing views occurs after node and could observe the mutation. Ignores users at or
+        # after copy_node (the epilogue), meta-only users, copy_ into mutated_arg itself, and control_deps ordering-only uses.
         node_loc = node_order[node]
         copy_node_loc = node_order[copy_node] if copy_node is not None else None
 
         def is_meta_only_user(node):
+            # [FUNCTION DOC] HELPER: True if node is a size/stride/numel/storage-offset op, or a view whose users are all meta-only.
             if _is_view_op(node.target):
                 return all(is_meta_only_user(u) for u in node.users)
             return node.target in META_ONLY_OPS
@@ -597,8 +655,12 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
         return False
 
     def can_inplace(node, mutated_arg):
+        # [FUNCTION DOC] Decides if mutated_arg (a node, or list/tuple of nodes) can be mutated in place by node. Lists require distinct storages and all elements ok.
+        # Rejects args without storage or with internal overlap. For graph inputs requires a copy_ back and no later view uses; for views of inputs requires
+        # a layout-preserving copy back of this op's result; otherwise requires no later use of overlapping views. Returns bool.
         # ls should be a list of tensors that all shares the same storage.
         def _overlap(ls) -> bool:
+            # [FUNCTION DOC] HELPER: True if the given tensors overlap in memory; assumes overlap if a data-dependent guard error occurs.
             try:
                 return len(compute_overlapping_tensors(ls)) != 0
             except GuardOnDataDependentSymNode:
@@ -676,6 +738,8 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
             )
 
     def copy_node_for_reinplaced_arg(node, mutated_arg):
+        # [FUNCTION DOC] HELPER: Finds the epilogue copy_ node that writes this op's result back to mutated_arg, directly or via views (the via-views
+        # case is verified layout preserving, else returns None). Returns None if there is none.
         copy_node = copy_args_to_copy_nodes.get((mutated_arg, node))
         if copy_node is None:
             copy_node = copy_args_to_copy_nodes_via_views.get((mutated_arg, node))
@@ -693,6 +757,7 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
         return copy_node
 
     def all_can_inplace(node, mutated_args):
+        # [FUNCTION DOC] HELPER: True if can_inplace holds for every arg in mutated_args.
         return all(can_inplace(node, arg) for arg in mutated_args)
 
     def log_inplace_results(
@@ -703,10 +768,13 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
         missed_nodes,
         trigger,
     ):
+        # [FUNCTION DOC] HELPER: Logs (info) which tensors were attempted, kept as clones, and missed, with the total static-shape bytes of missed
+        # opportunities, and records missed count and bytes in ReinplaceCounters for the trigger. Side effects: logging and counter updates.
         # Total size of possibly_missed_reinplacing_opportunities for tensors with static shapes.
         missed_bytes = 0
 
         def bytes(node):
+            # [FUNCTION DOC] HELPER: Size in bytes of the node's fake tensor value (element size times numel) if statically known, else 0.
             t = node.meta.get("val", None)
             if (
                 t is not None
@@ -744,6 +812,10 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
     def reinplace_and_refine_tensors_to_clone(
         old_tensors_to_clone, kwargs, node_name, trigger
     ):
+        # [FUNCTION DOC] Given argument names/indices of an auto_functionalized or triton node, decides which can be reinplaced and returns the list that
+        # must still be cloned. Does not reinplace two args sharing storage with one already reinplaced. For each reinplaceable arg, records epilogue copy_ nodes
+        # (and, except for auto_functionalize v2, getitem users selecting the arg) in replace_dict, and logs results.
+        # Raises AssertionError if an arg is missing from kwargs.
         tensors_to_clone: list[str] = []
         storage_of_reinplaced_args = OrderedSet[int | None]()
 
@@ -753,6 +825,8 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
 
         # TODO this logic can be made more precise using _overlap
         def tensor_with_same_storage_already_reinplaced(arg):
+            # [FUNCTION DOC] HELPER: True if the storage of the arg (each element if a list/tuple) is already in storage_of_reinplaced_args.
+            # KNOWN ISSUE: the non-list branch reads the enclosing loop variable mutated_arg rather than the arg parameter; behaves the same only because callers pass that value.
             if isinstance(arg, (list, tuple)):
                 return any(
                     get_node_storage(a) in storage_of_reinplaced_args for a in arg
@@ -920,16 +994,21 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
                     # to the input tensors.
 
                     def get_index_from_node(n):
+                        # [FUNCTION DOC] HELPER: Returns the index argument of a getitem node, or None if n is not a getitem.
                         """Extract the index from a getitem node."""
                         if n.target is operator.getitem:
                             return n.args[1]
                         return None
 
                     def is_getitem_node(n, parent):
+                        # [FUNCTION DOC] HELPER: True if n is a getitem node indexing into parent.
                         """Check if node n is a getitem indexing into parent."""
                         return n.target is operator.getitem and n.args[0] is parent
 
                     def replace_and_collect(current_node, replacement_tensors):
+                        # [FUNCTION DOC] HELPER: Recursively fills replace_dict so getitem results of a with_effects node are replaced by the input tensors they correspond to.
+                        # Children are recorded before parents. Leaf nodes map to the single replacement; otherwise getitem users are matched by integer index into the replacement
+                        # list. Returns True if all children were replaced.
                         """
                         Collect replacements for getitem nodes into replace_dict.
                         Nodes are added in child-first order so children are erased before parents.
@@ -1063,6 +1142,8 @@ def reinplace_inplaceable_ops(
     fake_tensor_updater: torch._inductor.fx_utils.FakeTensorUpdater,
     graph: torch.fx.Graph,
 ) -> None:
+    # [FUNCTION DOC] Public entry: under the python dispatcher, canonicalizes view scatter ops, refreshes fake tensor alias info with fake_tensor_updater,
+    # runs the core reinplace pass, then decomposes generalized scatters. Mutates graph.
     with enable_python_dispatcher():
         canonicalize_view_scatter_ops(graph)
         # canonicalize_view_scatter_ops adds new operations to the graph.

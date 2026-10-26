@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor FX pass replacing aten random ops (rand, randn, randint) with inductor_prims random ops
+# driven by explicit seeds, and fusing the per-device seed/offset creation nodes into single nodes.
+# Registers graph patterns into a module-level PatternMatcherPass (joint_graph_passes) at import time.
 import collections
 import logging
 
@@ -23,6 +26,11 @@ aten = torch.ops.aten
 
 
 def _shape_to_offset(shape, device: torch.device):
+    # [FUNCTION DOC] HELPER: Computes the Philox RNG offset consumed by generating a tensor of the given shape on device.
+    # Returns 0 for empty tensors (statically or via guard_or_false) and for non-cuda devices; device may be None
+    # (cpu), a string, or a torch.device. For cuda it mirrors the philox offset formula: grid size is clamped
+    # between 1 and the max resident grid from device properties, then offset is a ceil division times 4.
+    # Queries CUDA device properties; may return a symbolic value for symbolic shapes.
     # Modified from torch/_prims/rng_prims.py:philox_rand_offset
     nelem = 1
     for s in shape:
@@ -57,6 +65,9 @@ def _shape_to_offset(shape, device: torch.device):
 
 
 def replace_random_passes(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] Entry point: runs the random-replacement patterns, then fuses seed creation, and (if
+    # config.align_random_eager) fuses eager-offset creation, each under a GraphTransformObserver.
+    # Returns total number of rewrites, or 0 immediately if config.fallback_random is set. Mutates gm.
     """Modify the given FX graph to use backend-native random ops"""
     if config.fallback_random:
         return 0
@@ -72,6 +83,10 @@ def replace_random_passes(gm: torch.fx.GraphModule):
 
 
 def fuse_offset_creation_pass(graph: torch.fx.Graph) -> int:
+    # [FUNCTION DOC] Groups all rand_eager_offset call nodes by device (second arg) and replaces each group with one
+    # rand_eager_offsets node placed before the first of the group, plus a select node per original offset.
+    # The combined node gets fake-tensor metadata (int64, shape count x 2) and the original uses are rewired
+    # and old nodes erased. Mutates graph in place; returns the number of devices fused (0 if none).
     """
     Here offset node means seed << 32 + offset, will unpacked in lowering.py:inductor_random()
     Horizontally fuse all the seed generation on each device
@@ -119,6 +134,10 @@ def fuse_offset_creation_pass(graph: torch.fx.Graph) -> int:
 
 
 def fuse_seed_creation_pass(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Groups all inductor_prims.seed nodes by device (first arg) and replaces each group with a single
+    # seeds node (count, device) placed before the first one, plus a lookup_seed node per original seed.
+    # Combined node gets fake metadata (int64 vector of length count); old seed nodes are replaced and erased.
+    # Mutates graph in place; returns number of devices fused (0 if none). Exists because seed creation is launch bound.
     """
     Horizontally fuse all the seed generation on each device
 
@@ -165,10 +184,12 @@ def fuse_seed_creation_pass(graph: torch.fx.Graph):
 
 
 def default_kwargs(device):
+    # [FUNCTION DOC] HELPER: Returns extra keyword arguments for inductor_prims.random for a device; currently always empty.
     return {}
 
 
 def get_device(device):
+    # [FUNCTION DOC] HELPER: Returns the given device if not None, else the device of a default-created tensor (the current default device).
     if device is not None:
         return device
     return torch.empty([]).device  # default device
@@ -192,12 +213,18 @@ def replace_random(
     layout=None,
     pin_memory=None,
 ):
+    # [FUNCTION DOC] Pattern handler for aten rand/randn (default and generator overloads). Skips (no change) if a generator
+    # is given or pin_memory is set. Otherwise replaces the call with inductor_prims.random using a fresh seed node
+    # and mode 'rand' or 'randn', casting to dtype if given. With config.align_random_eager on cuda and mode rand,
+    # uses an eager-offset node (from _shape_to_offset) instead of a seed, passing align_dtype.
+    # Replacement is done via match.replace_by_example; layout is ignored.
     if generator is not None:
         return
     if pin_memory:
         return
 
     def replacement(size):
+        # [FUNCTION DOC] HELPER: Replacement body traced by replace_by_example: builds the random tensor from a seed, mode and size, casting to dtype if set.
         result = inductor_prims.random(
             size, inductor_prims.seed(device), mode, **default_kwargs(device)
         )
@@ -217,6 +244,8 @@ def replace_random(
     if mode == "rand" and config.align_random_eager and device.type == "cuda":
         # Only enable when align_random_eager is on.
         def replacement_align(size):
+            # [FUNCTION DOC] HELPER: Replacement body for eager-aligned rand on cuda: computes the philox offset for the size, creates an
+            # eager-offset node, calls inductor_prims.random with align_dtype (first element if dtype is a sequence), then casts to dtype if set.
             offset = _shape_to_offset(size, device)
 
             align_dtype = dtype
@@ -253,10 +282,14 @@ def replace_randint(
     layout=None,
     pin_memory=None,
 ):
+    # [FUNCTION DOC] Pattern handler for aten.randint.low. Skips if pin_memory is set; otherwise replaces the call with
+    # inductor_prims.randint(low, high, size, seed) cast to dtype (default int64), resolving device via get_device.
+    # layout is ignored.
     if pin_memory:
         return
 
     def replacement(low, high, size):
+        # [FUNCTION DOC] HELPER: Replacement body for randint: builds the integer random tensor from low, high, size and a fresh seed, then casts to dtype.
         result = inductor_prims.randint(low, high, size, inductor_prims.seed(device))
         return result.to(dtype)
 
