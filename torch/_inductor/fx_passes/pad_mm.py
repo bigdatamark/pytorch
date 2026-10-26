@@ -1,3 +1,8 @@
+# [MODULE DOC] Inductor post-grad pass that pads matrix dimensions of mm, bmm and addmm to dtype-specific alignment
+# multiples (8 for fp16/bf16, 4 for fp32) when benchmarking or heuristics say padded matmul is faster.
+# Contains: safety checks (can_pad), performance checks (should_pad, benchmark cache, autoheuristic),
+# padding/replacement functions, and _pad_mm_init which registers the patterns.
+# Import-time side effects: none beyond defining module globals (aten alias, _skip_do_bench_times test flag).
 import functools
 import itertools
 import operator
@@ -47,6 +52,8 @@ _skip_do_bench_times = False
 
 
 def fetch_fake_tensors(match: Match, kwarg_names: Sequence[str]) -> list[Tensor]:
+    # [FUNCTION DOC] HELPER: Collect the fake tensor values (stored in node meta under the value key) for the given kwarg names of a pattern match.
+    # Returns a list in the same order as kwarg_names.
     kwargs = match.kwargs
     return [kwargs[name].meta["val"] for name in kwarg_names]
 
@@ -54,8 +61,11 @@ def fetch_fake_tensors(match: Match, kwarg_names: Sequence[str]) -> list[Tensor]
 def unwrap_fake_args(
     *arg_names: str,
 ) -> Callable[[Callable[..., Any]], Callable[[Match], Any]]:
+    # [FUNCTION DOC] HELPER: Decorator factory. The decorated function is wrapped so it takes a Match and is called with the fake tensors of the named match kwargs.
     def decorator(func: Callable[..., Any]) -> Callable[[Match], Any]:
+        # [FUNCTION DOC] HELPER: Wrap func into a function of a Match.
         def wrapper(match: Match) -> Any:
+            # [FUNCTION DOC] HELPER: Fetch the fake tensors for the captured arg names and call func with them, returning its result.
             fake_tensors = fetch_fake_tensors(match, arg_names)
             return func(*fake_tensors)
 
@@ -65,10 +75,12 @@ def unwrap_fake_args(
 
 
 def get_alignment_size(x: Tensor) -> int:
+    # [FUNCTION DOC] Return the padding alignment size (in elements) for a tensor, based on its dtype.
     return get_alignment_size_dtype(x.dtype)
 
 
 def get_alignment_size_dtype(dtype: torch.dtype) -> int:
+    # [FUNCTION DOC] Return 8 for half/bfloat16, 4 for float32, and 0 (meaning never pad) for any other dtype.
     if dtype == torch.float16 or dtype == torch.half or dtype == torch.bfloat16:
         return 8
     elif dtype == torch.float32 or dtype == torch.float:
@@ -78,16 +90,19 @@ def get_alignment_size_dtype(dtype: torch.dtype) -> int:
 
 
 def check_device(a: Tensor, b: Tensor) -> bool:
+    # [FUNCTION DOC] True if both tensors are on CUDA or both are on XPU.
     return (a.is_cuda and b.is_cuda) or (a.is_xpu and b.is_xpu)
 
 
 def check_dtype(a: Tensor, b: Tensor) -> bool:
+    # [FUNCTION DOC] True if both tensors are floating point.
     return a.is_floating_point() and b.is_floating_point()
 
 
 def hint_symbols(
     ds: Sequence[int | torch.SymInt],
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Map each (possibly symbolic) dimension to a concrete optimization hint integer; returns a list of ints.
     """Helper to convert symbolic dimensions to their concrete hint values."""
     from torch.fx.experimental.symbolic_shapes import optimization_hint
 
@@ -100,6 +115,10 @@ def can_pad(
     op: torch._ops.OpOverloadPacket,
     input: Tensor | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Safety check: decide whether padding is possible for an mm/addmm/bmm call.
+    # Returns False if shape padding is disabled, devices are not both CUDA/XPU, dtypes are not float, any tensor has no static dim,
+    # any dim is zero, the op is unsupported, no dim needs padding, deterministic mode is on without force/autoheuristic, or triton is missing.
+    # Raises RuntimeError if a size is neither int nor SymInt. Reads inductor config only.
     """
     Determines if an operation CAN be padded (safety checks).
     All logic related to whether it's safe to pad should be here.
@@ -107,6 +126,7 @@ def can_pad(
 
     # Can't pad if there is no static dims, we pad static dims only.
     def has_one_static_dim(t: Tensor) -> bool:
+        # [FUNCTION DOC] HELPER: True if the tensor has at least one plain int dimension; raises RuntimeError for an unexpected size type.
         """Return False if all dimensions are symbolic — nothing concrete to pad."""
         for x in t.size():
             if isinstance(x, int):
@@ -176,6 +196,8 @@ def can_pad(
 
 
 def get_padded_length(x: int | torch.SymInt, alignment_size: int) -> int:
+    # [FUNCTION DOC] Number of elements to add to x to reach the next multiple of alignment_size.
+    # Returns 0 for symbolic x, zero alignment, already aligned x, or x equal to 1 (squeezable).
     # we don't pad x if it is symbolic
     if isinstance(x, torch.SymInt) or alignment_size == 0 or x % alignment_size == 0:
         return 0
@@ -188,6 +210,7 @@ def get_padded_length(x: int | torch.SymInt, alignment_size: int) -> int:
 
 
 def pad_dim(x: Tensor, padded_length: int, dim: int) -> Tensor:
+    # [FUNCTION DOC] Append padded_length zeros to tensor x along dim by concatenation; returns x unchanged when padded_length is 0.
     if padded_length == 0:
         return x
     pad = x.new_zeros(*x.shape[:dim], padded_length, *x.shape[dim + 1 :])
@@ -197,10 +220,12 @@ def pad_dim(x: Tensor, padded_length: int, dim: int) -> Tensor:
 def addmm_pattern(
     input: Tensor, mat1: Tensor, mat2: Tensor, beta: float, alpha: float
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Search pattern for addmm with beta and alpha scalars; calls the aten addmm op.
     return aten.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
 
 
 def _is_statically_expandable_to(shape: torch.Size, desired: Sequence[Any]) -> bool:
+    # [FUNCTION DOC] HELPER: True if shape can be statically broadcast to desired (right-aligned; each dim equals the target or is 1, proven statically).
     if len(shape) > len(desired):
         return False
     return all(
@@ -210,6 +235,8 @@ def _is_statically_expandable_to(shape: torch.Size, desired: Sequence[Any]) -> b
 
 
 def should_pad_addmm(match: Match) -> bool:
+    # [FUNCTION DOC] Extra-check for addmm matches. Returns False for beta of zero on CUDA when the input is not statically expandable to the output shape;
+    # otherwise defers to should_pad with the addmm op.
     mat1, mat2, input = fetch_fake_tensors(match, ("mat1", "mat2", "input"))
     beta = match.kwargs["beta"]
     if (
@@ -235,6 +262,9 @@ def pad_addmm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Compute addmm with padded operands then slice the result back to original size.
+    # Pads mat1/mat2 (unless already pre-padded) and pads the bias along n and m when it is not broadcast (size 1),
+    # runs addmm, and trims m_padded_length rows and n_padded_length columns. Returns the unpadded-shape result.
     # for paddings, dim order is reversed for some reasons
     # and for every dim, we need to specify left and right padding
     if not mat1_pre_padded:
@@ -272,6 +302,7 @@ def addmm_replace(
     beta: float = 1.0,
     alpha: float = 1.0,
 ) -> Tensor:
+    # [FUNCTION DOC] Replacement function for the addmm pattern: computes per-dim padded lengths from alignment and calls pad_addmm.
     k_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
     n_padded_length = get_padded_length(mat2.shape[1], get_alignment_size(mat2))
     m_padded_length = get_padded_length(mat1.shape[0], get_alignment_size(mat1))
@@ -288,6 +319,8 @@ def addmm_replace(
 
 
 def is_mm_compute_bound(M: int, K: int, N: int, dtype: torch.dtype) -> bool:
+    # [FUNCTION DOC] Heuristic: True if the matmul of shape MxK by KxN is compute bound, using arithmetic intensity versus half the machine balance.
+    # Returns False for zero-sized problems; forces True for bf16 with large K on pre-Hopper GPUs/XPU, or if device info lookup fails.
     denominator = M * K + N * K + M * N
     if denominator == 0:
         return False
@@ -322,22 +355,27 @@ def is_mm_compute_bound(M: int, K: int, N: int, dtype: torch.dtype) -> bool:
 
 @functools.cache
 def get_pad_cache() -> torch._inductor.codecache.LocalCache:
+    # [FUNCTION DOC] HELPER: Return the process-wide (cached) LocalCache used for padding decisions and benchmark times.
     return torch._inductor.codecache.LocalCache()
 
 
 def get_cached_should_pad(key: str) -> bool:
+    # [FUNCTION DOC] HELPER: Look up a cached padding decision by key; None if absent.
     return get_pad_cache().lookup(key)  # type: ignore[return-value]
 
 
 def set_cached_should_pad(key: str, value: bool) -> None:
+    # [FUNCTION DOC] HELPER: Store a padding decision in the cache.
     return get_pad_cache().set_value(key, value=value)
 
 
 def get_cached_base_mm_benchmark_time(key: str) -> float:
+    # [FUNCTION DOC] HELPER: Look up a cached original-mm benchmark time by key; None if absent.
     return get_pad_cache().lookup(key)  # type: ignore[return-value]
 
 
 def set_cached_base_mm_benchmark_time(key: str, value: float) -> None:
+    # [FUNCTION DOC] HELPER: Store an original-mm benchmark time in the cache.
     return get_pad_cache().set_value(key, value=value)
 
 
@@ -349,7 +387,10 @@ def should_pad_bench_key(
     input: Tensor | None = None,
     is_base_time_key: bool = False,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build the string cache key for a padding decision from operand shapes/strides/dtypes, whether padding time is excluded,
+    # the op, the optional bias, and the tf32 setting. With is_base_time_key the pad-exclusion parts are omitted and a prefix is added.
     def tensor_key(t: Tensor) -> tuple[torch.Size, tuple[int, ...], torch.dtype]:
+        # [FUNCTION DOC] HELPER: Tuple of shape, stride and dtype for a tensor.
         return (t.shape, t.stride(), t.dtype)
 
     tf32_key = (
@@ -360,6 +401,7 @@ def should_pad_bench_key(
     )
 
     def fmt_pad(name: str) -> str | None:
+        # [FUNCTION DOC] HELPER: Return the pad-exclusion key text for an operand, or None for base-time keys.
         if is_base_time_key:
             return None
         return f"exclude_pad:{should_exclude_padding_time(match, name)}"
@@ -381,6 +423,7 @@ def should_pad_bench_key(
 
 
 def get_non_view_def(node: torch.fx.Node) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Walk back through getitem and view nodes to the defining non-view node.
     if node.op == "call_function" and node.target is operator.getitem:
         return get_non_view_def(node.args[0])  # type: ignore[arg-type]
 
@@ -395,6 +438,9 @@ def get_non_view_def(node: torch.fx.Node) -> torch.fx.Node:
 
 
 def should_exclude_padding_time(match: Match, arg_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether the cost of padding the named operand should be excluded from benchmarking because it can be memory planned away.
+    # False if the operand is not contiguous or is produced by an op whose output cannot be planned (mm, conv, bmm, addmm, attention, large cat);
+    # otherwise True unless it is a graph input placeholder.
     from torch._prims_common import is_contiguous_or_false
 
     node_def = get_non_view_def(match.kwargs[arg_name])
@@ -436,6 +482,8 @@ def should_exclude_padding_time(match: Match, arg_name: str) -> bool:
 
 
 def is_padded_faster(key: str, ori_time: float, pad_time: float) -> bool:
+    # [FUNCTION DOC] Decide whether padded is faster: original time must exceed padded time times a multiplier (default 1.1, overridable via fusion options).
+    # Side effects: stores the result in the pad cache and bumps a counter when the multiplier option is used. Always True if the test skip flag is set.
     """
     Determines if padding is beneficial by comparing benchmark times.
     Helper function that applies a multiplier to account for memory ops overhead.
@@ -455,6 +503,7 @@ def is_padded_faster(key: str, ori_time: float, pad_time: float) -> bool:
 
 
 def should_pad_mm_bf16(dtype: torch.dtype, M: int, N: int, K: int) -> bool:
+    # [FUNCTION DOC] HELPER: True to force padding for bf16 mm with large odd N and K at or above a configured threshold on pre-Hopper GPUs/XPU.
     # always force pad for mm with bf16 when the following are satisfied to avoid perf regression
     large_k_threshold_to_pad = torch._inductor.config.post_grad_fusion_options[
         "pad_aten_mm_pass"
@@ -478,6 +527,7 @@ def should_pad(
     op: torch._ops.OpOverloadPacket,
     input: Tensor | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Extra-check entry point: padding must be allowed (can_pad) and worthwhile (_should_pad).
     _can_pad = can_pad(mat1, mat2, op, input)
     # Note that if you're tempted to insert a dynamo_timed call here, this function can
     # be called enough that the dynamo_timed overhead is not negligible.
@@ -485,6 +535,7 @@ def should_pad(
 
 
 def get_do_bench() -> Callable[[Callable[[], Any]], float]:
+    # [FUNCTION DOC] HELPER: Return a benchmark callable (GPU benchmarker with 5 warmup) mapping a function to its time.
     return functools.partial(
         # pyrefly: ignore [bad-argument-type]
         torch._inductor.runtime.benchmarking.benchmarker.benchmark_gpu,
@@ -502,6 +553,9 @@ def _should_pad(
     op: torch._ops.OpOverloadPacket,
     input: Tensor | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Performance check for padding (memoized). Computes padded lengths; returns True if force_shape_pad is set or the bf16 rule fires,
+    # False if not compute bound or op unsupported, else uses cached decision, autoheuristic (mm only), or benchmarks original vs padded.
+    # Returns False in deterministic mode if no autoheuristic decision. Side effects: allocates random tensors, runs benchmarks, updates caches and counters.
     """
     Determines if an operation SHOULD be padded (performance checks).
     All logic related to whether padding would be performant should be here.
@@ -554,6 +608,7 @@ def _should_pad(
             return cached_pad
 
         def realize_tensor(t):
+            # [FUNCTION DOC] HELPER: Create a real random tensor matching a tensor's shape and strides (using size hints for fake/symbolic tensors).
             if is_fake_tensor(t):
                 size_hints = hint_symbols(t.size())
                 # pyrefly: ignore [bad-argument-type]
@@ -595,6 +650,7 @@ def _should_pad(
             )
 
             def write_pad():
+                # [FUNCTION DOC] HELPER: Zero the padded corner region of the pre-padded mat1 buffer (benchmarks the cost of writing pad).
                 if is_bmm:
                     mat1_pad[:, -m_padded_length:, -k_padded_length:].fill_(0)
                 else:
@@ -612,6 +668,7 @@ def _should_pad(
             )
 
             def write_pad():
+                # [FUNCTION DOC] HELPER: Zero the padded corner region of the pre-padded mat2 buffer.
                 if is_bmm:
                     mat2_pad[:, -k_padded_length:, -n_padded_length:].fill_(0)
                 else:
@@ -661,12 +718,14 @@ def _should_pad(
             )
 
         def orig_bench_fn():
+            # [FUNCTION DOC] HELPER: Run the original unpadded op once for benchmarking.
             if op is torch.ops.aten.bmm or op is torch.ops.aten.mm:
                 op(mat1, mat2)
             else:
                 op(input, mat1, mat2)
 
         def pad_bench_fn():
+            # [FUNCTION DOC] HELPER: Run all padding benchmark steps once.
             for fn in fns:
                 fn()
 
@@ -715,6 +774,7 @@ def get_context(
     k_padded_length: int,
     n_padded_length: int,
 ) -> AHContext:
+    # [FUNCTION DOC] HELPER: Build the autoheuristic context with m/k/n, strides, padded lengths, alignment sizes, dtypes, pre-padded flags and tf32 usage.
     context = AHContext()
 
     context.add_feature("m", mat1.shape[0])
@@ -756,9 +816,12 @@ def run_autoheuristic(
     ori_time_key: str,
     key: str,
 ) -> bool | None:
+    # [FUNCTION DOC] HELPER: Ask the AutoHeuristic for pad vs original. Returns True/False for a decision, or None when it defers to autotuning.
+    # Side effects: may benchmark and collect feedback; caches the decision or benchmark times.
     def feedback_fn(
         choice: str,
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Benchmark feedback for a choice (original or pad); None for unknown choices.
         if choice == orig_choice:
             return do_bench(orig_bench_fn)
         elif choice == pad_choice:
@@ -766,6 +829,7 @@ def run_autoheuristic(
         return None
 
     def fallback() -> str:
+        # [FUNCTION DOC] HELPER: Fallback choice name meaning autotune.
         return "autotune"
 
     orig_choice = "orig"
@@ -810,10 +874,12 @@ def run_autoheuristic(
 
 
 def mm_pattern(mat1: Tensor, mat2: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Search pattern for mm; calls the aten mm op.
     return aten.mm(mat1, mat2)
 
 
 def should_pad_mm(match: Match) -> bool:
+    # [FUNCTION DOC] Extra-check for mm matches: delegates to should_pad with the mm op.
     mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
     return should_pad(match, mat1, mat2, torch.ops.aten.mm)
 
@@ -821,6 +887,7 @@ def should_pad_mm(match: Match) -> bool:
 def pad_mat1(
     mat1: Tensor, *, m_padded_length: int, k_padded_length: int, is_bmm: bool = False
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Pad mat1 on the right (k) and bottom (m) with zeros via constant padding; extra batch dim handled when is_bmm. Returns mat1 unchanged if no padding.
     if k_padded_length != 0 or m_padded_length != 0:
         # dim order is reversed for constant_pad_nd, for every dim we specify right and left padding
         pad_arg = [0, k_padded_length, 0, m_padded_length]
@@ -834,6 +901,7 @@ def pad_mat1(
 def pad_mat2(
     mat2: Tensor, *, k_padded_length: int, n_padded_length: int, is_bmm: bool = False
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Pad mat2 on the right (n) and bottom (k) with zeros via constant padding; extra batch dim handled when is_bmm. Returns mat2 unchanged if no padding.
     if k_padded_length != 0 or n_padded_length != 0:
         # dim order is reversed for constant_pad_nd, for every dim we specify right and left padding
         pad_arg = [0, n_padded_length, 0, k_padded_length]
@@ -853,6 +921,7 @@ def pad_mm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Compute mm on padded operands (skipping those pre-padded) and slice off padded rows/columns of the result.
     if not mat1_pre_padded:
         mat1 = pad_mat1(
             mat1, m_padded_length=m_padded_length, k_padded_length=k_padded_length
@@ -870,6 +939,7 @@ def pad_mm(
 
 
 def mm_replace(mat1: Tensor, mat2: Tensor) -> Tensor:
+    # [FUNCTION DOC] Replacement function for the mm pattern: computes padded lengths from alignment and calls pad_mm.
     k_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
     m_padded_length = get_padded_length(mat1.shape[0], get_alignment_size(mat1))
     n_padded_length = get_padded_length(mat2.shape[1], get_alignment_size(mat2))
@@ -883,10 +953,12 @@ def mm_replace(mat1: Tensor, mat2: Tensor) -> Tensor:
 
 
 def bmm_pattern(mat1: Tensor, mat2: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Search pattern for bmm; calls the aten bmm op.
     return aten.bmm(mat1, mat2)
 
 
 def should_pad_bmm(match: Match) -> bool:
+    # [FUNCTION DOC] Extra-check for bmm matches: delegates to should_pad with the bmm op.
     mat1, mat2 = fetch_fake_tensors(match, ("mat1", "mat2"))
     return should_pad(match, mat1, mat2, torch.ops.aten.bmm)
 
@@ -900,6 +972,7 @@ def pad_bmm(
     mat1_pre_padded: bool = False,
     mat2_pre_padded: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Compute bmm on padded operands (skipping those pre-padded) and slice off padded rows/columns of the result.
     if not mat1_pre_padded:
         mat1 = pad_mat1(
             mat1,
@@ -923,6 +996,7 @@ def pad_bmm(
 
 
 def bmm_replace(mat1: Tensor, mat2: Tensor) -> Tensor:
+    # [FUNCTION DOC] Replacement function for the bmm pattern: computes padded lengths from alignment and calls pad_bmm.
     k_padded_length = get_padded_length(mat1.shape[2], get_alignment_size(mat1))
     n_padded_length = get_padded_length(mat2.shape[2], get_alignment_size(mat2))
     m_padded_length = get_padded_length(mat1.shape[1], get_alignment_size(mat1))
@@ -937,6 +1011,9 @@ def bmm_replace(mat1: Tensor, mat2: Tensor) -> Tensor:
 
 @functools.cache
 def _pad_mm_init(input_device: torch.device | None = None) -> None:
+    # [FUNCTION DOC] HELPER: One-time (cached) registration of mm, bmm and addmm padding replacements, each in training and inference variants.
+    # Picks the trace device from input_device or availability (cuda, xpu, else cpu), builds dummy args, and calls gen_register_replacement
+    # into the joint graph patterns. Raises AssertionError if a workaround entry is not a mapping.
     from .joint_graph import patterns
 
     if input_device:
