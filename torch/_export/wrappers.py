@@ -1,3 +1,9 @@
+# [MODULE DOC] Export tracing wrappers. Defines the _export_tracepoint higher-order op (an identity op
+# that marks module call inputs/outputs in traced graphs), helpers to hook submodules with it
+# and record their call specs, a strict-mode marker, and experimental decorators that make
+# tensor-subclass constructors and custom autograd Function.apply traceable in the
+# pre-dispatch export graph via flat_apply. Import-time side effects: instantiates the
+# _export_tracepoint op and registers its proxy, fake, functionalize, Autograd and CPU impls.
 import inspect
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
@@ -38,10 +44,14 @@ _R = TypeVar("_R")
 
 
 class ExportTracepoint(HigherOrderOperator):
+    # [CLASS DOC] Higher-order operator named _export_tracepoint. It is an identity on its tensor
+    # arguments; keyword arguments (kind, path) are metadata that survive in the exported graph.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Register the operator under the name _export_tracepoint.
         super().__init__("_export_tracepoint")
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Invoke the higher-order op dispatch with the given arguments and return its result.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(*args, **kwargs)
 
@@ -53,6 +63,9 @@ _export_tracepoint = ExportTracepoint()
 def export_tracepoint_dispatch_mode(
     mode: ProxyTorchDispatchMode, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC] Proxy-mode implementation: unwraps proxies from the arguments, records a call to
+    # the tracepoint op in the traced graph, and returns the original args tracked to that
+    # proxy's outputs.
     # pyrefly: ignore[missing-attribute]  # TODO tracer is PythonKeyTracer here, not _GraphAppendingTracerEx
     p_args, p_kwargs = pytree.tree_map(mode.tracer.unwrap_proxy, (args, kwargs))
     proxy = mode.tracer.create_proxy(
@@ -63,6 +76,7 @@ def export_tracepoint_dispatch_mode(
 
 @register_fake(_export_tracepoint, skip_cache=True)
 def export_tracepoint_fake_tensor_mode(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Fake-tensor implementation: returns the positional args unchanged as a tuple.
     return args
 
 
@@ -70,6 +84,8 @@ def export_tracepoint_fake_tensor_mode(*args: Any, **kwargs: Any) -> tuple[Any, 
 def export_tracepoint_functional(
     ctx: "BaseFunctionalizeAPI", *args: Any, **kwargs: Any
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Functionalization implementation: unwraps functional tensors, redispatches the
+    # tracepoint op to the next layer for its graph effect, and returns the original args.
     unwrapped_args = ctx.unwrap_tensors(args)
     # pyrefly: ignore[bad-argument-type]  # TODO unwrap_tensors accepts pytrees at runtime
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
@@ -86,6 +102,7 @@ _export_tracepoint.py_impl(DispatchKey.Autograd)(
 
 @_export_tracepoint.py_impl(DispatchKey.CPU)
 def export_tracepoint_cpu(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Eager CPU implementation: returns the positional args unchanged as a tuple.
     return args
 
 
@@ -94,6 +111,11 @@ def _wrap_submodule(
     path: str,
     module_call_specs: dict[str, dict[str, pytree.TreeSpec]],
 ) -> tuple["RemovableHandle", "RemovableHandle"]:
+    # [FUNCTION DOC] HELPER: Look up the submodule at a dotted path under mod and register forward pre and
+    # post hooks that route flattened inputs and outputs through the tracepoint op (kinds
+    # module_call_inputs / module_call_outputs). The post hook records the input and output
+    # tree specs for the path into module_call_specs. Returns the two removable handles.
+    # Raises AssertionError if mod is not an nn.Module or path is empty.
     if not isinstance(mod, torch.nn.Module):
         raise AssertionError(f"expected torch.nn.Module, got {type(mod)}")
     if path == "":
@@ -103,6 +125,8 @@ def _wrap_submodule(
     def update_module_call_signatures(
         path: str, in_spec: pytree.TreeSpec, out_spec: pytree.TreeSpec
     ) -> None:
+        # [FUNCTION DOC] HELPER: Store the in/out specs for path in module_call_specs; if the path was
+        # already recorded, raises AssertionError when either spec differs from the stored one.
         if path in module_call_specs:
             if module_call_specs[path]["in_spec"] != in_spec:
                 raise AssertionError(
@@ -115,6 +139,8 @@ def _wrap_submodule(
         module_call_specs[path] = {"in_spec": in_spec, "out_spec": out_spec}
 
     def check_flattened(flat_args: list[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Raises AssertionError unless every flattened leaf is a tensor, string,
+        # int, float, bool or None.
         for a in flat_args:
             if not (isinstance(a, (torch.Tensor, str, int, float, bool)) or a is None):
                 raise AssertionError(
@@ -124,6 +150,9 @@ def _wrap_submodule(
     def pre_hook(
         module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Forward pre-hook: flatten args and kwargs, validate leaves, pass them
+        # through the tracepoint op with kind module_call_inputs, and return the rebuilt
+        # (args, kwargs).
         flat_args, in_spec = pytree.tree_flatten((args, kwargs))
         check_flattened(flat_args)
         flat_args = _export_tracepoint(*flat_args, kind="module_call_inputs", path=path)
@@ -136,6 +165,9 @@ def _wrap_submodule(
         kwargs: dict[str, Any],
         res: Any,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Forward post-hook: flatten the result, validate leaves, pass them through
+        # the tracepoint op with kind module_call_outputs, record the call signature for the
+        # path, and return the rebuilt result structure.
         _, in_spec = pytree.tree_flatten((args, kwargs))
         flat_res, out_spec = pytree.tree_flatten(res)
         check_flattened(flat_res)
@@ -154,6 +186,9 @@ def _wrap_submodules(
     preserve_signature: Iterable[str],
     module_call_signatures: dict[str, dict[str, pytree.TreeSpec]],
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager that wraps each submodule path in preserve_signature of f
+    # with the tracepoint hooks (recording specs into module_call_signatures) for the body
+    # of the with block, then removes all hooks even if an error occurs.
     handles: list[RemovableHandle] = []
 
     try:
@@ -167,7 +202,10 @@ def _wrap_submodules(
 
 
 def _mark_strict_experimental(cls: type[_R]) -> type[_R]:
+    # [FUNCTION DOC] HELPER: Class decorator that replaces __call__ so calling an instance runs it under
+    # the strict_mode higher-order op with the given positional args. Mutates and returns cls.
     def call(self: Any, *args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Call the instance through strict_mode with the positional args.
         return strict_mode(self, args)
 
     cls.__call__ = call  # type: ignore[attr-defined]
@@ -177,6 +215,12 @@ def _mark_strict_experimental(cls: type[_R]) -> type[_R]:
 def _register_func_spec_proxy_in_tracer(
     tracer: "_ProxyTracer", name: str, spec: pytree.TreeSpec
 ) -> "Proxy":
+    # [FUNCTION DOC] HELPER: Return a get_attr proxy for a pytree spec stored on the tracer root, reusing
+    # the existing attribute when the cached name (name plus "0") is present, else
+    # registering a fresh attribute. Raises AssertionError if the cached attribute holds a
+    # different spec. Mutates the tracer root.
+    # KNOWN ISSUE: the cache lookup assumes the first fresh qualname is name plus "0"; if the
+    # tracer yields another name the cache never hits and duplicates are created.
     """
     This is a wrapper utility method on top of tracer to cache the
     already registered subclass spec attribute. This is useful because
@@ -207,6 +251,10 @@ def _emit_flat_apply_call(
     track_value: object,
     call_spec_cache_key: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Emit a flat_apply call node into the traced graph. Flattens graphable_args to
+    # leaves plus a spec stored on the tracer root, obtains a cached spec for a constant
+    # function wrapper of const_target_for_apply, creates the call_function node with proxied
+    # leaves, and tracks track_value to the node's output. Returns nothing; mutates the graph.
     # Flatten to graphable form and record the spec on the FX root
     flat_args, in_spec = to_graphable(graphable_args)
     qualname = tracer.get_fresh_qualname(spec_name)  # type: ignore[union-attr]
@@ -231,12 +279,19 @@ def _emit_flat_apply_call(
 
 
 def _is_init(fn: object) -> bool:
+    # [FUNCTION DOC] HELPER: True if fn is callable and named __init__.
     return callable(fn) and fn.__name__ == "__init__"
 
 
 def mark_subclass_constructor_exportable_experimental(
     constructor_subclass: Callable[_P, None],
 ) -> Callable[_P, None]:
+    # [FUNCTION DOC] Decorator for a tensor subclass __init__. Raises RuntimeError at decoration time if
+    # the function is not named __init__. The returned wrapper runs the original constructor;
+    # while exporting it also (a) raises RuntimeError if the class is not a traceable wrapper
+    # subclass, (b) returns quietly if no pre-dispatch torch-function mode is active, and (c)
+    # otherwise records a flat_apply node that rebuilds the subclass from the constructor
+    # arguments (excluding self) and tracks the instance to it.
     """
     Experimental decorator that makes subclass to be traceable in export
     with pre-dispatch IR. To make your subclass traceable in export, you need to:
@@ -265,6 +320,10 @@ def mark_subclass_constructor_exportable_experimental(
         )
 
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Wrapper described by mark_subclass_constructor_exportable_experimental:
+        # run the constructor, then during export emit the flat_apply constructor node.
+        # Raises RuntimeError for non-traceable subclasses; AssertionError for unexpected
+        # qualname or mode type.
         constructor_subclass(*args, **kwargs)
 
         if not torch.compiler.is_exporting():
@@ -311,6 +370,14 @@ def mark_subclass_constructor_exportable_experimental(
 
 
 def allow_in_pre_dispatch_graph(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Decorator that lets an __init__ (delegated to the subclass-constructor decorator) or a
+    # custom autograd Function apply method appear in the pre-dispatch export graph. Raises
+    # RuntimeError at decoration time for any other function name. The wrapper behaves like
+    # the original unless exporting a call on an autograd Function class under a pre-dispatch
+    # proxy mode; then it runs the function with pre-dispatch excluded for the concrete
+    # result and emits a flat_apply node calling the custom-autograd helper, tracking the output.
+    # KNOWN ISSUE: the name check repeats _is_init after it was already handled, and the error
+    # message says "__init_" (typo).
     """
     Experimental decorator that adds user function to export pre-dispatch graph. Note that
     we only support custom autograd function/subclass constructors today. To use this function:
@@ -343,6 +410,9 @@ def allow_in_pre_dispatch_graph(func: Callable[_P, _R]) -> Callable[_P, _R]:
 
     @wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Wrapper described by allow_in_pre_dispatch_graph. Falls through to the plain
+        # call unless exporting, args[0] is an autograd Function subclass, and a pre-dispatch
+        # proxy mode exists. Raises AssertionError if that mode is not pre-dispatch.
         if not torch.compiler.is_exporting():
             return func(*args, **kwargs)
 

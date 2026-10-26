@@ -1,3 +1,7 @@
+# [MODULE DOC] Defines GraphInfoProvider, a container for joint-graph structure (node order, edges) and
+# per-node runtime and memory data for activation checkpointing candidates. It lazily builds
+# networkx directed graphs and a simplified FX graph used by knapsack-based selection.
+# Import-time side effects: imports networkx.
 from typing import Any
 
 import networkx as nx
@@ -6,6 +10,9 @@ from torch.fx import Graph, Node
 
 
 class GraphInfoProvider:
+    # [CLASS DOC] Holds node names in order, edges, the ordered list of recomputable (banned) nodes, and
+    # dictionaries of runtimes and memories per node. Four derived graphs are built lazily and
+    # cached by name in a private dictionary. Knapsack input lists may be recorded or derived.
     """
     This class provides information about the graph, such as the nodes, edges, and their runtime and memory requirements.
     It also provides methods to create graphs from the information provided.
@@ -29,6 +36,11 @@ class GraphInfoProvider:
         recorded_knapsack_input_runtimes: list[float] | None = None,
         joint_graph: Graph | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store graph structure and per-node data. Runtimes and memories come from the given
+        # mappings, or, if absent, from the recorded knapsack input lists paired positionally with
+        # all_recomputable_banned_nodes. Raises ValueError if neither source is given for
+        # runtimes or for memories. Lazy graph caches start empty.
+        # KNOWN ISSUE: the joint_graph argument is accepted but never used or stored.
         self.graph_nodes_in_order = graph_nodes_in_order
         self.graph_edges = graph_edges
         self.all_node_runtimes: dict[str, float] = dict()
@@ -74,6 +86,10 @@ class GraphInfoProvider:
         recorded_knapsack_input_memories: list[float],
         recorded_knapsack_input_runtimes: list[float],
     ) -> "GraphInfoProvider":
+        # [FUNCTION DOC] Alternate constructor: derive node names (in order) and (node, user) edges from an FX
+        # joint graph, convert banned nodes to names, and build a provider using the recorded
+        # knapsack memory and runtime lists. Returns the new provider.
+        # KNOWN ISSUE: method name is misspelled (inialize).
         """
         Enables initialization from a joint graph.
         """
@@ -95,6 +111,7 @@ class GraphInfoProvider:
 
     @property
     def recomputable_node_only_graph(self) -> nx.DiGraph:
+        # [FUNCTION DOC] Lazily build and cache the graph containing only recomputable nodes and the edges among them.
         if self._lazily_initialized_graphs[self.__RECOMPUTABLE_NODE_ONLY_GRAPH] is None:
             self._lazily_initialized_graphs[self.__RECOMPUTABLE_NODE_ONLY_GRAPH] = (
                 self._create_recomputable_node_only_graph()
@@ -103,6 +120,8 @@ class GraphInfoProvider:
 
     @property
     def recomputable_node_only_graph_with_larger_graph_context(self) -> nx.DiGraph:
+        # [FUNCTION DOC] Lazily build and cache the recomputable-node graph whose edges reflect reachability
+        # through the full joint graph (see the private builder).
         if (
             self._lazily_initialized_graphs[
                 self.__RECOMPUTABLE_NODE_ONLY_GRAPH_WITH_LARGER_GRAPH_CONTEXT
@@ -118,6 +137,7 @@ class GraphInfoProvider:
 
     @property
     def full_joint_nx_graph(self) -> nx.DiGraph:
+        # [FUNCTION DOC] Lazily build and cache the full joint graph as a networkx digraph without output nodes.
         if self._lazily_initialized_graphs[self.__FULL_NX_JOINT_GRAPH] is None:
             self._lazily_initialized_graphs[self.__FULL_NX_JOINT_GRAPH] = (
                 self._create_full_joint_graph()
@@ -126,6 +146,7 @@ class GraphInfoProvider:
 
     @property
     def simplified_fx_joint_graph(self) -> Graph:
+        # [FUNCTION DOC] Lazily build and cache a placeholder-and-identity FX graph with the same dependency structure.
         if self._lazily_initialized_graphs[self.__SIMPLIFIED_FX_JOINT_GRAPH] is None:
             self._lazily_initialized_graphs[self.__SIMPLIFIED_FX_JOINT_GRAPH] = (
                 self._recreate_psuedo_joint_graph()
@@ -133,18 +154,21 @@ class GraphInfoProvider:
         return self._lazily_initialized_graphs[self.__SIMPLIFIED_FX_JOINT_GRAPH]
 
     def get_non_ac_peak_memory(self) -> float:
+        # [FUNCTION DOC] Return the sum of memory over all recomputable candidate nodes (the cost of saving all of them).
         return sum(
             self.all_node_memories[node_name]
             for node_name in self.all_recomputable_banned_nodes_set
         )
 
     def get_theoretical_max_runtime(self) -> float:
+        # [FUNCTION DOC] Return the sum of runtime over all recomputable candidate nodes (the cost of recomputing all of them).
         return sum(
             self.all_node_runtimes[node_name]
             for node_name in self.all_recomputable_banned_nodes_set
         )
 
     def get_knapsack_memory_input(self) -> list[float]:
+        # [FUNCTION DOC] Return the recorded knapsack memory list if non-empty, else memories of the candidates in banned-node order.
         return (
             self.recorded_knapsack_input_memories
             if self.recorded_knapsack_input_memories
@@ -155,6 +179,7 @@ class GraphInfoProvider:
         )
 
     def get_knapsack_runtime_input(self) -> list[float]:
+        # [FUNCTION DOC] Return the recorded knapsack runtime list if non-empty, else runtimes of the candidates in banned-node order.
         return (
             self.recorded_knapsack_input_runtimes
             if self.recorded_knapsack_input_runtimes
@@ -165,6 +190,7 @@ class GraphInfoProvider:
         )
 
     def _create_recomputable_node_only_graph(self) -> nx.DiGraph:
+        # [FUNCTION DOC] HELPER: Build a digraph with one node per candidate and an edge for each original edge whose endpoints are both candidates.
         graph = nx.DiGraph()
         for recomputable_node in self.all_recomputable_banned_nodes:
             graph.add_node(recomputable_node)
@@ -180,6 +206,10 @@ class GraphInfoProvider:
     def _create_recomputable_node_only_graph_with_larger_graph_context(
         self,
     ) -> nx.DiGraph:
+        # [FUNCTION DOC] HELPER: Build a digraph over candidates. For each candidate, find the candidates
+        # reachable from it in the full joint graph (breadth-first); add an edge to a reachable
+        # candidate only if it is not also reachable through another reachable candidate
+        # (a transitive reduction restricted to candidates).
         # Create a dictionary to store the reachable nodes for each node
         all_recomputable_banned_nodes_set = set(self.all_recomputable_banned_nodes)
 
@@ -210,6 +240,7 @@ class GraphInfoProvider:
         return candidate_graph
 
     def _create_full_joint_graph(self) -> nx.DiGraph:
+        # [FUNCTION DOC] HELPER: Build a digraph of every node and edge, skipping nodes named output and their edges.
         graph = nx.DiGraph()
         for node in self.graph_nodes_in_order:
             if node == "output":
@@ -223,6 +254,9 @@ class GraphInfoProvider:
         return graph
 
     def _recreate_psuedo_joint_graph(self) -> Graph:
+        # [FUNCTION DOC] HELPER: Rebuild an FX graph from names and edges: nodes without inputs become
+        # placeholders, others become identity-tuple calls over their input nodes, in the stored
+        # order. Raises ValueError if an edge references an unknown node.
         # Create a dictionary to store the dependencies of each node
         node_dependencies: dict[str, list[str]] = {
             node: [] for node in self.graph_nodes_in_order
@@ -250,6 +284,11 @@ class GraphInfoProvider:
         layout_k: float = 0.5,
         layout_iterations: int = 30,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Debug helper that draws the larger-context candidate graph with matplotlib
+        # (spring layout, nodes colored by memory, labeled by index) and shows the window.
+        # Requires matplotlib and a display; blocks on the plot.
+        # KNOWN ISSUE: reads node attributes memory and index that the graph builder never sets,
+        # so the memory lookup raises KeyError; the label falls back to the node name.
         """
         Visualize the recomputable candidate graph with larger context.
         """

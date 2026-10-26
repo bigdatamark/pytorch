@@ -1,3 +1,7 @@
+# [MODULE DOC] Builds structured logging payloads describing the min-cut / knapsack activation
+# checkpointing decision on a joint graph (node info, edges, memory and runtime inputs,
+# saved vs recomputed choices) and emits them as a JSON structured-trace artifact.
+# No import-time side effects besides creating a module logger.
 import json
 import logging
 from typing import Any
@@ -13,6 +17,10 @@ def create_joint_graph_node_information(
     joint_graph: Graph,
     recomputable_node_info: dict[str, int],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Build a mapping from node name to a description dict for each node of the joint graph:
+    # position, name, whether it is a recomputable candidate, target and shape as strings
+    # (shape empty if no tensor metadata), input node names, and stack trace. Candidates also
+    # get the index assigned to them in recomputable_node_info. Pure; returns the mapping.
     joint_graph_node_information: dict[str, Any] = {}
 
     for i, joint_graph_node in enumerate(joint_graph.nodes):
@@ -45,6 +53,7 @@ def create_joint_graph_node_information(
 
 
 def create_joint_graph_edges(joint_graph: Graph) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] Return the list of (input node name, consuming node name) pairs for all nodes of the graph.
     joint_graph_edges: list[tuple[str, str]] = [
         (inp.name, node.name)
         for node in joint_graph.nodes
@@ -72,6 +81,10 @@ def create_activation_checkpointing_logging_structure_payload(
     more_aggressive_saved_values_mem_ratio: float,
     aggressive_recomputation_saved_values_mem_ratio: float,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Assemble the dictionary of logging fields (graph size, edges with total, node information,
+    # banned-node order, expected runtime, knapsack saved/recomputed indices and inputs, min
+    # cut saved values, memory budget, activation size statistics and the two aggressive-
+    # recomputation memory ratios). Pure; returns the dictionary keyed by human-readable labels.
     """
     Creates a structured payload for logging activation checkpointing information.
 
@@ -143,6 +156,11 @@ def create_structured_trace_for_min_cut_info(
     more_aggressive_saved_values_mem_ratio: float,
     aggressive_recomputation_saved_values_mem_ratio: float,
 ) -> None:
+    # [FUNCTION DOC] Compute per-node and edge information for the joint graph, annotate every recomputable
+    # candidate with its memory, runtime and whether it was saved or recomputed, build the
+    # payload, and serialize it to JSON. Side effects: stores the JSON string on the graph
+    # object (for AOTAutograd cache replay) and emits a structured trace artifact named
+    # min_cut_information. Returns nothing.
     """
     Creates a structured trace for minimum cut information in the graph.
 

@@ -1,3 +1,9 @@
+# [MODULE DOC] Validity checking for ExportedProgram objects. Defines SpecViolationError, the Verifier
+# base class (dialect ATEN) and TrainingIRVerifier (dialect TRAINING) built through the
+# _VerifierMeta metaclass that keeps a registry of verifiers by dialect, node-level checks
+# (val metadata, torch_fn), and checks that the module call graph and graph signature agree
+# with the graph. Entry points: Verifier.check and load_verifier.
+# Import-time side effects: defining the two verifier classes registers them by dialect.
 # mypy: allow-untyped-defs
 import inspect
 import math
@@ -26,22 +32,31 @@ if TYPE_CHECKING:
 
 
 class SpecViolationError(Exception):
+    # [CLASS DOC] Exception raised whenever an exported program violates the export specification.
     pass
 
 
 def is_functional(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Return True if the operator overload's schema is not mutable.
     return not op._schema.is_mutable
 
 
 def _check_has_fake_tensor(node: torch.fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Legacy alias that delegates to _check_val for the node.
     # TODO(angelayi): remove this in favor of _check_val
     return _check_val(node)
 
 
 def _check_val(node: torch.fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Validate the val entry of a node's metadata. A missing val is allowed only for
+    # a call_function node whose operator overload returns nothing. Otherwise val must be a
+    # supported kind (None, scalar, str, memory format, dtype, device, layout, tensor, symbolic
+    # number, custom object argument, registered custom class, or an iterable of those).
+    # Raises SpecViolationError when val is missing or invalid.
     from torch.fx.experimental.symbolic_shapes import SymBool, SymFloat, SymInt
 
     def _check_correct_val(val):
+        # [FUNCTION DOC] HELPER: Recursively decide whether val is an allowed metadata value; returns bool.
         if val is None:
             return True
         elif isinstance(val, (int, bool, str, float)):
@@ -65,6 +80,7 @@ def _check_val(node: torch.fx.Node) -> None:
         return False
 
     def _no_returns(op):
+        # [FUNCTION DOC] HELPER: True if op is an OpOverload whose schema has no return values.
         if not isinstance(op, OpOverload):
             return False
         return len(op._schema.returns) == 0
@@ -80,6 +96,10 @@ def _check_val(node: torch.fx.Node) -> None:
 
 
 def _check_torch_fn(node: torch.fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: Require a torch_fn metadata entry on the node; raises SpecViolationError if
+    # it is missing or malformed.
+    # KNOWN ISSUE: the malformed check negates only the tuple test and then ANDs the string
+    # tests, so a tuple of wrong element types is never rejected and a non-tuple is indexed.
     torch_fn = node.meta.get("torch_fn")
     if torch_fn is None:
         raise SpecViolationError(
@@ -96,9 +116,18 @@ def _check_torch_fn(node: torch.fx.Node) -> None:
 
 
 class _VerifierMeta(type):
+    # [CLASS DOC] HELPER: Metaclass for Verifier classes. Holds a class-level registry mapping dialect
+    # name to verifier class. Enforces that the base class defines check and
+    # _check_graph_module with dialect ATEN, and that subclasses define a non-ATEN string
+    # dialect and do not override those two methods.
     _registry: dict[str, type["Verifier"]] = {}
 
     def __new__(metacls, name, bases, attrs):
+        # [FUNCTION DOC] HELPER: Validate the class definition as described on the metaclass and register
+        # the new class under its dialect. Raises SyntaxError if a subclass overrides check or
+        # _check_graph_module; raises AssertionError for a missing or invalid dialect or
+        # missing base methods. Side effect: updates the shared registry (a later class with
+        # the same dialect replaces the earlier one).
         if bases:
             if "check" in attrs or "_check_graph_module" in attrs:
                 raise SyntaxError("Overriding method check is not allowed.")
@@ -126,6 +155,8 @@ class _VerifierMeta(type):
 
 
 def getattr_recursive(obj: Any, target: str) -> Any:
+    # [FUNCTION DOC] Resolve a dotted attribute path on obj and return the final attribute. Raises
+    # RuntimeError naming the resolved prefix when an attribute along the path is missing.
     target_atoms = target.split(".")
     attr_itr = obj
     for i, atom in enumerate(target_atoms):
@@ -138,9 +169,15 @@ def getattr_recursive(obj: Any, target: str) -> Any:
 
 
 class Verifier(metaclass=_VerifierMeta):
+    # [CLASS DOC] Base ATEN-dialect verifier. Subclasses (other dialects) customize the allowed builtin
+    # ops, operator types, get_attr types, per-operator checks and extra graph checks.
+    # check validates an ExportedProgram: every graph module (including nested ones), the
+    # module call graph, and the graph signature; failures raise SpecViolationError.
     dialect = "ATEN"
 
     def allowed_builtin_ops(self) -> list:
+        # [FUNCTION DOC] Return the list of Python builtin/operator/math callables permitted as call_function
+        # targets (arithmetic, comparison, logic, getitem, rounding helpers).
         return [
             operator.getitem,
             operator.add,
@@ -170,12 +207,18 @@ class Verifier(metaclass=_VerifierMeta):
         ]
 
     def allowed_op_types(self) -> tuple[type[Any], ...]:
+        # [FUNCTION DOC] Return the operator types permitted as call_function targets: OpOverload and
+        # HigherOrderOperator.
         return (OpOverload, HigherOrderOperator)
 
     def allowed_getattr_types(self) -> tuple[type[Any], ...]:
+        # [FUNCTION DOC] Return the types allowed for get_attr results in the top-level graph module
+        # (GraphModule and TreeSpec).
         return (torch.fx.GraphModule, torch.utils._pytree.TreeSpec)
 
     def allowed_getattr_types_for_subgm(self) -> tuple[type[Any], ...]:
+        # [FUNCTION DOC] Return the types allowed for get_attr results in nested graph modules; additionally
+        # permits parameters and tensors because higher-order-op subgraphs may read weights.
         # subgm in HOP's argument could have getattr(weight) nodes, thus stateful
         return (
             torch.fx.GraphModule,
@@ -185,22 +228,36 @@ class Verifier(metaclass=_VerifierMeta):
         )
 
     def check_valid_op(self, op):
+        # [FUNCTION DOC] Hook for dialect-specific operator checks; the base implementation accepts everything.
         pass
 
     def check_additional(self, gm: GraphModule) -> None:
+        # [FUNCTION DOC] Hook for extra dialect-specific checks on a graph module; does nothing by default.
         """
         Additional checks that are specific to some dialects.
         """
 
     @final
     def check(self, ep: "ExportedProgram") -> None:
+        # [FUNCTION DOC] Verify an ExportedProgram: check its graph module (recursively), then its module
+        # call graph and graph signature. Returns nothing; raises SpecViolationError (or
+        # AssertionError/RuntimeError from helpers) on the first violation. Final: not overridable.
         self._check_graph_module(ep.graph_module)
         _verify_exported_program_module_call_graph(ep)
         _verify_exported_program_signature(ep)
 
     @final
     def _check_graph_module(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] HELPER: Lint and check every GraphModule found in gm.modules(). call_module and
+        # call_method nodes are rejected; call_function nodes need valid val metadata and an
+        # allowed operator (an allowed type, builtin or whitelisted torch function; non-training
+        # dialects also require OpOverloads to be non-mutating); get_attr targets must resolve
+        # to allowed types (with special acceptance of valid lowered backend modules and AOT
+        # Inductor wrappers); placeholders need valid val metadata. Finally calls
+        # check_additional. Raises SpecViolationError on violations.
         def _allowed_getattr_types(is_toplevel_gm) -> tuple[type[Any], ...]:
+            # [FUNCTION DOC] HELPER: Pick the allowed get_attr types for the top-level or a nested module;
+            # raises AssertionError if the choice contains the generic object type.
             if is_toplevel_gm:
                 ret = self.allowed_getattr_types()
             else:
@@ -210,13 +267,18 @@ class Verifier(metaclass=_VerifierMeta):
             return ret
 
         def _check_valid_op(op) -> None:
+            # [FUNCTION DOC] HELPER: Check one call_function target against the allowed types, builtins and
+            # torch functions, enforce functional ops for non-TRAINING dialects, then run the
+            # dialect hook. Raises SpecViolationError for a disallowed or mutable operator.
             def _allowed_builtin_ops() -> list:
+                # [FUNCTION DOC] HELPER: Return the allowed builtin ops, raising AssertionError if any is not a builtin.
                 ret = self.allowed_builtin_ops()
                 if not all(inspect.isbuiltin(op) for op in ret):
                     raise AssertionError("allowed_builtin_ops must all be builtins")
                 return ret
 
             def _allowed_op_types() -> tuple[type[Any], ...]:
+                # [FUNCTION DOC] HELPER: Return the allowed op types, raising AssertionError if it includes object.
                 ret = self.allowed_op_types()
                 if any(t is object for t in ret):
                     raise AssertionError("allowed_op_types must not contain 'object'")
@@ -302,6 +364,7 @@ class Verifier(metaclass=_VerifierMeta):
                     if isinstance(attr, torch.nn.Module):
 
                         def _is_type(name, ty):
+                            # [FUNCTION DOC] HELPER: True if the attribute named name on the module is an instance of ty.
                             return isinstance(getattr(attr, name, None), ty)
 
                         if type(attr).__name__ == "LoweredBackendModule":
@@ -352,10 +415,14 @@ class Verifier(metaclass=_VerifierMeta):
 
 
 class TrainingIRVerifier(Verifier):
+    # [CLASS DOC] Verifier for the TRAINING dialect; same checks as the base but mutable operators are allowed.
     dialect = "TRAINING"
 
 
 def _verify_exported_program_module_call_graph(exported_program) -> None:
+    # [FUNCTION DOC] HELPER: For every module call graph entry with a signature, check that each named
+    # input and output argument corresponds to a node in the program graph. Raises
+    # SpecViolationError for a missing name.
     module_call_graph = exported_program.module_call_graph
     nodes = {node.name for node in exported_program.graph.nodes}
     for entry in module_call_graph:
@@ -373,6 +440,15 @@ def _verify_exported_program_module_call_graph(exported_program) -> None:
 
 
 def _verify_exported_program_signature(exported_program) -> None:
+    # [FUNCTION DOC] HELPER: Check the graph signature against the graph and program state. Inputs: the
+    # placeholder count must equal the input spec count, names must match for tensor and
+    # symbolic args, and each kind (parameter, buffer, constant tensor, custom object, token)
+    # must have the right argument type, a target, and be present in the state dict or
+    # constants as appropriate (persistent buffers may also be found in constants or a
+    # lazily built graph module state dict; non-persistent ones must not be in the state dict).
+    # Outputs: counts must match, mutated-buffer/parameter/user-input outputs must point to
+    # existing entries, and user outputs must be in signature order. Raises SpecViolationError.
+    # KNOWN ISSUE: the token-kind error message wrongly says constant tensor / tensor argument.
     # Check ExportedProgram signature matches
     gs = exported_program.graph_signature
 
@@ -579,6 +655,9 @@ def _verify_exported_program_signature(exported_program) -> None:
 
 
 def load_verifier(dialect: str) -> type[Verifier]:
+    # [FUNCTION DOC] Return the verifier class registered for dialect. ATEN or the empty string yields the
+    # base Verifier (registered as ATEN, or Verifier itself as a fallback); other dialects
+    # are looked up directly and raise KeyError if unregistered.
     if dialect == "ATEN" or dialect == "":
         return _VerifierMeta._registry.get(dialect, Verifier)
     return _VerifierMeta._registry[dialect]

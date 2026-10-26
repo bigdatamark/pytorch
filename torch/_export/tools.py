@@ -1,3 +1,6 @@
+# [MODULE DOC] Export diagnostics tooling. Public API: report_exportability, which tries to export a
+# module and, on failure, each of its submodules, to localize export problems.
+# Import-time side effects: creates a module logger only.
 # mypy: allow-untyped-defs
 import logging
 import warnings
@@ -21,6 +24,11 @@ def _generate_inputs_for_submodules(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None = None,
 ) -> dict[str, tuple[Any, Any]]:
+    # [FUNCTION DOC] HELPER: Run the model once on the given inputs with forward pre-hooks registered on the
+    # named target submodules, recording each one's (args, kwargs). Returns a mapping from
+    # submodule name to that pair; submodules that never ran are absent. Any exception from
+    # the model run is downgraded to a warning (partial results are returned). Hooks are
+    # always removed afterwards. Does not work if two names refer to the same module object.
     """
     Generate inputs for targeting submodules in the given model. Note that if two submodules refer to the same obj, this
     function doesn't work.
@@ -40,6 +48,8 @@ def _generate_inputs_for_submodules(
     submodule_to_names = {mod: name for name, mod in model.named_modules()}
 
     def pre_forward(module, module_args, module_kwargs):
+        # [FUNCTION DOC] HELPER: Forward pre-hook that stores the module's call args and kwargs in the
+        # results mapping under the module's name (later calls overwrite earlier ones).
         results[submodule_to_names[module]] = (module_args, module_kwargs)
 
     try:
@@ -68,6 +78,15 @@ def report_exportability(
     strict: bool = True,
     pre_dispatch: bool = False,
 ) -> dict[str, Exception | None]:
+    # [FUNCTION DOC] Try exporting mod (via the private export entry point with the given strict and
+    # pre_dispatch flags); where a module fails, recurse into its direct children using inputs
+    # captured by running the model once. Returns a mapping from dotted submodule name (empty
+    # string for the root) to the raised exception, or None on success. Only the first module
+    # of each type is tried, and modules without captured inputs are skipped (not in the report).
+    # Side effects: logs usage telemetry, runs the model, logs successes and a de-duplicated
+    # summary of failures.
+    # KNOWN ISSUE: the de-duplication key splits the repr on a literal backslash-n sequence
+    # rather than a real newline, so multi-line reprs are not truncated to the first line.
     """
     Report exportability issues for a module in one-shot.
 
@@ -97,6 +116,9 @@ def report_exportability(
     report: dict[str, Exception | None] = {}
 
     def try_export(module, module_name, args, kwargs):
+        # [FUNCTION DOC] HELPER: Recursive worker. Skips module types already tried; if inputs are known,
+        # attempts an export and records None (and stops descending) on success, or the
+        # exception (and continues into children) on failure. Writes into the enclosing report.
         nonlocal submod_inputs, report, strict, pre_dispatch, tried_module_types
 
         if type(module) in tried_module_types:
