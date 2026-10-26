@@ -1,3 +1,10 @@
+# [MODULE DOC] Split/cat/stack/unbind graph optimization passes for Inductor (pre-grad torch-level and
+# post-grad aten-level). Defines the pattern-matcher pass registries (PRE_GRAD_PATTERNS, POST_GRAD_PATTERNS,
+# one PatternMatcherPass per pass name, skipping names owned by group batch fusion), normalization patterns
+# (split, unbind, cat, stack, squeeze, reshape, clamp, detach), split/cat merging and simplification
+# (SplitCatSimplifier), and many registered graph patterns that fuse or eliminate split/cat/stack/unbind/
+# getitem chains. Import-time side effects: reads env var TORCHINDUCTOR_PATTERN_MATCH_BACKEND to choose the
+# counters key (default inductor), creates the pass registries, and registers all patterns via decorators.
 # mypy: allow-untyped-defs
 import itertools
 import logging
@@ -98,6 +105,9 @@ for pass_name in post_grad_pass_names:
 
 
 def construct_pattern_matcher_pass(pass_name: str):
+    # [FUNCTION DOC] Return the PatternMatcherPass registered under pass_name, looking in the pre-grad registry first and
+    # falling back to the post-grad registry. Raises a key error if the name is in neither (e.g. a pass owned by
+    # group batch fusion).
     """
     Return the specific pattern_matcher_pass given the pass name.
     """
@@ -108,6 +118,9 @@ def construct_pattern_matcher_pass(pass_name: str):
 
 
 def _get_split_args_default(split_node):
+    # [FUNCTION DOC] HELPER: Extract (input, split size/sections, dim) from a split call node using positional/keyword lookup.
+    # Uses the method-call keyword name for the size when the node is a call_method. Dim defaults to 0 when
+    # missing or falsy. Returns a 3-tuple; entries may be None if not found.
     input_kwarg = "tensor"
     split_size_kwarg = "split_size_or_sections"
     dim_kwarg = "dim"
@@ -122,6 +135,9 @@ def _get_split_args_default(split_node):
 
 
 def _get_dim(node: Any):
+    # [FUNCTION DOC] HELPER: Return the integer dim of a split or unbind node. Uses the dim keyword if present; otherwise the
+    # last positional arg when it is the third (split) or second (unbind) argument, else default 0. Raises an
+    # assertion error if the node is not an FX node, dim is not an int, or the target is neither split nor unbind.
     if not isinstance(node, torch.fx.Node):
         raise AssertionError(f"expected torch.fx.Node, got {type(node)}")
     if "dim" in node.kwargs:
@@ -172,6 +188,12 @@ def normalize_split_base(
         [torch.fx.Node], tuple[torch.fx.Node | None, Any | None, int | None]
     ],
 ):
+    # [FUNCTION DOC] Rewrite any split call (function or method form) into the canonical torch.split with an explicit list of
+    # section sizes and a non-negative dim keyword. _get_split_args extracts (input, size, dim) from the node.
+    # Does nothing if args are missing, example values are absent, any section is symbolic, or the node is
+    # already canonical. Mutates the graph: inserts the new node, redirects users, copies meta, erases the old
+    # node, and increments the normalization_pass counter. Raises an assertion error if example_value is not a
+    # list or tuple.
     """
     Normalize split with split_size into split_with_sizes, so that we only deal with one type of split in
     subsequent optimizations
@@ -227,6 +249,7 @@ def normalize_split_base(
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_split_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize torch.split / split method nodes using the default argument extraction.
     return normalize_split_base(match, _get_split_args_default)
 
 
@@ -239,6 +262,11 @@ def normalize_split_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("remove_split_with_size_one_pass"),
 )
 def remove_split_with_size_one(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: remove a split that produces a single section (a no-op split) along with its single
+    # getitem. Skips if args/example values are missing or sections are symbolic. When exactly one section and
+    # the split has users, rewires the grand-child users to consume the split input directly, erases the getitem
+    # and split, and increments the remove_split_with_size_one_pass counter. Raises an assertion error if
+    # example_value is not a list or tuple.
     graph = match.graph
     split_node = match.nodes[0]
     split_input, split_size, split_dim = _get_split_args_default(split_node)
@@ -282,6 +310,9 @@ def remove_split_with_size_one(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_unbind_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize unbind (function or method form, dim or axis keyword) into torch.unbind with
+    # only the input positional and a non-negative dim keyword. Skips if the input is missing or lacks example
+    # values. Replaces the node (copying meta) and increments the normalization_pass counter.
     node = match.nodes[0]
     graph = match.graph
     input = get_arg_value(node, 0, "input")
@@ -319,6 +350,10 @@ def normalize_unbind_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_cat_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize cat/concat into torch.cat with the tensors positional and a non-negative dim
+    # keyword (dim or axis, default 0). Skips if args are missing or any example value is absent; no-op if
+    # already canonical. Replaces the node, copies meta, increments normalization_pass. Raises an assertion
+    # error if tensors is not a list/tuple or tensors disagree on ndim (except 1-D empty tensors).
     cat_node = match.nodes[0]
     graph = match.graph
     tensors = get_arg_value(cat_node, 0, "tensors")
@@ -342,6 +377,7 @@ def normalize_cat_default(match: Match, *args, **kwargs):
     ndim = cat_node.meta["example_value"].dim()
 
     def is_empty_tensor(x):
+        # [FUNCTION DOC] HELPER: True if the tensor is 1-D with zero length (cat accepts these alongside other ranks).
         # special case where torch.cat supports cat'ing with an empty tensor
         x_shape = x.meta["example_value"].shape
         return len(x_shape) == 1 and guard_or_false(x_shape[0] == 0)
@@ -381,6 +417,9 @@ def normalize_cat_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_stack_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize torch.stack into a call with the tensors positional and a non-negative dim
+    # keyword (default 0). Skips if args or example values are missing. Replaces the node, copies meta, and
+    # increments normalization_pass. Raises an assertion error if tensors is not a list/tuple.
     node = match.nodes[0]
     graph = match.graph
     tensors = get_arg_value(node, 0, "tensors")
@@ -414,6 +453,8 @@ def normalize_stack_default(match: Match, *args, **kwargs):
 
 
 def find_next_users(split_node: torch.fx.Node) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] Return the de-duplicated list (in discovery order) of nodes that consume the getitem users of a split
+    # node, i.e. the 'next users' after the getitems.
     next_users = []
     for getitem_node in split_node.users:
         for getitem_user in getitem_node.users:
@@ -427,6 +468,9 @@ def find_next_users(split_node: torch.fx.Node) -> list[torch.fx.Node]:
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_squeeze_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize the squeeze method into torch.squeeze, with an optional dim keyword (a single
+    # element sequence of dims is unwrapped to a scalar). Replaces the node and copies meta; no counter
+    # increment. Raises an assertion error if dim keyword is combined with extra positional args.
     squeeze_node = match.nodes[0]
     squeeze_input = get_arg_value(squeeze_node, 0)
 
@@ -467,6 +511,9 @@ def normalize_squeeze_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_reshape_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize the reshape method into torch.reshape with the static shape from example
+    # value. Skips (with debug log) if example value is absent or the shape has free symbols. Replaces the
+    # node and copies meta; no counter increment.
     reshape_node = match.nodes[0]
     if not is_node_meta_valid(reshape_node):
         log.debug("example value absent for node: %s", reshape_node)
@@ -496,6 +543,9 @@ def normalize_reshape_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_clamp_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize clamp (method or function) into torch.clamp, converting positional min/max
+    # into keywords. Skips if example value is absent or shape is symbolic. Replaces the node and copies meta;
+    # no counter increment.
     clamp_node = match.nodes[0]
     if not is_node_meta_valid(clamp_node):
         log.debug("example value absent for node: %s", clamp_node)
@@ -529,6 +579,8 @@ def normalize_clamp_default(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_pass"),
 )
 def normalize_detach_default(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: normalize the detach method into torch.detach. Skips if example value is absent or
+    # shape is symbolic. Replaces the node and copies meta; no counter increment.
     detach_node = match.nodes[0]
     if not is_node_meta_valid(detach_node):
         log.debug("example value absent for node: %s", detach_node)
@@ -549,16 +601,24 @@ def normalize_detach_default(match: Match, *args, **kwargs):
 
 
 class TorchSplit(CallFunction):
+    # [CLASS DOC] Pattern expression that matches a normalized torch.split call (list/tuple sections, dim
+    # captured as keyword argument dim) and requires every user to be a distinct integer, non-negative getitem.
+    # Subclass of CallFunction; stateless beyond its parent's fields.
     """
     Matches a call to torch.split if it is in a normalized form. Ensures that all users of
     splits are unique getitems.
     """
 
     def __init__(self, arg, sizes, func=torch.split) -> None:
+        # [FUNCTION DOC] Builds a CallFunction pattern for func (default torch.split) with the given input and sizes patterns,
+        # multiple users allowed, and dim bound to a keyword argument so repeated uses must agree.
         # using KeywordArg("dim") for `dim` checks they all match
         super().__init__(func, arg, sizes, _users=MULTIPLE, dim=KeywordArg("dim"))
 
     def _match(self, node: torch.fx.Node, ctx: MatchContext):
+        # [FUNCTION DOC] Match via the parent first; then fail if sections are not a list/tuple (not normalized) or if any user
+        # is not an integer-indexed getitem, has a duplicate index, or a negative index. Returns the match or a
+        # FailedMatch with the reason. Pure check, no graph mutation.
         m = super()._match(node, ctx)
         if not m:
             return m
@@ -604,6 +664,10 @@ def merge_splits(
     # Note: dim is implicitly passed by TorchSplit, as it internally uses a pattern with dim
     dim: int,
 ):
+    # [FUNCTION DOC] Pattern handler: merge a split whose input is a getitem of another split into one split with combined
+    # sections (the second split's sections replace the consumed section of the first). Skips if the second
+    # split has no users. Inserts a new split before the first split, rewires remaining getitems and creates
+    # new getitems for the second split's users, erases old nodes, and increments merge_splits_pass counter.
     node = match.output_node()
     # it is possible that the split has no users,
     # we check the corner case and skip the pattern
@@ -674,6 +738,10 @@ def merge_splits(
 
 
 class SplitCatSimplifier:
+    # [CLASS DOC] Helper that simplifies split followed by cat/stack (or other) users. Finds ranges of getitems
+    # consumed consecutively by each user, shrinks the split to fewer sections (or removes it entirely),
+    # adds unflatten/movedim/unsqueeze transform parameters when split dim differs from cat dim, rewrites
+    # the user nodes, and erases the old nodes. Stateless; all work is done in methods called by simplify.
     """
     Helper class to simplify split-cat pattern. In simple cases, both split and cat node can be removed in a "split->cat"
     pattern. However, there are various cases where they can't and we need to simplify split/ add transforms before cat.
@@ -700,6 +768,10 @@ class SplitCatSimplifier:
         split_node: torch.fx.Node,
         split_sections: list[int],
     ):
+        # [FUNCTION DOC] Run the full simplification for one split node and its next users: compute per-user input lists,
+        # simplified split ranges, and transform params; bail out (no change) if any is empty/None. Otherwise
+        # replace the split, rewrite the cat users, erase old nodes, and increment the unbind_stack_pass counter.
+        # KNOWN ISSUE: the counter incremented is unbind_stack_pass even though this is the split/cat simplifier.
         # Find the next users (i.e. users after the getitem)
         next_users = find_next_users(split_node)
         # Gather inputs of the next users. When inputs come from `split_node`, they are instead represented by
@@ -735,6 +807,9 @@ class SplitCatSimplifier:
     def get_user_input_list(
         self, split_node: torch.fx.Node, next_users: list[torch.fx.Node]
     ) -> list[list[torch.fx.Node | _Range]]:
+        # [FUNCTION DOC] For each next user, build the list of its inputs: merged ranges plus other nodes for cat/stack users,
+        # or getitem index ranges for other user kinds. Returns a list of lists whose items are either a closed
+        # (start, end) getitem index range or a non-split input node.
         """
         Returns list of inputs to the following user nodes, in order. The outer list represents the user node. The inner
         list represents the inputs to that particular node. This list can either contain
@@ -752,6 +827,8 @@ class SplitCatSimplifier:
     def get_merged_user_inputs(
         self, split_node: torch.fx.Node, cat_node: torch.fx.Node
     ) -> list[torch.fx.Node | _Range]:
+        # [FUNCTION DOC] For a cat/stack node, map each tensor input to either the getitem index (if it is a user of the split)
+        # or the node itself, then merge consecutive indices into ranges. Returns the merged list.
         user_inputs = get_arg_value(cat_node, 0, "tensors")
         simplified_user_inputs = []
         split_users = OrderedSet(split_node.users.keys())
@@ -766,6 +843,7 @@ class SplitCatSimplifier:
     def get_non_cat_node_input(
         self, split_node: torch.fx.Node, node: torch.fx.Node
     ) -> list[_Range]:
+        # [FUNCTION DOC] Return one single-index range per input of node that is a getitem of the split, in input order.
         """
         Get input for a non cat node in the same format as `get_merged_user_inputs`
         """
@@ -780,6 +858,8 @@ class SplitCatSimplifier:
     def merge_consecutive_inputs(
         self, inputs: list[torch.fx.Node | int]
     ) -> list[torch.fx.Node | _Range]:
+        # [FUNCTION DOC] Merge runs of consecutive integer indices into closed (start, end) tuples while passing non-integer
+        # items through unchanged and in order. Pure function returning a list.
         """
         Merge consecutive inputs going into a user node.
 
@@ -813,6 +893,10 @@ class SplitCatSimplifier:
         next_users,
         user_inputs_list: list[list[torch.fx.Node | _Range]],
     ) -> list[_Range] | None:
+        # [FUNCTION DOC] Compute the element ranges (in split-dimension coordinates) the simplified split should produce: convert
+        # getitem index ranges to cumulative size ranges, require them to be non-overlapping (else return None), fill
+        # gaps to cover the whole dimension, and return None if the number of sections would not shrink. Records
+        # the number of removed sections in the scmerge_split_sections_removed counter (assigned, not incremented).
         ranges = OrderedSet[Any]()
         for user_inputs in user_inputs_list:
             ranges.update(u for u in user_inputs if isinstance(u, tuple))
@@ -836,12 +920,15 @@ class SplitCatSimplifier:
         return split_ranges
 
     def has_non_overlapping_ranges(self, ranges: list[_Range]) -> bool:
+        # [FUNCTION DOC] Return True if the sorted ranges never overlap (each end is at most the next start).
         for range_, next_range in itertools.pairwise(ranges):
             if range_[1] > next_range[0]:
                 return False
         return True
 
     def fill_gaps(self, ranges: list[_Range], min_: int, max_: int) -> list[_Range]:
+        # [FUNCTION DOC] Return the ranges plus extra ranges filling any gaps from min_ to max_. Raises an index error if
+        # ranges is empty.
         cur = min_
         filled_ranges = []
         for a, b in ranges:
@@ -859,6 +946,10 @@ class SplitCatSimplifier:
         next_users: list[torch.fx.Node],
         user_inputs_list: list[list[torch.fx.Node | _Range]],
     ) -> list[list[_TransformParam]] | None:
+        # [FUNCTION DOC] For each user and each of its inputs, decide which transforms are needed: a 4-tuple of optional
+        # (unflatten params, movedim params, unsqueeze params, extra) or all None for none. Non-cat/stack users get
+        # an empty list. Returns None if a merged range has unequal split sections (cannot unflatten) when dims
+        # differ. Reads cat dim from the user nodes.
         """
         Figure out what transforms are needed for each input to each cat node.
 
@@ -915,6 +1006,12 @@ class SplitCatSimplifier:
         user_inputs_list: list[list[torch.fx.Node | _Range]],
         split_ranges: list[_Range],
     ) -> list[list[torch.fx.Node]]:
+        # [FUNCTION DOC] Replace the split: if one range remains, the split input itself stands in for it; otherwise insert a
+        # new split with the range sizes (copying example values and incrementing scmerge_split_added) and getitems
+        # for each section. Then map each range in user_inputs_list to the matching new item. Returns the new
+        # user inputs list.
+        # KNOWN ISSUE: the append to split_items is nested inside the example-value validity check, so if meta
+        # is invalid the list stays empty and later indexing fails.
         """
         Replace the split node. It can either remove the split node if len(split_ranges) == 1, or simplify it
         into a split with lesser sections if len(split_ranges) > 1.
@@ -983,6 +1080,12 @@ class SplitCatSimplifier:
         user_inputs_list_new,
         transform_params_list: list[list[_TransformParam]],
     ):
+        # [FUNCTION DOC] Rewrite each next user of the split to consume the new split items. For non cat/stack users, swap
+        # their getitem inputs for the new inputs in order. For cat/stack users, apply the per-input transforms
+        # (unflatten, movedim, flatten) and merge runs of unsqueeze inputs into stack nodes, all inserted before
+        # the user, with example values computed eagerly. Then build a new cat (or reuse the single input),
+        # adding a flatten when a cat's dim differs from the split dim, and redirect all uses of the old user.
+        # Returns early (leaving partial changes possible) if an input lacks example values; erases nothing.
         split_dim = _get_dim(split_node)
         split_users = split_node.users.keys()
         new_cats = []
@@ -1142,6 +1245,8 @@ class SplitCatSimplifier:
         split_node: torch.fx.Node,
         next_users: list[torch.fx.Node],
     ):
+        # [FUNCTION DOC] Erase the old split node, its getitem users, and the old cat/stack users, in reverse order, only if
+        # they have no remaining users. Increments the scmerge_split_removed and scmerge_cat_removed counters.
         to_remove = [split_node]
         counters[backend]["scmerge_split_removed"] += 1
         to_remove.extend(split_node.users.keys())
@@ -1156,6 +1261,9 @@ class SplitCatSimplifier:
 
 
 class UnbindCatRemover(SplitCatSimplifier):
+    # [CLASS DOC] SplitCatSimplifier specialization for unbind followed by cat/stack. An unbind cannot be
+    # shrunk, so it is only removed when all its getitems are consecutive and feed users as one range.
+    # Overrides range simplification and transform parameter computation (movedim, flatten, unsqueeze).
     """
     Helper class to merge Unbind->Cat/Stack. Many of the cases are similar to SplitCatSimplifier.
 
@@ -1169,6 +1277,9 @@ class UnbindCatRemover(SplitCatSimplifier):
         graph: torch.fx.Graph,
         unbind_node: torch.fx.Node,
     ):
+        # [FUNCTION DOC] Entry point: remove an unbind node if it has valid example values and its getitem indices are sorted,
+        # consecutive, and cover every output. Treats the unbind as a split with unit sections and delegates to
+        # the parent simplify; otherwise does nothing.
         if not is_node_meta_valid(unbind_node):
             return
         # we need to check if the getitem indices from unbind are consecutive and all go to the same cat node
@@ -1189,6 +1300,8 @@ class UnbindCatRemover(SplitCatSimplifier):
         next_users: list[torch.fx.Node],
         user_inputs_list: list[list[torch.fx.Node | _Range]],
     ) -> list[_Range] | None:
+        # [FUNCTION DOC] Call the parent range computation and accept the result only if it collapses to exactly one range
+        # (the unbind can be fully removed); otherwise return None.
         simplified_split_ranges = super().get_simplified_split_ranges(
             split_sections, next_users, user_inputs_list
         )
@@ -1202,6 +1315,10 @@ class UnbindCatRemover(SplitCatSimplifier):
         next_users: list[torch.fx.Node],
         user_inputs_list: list[list[torch.fx.Node | _Range]],
     ) -> list[list[_TransformParam]] | None:
+        # [FUNCTION DOC] For each user and input: inputs coming from the unbind get a movedim (if unbind dim differs from the
+        # cat dim) and, for cat users, a flatten of the cat dim with the next one; other inputs get an unsqueeze
+        # when the user is a stack, else no transform. Returns a list of lists of 4-tuples (unflatten, movedim,
+        # unsqueeze, flatten); the unflatten slot is always unused.
         """
         Figure out what transforms are needed for each input to each cat node.
 
@@ -1251,10 +1368,17 @@ class UnbindCatRemover(SplitCatSimplifier):
 
 
 class GetItem(CallFunction):
+    # [CLASS DOC] Pattern expression matching an operator getitem call on a given argument pattern and
+    # index pattern. Overrides anchor-node search so it works when the container argument is a generic
+    # argument pattern.
     def __init__(self, arg, index, _users=1) -> None:
+        # [FUNCTION DOC] Build a call pattern for getitem on arg and index, with _users controlling the allowed user count.
         super().__init__(operator.getitem, arg, index, _users=_users)
 
     def find_anchor_nodes(self, ctx: MatchContext, searched: OrderedSet[torch.fx.Node]):
+        # [FUNCTION DOC] Generator of candidate anchor nodes: for each sub-pattern in the first argument, find its anchor nodes
+        # and yield their not-yet-searched users that satisfy this pattern's match functions, marking them searched.
+        # Deliberately does not use the context's stored pattern to node mapping.
         # We generally match GetItem with arg being an Arg(). So, we never return the anchor
         # nodes as the stored node in ctx.pattern_to_node is returned. Here we override find_anchor_nodes
         # to not use ctx.pattern_to_node
@@ -1307,6 +1431,10 @@ class GetItem(CallFunction):
 def merge_split_squeeze(
     match: Match, split_input: torch.fx.Node, split_sizes: list[int], dim: int
 ):
+    # [FUNCTION DOC] Pattern handler: replace a split into size-1 sections where every getitem is squeezed on the same dim
+    # with a single unbind plus getitems and no squeezes. Skips if any section is not 1, dim is a sequence, or
+    # a next user is not a squeeze. Inserts an unbind (with example value), rewires each squeeze to a getitem,
+    # erases the squeezes, old getitems, and split, and increments the split_cat_pass counter.
     graph = match.graph
     split = next(node for node in match.nodes if node.target is torch.split)
     if not all(s == 1 for s in split_sizes):
@@ -1371,6 +1499,8 @@ getitem_unbind = ListOf(
     pass_dict=construct_pattern_matcher_pass("unbind_stack_pass"),
 )
 def merge_unbind_stack(match: Match, unbind_input: torch.fx.Node, dim: int):
+    # [FUNCTION DOC] Pattern handler: for a stack/cat of getitems of an unbind, delegate to UnbindCatRemover to remove
+    # the unbind if possible. Mutates the graph via the remover.
     unbind_node = next(node for node in match.nodes if node.target is torch.unbind)
     UnbindCatRemover().remove_unbind(match.graph, unbind_node)
 
@@ -1436,6 +1566,8 @@ reshape_getitem_split = ListOf(
     pass_dict=construct_pattern_matcher_pass("split_cat_pass"),
 )
 def simplify_split_cat(match: Match, split_sections: list[int], dim: int):
+    # [FUNCTION DOC] Pattern handler: for a stack/cat of getitems of a normalized split, delegate to SplitCatSimplifier to
+    # simplify or remove the split. Returns early if split_sections is not a list/tuple (unnormalized).
     if not isinstance(split_sections, (list, tuple)):  # Unnormalized split
         return
     split_node = next(node for node in match.nodes if node.target is torch.split)
@@ -1461,6 +1593,8 @@ def simplify_split_cat(match: Match, split_sections: list[int], dim: int):
 
 
 def has_same_parent_node(node: torch.fx.Node):
+    # [FUNCTION DOC] HELPER: Return True if every element of the node's first argument list is a getitem call and all
+    # share the same container (parent) node. Returns False otherwise.
     # the input nodes of the node should come from the same parent
     prev_node = None
     for getitem in node.args[0]:  # type: ignore[union-attr]
@@ -1475,6 +1609,7 @@ def has_same_parent_node(node: torch.fx.Node):
 
 
 def remove_zeros(split_sections: list[int]):
+    # [FUNCTION DOC] HELPER: Return (sections without zero entries, mapping from old index to new index for kept entries).
     """
     Remove zeros from the list and get the index mapping dict from getitem
     in split node to getitem in new split node
@@ -1491,6 +1626,8 @@ def remove_zeros(split_sections: list[int]):
 
 
 def is_sorted_and_consecutive(arr: list[int]) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the list is in ascending order and adjacent elements differ by exactly 1
+    # (an empty or single element list is accepted).
     # check if the array is sorted
     if arr == sorted(arr):
         # check if the differences between adjacent elements are all 1
@@ -1500,6 +1637,7 @@ def is_sorted_and_consecutive(arr: list[int]) -> bool:
 
 
 def calculate_fused_tensor_size(split_node: torch.fx.Node, indices: list[int]) -> int:
+    # [FUNCTION DOC] HELPER: Sum the split sections of split_node whose positions appear in indices; returns an int.
     """
     Calculate the fused tensor size in the indices
     """
@@ -1521,6 +1659,11 @@ def calculate_fused_tensor_size(split_node: torch.fx.Node, indices: list[int]) -
     pass_dict=construct_pattern_matcher_pass("merge_getitem_cat_pass"),
 )
 def merge_getitem_cat(match: Match, split_sections: list[int], dim: int):
+    # [FUNCTION DOC] Pattern handler: for cats whose inputs are consecutive getitems of one normalized split on the same dim
+    # (each with one user), replace those getitems by one getitem of a split with the sections fused, and drop
+    # zero-length leftovers, rebuilding the split node and remapping getitem indices. Skips unnormalized
+    # splits and cats that do not satisfy the checks. Mutates the graph and increments merge_getitem_cat_pass.
+    # KNOWN ISSUE: the in-body loop computing fused_tensor_size is dead code (value unused; the helper is used).
     if not isinstance(split_sections, (list, tuple)):  # Unnormalized split
         return
     graph = match.graph
@@ -1628,6 +1771,10 @@ def merge_getitem_cat(match: Match, split_sections: list[int], dim: int):
     pass_dict=construct_pattern_matcher_pass("mutate_cat_pass"),
 )
 def mutate_cat_node(match: Match, split_sections: list[int], dim: int):
+    # [FUNCTION DOC] Pattern handler: for cats of consecutive getitems of one split on the same dim, replace the cat by the
+    # split input when all sections are used, or by a slice of the split input (built as a getitem with a
+    # slice tuple) when only some are used, then erase the cat. Increments mutate_cat_pass. Skips unnormalized
+    # splits or inputs without example values for the partial case.
     if not isinstance(split_sections, (list, tuple)):  # Unnormalized split
         return
     graph = match.graph
@@ -1705,6 +1852,12 @@ getitem_split_aten = ListOf(
     pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
 )
 def normalize_split_default_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): normalize aten split.Tensor into split_with_sizes with an explicit list of
+    # equal sections and non-negative dim. Skips on missing args, absent val, or symbolic sizes; clamps the
+    # split size to the input size along dim. Replaces the node, copies meta, increments
+    # normalization_aten_pass. Raises an assertion error if val is not a list/tuple.
+    # KNOWN ISSUE: sections are built as equal sizes, so a smaller final chunk (non-divisible input) is
+    # not represented correctly.
     split_node = match.nodes[0]
     graph = match.graph
     split_input, split_size, split_dim = _get_split_args_default(split_node)
@@ -1755,6 +1908,9 @@ def normalize_split_default_aten(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
 )
 def normalize_split_with_size_default_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): canonicalize split_with_sizes by moving a negative dim to non-negative
+    # positional-arg/keyword form. Skips on missing args, absent val, or symbolic sections; no-op if already
+    # canonical. Replaces the node, copies meta, increments normalization_aten_pass.
     split_node = match.nodes[0]
     graph = match.graph
     split_input, split_sections, split_dim = _get_split_args_default(split_node)
@@ -1801,6 +1957,13 @@ def normalize_split_with_size_default_aten(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("split_cat_aten_pass"),
 )
 def merge_split_cat_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): for a large cat (at least threshold_to_cat inputs, config default 10) fed by
+    # getitems of aten split_with_sizes, group runs of consecutive getitems per parent split and replace each
+    # qualifying run with one slice of the split input (or the input itself if the run covers all sections),
+    # then update the cat arguments, erase unused getitems and the split, and increment split_cat_aten_pass.
+    # Reads the post-grad fusion options config.
+    # KNOWN ISSUE: the split dim variable is taken from the last parent seen in the loop and a dim mismatch
+    # only breaks the scan loop, not the later rewrite.
     graph = match.graph
     split_node = match.nodes[0]
     threshold_to_cat = torch._inductor.config.post_grad_fusion_options[
@@ -1905,6 +2068,12 @@ def merge_split_cat_aten(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("select_cat_aten_pass"),
 )
 def merge_select_cat_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): for a cat of select ops over consecutive indices of one tensor covering the full
+    # dim, replace the cat by a view of the selected-from tensor with the cat's shape, erase the cat and unused
+    # selects, and increment select_cat_aten_pass. Skips when select dims differ from cat dim, indices are not
+    # consecutive, or val metadata is missing.
+    # KNOWN ISSUE: the tensors argument (a list) is used as if it were a node (attribute users), which looks
+    # wrong and would fail for a plain list.
     graph = match.graph
     node = match.nodes[0]
     node_input = get_arg_value(node, 0, "tensors")
@@ -1957,6 +2126,10 @@ def merge_select_cat_aten(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("normalization_aten_pass"),
 )
 def normalize_cat_default_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): normalize aten cat into a call with the tensors positional and a non-negative
+    # dim keyword (dim or axis, default 0). Requires val metadata on all nodes (else skips). Replaces the node,
+    # copies meta, increments normalization_aten_pass. Raises an assertion error if tensors is not a list/tuple
+    # or ranks mismatch (except 1-D empty tensors).
     cat_node = match.nodes[0]
     graph = match.graph
     tensors = get_arg_value(cat_node, 0, "tensors")
@@ -1980,6 +2153,7 @@ def normalize_cat_default_aten(match: Match, *args, **kwargs):
     ndim = cat_node.meta["val"].dim()
 
     def is_empty_tensor(x: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the tensor is 1-D with zero length (allowed alongside other ranks in cat).
         # special case where torch.ops.aten.cat.default supports cat'ing with an empty tensor
         x_shape = x.meta["val"].shape
         return len(x_shape) == 1 and x_shape[0] == 0
@@ -2011,6 +2185,10 @@ def normalize_cat_default_aten(match: Match, *args, **kwargs):
     pass_dict=construct_pattern_matcher_pass("unbind_stack_aten_pass"),
 )
 def merge_unbind_stack_aten(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): for a cat of unsqueezes of select ops that together enumerate every index (from 0,
+    # consecutive) of one parent along the cat dim and where the parent has no other users, replace the cat
+    # with the parent tensor and erase the cat, unsqueezes, and unused selects. Increments
+    # unbind_stack_aten_pass. Returns without change if any structural check fails.
     node = match.nodes[-1]
     graph = match.graph
     # pyre-fixme[6]
@@ -2068,6 +2246,8 @@ def merge_unbind_stack_aten(match: Match, *args, **kwargs):
 
 
 def divide_into_consecutive_sublists(indices: list[int]) -> list[list[int]]:
+    # [FUNCTION DOC] HELPER: Split a list of integers into maximal runs of consecutive values (each next item is previous plus
+    # one). Lists of length 0 or 1 are returned wrapped in a single outer list. Pure function.
     n = len(indices)
     if n <= 1:
         return [indices]
@@ -2106,6 +2286,11 @@ def update_args_from_split_getitem(
     idx_to_getitems: dict[int, torch.fx.Node],
     threshold_to_cat: int = 2,
 ):
+    # [FUNCTION DOC] HELPER: Flush a run of getitems from one split into the new cat argument lists. If the run covers every
+    # section consecutively, append the split input itself; otherwise divide into consecutive sub-runs and, for
+    # each sub-run of at least threshold_to_cat items, append a slice (getitem with a slice tuple, inserted after
+    # node, with example value) of the split input along the split dim, else append the original getitems.
+    # Mutates new_cat_args and new_cat_args_meta in place; may insert graph nodes.
     split_input, split_size, split_dim = _get_split_args_default(parents_seen[-1])
     # case 1: the number of getitems is the same as the split size, eliminate the split
     if len(split_size) == len(getitem_indices) and is_sorted_and_consecutive(
@@ -2161,6 +2346,8 @@ def reshape_cat_node(
     unbind_dim: int,
     cat_shape: torch.Size,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Build a reshape (preceded by a permute swapping unbind and cat dims when they differ) of the
+    # unbind input to the target cat shape, setting example values on the new nodes. Returns the reshape node.
     if cat_dim != unbind_dim:
         # construct the permute node args, which has the same shape as the slice node
         # then it has the same dim as the unbind_input, i.e., shape of cat + 1
@@ -2199,6 +2386,10 @@ def update_args_from_unbind_getitem(
     idx_to_getitems: dict[int, torch.fx.Node],
     threshold_to_cat: int = 2,
 ):
+    # [FUNCTION DOC] HELPER: Unbind/stack analogue of the split flush. If the run covers the whole unbind dim, append a reshape
+    # of the unbind input to the cat shape; if it is a consecutive run of at least threshold_to_cat items,
+    # slice the input along the unbind dim (with narrow example value) and reshape it; otherwise append the
+    # original getitems. Mutates new_cat_args and new_cat_args_meta; may insert graph nodes.
     unbind_input = get_arg_value(parents_seen[-1], 0, "input")  # split or unbind input
     unbind_dim = get_arg_value(parents_seen[-1], 1, "dim")  # split or unbind dim
     cat_dim = get_arg_value(node, 1, "dim")  # cat or stack dim
@@ -2264,6 +2455,10 @@ def construct_cat_args(
     threshold_to_cat: int = 2,
     run_update_func: Callable = update_args_from_split_getitem,  # type: ignore[type-arg]
 ) -> tuple[list[torch.fx.Node], list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Scan the inputs of a cat/stack node and build replacement argument lists. Consecutive getitems
+    # of the same split or unbind parent are grouped and passed to run_update_func (which decides whether to
+    # merge them into slices/reshapes); other inputs are copied through. Returns (new args, their example
+    # values). Does not erase nodes, though run_update_func may insert nodes.
     new_cat_args, parents_seen, getitem_indices, idx_to_getitems = [], [], [], {}  # type: ignore[var-annotated]
     new_cat_args_meta = []  # type: ignore[var-annotated]
     for input in inputs:
@@ -2329,6 +2524,8 @@ def construct_cat_args(
 
 
 def remove_split_unbind_children(graph: torch.fx.Graph, inputs: list[torch.fx.Node]):
+    # [FUNCTION DOC] HELPER: Erase input nodes that have no users, then erase the parent split/unbind nodes of any getitem
+    # inputs that now have no users. Mutates the graph.
     nodes = OrderedSet[Any]()
     for input in inputs:
         if input.target is operator.getitem:
@@ -2367,6 +2564,10 @@ def remove_split_unbind_children(graph: torch.fx.Graph, inputs: list[torch.fx.No
     pass_dict=construct_pattern_matcher_pass("split_cat_to_slices_pass"),
 )
 def split_cat_to_slices(match: Match, split_sections: list[int], dim: int):
+    # [FUNCTION DOC] Pattern handler: for a cat of getitems from a normalized torch.split, merge long consecutive runs (at
+    # least threshold_to_cat, from pre-grad config, default 10) into slices of the split input. If one argument
+    # remains, the cat is replaced by it; if fewer than before, a new cat on the split dim replaces the old.
+    # Erases the old cat and orphaned children; increments split_cat_to_slices_pass. Skips unnormalized splits.
     if not isinstance(split_sections, (list, tuple)):  # Unnormalized split
         return
     split_nodes = [node for node in match.nodes if node.target is torch.split]
@@ -2450,6 +2651,9 @@ def split_cat_to_slices(match: Match, split_sections: list[int], dim: int):
     pass_dict=construct_pattern_matcher_pass("unbind_cat_to_view_pass"),
 )
 def unbind_cat_to_view(match: Match, unbind_input: torch.fx.Node, dim: int):
+    # [FUNCTION DOC] Pattern handler: for a cat of getitems from an unbind, merge runs into slice plus reshape of the unbind
+    # input (threshold from pre-grad config, default 10). Replaces the cat by the single remaining argument or
+    # by a new cat with fewer inputs, erases orphans, and increments unbind_cat_to_view_pass.
     unbind_node = next(node for node in match.nodes if node.target is torch.unbind)
     graph = match.graph
     # get the cat_node and check its inputs and meta data
@@ -2508,6 +2712,9 @@ def reshape_cat_node_to_stack(
     stack_node: torch.fx.Node,
     split_or_unbind_dim: int,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replace a stack node with a view of cat_node: if stack dim differs from the split/unbind dim,
+    # first reshape (with swapped sizes) and permute to move dims; then view to the stack shape. Copies meta,
+    # redirects uses of the stack, erases it, and removes orphaned inputs. Returns nothing.
     # reshape the cat node to the stack node shape
     stack_shape = stack_node.meta["example_value"].shape
     stack_dim = _get_dim(stack_node)
@@ -2564,6 +2771,8 @@ def convert_reshape_cat_arg_to_stack(
     stack_dim: int,
     split_dim: int,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Return a view node reshaping cat_node (after a dim-swapping permute when stack dim differs from
+    # split dim) to the stack node shape, with example values set. Does not replace or erase anything.
     # reshape the cat node to the stack node shape
     cat_shape = cat_node.meta["example_value"].shape
     if stack_dim != split_dim:
@@ -2624,6 +2833,10 @@ def convert_reshape_cat_arg_to_stack(
     pass_dict=construct_pattern_matcher_pass("split_stack_to_cats_pass"),
 )
 def split_stack_to_cats(match: Match, split_sections: list[int], dim: int):
+    # [FUNCTION DOC] Pattern handler: for a stack of getitems from a normalized split, merge consecutive runs into slices of
+    # the split input, build a cat on the split dim, and convert it to the stack result with reshape_cat_node_to_stack.
+    # Handles both the single remaining argument and the reduced multi-argument cases. Threshold from pre-grad
+    # config (default 10). Increments split_stack_to_cats_pass. Skips unnormalized splits.
     if not isinstance(split_sections, (list, tuple)):  # Unnormalized split
         return
     split_node = next(node for node in match.nodes if node.target is torch.split)
@@ -2697,6 +2910,9 @@ def split_stack_to_cats(match: Match, split_sections: list[int], dim: int):
     pass_dict=construct_pattern_matcher_pass("unbind_stack_to_slices_pass"),
 )
 def unbind_stack_to_slices(match: Match, unbind_input: torch.fx.Node, dim: int):
+    # [FUNCTION DOC] Pattern handler: for a stack of getitems from an unbind, merge runs into slices/reshapes of the unbind
+    # input, then rebuild via a single converted node or a new cat followed by conversion to the stack
+    # shape. Threshold from pre-grad config (default 10). Increments unbind_stack_to_slices_pass.
     unbind_node = next(node for node in match.nodes if node.target is torch.unbind)
     graph = match.graph
     # get the cat_node and check its inputs and meta data
@@ -2764,6 +2980,9 @@ def unbind_stack_to_slices(match: Match, unbind_input: torch.fx.Node, dim: int):
 
 
 def get_view_shape_list(cat_arg: torch.fx.Node, stack_dim: int) -> list[int]:
+    # [FUNCTION DOC] HELPER: Find the first reshape that consumes a getitem of a split of cat_arg and return the shape of its
+    # example value with a new dim inserted at stack_dim, with that dim set to -1 as a placeholder. Returns an
+    # empty list if none is found.
     # cat_arg must be the split input
     view_shape_list = []
     for user in cat_arg.users:
@@ -2795,6 +3014,11 @@ def get_view_shape_list(cat_arg: torch.fx.Node, stack_dim: int) -> list[int]:
     pass_dict=construct_pattern_matcher_pass("move_reshape_out_of_split_stack_pass"),
 )
 def move_reshape_out_of_split_stack(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: for stacks of reshaped getitems of one split, move the reshape out by stacking/catting
+    # the split pieces directly: with one remaining argument convert it with a permute and view; with
+    # several, decompose into stacks of the original inputs plus converted pieces, joined by a cat on the
+    # stack dim. Erases the old stack and orphans, and increments move_reshape_out_of_split_stack_pass.
+    # Threshold from pre-grad config (default 10); skips stacks without example values.
     split_node = next(node for node in match.nodes if node.target is torch.split)
     split_dim = _get_dim(split_node)
     split_users = list(split_node.users.keys())
@@ -2933,6 +3157,10 @@ view_getitem_split_aten = ListOf(
     pass_dict=construct_pattern_matcher_pass("move_view_after_cat_aten_pass"),
 )
 def move_view_after_cat(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler (aten): for a cat of reshape-of-getitem inputs covering all consecutive sections of one
+    # split_with_sizes, replace the cat with a single reshape of the split input (preceded by a permute when
+    # cat dim differs from split dim) to the cat shape. Skips when indices are not consecutive, counts differ,
+    # or example values are absent. Erases the cat and increments move_view_after_cat_aten_pass.
     split_node = next(
         node
         for node in match.nodes
@@ -2998,6 +3226,9 @@ def move_view_after_cat(match: Match, *args, **kwargs):
 
 
 def match_einsum_strings(s: str) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the einsum equation string has three comma/arrow separated parts of lengths
+    # 3, 4, and 3 where the first two characters of all parts agree, the third characters of the first two
+    # agree, and the last character of the second equals the third character of the third. False otherwise.
     """
     This function takes a string s as input, where s is in the format "3 letter string,
     4 letter string -> 3 letter string".
@@ -3035,10 +3266,16 @@ def match_einsum_strings(s: str) -> bool:
     pass_dict=construct_pattern_matcher_pass("einsum_to_pointwise_pass"),
 )
 def replace_einsum_to_pointwise(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler: replace a two-operand einsum of a specific equation form (see match_einsum_strings) by a
+    # pointwise multiply and sum when it has an add user and both operands have example values. Uses replace_by_example
+    # on the match and increments einsum_to_pointwise_pass.
     def repl(input, weights):
+        # [FUNCTION DOC] HELPER: Replacement computation: add a trailing dim to input, multiply with weights, sum over the second to last dim.
         return (input.unsqueeze(-1) * weights).sum(-2)
 
     def should_replace_einsum(einsum_node) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if the einsum has exactly two operands, both operands (from the enclosing scope)
+        # have valid example values, any user is an add, and the equation matches the supported form.
         equation = get_arg_value(einsum_node, 0)
         users = einsum_node.users.keys()
         # for now, we only consider the case of two operands

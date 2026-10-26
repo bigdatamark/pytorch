@@ -1,3 +1,7 @@
+# [MODULE DOC] SPMD graph verification used before collective reordering / overlap scheduling.
+# Hashes each rank's FX graph structure (op targets plus tensor metadata), gathers hashes across
+# ranks, and on mismatch prints/logs/traces a diagnostic report and optionally raises.
+# Main entry point: spmd_check. Import-time side effect: creates the module logger.
 """SPMD graph verification for overlap scheduling.
 
 Verifies all ranks have identical FX graph structure before collective
@@ -18,6 +22,9 @@ log = logging.getLogger(__name__)
 
 
 def _compute_hash(gm: torch.fx.GraphModule) -> int | None:
+    # [FUNCTION DOC] HELPER: Compute a 64-bit signed structural hash of the graph's call_function nodes (target string
+    # plus fake tensor val metadata) using the device-agnostic FX graph cache pickler and a blake2b digest.
+    # Returns None (after logging a warning) if the graph cannot be pickled (bypass exception).
     """Compute a structural hash of the graph including tensor metadata.
 
     Uses FxGraphCachePickler(device_id_agnostic=True) to serialize
@@ -51,6 +58,8 @@ def _compute_hash(gm: torch.fx.GraphModule) -> int | None:
 def _build_diag_fingerprint(
     gm: torch.fx.GraphModule,
 ) -> tuple[tuple[str, str | None], ...]:
+    # [FUNCTION DOC] HELPER: Build a tuple of (target string, formatted metadata or None) for each call_function node,
+    # in graph order. Used only on the mismatch path for human-readable diffs.
     """Build human-readable fingerprint for mismatch diagnostics.
 
     Only called on the rare mismatch path.
@@ -73,6 +82,8 @@ def _build_diag_fingerprint(
 
 
 def _format_val_metadata(val: object, extract_fn: object) -> str | None:
+    # [FUNCTION DOC] HELPER: Format a node's val metadata as a string: None for missing val, tensor metadata for a tensor,
+    # a parenthesized comma list for tuples/lists (type names for non-tensor items), else the type name.
     """Format node val metadata for human-readable diagnostics."""
     if val is None:
         return None
@@ -90,6 +101,11 @@ def _format_val_metadata(val: object, extract_fn: object) -> str | None:
 
 
 def spmd_check(gm: torch.fx.GraphModule) -> bool:
+    # [FUNCTION DOC] Check that all ranks hold structurally identical graphs. Returns True immediately if distributed is
+    # not initialized, world size is 1 or less, or the graph is unhashable. Otherwise all-gathers hashes
+    # (with fake mode disabled); equal hashes return True. On mismatch, gathers fingerprints, builds a
+    # report, prints it, logs a warning, emits a structured trace artifact, then raises a runtime error if
+    # config spmd_mismatch is error; otherwise returns False. Collective call: all ranks must participate.
     """Verify all ranks have identical FX graph structure (SPMD).
 
     Computes a structural hash (op targets + tensor metadata including
@@ -153,6 +169,7 @@ def spmd_check(gm: torch.fx.GraphModule) -> bool:
 
 
 def _entry_target(entry: object) -> str:
+    # [FUNCTION DOC] HELPER: Return the target string of a fingerprint entry (first tuple element, or the entry as string).
     """Extract the target string from a fingerprint entry."""
     if isinstance(entry, tuple):
         return str(entry[0])
@@ -160,6 +177,7 @@ def _entry_target(entry: object) -> str:
 
 
 def _entry_metadata(entry: object) -> str:
+    # [FUNCTION DOC] HELPER: Return a metadata suffix string for a fingerprint entry, or empty string if absent or None.
     """Format metadata from a fingerprint entry, if present."""
     if isinstance(entry, tuple) and len(entry) >= 2:
         meta = entry[1]
@@ -173,6 +191,9 @@ def _build_mismatch_report(
     rank: int,
     world_size: int,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build the multi-line mismatch report text: header, node counts per rank (marking ranks that
+    # differ from rank 0), and for each differing rank up to 10 positional node diffs plus the top 10 ops
+    # present more times on only one side. Pure function returning a string.
     """Build diagnostic report for SPMD graph mismatch."""
     lines = [
         "=" * 80,
