@@ -1,3 +1,9 @@
+# [MODULE DOC] Generic key/value cache abstractions for Inductor: Cache (abstract get and
+# insert), InMemoryCache (dict plus lock, loadable from an environment variable or a
+# pickle file), AsyncCache (thread-pool wrappers), OnDiskCache (one pickle file per key
+# under a temp dir with file locks and a version prefix) and InductorOnDiskCache (uses
+# the Inductor default cache dir). Inserts never overwrite. Defines Key and Value
+# TypeVars and CacheError. No import-time side effects beyond definitions.
 from __future__ import annotations
 
 import pickle
@@ -28,12 +34,16 @@ Value = TypeVar("Value", str, int, tuple[Any, ...], bytes, dict[Any, Any], list[
 
 
 class CacheError(ValueError):
+    # [CLASS DOC] Error type for cache failures such as malformed serialized data or
+    # values/keys that cannot be pickled or unpickled.
     """
     Exception raised for errors encountered during cache operations.
     """
 
 
 class Cache(ABC, Generic[Key, Value]):
+    # [CLASS DOC] Abstract interface for a key/value cache with get and insert; inserts
+    # must not overwrite existing entries.
     """
     Abstract base class for cache implementations.
     Provides the interface for cache operations.
@@ -41,6 +51,7 @@ class Cache(ABC, Generic[Key, Value]):
 
     @abstractmethod
     def get(self: Self, key: Key) -> Value | None:
+        # [FUNCTION DOC] Abstract: return the cached value for key, or None if absent.
         """
         Retrieve a value from the cache.
         Args:
@@ -51,6 +62,8 @@ class Cache(ABC, Generic[Key, Value]):
 
     @abstractmethod
     def insert(self: Self, key: Key, value: Value) -> bool:
+        # [FUNCTION DOC] Abstract: store value under key; return True if stored, False if the
+        # key already exists.
         """
         Insert a value into the cache.
         Args:
@@ -62,11 +75,14 @@ class Cache(ABC, Generic[Key, Value]):
 
 
 class InMemoryCache(Cache[Key, Value]):
+    # [CLASS DOC] Thread-safe dict-backed cache. State: _cache (mapping) guarded by _lock.
+    # No overwrites on insert. Can be populated from an env var or a pickled dict file.
     """
     In-memory cache implementation using a dictionary and thread lock.
     """
 
     def __init__(self: Self) -> None:
+        # [FUNCTION DOC] Creates an empty cache dict and a lock.
         """
         Initialize an empty in-memory cache.
         """
@@ -74,6 +90,8 @@ class InMemoryCache(Cache[Key, Value]):
         self._lock: Lock = Lock()
 
     def get(self: Self, key: Key) -> Value | None:
+        # [FUNCTION DOC] Under the lock, returns the stored value for key, or None if missing.
+        # A stored value of None is indistinguishable from a miss.
         """
         Retrieve a value from the cache.
         Args:
@@ -87,6 +105,8 @@ class InMemoryCache(Cache[Key, Value]):
             return None
 
     def insert(self: Self, key: Key, value: Value) -> bool:
+        # [FUNCTION DOC] Under the lock, stores the value if the key is absent and returns
+        # True; returns False without overwriting if the key exists.
         """
         Insert a value into the cache.
         Args:
@@ -104,6 +124,12 @@ class InMemoryCache(Cache[Key, Value]):
 
     @classmethod
     def from_env_var(cls, env_var: str) -> Self:
+        # [FUNCTION DOC] Builds a cache from the named environment variable, which holds
+        # semicolon-separated entries of the form key-literal, comma, value-literal where each
+        # side is the textual repr of pickled bytes. Missing variable or blank entries give
+        # an empty cache or are skipped. Raises CacheError on a missing comma, an invalid
+        # literal, an un-pickle-able key or value, or one key with conflicting values;
+        # identical duplicate entries are accepted. Reads the environment only.
         """
         Create an in-memory cache from an environment variable.
         Args:
@@ -182,6 +208,10 @@ class InMemoryCache(Cache[Key, Value]):
 
     @classmethod
     def from_file_path(cls, fpath: Path) -> Self:
+        # [FUNCTION DOC] Builds a cache whose dict is loaded from a pickle file; a missing
+        # file gives an empty cache. Raises CacheError if unpickling fails or the loaded
+        # object is not a dict. Reads the file; no locking.
+        # KNOWN ISSUE: only pickle.UnpicklingError is caught, so other unpickle errors escape.
         """
         Create an in-memory cache from a file path.
         Args:
@@ -214,6 +244,8 @@ class InMemoryCache(Cache[Key, Value]):
 
 
 class AsyncCache(Cache[Key, Value]):
+    # [CLASS DOC] Cache mixin adding get_async and insert_async that run get and insert on a
+    # supplied thread pool executor and return futures. Still abstract for get/insert.
     """
     Asynchronous cache implementation using ThreadPoolExecutor.
     """
@@ -221,6 +253,7 @@ class AsyncCache(Cache[Key, Value]):
     def get_async(
         self: Self, key: Key, executor: ThreadPoolExecutor
     ) -> Future[Value | None]:
+        # [FUNCTION DOC] Submits get for key to the executor and returns the future.
         """
         Retrieve a value from the cache asynchronously.
         Args:
@@ -234,6 +267,8 @@ class AsyncCache(Cache[Key, Value]):
     def insert_async(
         self: Self, key: Key, value: Value, executor: ThreadPoolExecutor
     ) -> Future[bool]:
+        # [FUNCTION DOC] Submits insert of key and value to the executor and returns the
+        # future holding the boolean result.
         """
         Insert a value into the cache asynchronously.
         Args:
@@ -247,6 +282,10 @@ class AsyncCache(Cache[Key, Value]):
 
 
 class OnDiskCache(AsyncCache[Key, Value]):
+    # [CLASS DOC] File-backed cache: each key is hashed (SHA256 of its pickle) to a file
+    # name under base_dir; file content is a 4-byte version prefix followed by the pickled
+    # value. Per-file-prefix lock files serialize access. Stale-version files are deleted
+    # on read. State: name (cache dir name); class attribute version (default 0).
     """
     On-disk cache implementation using files and file locks.
     Stores cache data in files on disk, with atomic operations and versioning.
@@ -259,6 +298,7 @@ class OnDiskCache(AsyncCache[Key, Value]):
     version: int = 0
 
     def __init__(self: Self, name: str | None = None) -> None:
+        # [FUNCTION DOC] Sets the cache directory name, defaulting to on_disk_cache.
         """
         Initialize an on-disk cache instance.
         Args:
@@ -269,6 +309,7 @@ class OnDiskCache(AsyncCache[Key, Value]):
 
     @cached_property
     def base_dir(self: Self) -> Path:
+        # [FUNCTION DOC] Cached property: temp directory, then cache, then the cache name.
         """
         Get the base directory for the cache.
         Returns:
@@ -277,6 +318,9 @@ class OnDiskCache(AsyncCache[Key, Value]):
         return Path(gettempdir()) / "cache" / self.name
 
     def _fpath_from_key(self: Self, key: Key) -> Path:
+        # [FUNCTION DOC] HELPER: Maps a key to its file path: the first 32 hex characters of
+        # the SHA256 of the key pickle, inside base_dir. Raises CacheError if the key cannot
+        # be pickled. The trailing exhaustiveness call is unreachable.
         """
         Get the file path for a given key.
         Args:
@@ -296,6 +340,9 @@ class OnDiskCache(AsyncCache[Key, Value]):
         assert_never(key)
 
     def _flock_from_fpath(self: Self, fpath: Path) -> FileLock:
+        # [FUNCTION DOC] HELPER: Returns a file lock for the lock file named by the first 4
+        # characters of the entry file name, inside a locks subfolder of the entry directory
+        # (so many keys share a lock). Does not create the directory.
         """
         Get a file lock for a given file path.
         Args:
@@ -312,6 +359,10 @@ class OnDiskCache(AsyncCache[Key, Value]):
 
     @property
     def version_prefix(self: Self) -> bytes:
+        # [FUNCTION DOC] Property: first 4 bytes of the SHA256 of the OnDiskCache version
+        # number text, written at the start of every cache file.
+        # KNOWN ISSUE: reads the version from the OnDiskCache class, not self, so subclass
+        # version overrides are ignored.
         """
         Get the version prefix for the cache.
         Returns:
@@ -321,6 +372,10 @@ class OnDiskCache(AsyncCache[Key, Value]):
 
     @override
     def get(self: Self, key: Key) -> Value | None:
+        # [FUNCTION DOC] Under the entry lock, returns the unpickled value for key, or None if
+        # the file is missing. If the version prefix differs, the stale file is deleted and
+        # None is returned. Raises CacheError if the value cannot be unpickled. Side effect:
+        # file removal.
         """
         Retrieve a value from the cache.
         Args:
@@ -363,6 +418,11 @@ class OnDiskCache(AsyncCache[Key, Value]):
 
     @override
     def insert(self: Self, key: Key, value: Value) -> bool:
+        # [FUNCTION DOC] Creates the entry directory, then under the lock creates the file
+        # exclusively and writes the version prefix and pickled value. Returns False if the
+        # file already exists, else True. Raises CacheError if the value cannot be pickled.
+        # KNOWN ISSUE: on a pickling failure the partially written file is left behind, so
+        # later gets may see a corrupt entry and inserts return False.
         """
         Insert a value into the cache.
         Args:
@@ -395,12 +455,15 @@ class OnDiskCache(AsyncCache[Key, Value]):
 
 
 class InductorOnDiskCache(OnDiskCache[Key, Value]):
+    # [CLASS DOC] OnDiskCache fixed to the name inductor_on_disk_cache and rooted at the
+    # Inductor default cache directory instead of the system temp directory.
     """
     Inductor-specific on-disk cache implementation.
     Uses a custom base directory for Inductor cache files.
     """
 
     def __init__(self: Self) -> None:
+        # [FUNCTION DOC] Initializes the parent with the fixed cache name.
         """
         Initialize an inductor on-disk cache instance.
         Sets the cache directory name to "inductor_on_disk_cache".
@@ -409,6 +472,7 @@ class InductorOnDiskCache(OnDiskCache[Key, Value]):
 
     @cached_property
     def base_dir(self: Self) -> Path:
+        # [FUNCTION DOC] Cached property: Inductor default cache dir, then cache, then name.
         """
         Get the base directory for the Inductor cache.
         Returns:

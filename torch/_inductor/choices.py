@@ -1,3 +1,9 @@
+# [MODULE DOC] Default Inductor tuning heuristics. Defines InductorChoices, an overridable
+# collection of decisions (config heuristics per device, GEMM/template choice generation,
+# layout fixing, cooperative/persistent reduction, reduction split factor, fusion legality
+# and scoring) installed via V.set_choices_handler, plus FusionScore (ordering key for
+# fusions) and the Sortable protocol. At import time it defines a shape-logging hook that
+# is a no-op outside fbcode.
 from __future__ import annotations
 
 import dataclasses
@@ -56,6 +62,8 @@ if TYPE_CHECKING or not config.is_fbcode():
         op_name: str,
         context_fn: Any = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: No-op stand-in for the fbcode shape logger; ignores its
+        # arguments and returns nothing.
         return
 
 else:
@@ -65,13 +73,19 @@ else:
 
 
 class Sortable(typing.Protocol):
+    # [CLASS DOC] HELPER: Protocol for values usable as sort keys, requiring a less-than
+    # comparison.
     """Anything that can be used as a list.sort() key (int/tuple/etc)"""
 
+    # [FUNCTION DOC] HELPER: Protocol method; strict ordering comparison.
     def __lt__(self, other: typing.Self) -> bool: ...
 
 
 @dataclasses.dataclass
 class FusionScore:
+    # [CLASS DOC] Dataclass ordering key for candidate fusions with integer fields
+    # template_score, node_type_score, memory_score, buffer_overlap_score and proximity_score.
+    # Comparison is defined by __lt__; higher scores fuse first.
     template_score: int
     node_type_score: int
     memory_score: int
@@ -79,6 +93,9 @@ class FusionScore:
     proximity_score: int
 
     def __lt__(self, other):
+        # [FUNCTION DOC] Returns whether this score ranks below other. Order: template_score
+        # first; then if the larger memory_score exceeds 16 times the smaller, memory_score
+        # decides; otherwise lexicographic on node_type, memory, buffer_overlap, proximity.
         """
         node_type_score orders same-kind fusions above mixed-kind fusions unless
         the memory_score differs too much. Nested reduction candidates use -1
@@ -113,6 +130,10 @@ class FusionScore:
 
 
 class InductorChoices:
+    # [CLASS DOC] Stateless collection of overridable heuristics used by Inductor codegen,
+    # scheduler and autotuning. Subclass and install through the virtualized choices
+    # handler to customize. Subclasses used via the inductor_choices_class option must
+    # implement uuid for cache key computation. Correctness requirements do not belong here.
     """
     This class contains a collection of default heuristics that affect performance of our generated
     code.  We try to not put correctness requirements in this file.
@@ -131,6 +152,8 @@ class InductorChoices:
     def get_config_heuristics(
         self, device_type: str | None = "cuda"
     ) -> BaseConfigHeuristic:
+        # [FUNCTION DOC] Returns a new config heuristic object for the device type: CUDA (or
+        # ROCm when torch.version.hip is set), XPU, CPU, MTIA, else the base heuristic.
         if device_type == "cuda":
             if torch.version.hip is None:
                 return CUDAConfigHeuristic()
@@ -149,10 +172,13 @@ class InductorChoices:
     def get_conv_configs(
         self, device_type: str | None = "cuda"
     ) -> partial[Generator[TritonConfig, None, None]]:
+        # [FUNCTION DOC] Returns the convolution config generator (a partial) from the
+        # device heuristic.
         conv_heuristics = self.get_config_heuristics(device_type)
         return conv_heuristics.get_conv_configs()
 
     def get_depthwise_conv_configs(self, device_type: str | None = "cuda") -> list[Any]:
+        # [FUNCTION DOC] Returns the depthwise convolution configs from the device heuristic.
         heuristics = self.get_config_heuristics(device_type)
         return heuristics.get_depthwise_conv_configs()
 
@@ -165,18 +191,22 @@ class InductorChoices:
         dtype: torch.dtype,
         device_type: str | None = "cuda",
     ) -> list[Any]:
+        # [FUNCTION DOC] Returns flex attention forward configs for the head dim, sequence
+        # length and dtype from the device heuristic.
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_fwd_configs(head_dim, seq_len, dtype)
 
     def get_flex_attention_bwd_configs(
         self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
     ) -> list[Any]:
+        # [FUNCTION DOC] Returns flex attention backward configs for the head dim and dtype.
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_attn_bwd_configs(head_dim, dtype)
 
     def get_flex_decode_configs(
         self, head_dim: int, dtype: torch.dtype, device_type: str | None = "cuda"
     ) -> list[Any]:
+        # [FUNCTION DOC] Returns flex decoding configs for the head dim and dtype.
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
 
@@ -191,6 +221,8 @@ class InductorChoices:
         sparse_q_block_size: int,
         sparse_kv_block_size: int,
     ) -> list[Any]:
+        # [FUNCTION DOC] Extension hook; default returns the given choices list unchanged and
+        # ignores all other arguments.
         """Append backend-specific flex-attention template choices.
 
         Default is a no-op. Subclasses may override to inject additional
@@ -199,6 +231,8 @@ class InductorChoices:
         return choices
 
     def _logging_context(self) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Hook returning extra fields for the shape log row; default is
+        # an empty mapping.
         """Extra fields for the per-shape log row. Subclasses may override."""
         return {}
 
@@ -210,6 +244,9 @@ class InductorChoices:
         op_name: str,
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[KernelTemplateChoice]:
+        # [FUNCTION DOC] HELPER: Hook to post-process template choices. Default: for matmul
+        # style inputs logs the shape (fbcode only), then flattens all generators in the
+        # mapping into one list of choices in order. Consumes the generators.
         """
         This method can be subclassed to perform any override/modification of the choices.
         The incoming parameters are cheap (generators), so you can do any overrides without
@@ -245,6 +282,11 @@ class InductorChoices:
         op_name: str,
         kwarg_overrides: dict[str, Any] | None = None,
     ) -> Generator[KernelTemplateChoice, None, None]:
+        # [FUNCTION DOC] Builds a generator of kernel template choices for one template: looks
+        # up the template-specific heuristic for the template uid, device type and op name,
+        # gets its configs, adjusted inputs and extra kwargs, and wraps them (with optional
+        # per-config kwarg overrides and the output layout) in a choice generator.
+        # Raises an error if the inputs have no device type.
         """
         Utility to get the KernelTemplateChoice generator for a specific input.
 
@@ -284,6 +326,11 @@ class InductorChoices:
         adjusted_choices: list[KernelTemplateChoice],
         op_name: str,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether output layouts must be fixed rather than
+        # flexible. True for non-mm/addmm ops on mps; for ROCm with origami under max autotune;
+        # without max autotune, true for ops other than mm/addmm unless flexible layouts are
+        # allowed; with max autotune, true if flexible layouts are disallowed, if the CUTLASS,
+        # CK, CKTILE or CPP backends are enabled, or if any choice uses a non-extern template.
         """Return True if any active backend requires fixed (non-flexible) tensor layouts."""
         # TODO: debug and fix
         # NOTE: on mps, we see issues with flexible layouts on baddmm. This check just makes sure
@@ -345,6 +392,13 @@ class InductorChoices:
         op_name: str,
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[ChoiceCaller]:
+        # [FUNCTION DOC] Returns the ChoiceCaller list for the templates: builds a choice
+        # generator per template (with per-uid kwarg overrides), finalizes them via
+        # _finalize_template_configs, and if layouts must be fixed sets a non-flexible output
+        # layout on each choice and drops its cached choice. Skips choices that produce none.
+        # Raises ValueError if fewer than 2 input nodes.
+        # KNOWN ISSUE: docstring lists a layout argument that does not exist; the layout
+        # comment says conversion to flexible while the code requests a fixed layout.
         """
         Get list of ChoiceCallers for MM templates using template-specific heuristics.
 
@@ -401,6 +455,7 @@ class InductorChoices:
         groups: list[sympy.Expr],
         kernel_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Hook; default returns kernel_kwargs unchanged.
         """Hook to change the kwargs passed to TritonKernel, used to apply fixed configurations"""
         return kernel_kwargs
 
@@ -409,10 +464,12 @@ class InductorChoices:
         best_choice: ChoiceCaller,
         timings: dict[ChoiceCaller, float],
     ) -> ChoiceCaller:
+        # [FUNCTION DOC] Hook; default returns the benchmarked best choice unchanged.
         """Hook to override the autotuning best choice after benchmarking."""
         return best_choice
 
     def customize_fused_kernel_name(self, fused_name: str, src_code: str) -> str:
+        # [FUNCTION DOC] Hook; default returns the fused kernel name unchanged.
         """Hook to transform fused kernel names during codegen"""
         return fused_name
 
@@ -420,6 +477,10 @@ class InductorChoices:
     def should_use_cooperative_reduction(
         device: torch.device, numel: sympy.Expr, reduction_numel: sympy.Expr
     ) -> bool:
+        # [FUNCTION DOC] Returns True if forced by config; False if disabled in config or on
+        # CPU. Otherwise uses the numel hint (fallback 2): up to 8 uses threshold 32768 times
+        # the hint, up to 16 uses 2097152, larger returns False; then True only when the
+        # reduction size is statically known to be at least the threshold.
         """Heuristic to decide if a cooperative reduction should be used."""
         if config.triton.force_cooperative_reductions:
             return True
@@ -443,8 +504,15 @@ class InductorChoices:
         features: SIMDKernelFeatures,
         cooperative_reduction: bool,
     ) -> bool:
+        # [FUNCTION DOC] Decides whether to use a persistent reduction. False if disabled; False
+        # if a strict-sum rblock exists (without multirow) and is not known to cover the whole
+        # reduction. Threshold is 1024 for inner hint else 64. For non inner/outer-tiny hints,
+        # requires finite constant bounds of the reduction size whose next powers of two are
+        # equal (avoids tile quantization). Cooperative reductions scale the threshold by 32
+        # over min(numel hint, 32); multi_kernel multiplies by 16. Returns whether the
+        # reduction size is statically known to be at most the threshold.
         """
-        Heuristic to decide if a persistent reduction should be used.
+        Heuristic to decide if a persistent should be used.
         """
         if not config.triton.persistent_reductions:
             return False
@@ -512,6 +580,9 @@ class InductorChoices:
         xnumel: int,
         num_sm: int,
     ) -> int:
+        # [FUNCTION DOC] HELPER: Returns the reduction size at or below which inner reductions
+        # are not split: for devices with major compute capability 10 or higher, 32768 when
+        # xnumel is below the SM count else 40960; otherwise 8192.
         # Benchmark results from two scenarios:
         # (1) Standalone ops/small models: CPU wall time measures end-to-end
         #     latency and generally prefers a large no-split threshold.
@@ -536,6 +607,13 @@ class InductorChoices:
         numel_hint: int,
         inner_reduction: bool,
     ) -> int:
+        # [FUNCTION DOC] Returns the number of splits (RSPLIT) for a split reduction, using
+        # device properties (SM count, warp size, threads per SM). Inner reductions: 1 if there
+        # are many outputs or the reduction is below a size threshold; otherwise pick a split
+        # size from element-per-thread bounds, preferring divisors of the reduction size, and
+        # return the ceiling of the reduction size over split size times threads. Outer
+        # reductions: similar with 4 values per thread and 128-wide x blocks. Queries device
+        # properties.
         """Heuristic to decide the RSPLIT used for split reductions.
         When a reduction has a small number of outputs there is not enough parallelism,
         so we will do the reduction in two phases."""
@@ -631,6 +709,12 @@ class InductorChoices:
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
+        # [FUNCTION DOC] General fusion veto, True if fusion is allowed. Rejects when there is
+        # no shared data (unless aggressive fusion applies to non-reduction nodes), recording a
+        # metric row and reason when buffers are shared but indexing mismatches; when the
+        # fused node count exceeds the max fusion size (non-foreach); when fusion would raise
+        # peak memory; or when it touches too many unique IO buffers. Each rejection logs a
+        # WhyNoFuse reason. Side effects: may write debug text files and add metric rows.
         """
         Heuristics to prevent fusion applied to both horizontal and vertical fusions.  Heuristics here should not
         be needed for correctness and tweaking them may yield additional performance.
@@ -701,6 +785,7 @@ class InductorChoices:
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
+        # [FUNCTION DOC] Hook; default always allows vertical fusion.
         """Hook for heuristics to prevent vertical (producer/consumer) fusions"""
         return True
 
@@ -711,6 +796,9 @@ class InductorChoices:
         node2: BaseSchedulerNode,
         shared_data_score: int,
     ) -> bool:
+        # [FUNCTION DOC] Hook for horizontal fusion: allowed for mix-order reductions; rejected
+        # if the shared data score is below the config memory threshold or the nodes are far
+        # apart (peak memory risk); otherwise allowed. Logs a WhyNoFuse reason on rejection.
         """Hook for heuristics to prevent horizontal (consumer/consumer) fusions"""
         if MixOrderReduction.can_fuse(node1, node2):
             # For mix order reduction, we disregard shared data or
@@ -732,6 +820,12 @@ class InductorChoices:
         node1: BaseSchedulerNode,
         node2: BaseSchedulerNode,
     ) -> Sortable:
+        # [FUNCTION DOC] Computes a FusionScore for fusing node1 and node2 (higher fuses
+        # first). Uses scheduler memory scores, proximity (negative max order distance),
+        # template score (0 when node2 is a template, else 1 or 2 depending on epilogue fusion
+        # ordering and positive memory score), and a node type score (1 for same kind with
+        # positive memory savings; -1 for dependent reductions of statically different
+        # reduction sizes under nested reduction).
         """
         Assign a score (higher comes first) to the fusion of node1 and node2.
         When different fusions conflict with each other, this is the way we

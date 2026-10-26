@@ -1,3 +1,8 @@
+# [MODULE DOC] Defines CacheKeyStrategy, a frozen description of how Inductor caches
+# hash ordered components into string keys (SHA256, base32 or hex, optional prefix and
+# separator), plus named strategy instances for compact, code, fx_graph, system and
+# autotune caches. Formats are kept for compatibility with existing cache layouts.
+# No import-time side effects beyond constructing the instances.
 from __future__ import annotations
 
 import base64
@@ -12,13 +17,22 @@ CacheKeyComponent = str | bytes | bytearray | memoryview
 
 
 class _HashLike(Protocol):
+    # [CLASS DOC] HELPER: Structural type for hash objects offering update, digest and
+    # hexdigest.
+    # [FUNCTION DOC] HELPER: Protocol method; feeds bytes into the hash.
     def update(self, data: bytes, /) -> None: ...
+    # [FUNCTION DOC] HELPER: Protocol method; returns the raw digest bytes.
     def digest(self) -> bytes: ...
+    # [FUNCTION DOC] HELPER: Protocol method; returns the hex digest string.
     def hexdigest(self) -> str: ...
 
 
 @dataclasses.dataclass(frozen=True)
 class CacheKeyStrategy:
+    # [CLASS DOC] Immutable recipe for building cache keys: name (debug label only),
+    # digest_format (base32 or hex), prefix prepended to the key, optional byte
+    # separator inserted between components, and base32_length (characters kept from the
+    # base32 digest). Methods: digest, key (prefix plus digest) and key_from_json.
     """
     Describes how an Inductor cache turns stable components into a cache key.
 
@@ -36,6 +50,8 @@ class CacheKeyStrategy:
 
     @staticmethod
     def _to_bytes(component: CacheKeyComponent) -> bytes:
+        # [FUNCTION DOC] HELPER: Converts a str (UTF-8 encoded), bytes, bytearray or
+        # memoryview into bytes; raises TypeError for any other type.
         if isinstance(component, str):
             return component.encode("utf-8")
         if isinstance(component, bytes):
@@ -47,6 +63,8 @@ class CacheKeyStrategy:
         raise TypeError(f"Unsupported cache key component: {type(component)!r}")
 
     def _hasher(self, components: tuple[CacheKeyComponent, ...]) -> _HashLike:
+        # [FUNCTION DOC] HELPER: Builds a SHA256 hash fed with each component converted to
+        # bytes, inserting the separator between consecutive components when configured.
         hasher = hashlib.sha256()
         for idx, component in enumerate(components):
             if idx > 0 and self.separator is not None:
@@ -55,6 +73,9 @@ class CacheKeyStrategy:
         return hasher
 
     def digest(self, *components: CacheKeyComponent) -> str:
+        # [FUNCTION DOC] Hashes the components and returns the digest string: lowercase hex
+        # for hex format, or the lowercase base32 text truncated to base32_length for base32
+        # format. Raises TypeError for unsupported component types.
         hasher = self._hasher(components)
         if self.digest_format == "hex":
             return hasher.hexdigest()
@@ -68,9 +89,12 @@ class CacheKeyStrategy:
         assert_never(self.digest_format)
 
     def key(self, *components: CacheKeyComponent) -> str:
+        # [FUNCTION DOC] Returns the strategy prefix followed by the digest of the components.
         return f"{self.prefix}{self.digest(*components)}"
 
     def key_from_json(self, value: Any, *, sort_keys: bool = True) -> str:
+        # [FUNCTION DOC] Serializes the value to JSON text (keys sorted by default) and
+        # returns the key for that single text component. Raises if value is not serializable.
         return self.key(json.dumps(value, sort_keys=sort_keys))
 
 
