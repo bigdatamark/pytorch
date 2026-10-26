@@ -1,3 +1,13 @@
+# [MODULE DOC] Inductor code generation backend for Pallas (JAX kernel language) targeting
+# CPU (interpret mode), GPU (Mosaic GPU) and TPU. Main contents: PallasPrinter (sympy to
+# jnp expression printer), PallasKernelOverrides (elementwise op to jnp string mapping),
+# PallasKernel (SIMDKernel subclass that records loads/stores/reductions and emits a Python
+# source string containing a Pallas kernel, a jitted wrapper and a "<name>_main" entry point),
+# PallasScheduling (scheduler glue that names, dedups and registers kernels via
+# async_compile.pallas), plus small dataclasses used during codegen and the Unsupported error.
+# Import-time side effects: creates the module-level pallas_pexpr printer function and the
+# "kernel_code" artifact logger; no JAX import happens here (JAX is only imported by the
+# generated source).
 from __future__ import annotations
 
 import dataclasses
@@ -33,18 +43,25 @@ from .simd import IterationRangesEntry, SIMDKernel, SIMDScheduling
 
 
 class PallasPrinter(PythonPrinter):
+    # [CLASS DOC] Sympy-to-Python printer subclass that renders Where, Min and Max nodes
+    # as jnp.where / jnp.minimum / jnp.maximum calls so printed index expressions work on
+    # JAX arrays. Stateless; used through the module-level pallas_pexpr function.
     """
     Custom sympy printer for Pallas that handles JAX-specific constructs.
     """
 
     def _print_Where(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Printer hook. Prints the three arguments (condition, true
+        # branch, false branch) recursively and returns a jnp.where call string.
         """Convert sympy Where to jnp.where."""
-        c = self.doprint(expr.args[0])
+        c =self.doprint(expr.args[0])
         p = self.doprint(expr.args[1])
         q = self.doprint(expr.args[2])
         return f"jnp.where({c}, {p}, {q})"
 
     def _print_Min(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Printer hook. Prints each argument and folds them left to
+        # right into nested jnp.minimum calls; returns the resulting string.
         """Convert sympy Min to jnp.minimum for JAX compatibility."""
         args = [self.doprint(arg) for arg in expr.args]
         result = args[0]
@@ -53,6 +70,8 @@ class PallasPrinter(PythonPrinter):
         return result
 
     def _print_Max(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Printer hook. Same as the Min hook but folds arguments into
+        # nested jnp.maximum calls.
         """Convert sympy Max to jnp.maximum for JAX compatibility."""
         args = [self.doprint(arg) for arg in expr.args]
         result = args[0]
@@ -81,14 +100,22 @@ kernel_code_log = torch._logging.getArtifactLogger(__name__, "kernel_code")
 
 
 class PallasKernelWrapper:
+    # [CLASS DOC] Thin adapter that makes a compiled Pallas "main" function look like other
+    # Inductor kernels by exposing a run method. State: kernel_fn (callable taking the tensors
+    # plus a stream keyword) and kernel_path (source file path or None, used for logging).
     """Wrapper to provide .run() interface for Pallas kernels"""
 
     def __init__(self, kernel_fn: Callable[..., Any], kernel_path: str | None = None):
+        # [FUNCTION DOC] Stores the kernel callable and its source path, and logs the path to
+        # the kernel_code artifact logger (side effect: one log record per construction).
         self.kernel_fn = kernel_fn
         self.kernel_path = kernel_path
         kernel_code_log.info("Pallas kernel path: %s", kernel_path)
 
     def run(self, *args, stream=None, **kwargs):
+        # [FUNCTION DOC] Invokes the wrapped kernel callable, forwarding positional args,
+        # extra keyword args and the stream keyword; returns whatever the callable returns.
+        # Side effects and errors come entirely from the wrapped callable.
         """
         Execute the Pallas kernel.
 
@@ -104,10 +131,18 @@ class PallasKernelWrapper:
 
 
 class Unsupported(RuntimeError):
+    # [CLASS DOC] Runtime error raised by codegen when an op, store mode, reduction type or
+    # index pattern cannot be lowered by the Pallas backend. No extra state.
     """Exception raised when an operation is not supported by the Pallas backend."""
 
 
 class PallasKernelOverrides(OpOverrides):
+    # [CLASS DOC] Op handler table mapping Inductor pointwise ops to JAX source strings.
+    # Every method is a static function that receives operand expressions as strings (already
+    # CSE'd variable names or literals) and returns a string expression using jnp, jax.lax or
+    # jax.scipy.special. Methods that touch graph state (index_expr, load_seed, to_dtype on
+    # TPU) use the V virtualized context. Aliases (clip, i0, i1, igamma, igammac) point at the
+    # same implementations. Polynomial families only support orders 0..5 (higher gives zeros).
     """
     Map element-wise ops to JAX/Pallas operations.
 
@@ -118,146 +153,181 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sin(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.sin to operand expression x.
         return f"jnp.sin({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def cos(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.cos to operand expression x.
         return f"jnp.cos({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tan(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.tan to operand expression x.
         return f"jnp.tan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sinh(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.sinh to operand expression x.
         return f"jnp.sinh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def cosh(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.cosh to operand expression x.
         return f"jnp.cosh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def tanh(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.tanh to operand expression x.
         return f"jnp.tanh({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def asin(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.arcsin to operand expression x.
         return f"jnp.arcsin({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def acos(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.arccos to operand expression x.
         return f"jnp.arccos({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.arctan to operand expression x.
         return f"jnp.arctan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def exp(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.exp to operand expression x.
         return f"jnp.exp({x})"
 
     @staticmethod
     def exp2(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.exp2 (base-2 exponential) to x.
         return f"jnp.exp2({x})"
 
     @staticmethod
     def expm1(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.expm1 (exp minus one) to x.
         return f"jnp.expm1({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def log(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.log (natural log) to x.
         return f"jnp.log({x})"
 
     @staticmethod
     def log10(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.log10 to operand expression x.
         return f"jnp.log10({x})"
 
     @staticmethod
     def log2(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.log2 to operand expression x.
         return f"jnp.log2({x})"
 
     @staticmethod
     def log1p(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.log1p (log of one plus x) to x.
         return f"jnp.log1p({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sqrt(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.sqrt to operand expression x.
         return f"jnp.sqrt({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def rsqrt(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.lax.rsqrt (reciprocal sqrt) to x.
         return f"jax.lax.rsqrt({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def abs(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.abs to operand expression x.
         return f"jnp.abs({x})"
 
     @staticmethod
     def neg(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the parenthesized unary negation of x.
         return f"(-{x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def floor(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.floor to operand expression x.
         return f"jnp.floor({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ceil(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.ceil to operand expression x.
         return f"jnp.ceil({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def trunc(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.trunc to operand expression x.
         return f"jnp.trunc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def round(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.round to operand expression x.
         return f"jnp.round({x})"
 
     @staticmethod
     def sigmoid(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.nn.sigmoid to operand x.
         return f"jax.nn.sigmoid({x})"
 
     @staticmethod
     def relu(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string computing the elementwise maximum of x and 0.
         return f"jnp.maximum({x}, 0)"
 
     @staticmethod
     def pow(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.power (a raised to b).
         return f"jnp.power({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def maximum(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.maximum to a and b.
         return f"jnp.maximum({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def minimum(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.minimum to a and b.
         return f"jnp.minimum({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def where(cond: str, a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.where: a where cond holds, else b.
         return f"jnp.where({cond}, {a}, {b})"
 
     @staticmethod
     def masked(mask: str, body: Callable[[], str], other: float) -> str:
+        # [FUNCTION DOC] Evaluates the body callable (which emits its own code and returns the
+        # result expression) and returns a jnp.where string selecting that result where mask
+        # holds, else the fill value other. Float nan/inf fill values are rendered as jnp.nan,
+        # jnp.inf or negative jnp.inf; other values use their repr. The body is always
+        # evaluated eagerly (no short-circuiting).
         """
         Computes body, but only uses the result where mask is true.
         Where mask is false, uses the 'other' value instead.
@@ -283,6 +353,10 @@ class PallasKernelOverrides(OpOverrides):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
+        # [FUNCTION DOC] Returns a source string converting x to the JAX equivalent of dtype:
+        # wraps x in jnp.asarray (so scalars work) then casts. On a TPU current device, int64
+        # targets are silently downgraded to int32. src_dtype and use_compute_types are
+        # accepted for interface compatibility but ignored.
         # TPU doesn't support 64-bit types
         if dtype == torch.int64 and V.graph.get_current_device_or_throw().type == "tpu":
             dtype = torch.int32
@@ -292,6 +366,9 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype_bitcast(x: str, dtype: torch.dtype, src_dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Returns a source string that first casts x to src_dtype and then
+        # reinterprets the bits as dtype using jax.lax.bitcast_convert_type. Element sizes
+        # are expected to match; no check is made here.
         """Bitcast a value from one dtype to another with the same size."""
         jax_dtype = torch_dtype_to_jax(dtype)
         jax_src_dtype = torch_dtype_to_jax(src_dtype)
@@ -300,6 +377,11 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def index_expr(expr: sympy.Expr, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Lowers a sympy index expression used as a value. Side effects on the
+        # current kernel: records the iteration variables the expression uses, runs indexing
+        # preparation and renaming (registering symbolic sizes as kernel args), prints it with
+        # the Pallas printer and emits a CSE'd compute line (with value bounds). Returns the
+        # string converting that CSE variable to the requested dtype.
         """Convert a sympy expression to a JAX array indexing expression."""
         from ..utils import get_bounds_index_expr
 
@@ -317,12 +399,17 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def value_expr(expr: sympy.Expr, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Same lowering as index_expr (delegates to it); returns the expression
+        # string cast to dtype and has the same kernel side effects.
         # Pallas index_expr already emits the requested dtype, so value_expr has
         # the same lowering here.
         return PallasKernelOverrides.index_expr(expr, dtype)
 
     @staticmethod
     def constant(val, dtype: torch.dtype) -> str:
+        # [FUNCTION DOC] Returns a source string for a literal. Bool dtype gives True/False;
+        # float nan and +/-inf map to jnp.nan / jnp.inf / negative jnp.inf (regardless of
+        # dtype); everything else becomes a jnp.array of the value with the JAX dtype.
         """Convert a constant value to JAX representation."""
         jax_dtype = torch_dtype_to_jax(dtype)
         if dtype == torch.bool:
@@ -337,122 +424,151 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def real(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string taking the real part of x via jnp.real.
         return f"jnp.real({x})"
 
     @staticmethod
     def imag(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string taking the imaginary part of x via jnp.imag.
         return f"jnp.imag({x})"
 
     @staticmethod
     def conj(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.conj (complex conjugate) to x.
         return f"jnp.conj({x})"
 
     @staticmethod
     def angle(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.angle (complex argument) to x.
         return f"jnp.angle({x})"
 
     @staticmethod
     def view_as_real(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string stacking real and imaginary parts of x along
+        # a new trailing axis (last axis of length 2).
         """View complex tensor as real tensor with extra dimension."""
         return f"jnp.stack([jnp.real({x}), jnp.imag({x})], axis=-1)"
 
     @staticmethod
     def view_as_complex(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string combining the two entries of the trailing
+        # axis of x (real, imaginary) into a complex value.
         """View real tensor as complex tensor."""
         return f"({x}[..., 0] + 1j * {x}[..., 1])"
 
     # Comparison operations
     @staticmethod
     def eq(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise equality comparison source of a and b.
         return f"({a} == {b})"
 
     @staticmethod
     def ne(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise inequality comparison source of a and b.
         return f"({a} != {b})"
 
     @staticmethod
     def lt(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise less-than comparison source.
         return f"({a} < {b})"
 
     @staticmethod
     def le(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise less-or-equal comparison source.
         return f"({a} <= {b})"
 
     @staticmethod
     def gt(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise greater-than comparison source.
         return f"({a} > {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isnan(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.isnan to x.
         return f"jnp.isnan({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def isinf(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.isinf to x.
         return f"jnp.isinf({x})"
 
     @staticmethod
     def isfinite(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.isfinite to x.
         return f"jnp.isfinite({x})"
 
     @staticmethod
     def ge(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized elementwise greater-or-equal comparison source.
         return f"({a} >= {b})"
 
     # Logical operations
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_and(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.logical_and to a and b.
         return f"jnp.logical_and({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_or(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.logical_or to a and b.
         return f"jnp.logical_or({a}, {b})"
 
     @staticmethod
     def logical_not(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.logical_not to x.
         return f"jnp.logical_not({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def logical_xor(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.logical_xor to a and b.
         return f"jnp.logical_xor({a}, {b})"
 
     # Math operations
     @staticmethod
     # pyrefly: ignore [bad-override]
     def atan2(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.arctan2 (a over b).
         return f"jnp.arctan2({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def hypot(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.hypot to a and b.
         return f"jnp.hypot({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def fmod(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.fmod (C-style remainder) to a and b.
         return f"jnp.fmod({a}, {b})"
 
     @staticmethod
     def remainder(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.remainder (sign follows divisor).
         return f"jnp.remainder({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def truncdiv(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns a source string for division rounding toward zero: product of
+        # the signs times floor division of absolute values, cast back to the dtype of a.
         # Truncated division (rounds toward zero)
         # For integers: sign(a)*sign(b) * (abs(a) // abs(b))
         return f"(jnp.sign({a}) * jnp.sign({b}) * (jnp.abs({a}) // jnp.abs({b}))).astype({a}.dtype)"
 
     @staticmethod
     def floordiv(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the parenthesized floor-division source of a by b.
         return f"({a} // {b})"
 
     @staticmethod
     def clamp(x: str, min_val: str, max_val: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.clip of x to [min_val, max_val].
         return f"jnp.clip({x}, {min_val}, {max_val})"
 
     clip = clamp
@@ -461,40 +577,51 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def sign(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the sign of x that yields 0.0 for NaN
+        # inputs (matching PyTorch) and jnp.sign otherwise.
         # PyTorch returns 0 for NaN, JAX returns NaN
         return f"jnp.where(jnp.isnan({x}), 0.0, jnp.sign({x}))"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def signbit(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.signbit to x.
         return f"jnp.signbit({x})"
 
     # Special math functions
     @staticmethod
     # pyrefly: ignore [bad-override]
     def erf(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.scipy.special.erf to x.
         return f"jax.scipy.special.erf({x})"
 
     @staticmethod
     def erfc(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.scipy.special.erfc to x.
         return f"jax.scipy.special.erfc({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def erfinv(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.scipy.special.erfinv to x.
         return f"jax.scipy.special.erfinv({x})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def lgamma(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.scipy.special.gammaln (log gamma) to x.
         return f"jax.scipy.special.gammaln({x})"
 
     @staticmethod
     def digamma(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jax.scipy.special.digamma to x.
         return f"jax.scipy.special.digamma({x})"
 
     @staticmethod
     def bessel_j0(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Bessel function J0: computed in
+        # float64 via bessel_jn (order 0), with an explicit result of 1.0 where x is zero
+        # (bessel_jn gives NaN there), then cast back to the dtype of x.
         # bessel_jn requires float64 and has numerical issues at x=0 (returns NaN)
         # bessel_jn(x, v=n) returns array of shape (n+1, ...) with J_0 to J_n
         # Handle by: convert to float64, compute, handle x=0, convert back
@@ -507,6 +634,9 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def bessel_j1(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Bessel function J1: computed in
+        # float64 via bessel_jn (order 1, taking the second entry), with an explicit result
+        # of 0.0 where x is zero, then cast back to the dtype of x.
         # bessel_jn requires float64 and has numerical issues at x=0 (returns NaN)
         # bessel_jn(x, v=n) returns array of shape (n+1, ...) with J_0 to J_n
         # Handle by: convert to float64, compute, handle x=0, convert back
@@ -519,18 +649,27 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def modified_bessel_i0(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for modified Bessel I0 as the exponentially
+        # scaled bessel_i0e times exp of abs(x). Also registered under the alias i0.
         # Modified Bessel function of the first kind I_0(x)
         # I_0(x) = bessel_i0e(x) * exp(|x|) where bessel_i0e is the scaled version
         return f"jax.lax.bessel_i0e({x}) * jnp.exp(jnp.abs({x}))"
 
     @staticmethod
     def modified_bessel_i1(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for modified Bessel I1 as the exponentially
+        # scaled bessel_i1e times exp of abs(x). Also registered under the alias i1.
+        # KNOWN ISSUE: the returned product is not parenthesized (same for modified_bessel_i0),
+        # so embedding it in a larger expression relies on operator precedence.
         # Modified Bessel function of the first kind I_1(x)
         # I_1(x) = bessel_i1e(x) * exp(|x|) where bessel_i1e is the scaled version
         return f"jax.lax.bessel_i1e({x}) * jnp.exp(jnp.abs({x}))"
 
     @staticmethod
     def spherical_bessel_j0(x: str) -> str:
+        # [FUNCTION DOC] Returns a source string for sin(x)/x, with 1.0 where x equals zero.
+        # KNOWN ISSUE: the division is still evaluated at x == 0 (selection happens after),
+        # which can produce NaN intermediates but not a wrong selected value.
         # Spherical Bessel function of the first kind j_0(x) = sin(x) / x
         # Handle x=0: j_0(0) = 1
         return f"jnp.where({x} == 0.0, 1.0, jnp.sin({x}) / {x})"
@@ -539,6 +678,8 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def i0e(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the exponentially scaled Bessel I0
+        # using jax.lax.bessel_i0e.
         # Exponentially scaled modified Bessel function I_0
         return f"jax.lax.bessel_i0e({x})"
 
@@ -546,17 +687,23 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def i1e(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the exponentially scaled Bessel I1
+        # using jax.lax.bessel_i1e.
         # Exponentially scaled modified Bessel function I_1
         return f"jax.lax.bessel_i1e({x})"
 
     @staticmethod
     def gammainc(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the regularized lower incomplete gamma
+        # function (x is the shape parameter, y the argument). Alias: igamma.
         # Regularized lower incomplete gamma function P(a, x)
         # Note: PyTorch uses gammainc(input, other) where input is a (shape param)
         return f"jax.scipy.special.gammainc({x}, {y})"
 
     @staticmethod
     def gammaincc(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the regularized upper incomplete gamma
+        # function (x shape parameter, y argument). Alias: igammac.
         # Regularized upper incomplete gamma function Q(a, x)
         return f"jax.scipy.special.gammaincc({x}, {y})"
 
@@ -566,33 +713,44 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def polygamma(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the polygamma function; x is the order
+        # (cast to int32 in the generated code) and y is the value.
         # Polygamma function psi^(n)(x), x is order n, y is the value
         # Note: JAX uses polygamma(n, x) where n is integer order
         return f"jax.scipy.special.polygamma({x}.astype(jnp.int32), {y})"
 
     @staticmethod
     def ndtri(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the inverse standard normal CDF.
         # Inverse of the standard normal CDF
         return f"jax.scipy.special.ndtri({x})"
 
     @staticmethod
     def zeta(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for the Hurwitz zeta function with
+        # exponent x and offset y.
         # Hurwitz zeta function zeta(x, q) = sum_{k=0}^inf 1/(k+q)^x
         return f"jax.scipy.special.zeta({x}, {y})"
 
     @staticmethod
     def xlogy(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for x times log of y, giving 0 where x is 0.
         # x * log(y), with proper handling of x=0
         return f"jax.scipy.special.xlogy({x}, {y})"
 
     @staticmethod
     def xlog1py(x: str, y: str) -> str:
+        # [FUNCTION DOC] Returns the source string for x times log of (1 plus y), 0 where x is 0.
         # x * log1p(y), with proper handling of x=0
         return f"jax.scipy.special.xlog1py({x}, {y})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def chebyshev_polynomial_t(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Chebyshev polynomial of the first
+        # kind T_n(x) for degree expression n: cosine of n times arccos for abs(x) <= 1,
+        # hyperbolic cosine form for x > 1, and the same form with sign (-1 to the n) for
+        # x < -1. Works for any n.
         # Chebyshev polynomial of the first kind T_n(x)
         # For |x| <= 1: T_n(x) = cos(n * arccos(x))
         # For x > 1: T_n(x) = cosh(n * arccosh(x))
@@ -608,6 +766,10 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def chebyshev_polynomial_u(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Chebyshev polynomial of the second
+        # kind U_n(x): sine form divided by sqrt(1 - x squared) inside (-1, 1), n+1 at x = 1,
+        # (-1 to the n)*(n+1) at x = -1, hyperbolic forms outside. The sqrt argument is floored
+        # at 1e-10 to avoid division by zero. Works for any n.
         # Chebyshev polynomial of the second kind U_n(x)
         # For |x| < 1: U_n(x) = sin((n+1) * arccos(x)) / sqrt(1 - x^2)
         # For x = 1: U_n(1) = n+1
@@ -630,6 +792,9 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def chebyshev_polynomial_v(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the third-kind Chebyshev polynomial V_n(x)
+        # as a nested selection over n using explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: for n greater than 5 (and negative n) the result is silently zeros.
         # Chebyshev polynomial of the third kind V_n(x)
         # V_n(x) = (T_n(x) - T_{n+1}(x)) / (1 - x) for x != 1
         # V_n(1) = 1, recurrence: V_0 = 1, V_1 = 2x - 1, V_n = 2x*V_{n-1} - V_{n-2}
@@ -647,6 +812,9 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def chebyshev_polynomial_w(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the fourth-kind Chebyshev polynomial W_n(x)
+        # as a nested selection over n using explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: for n greater than 5 (and negative n) the result is silently zeros.
         # Chebyshev polynomial of the fourth kind W_n(x)
         # W_n(x) = (T_n(x) + T_{n+1}(x)) / (1 + x) for x != -1
         # W_n(-1) = (-1)^n, recurrence: W_0 = 1, W_1 = 2x + 1, W_n = 2x*W_{n-1} - W_{n-2}
@@ -664,26 +832,37 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def shifted_chebyshev_polynomial_t(x: str, n: str) -> str:
+        # [FUNCTION DOC] Shifted first-kind Chebyshev polynomial: delegates to the unshifted
+        # version with the argument remapped from [0, 1] to [-1, 1] (two x minus one).
         return PallasKernelOverrides.chebyshev_polynomial_t(f"(2 * {x} - 1)", n)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def shifted_chebyshev_polynomial_u(x: str, n: str) -> str:
+        # [FUNCTION DOC] Shifted second-kind Chebyshev polynomial: delegates to the unshifted
+        # version with argument two x minus one.
         return PallasKernelOverrides.chebyshev_polynomial_u(f"(2 * {x} - 1)", n)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def shifted_chebyshev_polynomial_v(x: str, n: str) -> str:
+        # [FUNCTION DOC] Shifted third-kind Chebyshev polynomial: delegates to the unshifted
+        # version with argument two x minus one (inherits the n <= 5 limit).
         return PallasKernelOverrides.chebyshev_polynomial_v(f"(2 * {x} - 1)", n)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def shifted_chebyshev_polynomial_w(x: str, n: str) -> str:
+        # [FUNCTION DOC] Shifted fourth-kind Chebyshev polynomial: delegates to the unshifted
+        # version with argument two x minus one (inherits the n <= 5 limit).
         return PallasKernelOverrides.chebyshev_polynomial_w(f"(2 * {x} - 1)", n)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def hermite_polynomial_h(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the physicist's Hermite polynomial H_n(x)
+        # as a nested selection over n using explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: n greater than 5 or negative silently yields zeros.
         # Physicist's Hermite polynomial H_n(x)
         # H_n(x) = 2^n * x^n - n*(n-1)/2 * 2^(n-2) * x^(n-2) + ...
         # Use explicit formula: H_n(x) = n! * sum_{m=0}^{n//2} (-1)^m / (m! * (n-2m)!) * (2x)^(n-2m)
@@ -703,6 +882,9 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def hermite_polynomial_he(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the probabilist's Hermite polynomial
+        # He_n(x) using explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: n greater than 5 or negative silently yields zeros.
         # Probabilist's Hermite polynomial He_n(x)
         # He_0 = 1, He_1 = x, He_2 = x^2 - 1, He_3 = x^3 - 3x
         return (
@@ -718,6 +900,9 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def laguerre_polynomial_l(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Laguerre polynomial L_n(x) using
+        # explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: n greater than 5 or negative silently yields zeros.
         # Laguerre polynomial L_n(x)
         # L_0 = 1, L_1 = 1 - x, L_2 = (x^2 - 4x + 2)/2, L_3 = (-x^3 + 9x^2 - 18x + 6)/6
         return (
@@ -733,6 +918,9 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def legendre_polynomial_p(x: str, n: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the Legendre polynomial P_n(x) using
+        # explicit closed forms for n = 0..5.
+        # KNOWN ISSUE: n greater than 5 or negative silently yields zeros.
         # Legendre polynomial P_n(x)
         # P_0 = 1, P_1 = x, P_2 = (3x^2 - 1)/2, P_3 = (5x^3 - 3x)/2
         return (
@@ -748,15 +936,19 @@ class PallasKernelOverrides(OpOverrides):
     # Reciprocal and square
     @staticmethod
     def reciprocal(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.reciprocal to x.
         return f"jnp.reciprocal({x})"
 
     @staticmethod
     def square(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.square to x.
         return f"jnp.square({x})"
 
     # Additional operations
     @staticmethod
     def fma(a: str, b: str, c: str) -> str:
+        # [FUNCTION DOC] Returns the source string for a times b plus c, written as separate
+        # multiply and add (JAX has no fused multiply-add primitive; hardware may still fuse).
         """Fused multiply-add: a * b + c
 
         JAX doesn't have jnp.fma, so we use the unfused version.
@@ -767,55 +959,70 @@ class PallasKernelOverrides(OpOverrides):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def copysign(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.copysign (magnitude of a, sign of b).
         return f"jnp.copysign({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def nextafter(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.nextafter (next float after a toward b).
         return f"jnp.nextafter({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def ldexp(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.ldexp (a times two to the b).
         return f"jnp.ldexp({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def frexp(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.frexp (mantissa and exponent pair) to x.
         return f"jnp.frexp({x})"
 
     @staticmethod
     def modf(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.modf (fractional and integral parts) to x.
         return f"jnp.modf({x})"
 
     # Bitwise operations
     @staticmethod
     def bitwise_and(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.bitwise_and to a and b.
         return f"jnp.bitwise_and({a}, {b})"
 
     @staticmethod
     def bitwise_or(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.bitwise_or to a and b.
         return f"jnp.bitwise_or({a}, {b})"
 
     @staticmethod
     def bitwise_xor(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.bitwise_xor to a and b.
         return f"jnp.bitwise_xor({a}, {b})"
 
     @staticmethod
     def bitwise_not(x: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.bitwise_not to x.
         return f"jnp.bitwise_not({x})"
 
     @staticmethod
     def left_shift(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.left_shift (a shifted left by b).
         return f"jnp.left_shift({a}, {b})"
 
     @staticmethod
     def right_shift(a: str, b: str) -> str:
+        # [FUNCTION DOC] Returns the source string applying jnp.right_shift (a shifted right by b).
         return f"jnp.right_shift({a}, {b})"
 
     # Random number generation operations
     @staticmethod
     def load_seed(name: str, offset: str) -> str:
+        # [FUNCTION DOC] Returns a source string for the seed value: the first element of the
+        # named seed buffer (registered as a kernel input) plus a seed offset. Side effect:
+        # asks the current kernel args to register a "load_seed_offset" scalar size variable
+        # built from the offset expression, which becomes an extra kernel parameter.
         """Load the random seed value from a buffer."""
         # Load the seed from the buffer and add offset for uniqueness
         # pyrefly: ignore[bad-argument-type]
@@ -824,6 +1031,10 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def rand(seed: str, offset: str) -> str:
+        # [FUNCTION DOC] Returns a source string producing uniform float32 randoms in [0, 1):
+        # a base JAX PRNG key is made from the seed, then for every element of the offset
+        # array a key is derived by folding in that offset (vmapped over the flattened offsets)
+        # and the result is reshaped to the offset shape. Streams differ from PyTorch's RNG.
         """Generate uniform random numbers in [0, 1).
 
         Uses JAX's threefry2x32 PRNG directly for vectorized random generation.
@@ -840,6 +1051,8 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def randn(seed: str, offset: str) -> str:
+        # [FUNCTION DOC] Same construction as rand but draws standard normal float32 values
+        # per offset element; returns the source string reshaped to the offset shape.
         """Generate standard normal random numbers.
 
         Uses JAX's threefry2x32 PRNG directly for vectorized random generation.
@@ -855,6 +1068,9 @@ class PallasKernelOverrides(OpOverrides):
 
     @staticmethod
     def randint64(seed: str, offset: str, low: str, high: str) -> str:
+        # [FUNCTION DOC] Same per-offset key construction as rand, drawing int64 values in
+        # [low, high) with the bounds embedded as expressions; returns the source string
+        # reshaped to the offset shape.
         """Generate random int64 values in [low, high)."""
         # For vectorized random, use vmap to fold in each offset value
         return (
@@ -866,6 +1082,11 @@ class PallasKernelOverrides(OpOverrides):
 
 @dataclasses.dataclass
 class _IndirectAccessInfo:
+    # [CLASS DOC] HELPER: Immutable-by-convention record of one detected data-dependent table
+    # lookup used for scalar prefetch: table_param (kernel param of the table), table_buf_name
+    # (graph buffer name), table_shape (static ints), indirect_dim (table dimension that is
+    # indexed), indirect_var (name of the temp holding indices) and indices_param (kernel
+    # param of the indices buffer). Compared by value to detect repeated identical accesses.
     """Describes a detected indirect (data-dependent) buffer access."""
 
     table_param: str
@@ -878,6 +1099,10 @@ class _IndirectAccessInfo:
 
 @dataclasses.dataclass
 class _BufferIndexing:
+    # [CLASS DOC] HELPER: Result of index analysis for one buffer access: index_str is the
+    # text placed inside the subscript (for example the Ellipsis, a slice, or an array
+    # expression) and needs_flatten says whether the buffer must be flattened first and
+    # gathered with that index.
     """Encapsulates index string and flattening requirements for buffer access."""
 
     index_str: str
@@ -886,6 +1111,9 @@ class _BufferIndexing:
 
 @dataclasses.dataclass
 class _BroadcastedIterVar:
+    # [CLASS DOC] HELPER: Record describing one iteration variable that gets its own
+    # broadcast axis when emitting range arrays: idx (position among range tree nodes),
+    # var_sym (the symbol), entry (its range tree entry) and length_val (static length or None).
     """Encapsulates information needed to codegen a broadcasted iteration var"""
 
     # index of this var in `self.range_tree_nodes.items()``
@@ -897,6 +1125,13 @@ class _BroadcastedIterVar:
 
 @dataclasses.dataclass
 class _CodegenContext:
+    # [CLASS DOC] HELPER: Mutable bag of values computed once in PallasKernel.codegen_kernel and
+    # shared by the codegen helper methods: the output IndentedBuffer, kernel name, device
+    # flags and interpret literal, the various kernel parameter name lists (all, pure outputs,
+    # outputs, size variables, aliases, inputs), output buffer name mapping, aliasing flags,
+    # outputs that are copied back, and alias_pairs (input index, output index). Fields such
+    # as size_var_params, pointer_tail, kernel_input_params, full_kernel_params and
+    # alias_pairs are reassigned after the kernel body is generated.
     """Bundles local state shared across codegen_kernel helper methods."""
 
     code: IndentedBuffer
@@ -920,6 +1155,17 @@ class _CodegenContext:
 
 
 class PallasKernel(SIMDKernel):
+    # [CLASS DOC] SIMDKernel subclass that turns Inductor load/store/reduction callbacks into
+    # lines of JAX source and finally assembles a full Pallas program (kernel function, jitted
+    # wrapper, "<name>_main" torch<->jax entry point) in codegen_kernel. Device flags: is_gpu,
+    # is_tpu (CPU runs Pallas in interpret mode). Accumulated state during visiting:
+    # store_with_output (output param, store line pairs), load_index_exprs, outputs_need_read,
+    # permuted_input_buffers / collapsed_reshape_inputs / collapsed_output_shape (transpose
+    # handling), used_iter_vars / tile_relative_iter_vars, has_flatten_indexing and
+    # flatten_indexed_buffers, strided_input_buffers, indirect_access (scalar prefetch info),
+    # and CSE-to-param maps. Late attributes set by helper methods (not in __init__):
+    # tile_has_transpose, tile_skip_last_n, tile_cpu_tpu, aliasable_out_ptrs.
+    # Invariant: at most one distinct indirect access per kernel.
     """Pallas kernel codegen for TPU and GPU (Mosaic backend).
 
     Generates Python code that defines a Pallas kernel and a host entrypoint,
@@ -930,6 +1176,12 @@ class PallasKernel(SIMDKernel):
     kexpr: Callable[[sympy.Expr], str] = pallas_pexpr  # Use Pallas expression printer
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initializes the base SIMD kernel, then caches device flags from the
+        # current graph device (is_gpu for cuda, is_tpu for tpu), enables the TMA path on GPU,
+        # and creates all empty tracking containers listed in the class doc. Precomputes
+        # _output_buffer_names from the write dependencies of all scheduler nodes in the
+        # kernel's features. Requires an active graph context (V.graph) and raises if the
+        # current device cannot be determined.
         super().__init__(*args, **kwargs)
         # Determine device type once at initialization
         device = V.graph.get_current_device_or_throw()
@@ -980,11 +1232,19 @@ class PallasKernel(SIMDKernel):
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
+        # [FUNCTION DOC] No-op: bounds checks for indirect indexing are intentionally skipped
+        # (JAX handles out-of-range indices itself). Arguments are ignored; returns nothing.
         """Check array bounds for indirect indexing."""
         # For now, skip explicit bounds checking as JAX/Pallas handles this internally
         # TODO: Implement explicit bounds checking with assertions if needed
 
     def _get_index_str(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Converts an index expression into subscript text. After
+        # indexing preparation: a bare symbol gives the Ellipsis (full-array access), an
+        # integer gives its decimal text, and anything else goes through _convert_to_jax_slice.
+        # Side effects: that conversion may record used iteration variables.
+        # KNOWN ISSUE: the docstring examples (strided slices) describe patterns the slice
+        # conversion mostly no longer emits; it returns Ellipsis or a printed expression.
         """
         Convert an index expression to a string suitable for Pallas indexing.
 
@@ -1020,6 +1280,16 @@ class PallasKernel(SIMDKernel):
             return self._convert_to_jax_slice(prepared_index)
 
     def _convert_to_jax_slice(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Maps a non-trivial index expression to subscript text. Renames
+        # symbolic sizes to kernel params; an index containing a modular-indexing term is
+        # printed as a full expression (roll/wrap access). Otherwise simplifies and finds used
+        # iteration variables (recorded in used_iter_vars). No variables: the printed constant.
+        # One variable with affine stride: negative stride or non-unit stride with offset prints
+        # the expression; zero offset gives the Ellipsis; unit stride with non-negative integer
+        # offset gives an offset-to-end slice text. Multiple variables or unmatched patterns
+        # fall back to the Ellipsis (inputs are assumed contiguous at the JAX boundary).
+        # KNOWN ISSUE: the multi-variable branch returns the Ellipsis in both the unit-stride
+        # and strided cases, so the all-unit-stride check has no effect.
         """
         Convert a sympy index expression to JAX slice notation.
 
@@ -1120,6 +1390,10 @@ class PallasKernel(SIMDKernel):
         return "..."
 
     def _generate_strided_index(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Prints an index expression consisting solely of iteration
+        # variables as array-valued source (the variables are broadcast range arrays in the
+        # kernel), recording them in used_iter_vars. Raises Unsupported if the expression has
+        # any free symbol that is not an iteration variable (for example indirect temps).
         """
         Generate JAX code to compute an index array for strided/complex indexing patterns.
 
@@ -1150,28 +1424,45 @@ class PallasKernel(SIMDKernel):
         return index_str
 
     def _get_iter_vars(self) -> OrderedSet:
+        # [FUNCTION DOC] HELPER: Returns an ordered set of all iteration-variable symbols
+        # known to the kernel (keys of the range tree node mapping).
         """Get the set of iteration variable symbols."""
         return OrderedSet(self.range_tree_nodes.keys())
 
     def _get_used_iter_vars(self, index: sympy.Expr) -> OrderedSet:
+        # [FUNCTION DOC] HELPER: Returns the iteration variables that appear as free symbols
+        # of the given expression (set intersection with the kernel's variables).
         """Get iteration variables used in an index expression."""
         return index.free_symbols & self._get_iter_vars()
 
     def _has_iteration_vars(self, index: sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: True if the expression uses at least one iteration variable.
         """Check if index expression contains iteration variables."""
         return bool(self._get_used_iter_vars(index))
 
     def _get_indirect_vars(self, index: sympy.Expr) -> list[sympy.Symbol]:
+        # [FUNCTION DOC] HELPER: Returns the free symbols whose names start with "tmp" (CSE
+        # temporaries holding data-dependent indices); order follows set iteration order.
         """Get list of indirect variable symbols (tmp*) in an index expression."""
         return [s for s in index.free_symbols if str(s).startswith("tmp")]
 
     def _has_indirect_vars(self, index: sympy.Expr) -> bool:
+        # [FUNCTION DOC] HELPER: True if the expression contains any indirect (tmp) symbol.
         """Check if index expression contains indirect variables."""
         return len(self._get_indirect_vars(index)) > 0
 
     def _decompose_strided_access(
         self, index: sympy.Expr, name: str
     ) -> list[tuple[int, int, int]] | None:
+        # [FUNCTION DOC] HELPER: Tries to express a flat load index on buffer name as per-dim
+        # (stride, offset, skip) triples so the input can be reshaped outside the kernel and
+        # indexed statically. Returns None when: the index has indirect or modular terms, the
+        # buffer already uses flatten indexing, the shape is dynamic/empty, any coefficient is
+        # non-affine, non-positive or maps to no dimension (or does not divide the dim size),
+        # the constant part is negative or leaves a remainder, all strides are 1, the implied
+        # output element count differs from the iteration-space size, or a variable's range
+        # differs from the effective size of its dimension (collapsed dims). Pure analysis,
+        # no mutation. Constant offset is spread over dims by divmod with C strides.
         """Decompose a flat index into per-dimension (stride, offset, skip) triples.
 
         Given flat index like ``64*x0 + 2*x1 + 5`` and buffer shape ``(32, 64)``
@@ -1310,6 +1601,10 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _strided_load_expr(buf: str, decomp: list[tuple[int, int, int]]) -> str:
+        # [FUNCTION DOC] HELPER: Builds the subscript source for a strided-decomposed load: each
+        # dimension with stride 1 contributes a full slice; each strided dimension contributes
+        # a full slice for the halved blocks axis plus a static index of its offset on the
+        # extra stride axis (matching the reshape done by _codegen_strided_reshapes).
         """Build ``buf[:, :, offset]`` for strided dims, ``:`` for others."""
         parts: list[str] = []
         for stride, offset, _skip in decomp:
@@ -1323,6 +1618,11 @@ class PallasKernel(SIMDKernel):
     def _codegen_strided_reshapes(
         self, code: IndentedBuffer, params: list[str]
     ) -> None:
+        # [FUNCTION DOC] HELPER: For each kernel param that maps to a buffer with strided
+        # decomposition info, writes into the code buffer a reshape that splits every strided
+        # dim into (blocks, stride), and, if any dim has skip > 0, a slice dropping the leading
+        # blocks. Params without info, unknown buffers, or buffers with a dynamic dim are left
+        # untouched (the reshape is emitted only if every dim size is static).
         """Emit reshape + optional slice for strided input parameters.
 
         For each strided param, reshapes ``(M, N)`` to ``(M, N/stride, stride)``
@@ -1364,6 +1664,9 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _get_actual_out_strides(out_buf, n: int) -> list[int] | None:
+        # [FUNCTION DOC] HELPER: Reads the layout strides of an output buffer and returns them
+        # as ints. Returns None if there is no layout, no stride attribute, the stride count
+        # differs from n, or any stride is not a plain/sympy integer.
         """Extract actual output buffer strides from its layout."""
         layout = getattr(out_buf, "get_layout", lambda: None)()
         if layout is None:
@@ -1380,6 +1683,11 @@ class PallasKernel(SIMDKernel):
         return strides
 
     def _compute_store_coeffs(self, ordered: list) -> dict | None:
+        # [FUNCTION DOC] HELPER: Given iteration variables, computes the linearization
+        # coefficient each would have in the stored output: groups variables by range tree
+        # prefix, orders groups innermost (last prefix) to outermost, and inside a group follows
+        # dict order; the innermost gets 1 and each next one multiplies by the previous length.
+        # Returns a mapping symbol to int, or None if any length is not a static int.
         """Compute store-side linearization coefficients from range tree nesting.
 
         The tree structure encodes the output iteration order: later
@@ -1416,6 +1724,14 @@ class PallasKernel(SIMDKernel):
     def _get_full_load_permutation(
         self, name: str, index: sympy.Expr
     ) -> tuple[int, ...] | None:
+        # [FUNCTION DOC] HELPER: Detects whether a full-array load of buffer name must be
+        # transposed to match the output layout. Requires a static-shape, contiguous input of
+        # rank >= 2. Maps each non-reduction iteration variable to an output dim (store coeffs
+        # vs actual output strides) and an input dim (load coeffs vs C strides) and returns the
+        # permutation (position = output dim, value = input dim), or None if it is the identity
+        # or cannot be determined unambiguously (duplicate strides, non-positive coefficients,
+        # mismatching variable counts). Special case: one flat variable covering all elements
+        # infers the permutation from output strides directly. Pure analysis.
         """Return permutation for a full-array load, or None.
 
         Computes the permutation by mapping each range-tree variable to
@@ -1522,6 +1838,12 @@ class PallasKernel(SIMDKernel):
     def _get_collapsed_load_permutation(
         self, name: str, index: sympy.Expr
     ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+        # [FUNCTION DOC] HELPER: Like the full-load permutation detection, but for kernels whose
+        # range tree collapsed contiguous dims (fewer variables than buffer rank, at least two).
+        # Groups input dims right-to-left to match variable ranges, maps variables to collapsed
+        # input dims via load coefficients and to collapsed output dims via store coefficients
+        # (using a graph output buffer whose element count matches), and returns the pair
+        # (collapsed input shape, permutation) or None for identity/ambiguous/unsupported cases.
         """Handle permutation when range tree has collapsed dimensions.
 
         When simplify_and_reorder merges contiguous dims, the range tree
@@ -1637,6 +1959,10 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _group_dims_to_ranges(dims: list[int], ranges: list[int]) -> list[int] | None:
+        # [FUNCTION DOC] HELPER: Merges consecutive dims scanning from the rightmost so that the
+        # running product equals some not-yet-used value in ranges; each match closes a group.
+        # Returns the group sizes left-to-right, or None if leftover product or unmatched
+        # ranges remain.
         """Group consecutive dims (right-to-left) to match range values.
 
         Returns collapsed shape (left-to-right) or None if no valid grouping.
@@ -1659,6 +1985,11 @@ class PallasKernel(SIMDKernel):
         return groups
 
     def _get_index_expr(self, index: sympy.Expr) -> _BufferIndexing:
+        # [FUNCTION DOC] HELPER: First-pass classification of an access index. Mixed indirect
+        # plus iteration variables: handled by _handle_mixed_indexing, flatten required.
+        # Indirect only: printed expression, no flatten. Otherwise uses _get_index_str and
+        # requires flattening when the index has modular indexing (and is not the Ellipsis) or
+        # is an actual expression rather than the Ellipsis, a slice with "::" or an integer.
         """Get the index expression string and whether it needs flattening."""
         has_indirect = self._has_indirect_vars(index)
         has_iter_vars = self._has_iteration_vars(index)
@@ -1684,6 +2015,8 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _safe_int(val: Any) -> int | None:
+        # [FUNCTION DOC] HELPER: Converts val to an int, returning None when conversion raises a
+        # type or value error (for example a symbolic size).
         """Convert value to int, returning None on failure."""
         try:
             return int(val)
@@ -1692,6 +2025,7 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _c_contiguous_strides(shape: list[int]) -> list[int]:
+        # [FUNCTION DOC] HELPER: Returns row-major strides (in elements) for the shape.
         """Return C-contiguous strides for the given shape."""
         n = len(shape)
         strides = [1] * n
@@ -1701,6 +2035,9 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _map_coeffs_to_dims(coeffs: list[int], strides: list[int]) -> list[int] | None:
+        # [FUNCTION DOC] HELPER: For each coefficient returns the index of the dimension whose
+        # stride equals it. Returns None if strides contain duplicates, any coefficient has no
+        # matching stride, or two coefficients map to the same dimension.
         """Map coefficient values to dimension indices via stride matching.
 
         Returns a list where entry k is the dimension whose stride equals
@@ -1722,6 +2059,10 @@ class PallasKernel(SIMDKernel):
         return mapping
 
     def _zero_dim_output_flags(self, ctx: _CodegenContext) -> tuple[bool, bool]:
+        # [FUNCTION DOC] HELPER: Scans the output buffers of the codegen context and returns
+        # (has_zero_dim, has_unknown_dim): the first is True as soon as any output has a
+        # dimension that is statically zero; the second is True if any output buffer is
+        # missing from the graph or has a dimension of unknown (symbolic) size.
         """Return whether an output has a zero or unknown dimension."""
         has_unknown_dim = False
         for buf_name in ctx.output_buffer_lookup.values():
@@ -1738,6 +2079,15 @@ class PallasKernel(SIMDKernel):
         return False, has_unknown_dim
 
     def _get_reduction_axes(self) -> tuple[int, ...]:
+        # [FUNCTION DOC] HELPER: Decides which axes (negative, counted from the end) of the
+        # loaded array a reduction should run over. Defaults to the last axis when there are
+        # no recorded loads, no pointwise or reduction variables, or reduction size <= 1. For
+        # each recorded load of rank >= 2 with static strides, collects the reduction-variable
+        # coefficients and matches them to buffer strides: several distinct coefficients with
+        # several reduction variables return all matched axes; a single coefficient walks outward
+        # over dims within the reduction span (descending strides) or collects dims whose strides
+        # fall in the span. Fallback for gather/flatten loads: first axis if the reduction
+        # stride exceeds the pointwise stride, else last axis. Pure analysis.
         """Determine which axes of the loaded array are reduction axes.
 
         Finds the innermost reduction stride from the load index
@@ -1840,6 +2190,9 @@ class PallasKernel(SIMDKernel):
         return (-1,)
 
     def _compute_prefix_numel(self, prefixes: OrderedSet) -> int | None:
+        # [FUNCTION DOC] HELPER: Multiplies the static sizes of the kernel numels whose prefix
+        # is in the given set (prefixes absent from the kernel are skipped). Returns None if any
+        # included size is not a static int; returns 1 when none match.
         """Compute total numel for given prefixes (e.g., pointwise prefixes)."""
         result = 1
         for p in prefixes:
@@ -1851,6 +2204,8 @@ class PallasKernel(SIMDKernel):
         return result
 
     def _compute_reduction_numel(self) -> int | None:
+        # [FUNCTION DOC] HELPER: Product of the static sizes of all reduction range trees
+        # (1 if there are none); None if any such size is symbolic.
         """Compute total reduction numel."""
         result = 1
         for tree in self.range_trees:
@@ -1862,6 +2217,11 @@ class PallasKernel(SIMDKernel):
         return result
 
     def _can_use_tma_approach(self) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True only if the GPU TMA tiling path is safe: no
+        # permuted inputs, no real reduction (reduction size > 1), every input buffer exists,
+        # is contiguous, not float64, and has fully static shape; all input shapes are
+        # identical; and the product of non-reduction range sizes equals the input element
+        # count (static). Pure check.
         """
         Check if TMA (Tensor Memory Accelerator) approach can be used.
         TMA works for simple element-wise ops but not for:
@@ -1931,6 +2291,11 @@ class PallasKernel(SIMDKernel):
         return True
 
     def _get_buffer_info(self, name: str) -> tuple[Any, Any, Any, list, bool] | None:
+        # [FUNCTION DOC] HELPER: Looks up a graph buffer and returns (buffer, size list, element
+        # count, per-dim int strides with None for symbolic, is_contiguous) or None if the buffer
+        # does not exist. Element count multiplies static sizes and keeps symbolic ones in the
+        # product. Contiguity is judged against row-major strides; unknown strides count as
+        # non-contiguous (a missing layout is treated as contiguous).
         """Get buffer metadata (buf_obj, buf_size, buf_numel, actual_strides, is_contiguous).
 
         Returns None if the buffer doesn't exist.
@@ -1975,6 +2340,9 @@ class PallasKernel(SIMDKernel):
     def _compute_output_numel_from_index(
         self, index: sympy.Expr
     ) -> tuple[int, OrderedSet]:
+        # [FUNCTION DOC] HELPER: Returns (product of static range lengths of the iteration
+        # variables used in index, the set of those variables). Variables with symbolic length
+        # or unknown to the range tree contribute nothing to the product.
         """Compute expected output numel and used vars from iteration variables in index."""
         used_vars = self._get_used_iter_vars(index)
 
@@ -1995,6 +2363,9 @@ class PallasKernel(SIMDKernel):
     def _get_index_coefficients(
         self, index: sympy.Expr, used_vars: OrderedSet
     ) -> OrderedSet:
+        # [FUNCTION DOC] HELPER: For each used variable, matches its affine coefficient in the
+        # index (defaulting to 1 when no affine match) and collects them in an ordered set,
+        # as ints when static and otherwise the symbolic coefficient.
         """
         Extract coefficients of iteration variables from index expression.
         """
@@ -2015,6 +2386,9 @@ class PallasKernel(SIMDKernel):
         is_contiguous: bool,
         coefficients: OrderedSet,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if some access coefficient is not among the
+        # expected strides: row-major strides of the shape for a contiguous buffer, or the
+        # known actual strides otherwise. That indicates a gather-like (non-standard) pattern.
         """
         Check if access pattern requires gather (non-standard striding).
         """
@@ -2051,6 +2425,13 @@ class PallasKernel(SIMDKernel):
         index: sympy.Expr,
         indexing: _BufferIndexing,
     ) -> _BufferIndexing:
+        # [FUNCTION DOC] HELPER: Upgrades a full-array access (Ellipsis, no flatten) to an
+        # explicit strided index expression with flatten when it would otherwise be wrong:
+        # buffer size differs from the iteration-space size, an im2col-like case (more used
+        # variables than buffer dims), or a gather pattern. Skipped for symbolic coefficients,
+        # for known non-contiguous equal-size buffers off TPU, and when no variables are used.
+        # Returns the original indexing otherwise. May raise Unsupported via
+        # _generate_strided_index; records used iteration variables.
         """Check if buffer access needs strided indexing due to size mismatch or gather patterns."""
         # Only applies when full array access is indicated
         if indexing.index_str != "..." or indexing.needs_flatten:
@@ -2109,6 +2490,12 @@ class PallasKernel(SIMDKernel):
         index: sympy.Expr,
         indexing: _BufferIndexing,
     ) -> _BufferIndexing:
+        # [FUNCTION DOC] HELPER: Refines indexing using the buffer rank. Leaves it unchanged if
+        # already flattened or full-array or the buffer is unknown. Rank 0, or a size-1 vector
+        # indexed without iteration variables, becomes the Ellipsis. Rank >= 2: a constant index
+        # (no iteration variables) is marked for flattening; a "::" slice is replaced by a
+        # strided index expression with flatten. On GPU a "::" slice on a 1-D buffer is also
+        # replaced. May raise Unsupported through _generate_strided_index.
         """
         Adjust index expression based on buffer shape (0-dim scalar, multi-dim, etc.).
         """
@@ -2163,6 +2550,12 @@ class PallasKernel(SIMDKernel):
         index: sympy.Expr,
         indexing: _BufferIndexing,
     ) -> _BufferIndexing:
+        # [FUNCTION DOC] HELPER: If an access was marked for flatten, tries to replace it by a
+        # slice over the last axis only. Applies when the buffer has rank >= 2, exactly one
+        # iteration variable with static affine stride > 1 and offset in [0, stride), the last
+        # dim divisible by the stride, and the variable's length times stride equals the total
+        # element count. Returns a new indexing (all-but-last full slices then offset-to-end
+        # with step stride, flatten off); otherwise returns the input indexing unchanged.
         """
         Try to emit multi-dim slice notation instead of flatten + gather.
 
@@ -2233,6 +2626,9 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _gather_permute_expr(load_expr: str, perm: tuple[int, ...]) -> str:
+        # [FUNCTION DOC] HELPER: Wraps a load expression in a call to the runtime helper
+        # pallas_permute with the permutation tuple (flatten plus 1-D gather transpose),
+        # used instead of a native permute to dodge a TPU Mosaic bug for rank >= 3.
         """Generate gather-based permutation instead of jnp.permute_dims.
 
         Avoids a Mosaic compiler bug where jnp.permute_dims produces
@@ -2242,6 +2638,10 @@ class PallasKernel(SIMDKernel):
         return f"pallas_permute({load_expr}, {perm})"
 
     def _trace_to_load_source(self, var_name: str) -> str | None:
+        # [FUNCTION DOC] HELPER: Finds the kernel parameter name of the buffer a temp variable
+        # was loaded from. Looks up the CSE-to-param map; otherwise searches the compute lines
+        # for the assignment of the temp and recursively follows each temp it references until
+        # one is found. Returns None if nothing traces back. Pure analysis.
         """Trace a tmp variable back to its source buffer's kernel param.
 
         Follows CSE assignments backward through bounds-checking (where/clamp)
@@ -2262,6 +2662,12 @@ class PallasKernel(SIMDKernel):
     def _detect_indirect_access(
         self, buf: str, name: str, index: sympy.Expr
     ) -> _IndirectAccessInfo | None:
+        # [FUNCTION DOC] HELPER: Recognizes a table lookup indexed by one loaded index tensor.
+        # Requires a static table of rank >= 2, exactly one indirect variable with a positive
+        # int coefficient equal to a C-stride of some dimension that is not one of the last two
+        # dims, and a traceable source param for the indices. Rejects 1-to-1 gathers where the
+        # (1-D, static) indices buffer has at least as many elements as the iteration space.
+        # Returns an _IndirectAccessInfo describing the access, or None. Pure analysis.
         """Detect a load with data-dependent indexing suitable for scalar prefetch.
 
         Matches exactly one indirect variable whose coefficient corresponds to
@@ -2335,6 +2741,11 @@ class PallasKernel(SIMDKernel):
         )
 
     def _eliminate_dead_indirect_code(self) -> None:
+        # [FUNCTION DOC] HELPER: Dead-code elimination on the kernel's compute lines. Roots are
+        # the temps referenced by recorded store lines; liveness propagates backward to every
+        # temp referenced by the right-hand side of a live assignment (iterated to a fixed
+        # point). Rewrites the compute buffer to keep only live temp assignments and all lines
+        # that are not temp assignments. Mutates self.compute.
         """Remove dead compute lines after scalar prefetch replaces indirect load.
 
         When the table load is simplified to buf[0] (scalar prefetch handles
@@ -2383,6 +2794,15 @@ class PallasKernel(SIMDKernel):
         index: sympy.Expr,
         indexing: _BufferIndexing,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Produces the load source for a buffer param. Flattened access:
+        # if an indirect (scalar prefetch) access is detected, records it (raising
+        # AssertionError if a different indirect access was already recorded) and returns a
+        # scalar read of the table ref; otherwise marks the kernel/buffer as flatten-indexed
+        # and returns a flatten-then-gather expression (index cast to a 32-bit or 64-bit int
+        # type when it contains min/max). Direct access: subscripts the ref; for a full-array
+        # load on non-GPU devices it wraps in a transposing gather when a permutation is found
+        # or in a native permute of a collapsed reshape, recording permuted_input_buffers,
+        # collapsed_reshape_inputs and collapsed_output_shape as side effects.
         """
         Build the load expression based on indexing mode.
         """
@@ -2436,6 +2856,9 @@ class PallasKernel(SIMDKernel):
             return load_expr
 
     def _maybe_squeeze_intermediate_buffer(self, name: str, load_expr: str) -> str:
+        # [FUNCTION DOC] HELPER: For an intermediate buffer (name starts with "buf") of shape
+        # (N, 1) in a kernel that also reads a 1-D graph input, wraps the load in a squeeze of
+        # the last axis to avoid an unintended (N, N) broadcast. Otherwise returns it unchanged.
         """
         Squeeze (N,1) intermediate buffers when kernel has 1D graph inputs.
 
@@ -2464,6 +2887,14 @@ class PallasKernel(SIMDKernel):
     def _maybe_broadcast_1d_buffer(
         self, name: str, index: sympy.Expr, load_expr: str
     ) -> str:
+        # [FUNCTION DOC] HELPER: Reshapes a loaded 1-D floating graph input so it broadcasts
+        # along the right axis of a higher-rank reference input. Conditions: static length,
+        # a reference input of rank > 1 with static shape, the index uses exactly one iteration
+        # variable whose length equals the buffer length and which is the only non-reduction
+        # variable of that length. The target axis is the unique matching reference dim, or the
+        # variable's position among range tree nodes if ambiguous. If the axis is the last one
+        # (default broadcasting) or anything is unmet, the expression is returned unchanged;
+        # otherwise returns it reshaped with -1 at that axis and 1 elsewhere.
         """Reshape 1D buffers for higher-dim broadcasting in reduction kernels.
 
         When a 1D buffer (e.g. a reduction result from a prior kernel, or a
@@ -2555,6 +2986,12 @@ class PallasKernel(SIMDKernel):
     def _check_im2col_pattern(
         self, index: sympy.Expr, indexing: _BufferIndexing
     ) -> _BufferIndexing:
+        # [FUNCTION DOC] HELPER: Called for stores with full-array indexing. If preparing the
+        # store index introduces extra block variables not in the raw index (and the raw index
+        # uses more than one variable), checks the recorded loads: if some load with the same
+        # variables is not compressed the same way and its coefficients do not match its buffer
+        # strides, treats the pattern as im2col and returns a flatten indexing built from the
+        # prepared index (may raise Unsupported). Otherwise returns indexing unchanged.
         """
         Check for im2col-like patterns where store uses block variables but load doesn't.
 
@@ -2619,6 +3056,10 @@ class PallasKernel(SIMDKernel):
     def _check_load_is_strided_input(
         self, buf_name: str, load_index: sympy.Expr, load_orig_vars: OrderedSet
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the set of affine coefficients of the load's
+        # variables equals the set of strides of the buffer's non-trivial dims (size > 1 or
+        # unknown), which indicates a plain strided input rather than an im2col pattern. False
+        # when the buffer or its layout/strides are unavailable.
         """
         Check if load coefficients match buffer strides (strided input vs im2col).
         """
@@ -2657,6 +3098,9 @@ class PallasKernel(SIMDKernel):
         return OrderedSet(load_coeffs) == buf_stride_set
 
     def _check_store_needs_transpose(self, name: str) -> bool:
+        # [FUNCTION DOC] HELPER: True if a rank-2 output with static sizes > 1 is column-major
+        # (first stride smaller than the second) while no kernel input is column-major, and no
+        # load-side permutation was already applied. Used to transpose the value on store.
         """
         Check if output needs transpose for column-major storage.
 
@@ -2711,6 +3155,10 @@ class PallasKernel(SIMDKernel):
     def _build_full_array_store_expr(
         self, out: str, value: CSEVariable, needs_transpose: bool
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns two source lines: a temp holding the value as an
+        # array, and a full assignment into the output ref. A 0-d value is broadcast with a
+        # full fill; with needs_transpose the value is transposed; otherwise the value is
+        # reshaped when its size equals the output size, else broadcast to the output shape.
         """
         Build store expression for full array assignment.
 
@@ -2742,6 +3190,13 @@ class PallasKernel(SIMDKernel):
         indexing: _BufferIndexing,
         mode: Any = None,
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Builds the store source lines for one output. Full-array index:
+        # delegates to the full-array store (with transpose check). Flattened index: sets
+        # has_flatten_indexing and writes a flat functional scatter (add for atomic_add, set
+        # otherwise) reshaped to the output. Constant index into rank > 1 output: full-array
+        # store. Indirect index: scatter into the flattened output; for atomic_add the output
+        # is added to outputs_need_read and the read comes from the "<out>_alias" param. Plain
+        # index: direct subscript assignment.
         """
         Build the store expression based on indexing mode.
         mode can be None (set) or "atomic_add" (accumulate).
@@ -2798,6 +3253,14 @@ class PallasKernel(SIMDKernel):
         name: str,
         mode: Any,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Builds one scatter store line from detected scatter info.
+        # Marks the output as needing read access (added to outputs_need_read) and reads from
+        # the "<out>_alias" param using a functional .at update with add (atomic_add) or set.
+        # Point scatter: indexes the indirect dim with the index variable and 0 elsewhere.
+        # Otherwise element-wise scatter (iteration variable names, with the index variable
+        # padded by None axes for broadcasting) when the store variable count equals both the
+        # remaining dims and all kernel variables; else slice-based scatter using full slices
+        # for iteration dims.
         """Build store expression for scatter operations (indirect indexing)."""
         is_point_scatter = scatter_info.get("is_point_scatter", False)
 
@@ -2872,6 +3335,13 @@ class PallasKernel(SIMDKernel):
 
     @typing_extensions.override
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        # [FUNCTION DOC] Kernel load callback. Registers buffer name as a kernel input, records
+        # its index (for later reduction axis detection), classifies the index, upgrades to
+        # strided/flatten indexing as needed, then prefers strided decomposition (reshape plus
+        # static indexing, recorded in strided_input_buffers) before slice or flatten forms.
+        # For full-array loads applies squeeze and 1-D broadcast fixes. Emits a CSE'd compute
+        # line with the buffer dtype and records the temp -> param -> graph name mappings.
+        # Returns the CSE variable; may raise Unsupported from index handling.
         buf = self.args.input(name)
         dtype = V.graph.get_dtype(name)
 
@@ -2919,6 +3389,19 @@ class PallasKernel(SIMDKernel):
         return cse_var
 
     def _handle_mixed_indexing(self, index: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Prints an index mixing iteration variables and loaded index
+        # temps as an advanced-indexing expression. Records used iteration variables. Variables
+        # are ordered by coefficient (descending, symbolic treated as largest). Cases: a single
+        # reduction variable with one indirect temp becomes a plain arange substitution
+        # (element-wise gather); several indirect temps with exactly one unused iteration
+        # variable are paired element-wise (indirect temps reshaped onto the leading axis,
+        # iteration variables onto following axes); otherwise each iteration variable becomes
+        # a range with trailing None axes and each indirect temp gets leading/trailing None
+        # axes, based on relative coefficient ordering. Substitution is textual by name.
+        # KNOWN ISSUE: textual replacement of variable names in the printed string can hit
+        # longer names that contain a variable name as a substring, and the indirect trailing
+        # dimension count assumes two dims per indirect variable (documented in code as a guess
+        # fixed up later by a reshape at store time).
         """
         Handle indexing with both indirect variables and iteration variables.
 
@@ -2949,6 +3432,8 @@ class PallasKernel(SIMDKernel):
         # Variables with larger strides correspond to earlier output dimensions.
         # Use inf default so symbolic coefficients sort as outermost dimensions.
         def _coeff(var):
+            # [FUNCTION DOC] HELPER: Returns the index coefficient of var, using infinity when
+            # the coefficient is symbolic so it sorts as the outermost dimension.
             return self._get_index_coefficient(index, var, default=float("inf"))
 
         used_iter_vars = sorted(used_iter_vars_set, key=_coeff, reverse=True)
@@ -3116,6 +3601,12 @@ class PallasKernel(SIMDKernel):
     def store(
         self, name: str, index: sympy.Expr, value: CSEVariable, mode: Any = None
     ) -> None:
+        # [FUNCTION DOC] Kernel store callback. Raises Unsupported unless mode is None (set) or
+        # atomic_add. Registers the output param and the stored buffer name, then builds store
+        # lines: scalar (rank 0) outputs get a fill/reshape assignment; if a collapsed output
+        # shape is set a full-array store is used; else scatter patterns, regular indexing
+        # (shape adjustment, im2col check) are used. Each produced line is appended to the
+        # stores buffer and to store_with_output paired with its output param.
         # mode can be None (set), "atomic_add" (accumulate), etc.
         if mode is not None and mode != "atomic_add":
             raise Unsupported(f"pallas store mode '{mode}' not supported")
@@ -3177,6 +3668,9 @@ class PallasKernel(SIMDKernel):
     def _get_index_coefficient(
         index: sympy.Expr, var: sympy.Symbol, default: int | float = 0
     ) -> int | float:
+        # [FUNCTION DOC] HELPER: Returns the integer coefficient of var in index (falling back
+        # to the symbolic derivative when direct extraction gives zero). If it cannot be
+        # converted to an int (symbolic), returns the default (0 unless overridden).
         """Get integer coefficient of a variable in an index expression."""
         coeff = index.coeff(var)
         if coeff == 0:
@@ -3189,6 +3683,9 @@ class PallasKernel(SIMDKernel):
     def _detect_scatter_pattern(
         self, index: sympy.Expr, output_name: str = ""
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC] HELPER: Detects a store with exactly one indirect variable and non-zero
+        # int coefficient. No iteration variables: point-scatter detection on the named output;
+        # otherwise iteration-scatter detection. Returns an info mapping or None.
         """Detect scatter operation pattern. Returns scatter info dict or None."""
         indirect_syms = self._get_indirect_vars(index)
         if len(indirect_syms) != 1:
@@ -3210,6 +3707,11 @@ class PallasKernel(SIMDKernel):
     def _detect_point_scatter(
         self, output_name: str, indirect_var: str, indirect_coeff: int
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC] HELPER: For a store with only the indirect variable, finds the output
+        # dimension it indexes by matching its coefficient to cumulative row-major strides
+        # (defaults to the last dim if none matches). Returns a mapping with the indirect
+        # variable name, indirect dim, empty before/after lists, point-scatter flag and output
+        # shape; None if the name is empty, the buffer shape is not static, or rank < 2.
         """Detect single-element scatter pattern."""
         if not output_name:
             return None
@@ -3243,6 +3745,12 @@ class PallasKernel(SIMDKernel):
     def _detect_iter_scatter(
         self, index: sympy.Expr, indirect_var: str, indirect_coeff: int
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC] HELPER: Sorts the positive-coefficient iteration variables plus the
+        # indirect variable by coefficient (descending) and checks that the variables after the
+        # indirect one have row-major consecutive strides ending exactly at the indirect
+        # coefficient. Returns a mapping with the indirect variable, its position, the
+        # (name, length) lists before and after it and a point-scatter flag of false; None when
+        # a length is symbolic or the strides are inconsistent.
         """Detect scatter pattern with iteration variables."""
         used_iter_vars = self._get_used_iter_vars(index)
 
@@ -3292,6 +3800,14 @@ class PallasKernel(SIMDKernel):
         reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:  # type: ignore[override]
+        # [FUNCTION DOC] Kernel reduction callback. Requires being inside a reduction (raises
+        # AssertionError otherwise). welford_reduce is delegated to the fallback; tuple values
+        # or unsupported reduction types raise Unsupported. Results are cached per (source
+        # dtype, type, value). Emits a jnp reduction (sum, prod, max, min, any, argmax, argmin,
+        # xor_sum): partial reductions (pointwise and reduction dims both present) use axes from
+        # _get_reduction_axes with keepdims (argmax/argmin use only the last axis, no keepdims);
+        # symbolic partial reductions reduce axis 0; full reductions reduce everything.
+        # Returns the CSE variable holding the result.
         """
         Generate code for reduction operations in JAX/Pallas.
 
@@ -3399,11 +3915,24 @@ class PallasKernel(SIMDKernel):
 
     @staticmethod
     def _buffer_is_contiguous(buffer_name: str) -> bool:
+        # [FUNCTION DOC] HELPER: Looks up the graph buffer and returns whether its layout is
+        # contiguous. Raises an attribute error if the buffer does not exist.
+        # KNOWN ISSUE: appears unused within this module.
         buf = V.graph.get_buffer(buffer_name)
         layout = buf.get_layout()
         return layout.is_contiguous()
 
     def _can_tile_cpu_tpu(self) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether the CPU/TPU grid-tiling path can be used. Rejects
+        # GPU, flatten indexing, outputs needing reads, iteration variables appearing in the
+        # compute body (unless emitted tile-relative), non-static output shapes and any
+        # input/output that is not shape-compatible with the highest-rank output (equal dims,
+        # broadcast 1s, strided inputs, permuted inputs checked after permutation, reduction
+        # inputs with extra leading dims, numpy-style broadcast for lower rank). Requires at
+        # least one buffer with a tileable dim. Side effects: sets tile_has_transpose,
+        # tile_skip_last_n (number of reduction trees when a real reduction exists) and
+        # _cpu_max_grid_product (64 off TPU, None on TPU).
+        # Mutates state even when it ultimately returns False.
         """Check if this kernel can use tiling on CPU/TPU.
 
         Tiling is compatible with reductions, transpositions, and multi-range-tree
@@ -3602,6 +4131,19 @@ class PallasKernel(SIMDKernel):
         return True
 
     def codegen_kernel(self, name: str | None = None) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] Assembles the complete generated Python source for this kernel and
+        # returns it as a string (name defaults to a placeholder later replaced by the
+        # scheduler). Raises RuntimeError if there is no output param. Steps: compute param
+        # lists and aliasing (each pure output gets a "<out>_alias" donated input), which
+        # outputs must be copied back (all on CPU, none on TPU, non-aliased on GPU); build a
+        # _CodegenContext; emit imports and iteration variables plus compute lines; re-read
+        # params since new size variables may have appeared; decide CPU/TPU tiling; compute
+        # alias pairs. With a scalar-prefetch indirect access, removes dead code and emits the
+        # special wrapper and returns. Otherwise emits the kernel function, a jitted wrapper
+        # (static args for shapes/dtypes/size vars, donated aliased inputs) handling zero-size
+        # outputs, 0-d promotion, collapsed output shape, tiling specs or non-tiled specs, tile
+        # parameters, then dispatches to the TMA, legacy GPU or CPU/TPU wrapper emitter, and
+        # finally the main entry. Sets self.aliasable_out_ptrs and self.tile_cpu_tpu.
         """
         Generate the complete Pallas kernel code as a Python string.
 
@@ -3880,6 +4422,11 @@ class PallasKernel(SIMDKernel):
     def _compute_alias_pairs(
         ctx: _CodegenContext, aliasable_flags: dict[str, bool]
     ) -> list[tuple[int, int]]:
+        # [FUNCTION DOC] HELPER: Builds (input index, output index) pairs for donation
+        # aliasing. For pure outputs with aliasing enabled, pairs the output with its
+        # "<out>_alias" input; for in-place outputs pairs it with the same-named input.
+        # Pure outputs with aliasing disabled get no pair. Raises ValueError if the expected
+        # input name is missing from the context's input list.
         alias_pairs: list[tuple[int, int]] = []
         for out_idx, name in enumerate(ctx.output_params):
             if name.startswith("out_ptr"):
@@ -3898,6 +4445,9 @@ class PallasKernel(SIMDKernel):
         kernel_body: IndentedBuffer,
         ctx: _CodegenContext,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Appends to the output code buffer the kernel body lines (plain
+        # strings left-stripped, other line objects appended as-is) followed by every recorded
+        # store line whose output param is a parameter of the kernel function.
         """Emit the kernel body lines and store operations into code."""
         for line in kernel_body._lines:
             if isinstance(line, str):
@@ -3914,6 +4464,15 @@ class PallasKernel(SIMDKernel):
         kernel_name: str,
         kernel_body: IndentedBuffer,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits the full program for the scalar-prefetch variant (table
+        # lookup by a loaded index vector). Requires indirect_access (AssertionError if unset).
+        # Kernel params are reordered: indices, table, other inputs, aliases, outputs. The
+        # jitted wrapper reshapes the table to (rows, 1, D) after moving the indirect dim first,
+        # reshapes other inputs and alias buffers to the same 3-D layout, builds row-tiled block
+        # specs (index-driven for the table), output specs and alias map, and calls a pallas
+        # call with a prefetch grid spec over the number of indices, then reshapes outputs
+        # back. Finishes by emitting the main entry. Writes only into the context's code buffer.
+        # Limitation: other inputs with rank above 2 are flattened assuming broadcastability.
         """Emit kernel, JIT wrapper, and main entry for scalar prefetch."""
         if self.indirect_access is None:
             raise AssertionError("expected indirect_access to be set")
@@ -4084,6 +4643,11 @@ class PallasKernel(SIMDKernel):
         self._codegen_main_entry(ctx, jit_wrapper_name)
 
     def _codegen_imports(self, ctx: _CodegenContext) -> None:
+        # [FUNCTION DOC] HELPER: Writes the import block of the generated source into the code
+        # buffer: base imports (functools, math, torch, jax, pallas, runtime helpers), TPU
+        # extras (export, tpu pallas, torch_tpu bridge) or GPU Mosaic import when not CPU
+        # interpret mode, and for indirect access on non-TPU also forces the JAX platform
+        # to cpu and imports the tpu pallas module.
         imports = """
 import functools
 import math
@@ -4115,6 +4679,9 @@ from torch._inductor.runtime.runtime_utils import (
         ctx.code.splice(imports, strip=True)
 
     def _get_iter_var_axis(self, var_sym: sympy.Symbol) -> int | None:
+        # [FUNCTION DOC] HELPER: Maps an iteration variable to its output axis: pointwise
+        # variables get 0, 1, 2... in range tree order and reduction variables follow after all
+        # pointwise ones. Returns None if the symbol is unknown.
         """Map an iteration variable to its output tensor axis index.
 
         Non-reduction variables map to axes 0, 1, 2, ... in order.
@@ -4136,6 +4703,10 @@ from torch._inductor.runtime.runtime_utils import (
     def _get_reshape_target_shape_and_numel(
         self,
     ) -> tuple[tuple[int, ...] | None, int | None]:
+        # [FUNCTION DOC] HELPER: Looks for an N-D (rank > 1) buffer shape whose element count
+        # equals the static length of some iteration variable, searching output buffers first
+        # and then input buffers. Returns (shape, element count) of the first match or
+        # (None, None). Used to reshape flat range arrays to the real tensor shape.
         # Find reshape target: N-D shape whose numel matches an iteration
         # var. Try output first (repeat/upsample), then inputs (reductions).
         iter_lengths = OrderedSet(
@@ -4147,6 +4718,9 @@ from torch._inductor.runtime.runtime_utils import (
         )
 
         def _get_nd_shape_if_matches(buf_name):
+            # [FUNCTION DOC] HELPER: For a named buffer of rank > 1 returns (shape, element
+            # count) if the count is one of the iteration lengths, else (None, None). Symbolic
+            # dims stay symbolic in the shape.
             buf = V.graph.try_get_buffer(buf_name)
             if buf is None or len(buf.get_size()) <= 1:
                 return None, None
@@ -4172,6 +4746,9 @@ from torch._inductor.runtime.runtime_utils import (
     def _make_broadcasted_iteration_var_expr(
         self, broadcast_vars: list[_BroadcastedIterVar], broadcast_idx: int
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns source for a range array of the chosen variable's
+        # length reshaped to have that length on its assigned broadcast axis and 1 on the
+        # other broadcast axes, so several variables form an outer-product grid.
         bv = broadcast_vars[broadcast_idx]
         length = bv.entry.length
         renamed_length = self.rename_indexing(length)
@@ -4191,6 +4768,14 @@ from torch._inductor.runtime.runtime_utils import (
     def _codegen_iteration_vars(
         self, kernel_body: IndentedBuffer, ctx: _CodegenContext
     ) -> None:
+        # [FUNCTION DOC] HELPER: Writes into the kernel body one definition per used iteration
+        # variable as a JAX range array. Nothing is written on GPU or if no variable is used.
+        # Variables whose length equals a reshape target size are reshaped to that N-D shape;
+        # other variables become broadcast-shaped ranges when more than one such variable exists
+        # (also for symbolic lengths when a target shape is known); the remaining simple 1-D
+        # case becomes a tile-relative range (tile offset by grid position) when the variable
+        # appears in the compute body, is pointwise and no read-back/flatten indexing is used,
+        # recording it in tile_relative_iter_vars; otherwise a plain range.
         # Generate iteration variables as jnp.arange arrays
         # Skip on GPU - jnp.arange is not supported by Pallas Mosaic backend
         if not (self.range_tree_nodes and not self.is_gpu and self.used_iter_vars):
@@ -4297,6 +4882,10 @@ from torch._inductor.runtime.runtime_utils import (
         broadcast_idx: int,
         num_broadcast_dims: int,
     ) -> int:
+        # [FUNCTION DOC] HELPER: Chooses the broadcast axis for a variable: with a mix of
+        # reduction (name starts with r) and pointwise variables the axis equals its list
+        # position (pointwise first, reduction last); otherwise the order is reversed so the
+        # first variable is innermost.
         # Axis placement depends on var types (reduction r* vs x*):
         # - Mixed: pointwise first, reduction last for output reshape
         # - Same-type: reverse order, first var innermost
@@ -4312,6 +4901,13 @@ from torch._inductor.runtime.runtime_utils import (
         return num_broadcast_dims - 1 - broadcast_idx
 
     def _codegen_jit_wrapper_tma(self, ctx: _CodegenContext, kernel_arg: str) -> None:
+        # [FUNCTION DOC] HELPER: Emits the GPU wrapper body that tiles flat 1-D data in blocks of
+        # 128 elements using TMA copies. Generated code defines an inner kernel looping over
+        # tiles: copy each input tile from global to shared memory with a barrier per input, wait,
+        # call the user kernel (kernel_arg) on shared-memory tiles, commit and copy outputs back,
+        # wait. Also builds shared-memory/barrier scratch shapes, aligned flat output specs,
+        # calls the Mosaic GPU kernel on flattened inputs and unpads results to original shapes.
+        # Writes only into the context code buffer.
         code = ctx.code
         kernel_input_params = ctx.kernel_input_params
         output_params = ctx.output_params
@@ -4434,9 +5030,15 @@ from torch._inductor.runtime.runtime_utils import (
     def _codegen_jit_wrapper_legacy_gpu(
         self, ctx: _CodegenContext, kernel_arg: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits the older GPU wrapper body that pads to multiples of 128.
+        # Generated code compares all input and output element counts: if all equal (and > 1)
+        # it pads flattened inputs, runs the kernel with aligned output specs and unpads;
+        # if the first output is scalar-sized it pads inputs only and returns results directly;
+        # otherwise it broadcasts every input to the first output shape, pads, runs and unpads.
+        # Writes only into the context code buffer.
         code = ctx.code
         kernel_input_params = ctx.kernel_input_params
-        input_list = f"[{', '.join(kernel_input_params)}]"
+        input_list =f"[{', '.join(kernel_input_params)}]"
 
         # Legacy GPU path with explicit padding (use_emit_pipeline=False)
         # Mosaic GPU requires tensor sizes to be multiples of 128.
@@ -4510,6 +5112,8 @@ from torch._inductor.runtime.runtime_utils import (
         )
 
     def _param_to_buf_name(self, param: str) -> str | None:
+        # [FUNCTION DOC] HELPER: Reverse lookup from a kernel parameter name to the graph
+        # buffer name among input buffers; None if no input maps to it.
         """Map a kernel parameter name back to its graph buffer name."""
         for graph_name, inner_name in self.args.input_buffers.items():
             if inner_name == param:
@@ -4517,6 +5121,12 @@ from torch._inductor.runtime.runtime_utils import (
         return None
 
     def _codegen_tiled_specs(self, ctx: _CodegenContext) -> None:
+        # [FUNCTION DOC] HELPER: Emits wrapper code that computes tile sizes, grid and the
+        # axis-to-grid mapping from the first output shape via the runtime helper (passing
+        # transpose flag, number of trailing reduction dims to skip, TPU flag, per-input
+        # permutations and the CPU grid cap when set). Then emits output block specs, strided
+        # and collapsed input reshapes, and input block specs (with per-input permutation when
+        # any input is permuted). Writes only into the context code buffer.
         """Generate tiled BlockSpec and grid variables for CPU/TPU.
 
         Tiles the last 1–2 dimensions of each tensor, respecting TPU
@@ -4596,6 +5206,11 @@ from torch._inductor.runtime.runtime_utils import (
         alias_pairs: list[tuple[int, int]],
         alias_map_literal: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits the CPU/TPU wrapper tail: a pallas call of the kernel with
+        # output/input specs, interpret flag, grid (tiled grid or a single step) and the
+        # input-output alias map when alias pairs exist; inputs are passed through a rank
+        # promotion helper. Results are then reshaped back to the original shapes (tuple or
+        # single) and returned. Writes only into the context code buffer.
         code = ctx.code
         grid_expr = "_grid" if self.tile_cpu_tpu else "(1,)"
         code.writeline("_result = pl.pallas_call(")
@@ -4627,6 +5242,8 @@ from torch._inductor.runtime.runtime_utils import (
         code.writeline("return _result")
 
     def _codegen_main_entry(self, ctx: _CodegenContext, jit_wrapper_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Dispatches to the TPU or default (CPU/GPU) emitter of the
+        # "<name>_main" torch-facing entry point depending on the context's TPU flag.
         if ctx.is_tpu:
             self._codegen_main_entry_tpu(ctx, jit_wrapper_name)
         else:
@@ -4635,6 +5252,14 @@ from torch._inductor.runtime.runtime_utils import (
     def _codegen_main_entry_tpu(
         self, ctx: _CodegenContext, jit_wrapper_name: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits the TPU main function (all kernel params plus a stream
+        # keyword). Generated body: disable 64-bit mode and clear JAX caches, cast int64 input
+        # tensors to int32, build abstract placeholders for inputs, compute output shapes and
+        # dtypes, export the jitted wrapper for the TPU platform, register the serialized module
+        # with the torch_tpu bridge under a key made from kernel name plus all input/output
+        # shapes (retrying with an older signature on a type error), call it with donation info
+        # (again with a fallback signature), and copy results into aliased input buffers.
+        # Writes only into the context code buffer.
         code = ctx.code
         code.writeline("")
         main_name = f"{ctx.kernel_name}_main"
@@ -4811,6 +5436,12 @@ from torch._inductor.runtime.runtime_utils import (
     def _codegen_main_entry_default(
         self, ctx: _CodegenContext, jit_wrapper_name: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emits the CPU/GPU main function (all kernel params plus a
+        # stream keyword). Generated body: enable 64-bit mode, on CPU pin the default JAX device
+        # to CPU, clear caches, convert alias, in-place and input torch tensors to JAX via DLPack
+        # (aliases contiguous only on CPU, inputs contiguous), compute output shapes/dtypes,
+        # call the jitted wrapper, block until ready, and copy the listed outputs back into the
+        # torch tensors. Writes only into the context code buffer.
         code = ctx.code
         code.writeline("")
         main_name = f"{ctx.kernel_name}_main"
@@ -4892,10 +5523,15 @@ from torch._inductor.runtime.runtime_utils import (
     def _emit_torch_to_jax(
         code: IndentedBuffer, var_name: str, is_tpu: bool, *, contiguous: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Writes one line defining "<var>_jax" as a DLPack conversion of
+        # the detached torch tensor, optionally made contiguous first. is_tpu is unused.
         suffix = ".detach().contiguous()" if contiguous else ".detach()"
         code.writeline(f"{var_name}_jax = jax.dlpack.from_dlpack({var_name}{suffix})")
 
     def call_kernel(self, name: str, node: IRNode | None = None) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] Writes into the host wrapper code a line calling the compiled kernel's
+        # run method with the call arguments: first the argument of each aliasable pure output
+        # (donated alias inputs), then all normal call args. node is unused.
         """Generate the Python code that calls this Pallas kernel."""
         wrapper = V.graph.wrapper_code
         arg_defs, call_args, _, _ = self.args.python_argdefs()
@@ -4917,15 +5553,24 @@ from torch._inductor.runtime.runtime_utils import (
 
 
 class PallasScheduling(SIMDScheduling):
+    # [CLASS DOC] SIMD scheduling backend for Pallas: uses PallasKernel as kernel type, limits
+    # fusion of reductions with differing read indices, and defines kernels by naming them
+    # from a source hash and registering them with async_compile.pallas in the wrapper.
     kernel_type = PallasKernel  # type: ignore[assignment]
 
     @classmethod
     def get_backend_features(cls, device: torch.device) -> OrderedSet[BackendFeature]:
+        # [FUNCTION DOC] Returns the backend feature set: only reduce-to-single-element
+        # support (no split reductions needed). The device argument is ignored.
         # Pallas/JAX can handle reductions to single elements efficiently
         # without requiring split reductions
         return OrderedSet([BackendFeature.REDUCE_TO_SINGLE_ELEMENT])
 
     def can_fuse(self, node1, node2):  # type: ignore[override]
+        # [FUNCTION DOC] Returns whether two scheduler nodes may fuse: first the base SIMD rule,
+        # then, if both are reductions, rejects fusion when any buffer read by both has different
+        # index expressions (keepdims partial reductions would give incompatible shapes).
+        # Also used as can_fuse_vertical and can_fuse_horizontal. Pure check.
         if not super().can_fuse(node1, node2):
             return False
         # Pallas partial reductions use keepdims, so fusing two reductions
@@ -4955,6 +5600,13 @@ class PallasScheduling(SIMDScheduling):
         node_schedule: Sequence[BaseSchedulerNode],
         kernel: PallasKernel,
     ) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] Registers generated Pallas source with the host wrapper and returns the
+        # kernel name. Reuses the existing name if identical source was already defined.
+        # Otherwise names it from the fused node names (when descriptive names are enabled) and
+        # the first 8 hex chars of the source SHA-256, records it in the source-to-kernel cache,
+        # substitutes the name placeholder in the source, wraps the source into an
+        # async_compile.pallas call (raw triple-quoted string) and defines the kernel in the
+        # wrapper together with origin metadata comments. The kernel argument is unused.
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             return wrapper.src_to_kernel[src_code]
