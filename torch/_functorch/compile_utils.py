@@ -1,3 +1,8 @@
+# [MODULE DOC] FX graph helpers used by functorch/AOT compilation: common subexpression
+# elimination (fx_graph_cse) that is aware of randomness, aliasing of outputs, mutation
+# regions and unbacked symbols; plus small utilities to hoist getitem nodes, strip op overloads,
+# and fetch placeholders/outputs. Import-time side effects: defines the aten alias and the
+# rand_ops list of random ATen ops that CSE must not merge.
 from __future__ import annotations
 
 import dataclasses
@@ -26,11 +31,16 @@ aten = torch.ops.aten
 
 @dataclasses.dataclass(frozen=True)
 class _ScalarKey:
+    # [CLASS DOC] HELPER: Frozen hashable key for a float or complex scalar in CSE tokens.
+    # Holds a type tag and the big-endian packed bytes so equality/hash follow bit patterns
+    # (nan equals itself, -0.0 differs from 0.0).
     tag: str
     bits: bytes
 
 
 def _normalize_cse_arg(val: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Maps an exact float or complex value to a _ScalarKey built from
+    # its packed bits; any other value (including subclasses and ints) is returned unchanged.
     # Python float hash/eq is not value-identity: nan != nan (hash(nan) is
     # id-based) while -0.0 == 0.0 and hashes equal. Key by bit pattern instead.
     if type(val) is float:
@@ -41,6 +51,8 @@ def _normalize_cse_arg(val: Any) -> Any:
 
 
 def get_aten_target(node: fx.Node) -> OpOverloadPacket | Callable[..., Any] | str:
+    # [FUNCTION DOC] Returns the overload packet of the node's target if it has one, otherwise
+    # the target itself.
     if hasattr(node.target, "overloadpacket"):
         return node.target.overloadpacket
     return node.target
@@ -70,6 +82,13 @@ def fx_graph_cse(
     fx_g: torch.fx.graph.Graph,
     extra_node_key: Callable[[fx.Node], Hashable] | None = None,
 ) -> fx.Graph:
+    # [FUNCTION DOC] Returns a new FX graph equal to fx_g with common subexpressions removed.
+    # Placeholder/output/get_attr, impure, random, aten.empty, output-aliasing, mutation-base,
+    # and unbacked-symbol nodes are copied as is. Other nodes get a token (target, optional
+    # extra_node_key result, normalized args/kwargs, stream/mempool context); a node is
+    # replaced by an earlier one with an equal token in the same mutation region, otherwise
+    # it replaces the earlier entry if the region differs. Calls compute_mutation_region_ids
+    # on fx_g (mutates node metadata). Raises AssertionError if the last node is not output.
     new_graph = fx.Graph()
     env: dict[
         fx.Node, fx.Node
@@ -98,6 +117,8 @@ def fx_graph_cse(
         )
 
     def checkable_node(node: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node's meta val is a tensor whose untyped storage
+        # can be obtained (False for non-tensors or storage-less tensors).
         """We can evaluate only nodes that represent tensors with defined storage."""
         if "val" not in node.meta or not isinstance(node.meta["val"], torch.Tensor):
             return False
@@ -110,6 +131,9 @@ def fx_graph_cse(
         return True
 
     def custom_context_key(node: fx.Node) -> tuple[int, int | None, int | None]:
+        # [FUNCTION DOC] HELPER: Returns (stream, mempool, mempool_device) from the node's
+        # custom meta (stream defaults to 0, others to None) so nodes in different contexts
+        # are not merged.
         custom = node.meta.get("custom", {})
         return (
             custom.get("stream", 0),
@@ -141,6 +165,8 @@ def fx_graph_cse(
     )
 
     def _add_base(node: Any, bases: set[fx.Node]) -> None:
+        # [FUNCTION DOC] HELPER: Adds node (or each element if it is a list/tuple) to the bases
+        # set, ignoring anything that is not an fx Node.
         for b in node if isinstance(node, (list, tuple)) else (node,):
             if isinstance(b, fx.Node):
                 bases.add(b)
@@ -207,6 +233,10 @@ def fx_graph_cse(
             def substitute(
                 arg_list: list[Any] | tuple[Any, ...],
             ) -> tuple[tuple[Any, ...], TreeSpec]:
+                # [FUNCTION DOC] HELPER: Flattens a nested args/kwargs structure, replaces old
+                # graph nodes by their new-graph nodes, symbolic ints/bools/floats by their
+                # underlying node, and floats/complex by bit-pattern keys. Returns the flat
+                # tuple and the tree spec for reconstruction.
                 arg_list, spec = tree_flatten(arg_list)
                 for i in range(len(arg_list)):
                     v = arg_list[i]
@@ -263,6 +293,9 @@ def fx_graph_cse(
 
 
 def raise_getitems(gm: fx.GraphModule) -> fx.GraphModule:
+    # [FUNCTION DOC] Moves every operator.getitem node to directly after its single input node
+    # (processing in reverse to keep relative order), recompiles gm, and returns it. Mutates gm
+    # in place. Raises AssertionError if a getitem node has other than one input node.
     # Pre-create a list of nodes to iterate over, as modifying the node order
     # during the loop can lead to infinite loops if not handled properly.
     getitem_nodes = list(
@@ -284,6 +317,8 @@ def raise_getitems(gm: fx.GraphModule) -> fx.GraphModule:
 
 
 def strip_overloads(gm: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Replaces each OpOverload node target with its overload packet in place and
+    # recompiles gm. Returns nothing.
     """
     Modifies the target of graph nodes in :attr:`gm` to strip overloads.
 
@@ -297,10 +332,13 @@ def strip_overloads(gm: fx.GraphModule) -> None:
 
 
 def get_placeholders(graph: fx.Graph) -> list[Any]:
+    # [FUNCTION DOC] Returns the placeholder nodes of the graph.
     return graph.find_nodes(op="placeholder")
 
 
 def get_outputs(graph: fx.Graph) -> list[fx.Node]:
+    # [FUNCTION DOC] Returns the flattened leaves of the first output node's args. Raises
+    # AssertionError if the graph has no output node.
     for node in graph.find_nodes(op="output"):
         return pytree.tree_leaves(node.args[0])
     raise AssertionError("No output node found")

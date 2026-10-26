@@ -1,3 +1,10 @@
+# [MODULE DOC] Global configuration flags for AOT Autograd and the partitioner: autograd cache
+# switches, custom-op aliasing checks, recomputation/ban heuristics, activation memory budget and
+# solver options, activation offloading, fake tensor behavior, autocast in backward, and misc
+# debugging/testing knobs. Import-time side effects: reads environment variables (e.g.
+# FAKE_ALLOW_META, AOT_PARTITIONER_DEBUG, TORCHINDUCTOR_AUTOGRAD_CACHE, CI, TORCH_COMPILE_GRAPH_FORMAT)
+# and finally calls install_config_module on itself, which adds patch/save_config support and
+# validation. Flags listed in _save_config_ignore are excluded from saved configs.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -113,6 +120,8 @@ error_on_custom_op_aliasing: bool = Config(
 
 
 def remote_autograd_cache_default() -> bool | None:
+    # [FUNCTION DOC] Reads TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE: returns True if it equals "1",
+    # False if "0", otherwise None (meaning use the default/justknob decision elsewhere).
     if os.environ.get("TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE") == "1":
         return True
     if os.environ.get("TORCHINDUCTOR_AUTOGRAD_REMOTE_CACHE") == "0":
