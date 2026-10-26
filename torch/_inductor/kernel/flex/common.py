@@ -1,3 +1,9 @@
+# [MODULE DOC] Shared helpers for the flex attention Triton / CuteDSL lowerings: boundary-check
+# and head-dim option logic, kernel option message text, scatter lowering for captured-buffer
+# gradients, conversion of mod subgraphs into ComputedBuffers, realization of captured buffers,
+# stride / fake-input construction for autotuning, and the flex template loader.
+# Import-time side effects: defines the SubgraphResults alias, _IntLike alias, and the
+# load_flex_template partial bound to the templates directory next to this file.
 # mypy: allow-untyped-defs
 """Common utilities and functions for flex attention kernels"""
 
@@ -51,6 +57,9 @@ SubgraphResults = list[ComputedBuffer | None] | ComputedBuffer | None
 
 
 def can_skip_boundary_checks(seq_len, sparse_block_size) -> bool:
+    # [FUNCTION DOC] Return True if the statically-known shape facts show per-tile bounds masking can be
+    # skipped for a dimension: seq_len must be a multiple of 128 (the LCM of candidate tile sizes) and
+    # either a multiple of sparse_block_size or no larger than it. Uses sizevars static reasoning.
     """True when per-tile bounds masking can be skipped along this dim.
 
     This is decided before a config is chosen, so divisibility is checked
@@ -69,10 +78,13 @@ def can_skip_boundary_checks(seq_len, sparse_block_size) -> bool:
 
 
 def is_tensor_ir_node(node: object) -> bool:
+    # [FUNCTION DOC] HELPER: True if node is an IRNode that produces a tensor output.
     return isinstance(node, IRNode) and node.has_tensor_output()
 
 
 def _flex_kernel_options_example(kind: str) -> str:
+    # [FUNCTION DOC] HELPER: Return an example kernel_options string for error messages; the backward
+    # variant shows bwd_ block sizes, any other kind shows forward options.
     match kind:
         case "backward":
             return (
@@ -88,6 +100,8 @@ def _flex_kernel_options_example(kind: str) -> str:
 
 
 def _flex_kernel_tuning_options(kind: str) -> str:
+    # [FUNCTION DOC] HELPER: Return message text listing tunable kernel options for the kind (backward,
+    # decode, or forward by default), including which prefix selects phase-specific options.
     match kind:
         case "backward":
             return (
@@ -107,6 +121,11 @@ def _flex_kernel_tuning_options(kind: str) -> str:
 
 
 def zeros_and_scatter_lowering(shape: list[int], indices, values):
+    # [FUNCTION DOC] Lowering for the custom zeros_and_scatter op used to compute gradients of captured
+    # buffers. Allocates and realizes a zero float32 buffer of the given shape, casts values to it,
+    # and returns a ComputedBuffer that mutates it via an atomic-add Scatter over the indices.
+    # With no indices only scalar output shape is allowed. Raises AssertionError on unexpected types,
+    # missing device, or non-scalar shape without indices. Side effect: realizes the grad buffer.
     """To support backwards on captured buffers we register a specific lowering for our specific custom up"""
     # Always accumulate into fp32 then cast
     grad = _full(0, values.get_device(), torch.float32, shape)
@@ -126,6 +145,7 @@ def zeros_and_scatter_lowering(shape: list[int], indices, values):
         expected_vals_size = values.get_size()
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Output indexer for the no-index case; always returns an empty list.
             return []
 
     else:
@@ -168,6 +188,8 @@ def zeros_and_scatter_lowering(shape: list[int], indices, values):
 def get_fwd_subgraph_outputs(
     subgraph_buffer: SubgraphResults, mask_graph_buffer: SubgraphResults
 ) -> list[ComputedBuffer | None]:
+    # [FUNCTION DOC] HELPER: Normalize the score-mod and mask-mod subgraph results (each a buffer, list, or
+    # None) to lists and return them concatenated: score outputs first, then mask outputs.
     subgraph_buffer = (
         subgraph_buffer if isinstance(subgraph_buffer, Sequence) else [subgraph_buffer]
     )
@@ -184,6 +206,11 @@ def build_subgraph_module_buffer(
     args: list[TensorBox],
     graph_module: torch.fx.GraphModule,
 ) -> SubgraphResults:
+    # [FUNCTION DOC] Lower an FX graph module pointwise into inlineable buffers. Runs a
+    # PointwiseSubgraphLowering (allowing zeros_and_scatter mutation with its custom lowering) on args
+    # and converts each graph output into an unnamed ComputedBuffer with flexible layout, passing
+    # through existing ComputedBuffers and None. Returns the same tree structure as the graph outputs.
+    # Raises AssertionError if an output is not a TensorBox over a StorageBox or lacks a device.
     """This function's goal is to take in the required args and produce the subgraph buffer
     The subgraph buffer is a ComputedBuffer that will be inlined into the triton template
 
@@ -206,6 +233,8 @@ def build_subgraph_module_buffer(
         pw_subgraph.run(*args)
 
     def convert_output_node_to_buffer(output_buffer) -> ComputedBuffer | None:
+    # [FUNCTION DOC] HELPER: Convert one lowered graph output into a ComputedBuffer (None stays None,
+    # ComputedBuffer is passed through); raises AssertionError for unexpected node types or no device.
         if output_buffer is None:
             return None
         if isinstance(output_buffer, ComputedBuffer):
@@ -237,10 +266,13 @@ def build_subgraph_module_buffer(
 
 
 def build_subgraph_buffer(args: list[TensorBox], subgraph: Subgraph) -> SubgraphResults:
+    # [FUNCTION DOC] Convenience wrapper: build subgraph buffers from the Subgraph IR object's graph module.
     return build_subgraph_module_buffer(args, subgraph.graph_module)
 
 
 def maybe_realize(args: list[IRNode | None]):
+    # [FUNCTION DOC] Realize every IRNode in a (possibly nested) structure of optional nodes via
+    # realize_inputs; None and sympy expressions pass through. Returns the same structure.
     """Accepts a list of optional IRNodes and returns a list of realized IRNodes"""
     return tree_map(
         lambda x: (
@@ -251,6 +283,12 @@ def maybe_realize(args: list[IRNode | None]):
 
 
 def realize_captures_for_cutedsl(buffers):
+    # [FUNCTION DOC] Realize captured buffers for CuteDSL. Plain graph inputs are kept as inputs (and
+    # registered for alignment checks), ReinterpretView captures become uniquely named synthetic
+    # InputBuffers with fixed layout, and anything else is copied into a fresh buffer. Layouts are frozen.
+    # Side effects: records all resulting named nodes and the original view nodes in the graph's
+    # _cutedsl_capture_nodes mapping and may extend the graph's inputs_to_check. Returns the
+    # realized structure.
     """Realize captured buffers for CuteDSL, preserving views and plain inputs.
 
     Unlike maybe_realize (used by the Triton path), CuteDSL needs physical
@@ -268,6 +306,8 @@ def realize_captures_for_cutedsl(buffers):
     view_captures: dict[str, ReinterpretView] = {}
 
     def _add_alignment_check_for_input(input_buffer: InputBuffer) -> None:
+        # [FUNCTION DOC] HELPER: If the input buffer is a graph input, add its index to the graph's
+        # inputs_to_check so the wrapper emits a misalignment copy for it. No-op otherwise.
         # Preserved captures can be used by vectorized CuteDSL loads, so make
         # sure the wrapper still emits copy_if_misaligned for graph inputs.
         # Normal template inputs are already in inputs_to_check; captures need
@@ -282,6 +322,9 @@ def realize_captures_for_cutedsl(buffers):
                 V.graph.inputs_to_check = [*inputs_to_check, idx]
 
     def _realize(x):
+        # [FUNCTION DOC] HELPER: Realize one capture (None and sympy expressions pass through). Returns a
+        # preserved InputBuffer for graph inputs, a new synthetic InputBuffer for view captures (recording
+        # the view in view_captures), or a copied input otherwise.
         if x is None or isinstance(x, sympy.Expr):
             return x
         realized = ExternKernel.realize_input(x)
@@ -325,12 +368,14 @@ def realize_captures_for_cutedsl(buffers):
 
 
 def freeze_irnodes(tree: Any) -> Any:
+    # [FUNCTION DOC] Freeze the layout of every IRNode in a pytree (ignoring nodes that cannot be frozen); None gives None.
     """Freeze layouts for every IRNode contained in a pytree."""
 
     if tree is None:
         return None
 
     def _freeze(node: IRNode) -> IRNode:
+        # [FUNCTION DOC] HELPER: Freeze one node's layout, swallowing NotImplementedError; returns the node.
         try:
             node.freeze_layout()
         except NotImplementedError:
@@ -346,6 +391,8 @@ def create_placeholder(
     device: torch.device,
     size: list[int] | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Create a TensorBox over a new InputBuffer named name with a fixed layout of the given
+    # dtype, device and size (scalar if no size) and contiguous strides.
     """Creates a placeholder input buffers for producing subgraph_output."""
     input_buffer = InputBuffer(
         name=name,
@@ -363,6 +410,8 @@ def construct_strides(
     sizes: Sequence[_IntLike],
     fill_order: Sequence[int],
 ) -> Sequence[_IntLike]:
+    # [FUNCTION DOC] Compute strides for sizes given a fill order (dimensions listed from innermost to
+    # outermost). Raises AssertionError if lengths differ. Returns a list of strides.
     """From a list of sizes and a fill order, construct the strides of the permuted tensor."""
     # Initialize strides
     if len(sizes) != len(fill_order):
@@ -384,6 +433,9 @@ def infer_dense_strides(
     size: Sequence[_IntLike],
     orig_strides: Sequence[_IntLike],
 ):
+    # [FUNCTION DOC] Compute dense non-overlapping strides for size that follow the layout permutation of
+    # orig_strides (like empty_like). If the last dimension would not get stride 1, it is moved to be
+    # the innermost, since attention kernels need a unit last stride. Returns the strides.
     """This is a mirror of the same function in aten/src/ATen/ExpandUtils.cpp
 
     Args:
@@ -410,6 +462,8 @@ def infer_dense_strides(
 
 
 def create_indices_fake(x) -> torch.Tensor:
+    # [FUNCTION DOC] Build a fake autotuning tensor for an index-like input: arange over the last dim
+    # expanded to the hinted shape and made contiguous, with the input's dtype and device.
     """Create a fake indices that is used for autotuning."""
     size = V.graph.sizevars.optimization_hints(x.get_size())
     indices = torch.arange(0, size[-1], dtype=x.get_dtype(), device=x.get_device())
@@ -418,6 +472,10 @@ def create_indices_fake(x) -> torch.Tensor:
 
 
 def create_num_blocks_fake_generator(sparse_indices):
+    # [FUNCTION DOC] Return a function that makes fake num_blocks tensors for autotuning, filled with the
+    # hinted size of the last sparse_indices dimension. (The docstring's min(16, max_block) wording
+    # does not match the code, which does not cap at 16.)
+    # KNOWN ISSUE: docstring claims blocks are capped at 16 but the code uses the uncapped hint.
     """Create a fake num_blocks that is used for autotuning.
 
     The idea here is that we need to create a real tensor with real data
@@ -433,6 +491,8 @@ def create_num_blocks_fake_generator(sparse_indices):
     """
 
     def create_num_blocks_fake(x) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Make a constant-filled tensor shaped like x (hinted sizes) with the
+        # captured block count, x's dtype and device.
         num_blocks_for_autotuning = V.graph.sizevars.optimization_hint(
             sparse_indices.shape[-1]
         )
@@ -448,6 +508,8 @@ def create_num_blocks_fake_generator(sparse_indices):
 
 
 def contiguous_last_dim(x):
+    # [FUNCTION DOC] Return x unchanged if its last stride is 1 or unknown; otherwise return it
+    # re-laid-out with a contiguous stride order via ExternKernel.require_stride_order.
     """Ensure that realized IR node has a contiguous stride in the last dimension."""
     strides = x.maybe_get_stride()
     if strides and strides[-1] != 1:
@@ -459,6 +521,9 @@ def contiguous_last_dim(x):
 def set_head_dim_values(
     kernel_options: dict[str, Any], qk_head_dim, v_head_dim, graph_sizevars
 ):
+    # [FUNCTION DOC] Populate kernel_options in place (setdefault, so user values win) with QK_HEAD_DIM,
+    # V_HEAD_DIM, their power-of-two rounded versions, and SAFE_HEAD_DIM (True when both are powers of
+    # two). Head dims are made static via guard_int from graph_sizevars.
     """
     Mutates kernel options, adding head dimension calculations.
 
@@ -491,10 +556,12 @@ def set_head_dim_values(
 
 
 def is_power_of_2(n):
+    # [FUNCTION DOC] HELPER: True if n is a nonzero power of two.
     return n != 0 and ((n & (n - 1)) == 0)
 
 
 def next_power_of_two(n):
+    # [FUNCTION DOC] HELPER: Smallest power of two >= n; returns 1 for n <= 0.
     if n <= 0:
         return 1
     return 2 ** math.ceil(math.log2(n))

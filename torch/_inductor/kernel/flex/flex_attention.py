@@ -1,3 +1,8 @@
+# [MODULE DOC] Triton lowering of the flex_attention and flex_attention_backward higher-order ops
+# for GPU devices. Registers the two lowerings (import-time side effect), defines the forward and
+# backward TritonTemplate objects and their launch-grid functions, and holds helpers for kernel
+# option sanitizing, joint-graph validation and gradient output bookkeeping. Dispatches to the CPU,
+# MPS, flex-decoding and flash (CuteDSL) paths when applicable.
 # mypy: allow-untyped-defs
 """Triton Implementation of the flex_attention Kernel"""
 
@@ -69,6 +74,9 @@ Expr = sympy.Expr
 def _sanitize_kernel_options_for_triton(
     kernel_options: dict[str, Any],
 ) -> tuple[dict[str, Any], _Backend]:
+    # [FUNCTION DOC] HELPER: Copy kernel_options, remove the BACKEND entry (default "AUTO") and return
+    # (options without BACKEND, backend). The input mapping is not mutated.
+    # KNOWN ISSUE: docstring talks about stripping quotes around str values, but the code only pops BACKEND.
     """We always strip quotes around str values, we only need this in lowering, so we pop it here
     to avoid passing to triton constexpr dict
     """
@@ -84,6 +92,9 @@ def raise_flex_kernel_options_error(
     sparse_q_block_size: int,
     sparse_kv_block_size: int,
 ) -> None:
+    # [FUNCTION DOC] Always raises ValueError describing that the Q/KV sparse block sizes are not divisible
+    # by the chosen tile sizes, listing the given option values, and advising valid kernel_options and
+    # max-autotune. kernel_name selects the kernel-specific tuning hints (forward or backward).
     option_values = ", ".join(f"{name}={kernel_options[name]}" for name in option_names)
     raise ValueError(
         f"Invalid FlexAttention {kernel_name} kernel options: Q and KV block sizes "
@@ -105,6 +116,9 @@ def _check_flash_supported_scalar_captures(
     *,
     backward: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError (FLASH backend unsupported) if score_mod or mask_mod
+    # captures a 0-dim CPU scalar tensor that flash attention cannot take; message mentions backward
+    # when backward is True. Otherwise do nothing.
     if has_unsupported_cpu_scalar_tensor_captures(
         score_mod_other_buffers, mask_mod_other_buffers
     ):
@@ -119,6 +133,8 @@ def _check_flash_supported_scalar_captures(
 
 @SymbolicGridFn
 def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv):
+    # [FUNCTION DOC] Launch grid for the forward kernel: a 3-tuple of (ceil-div of num_queries by BLOCK_M,
+    # batch_size, q_heads). cdiv is the ceiling-division callable supplied by SymbolicGridFn.
     """How is this kernel parallelized?
     We create a grid of (ceil_div(n_queries, query_block_size), batch_size, num_heads)
     Each block is responsible for iterating over blocks of keys and values calculating
@@ -128,6 +144,8 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
 
 
 def get_float32_precision():
+    # [FUNCTION DOC] Return the quoted Triton precision string for tl.dot: "'ieee'" when CUDA fp32 matmul
+    # precision (or the global float32 matmul precision) is full, or on HIP or MTIA; otherwise "'tf32'".
     if (
         (
             torch.backends.cuda.matmul.fp32_precision == "ieee"
@@ -164,6 +182,15 @@ def flex_attention(
     score_mod_other_buffers,
     mask_mod_other_buffers,
 ):
+    # [FUNCTION DOC] Lowering for the flex_attention hop. Routes CPU to lower_cpu and MPS to lower_mps.
+    # For GPU: rejects head dims under 16 (NotImplementedError), builds score_mod and mask_mod
+    # subgraph buffers, then picks flex decoding (TRITON_DECODE or AUTO when eligible), the flash
+    # CuteDSL kernel, or the Triton forward template. For Triton it sets kernel options (divisibility,
+    # GQA factor, head dims, TMA, block sizes shrunk to sparse block sizes, per-config tuning),
+    # appends a template choice per config, autotunes and returns (out, logsumexp, max_scores).
+    # Raises RuntimeError for TRITON_DECODE when ineligible, ValueError for invalid block options, or
+    # AssertionError for non-broadcastable batch or empty sequences. Side effects: realizes and
+    # freezes inputs, guards symbolic ints, attaches subgraph_inps / subgraph_outs to the output node.
     """The main lowering for the flex_attention hop
     This can currently lower to one of 4 templates:
     1. Base Triton Template
@@ -621,6 +648,8 @@ def flex_attention(
 def flex_attention_backward_grid(
     batch_size, q_heads, num_queries, d_model, kv_heads, num_key_value, meta, *, cdiv
 ):
+    # [FUNCTION DOC] Launch grid for the backward kernel: a 3-tuple of (query blocks times the GQA ratio
+    # plus KV blocks, batch_size, kv_heads), using BLOCK_M2 and BLOCK_N1 from meta.
     """How is this kernel parallelized?
     We create a grid of (ceil_div(n_queries, query_block_size) * heads_ratio + ceil_div(n_kv, kv_block_size), batch_size, kv_heads)
     Currently this is only parallelizing over batch* kv_heads, but we can, and want to
@@ -644,6 +673,9 @@ flex_attention_backward_template = TritonTemplate(
 
 
 def validate_joint_graph(joint_graph: torch.fx.Graph):
+    # [FUNCTION DOC] Pre-lowering check on a joint graph: raises NotImplementedError with a workaround
+    # message if any zeros_and_scatter node (gradient of a captured indexed tensor) has a user other than
+    # the output node, i.e. the same tensor is indexed more than once. Returns nothing.
     """We do some pre lowering graph checks in order to raise nicer error messages"""
     for node in joint_graph.nodes:
         if (
@@ -669,6 +701,9 @@ def validate_joint_graph(joint_graph: torch.fx.Graph):
 
 @dataclass(frozen=True)
 class JointOutputResult:
+    # [CLASS DOC] Frozen record of processed joint-graph outputs: grad_input (the score-mod gradient
+    # buffer), captured_grads_compute (buffers to inline into the kernel), captured_grads (per captured
+    # buffer, TensorBox or None when no grad), and mutated_grads (the non-None captured grads).
     """Results from processing joint outputs."""
 
     grad_input: ComputedBuffer
@@ -680,6 +715,10 @@ class JointOutputResult:
 def process_joint_outputs(
     all_joint_outputs: SubgraphResults, num_placeholders: int
 ) -> JointOutputResult:
+    # [FUNCTION DOC] Split lowered joint-graph outputs into a JointOutputResult: the first output is the
+    # score gradient; outputs from index num_placeholders - 1 onward are captured-buffer grads, with None
+    # entries for buffers needing no grad. Raises AssertionError if the input is not a list or its first
+    # entry is None.
     """Process joint outputs and extract various buffers needed for lowering
 
     Args:
@@ -702,6 +741,8 @@ def process_joint_outputs(
     grads_compute = [buf for buf in other_grads if buf is not None]
 
     def get_out(buf):
+        # [FUNCTION DOC] HELPER: Map a captured-grad ComputedBuffer to a TensorBox over the graph buffer of
+        # the same name; None gives None. Raises AssertionError for non-ComputedBuffer or unnamed buffers.
         if buf is None:
             return None
         if not isinstance(buf, ComputedBuffer):
@@ -726,6 +767,16 @@ def process_joint_outputs(
     torch.ops.higher_order.flex_attention_backward, type_promotion_kind=None
 )
 def flex_attention_backward(*args, **kwargs):
+    # [FUNCTION DOC] Lowering for the flex_attention_backward hop (args are unpacked positionally:
+    # query, key, value, out, logsumexp, grad_out, grad_logsumexp, fw_graph, joint_graph, block_mask,
+    # scale, kernel_options, score_mod_other_buffers, mask_mod_other_buffers). Raises
+    # NotImplementedError on MPS, ValueError for mixed q/k/v dtypes or invalid block options, and
+    # AssertionError for non-broadcastable batch. Builds forward, joint and mask subgraph buffers,
+    # optionally dispatches to the flash CuteDSL backward kernel, otherwise computes delta (sum of out
+    # times grad_out, minus scaled grad_logsumexp if given), allocates grad query / value outputs,
+    # sets kernel options and autotunes the Triton backward template. Reduces key/value grads over
+    # batch when kv batch is 1 and casts captured grads back to their original dtypes.
+    # Returns (grad_query, grad_key, grad_value, captured_grads tuple). Realizes and freezes inputs.
     """Lowering for the flex_attention_backward op in triton"""
     (
         query,
@@ -1231,6 +1282,9 @@ def get_bwd_subgraph_outputs(
     mask_graph_buffer: SubgraphResults,
     joint_outputs: JointOutputResult,
 ) -> list[ComputedBuffer | TensorBox | None]:
+    # [FUNCTION DOC] Collect all backward subgraph outputs into one list for symint analysis: forward
+    # score buffers, mask buffers, then the joint grad input, captured grad compute buffers, captured
+    # grads and mutated grads.
     subgraph_buffer = (
         subgraph_buffer if isinstance(subgraph_buffer, Sequence) else [subgraph_buffer]
     )

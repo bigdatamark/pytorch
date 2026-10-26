@@ -1,3 +1,7 @@
+# [MODULE DOC] Triton lowering of flex_attention for short query lengths (flex decoding). Defines the
+# eligibility check, launch grid, the split-KV heuristic, the TritonTemplate, and the lowering which
+# computes per-split partial outputs and then reduces them across splits with log-sum-exp rescaling.
+# Import-time side effect: constructs the flex_decoding_template.
 # mypy: allow-untyped-defs
 """Triton Implementation of the flex_attention Kernel for short query length (FlexDecoding)"""
 
@@ -46,6 +50,8 @@ def raise_flex_decoding_kernel_options_error(
     sparse_q_block_size: int,
     sparse_kv_block_size: int,
 ) -> None:
+    # [FUNCTION DOC] Always raises ValueError explaining that the Q / KV sparse block sizes are not
+    # divisible by the selected BLOCK_M / BLOCK_N, with the option values and tuning advice.
     formated_kernel_options = ", ".join(
         f"{name}={kernel_options[name]}" for name in ("BLOCK_M", "BLOCK_N")
     )
@@ -64,6 +70,11 @@ def raise_flex_decoding_kernel_options_error(
 
 
 def _use_flex_decoding(query, kv_indices, value, kernel_options, enable_gqa) -> bool:
+    # [FUNCTION DOC] Decide whether the flex decoding kernel should be used (True) instead of the main
+    # kernel. Requires no FORCE_USE_FLEX_ATTENTION option, no OUTPUT_MAX option, query length in
+    # 1..127, statically-known integer batch and head counts, a block mask whose head count is 1 (or
+    # equal to query heads when not GQA), and a power-of-two query/kv head ratio. Unprovable symbolic
+    # conditions count as False. Logs the decision at debug level; no other side effects.
     """Decide which kernel to use, return true if use flex decoding kernel.
     Note:
        Since the number of splits is calculated based on the number of batch and head dims
@@ -134,6 +145,8 @@ def _use_flex_decoding(query, kv_indices, value, kernel_options, enable_gqa) -> 
 
 @SymbolicGridFn
 def flex_decoding_grid(batch_size, kv_heads, gqa_group_size, seq_len_q, d_model, meta):
+    # [FUNCTION DOC] Launch grid for the decode kernel: a 3-tuple of (ceil-div of seq_len_q times the GQA
+    # group size by BLOCK_M, batch_size times kv_heads, SPLIT_KV from meta).
     """How is this kernel parallelized?
     We create a grid of (batch_size * kv_heads, SPLIT_KV, 1)
     Each block is responsible for iterating over blocks of keys and values calculating
@@ -157,6 +170,9 @@ flex_decoding_template = TritonTemplate(
 
 
 def get_split_k(B: int, H: int, Mk: int) -> int:
+    # [FUNCTION DOC] Heuristic for the number of KV splits: twice the device's multiprocessor count
+    # (CUDA, or XPU subslice count) divided by batch times heads (at least 1), floored at 1.
+    # Raises AssertionError if B * H is not a concrete integer. Mk is unused.
     if torch.xpu.is_available():
         num_SM = torch.xpu.get_device_properties("xpu").gpu_subslice_count
     else:
@@ -173,6 +189,17 @@ def get_split_k(B: int, H: int, Mk: int) -> int:
 
 
 def create_flex_decoding_kernel(*args, **kwargs):
+    # [FUNCTION DOC] Decode lowering for small query length with GQA heads packed into the M dimension.
+    # Args are unpacked positionally: query, key, value, block_mask, scale, kernel_options,
+    # score_mod_subgraph, mask_mod_subgraph, score_mod_other_buffers, mask_mod_other_buffers.
+    # Sets kernel options (divisibility, GQA heads which must be a power of two else ValueError,
+    # head dims, SPLIT_KV, BLOCK_M, TMA), reshapes query to group GQA heads, autotunes the split-KV
+    # template which writes partial accumulators plus row max and sum buffers, then reduces over splits
+    # with exp2 rescaling (fully masked rows handled) to produce the output and logsumexp.
+    # Returns (output, logsumexp). Raises AssertionError for non-broadcastable batch, ValueError for
+    # invalid block options. Side effects: realizes and freezes buffers, attaches subgraph_inps /
+    # subgraph_outs to the accumulator node.
+    # KNOWN ISSUE: returns only two values while the Triton forward lowering returns three (also max_scores).
     """Flex decode lowering that is optimized for small Q_LEN and GQA packing"""
     (
         query,

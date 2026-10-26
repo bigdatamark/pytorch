@@ -1,3 +1,6 @@
+# [MODULE DOC] CPU lowering of the flex_attention hop using the C++ CppFlexAttentionTemplate (x86 with
+# AVX2 only, inference only). Provides the platform support check and lower_cpu, which turns the
+# score_mod / mask_mod graphs into buffers over symbolic split-size tiles. No import-time side effects.
 # mypy: allow-untyped-defs
 """CPU-specific implementations for flex attention"""
 
@@ -29,6 +32,8 @@ from .common import (
 
 
 def check_cpu_supported():
+    # [FUNCTION DOC] Return True if the CPU flex attention template is usable: AVX2 is supported and the
+    # ATEN_CPU_CAPABILITY env var is not "default", no XPU is available, and the platform is not macOS.
     requires_avx2_on_cpu = (
         torch.cpu._is_avx2_supported() and os.getenv("ATEN_CPU_CAPABILITY") != "default"
     )
@@ -41,6 +46,10 @@ def check_cpu_supported():
 
 
 def _realize_duplicate_buffer_inputs(inputs):
+    # [FUNCTION DOC] HELPER: If several inputs share the same buffer name (e.g. q and k views of one
+    # storage), return a list where those inputs are replaced with fresh copies so each has a distinct
+    # buffer name; otherwise return the inputs unchanged. The C++ template names pointer arguments by
+    # storage buffer name.
     names = [inp.get_name() for inp in inputs]
     duplicate_names = OrderedSet(name for name in names if names.count(name) > 1)
     if not duplicate_names:
@@ -67,6 +76,14 @@ def lower_cpu(
     score_mod_other_buffers,
     mask_mod_other_buffers,
 ):
+    # [FUNCTION DOC] Lower flex_attention on CPU with the C++ template. Validates inputs (same q/k/v dtype,
+    # float / float16 / bfloat16 only, no return of logsumexp, supported platform) raising ValueError or
+    # NotImplementedError, and asserts the block mask covers the sequence lengths (AssertionError).
+    # Creates two unbacked symbols for the runtime q and kv tile sizes (ranged to at least 2, then removed
+    # from the pending unbacked list), builds the score subgraph and a mask subgraph rewritten to apply
+    # the mask onto the score tile, realizes inputs, builds output layout matching query strides, adds
+    # template choices and autotunes. Returns a 1-tuple holding the output. Side effects: mutates
+    # shape_env ranges and pending symbols, attaches subgraph_inps / subgraph_outs to the result.
     """CPP based template for flex attention for x86 CPUs"""
     (
         _,  # q_length
@@ -168,6 +185,10 @@ def lower_cpu(
     #       qk_data = torch.where(mask, qk_data, torch.full_like(qk_data, -float("inf")))
     #       return qk_data
     def convert_mask_graph_module(mask_graph):
+    # [FUNCTION DOC] HELPER: Deep-copy the scalar mask graph module and rewrite it so it takes an extra
+    # leading qk_data input and returns the score tile where the mask is true and negative infinity
+    # elsewhere (using full and where nodes of the tile size). Raises AssertionError if the graph has no
+    # output node. Returns the new GraphModule; the original is untouched.
         gm = copy.deepcopy(mask_graph.graph_module)
         graph = gm.graph
         # Add qk_data as the first input

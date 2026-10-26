@@ -1,3 +1,8 @@
+# [MODULE DOC] Analysis that decides how captured ("aux") tensors loaded inside flex attention
+# score_mod / mask_mod graphs can be vectorized across consecutive KV lanes.
+# Walks the FX graph of the mod, classifies each indexed load as gather, lane-uniform or
+# contiguous, and picks a common vector width. Pure analysis; no import-time side effects
+# beyond defining two module-level AuxVecPolicy constants and DEFAULT_MASK_MOD_VEC_SIZE.
 # mypy: allow-untyped-defs
 """Captured aux tensor vectorization analysis for flex attention."""
 
@@ -22,6 +27,8 @@ DEFAULT_MASK_MOD_VEC_SIZE = 32
 
 
 class LoadKind(Enum):
+    # [CLASS DOC] Enum classifying a captured tensor load: GATHER (scalar per lane), LANE_UNIFORM
+    # (same value for all KV lanes) or CONTIGUOUS (consecutive lanes hit consecutive storage).
     """How a captured aux tensor load behaves across vectorized KV lanes.
 
     GATHER: Cannot use a direct vector load.
@@ -36,6 +43,9 @@ class LoadKind(Enum):
 
 @dataclasses.dataclass(frozen=True)
 class AuxLoadVecInfo:
+    # [CLASS DOC] Frozen result of classifying one aux load: a LoadKind plus an optional vec_size.
+    # Invariant (checked at construction): vec_size is set if and only if kind is CONTIGUOUS.
+    # Use the gather / lane_uniform / contiguous constructors.
     """Vectorization classification for one captured aux tensor load.
 
     kind: Load classification.
@@ -46,6 +56,8 @@ class AuxLoadVecInfo:
     vec_size: int | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Dataclass validation hook; raises AssertionError if a CONTIGUOUS load has
+        # no vec_size or a non-CONTIGUOUS load carries one.
         """Validate that only contiguous loads carry a vector width."""
         if self.kind is LoadKind.CONTIGUOUS:
             if self.vec_size is None:
@@ -58,22 +70,29 @@ class AuxLoadVecInfo:
 
     @classmethod
     def gather(cls) -> "AuxLoadVecInfo":
+        # [FUNCTION DOC] HELPER: Build a GATHER classification (no vector width).
         """Create a gather-load classification."""
         return cls(LoadKind.GATHER)
 
     @classmethod
     def lane_uniform(cls) -> "AuxLoadVecInfo":
+        # [FUNCTION DOC] HELPER: Build a LANE_UNIFORM classification (no vector width).
         """Create a lane-uniform-load classification."""
         return cls(LoadKind.LANE_UNIFORM)
 
     @classmethod
     def contiguous(cls, vec_size: int) -> "AuxLoadVecInfo":
+        # [FUNCTION DOC] HELPER: Build a CONTIGUOUS classification carrying the given vector width.
         """Create a contiguous direct-vector-load classification."""
         return cls(LoadKind.CONTIGUOUS, vec_size)
 
 
 @dataclasses.dataclass(frozen=True)
 class AuxVecPolicy:
+    # [CLASS DOC] Frozen per-ABI configuration for vector width selection: positions of the q_idx and
+    # kv_idx placeholders in the mod graph, the maximum direct load width, the minimum number of
+    # indices required to allow contiguous vector loads, and where non-lane index placeholders start.
+    # Instances: MASK_MOD_AUX_VEC_POLICY and SCORE_MOD_AUX_VEC_POLICY.
     """ABI-specific rules for selecting an aux tensor vector width.
 
     q_idx_placeholder: Placeholder index for the query lane.
@@ -108,6 +127,8 @@ SCORE_MOD_AUX_VEC_POLICY = AuxVecPolicy(
 
 @dataclasses.dataclass(frozen=True)
 class AuxIndexedTensor:
+    # [CLASS DOC] Frozen pairing of a captured tensor buffer with the partial indices (FX nodes or
+    # constants) already applied to it by earlier chained index calls.
     """Captured tensor plus any safe partial indices already accumulated."""
 
     buffer: TensorBox
@@ -121,6 +142,9 @@ def make_fx_index_symbols(
     *,
     kv_expr: sympy.Expr | None = None,
 ) -> tuple[sympy.Symbol, sympy.Symbol, dict[torch.fx.Node, sympy.Expr]]:
+    # [FUNCTION DOC] HELPER: Build sympy symbols for index analysis. Creates integer nonnegative symbols
+    # for q_idx and kv_idx plus one per non-lane index node, and a mapping from FX node to expression
+    # (kv node maps to kv_expr if given). Returns (q_idx symbol, kv_idx symbol, node-to-expr mapping).
     """Build symbolic replacements for lane and non-lane FX index nodes."""
     q_idx = sympy.Symbol("q_idx", integer=True, nonnegative=True)
     kv_idx = sympy.Symbol("kv_idx", integer=True, nonnegative=True)
@@ -141,6 +165,9 @@ def select_mask_mod_vec_size(
     graph_module: GraphModule | None,
     other_buffers: Sequence[TensorBox],
 ) -> int | None:
+    # [FUNCTION DOC] Pick the vector width for mask_mod, whose ABI is (b, h, q, kv). Returns None if there is
+    # no mask_mod or vectorization is unsupported; the default width if no aux tensors are captured;
+    # otherwise the width from select_aux_mod_vec_size with the mask policy, or None if that is 1 or less.
     """Use mask_mod's (b, h, q, kv) ABI; vec32 matches the packed R2P mask width."""
     if not has_mask_mod or not supports_mask_mod_vec:
         return None
@@ -163,6 +190,9 @@ def select_score_mod_vec_size(
     graph_module: GraphModule | None,
     other_buffers: Sequence[TensorBox],
 ) -> int | None:
+    # [FUNCTION DOC] Pick the vector width for score_mod. Returns None when there is no score_mod or no
+    # captured aux tensors, 1 when the hardware is not SM100 or later, otherwise the width chosen by
+    # select_aux_mod_vec_size with the score policy (capped at 8).
     """Select score_mod vector width for captured aux loads.
 
     A return value of None means there are no captured tensor loads constraining
@@ -185,6 +215,12 @@ def select_aux_mod_vec_size(
     other_buffers: Sequence[TensorBox],
     policy: AuxVecPolicy,
 ) -> int:
+    # [FUNCTION DOC] Choose a common vector width (int, 1 means scalar) for all captured tensor loads in a
+    # mod graph. Maps placeholders after the fixed ones to other_buffers, then walks aten index calls:
+    # partial indexing that does not touch the KV lane is chained; complete loads are classified.
+    # Width is the minimum over contiguous loads, starting at the policy max; if no lane-uniform or
+    # contiguous load exists (or graph_module is None / too few placeholders) the result is 1.
+    # Over-indexed loads are ignored. Raises AssertionError on an internal inconsistency.
     """Choose a safe vector width for captured tensor loads.
 
     The analysis follows aten.index chains from captured tensor placeholders,
@@ -269,6 +305,8 @@ def is_safe_partial_aux_index(
     kv_idx_node: torch.fx.Node,
     non_lane_index_nodes: Sequence[torch.fx.Node],
 ) -> bool:
+    # [FUNCTION DOC] Return True only if every index in the partial index tuple translates to a sympy
+    # expression that does not depend on the KV lane; False if any is unsupported or uses kv_idx.
     """Return whether partial indices can be chained before the KV-lane index."""
     _, kv_idx, index_symbols = make_fx_index_symbols(
         q_idx_node, kv_idx_node, non_lane_index_nodes
@@ -289,6 +327,13 @@ def direct_aux_load_vec_size_and_kind(
     max_vec_size: int = 8,
     min_index_rank_for_contiguous_load: int = 1,
 ) -> AuxLoadVecInfo:
+    # [FUNCTION DOC] Classify a complete captured load and return an AuxLoadVecInfo. Gather if indices are
+    # not a nonempty list/tuple, any index is untranslatable, the KV lane is not in the last index,
+    # fewer indices than the minimum rank, KV appears in a prefix index, or last-dim stride is not 1.
+    # Lane-uniform if no index uses KV. Otherwise tries widths from max_vec_size halving down to 2 and
+    # returns contiguous for the first where last size, layout offset and other strides are statically
+    # multiples of the width and the lane expression is contiguous over that width; else gather.
+    # Raises AssertionError if max_vec_size is not a power of two >= 2.
     """Return vector-load information for a captured aux load.
 
     The load is lane-uniform if none of its indices depend on KV. Otherwise,
@@ -351,6 +396,11 @@ def fx_aux_index_to_sympy(
     index_symbols: Mapping[torch.fx.Node, sympy.Expr],
     node_to_sympy: Callable[[torch.fx.Node], sympy.Expr | None] | None = None,
 ) -> sympy.Expr | None:
+    # [FUNCTION DOC] Translate an FX index argument into a sympy expression, or None if unsupported.
+    # Handles integer constants, mapped nodes (index_symbols, then optional node_to_sympy callback),
+    # and call_function nodes for abs, neg, clamp (min/max bounds), add, sub, mul, minimum, maximum,
+    # remainder (modular indexing) and floor-mode div (floor division). Recurses on operands;
+    # add/sub/mul results are simplified via the graph's sizevars.
     """Translate the supported FX integer index operations to sympy."""
     if isinstance(index, int | sympy.Integer):
         return sympy.Integer(index)
