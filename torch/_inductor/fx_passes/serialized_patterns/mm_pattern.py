@@ -2,6 +2,7 @@
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
 # cd ~/pytorch && python torchgen/fuse/gen_patterns.py
+# [MODULE DOC] Generated (do not edit) pattern-matcher graphs for mm; defines mm_pattern_training (forward mm plus two backward mm grads via permuted operands) and mm_pattern_inference.
 
 import torch
 import torch._inductor

@@ -2,6 +2,7 @@
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
 # cd ~/pytorch && python torchgen/fuse/gen_patterns.py
+# [MODULE DOC] Generated (do not edit) pattern-matcher graphs for fusing addmm; defines addmm_pattern_training (forward addmm plus backward bias-sum and two mm grads scaled by beta/alpha) and addmm_pattern_inference (single addmm with beta/alpha).
 
 import torch
 import torch._inductor

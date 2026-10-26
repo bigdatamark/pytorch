@@ -2,6 +2,10 @@
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
 # cd ~/pytorch && python torchgen/fuse/gen_patterns.py
+# [MODULE DOC] Generated (do not edit) serialized pattern-matcher graphs for scaled-dot-product-attention (SDPA) fusion.
+# Variant: query/key bmm, divide by inv_scale, add attn_mask, softmax, bmm with value; no dropout.
+# Defines module-level pattern expressions _sfdp_pattern_5_training/_inference and their _half_ (reduced precision) variants; inputs are KeywordArgs query, key, value, inv_scale (plus attn_mask/dropout_p where used).
+# Import-time side effects: none beyond building pattern objects; consumed by the inductor SDPA pattern registration.
 
 import torch
 import torch._inductor

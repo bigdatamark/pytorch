@@ -2,6 +2,7 @@
 # This is an auto-generated file. Please do not modify it by hand.
 # To re-generate, run:
 # cd ~/pytorch && python torchgen/fuse/gen_patterns.py
+# [MODULE DOC] Generated (do not edit) pattern-matcher graphs for bmm; defines bmm_pattern_training (forward bmm plus two backward bmm grads via permuted operands) and bmm_pattern_inference.
 
 import torch
 import torch._inductor
