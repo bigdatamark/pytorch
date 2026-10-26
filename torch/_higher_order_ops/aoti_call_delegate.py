@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Defines the aoti_call_delegate higher-order op, which calls an
+# AOTInductor-compiled submodule from an ExportedProgram graph. Provides the HOP object
+# and its implementations for real execution, proxy tracing, fake tensor mode and
+# functionalization. Import time: creates the HOP and registers fallthroughs for the
+# PythonDispatcher, PythonTLSSnapshot, ADInplaceOrView and AutocastCPU dispatch keys.
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -40,8 +46,11 @@ class AOTICallDelegate(HigherOrderOperator):
     - weight_args is the list of weights in original GraphModule, including parameters and buffers
     - input_args is the list of flatten inputs
     """
+    # [CLASS DOC] HigherOrderOperator named "aoti_call_delegate"; stateless. Takes the
+    # lowered module, the original graph module, weights and inputs; returns output tensors.
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Registers the HOP under the name aoti_call_delegate.
         super().__init__("aoti_call_delegate")
 
     def __call__(
@@ -51,6 +60,8 @@ class AOTICallDelegate(HigherOrderOperator):
         weight_args: list[torch.Tensor],
         input_args: list[torch.Tensor],
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC] Dispatches the four arguments through the base HOP call and
+        # returns the resulting list of output tensors.
         # pyrefly: ignore [missing-attribute]
         return super().__call__(lowered_module, original_gm, weight_args, input_args)
 
@@ -69,6 +80,12 @@ def call_delegate_cpu(
     weight_args: list[torch.Tensor],
     input_args: list[torch.Tensor],
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Eager implementation (CompositeExplicitAutograd). Converts FX immutable
+    # dicts/lists inside weights+inputs to plain dicts/lists. If any argument is a fake
+    # tensor, runs the stateless original_gm on all of them and returns its output.
+    # Otherwise drops the weights and runs the AOTI module on the inputs: an
+    # AOTInductorRunnerWrapper is called with unpacked inputs, an AOTInductorEPModule with
+    # the inputs as one sequence. Raises RuntimeError for any other module type.
     # FX creates this immutable_dict/list concept. Get rid of this.
     map_types: dict[type, type] = {
         torch.fx.immutable_collections.immutable_dict: dict,
@@ -101,6 +118,10 @@ def call_delegate_cpu(
 def trace_aoti_call_delegate(
     proxy_mode, func_overload, lowered_module, original_gm, weight_args, input_args
 ):
+    # [FUNCTION DOC] HELPER: Traces the HOP into the FX graph. Registers lowered_module and
+    # original_gm as submodules of the tracer root (mutating it), emits a call_function node
+    # named aoti_call_delegate with proxied args, computes real outputs with proxy tracing
+    # disabled via call_delegate_cpu, and returns them tracked against the output proxy.
     proxy_mode.tracer.root.register_module("lowered_module", lowered_module)
     proxy_mode.tracer.root.register_module("original_gm", original_gm)
 
@@ -124,6 +145,8 @@ def call_delegate_proxy_torch_dispatch_mode(
     weight_args: list[torch.Tensor],
     input_args: list[torch.Tensor],
 ):
+    # [FUNCTION DOC] Proxy-mode dispatch implementation: delegates to
+    # trace_aoti_call_delegate and returns the traced outputs.
     res = trace_aoti_call_delegate(
         mode, aoti_call_delegate, lowered_module, original_gm, weight_args, input_args
     )
@@ -137,6 +160,8 @@ def call_delegate_fake_tensor_mode(
     weight_args: list[torch.Tensor],
     input_args: list[torch.Tensor],
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Fake tensor mode implementation (cache skipped): reuses
+    # call_delegate_cpu, which runs the original graph module on the fake inputs.
     return call_delegate_cpu(lowered_module, original_gm, weight_args, input_args)
 
 
@@ -148,6 +173,9 @@ def call_delegate_functionalize(
     weight_args: list[torch.Tensor],
     input_args: list[torch.Tensor],
 ):
+    # [FUNCTION DOC] Functionalization implementation: unwraps functional tensors in weights
+    # and inputs, redispatches the HOP to the next level, and re-wraps the result. The op
+    # is assumed not to mutate its inputs. Returns the wrapped outputs.
     unwrapped_weight_args = tuple(
         ctx.unwrap_tensors(weight_arg) for weight_arg in weight_args
     )

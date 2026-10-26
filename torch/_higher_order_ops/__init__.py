@@ -1,3 +1,10 @@
+# [PACKAGE DOC] Package of higher-order operators (HOPs): ops that take callables/subgraphs
+# as arguments (cond, while_loop, scan, map, invoke_subgraph, flex_attention, etc.).
+# It only re-exports the HOP objects and helpers from its submodules and lists them in
+# __all__, so they are reachable as torch._higher_order_ops.<name>. Importing it imports
+# every HOP submodule, which registers each operator and its dispatch implementations.
+# KNOWN ISSUE: __all__ lists "register_hook", which is not imported or defined here, and
+# lists "map" twice; a star import of this package would fail on the missing name.
 from torch._higher_order_ops._invoke_quant import (
     invoke_quant,
     invoke_quant_packed,

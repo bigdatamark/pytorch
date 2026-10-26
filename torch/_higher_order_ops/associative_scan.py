@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements the associative_scan higher-order op: an inclusive parallel scan
+# with a user supplied associative binary combine function. Contains the public
+# associative_scan API (pointwise mode uses the HOP, generic mode uses a vmapped recursive
+# algorithm), the HOP object and its dense, autograd, proxy tracing, fake tensor and
+# functionalization implementations, and a plain reference implementation for tests.
+# Import time: creates the associative_scan_op HOP and registers its implementations.
 import functools
 import itertools
 from collections.abc import Callable
@@ -37,6 +43,10 @@ aten = torch._ops.ops.aten
 
 
 def wrap_combine_fn_flat(*args, combine_fn, spec, num_leaves):
+    # [FUNCTION DOC] Adapts a pytree combine function to flat leaves. Expects exactly twice
+    # num_leaves positional tensors; the first half and second half are each rebuilt into
+    # the pytree structure spec, then combine_fn is called on the two trees and its result
+    # returned. Raises AssertionError on a wrong argument count.
     if len(args) != 2 * num_leaves:
         raise AssertionError(
             f"Combine_fn received wrong number of arguments, expected {2 * num_leaves}, but got {len(args)}"
@@ -47,6 +57,10 @@ def wrap_combine_fn_flat(*args, combine_fn, spec, num_leaves):
 
 
 def _interleave(a, b, dim=0):
+    # [FUNCTION DOC] HELPER: Interleaves tensors a and b along dim (a0, b0, a1, b1, ...).
+    # b may be the same length as a or one shorter; in the shorter case b is zero padded by
+    # one at the end of dim and the trailing padded slot is sliced off the result.
+    # Returns the new tensor; inputs are not modified.
     # https://stackoverflow.com/questions/60869537/how-can-i-interleave-5-pytorch-tensors
     if b_trunc := (a.shape[dim] == b.shape[dim] + 1):
         pad = (
@@ -66,6 +80,11 @@ def _interleave(a, b, dim=0):
 
 
 def safe_map(f, *args):
+    # [FUNCTION DOC] HELPER: Like map over several sequences but requires equal lengths.
+    # Calls f with one element from each sequence per step and returns a list of results.
+    # Raises ValueError if any sequence length differs from the first.
+    # KNOWN ISSUE: the error message lacks an f-string prefix, so the lengths are not
+    # interpolated into the message.
     args = list(map(list, args))
     n = len(args[0])
     for arg in args[1:]:
@@ -73,16 +92,25 @@ def safe_map(f, *args):
             raise ValueError("length mismatch: {list(map(len, args))}")
 
     def nf(a):
+        # [FUNCTION DOC] HELPER: Unpacks a tuple of per-sequence elements into f.
         return f(*a)
 
     return list(map(nf, zip(*args)))
 
 
 class AssociativeScanOp(HigherOrderOperator):
+    # [CLASS DOC] HigherOrderOperator named "associative_scan" taking a combine function,
+    # a list of flat input tensors (scan over their first dimension) and a tuple of lifted
+    # additional inputs. Stateless; a single instance is created as associative_scan_op.
     def __init__(self):
+        # [FUNCTION DOC] Registers the HOP under the name associative_scan.
         super().__init__("associative_scan")
 
     def __call__(self, combine_fn, xs, additional_inputs):
+        # [FUNCTION DOC] Validates that additional_inputs is a tuple or list (lists are
+        # converted to a tuple) and that its entries have allowed types, then dispatches
+        # the HOP. Returns the scanned output tensors. Raises AssertionError for a bad
+        # additional_inputs container type.
         # There is currently an issue that the ScanOp is sometimes called with
         # the additional_inputs being a list. See https://github.com/pytorch/pytorch/issues/145785
         # Once this issue is resolved, the assertion should only allow tuples
@@ -102,6 +130,11 @@ class AssociativeScanOp(HigherOrderOperator):
 
     # pyrefly: ignore [bad-override]
     def gen_schema(self, combine_fn, xs, additional_inputs):
+        # [FUNCTION DOC] Builds the HOP schema. Traces combine_fn to a graph using two
+        # first-slice copies of xs plus additional_inputs as sample inputs, rejects it if
+        # it mutates any input (RuntimeError), then records combine_fn, each xs entry,
+        # each additional input and each combine output, plus the tree spec. Returns the
+        # generated schema.
         from torch._higher_order_ops.schema import HopSchemaGenerator
 
         # For associative scan, we need two copies of xs for the combine function
@@ -197,6 +230,11 @@ def associative_scan(
         cumsum = associative_scan(add, x, dim)
 
     """
+    # [FUNCTION DOC] Public API. Flattens xs, validates inputs, moves dim to the front and
+    # optionally flips it (reverse), then scans: generic mode vmaps combine_fn and runs the
+    # recursive generic_associative_scan; pointwise mode runs the HOP (compiled when needed).
+    # Undoes the flip and dim move and returns a pytree matching xs. Raises ValueError or
+    # RuntimeError for bad arguments (see the nested validator).
     # TODO: Support lifted arguments in inductor for associative_scan
     # TODO: Support autograd for cases with lifted arguments for combine_mode=pointwise
 
@@ -206,6 +244,10 @@ def associative_scan(
     leaves_xs_orig, spec_xs = pytree.tree_flatten(xs)
 
     def _validate_input(cfn, lxs, d, r, cm):
+        # [FUNCTION DOC] HELPER: Checks combine fn is callable, dim is an int, reverse is a
+        # bool, mode is pointwise or generic, and the xs leaves are a non-empty list of
+        # dense tensors each with more than dim dimensions. Raises ValueError, except a
+        # non-bool reverse raises RuntimeError. Returns nothing.
         # Basic arguments check
         if not callable(cfn):
             raise ValueError(f"Combine_fn must be a callable, but got {cfn}")
@@ -280,6 +322,7 @@ def associative_scan(
         )
 
         def run_flattened_associative_scan(combine_fn, leaves_xs):
+            # [FUNCTION DOC] HELPER: Calls the HOP on flat leaves with no additional inputs.
             return associative_scan_op(combine_fn, leaves_xs, additional_inputs=())
 
         out = _maybe_compile_and_run_fn(
@@ -344,11 +387,20 @@ def generic_associative_scan(operator, leaves, dim=0, additional_inputs=()):
             res = torch.tensor([0.0, 1.0, 3.0, 6.0])
 
     """
+    # [FUNCTION DOC] Reference recursive parallel scan over a list of tensors along dim
+    # (also the dense HOP implementation). Returns a list of scanned tensors, same shapes.
+    # Does not mutate inputs. Handles empty scan results via special-case concatenation.
 
     def call_operator(*args):
+        # [FUNCTION DOC] HELPER: Calls operator and flattens its result to a list of leaves.
         return pytree.tree_leaves(operator(*args))
 
     def _scan(elems):
+        # [FUNCTION DOC] HELPER: Recursive step. Returns elems unchanged if fewer than two
+        # entries along dim. Otherwise combines even-index with odd-index slices, scans that
+        # reduced list recursively, derives the remaining even positions by combining the
+        # scanned values with further slices (shape depends on parity of length),
+        # prepends the first original element, and interleaves the two sets.
         """Perform the actual recursive scan on ``elems``."""
         num_elems = elems[0].shape[dim]
 
@@ -406,6 +458,12 @@ def trace_associative_scan(
     xs: list[torch.Tensor],
     additional_inputs: tuple[torch.Tensor],
 ):
+    # [FUNCTION DOC] Traces the HOP into an FX graph. Traces combine_fn on first-slice
+    # samples (two per xs) and additional inputs with proxy tracing disabled, checks the
+    # graph has a single output node and returns as many leaves as xs, and that output
+    # metadata matches the input slices (else AssertionError). Registers the combine graph
+    # as a submodule of the tracer root, emits an associative_scan call node, and returns
+    # clones of xs tracked against that node.
     from torch._dynamo.utils import clone_input
 
     with disable_proxy_modes_tracing():
@@ -467,10 +525,17 @@ def trace_associative_scan(
 
 @associative_scan_op.py_impl(DispatchKey.CompositeExplicitAutograd)
 def associative_scan_op_dense(combine_fn, xs, additional_inputs):
+    # [FUNCTION DOC] Eager implementation: runs generic_associative_scan on xs (scan dim 0)
+    # and returns the list of scanned tensors.
     return generic_associative_scan(combine_fn, xs, additional_inputs=additional_inputs)
 
 
 class AssociativeScanAutogradOp(torch.autograd.Function):
+    # [CLASS DOC] Autograd function giving associative_scan a backward pass. Forward runs
+    # the HOP below autograd and saves operands and outputs; backward computes per-step
+    # local gradients with a vmapped joint graph, builds a cumulative-product transition
+    # matrix, and combines with upstream gradients. Context attributes: number of xs,
+    # number of additional inputs, combine function, scan length and dispatch key sets.
     r""" associative_scan
         Example::
             xs = torch.arange(1, 5) = [1, 2, 3, 4]
@@ -663,6 +728,10 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
         num_additional_inputs,
         *operands,
     ):
+        # [FUNCTION DOC] Stores num_xs, num_additional_inputs, combine_fn, scan length and
+        # the current TLS dispatch key sets on ctx. Splits operands into xs and additional
+        # inputs, runs the HOP below autograd, saves operands and outputs for backward,
+        # and returns the outputs as a tuple.
         ctx._num_xs = num_xs
         ctx._num_additional_inputs = num_additional_inputs
         ctx._combine_fn = combine_fn
@@ -687,6 +756,15 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *gl_ys):
+        # [FUNCTION DOC] Computes gradients for xs given upstream gradients gl_ys. Restores
+        # saved xs and outputs; for a zero length scan returns zero gradients. Otherwise
+        # materializes the joint backward graph of combine_fn, vmaps it over the scan
+        # dimension with unit upstream gradient to get per-step local gradients, then per
+        # leaf builds the upper triangular transition matrix, scales by gl_ys, sums and
+        # multiplies by the local xs gradients. Returns None for the first three forward
+        # args (fn and counts), the xs gradients, and None for additional inputs.
+        # KNOWN ISSUE: gradients for additional_inputs are not computed (always None).
+        # The first element of the local xs gradients is overwritten in place with ones.
         r"""
         This function computes the gradients of the scan operation.
         For a detailed description see the document above.
@@ -760,9 +838,17 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
         bwys, bwxs = split_into_chunks(grads, [num_xs, num_xs])
 
         def compute_y_mat(bwys: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds the gradient transition matrix from the local
+            # gradients bwys: repeats them into a square along a new dim, fills the lower
+            # triangle including the diagonal with ones, takes a cumulative product along
+            # the new dim, then zeros strictly below the diagonal. Returns that tensor.
             # Prepare a ones and a zeros helper mask in order to easily compute the y_mat
             def compute_helper_tril_mask(diagonal):
+                # [FUNCTION DOC] HELPER: Returns a boolean lower triangular mask of size
+                # scan_length squared (offset by diagonal), expanded to the shape of bwys.
                 def expand_masks(mask):
+                    # [FUNCTION DOC] HELPER: Appends trailing singleton dims to the mask
+                    # up to the rank of the outputs.
                     for _ in range(ndim - 1):
                         mask = mask.unsqueeze(-1)
                     return mask
@@ -799,6 +885,9 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
             return y_mat
 
         def compute_grad(bwxs, bwys, gl_ys):
+            # [FUNCTION DOC] HELPER: Gradient for one xs leaf. Sets the first step of bwxs
+            # to one in place, builds the transition matrix from bwys, scales by upstream
+            # gradients, sums over outputs and multiplies by bwxs. Returns the gradient.
             # Set the first gradient component of bwxs to 1.0, per definition.
             torch.select(bwxs, dim, 0).fill_(1.0)
 
@@ -837,6 +926,9 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
 
 @associative_scan_op.py_autograd_impl
 def associative_scan_autograd(combine_fn, xs, additional_inputs):
+    # [FUNCTION DOC] Autograd dispatch implementation. Raises RuntimeError if there are
+    # any lifted additional inputs; otherwise applies AssociativeScanAutogradOp to the
+    # combine function and operands and returns the outputs as a tuple.
     num_xs = len(xs)
     num_additional_inputs = len(additional_inputs)
 
@@ -856,6 +948,7 @@ def associative_scan_autograd(combine_fn, xs, additional_inputs):
 
 @associative_scan_op.py_impl(ProxyTorchDispatchMode)
 def associative_scan_proxy_mode(mode, combine_fn, xs, additional_inputs):
+    # [FUNCTION DOC] Proxy-mode implementation: delegates to trace_associative_scan.
     return trace_associative_scan(
         mode, associative_scan_op, combine_fn, xs, additional_inputs
     )
@@ -863,11 +956,17 @@ def associative_scan_proxy_mode(mode, combine_fn, xs, additional_inputs):
 
 @register_fake(associative_scan_op, skip_cache=True)
 def assoiciative_scan_fake_tensor_mode(combine_fn, xs, additional_inputs):
+    # [FUNCTION DOC] Fake tensor implementation: returns a tuple of clones of xs (output
+    # has the same shapes as the inputs). The combine function is not run.
     return tuple(x.clone() for x in xs)
 
 
 @associative_scan_op.py_functionalize_impl
 def associative_scan_functionalize(ctx, combine_fn, xs, additional_inputs):
+    # [FUNCTION DOC] Functionalization implementation: unwraps tensors, functionalizes
+    # combine_fn, verifies on sample first-slice inputs that it neither aliases nor mutates
+    # (error raised by the checker), redispatches the HOP to the next level, and returns
+    # the re-wrapped outputs.
     from torch._higher_order_ops.utils import _check_alias_and_mutation
 
     unwrapped_xs = ctx.unwrap_tensors(xs)
@@ -898,6 +997,10 @@ def associative_scan_functionalize(ctx, combine_fn, xs, additional_inputs):
 
 
 def _fake_associative_scan(combine_fn, xs, dim, reverse=False):
+    # [FUNCTION DOC] HELPER: Slow reference scan (used for testing). Iterates indices along
+    # dim (backwards if reverse), carrying the previous result and combining it with the
+    # current slice via combine_fn, then stacks the per-step results per leaf along dim.
+    # Returns a pytree like xs. Leaves are returned unchanged if the dim has size zero.
     inp_leaves, spec = pytree.tree_flatten(xs)
     result_flat: list[Any] = []
     num_leaves = len(inp_leaves)
