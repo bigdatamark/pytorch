@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pre-grad FX graph passes for Inductor, run on the Torch IR (or predispatch ATen IR) graph before autograd.
+# Defines PatternMatcherPass instances (gumbel max trick, efficient conv/bn eval, split/linear/add, chunk/squeeze/cat, reshape
+# removal, and predispatch ATen variants), no-op stubs for passes that only exist in internal builds, the pass driver
+# pre_grad_passes, conv/bn fusion, and permute/linear/matmul/cat fusion helpers.
+# Import-time side effects: creates the module-level pass objects and a logger; no graph is modified until a function is called.
 import copy
 import functools
 import itertools
@@ -81,6 +86,8 @@ remove_split_with_size_one_pass_aten = PatternMatcherPass(
 
 
 def save_inductor_dict(pass_to_compare=None):
+    # [FUNCTION DOC] HELPER: Snapshot Inductor pass counters. Takes an optional list of pass names (default: all pre-grad and post-grad
+    # fusion option names from config) and returns a mapping from each name to its current count in the global inductor counters (0 if absent).
     if not pass_to_compare:
         pass_to_compare = list(config.pre_grad_fusion_options.keys()) + list(
             config.post_grad_fusion_options.keys()
@@ -89,6 +96,8 @@ def save_inductor_dict(pass_to_compare=None):
 
 
 def is_same_dict(inductor_dict, optimus_dict):
+    # [FUNCTION DOC] HELPER: Compare counters to a baseline. Returns False if any pass in optimus_dict has a count in inductor_dict that differs
+    # from the baseline count (missing counts treated as 0); otherwise True.
     for pass_name, count in optimus_dict.items():
         if count != dict(inductor_dict).get(pass_name, 0):
             return False
@@ -96,83 +105,106 @@ def is_same_dict(inductor_dict, optimus_dict):
 
 
 def shape_prop(mod) -> None:
+    # [FUNCTION DOC] HELPER: No-op placeholder for shape propagation; accepts a module and returns None.
     return None
 
 
 def normalize_node_kwargs_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the normalize_node_kwargs_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def fuse_parallel_linear_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the fuse_parallel_linear_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def remove_split_ops(graph, shape_prop):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the split-removal helper; takes a graph and a shape propagation callable, returns None.
     return None
 
 
 def remove_split_ops_pass(graph):
+    # [FUNCTION DOC] HELPER: Run the (stub) split-removal helper on the graph's owning module using the module-level stub shape_prop. Returns None.
     remove_split_ops(graph.owning_module, shape_prop)
 
 
 def fuse_chunk_reshape_unsqueeze_concat_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the fuse_chunk_reshape_unsqueeze_concat_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def fuse_chunk_reshape_concat_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the fuse_chunk_reshape_concat_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def remove_noop_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the remove_noop_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def stack_to_unsqueeze_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the stack_to_unsqueeze_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def merge_concats_pass(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the merge_concats_pass pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def relu_nan_to_num(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the relu_nan_to_num pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def fuse_split_getitem_squeeze_cat(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the fuse_split_getitem_squeeze_cat pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def use_triton_dot_compress(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the use_triton_dot_compress pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def use_triton_lce_replace_simple_LCE_helper(gm, shape_prop):
+    # [FUNCTION DOC] HELPER: No-op placeholder taking a graph module and shape propagation callable; returns None.
     return None
 
 
 def use_triton_lce_replace_simple_LCE(graph):
+    # [FUNCTION DOC] HELPER: Pass wrapper: calls the simple-LCE helper with the graph's owning module and the module-level stub shape_prop, and returns its result (None).
     return use_triton_lce_replace_simple_LCE_helper(graph.owning_module, shape_prop)
 
 
 def use_triton_lce_replace_normal_LCE_helper(gm, shape_prop):
+    # [FUNCTION DOC] HELPER: No-op placeholder taking a graph module and shape propagation callable; returns None.
     return None
 
 
 def use_triton_lce_replace_normal_LCE(graph):
+    # [FUNCTION DOC] HELPER: Pass wrapper for the normal-LCE replacement.
+    # KNOWN ISSUE: it calls the simple-LCE helper instead of the normal-LCE helper defined just above (likely copy-paste bug).
     return use_triton_lce_replace_simple_LCE_helper(graph.owning_module, shape_prop)
 
 
 def use_matmul_lce_replace_normal_LCE(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the use_matmul_lce_replace_normal_LCE pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 def use_matmul_fuse_lce_replace_first_LCE(graph):
+    # [FUNCTION DOC] HELPER: No-op placeholder for the use_matmul_fuse_lce_replace_first_LCE pass (real implementation exists only in internal builds); takes a graph, does nothing, returns None.
     return None
 
 
 @init_once_fakemode
 def lazy_init(input_device: torch.device | None = None):
+    # [FUNCTION DOC] Once-only (and fake-mode) lazy initialization: imports the modules that register pre-grad patterns
+    # (apply_gumbel_max_trick, efficient_conv_bn_eval, split_cat) and, in fbcode builds, the internal fb module.
+    # Takes an optional input device (unused). Side effect: pattern registration on import.
     from . import (  # noqa: F401  # noqa: F401
         apply_gumbel_max_trick,
         efficient_conv_bn_eval,
@@ -184,6 +216,8 @@ def lazy_init(input_device: torch.device | None = None):
 
 
 def _get_pass_name_func(p):
+    # [FUNCTION DOC] HELPER: Map a pass entry to a (name, callable) pair. For a PatternMatcherPass it uses the pass_name and its apply method;
+    # for a plain function it uses the function name with leading underscores stripped; otherwise returns (None, None).
     if isinstance(p, PatternMatcherPassBase):
         pass_name = p.pass_name
         pass_func = p.apply
@@ -203,10 +237,17 @@ def _run_pre_dispatch_passes(
     add_passes: str | None = None,
     remove_passes: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Run the predispatch-IR pre-grad pass pipeline in place on gm. Builds an ordered default pass list (normalization first,
+    # then fusions, concat/split/reshape cleanups) and an extended list of optional passes. add_passes and remove_passes are
+    # comma separated pass-name strings: default passes named in remove_passes are skipped, and optional passes named in add_passes
+    # are run. Each pass is executed via pass_execution_and_save. Finally remove_noop runs again unless removed, and shape
+    # propagation is run over gm using the fake mode detected from example_inputs. Returns None; mutates gm; logs the options.
     # Wrapper that resolves pre_grad_fusion_options by device before
     # calling group_batch_fusion_passes, so the predispatch path
     # gets the same device filtering as the non-predispatch path.
     def _group_batch_fusion_passes_wrapper(graph: torch.fx.Graph) -> None:
+        # [FUNCTION DOC] HELPER: Run group batch fusion on the graph with fusion options resolved by the example inputs' device types, so the predispatch
+        # path filters by device like the non-predispatch path. Returns None.
         group_batch_fusion_passes(
             graph,
             pre_grad=True,
@@ -303,6 +344,9 @@ def _resolve_pre_grad_fusion_options(
     fusion_options: dict[str, dict[str, object]],
     example_inputs: Sequence[object] | None,
 ) -> dict[str, dict[str, object]]:
+    # [FUNCTION DOC] Return a copy of the fusion options filtered by device. An option with a devices entry is kept only if one of the
+    # example input tensors has a device type listed; options without devices always pass. The devices key is stripped from
+    # every returned option. If example_inputs is None nothing is filtered (only devices keys are stripped). Does not mutate the input.
     """Filter pre_grad_fusion_options by device compatibility.
 
     If an option has a "devices" key, only include it when at least one
@@ -339,6 +383,13 @@ def pre_grad_passes(
     add_passes: str | None = None,
     remove_passes: str | None = None,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Entry point for pre-grad passes. Applies pattern matcher based passes to gm and returns the (possibly replaced) module.
+    # Only when config.pattern_matcher is set: lazily initializes patterns; optionally keeps a copy for a numeric check; runs the
+    # predispatch pipeline if config.is_predispatch, otherwise numpy-compat normalization, fuse_fx, device-filtered normalization,
+    # group/batch fusions, per-option pattern passes (repeated by the counter option, with a structured trace when counters change),
+    # conv/bn eval and gumbel max passes. Always afterwards runs the configured custom pre-grad passes, topologically sorts,
+    # lifts quantization ops, lints and recompiles gm, and optionally runs the numeric check comparing before and after.
+    # Raises an error if a counter option is not an integer. Side effects: mutates the graph, updates global counters, emits traces.
     """
     Apply passes on the input FX graph using Torch IR.
 
@@ -454,6 +505,10 @@ def pre_grad_passes(
 
 
 def fuse_fx(gm: torch.fx.GraphModule, example_inputs) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Apply inference-oriented module-level fusions. Sinks cat after pointwise ops; for non-CPU inputs with permute_fusion
+    # enabled, runs shape propagation and the linear/permute and matmul/permute fusions. Returns early if autograd is enabled or
+    # inputs are not on CPU; otherwise, when config.freezing is set, removes identity modules and fuses conv with batch norm.
+    # Returns the resulting graph module.
     is_cpu = is_cpu_device(example_inputs)
     # pyre-fixme[16]: Module `torch._dynamo.utils` has no attribute `detect_fake_mode`
     fake_mode = detect_fake_mode(example_inputs)
@@ -482,6 +537,8 @@ def fuse_fx(gm: torch.fx.GraphModule, example_inputs) -> torch.fx.GraphModule:
 
 
 def fetch_attr(target: str, mod):
+    # [FUNCTION DOC] HELPER: Resolve a dotted attribute path on mod and return the attribute. Raises RuntimeError naming the prefix path
+    # if any component does not exist.
     target_atoms = target.split(".")
     attr_itr = mod
     for i, atom in enumerate(target_atoms):
@@ -494,6 +551,8 @@ def fetch_attr(target: str, mod):
 
 
 def remove_identity(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Remove nn.Identity call_module nodes from gm by redirecting their users to the input and erasing the node.
+    # Raises an error if an identity node does not have exactly one argument. Lints and recompiles only if something changed. Returns gm.
     """
     Removes all identity layers from the module.
     """
@@ -517,6 +576,11 @@ def remove_identity(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Fuse convolution with batch norm for inference, in place on gm (inplace argument is unused). Pass 1 handles
+    # Conv1d/2d/3d followed by the matching BatchNorm module; pass 2 handles conv modules followed by functional batch_norm with
+    # constant get_attr stats (only 8 positional args, float eps, eval mode). Candidates are grouped by conv module name; a conv
+    # whose output has other users, in training mode, or shared across different batch norms is skipped/disabled. Fused conv is
+    # created via fuse_conv_bn_eval or by deep-copying the conv and fusing weights; the bn nodes are erased. Lints, recompiles, returns gm.
     """
     Fuses Convolution/BN layers for inference purposes.
     """
@@ -533,6 +597,9 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
     modules = dict(gm.named_modules())
 
     class ConvBNFusion:
+        # [CLASS DOC] HELPER: Record of one conv module that is candidate for folding with its batch norm node(s).
+        # Holds the list of bn nodes, the conv module, either a bn module or functional bn constants (mean, var, eps, weight, bias),
+        # and a fusion_enabled flag that starts True and is cleared when the conv is shared by different batch norms.
         def __init__(
             self,
             bn_node,
@@ -544,6 +611,7 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
             bn_weight=None,
             bn_bias=None,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Store the first bn node (as a one-item list), conv module, bn module or functional bn parameters; enable fusion.
             self.bn_nodes = [
                 bn_node,
             ]
@@ -557,12 +625,15 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
             self.fusion_enabled = True
 
         def add_bn_node(self, bn_node):
+            # [FUNCTION DOC] HELPER: Append another bn node that uses the same conv and same bn.
             self.bn_nodes.append(bn_node)
 
         def disable_fusion(self):
+            # [FUNCTION DOC] HELPER: Mark this conv/bn group as not fusable.
             self.fusion_enabled = False
 
         def is_fusion_enabled(self):
+            # [FUNCTION DOC] HELPER: Return True if fusion is still enabled for this group.
             return self.fusion_enabled
 
     conv_bn_to_fuse: dict[int, ConvBNFusion] = {}
@@ -622,6 +693,7 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                     continue
 
                 def _used_by_same_conv_module(users):
+                    # [FUNCTION DOC] HELPER: Given the users of a bn constant, return True if all users take the same conv module (same target of first arg) as the first user.
                     conv_module_name = users[0].args[0].target
                     return all(
                         conv_module_name == user.args[0].target for user in users
@@ -706,7 +778,10 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
 
 
 class NormalizedLinearNode:
+    # [CLASS DOC] HELPER: View over an FX call_function node targeting the functional linear op, providing accessors for
+    # input, weight and bias whether passed positionally or by keyword. Construction raises an error for other nodes.
     def __init__(self, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Validate that node is a call_function of the functional linear op (raises an error otherwise) and store it.
         if node.op != "call_function":
             raise AssertionError(f"expected call_function node, got {node.op}")
         if node.target is not torch.nn.functional.linear:
@@ -716,18 +791,21 @@ class NormalizedLinearNode:
         self.node: torch.fx.Node = node
 
     def get_input(self) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Return the input argument node (positional index 0 or keyword input).
         if len(self.node.args) > 0:
             return self.node.args[0]  # type: ignore[return-value]
         else:
             return self.node.kwargs["input"]  # type: ignore[return-value]
 
     def get_weight(self) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Return the weight argument node (positional index 1 or keyword weight).
         if len(self.node.args) > 1:
             return self.node.args[1]  # type: ignore[return-value]
         else:
             return self.node.kwargs["weight"]  # type: ignore[return-value]
 
     def get_bias(self) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Return the bias argument node (positional index 2 or keyword bias); None if absent.
         if len(self.node.args) > 2:
             return self.node.args[2]  # type: ignore[return-value]
         else:
@@ -735,7 +813,10 @@ class NormalizedLinearNode:
 
 
 class NormalizedMatmulNode:
+    # [CLASS DOC] HELPER: View over an FX call_function node targeting bmm or matmul, giving accessors for the two operands
+    # whether passed positionally or by keyword. Construction raises an error for other nodes.
     def __init__(self, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Validate that node is a call_function of bmm or matmul (raises an error otherwise) and store it.
         if node.op != "call_function":
             raise AssertionError(f"expected call_function node, got {node.op}")
         if node.target not in [torch.bmm, torch.matmul]:
@@ -745,12 +826,14 @@ class NormalizedMatmulNode:
         self.node: torch.fx.Node = node
 
     def get_input(self) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Return the first operand node (positional 0 or keyword input).
         if len(self.node.args) > 0:
             return self.node.args[0]  # type: ignore[return-value]
         else:
             return self.node.kwargs["input"]  # type: ignore[return-value]
 
     def get_other(self) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Return the second operand node (positional 1 or keyword other).
         if len(self.node.args) > 1:
             return self.node.args[1]  # type: ignore[return-value]
         else:
@@ -758,6 +841,8 @@ class NormalizedMatmulNode:
 
 
 def check_permute(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if node (a permute call with tensor_meta) swaps only the last two dimensions of its tensor and keeps
+    # all others, with at least 3 dims in the permutation; negative dims normalized by rank. Otherwise False.
     ranks = len(node.meta["tensor_meta"].shape)
     if len(node.args) > 3:
         permutation = [node.args[i] % ranks for i in range(1, ranks + 1)]  # type: ignore[operator]
@@ -776,14 +861,20 @@ def check_permute(node: torch.fx.Node) -> bool:
 
 
 def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Rewrite a cat whose sole consumer chain (through single-user view calls) ends in a unary relu/tanh by applying the
+    # pointwise op to each cat input and concatenating afterwards. Skips cats using the out argument or a None dim.
+    # Mutates the graph (creates and erases nodes), lints and recompiles, returns the module.
     def one_user(node):
+        # [FUNCTION DOC] HELPER: Return the single user of node, or None if the node does not have exactly one user.
         users = list(node.users)
         return users[0] if len(users) == 1 else None
 
     def is_view(node):
+        # [FUNCTION DOC] HELPER: Return True if node is a call_method named view.
         return node.op == "call_method" and node.target == "view"
 
     def is_pointwise_unary(node):
+        # [FUNCTION DOC] HELPER: Return True if node is a call to relu or tanh (function or method form).
         ops = "call_function", "call_method"
         pointwise = torch.relu, torch.tanh, "relu", "tanh"
         return node.op in ops and node.target in pointwise
@@ -810,6 +901,7 @@ def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModu
                     axis=arg_not_provided,
                     out=None,
                 ):
+                    # [FUNCTION DOC] HELPER: Normalize cat arguments: returns a tuple of tensors, dim (default 0, axis overrides) and out.
                     if dim is arg_not_provided:
                         dim = 0
                     if axis is not arg_not_provided:
@@ -839,6 +931,8 @@ def sink_cat_after_pointwise(module: torch.fx.GraphModule) -> torch.fx.GraphModu
 
 
 def linear_permute_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Fuse a linear op followed by a last-two-dims permute into a single call of linear_transpose. Erases the permute and
+    # the linear node if it has no other users. Lints and recompiles; returns the module.
     for node in module.graph.find_nodes(op="call_method", target="permute"):
         if check_permute(node):
             if len(node.args) > 0:
@@ -874,6 +968,7 @@ def linear_permute_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 def linear_transpose(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Compute the transpose of linear output directly: weight times transposed input, plus bias expanded on the last dim when bias is given. Returns a tensor.
     if bias is None:
         return torch.matmul(weight, input.transpose(-1, -2))
     return torch.matmul(weight, input.transpose(-1, -2)) + bias.unsqueeze(-1)
@@ -883,6 +978,8 @@ def permute_linear_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
     for node in module.graph.find_nodes(
         op="call_function", target=torch.nn.functional.linear
     ):
+    # [FUNCTION DOC] Fuse a last-two-dims permute feeding a linear op into transpose_linear, erasing the replaced nodes when unused.
+    # Lints and recompiles; returns the module.
         if len(node.args) > 0:
             input_node = node.args[0]
         else:
@@ -914,6 +1011,8 @@ def permute_linear_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 def permute_matmul_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Fuse permute (last two dims) operands of bmm/matmul nodes into a single transpose_matmul call with flags telling which
+    # operand is transposed. Erases replaced nodes that become unused. Lints and recompiles; returns the module.
     for node in itertools.chain(
         module.graph.find_nodes(op="call_function", target=torch.bmm),
         module.graph.find_nodes(op="call_function", target=torch.matmul),
@@ -971,6 +1070,7 @@ def permute_matmul_fusion(module: torch.fx.GraphModule) -> torch.fx.GraphModule:
 def transpose_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Compute linear on an input given in permuted layout: matmul of the transposed input with the transposed weight, plus bias if provided. Returns a tensor.
     if bias is None:
         return torch.matmul(input.transpose(-1, -2), weight.t())
     return torch.matmul(input.transpose(-1, -2), weight.t()) + bias
@@ -979,6 +1079,7 @@ def transpose_linear(
 def transpose_matmul(
     A: torch.Tensor, B: torch.Tensor, Atrans: bool, Btrans: bool
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Matrix multiply A and B after optionally transposing the last two dims of A (Atrans) and/or B (Btrans). Returns a tensor.
     if Atrans:
         A = A.transpose(-1, -2)
     if Btrans:

@@ -1,5 +1,13 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Post-grad FX graph passes for Inductor, run on the normalized, functionalized ATen graph after autograd.
+# Main entry is post_grad_passes (reorder for locality, custom passes, pattern matcher passes, collective bucketing,
+# overlap scheduling, reinplacing, decomposition of functional HOPs). Also defines: no-op op removal via a registry of
+# decompositions, lowering/graph patterns (mm+mm, cumsum of full, cat/slice folds, split/cat elimination, addmm and baddbmm
+# unfusing, addcdiv FMA, rsqrt, partial reduction reuse, addmm fusion), scan/map to while_loop decomposition, auto_functionalized
+# decomposition, and a pass moving cpu constructors to the GPU.
+# Import-time side effects: creates three ordered PatternMatcherPass objects (pass_patterns), registers all decorated patterns
+# into them, fills noop_registry, and calls register_partial_reduction_pattern to register reduction reuse patterns.
 import functools
 import itertools
 import logging
@@ -91,6 +99,8 @@ pass_patterns = [
 
 
 def _remove_profiler_ops(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] HELPER: Erase profiler record_function enter/exit nodes from graph (they are side-effectful but irrelevant to computation and would
+    # block fusion). Mutates the graph in place; returns None.
     """
     Remove profiler ops (record_function) from the graph.
     These ops are side-effectful but don't affect computation,
@@ -115,6 +125,7 @@ def _remove_profiler_ops(graph: torch.fx.Graph) -> None:
 
 
 def _is_nondeterministic_seeded_node(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if node is a call_function on an OpOverload tagged nondeterministic_seeded (random ops).
     return (
         node.op == "call_function"
         and isinstance(node.target, torch._ops.OpOverload)
@@ -123,6 +134,8 @@ def _is_nondeterministic_seeded_node(node: torch.fx.Node) -> bool:
 
 
 def _chain_random_ops_for_ordering(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] HELPER: When config.fallback_random is set and there are at least two random ops, chain each random node to the previous one
+    # by adding control dependencies (preserve_node_ordering) so program order is kept for the global RNG. Otherwise a no-op. Mutates the graph.
     """Chain nondeterministic_seeded ops with control_deps to preserve program order.
 
     When fallback_random=True, random ops use the global CUDA RNG and must
@@ -143,6 +156,9 @@ def _chain_random_ops_for_ordering(graph: torch.fx.Graph) -> None:
 
 
 def respecialize_current_device_nodes(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] [device-as-parameter] Replace every use of the coor current_device node with the concrete current device value in its
+    # users' args and kwargs, then erase the node, because Inductor has no device-valued IR. Does nothing if no such node exists.
+    # Imports the core fx helper lazily; mutates the graph; returns None.
     """[device-as-parameter] Re-specialize CooR _coor_current_device() device nodes.
 
     Under compile-on-one-rank, make_fx rewrites a baked accelerator device operand to a
@@ -175,6 +191,14 @@ def respecialize_current_device_nodes(graph: torch.fx.Graph) -> None:
 
 
 def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
+    # [FUNCTION DOC] Main post-grad pipeline, called once for forward and once for backward graphs on gm, in place; returns None.
+    # Order: dead code elimination and locality reordering (config dependent), custom pre passes, mkldnn grouped gemm/concat linear,
+    # profiler op removal, device node respecialization, pattern matcher passes (group/batch fusion, noop and assert removal,
+    # three pass_patterns, fusion options, b2b gemm), micro pipeline TP and DDP fusion, custom post passes, random op chaining,
+    # stable sort, moving constructors to GPU, fake tensor update, custom backend passes, SPMD check, distributed comm
+    # bucketing/overlap/low contention passes, then reinplacing and decomposition of functional/scan/map HOPs, recompile and lint.
+    # is_inference selects locality reordering and is forwarded to inference-aware custom passes.
+    # KNOWN ISSUE: the group_batch_fusion pass is observed under the name post_grad_custom_pre_pass (apparent mislabel).
     """
     Passes that run on after grad.  This is called once on the forwards
     graph and once on the backwards graph.
@@ -488,6 +512,7 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
 
 
 def prepare_softmax_pattern(x, dim):
+    # [FUNCTION DOC] HELPER: Softmax pattern: given x and dim, returns max, sum of exp, shifted x and its exp (used as the match pattern).
     xmax = x.amax(dim=dim, keepdim=True)
     xsub = x - xmax
     xexp = xsub.exp()
@@ -496,6 +521,8 @@ def prepare_softmax_pattern(x, dim):
 
 
 def prepare_softmax_replacement(x, dim):
+    # [FUNCTION DOC] HELPER: Replacement for the softmax pattern using the online softmax prim to produce max and sum; returns the same four values
+    # (max, sum, x minus max, its exp), keeping the intermediates so log-softmax can still match.
     """
     Return xsub since otherwise log-softmax can not be matched
     due to a use of this intermediate node. Same reason to return
@@ -509,6 +536,8 @@ def prepare_softmax_replacement(x, dim):
 
 
 def prepare_softmax_extra_check(match):
+    # [FUNCTION DOC] HELPER: Extra check for the online softmax replacement: true only if config.online_softmax is set, the input device is cuda or xpu,
+    # and the configured backend for that device type is triton.
     """
     We only have triton online softmax kernels currently.
     """
@@ -521,6 +550,9 @@ def prepare_softmax_extra_check(match):
 
 
 def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] Rewrite every higher-order map_impl node in gm into a while_loop HOP that pre-allocates output buffers and copies
+    # each iteration's result into a slice. Uses a local pattern matcher pass; raises an error if any map node remains.
+    # Mutates gm's graph; returns None.
     """This is similar to decompose_scan_to_while_loop."""
     graph_pass = PatternMatcherPass()
 
@@ -530,6 +562,8 @@ def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
         pass_dict=graph_pass,
     )
     def _(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pattern handler for a map_impl match: requires no kwargs (raises otherwise), builds a traced replacement function
+        # implementing the while_loop lowering, and substitutes it for the matched node via replace_by_example.
         if len(kwargs) != 0:
             raise AssertionError(
                 "kwargs of map are not merged into args before entering decompose_map_to_while_loop_pass"
@@ -540,6 +574,9 @@ def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
         mapped_outputs = cur_node.meta["val"]
 
         def lower_to_while_loop(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Traced replacement body: unflattens operands, builds a loop index and empty strided output buffers (shapes resolved
+            # from bound symbolic ints), then calls while_loop with a condition on the index and a body selecting each slice, running the
+            # sub graph and copying outputs into the buffers. Returns a one-element tuple with the final outputs. Raises on kwargs.
             if len(kwargs) != 0:
                 raise AssertionError(f"expected no kwargs, got {kwargs}")
             xs, additional_inputs = pytree.tree_unflatten(args, tree_spec)
@@ -579,6 +616,7 @@ def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
             )
 
             def cond_fn(*flat_args):
+                # [FUNCTION DOC] HELPER: while_loop condition: true while the loop index is below map_length.
                 loop_idx, _, _, _ = pytree.tree_unflatten(
                     flat_args,
                     operands_and_additional_inputs_spec,
@@ -586,6 +624,8 @@ def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
                 return loop_idx < map_length
 
             def body_fn(*flat_args):
+                # [FUNCTION DOC] HELPER: while_loop body: asserts the index range, selects the slice of each input, runs the mapped subgraph, copies outputs into
+                # the buffers, and returns the incremented index with buffers and inputs.
                 loop_idx, out_bufs, xs, additional_inputs = pytree.tree_unflatten(
                     flat_args,
                     operands_and_additional_inputs_spec,
@@ -631,6 +671,9 @@ def decompose_map_to_while_loop(gm: torch.fx.GraphModule):
 def resolve_shape_to_proxy(
     shape: list[int | torch.SymInt], bound_symbols: dict[Any, Any]
 ):
+    # [FUNCTION DOC] Given a list of ints/SymInts and a mapping from symbols to traced values, return a list in which each symbolic dim is
+    # re-expressed as an expression over the mapped values (via sympy interpretation) and plain ints are kept. Raises an error
+    # if an element is neither SymInt nor int. Used so tracing produces graph nodes for shape computation.
     """
     Given a list of symints/ints, this function returns a calculated expression of bound_symbols' values.
     When we trace this function, we'll get a graph with call_function nodes that describes how the shape expr is
@@ -660,6 +703,9 @@ def resolve_shape_to_proxy(
 
 
 def decompose_scan_to_while_loop(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] Rewrite every higher-order scan node in gm into a while_loop HOP with a pre-allocated output buffer for the stacked ys
+    # (see the NOTE in the docstring for the transformation). Uses a local pattern matcher pass and raises an error if
+    # any scan node remains. Mutates gm's graph; returns None.
     """
     NOTE [decompose scan to while_loop]
     This pass decomposes `scan` to  `while_loop` by replacing the scan fx_node with a while_loop hop.
@@ -723,6 +769,8 @@ def decompose_scan_to_while_loop(gm: torch.fx.GraphModule):
         pass_dict=graph_pass,
     )
     def _(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pattern handler for a scan match: requires no kwargs and a get_attr combine subgraph (raises otherwise), extracts expected
+        # ys output metadata, and substitutes a traced while_loop implementation via replace_by_example without functional passes.
         from torch._higher_order_ops.scan import _extract_carry_and_out
 
         if len(kwargs) != 0:
@@ -739,6 +787,8 @@ def decompose_scan_to_while_loop(gm: torch.fx.GraphModule):
         _, ys_outputs = _extract_carry_and_out(cur_node.meta["val"], num_init_leaves)
 
         def lower_to_while_loop(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Traced replacement body for scan. Handles zero-length scans by returning init plus empty ys; otherwise builds loop index
+            # and pre-allocated ys buffers, then calls while_loop with cond/body functions. Returns the final carry followed by ys. Raises on kwargs.
             """
             The traced graph of this function will be used to replace the original scan fx_node.
             """
@@ -798,12 +848,15 @@ def decompose_scan_to_while_loop(gm: torch.fx.GraphModule):
 
             # Step 2: create the cond_fn and body_fn for while_loop
             def cond_fn(*flat_args):
+                # [FUNCTION DOC] HELPER: while_loop condition: true while the loop index is below scan_length.
                 loop_idx, _, _, _, _ = pytree.tree_unflatten(
                     flat_args, operands_and_additional_inputs_spec
                 )  # type: ignore[has-type]
                 return loop_idx < scan_length  # type: ignore[has-type]
 
             def body_fn(*flat_args):
+                # [FUNCTION DOC] HELPER: while_loop body: asserts index range, selects per-step xs, runs the combine subgraph, copies each y into its buffer
+                # slice, and returns the incremented index, buffers, next carry and xs.
                 loop_idx, ys_outs, carry, xs, additional_inputs = pytree.tree_unflatten(
                     flat_args,
                     operands_and_additional_inputs_spec,  # type: ignore[has-type]
@@ -857,6 +910,9 @@ def decompose_scan_to_while_loop(gm: torch.fx.GraphModule):
 
 @init_once_fakemode
 def lazy_init(input_device: torch.device | None = None):
+    # [FUNCTION DOC] Once-only (fake-mode) initialization of post-grad patterns: with mkldnn, imports mem-bound mm decomposition and runs mkldnn
+    # fusion init; otherwise registers weight-only-quant lowerings. Also registers the prepare-softmax replacement into pass_patterns[1].
+    # Takes an unused optional device. Side effects: pattern registration.
     if torch._C._has_mkldnn:
         from . import decompose_mem_bound_mm  # noqa: F401
         from .mkldnn_fusion import _mkldnn_fusion_init
@@ -886,9 +942,13 @@ def lazy_init(input_device: torch.device | None = None):
 
 
 def reorder_for_locality(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Reorder nodes to improve locality: walking the graph backward, move each producer right before its consumer when all of the
+    # producer's users were already seen, it is in the same mutation region, and it is not a getitem. Skips random-state ops and wait nodes
+    # when distributed is available. Only nodes before the first copy_ are touched. Mutates the graph; returns None.
     if torch.distributed.is_available():
 
         def check():
+        # [FUNCTION DOC] HELPER: Distributed-available variant: True unless the current node (from the enclosing loop) is a wait_tensor node.
             # This is a wait node, and `other_node`` is some collective node.
             # Eager semantics allow waits to be issued in a different order than
             # the collectives. Reordering this wait node might reorder collectives
@@ -899,9 +959,11 @@ def reorder_for_locality(graph: torch.fx.Graph):
     else:
 
         def check():
+        # [FUNCTION DOC] HELPER: Non-distributed variant: always True.
             return True
 
     def consumes_rng_state(node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if node is a random op tagged nondeterministic_seeded.
         return (
             node.op == "call_function"
             and isinstance(node.target, torch._ops.OpOverload)
@@ -909,6 +971,7 @@ def reorder_for_locality(graph: torch.fx.Graph):
         )
 
     def visit(other_node):
+        # [FUNCTION DOC] HELPER: Callback for each input of the current node: prepends the producer before the node if it passes the checks above.
         if (
             other_node.op == "call_function"
             and other_node.target != operator.getitem
@@ -954,6 +1017,8 @@ def register_lowering_pattern(
     output_metadata_is_input: int | str | None = None,
     output_metadata_fn: Callable[..., Any] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Register an aten to Inductor IR replacement pattern in the pass_patterns entry selected by pass_number (default 1).
+    # Forwards extra_check and output metadata options to pattern_matcher.register_lowering_pattern; returns the decorator.
     """
     Register an aten to inductor IR replacement pattern
     """
@@ -977,6 +1042,8 @@ def register_lowering_pattern(
 
 
 def is_valid_mm_plus_mm(match: Match):
+    # [FUNCTION DOC] HELPER: Extra check for the mm plus mm pattern: requires max autotune, all four operands to have known shapes, matching inner
+    # dims for each matmul, and equal output shapes for both; otherwise False.
     if not (config.max_autotune or config.max_autotune_gemm):
         return False
 
@@ -1014,6 +1081,7 @@ def is_valid_mm_plus_mm(match: Match):
     extra_check=is_valid_mm_plus_mm,
 )
 def mm_plus_mm(match: Match, mat1, mat2, mat3, mat4):
+    # [FUNCTION DOC] Lowering for add of two mm results: calls the tuned mm_plus_mm kernel on the four matrices and returns its IR.
     return inductor.kernel.mm_plus_mm.tuned_mm_plus_mm(mat1, mat2, mat3, mat4)
 
 
@@ -1037,6 +1105,9 @@ def mm_plus_mm(match: Match, mat1, mat2, mat3, mat4):
     pass_dict=pass_patterns[1],
 )
 def pointless_cumsum_replacement(match: Match, shape, fill_value, device, dtype, dim):
+    # [FUNCTION DOC] Replace cumsum of a constant full tensor with an arithmetic sequence computed directly (arange times fill value,
+    # reshaped and expanded), accounting for integral/bool promotion. Only the output node is replaced.
+    # Registered in pass_patterns[1]. Returns None.
     """Based on a pattern in OPTForCausalLM"""
 
     if is_integer_dtype(dtype) or is_boolean_dtype(dtype):
@@ -1054,6 +1125,7 @@ def pointless_cumsum_replacement(match: Match, shape, fill_value, device, dtype,
     acc_dtype = torch.int64 if integral_out else torch.float64
 
     def repl(*shape):
+        # [FUNCTION DOC] HELPER: Traced replacement producing the cumulative values along dim by scaling an arange and expanding to the full shape.
         dim_size = shape[dim]
         idx = torch.arange(1, dim_size + 1, device=device, dtype=acc_dtype)
 
@@ -1087,6 +1159,9 @@ _cat_1 = CallFunction(aten.cat, Arg(), 1, _users=2)
     )
 )
 def cat_slice_cat(match, cat_input, size, dim=1):
+    # [FUNCTION DOC] Lowering for a cat whose operand is another multi-use cat sliced and concatenated again; folds into a single cat with
+    # an extra slice of the first input when the slice size is non-negative and statically within bounds; otherwise falls back to
+    # building two cats. Returns lowered IR.
     """
     This is an example of a more complex pattern where cat_1 is used
     multiple times inside the pattern.  We fold 2 calls to cat into one.
@@ -1129,6 +1204,8 @@ def cat_slice_cat(match, cat_input, size, dim=1):
 
 
 def is_valid_splitwithsizes_cat(match):
+    # [FUNCTION DOC] HELPER: Extra check for split_with_sizes followed by cat: exactly one split and one cat, same dim, every split piece used once,
+    # and cat inputs in the original order, so the pair is an identity. Raises an error if a getitem lacks an index.
     split_nodes = filter_nodes(match.nodes, aten.split_with_sizes)
     cat_nodes = filter_nodes(match.nodes, aten.cat)
     get_item_nodes = filter_nodes(match.nodes, operator.getitem)
@@ -1160,6 +1237,8 @@ def is_valid_splitwithsizes_cat(match):
 
 
 def same_meta(node1: torch.fx.Node, node2: torch.fx.Node):
+    # [FUNCTION DOC] Return True if both nodes have tensor values with identical size, layout, dtype, device, stride (when strided), and
+    # conjugate/negative bits; shape comparisons use static truthiness for symbolic dims.
     """True if two nodes have the same metadata"""
     val1 = node1.meta.get("val")
     val2 = node2.meta.get("val")
@@ -1186,7 +1265,10 @@ noop_registry: dict[Any, Any] = {}
 
 
 def register_noop_decomp(targets, nop_arg=0):
+    # [FUNCTION DOC] Decorator factory registering a no-op condition function for the given target ops in noop_registry, with nop_arg giving
+    # either the positional index of the input that is returned, or a callable extracting it from the args.
     def register_fun(cond):
+        # [FUNCTION DOC] HELPER: Registers the condition function into the registry and returns it unchanged.
         register_decomposition(targets, registry=noop_registry, unsafe=True)(
             (cond, nop_arg)  # type: ignore[arg-type]
         )
@@ -1196,6 +1278,7 @@ def register_noop_decomp(targets, nop_arg=0):
 
 
 def _needs_spmd_graph_preservation() -> bool:
+    # [FUNCTION DOC] HELPER: True if config enables overlap scheduling or compute/comm overlap reordering, in which cases no-op ops are preserved so ranks keep identical graphs.
     """Check if SPMD graph preservation is needed for distributed overlap."""
     return (
         config.aten_distributed_optimizations.enable_overlap_scheduling
@@ -1205,6 +1288,7 @@ def _needs_spmd_graph_preservation() -> bool:
 
 @register_noop_decomp(aten.slice)
 def slice_noop(self, dim=0, start=None, end=None, step=1):
+    # [FUNCTION DOC] No-op condition for slice: true when start is 0, end covers the whole dim, and step is 1 (statically known). False when SPMD preservation is needed or start/end is None.
     if _needs_spmd_graph_preservation():
         # Keep no-op slices so all ranks produce identical FX graphs (SPMD)
         # with matching op counts and runtime estimations.
@@ -1227,6 +1311,7 @@ def slice_noop(self, dim=0, start=None, end=None, step=1):
 
 @register_noop_decomp(aten.slice_scatter, 1)
 def slice_scatter_noop(self, src, dim=0, start=None, end=None, step=1):
+    # [FUNCTION DOC] No-op condition for slice_scatter: true when self and src shapes match, start is 0, end covers the dim, and step is 1.
     if start is None:
         start = 0
     if end is None:
@@ -1247,11 +1332,13 @@ def slice_scatter_noop(self, src, dim=0, start=None, end=None, step=1):
 
 @register_noop_decomp(aten.repeat)
 def repeat_noop(self, repeats):
+    # [FUNCTION DOC] No-op condition for repeat: true if every repeat count is 1.
     return all(r == 1 for r in repeats)
 
 
 @register_noop_decomp(aten.constant_pad_nd)
 def constant_pad_nd(x, padding, fill_value=0):
+    # [FUNCTION DOC] No-op condition for constant_pad_nd: true if all padding values are 0, unless SPMD preservation is needed.
     if _needs_spmd_graph_preservation():
         # Keep no-op pads so all ranks produce identical FX graphs (SPMD)
         # with matching op counts and runtime estimations.
@@ -1261,36 +1348,43 @@ def constant_pad_nd(x, padding, fill_value=0):
 
 @register_noop_decomp(torch.ops.prims.convert_element_type)
 def convert_element_type_noop(x, dtype: torch.dtype):
+    # [FUNCTION DOC] No-op condition for convert_element_type: true if the input already has the target dtype.
     return x.dtype == dtype
 
 
 @register_noop_decomp(torch.ops.prims.device_put)
 def device_put_noop(x, device, non_blocking=True):
+    # [FUNCTION DOC] No-op condition for device_put: true if the input is already on the decoded target device.
     return x.device == decode_device(device)
 
 
 @register_noop_decomp([aten.ceil, aten.floor, aten.round, aten.trunc])
 def int_noop(x):
+    # [FUNCTION DOC] No-op condition for ceil/floor/round/trunc: true if the input has an integer dtype.
     return is_integer_dtype(x.dtype)
 
 
 @register_noop_decomp([aten.pow])
 def pow_noop(a, b):
+    # [FUNCTION DOC] No-op condition for pow: true if the exponent is the integer 1.
     return isinstance(b, int) and b == 1
 
 
 @register_noop_decomp([aten.cat], lambda args: args[0][0])
 def cat_noop(inputs, dim=0):
+    # [FUNCTION DOC] No-op condition for cat: true if there is a single input tensor.
     return len(inputs) == 1
 
 
 @register_noop_decomp(aten.view.default)
 def view_default_noop(arg, size):
+    # [FUNCTION DOC] No-op condition for view: true if the requested size statically equals the input shape.
     return statically_known_true(sym_eq(arg.shape, tuple(size)))
 
 
 @register_noop_decomp(aten.view.dtype)
 def view_dtype_noop(arg, dtype):
+    # [FUNCTION DOC] No-op condition for view with dtype: true if the dtype is unchanged.
     return arg.dtype == dtype
 
 
@@ -1299,10 +1393,14 @@ def view_dtype_noop(arg, dtype):
 @register_noop_decomp([aten.copy], nop_arg=1)
 @register_noop_decomp([aten.alias, aten.clone])
 def true_noop(*args, **kwargs):
+    # [FUNCTION DOC] Unconditional no-op condition for copy, alias and clone (safety relies on the separate identical-metadata check).
     return True
 
 
 def remove_noop_ops(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Remove nodes whose op is registered as a no-op (clone, alias, identity-like views and so on) by replacing uses with the source
+    # node, if metadata matches (same_meta) and the registered condition holds. Skips cases that would create new aliasing between
+    # inputs and outputs, pinned-memory copies, and non-node sources. Mutates the graph; returns None. Raises if the last node is not output.
     """
     Removes both operations that are essentially aten.clone and operations that are essentially aten.alias from the graph.
     """
@@ -1375,6 +1473,7 @@ def remove_noop_ops(graph: torch.fx.Graph):
 
 
 def remove_assert_ops(graph: torch.fx.Graph):
+    # [FUNCTION DOC] Erase _assert_tensor_metadata nodes (lowered to no-ops anyway) so they do not block fusion decisions. Mutates the graph.
     """
     Removes aten._assert_tensor_metadata.default op because
     1) it will be lowered to a no-op in inductor
@@ -1403,6 +1502,8 @@ def remove_assert_ops(graph: torch.fx.Graph):
 
 
 def apply_pass_to_subgraphs(pass_fn: Callable[[fx.Graph], None], graph: fx.Graph):
+    # [FUNCTION DOC] Apply pass_fn to the graph of every child GraphModule referenced by a get_attr node in graph. Not recursive by itself
+    # (the docstring says recursively; recursion comes from the pass_fn). Does nothing if the graph has no owning module.
     """Recursively apply a pass function to all subgraphs referenced by get_attr nodes."""
     gm = graph.owning_module
     if gm is None:
@@ -1418,6 +1519,8 @@ def apply_pass_to_subgraphs(pass_fn: Callable[[fx.Graph], None], graph: fx.Graph
 def apply_pass_to_control_deps_subgraphs(
     pass_fn: Callable[[fx.Graph], None], graph: fx.Graph
 ):
+    # [FUNCTION DOC] Apply pass_fn to the subgraph of each control_deps call node (the get_attr graph module in its second argument).
+    # Does nothing without an owning module; skips malformed nodes.
     """Recursively apply a pass function to subgraphs referenced by control_deps."""
     gm = graph.owning_module
     if gm is None:
@@ -1441,6 +1544,7 @@ def apply_pass_to_control_deps_subgraphs(
 def _get_single_replacement_node(
     replacement_nodes: Sequence[torch.fx.Node], target: torch.fx.node.Target
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: Return the single call_function node in the list whose target is the given target; raises an error if there is not exactly one.
     nodes = [
         node
         for node in replacement_nodes
@@ -1455,6 +1559,8 @@ def _propagate_triton_eager_input_vals(
     replacement_nodes: Sequence[torch.fx.Node],
     hop_node: torch.fx.Node,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Copy eager input value metadata from the original functional triton HOP node to the mutation HOP node in the replacement,
+    # minus the tensors_to_clone entry. No-op if the original has no such metadata.
     eager_input_vals = hop_node.meta.get("eager_input_vals")
     if eager_input_vals is None:
         return
@@ -1472,6 +1578,8 @@ def _propagate_triton_eager_input_vals(
 
 
 def decompose_triton_kernel_wrapper_functional(graph):
+    # [FUNCTION DOC] Decompose triton_kernel_wrapper_functional nodes into clones plus the mutation HOP, recursing into subgraphs first;
+    # assumes reinplacing already marked what to clone. Propagates eager input metadata; raises if any functional node remains.
     """Decomposes triton_kernel_wrapper_functional nodes into clones and the underlying
     mutation node.
 
@@ -1490,6 +1598,8 @@ def decompose_triton_kernel_wrapper_functional(graph):
         pass_dict=graph_pass,
     )
     def _(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pattern handler: flattens args and kwargs, replaces the node by the dense decomposition traced via replace_by_example,
+        # then propagates eager input values to the new mutation node.
         from torch._higher_order_ops.triton_kernel_wrap import (
             triton_kernel_wrapper_functional_dense,
         )
@@ -1501,6 +1611,7 @@ def decompose_triton_kernel_wrapper_functional(graph):
         # This is replace_by_example uses make_fx which does not support
         # tracing a function with kwargs.
         def decomp(*flat_args):
+            # [FUNCTION DOC] HELPER: Traced decomposition: unflattens args and kwargs and returns a one-element tuple with the dense functional wrapper result.
             args, kwargs = pytree.tree_unflatten(flat_args, spec)
             return (triton_kernel_wrapper_functional_dense(*args, **kwargs),)
 
@@ -1520,6 +1631,8 @@ def decompose_triton_kernel_wrapper_functional(graph):
 
 
 def fix_auto_functionalized_dtype_views(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] For auto_functionalized_v2 nodes, drop from the only_clone_these_tensors metadata those bases that are dtype views of a graph
+    # input's storage (the view can be regenerated); keeps others. Increments an inductor counter per dropped entry. Mutates node metadata.
     """
     Fix aliasing detection for dtype views in auto_functionalized_v2.
 
@@ -1567,6 +1680,9 @@ def fix_auto_functionalized_dtype_views(graph: torch.fx.Graph) -> None:
 
 
 def decompose_auto_functionalized(graph):
+    # [FUNCTION DOC] Decompose auto_functionalized and auto_functionalized_v2 nodes into clones plus the mutating op, using only_clone_these_tensors
+    # metadata, after recursing into control_deps subgraphs. Afterwards removes unused get_attr nodes and the GraphModule attributes
+    # they referenced (unless still used elsewhere), lints, and raises an error if any such node remains. Mutates graph and module.
     """Decomposes auto_functionalized nodes into clones and the underlying
     mutation node.
 
@@ -1584,6 +1700,7 @@ def decompose_auto_functionalized(graph):
         pass_dict=graph_pass,
     )
     def _(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pattern handler for auto_functionalized: flattens args, and replaces the node with the dense implementation traced via replace_by_example.
         from torch._higher_order_ops.auto_functionalize import auto_functionalized_dense
 
         only_clone_these_tensors = match.nodes[0].meta.get("only_clone_these_tensors")
@@ -1596,6 +1713,7 @@ def decompose_auto_functionalized(graph):
         # This is replace_by_example uses make_fx which does not support
         # tracing a function with kwargs.
         def decomp(*flat_args):
+            # [FUNCTION DOC] HELPER: Traced decomposition: unflattens args (exactly one positional, the mode, else raises) and calls the dense auto_functionalized.
             args, kwargs = pytree.tree_unflatten(flat_args, spec)
             if len(args) != 1:
                 raise AssertionError(f"expected 1 arg, got {len(args)}")
@@ -1611,6 +1729,7 @@ def decompose_auto_functionalized(graph):
         pass_dict=graph_pass,
     )
     def _(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Pattern handler for auto_functionalized_v2: resolves constant get_attr args, flattens args, and replaces the node with the dense v2 implementation.
         from torch._higher_order_ops.auto_functionalize import (
             auto_functionalized_v2_dense,
         )
@@ -1622,6 +1741,7 @@ def decompose_auto_functionalized(graph):
         flat_args, spec = pytree.tree_flatten((args, kwargs))
 
         def _maybe_resolve_constant_get_attr(node):
+            # [FUNCTION DOC] HELPER: Resolve a get_attr node lacking value metadata to its GraphModule or TreeSpec attribute (raises otherwise); other values pass through.
             # Resolve getattr node to its value because they don't always have meta["val"]
             if (
                 isinstance(node, torch.fx.Node)
@@ -1640,6 +1760,7 @@ def decompose_auto_functionalized(graph):
         # This is replace_by_example uses make_fx which does not support
         # tracing a function with kwargs.
         def decomp(*flat_args):
+            # [FUNCTION DOC] HELPER: Traced decomposition: unflattens args (exactly one positional, the mutable op, else raises) and calls the dense v2 implementation.
             args, kwargs = pytree.tree_unflatten(flat_args, spec)
             if len(args) != 1:
                 raise AssertionError(f"expected 1 arg, got {len(args)}")
@@ -1729,10 +1850,13 @@ def decompose_auto_functionalized(graph):
     output_metadata_is_input="input_",
 )
 def splitwithsizes_cat_replace(match, input_):
+    # [FUNCTION DOC] Lowering for cat of all getitem outputs of a split_with_sizes in order: returns the original input unchanged (identity).
     return input_
 
 
 def is_valid_cat_splitwithsizes(match):
+    # [FUNCTION DOC] HELPER: Extra check for cat followed by split_with_sizes: single cat with no other users, same dim, number of cat inputs equals the
+    # number of split sizes, and each input's size along dim equals the corresponding split size.
     cat_nodes = filter_nodes(match.nodes, aten.cat)
     split_nodes = filter_nodes(match.nodes, aten.split_with_sizes)
     if len(split_nodes) != 1 or len(cat_nodes) != 1:
@@ -1784,6 +1908,7 @@ def is_valid_cat_splitwithsizes(match):
     output_metadata_is_input="input_",
 )
 def cat_splitwithsizes_replace(match, input_):
+    # [FUNCTION DOC] Lowering for split_with_sizes of a cat with matching sizes: returns the cat input unchanged.
     return input_
 
 
@@ -1798,26 +1923,31 @@ def cat_splitwithsizes_replace(match, input_):
     pass_dict=pass_patterns[1],
 )
 def reciprocal_sqrt_to_rsqrt(match: Match, x):
+    # [FUNCTION DOC] Replace reciprocal of sqrt with rsqrt (pass_patterns[1]); mutates the graph via replace_by_example.
     """reciprocal(sqrt(x)) -> rsqrt(x)"""
 
     def repl(x):
+        # [FUNCTION DOC] HELPER: Traced replacement computing rsqrt.
         return aten.rsqrt(x)
 
     match.replace_by_example(repl, [x])
 
 
 def view_to_reshape(gm):
+    # [FUNCTION DOC] Convert aten.view calls into aten.reshape in gm's graph and, recursively, all subgraphs. Mutates targets in place.
     """
     Replace view ops in the GraphModule to reshape ops.
     """
 
     def _view_to_reshape_graph(graph):
+        # [FUNCTION DOC] HELPER: Retarget all view nodes in a single graph to reshape.
         for nd in graph.find_nodes(
             op="call_function", target=torch.ops.aten.view.default
         ):
             nd.target = torch.ops.aten.reshape.default
 
     def _recursive_view_to_reshape(graph):
+        # [FUNCTION DOC] HELPER: Apply the view-to-reshape conversion to subgraphs first, then to the given graph.
         apply_pass_to_subgraphs(_recursive_view_to_reshape, graph)
         _view_to_reshape_graph(graph)
 
@@ -1825,6 +1955,8 @@ def view_to_reshape(gm):
 
 
 def _is_bias_like_addmm_input(inp: torch.fx.Node, output: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether an addmm input looks like a broadcast bias: true for placeholders/get_attr, rank mismatch, a size-1 dim
+    # broadcast against a larger output dim, or a strided tensor with a zero stride; false if values are missing or shapes are fully equal.
     if inp.op in ("placeholder", "get_attr"):
         return True
 
@@ -1851,6 +1983,8 @@ def _is_bias_like_addmm_input(inp: torch.fx.Node, output: torch.fx.Node) -> bool
 
 
 def should_prefer_unfused_addmm(match):
+    # [FUNCTION DOC] Extra check: prefer splitting addmm into mm plus pointwise add. True only on GPU, when not marked to preserve flex gemm,
+    # dtypes and devices of all three operands agree, expandability holds for beta 0 on non-cuda, the input is bias-like, and every user of the output is pointwise.
     inp = match.kwargs["inp"]
     if not is_gpu(inp.meta["val"].device.type):
         return False
@@ -1877,6 +2011,7 @@ def should_prefer_unfused_addmm(match):
 
 
 def should_prefer_unfused_baddbmm(match):
+    # [FUNCTION DOC] Extra check: same idea for baddbmm: true on GPU when not flex-gemm preserved, input bias-like, and all output users pointwise.
     inp = match.kwargs["inp"]
     if not is_gpu(inp.meta["val"].device.type):
         return False
@@ -1903,6 +2038,9 @@ def should_prefer_unfused_baddbmm(match):
     extra_check=should_prefer_unfused_addmm,
 )
 def unfuse_bias_add_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, beta):
+    # [FUNCTION DOC] Replace addmm with a matmul plus pointwise bias add (scaling by alpha and beta), registered in pass_patterns[2].
+    # With half-dtype keep-fused config it only proceeds on xpu with a narrowing cast input. On cuda a zero beta drops the input.
+    # Returns None; mutates the graph.
     if config.keep_addmm_fused_for_half_dtypes and inp.meta["val"].dtype in (
         torch.bfloat16,
         torch.float16,
@@ -1924,6 +2062,7 @@ def unfuse_bias_add_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, beta):
     drop_input_for_beta_zero = inp.meta["val"].device.type == "cuda"
 
     def repl(inp, x1, x2, alpha, beta):
+        # [FUNCTION DOC] HELPER: Traced replacement: zeros if alpha and beta are 0 on cuda, else matmul scaled by alpha, plus input scaled by beta (omitted on cuda when beta is 0).
         if alpha == 0 and beta == 0 and drop_input_for_beta_zero:
             return x1.new_zeros((x1.shape[0], x2.shape[1]))
         mm_result = x1 @ x2
@@ -1953,6 +2092,7 @@ def unfuse_bias_add_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, beta):
     extra_check=should_prefer_unfused_baddbmm,
 )
 def unfuse_bias_baddbmm_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, beta):
+    # [FUNCTION DOC] Replace baddbmm with bmm plus pointwise bias add scaled by alpha and beta (pass_patterns[2]); the same half-dtype xpu restriction applies.
     if config.keep_addmm_fused_for_half_dtypes and inp.meta["val"].dtype in (
         torch.bfloat16,
         torch.float16,
@@ -1969,6 +2109,7 @@ def unfuse_bias_baddbmm_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, be
             return
 
     def repl(inp, x1, x2, alpha, beta):
+        # [FUNCTION DOC] HELPER: Traced replacement: bmm result scaled by alpha, plus the input scaled by beta.
         bmm_result = torch.bmm(x1, x2)
         if alpha != 1:
             bmm_result = alpha * bmm_result
@@ -1981,6 +2122,8 @@ def unfuse_bias_baddbmm_to_pointwise(match: Match, mat1, mat2, *, inp, alpha, be
 
 
 def is_valid_addmm_fusion(match):
+    # [FUNCTION DOC] Extra check for fusing mm plus add into addmm: false if mm is flex-gemm preserved, input is not a tensor node, input shape
+    # cannot expand to the mm output, dtypes differ from operands, or unfusing is preferred; otherwise True.
     if any(
         node.target is aten.mm.default and node.meta.get(_PRESERVE_FLEX_GEMM_GEMM_OP)
         for node in match.nodes
@@ -2031,13 +2174,16 @@ def is_valid_addmm_fusion(match):
     extra_check=is_valid_addmm_fusion,
 )
 def addmm(match, mat1, mat2, *, inp):
+    # [FUNCTION DOC] Replace mm plus add (either operand order) with a single addmm, registered in pass_patterns[2].
     def repl(inp, mat1, mat2):
+        # [FUNCTION DOC] HELPER: Traced replacement calling addmm.
         return aten.addmm(inp, mat1, mat2)
 
     match.replace_by_example(repl, [inp, mat1, mat2])
 
 
 def _is_addcdiv_fma_eligible(match: Match) -> bool:
+    # [FUNCTION DOC] HELPER: Guard for the addcdiv fusion: floating-point input and tensor operands, output on cuda or xpu, and a scalar (non-node) value.
     """Guards for the addcdiv FMA re-fusion pass."""
     # aten.addcdiv requires floating-point self; check inp, not output, because
     # aten.div promotes integers to float so the output is float even for int inp.
@@ -2076,6 +2222,8 @@ def _is_addcdiv_fma_eligible(match: Match) -> bool:
     extra_check=_is_addcdiv_fma_eligible,
 )
 def _fuse_addcdiv_to_fma(match: Match, inp, t1, t2, value) -> None:
+    # [FUNCTION DOC] Re-fuse add of input and (t1 divided by t2) times a scalar value back into addcdiv so the FMA-aware lowering can fire.
+    # Increments the addcdiv_fma_fused counter and replaces the match. Returns None.
     """Re-fuse ``inp + (t1/t2)*value`` back into ``aten.addcdiv``.
 
     torch.addcdiv is CompositeImplicitAutograd: it decomposes into
@@ -2087,6 +2235,7 @@ def _fuse_addcdiv_to_fma(match: Match, inp, t1, t2, value) -> None:
     def repl(
         inp: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor, value
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Traced replacement calling addcdiv.
         return torch.ops.aten.addcdiv(inp, t1, t2, value=value)
 
     counters["inductor"]["addcdiv_fma_fused"] += 1
@@ -2094,6 +2243,8 @@ def _fuse_addcdiv_to_fma(match: Match, inp, t1, t2, value) -> None:
 
 
 def register_partial_reduction_pattern():
+    # [FUNCTION DOC] Register graph patterns that reuse a partial amax/amin reduction for a full max/min of the same input (two outputs in one
+    # multi-output pattern, pass_patterns[2]). Called once at import. Only reuses for inputs with at least 4096 elements.
     "Reuse partial reductions in complete reductions"
 
     # post grad equivalents
@@ -2117,6 +2268,8 @@ def register_partial_reduction_pattern():
             pass_dict=pass_patterns[2],
         )
         def reuse_partial(match, input, reduced_dims, keepdim):
+            # [FUNCTION DOC] HELPER: Pattern handler for the partial plus full reduction: skips (returns True) when the input is small; otherwise replaces both
+            # with a partial reduction followed by a full reduction of the partial result, and bumps a counter.
             partial_red, full_red = match.output_nodes()
 
             # if they're small, reuse not worth it
@@ -2124,6 +2277,7 @@ def register_partial_reduction_pattern():
                 return True
 
             def replacement(inp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Traced replacement computing the partial reduction and then the complete reduction of it; returns both.
                 partial = partial_red.target(inp, reduced_dims, keepdim)
                 complete = full_red.target(partial)
                 return (partial, complete)
@@ -2136,6 +2290,7 @@ register_partial_reduction_pattern()
 
 
 def check_shape_cuda_and_fused_int_mm_mul_enabled(match):
+    # [FUNCTION DOC] Extra check: true if config.force_fuse_int_mm_with_mul is set and the third match arg is a 2D CUDA tensor.
     return (
         config.force_fuse_int_mm_with_mul
         and len(getattr(match.args[2].meta.get("val"), "shape", [])) == 2
@@ -2144,6 +2299,8 @@ def check_shape_cuda_and_fused_int_mm_mul_enabled(match):
 
 
 def is_index_put_and_requires_h2d_sync_for_gpu_value(node):
+    # [FUNCTION DOC] Return True if node is index_put(_) with byte/bool indices and a cpu scalar value, where moving the value to GPU would cause
+    # a host-to-device sync in the eager fallback. Normalizes the call to read args.
     from torch.fx.operator_schemas import normalize_function
 
     if node.target not in [
@@ -2173,9 +2330,13 @@ def is_index_put_and_requires_h2d_sync_for_gpu_value(node):
 
 
 class ConstructorMoverPass:
+    # [CLASS DOC] Pass that moves cpu tensor constructors (and optionally cpu scalar placeholders) to the target device type when
+    # all their downstream users can handle it. State: target device type string, allow_inputs and allow_outputs flags.
+    # Invoked as a callable on a graph; mutates the graph. Key methods: find_movable_constructors, get_cpu_indeg_count, cannot_be_moved.
     def __init__(
         self, target: str, allow_outputs: bool = False, allow_inputs: bool = False
     ) -> None:
+        # [FUNCTION DOC] Store target device type and flags. Raises an error if target is not a string.
         """
         Move constructors from cpu to the target_device.
 
@@ -2202,6 +2363,7 @@ class ConstructorMoverPass:
             )
 
     def allow_cpu_device(self, node: fx.Node) -> bool:
+        # [FUNCTION DOC] Return True if the node op accepts cpu tensor inputs while producing a target-device tensor (index, index_put, copy, slice_scatter).
         """
         Returns whether a node that returns a tensor on the target device may have
         cpu tensors as input.
@@ -2216,6 +2378,7 @@ class ConstructorMoverPass:
         )
 
     def is_on_target_device(self, node: fx.Node) -> bool:
+        # [FUNCTION DOC] Return True if the node's tensor value lives on the target device type.
         """
         Returns whether a node is on the target device.
         """
@@ -2223,6 +2386,7 @@ class ConstructorMoverPass:
         return node_device is not None and node_device.type == self.target
 
     def is_cpu_scalar_tensor(self, node: fx.Node) -> bool:
+        # [FUNCTION DOC] Return True if the node's value is a zero-dimensional cpu tensor.
         """
         Returns whether a node is a cpu scalar tensor.
         """
@@ -2233,6 +2397,7 @@ class ConstructorMoverPass:
         return is_cpu and is_scalar
 
     def all_inputs_are_cpu_scalar_or_on_target_device(self, node: fx.Node) -> bool:
+        # [FUNCTION DOC] Return True if all node inputs (args and kwargs that are nodes) are cpu scalar tensors or on the target device.
         """
         Returns whether a node's inputs are either cpu scalar tensors or
         on the target device.
@@ -2248,6 +2413,8 @@ class ConstructorMoverPass:
         )
 
     def cannot_be_moved(self, node: fx.Node) -> bool:
+        # [FUNCTION DOC] Return True if the node blocks moving: output nodes unless outputs are allowed, non prims/aten ops, or index_put ops needing a host sync.
+        # KNOWN ISSUE: the docstring says the opposite sense (returns whether the node can be moved).
         """
         Returns whether a node can be moved to the target device.
 
@@ -2269,6 +2436,7 @@ class ConstructorMoverPass:
         return False
 
     def get_node_device(self, node: fx.Node) -> torch.device | None:
+        # [FUNCTION DOC] Return the device of the node's tensor value from metadata, or None if it has no tensor value.
         """
         Get the device of a node.
         """
@@ -2276,6 +2444,7 @@ class ConstructorMoverPass:
         return None if not isinstance(ten, torch.Tensor) else ten.device
 
     def get_cpu_indeg_count(self, graph: fx.Graph) -> dict[fx.Node, int]:
+        # [FUNCTION DOC] Return a mapping from node to the count of its direct cpu-tensor inputs (nodes with a nonzero count only).
         """
         Get the number of cpu inputs to a node
         """
@@ -2285,6 +2454,7 @@ class ConstructorMoverPass:
             cpu_count = 0
 
             def add_cpu_inp(node):
+                # [FUNCTION DOC] HELPER: Increment the enclosing cpu count when the given input node is on cpu.
                 nonlocal cpu_count
                 device = self.get_node_device(node)
                 cpu_count += device is not None and device.type == "cpu"
@@ -2298,6 +2468,10 @@ class ConstructorMoverPass:
         return cpu_indeg
 
     def __call__(self, graph: fx.Graph) -> None:
+        # [FUNCTION DOC] Run the pass on the graph. Finds cpu constructors (and cpu scalar placeholders when inputs are allowed) and a single target
+        # device; if there is not exactly one target device, does nothing. Computes movable constructors; movable cpu scalar placeholders are
+        # batched (unsqueeze, cat, device_put, unbind, getitem) and their uses redirected, removing redundant device_puts; other
+        # movable constructors have their device kwarg changed. Mutates the graph; returns None.
         target_devices = OrderedSet[torch.device]()
         constructors = []
         cpu_placeholders: OrderedSet[fx.Node] = OrderedSet()
@@ -2405,6 +2579,9 @@ class ConstructorMoverPass:
     def find_movable_constructors(
         self, graph: fx.Graph, constructors: list[fx.Node]
     ) -> OrderedSet[fx.Node]:
+        # [FUNCTION DOC] From the cpu constructors, propagate through downstream users counting cpu inputs; constructors feeding unmovable users or
+        # nodes that stay on cpu are marked unmovable, along with constructors that are dependency-equivalent. Returns the set of constructors that can move.
+        # KNOWN ISSUE: docstring says moved to cpu, but the code decides moving to the target (gpu) device.
         """
         Starting from the cpu constructors, iterate through the graph and test that all of their
         downstream uses can safely be moved to cpu.
@@ -2429,6 +2606,7 @@ class ConstructorMoverPass:
         def make_dependencies_equivalent(
             set1: OrderedSet[fx.Node], set2: OrderedSet[fx.Node]
         ) -> OrderedSet[fx.Node]:
+            # [FUNCTION DOC] HELPER: Merge two constructor dependency sets into one shared set and register it for every member; returns the merged set.
             # could use union find but not worth complexity here
             set1.update(set2)
             for obj in set1:
@@ -2486,6 +2664,8 @@ class ConstructorMoverPass:
 
 
 def move_constructors_to_gpu(graph: fx.Graph) -> None:
+    # [FUNCTION DOC] Entry point: moves intermediate cpu tensors to the GPU where safe using ConstructorMoverPass for the detected GPU type.
+    # Inputs and outputs are allowed to move only when cudagraphs and graph partition are both enabled. Mutates the graph; returns None.
     """
     Moves intermediary tensors which are constructed on the cpu to gpu when safe
     """
