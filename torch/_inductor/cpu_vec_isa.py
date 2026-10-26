@@ -1,3 +1,7 @@
+# [MODULE DOC] Describes CPU SIMD instruction sets (AVX2, AVX512, AVX512-VNNI, AMX, NEON, SVE, VSX, ZVECTOR) for inductor's C++ vectorization.
+# Contains the VecISA class hierarchy (bit width, build macros, arch flags, lanes per dtype), runtime support probing by dry-compiling and dlopen-ing a test library,
+# and selection helpers (valid_vec_isa_list, pick_vec_isa, get_isa_from_cpu_capability).
+# Import-time side effects: builds module-level instances invalid_vec_isa and supported_vec_isa_list; no compilation happens until an instance is tested for truth.
 # mypy: allow-untyped-defs
 import dataclasses
 import functools
@@ -19,6 +23,9 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 def _get_isa_dry_compile_fingerprint(isa_flags: str) -> str:
+    # [FUNCTION DOC] HELPER: Build a cache-key string from the C++ compiler version info, the ISA flags and the torch version.
+    # Used as the extra key material when the dry-compile source is written to the codecache, so a changed compiler/flags/torch yields a fresh build.
+    # Imports cpp_builder lazily; may invoke the compiler to query its version.
     # ISA dry compile will cost about 1 sec time each startup time.
     # Please check the issue: https://github.com/pytorch/pytorch/issues/100378
     # Actually, dry compile is checking compile capability for ISA.
@@ -34,6 +41,10 @@ def _get_isa_dry_compile_fingerprint(isa_flags: str) -> str:
 
 
 class VecISA:
+    # [CLASS DOC] Base class describing one CPU SIMD ISA for inductor vectorization.
+    # Subclasses set class-level _bit_width, _macro, _arch_flags and _dtype_nelements. Instances hash by their string form.
+    # Truthiness means the ISA is usable: it dry-compiles a probe kernel and verifies the resulting library loads (cached per instance).
+    # Key methods: bit_width, nelements, build_macro, build_arch_flags, check_build.
     """Describes a CPU SIMD ISA (AVX2, AVX512, NEON, SVE, VSX, ZVECTOR) for
     inductor's CPU vectorization.
 
@@ -109,22 +120,29 @@ except OSError:
 """
 
     def bit_width(self) -> int:
+        # [FUNCTION DOC] Return the vector register width in bits for this ISA.
         return self._bit_width
 
     def nelements(self, dtype: torch.dtype = torch.float) -> int:
+        # [FUNCTION DOC] Return the number of vector lanes for the given dtype (default float32); raises a key error if the dtype is not in the ISA's table.
         return self._dtype_nelements[dtype]
 
     def build_macro(self) -> list[str]:
+        # [FUNCTION DOC] Return the list of preprocessor macro names to define when building for this ISA.
         return self._macro
 
     def build_arch_flags(self) -> str:
+        # [FUNCTION DOC] Return the compiler arch flag string for this ISA; subclasses may extend it based on detected features.
         return self._arch_flags
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash the instance by the hash of its string representation, so equal-named ISAs share a dict key.
         return hash(str(self))
 
     @staticmethod
     def _build_probe_env() -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Return a copy of the subprocess environment with torch's lib directory prepended to the library search path variable.
+        # Lets the probe child process resolve libtorch without importing torch. Prepended so the currently running torch wins over other installs.
         """Construct the child env for the dlopen probe.
 
         Make libtorch_cpu (and other torch shlibs) findable by the Linux
@@ -144,6 +162,8 @@ except OSError:
         return env
 
     def _probe_load(self, output_path: str) -> bool:
+        # [FUNCTION DOC] HELPER: Run a child Python interpreter that loads the shared library at output_path, with a 60 second timeout.
+        # Returns True on success, False on timeout (also emits a warning) or on a nonzero exit. The child's stderr is discarded.
         """Spawn a child Python that ``dlopen``s ``output_path``.
 
         Bound the dlopen probe so a stuck child cannot hang the parent for
@@ -175,6 +195,10 @@ except OSError:
         return True
 
     def check_build(self, code: str) -> bool:
+        # [FUNCTION DOC] Compile the given C++ source with this ISA's flags and verify the result loads.
+        # Writes the source to the codecache, takes a file lock keyed by the hash, builds the library if absent, then probes loading it in a subprocess.
+        # A marker file next to the library records a prior successful load and short-circuits the probe. Returns False on any build exception or load failure.
+        # Side effects: files in the codecache directory (source, library, marker, lock).
         """Dry-compile ``code`` with this ISA's flags and verify the resulting
         shared library can be loaded.
 
@@ -229,10 +253,13 @@ except OSError:
             return load_ok
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Return whether this ISA is usable, delegating to a cached implementation keyed by the config override value.
         return self.__bool__impl(config.cpp.vec_isa_ok)
 
     @functools.cache  # noqa: B019
     def __bool__impl(self, vec_isa_ok) -> bool:
+        # [FUNCTION DOC] HELPER: Cached truth computation. Returns the config override if it is not None, True in fbcode builds, otherwise the result of check_build on the shared AVX probe code.
+        # KNOWN ISSUE: the cache is keyed on the instance (and hashes by string), so equal-named instances share results and the cache keeps instances alive.
         if vec_isa_ok is not None:
             return vec_isa_ok
 
@@ -244,12 +271,14 @@ except OSError:
 
 @dataclasses.dataclass
 class VecNEON(VecISA):
+    # [CLASS DOC] ARM NEON ISA: 128-bit vectors, 4 floats or 8 half-precision values per vector. Arch flags are unused.
     _bit_width = 128  # This is required to leverage the compute implemented in aten/src/ATen/cpu/vec/vec128/vec128_float_neon.h
     _macro = ["CPU_CAPABILITY_NEON", "AT_BUILD_ARM_VEC256_WITH_SLEEF"]
     _arch_flags = ""  # Unused
     _dtype_nelements = {torch.float: 4, torch.bfloat16: 8, torch.float16: 8}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the name used for ISA matching: neon in fbcode, otherwise asimd (the cpuinfo feature name).
         if config.is_fbcode():
             return "neon"
         return "asimd"  # detects the presence of advanced SIMD on armv8-a kernels
@@ -259,12 +288,16 @@ class VecNEON(VecISA):
 
 @dataclasses.dataclass
 class VecSVE(VecISA):
+    # [CLASS DOC] ARM SVE ISA with a configurable vector width of 128 or 256 bits (default 256).
+    # Macros, arch flags (armv8-a and armv9-a variants) and per-dtype lane counts are computed in __post_init__ from the width.
+    # Caches whether the CPU supports SVE2 to choose the armv9-a flags.
     _bit_width: int = 256
     _armv9a_supported: bool | None = dataclasses.field(
         default=None, init=False, compare=False
     )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate the width (raises an assertion error if not 128 or 256) and derive build macros, both arch flag strings and the dtype lane table (width/32 floats, twice that for bf16/fp16).
         if self._bit_width not in (128, 256):
             raise AssertionError(f"unsupported SVE bit width: {self._bit_width}")
         nelements = self._bit_width // 32
@@ -288,11 +321,14 @@ class VecSVE(VecISA):
         }
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the ISA name: neon in fbcode, otherwise asimd.
+        # KNOWN ISSUE: identical to the NEON name, so string-based matching cannot tell SVE from NEON.
         if config.is_fbcode():
             return "neon"
         return "asimd"
 
     def _has_armv9a(self) -> bool:
+        # [FUNCTION DOC] HELPER: Return (and cache) whether the CPU reports sve2 capability; any exception while querying yields False.
         if self._armv9a_supported is None:
             try:
                 self._armv9a_supported = bool(
@@ -303,6 +339,7 @@ class VecSVE(VecISA):
         return self._armv9a_supported
 
     def build_arch_flags(self) -> str:
+        # [FUNCTION DOC] Return the armv9-a flags when SVE2 is supported, otherwise the armv8-a flags.
         if self._has_armv9a():
             return self._armv9a_arch_flags
         return self._arch_flags
@@ -312,6 +349,8 @@ class VecSVE(VecISA):
 
 @dataclasses.dataclass
 class VecAVX512(VecISA):
+    # [CLASS DOC] x86 AVX512 ISA: 512-bit vectors (16 floats, 32 half-precision values).
+    # Tracks whether avx512_bf16 is also supported and usable by the compiler; this is set as a side effect of evaluating truthiness.
     _bit_width = 512
     _macro = ["CPU_CAPABILITY_AVX512"]
     _arch_flags = (
@@ -323,6 +362,7 @@ class VecAVX512(VecISA):
     _is_avx512_bf16_supported = False
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the ISA name avx512.
         return "avx512"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
@@ -339,6 +379,9 @@ extern "C" __m512bh __avx512_bf16_chk_kernel(__m512 a, __m512 b) {
     @functools.cache  # noqa: B019
     # pyrefly: ignore [bad-override]
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Return whether AVX512 is usable: base probe must pass, and False in fbcode.
+        # As a side effect, if the CPU supports avx512_bf16 (non-Windows), temporarily adds its flag, dry-compiles a bf16 probe and records the result, then restores the flags.
+        # KNOWN ISSUE: returns False in fbcode even though the base class returns True there; the result is cached per instance.
         if super().__bool__():
             if config.is_fbcode():
                 return False
@@ -358,9 +401,11 @@ extern "C" __m512bh __avx512_bf16_chk_kernel(__m512 a, __m512 b) {
 
     @functools.lru_cache(None)  # noqa: B019
     def is_avx512_bf16_supported(self) -> bool:
+        # [FUNCTION DOC] Return the recorded avx512_bf16 support flag (cached; only meaningful after truthiness was evaluated).
         return self._is_avx512_bf16_supported
 
     def build_arch_flags(self) -> str:
+        # [FUNCTION DOC] Return the arch flags, with the avx512bf16 flag appended if bf16 support was detected.
         if self._is_avx512_bf16_supported:
             return self._arch_flags + " -mavx512bf16"
         else:
@@ -369,6 +414,7 @@ extern "C" __m512bh __avx512_bf16_chk_kernel(__m512 a, __m512 b) {
 
 @dataclasses.dataclass
 class VecAVX512VNNI(VecAVX512):
+    # [CLASS DOC] AVX512 with VNNI: adds int8/uint8 lane counts (64) and VNNI arch flags.
     _bit_width = 512
     _arch_flags = VecAVX512._arch_flags + " -mavx512vnni -mavx512vl"
     _dtype_nelements = {
@@ -380,6 +426,7 @@ class VecAVX512VNNI(VecAVX512):
     }
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the AVX512 name with a vnni suffix; the space-separated words are used as required feature names.
         return super().__str__() + " avx512_vnni"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
@@ -399,6 +446,7 @@ extern "C" __m512i __avx512_vnni_chk_kernel_2(__m512i src, __m512i a, __m512i b)
 
     @functools.cache  # noqa: B019
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Return whether AVX512 is usable and the CPU supports VNNI and a VNNI probe compiles and loads (non-Windows, not fbcode); otherwise False.
         if super().__bool__():
             if config.is_fbcode():
                 return False
@@ -411,17 +459,20 @@ extern "C" __m512i __avx512_vnni_chk_kernel_2(__m512i src, __m512i a, __m512i b)
         return False
 
     def build_arch_flags(self) -> str:
+        # [FUNCTION DOC] Return the class arch flags unchanged (no bf16 extension, unlike the parent).
         return self._arch_flags
 
 
 @dataclasses.dataclass
 class VecAMX(VecAVX512VNNI):
+    # [CLASS DOC] Intel AMX ISA built on AVX512-VNNI: adds AMX tile/bf16/int8 flags and tracks separate optional amx_fp16 support (needs a newer compiler).
     _arch_flags = VecAVX512VNNI._arch_flags + " -mamx-tile -mamx-bf16 -mamx-int8"
     # check amx_fp16 separately since it is not always supported when amx is supported
     # amx_fp16 intrinsic compilation need gcc >=13 on platforms which support amx_fp16
     _is_amx_fp16_supported = False
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the VNNI name with an amx_tile suffix.
         return super().__str__() + " amx_tile"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__
@@ -451,6 +502,8 @@ extern "C" void __amx_chk_kernel() {
 
     @functools.cache  # noqa: B019
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] Return whether AMX is usable: parent check passes, the AMX probe builds and loads, and the runtime AMX initialization succeeds (False in fbcode).
+        # Also probes amx_fp16 support with a temporarily extended flag string and records it. Cached per instance.
         if super().__bool__():
             if config.is_fbcode():
                 return False
@@ -471,9 +524,11 @@ extern "C" void __amx_chk_kernel() {
 
     @functools.lru_cache(None)  # noqa: B019
     def is_amx_fp16_supported(self) -> bool:
+        # [FUNCTION DOC] Return the recorded amx_fp16 support flag (cached).
         return self._is_amx_fp16_supported
 
     def build_arch_flags(self) -> str:
+        # [FUNCTION DOC] Return the arch flags plus avx512bf16 and amx-fp16 flags when those were detected as supported.
         extra_flags = ""
         if self._is_avx512_bf16_supported:
             # avx512_bf16 is not among the base flags, so we need to check and add it here
@@ -486,6 +541,7 @@ extern "C" void __amx_chk_kernel() {
 
 @dataclasses.dataclass
 class VecAVX2(VecISA):
+    # [CLASS DOC] x86 AVX2 ISA: 256-bit vectors (8 floats, 16 half-precision values).
     _bit_width = 256
     _macro = ["CPU_CAPABILITY_AVX2"]
     _arch_flags = (
@@ -494,6 +550,7 @@ class VecAVX2(VecISA):
     _dtype_nelements = {torch.float: 8, torch.bfloat16: 16, torch.float16: 16}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the ISA name avx2.
         return "avx2"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
@@ -501,6 +558,7 @@ class VecAVX2(VecISA):
 
 @dataclasses.dataclass
 class VecZVECTOR(VecISA):
+    # [CLASS DOC] IBM s390x ZVECTOR ISA: 256-bit emulated vectors with its own capability macros.
     _bit_width = 256
     _macro = [
         "CPU_CAPABILITY_ZVECTOR",
@@ -511,6 +569,7 @@ class VecZVECTOR(VecISA):
     _dtype_nelements = {torch.float: 8, torch.bfloat16: 16, torch.float16: 16}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the ISA name zvector.
         return "zvector"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
@@ -518,38 +577,46 @@ class VecZVECTOR(VecISA):
 
 @dataclasses.dataclass
 class VecVSX(VecISA):
+    # [CLASS DOC] POWER VSX ISA: reported as 256-bit because ATen emulates that width.
     _bit_width = 256  # VSX simd supports 128 bit_width, but aten is emulating it as 256
     _macro = ["CPU_CAPABILITY_VSX"]
     _arch_flags = "-mvsx"
     _dtype_nelements = {torch.float: 8, torch.bfloat16: 16, torch.float16: 16}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the ISA name vsx.
         return "vsx"
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
 
 
 class InvalidVecISA(VecISA):
+    # [CLASS DOC] Sentinel ISA meaning no vectorization: zero width, empty tables, always falsy.
     _bit_width = 0
     _macro = [""]
     _arch_flags = ""
     _dtype_nelements = {}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return the sentinel name INVALID_VEC_ISA.
         return "INVALID_VEC_ISA"
 
     def __bool__(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] Always return False.
         return False
 
     __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
 
 
 def x86_isa_checker() -> list[str]:
+    # [FUNCTION DOC] Return the list of x86 ISA names (avx2, avx512, avx512_vnni, amx_tile) the CPU supports, queried through torch.cpu helpers.
+    # Returns an empty list on non-x86 machines.
     supported_isa: list[str] = []
 
     def _check_and_append_supported_isa(
         dest: list[str], isa_supported: bool, isa_name: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Append isa_name to dest when isa_supported is true.
         if isa_supported:
             dest.append(isa_name)
 
@@ -589,6 +656,9 @@ def get_isa_from_cpu_capability(
     vec_isa_list: list[VecISA],
     invalid_vec_isa: InvalidVecISA,
 ):
+    # [FUNCTION DOC] Map an ATEN_CPU_CAPABILITY value (default, zvector, vsx, avx2, avx512) to an ISA from vec_isa_list.
+    # default returns the invalid sentinel; other known values return the first ISA whose name contains the mapped string; unknown non-empty values warn and are ignored.
+    # Falls back to the first (highest priority) entry of vec_isa_list. Raises an index error if the list is empty and nothing matched.
     # AMX setting is not supported in eager
     # VecAMX will be prioritized for selection when setting ATEN_CPU_CAPABILITY to avx512
     # TODO add sve256 support
@@ -619,6 +689,9 @@ def get_isa_from_cpu_capability(
 # we only cache some key isa information.
 @functools.cache
 def valid_vec_isa_list() -> list[VecISA]:
+    # [FUNCTION DOC] Return (cached) the list of ISAs usable on this host, best first.
+    # Darwin arm gets NEON; s390x parses the cpuinfo file for the vxe feature to add ZVECTOR; ppc64le gets VSX; aarch64 picks SVE (128 or 256) when sve/sve2 and bf16 exist, else NEON;
+    # x86 keeps candidates whose feature words are all supported and which pass their truthiness probe (may compile). Other platforms return what was gathered so far.
     isa_list: list[VecISA] = []
     if sys.platform == "darwin" and platform.processor() == "arm":
         isa_list.append(VecNEON())
@@ -669,6 +742,9 @@ def valid_vec_isa_list() -> list[VecISA]:
 
 
 def pick_vec_isa() -> VecISA:
+    # [FUNCTION DOC] Choose the ISA for codegen. fbcode x86 always gets AVX2.
+    # Returns the invalid sentinel if no ISA is valid. If config simdlen is unset, selects by the ATEN_CPU_CAPABILITY environment variable;
+    # otherwise returns the first valid ISA whose bit width equals simdlen, or the invalid sentinel.
     if config.is_fbcode() and (platform.machine() in ["x86_64", "AMD64"]):
         return VecAVX2()
 
