@@ -1,3 +1,6 @@
+# [MODULE DOC] Formatting and logging helpers for FlexGEMM compilation diagnostics.
+# Builds human-readable reports of the problem, analysis, lowering plan, config candidates and selection, and emits
+# them through the flex_gemm logger and structured trace. Import-time side effect: creates the module logger.
 """Format and emit opt-in FlexGEMM compilation diagnostics.
 
 The ``flex_gemm`` logger follows lowering from the captured FX body through
@@ -41,6 +44,8 @@ def log_flex_gemm_artifact(
     lowering_name: str | None = None,
     verbose: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Log one lazily rendered diagnostic at INFO (DEBUG when verbose) and emit a structured trace artifact.
+    # Name is prefixed flex_gemm_ in metadata; payload_fn is called lazily by both consumers.
     """Emit one lazily rendered local and structured FlexGEMM phase."""
     heading = "FLEXGEMM LOWERING"
     if lowering_name is not None:
@@ -65,6 +70,7 @@ def log_flex_gemm_artifact(
 
 
 def _append_items(lines: list[str], label: str, items: Iterable[str]) -> None:
+    # [FUNCTION DOC] HELPER: Append a label line and indented items (or a none marker) to lines in place.
     """Append an indented report section, including an explicit empty marker."""
     values = tuple(items)
     lines.append(f"{label}:")
@@ -72,6 +78,7 @@ def _append_items(lines: list[str], label: str, items: Iterable[str]) -> None:
 
 
 def _format_ir_tensor(name: str, node: "ir.IRNode") -> str:
+    # [FUNCTION DOC] HELPER: Format an IR node's shape, stride (or unrealized), dtype and device on one line.
     """Format the tensor contract visible to Inductor lowering."""
     stride = node.maybe_get_stride()
     return (
@@ -93,6 +100,7 @@ def format_flex_gemm_problem(
     fast_math: bool,
     explicit_config: dict[str, Any] | None,
 ) -> str:
+    # [FUNCTION DOC] Render the gemm op, kernel options, alpha/beta, inputs, captures and printed FX body as text.
     """Render the inputs and captured body entering FlexGEMM analysis."""
     lines = [
         f"gemm_op: {gemm_op}",
@@ -128,6 +136,7 @@ def format_flex_gemm_problem(
 
 
 def _format_fx_tensor(node: torch.fx.Node) -> str:
+    # [FUNCTION DOC] HELPER: Format an FX node with fake tensor shape, stride, dtype, or just its name if no tensor metadata.
     """Format an FX node using its captured fake-tensor metadata."""
     meta = node.meta.get("val")
     if not isinstance(meta, torch.Tensor):
@@ -139,12 +148,14 @@ def _format_fx_tensor(node: torch.fx.Node) -> str:
 
 
 def _format_geometry(geometry: Any) -> str:
+    # [FUNCTION DOC] HELPER: Format a geometry as axis (M for 0, otherwise N) and group.
     """Format grouped GEMM geometry in logical M/N terms."""
     axis = "M" if geometry.axis == 0 else "N"
     return f"axis={axis}, group={geometry.group}"
 
 
 def _format_output_contraction(contraction: Any | None) -> str:
+    # [FUNCTION DOC] HELPER: Describe the output contraction (none, or N-axis group and layout).
     """Format the logical contraction applied to the main output."""
     if contraction is None:
         return "none"
@@ -153,6 +164,7 @@ def _format_output_contraction(contraction: Any | None) -> str:
 
 
 def _format_normalized_dataflow(node: torch.fx.Node, normalized: Any) -> str:
+    # [FUNCTION DOC] HELPER: Render a normalized FX op as source -> operation; falls back to repr for unknown kinds.
     """Render one normalized FX operation as compact dataflow."""
     match normalized:
         case NormalizedView(shape=shape):
@@ -181,6 +193,7 @@ def _format_normalized_dataflow(node: torch.fx.Node, normalized: Any) -> str:
 
 
 def format_flex_gemm_analysis(analysis: "FlexGemmEpilogueAnalysis") -> str:
+    # [FUNCTION DOC] Render outputs, output contraction, auxiliary outputs, local reduction details and required geometries as text.
     """Render the semantic decisions a FlexGEMM developer acts on first."""
     outputs = analysis.outputs
     lines = [
@@ -244,6 +257,7 @@ def format_flex_gemm_analysis(analysis: "FlexGemmEpilogueAnalysis") -> str:
 def format_flex_gemm_analysis_details(
     analysis: "FlexGemmEpilogueAnalysis",
 ) -> str:
+    # [FUNCTION DOC] Render normalized nodes, grouped layouts, matches and select indices for deep debugging.
     """Render normalized nodes and recognizer records for deep debugging."""
     lines: list[str] = []
     for label, values in (
@@ -265,6 +279,7 @@ def format_flex_gemm_analysis_details(
 
 
 def _format_tensor_meta(meta: torch.Tensor) -> str:
+    # [FUNCTION DOC] HELPER: Format a tensor's shape, stride and dtype.
     """Format output metadata used for allocation and ABI planning."""
     return (
         f"shape={tuple(meta.shape)}, stride={tuple(meta.stride())}, dtype={meta.dtype}"
@@ -279,6 +294,7 @@ def format_flex_gemm_lowering_plan(
     aux_metas: Sequence[torch.Tensor],
     local_reduce_metas: Sequence[torch.Tensor],
 ) -> str:
+    # [FUNCTION DOC] Render output storage, capture kinds, auxiliary and local-reduction storage decisions as text.
     """Render buffer allocation and runtime-ABI decisions."""
     lines = [
         "output_storage:",
@@ -310,6 +326,7 @@ def format_flex_gemm_lowering_plan(
 
 
 def format_flex_gemm_config_key(config_key: "GemmConfigKey") -> str:
+    # [FUNCTION DOC] Render each config field one per line, showing auto for None values.
     """Render every config field so new GemmConfig fields remain visible."""
     return "\n".join(
         f"{name}: {'auto' if value is None else repr(value)}"
@@ -320,6 +337,7 @@ def format_flex_gemm_config_key(config_key: "GemmConfigKey") -> str:
 def format_flex_gemm_config_candidates(
     config_keys: Sequence["GemmConfigKey"],
 ) -> str:
+    # [FUNCTION DOC] Render all candidate configs as numbered sections, or a none marker if empty.
     """Render every lowering-approved config for verbose diagnostics."""
     lines: list[str] = []
     for index, config_key in enumerate(config_keys):
@@ -339,6 +357,8 @@ def format_flex_gemm_selection(
     candidate_count: int,
     tuned: bool,
 ) -> str:
+    # [FUNCTION DOC] Render search mode, candidate count, selected template and config, and TORCH_LOGS hints.
+    # A None choice means selection was deferred to a multi-template buffer.
     """Render the search summary and selected FlexGEMM template."""
     lines = [
         "search:",

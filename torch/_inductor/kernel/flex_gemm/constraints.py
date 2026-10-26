@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared FlexGEMM local-reduce and output-contraction constants, error messages and validators.
+# Defines the TensorSSA fragment width, error strings, helper functions checking group/axis/shape/config legality,
+# the FlexGemmOutputContraction and FlexGemmLocalReduceCallbacks dataclasses and an alias for GemmReductionGeometry.
+# No import-time side effects beyond defining constants.
 """Shared FlexGEMM local-reduce geometry, constants, and validation helpers."""
 
 import dataclasses
@@ -153,6 +157,7 @@ FLEX_GEMM_MAIN_OUTPUT_SHAPE_ERROR = (
 
 
 def statically_known_multiple(value: Any, divisor: int) -> bool:
+    # [FUNCTION DOC] Return whether value is statically known divisible by divisor, without adding guards.
     """Return whether a symbolic shape value is known divisible without guards."""
     return statically_known(value % divisor == 0)
 
@@ -160,6 +165,9 @@ def statically_known_multiple(value: Any, divisor: int) -> bool:
 def is_flex_gemm_partial_reduction_shape(
     aux_size: Sequence[Any], output_size: Sequence[Any]
 ) -> bool:
+    # [FUNCTION DOC] Return True if aux_size looks like a final PyTorch reduction of a 2-D output (not a local reduce).
+    # Matches scalar, M, N, 1x1, Mx1, 1xN shapes or a 2-D shape that statically divides the output in both dims and is
+    # smaller in at least one. Returns False for non-2-D outputs.
     """Recognize aux shapes that imply a final PyTorch reduction, not local reduce.
 
     FlexGEMM's generic aux-output path supports one same-shape aux tensor beside
@@ -195,6 +203,7 @@ def is_flex_gemm_partial_reduction_shape(
 def local_reduce_unsupported_tensorssa_error(
     reduction: Any, *, value_only: bool = False
 ) -> NotImplementedError:
+    # [FUNCTION DOC] Build (not raise) a NotImplementedError explaining the reduction does not map to a CuTe TensorSSA reduction.
     """Explain why a grouped reduction is outside the current TensorSSA subset."""
     suffix = " value-only reduction" if value_only else ""
     return NotImplementedError(
@@ -205,6 +214,7 @@ def local_reduce_unsupported_tensorssa_error(
 
 
 def validate_local_reduce_group_axis(group: int, axis: int) -> None:
+    # [FUNCTION DOC] Validate local-reduce group (positive) and axis (0 or 1); raises RuntimeError otherwise.
     """Keep local-reduce specs inside the GEMM tile's M/N grouping model."""
     if group <= 0:
         raise RuntimeError(LOCAL_REDUCE_GROUP_POSITIVE_ERROR)
@@ -215,6 +225,7 @@ def validate_local_reduce_group_axis(group: int, axis: int) -> None:
 def validate_local_reduce_selected_dim_divisible(
     shape: Sequence[Any], group: int, axis: int
 ) -> None:
+    # [FUNCTION DOC] Raise RuntimeError if the selected M/N dimension is known not divisible by group; unknown divisibility passes.
     """Reject selected M/N dimensions known not to have an integral compressed shape."""
     validate_local_reduce_group_axis(group, axis)
     selected_dim = shape[axis - 2]
@@ -225,6 +236,9 @@ def validate_local_reduce_selected_dim_divisible(
 
 
 def validate_local_reduce_tensorssa_group_size(axis: int, group: int) -> None:
+    # [FUNCTION DOC] Validate a group size against the 32-lane TensorSSA fragment.
+    # Raises NotImplementedError if group is 1 or less, larger than 32 and not a multiple of 32, or 32 or smaller and not a
+    # divisor of 32; RuntimeError for invalid group/axis.
     """Mirror the TensorSSA fragment tiling constraints used by QuACK.
 
     Groups within one fragment must divide the 32-lane TensorSSA width. Larger
@@ -244,11 +258,13 @@ def validate_local_reduce_tensorssa_group_size(axis: int, group: int) -> None:
 
 
 def local_reduce_needs_physical_callbacks(axis: int, group: int) -> bool:
+    # [FUNCTION DOC] Return True if the reduction needs physical callbacks (axis 0 or group wider than the fragment).
     """Return whether QuACK must merge TensorSSA partials outside the fragment path."""
     return axis == 0 or group > LOCAL_REDUCE_FRAGMENT_WIDTH
 
 
 def validate_local_reduce_runtime_dense_mm(ndim: int) -> None:
+    # [FUNCTION DOC] Raise NotImplementedError unless the matmul output is 2-D.
     """Keep runtime wrappers on the only layout QuACK currently supports.
 
     Local-reduce group/axis semantics are defined relative to dense ``mm`` output
@@ -262,6 +278,7 @@ def validate_local_reduce_runtime_dense_mm(ndim: int) -> None:
 def validate_local_reduce_out_shape(
     actual_shape: Sequence[Any], expected_shape: Sequence[Any]
 ) -> None:
+    # [FUNCTION DOC] Raise RuntimeError if the provided aux output shape differs (statically) from the expected compressed shape.
     """Ensure caller-provided aux storage matches the structural reduce plan.
 
     Runtime cannot reinterpret an arbitrary aux tensor as the compressed local-
@@ -278,6 +295,7 @@ def validate_local_reduce_out_shape(
 
 
 def validate_local_reduce_feed_main_capability(axis: int, group: int) -> None:
+    # [FUNCTION DOC] Raise NotImplementedError unless the feed-main reduction is on axis 0 with group not above 32.
     """Limit feed-main reducers to the physical path QuACK can re-inject today.
 
     Feeding a reduction back into the main epilogue needs the physical row-lane
@@ -293,6 +311,7 @@ def validate_local_reduce_feed_main_capability(axis: int, group: int) -> None:
 def local_reduce_compressed_shape(
     shape: Sequence[Any], group: int, axis: int
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] Return the output shape with the selected M/N dimension divided by group (validates first).
     """Compute the explicit aux shape that mirrors QuACK's grouped store."""
     validate_local_reduce_selected_dim_divisible(shape, group, axis)
     result = list(shape)
@@ -303,12 +322,16 @@ def local_reduce_compressed_shape(
 def validate_local_reduce_no_c_alpha_beta(
     effective_C: Any | None, alpha: float, beta: float
 ) -> None:
+    # [FUNCTION DOC] Raise NotImplementedError if a C operand is present or alpha or beta differs from 1.
     """Reject C/alpha/beta composition until local-reduce ordering is explicit."""
     if effective_C is not None or alpha != 1.0 or beta != 1.0:
         raise NotImplementedError(LOCAL_REDUCE_C_ALPHA_BETA_ERROR)
 
 
 def validate_flex_gemm_local_reduce_config(config: Any, group: int, axis: int) -> bool:
+    # [FUNCTION DOC] Return True if a QuACK GemmConfig supports the grouped local reduction for the given group and axis.
+    # Checks axis, swap_ab, tile divisibility and the fragment width (halved for some two-CTA N layouts), then the
+    # CTA layout families (single CTA, wide-M two-CTA, split N warp two-CTA) for groups above the fragment width.
     """Return whether a QuACK config has a validated grouped-reduction layout.
 
     This matches ``GemmConfig`` fields against layout families covered by forced
@@ -371,6 +394,7 @@ def validate_flex_gemm_local_reduce_config(config: Any, group: int, axis: int) -
 
 
 def flex_gemm_local_reduce_candidate_groups(config: Any, axis: int) -> tuple[int, ...]:
+    # [FUNCTION DOC] Return candidate group sizes (2..32 powers of two, then multiples of 32 up to the tile) for the axis; empty for invalid axis.
     """Enumerate group sizes worth checking against the config capability gate."""
     match axis:
         case 0:
@@ -385,6 +409,7 @@ def flex_gemm_local_reduce_candidate_groups(config: Any, axis: int) -> tuple[int
 def max_flex_gemm_local_reduce_group_for_configs(
     configs: Sequence[Any], axis: int
 ) -> int | None:
+    # [FUNCTION DOC] Return the largest candidate group accepted by the config gate across configs, or None if none.
     """Return the largest group accepted by the current local-reduce config gate."""
     candidates = [
         group
@@ -398,6 +423,7 @@ def max_flex_gemm_local_reduce_group_for_configs(
 def flex_gemm_local_reduce_config_error(
     configs: Sequence[Any], group: int, axis: int
 ) -> str:
+    # [FUNCTION DOC] Build the config-related error message, adding requested and maximum supported group when available.
     """Explain the current config-filter frontier for local-reduce groups."""
     max_group = max_flex_gemm_local_reduce_group_for_configs(configs, axis)
     if max_group is None:
@@ -424,6 +450,9 @@ def flex_gemm_local_reduce_config_error(
 # captures need the same concat-to-interleave mapping as B for chunked outputs.
 @dataclasses.dataclass(frozen=True)
 class FlexGemmOutputContraction:
+    # [CLASS DOC] Frozen description of an N-axis output contraction (see the NOTE above).
+    # Fields: group (physical N values per logical output, positive) and chunked (contiguous chunks rather than
+    # interleaved). Provides concat_layout and validate_quack.
     """Describe the contraction in NOTE [Non-shape-preserving FlexGEMM outputs].
 
     Attributes:
@@ -435,15 +464,19 @@ class FlexGemmOutputContraction:
     chunked: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raise ValueError if group is not positive.
         if self.group <= 0:
             raise ValueError("output-contraction group must be positive")
 
     @property
     def concat_layout(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Return the QuACK ABI tag tuple: containing B when chunked, otherwise empty.
         """Return the QuACK ABI tag that interleaves chunked B columns."""
         return ("B",) if self.chunked else ()
 
     def validate_quack(self, device_capacity: int) -> None:
+        # [FUNCTION DOC] Raise NotImplementedError unless the device capability supports this contraction.
+        # SM120 is unsupported; only capability 10 and 11 are validated; group 2 is allowed, and interleaved group 4 only on 10.
         if device_capacity == 12:
             raise NotImplementedError(
                 "FlexGEMM output contractions are not yet supported on SM120"
@@ -464,11 +497,14 @@ class FlexGemmOutputContraction:
 
 
 def output_contraction_capture_supported(kind: str, is_boolean: bool) -> bool:
+    # [FUNCTION DOC] Return True for scalar or column captures that are not boolean.
     """Return whether output-contraction codegen can broadcast a captured tensor."""
     return kind in ("scalar", "col") and not is_boolean
 
 
 def output_contraction_config_supported(config: Any, n: Any) -> bool:
+    # [FUNCTION DOC] Return True if a config has validated output-contraction store ownership.
+    # Requires no swap_ab, M cluster of 1 or tile_m 256 with cluster 2, N cluster 1, and tile_n statically at most n.
     """Return whether a config has validated output-contraction store ownership.
 
     Keep the physical M/N orientation, one CTA per cluster along N, and require
@@ -493,12 +529,14 @@ FlexGemmLocalReduceGeometry = GemmReductionGeometry
 
 @dataclasses.dataclass(frozen=True)
 class FlexGemmLocalReduceCallbacks:
+    # [CLASS DOC] Frozen pair of generated physical combine and finalize callbacks for local reductions.
     """Carry generated physical combine/finalize functions."""
 
     combine_fn: Any
     finalize_fn: Any
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raise RuntimeError if either callback is missing.
         """Keep physical reducers from existing without their generated code."""
         if self.combine_fn is None or self.finalize_fn is None:
             raise RuntimeError(LOCAL_REDUCE_CALLBACKS_REQUIRED_ERROR)

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Analysis that rewrites a flex mask_mod FX graph into a small union of 32-lane keep intervals.
+# Contains PackedMaskInterval (one half-open interval and its CuTe rendering), PackedMaskAnalyzer (FX graph to interval
+# sets), PackedMaskAuxPlaceholderMap (captured aux placeholders) and select_packed_mask_intervals (entry point), plus
+# sympy-to-CuTe rendering helpers. Import-time side effects: creates the perf_hints artifact logger.
 """Packed interval mask analysis for flex flash attention.
 
 Flex attention can evaluate arbitrary ``mask_mod`` functions lane by lane, but
@@ -49,6 +53,9 @@ LANE_UNIFORM_BINARY_OPS: Mapping[object, str] = {
 
 @dataclasses.dataclass(frozen=True)
 class PackedMaskInterval:
+    # [CLASS DOC] Frozen half-open keep interval over lanes of a packed 32-lane mask.
+    # Fields: lower_lane and upper_lane_exclusive (sympy expressions) and symbol_codes (mapping of temporary symbols to
+    # CuTe code; excluded from comparison and repr). Renders to a 32-bit keep mask expression via keep_mask_expr.
     """Half-open keep interval [lower_lane, upper_lane_exclusive) for a packed mask.
 
     Packed interval lowering replaces per-lane boolean mask evaluation with one
@@ -66,23 +73,31 @@ class PackedMaskInterval:
 
     @classmethod
     def full(cls) -> "PackedMaskInterval":
+        # [FUNCTION DOC] Return the interval keeping all 32 lanes (zero to 32).
         return cls(sympy.Integer(0), sympy.Integer(32))
 
     def is_full(self) -> bool:
+        # [FUNCTION DOC] Return True when the interval is exactly the full zero-to-32 range.
         return self.lower_lane == 0 and self.upper_lane_exclusive == 32
 
     def with_symbol_codes(
         self, symbol_codes: Mapping[sympy.Symbol, str]
     ) -> "PackedMaskInterval":
+        # [FUNCTION DOC] Return a copy of this interval carrying (a copy of) the given symbol code mapping.
         return dataclasses.replace(self, symbol_codes=dict(symbol_codes))
 
     def render_lower(self) -> str:
+        # [FUNCTION DOC] Render the lower bound as CuTe index code (raises AssertionError if unrenderable).
         return self._render(self.lower_lane)
 
     def render_upper(self) -> str:
+        # [FUNCTION DOC] Render the exclusive upper bound as CuTe index code (raises AssertionError if unrenderable).
         return self._render(self.upper_lane_exclusive)
 
     def keep_mask_expr(self) -> str:
+        # [FUNCTION DOC] Render the 32-bit CuTe keep-mask expression for this interval.
+        # Both bounds are clamped to the range 0 to 32; the mask is the intersection of a mask keeping the low (32 - upper)
+        # shifted bits and one clearing the lowest lower bits. Returns a code string.
         """Render the 32-bit CuTe keep-mask expression for this interval."""
         lower = self.render_lower()
         upper = self.render_upper()
@@ -96,6 +111,7 @@ class PackedMaskInterval:
         )
 
     def _render(self, expr: sympy.Expr) -> str:
+        # [FUNCTION DOC] HELPER: Render one sympy expression using this interval's symbol codes; raises AssertionError on failure.
         rendered = sympy_to_cute_index(expr, self.symbol_codes)
         if rendered is None:
             raise AssertionError(f"failed to render expr to cute index: {expr}")
@@ -107,6 +123,7 @@ MaybeIntervalSet = IntervalSet | None
 
 
 def is_bool_full_node(node: torch.fx.Node, value: bool) -> bool:
+    # [FUNCTION DOC] Return True if the FX node is a call to aten.full producing a scalar boolean equal to value.
     return (
         node.op == "call_function"
         and node.target is torch.ops.aten.full.default
@@ -117,6 +134,7 @@ def is_bool_full_node(node: torch.fx.Node, value: bool) -> bool:
 
 
 def _simplify_expr(expr: sympy.Expr) -> sympy.Expr:
+    # [FUNCTION DOC] HELPER: Simplify an expression with Inductor sizevars when a graph is active, else plain sympy simplify.
     """Simplify with Inductor sizevars when available, otherwise use SymPy."""
     if isinstance(V.graph, NullHandler):
         return sympy.simplify(expr)
@@ -127,6 +145,7 @@ def render_sympy_args(
     args: Sequence[sympy.Expr],
     symbol_codes: Mapping[sympy.Symbol, str] | None,
 ) -> list[str] | None:
+    # [FUNCTION DOC] Render each child expression to CuTe code; return the list, or None if any child is unsupported.
     """Render every child expression, returning ``None`` if any is unsupported."""
     rendered = []
     for arg in args:
@@ -140,6 +159,9 @@ def render_sympy_args(
 def sympy_to_cute_index(
     expr: sympy.Expr, symbol_codes: Mapping[sympy.Symbol, str] | None = None
 ) -> str | None:
+    # [FUNCTION DOC] Render a supported sympy integer expression as CuTe index code, or None if unsupported.
+    # Supports integers, symbols (via symbol_codes, or the names q_idx and kv_idx), floor division, sums, products and
+    # min/max. The expression is simplified first. Pure apart from reading the active graph's sizevars.
     """Render a supported SymPy integer expression as CuTe index code."""
     expr = _simplify_expr(expr)
     match expr:
@@ -178,10 +200,13 @@ def sympy_to_cute_index(
 
 
 def is_aten_index_node(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the FX node is a call to aten.index.Tensor.
     return node.op == "call_function" and node.target is torch.ops.aten.index.Tensor
 
 
 def fx_node_dtype(expr: torch.fx.Node) -> torch.dtype | None:
+    # [FUNCTION DOC] Read an FX node's dtype from tensor_meta, then from a fake value, then recursively from the base of an
+    # aten.index node; None if unknown.
     """Read an FX node dtype from metadata, following aten.index bases if needed."""
     tensor_meta = expr.meta.get("tensor_meta")
     if tensor_meta is not None:
@@ -197,6 +222,7 @@ def fx_node_dtype(expr: torch.fx.Node) -> torch.dtype | None:
 
 
 def fx_node_shape(expr: torch.fx.Node) -> tuple[int, ...] | None:
+    # [FUNCTION DOC] Read an FX node's shape as a tuple from tensor_meta or a fake tensor value; None if unknown.
     """Read an FX node shape from tensor metadata or fake tensor value."""
     tensor_meta = expr.meta.get("tensor_meta")
     if tensor_meta is not None:
@@ -209,6 +235,12 @@ def fx_node_shape(expr: torch.fx.Node) -> tuple[int, ...] | None:
 
 @dataclasses.dataclass
 class PackedMaskAnalyzer:
+    # [CLASS DOC] Lowers one mask_mod FX graph into a union of packed 32-lane intervals.
+    # Treats the 32 lanes as kv_idx plus a lane offset and rewrites comparisons into interval bounds over the lane.
+    # Attributes: nonnegative_indices, q_idx, kv_idx (FX placeholders); q_symbol, kv_symbol, lane_symbol (sympy symbols);
+    # symbol_codes (CuTe code for temporary aux-load symbols, mutated during analysis); placeholder_codes and
+    # placeholder_exprs (renderings of lane-uniform placeholders); aux_load_symbols (cache of load node to symbol);
+    # next_symbol_id (counter). Key method: node_to_intervals. Unsupported structure yields None.
     """Lower one Flex mask_mod FX graph to packed 32-lane mask intervals.
 
     The analyzer treats each packed mask as a 32-lane window starting at kv_idx,
@@ -258,6 +290,9 @@ class PackedMaskAnalyzer:
     next_symbol_id: int = 0
 
     def node_to_intervals(self, node: torch.fx.Node) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Lower a boolean FX node into an interval set, or None if unsupported.
+        # Handles constant booleans, and/or (intersect/union), comparisons (le, lt, ge, gt with operands swapped for ge/gt),
+        # eq, ne (complement of eq) and logical/bitwise not. Recurses into operand nodes.
         """Lower one supported boolean FX node into packed mask intervals."""
         if is_bool_full_node(node, True):
             return (PackedMaskInterval.full(),)
@@ -305,6 +340,8 @@ class PackedMaskAnalyzer:
     def combine_binary_intervals(
         self, node: torch.fx.Node, *, intersect: bool
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Combine the intervals of both operands of a binary logical node by intersection or union.
+        # Returns None if an operand is not an FX node or is unsupported.
         lhs, rhs = node.args
         if not isinstance(lhs, torch.fx.Node) or not isinstance(rhs, torch.fx.Node):
             return None
@@ -321,12 +358,14 @@ class PackedMaskAnalyzer:
         *,
         strict: bool,
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Lower a lhs-less-than(-or-equal) rhs comparison to intervals; strict selects less-than. None if unsupported.
         exprs = self.mask_operands_to_sympy(lhs, rhs)
         if exprs is None:
             return None
         return self.lane_comparison_to_intervals(*exprs, strict=strict)
 
     def equality_to_intervals(self, lhs: object, rhs: object) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Lower an equality of two mask operands to intervals; None if unsupported.
         exprs = self.mask_operands_to_sympy(lhs, rhs)
         if exprs is None:
             return None
@@ -335,6 +374,7 @@ class PackedMaskAnalyzer:
     def mask_operands_to_sympy(
         self, lhs: object, rhs: object
     ) -> tuple[sympy.Expr, sympy.Expr] | None:
+        # [FUNCTION DOC] Translate both operands to sympy expressions; return the pair or None if either fails.
         lhs_expr = self.fx_mask_expr_to_sympy(lhs)
         rhs_expr = self.fx_mask_expr_to_sympy(rhs)
         if lhs_expr is None or rhs_expr is None:
@@ -348,6 +388,9 @@ class PackedMaskAnalyzer:
         *,
         strict: bool,
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Convert a lane-dependent comparison into one interval using the lane coefficient of the difference.
+        # Coefficient 1 gives a prefix interval, minus 1 a suffix interval, 0 an all-or-none encoded in the upper bound.
+        # Other coefficients or non-affine differences return None; also None if bounds cannot be rendered.
         """Convert ``lhs_expr < rhs_expr`` or ``lhs_expr <= rhs_expr`` to an interval.
 
         The caller normalizes ``>`` and ``>=`` by swapping operands, so this method
@@ -392,6 +435,9 @@ class PackedMaskAnalyzer:
     def lane_equality_to_intervals(
         self, lhs_expr: sympy.Expr, rhs_expr: sympy.Expr
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Convert an equality into packed intervals.
+        # Matching floor divisions of q_idx and the lane-expanded kv_idx become a block interval; otherwise the lane
+        # coefficient decides: plus or minus 1 gives a singleton lane, 0 gives all-or-none. Other cases return None.
         """Convert ``lhs_expr == rhs_expr`` to packed keep intervals.
 
         Matching ``FloorDiv`` expressions can describe a contiguous block, e.g.
@@ -436,6 +482,7 @@ class PackedMaskAnalyzer:
     def _floor_div_equality_to_intervals(
         self, lhs_expr: FloorDiv, rhs_expr: FloorDiv
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] HELPER: Turn equality of same-divisor floor divisions of q_idx and kv_idx into a block interval, else None.
         """Convert matching block-id equality into a contiguous lane interval."""
         lhs_base, lhs_divisor = lhs_expr.args
         rhs_base, rhs_divisor = rhs_expr.args
@@ -456,6 +503,7 @@ class PackedMaskAnalyzer:
     def interval_if_renderable(
         self, lower: sympy.Expr, upper: sympy.Expr
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Build a single interval from lower and upper if both bounds can be rendered to CuTe, else None.
         if (
             sympy_to_cute_index(lower, self.symbol_codes) is not None
             and sympy_to_cute_index(upper, self.symbol_codes) is not None
@@ -464,6 +512,8 @@ class PackedMaskAnalyzer:
         return None
 
     def complement_intervals(self, intervals: MaybeIntervalSet) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Complement an interval set within 32 lanes by intersecting the two complement pieces of every interval.
+        # None input yields None; the result may be None if the code-size cap is exceeded.
         """Complement a keep-set within the 32-lane window via De Morgan.
 
         The complement of a union of intervals is the intersection of each
@@ -489,6 +539,7 @@ class PackedMaskAnalyzer:
     def union_interval_sets(
         self, intervals: MaybeIntervalSet, new_intervals: MaybeIntervalSet
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Concatenate two interval sets; None if either is None or the combined count exceeds the size cap.
         """Union supported interval sets while enforcing the code-size cap."""
         if intervals is None or new_intervals is None:
             return None
@@ -504,6 +555,7 @@ class PackedMaskAnalyzer:
         intervals: MaybeIntervalSet,
         new_intervals: MaybeIntervalSet,
     ) -> MaybeIntervalSet:
+        # [FUNCTION DOC] Intersect two interval sets pairwise (max of lowers, min of uppers); None if either is None or the product count exceeds the size cap.
         """Intersect supported interval sets while enforcing the code-size cap."""
         if intervals is None or new_intervals is None:
             return None
@@ -523,6 +575,8 @@ class PackedMaskAnalyzer:
         )
 
     def fx_mask_expr_to_sympy(self, expr: object) -> sympy.Expr | None:
+        # [FUNCTION DOC] Translate a mask operand to a sympy expression with kv_idx expanded as base plus lane.
+        # Uses placeholder expressions and the aux-load symbol hook; returns None if unsupported.
         """Translate a mask expression with kv_idx expanded by mask_lane."""
         index_symbols = {
             self.q_idx: self.q_symbol,
@@ -532,6 +586,8 @@ class PackedMaskAnalyzer:
         return fx_aux_index_to_sympy(expr, index_symbols, self.mask_aux_load_to_symbol)
 
     def mask_aux_load_to_symbol(self, node: torch.fx.Node) -> sympy.Expr | None:
+        # [FUNCTION DOC] Return (creating and caching) a temporary integer symbol standing for a lane-uniform aux tensor load.
+        # Records its CuTe code in symbol_codes and increments the counter; None if the node is not a renderable aten.index.
         """Assign a temporary SymPy symbol to a supported aux tensor load."""
         if not is_aten_index_node(node):
             return None
@@ -553,6 +609,9 @@ class PackedMaskAnalyzer:
         for_index: bool = False,
         index_dim_size: int | sympy.Expr | None = None,
     ) -> str | None:
+        # [FUNCTION DOC] Render an expression that does not vary across packed KV lanes as CuTe code, else None.
+        # Supports integer constants (negative index wrapped when for_index and the size is known), known placeholders,
+        # aten.index loads, floor division and add/sub/mul/remainder. kv_idx itself is rejected.
         """Render an expression that is invariant across the packed KV lanes."""
         if isinstance(expr, int | sympy.Integer):
             index = int(expr)
@@ -597,6 +656,9 @@ class PackedMaskAnalyzer:
         *,
         for_index: bool,
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Render a scalar integer aten.index load whose base and indices are lane uniform.
+        # Requires an integer dtype and scalar result; wraps negative runtime indices by adding the dimension size unless the
+        # index is known nonnegative (requires an integer size). Returns code string or None.
         """Render a scalar integer aten.index load that is uniform across lanes."""
         if fx_node_dtype(expr) not in (
             torch.int8,
@@ -648,6 +710,8 @@ class PackedMaskAnalyzer:
 
 @dataclasses.dataclass(frozen=True)
 class PackedMaskAuxPlaceholderMap:
+    # [CLASS DOC] Frozen mapping of mask_mod aux placeholders to CuTe code strings (codes) and sympy expressions (exprs)
+    # for scalar captures.
     """Maps mask_mod aux placeholders to runtime scalar expressions or tensors."""
 
     codes: Mapping[torch.fx.Node, str]
@@ -660,6 +724,9 @@ class PackedMaskAuxPlaceholderMap:
         other_buffers: Sequence[object],
         symbol_codes: Mapping[sympy.Symbol, str],
     ) -> "PackedMaskAuxPlaceholderMap | None":
+        # [FUNCTION DOC] Build the placeholder map from placeholders and captured buffers, or None if a scalar cannot be rendered.
+        # Scalar captures map to rendered code and expression; tensor captures (and trailing placeholders beyond the buffers)
+        # map to numbered aux_tensors entries.
         """Render lane-uniform mask_mod captures for packed interval analysis."""
         codes: dict[torch.fx.Node, str] = {}
         exprs: dict[torch.fx.Node, sympy.Expr] = {}
@@ -685,6 +752,10 @@ def select_packed_mask_intervals(
     other_buffers: Sequence[object] = (),
     aux_scalar_symbol_codes: Mapping[sympy.Symbol, str] | None = None,
 ) -> MaybeIntervalSet:
+    # [FUNCTION DOC] Entry point: select packed 32-lane intervals for a mask_mod graph.
+    # Requires at least four placeholders (batch, head, q, kv, then aux) and a single output. Returns a tuple of intervals
+    # (each tagged with the final symbol codes), or None when unsupported, when lowering fails (logs a perf hint with the
+    # graph), or when the result is the trivial full interval. Reads/writes no global state beyond logging.
     """Entry point for selecting packed mask intervals from a mask_mod graph.
 
     Returns ``None`` when the graph is unsupported, when interval packing would

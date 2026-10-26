@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Flex attention backend that lowers to the CuTe DSL flash-attention-4 (FA4) kernels.
+# Provides config selection (vector widths, packed mask intervals), availability checks for the optional
+# flash_attn.cute package, a CuTe-friendly hierarchical indexer patch for FixedLayout, and the forward and
+# backward kernel builders that create CuteDSL template choices and autotune them.
+# Import-time side effects: creates the forward and backward CuteDSLTemplate objects (loading template sources)
+# and binds the aten and prims op namespaces.
 """Call into flash-attention 4 for flexattention"""
 
 import dataclasses
@@ -38,6 +44,10 @@ from .interval_mask_packing import PackedMaskInterval, select_packed_mask_interv
 
 @dataclasses.dataclass
 class FlexFlashConfig:
+    # [CLASS DOC] Autotuning configuration for one CuteDSL flex flash attention kernel candidate.
+    # Fields: score_mod_vec_size (elements per thread for score_mod, None = kernel default), mask_mod_vec_size
+    # (consecutive KV lanes per mask_mod call), mask_mod_packed_intervals (precomputed 32-lane packed mask
+    # intervals or None). Plain mutable dataclass with no invariants beyond the defaults being None.
     """Autotuning configuration for CuteDSL flex flash attention kernels.
 
     score_mod_vec_size: Number of elements processed per thread in the score_mod
@@ -58,6 +68,10 @@ class FlexFlashConfig:
 def collect_aux_scalar_symbols(
     *buffer_groups: Sequence[Any],
 ) -> tuple[sympy.Symbol, ...]:
+    # [FUNCTION DOC] HELPER: Collect the distinct sympy symbols appearing in captured aux buffers.
+    # Takes any number of groups of buffers; only entries that are sympy expressions (scalar captures) are inspected.
+    # Symbols inside each expression are visited in name order; the result is a tuple in first-seen order without
+    # duplicates. Pure; raises nothing.
     symbols: dict[sympy.Symbol, None] = {}
     for buffers in buffer_groups:
         for buffer in buffers:
@@ -79,6 +93,13 @@ def get_flex_flash_fwd_configs(
     mask_mod_other_buffers: Sequence[TensorBox] = (),
     aux_scalar_symbols: Sequence[sympy.Symbol] = (),
 ) -> list[FlexFlashConfig]:
+    # [FUNCTION DOC] Build the list of FlexFlashConfig candidates for the forward kernel.
+    # Queries the CUDA compute capability (only when CUDA is available and a mask_mod or aux-tensor score_mod exists)
+    # to pick mask_mod and score_mod vector widths via the aux_vectorization selectors. On SM100/SM110 with a mask_mod
+    # graph it also tries to compute packed mask intervals, and when found forces the default mask vector size.
+    # Under max_autotune with an unconstrained score_mod it emits one config per power-of-two width from 1 to 128;
+    # otherwise a single config. The list is truncated to the test config max_flex_configs when set. Reads global
+    # config only; no mutation.
     cuda_major = None
     if torch.cuda.is_available() and (
         has_mask_mod or (has_score_mod and has_aux_tensors)
@@ -135,6 +156,7 @@ def get_flex_flash_fwd_configs(
 
 
 def _get_flex_flash_bwd_configs() -> list[FlexFlashConfig]:
+    # [FUNCTION DOC] HELPER: Return the single default (all-None) config used for the backward kernel.
     return [FlexFlashConfig()]
 
 
@@ -150,6 +172,7 @@ FLASH_ATTENTION_INSTALL_MESSAGE = (
 
 
 def _flash_attention_unavailable_message() -> str:
+    # [FUNCTION DOC] HELPER: Build the error message used when flash_attn.cute is not importable (includes install hint).
     return (
         "CUTE flash attention library is not available. "
         f"{FLASH_ATTENTION_INSTALL_MESSAGE}"
@@ -158,6 +181,8 @@ def _flash_attention_unavailable_message() -> str:
 
 @functools.lru_cache(maxsize=1)
 def ensure_flash_available() -> bool:
+    # [FUNCTION DOC] Return True if the flash_attn.cute package can be found (spec lookup only, no import of it).
+    # Result is cached (single entry); call cache_clear to retry after installing. Returns False on ImportError.
     """Check if flash-attn is importable; cache the result for reuse.
 
     Call ensure_flash_available.cache_clear() after installing flash-attn
@@ -171,6 +196,9 @@ def ensure_flash_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def flash_supports_aux_scalars() -> bool:
+    # [FUNCTION DOC] Return True if the installed FA4 forward and backward entry points both accept an aux_scalars
+    # parameter (needed for scalar captures). Imports flash_attn.cute.interface and inspects signatures; returns False
+    # if the import fails. Result is cached.
     """Check whether the installed FA4 package supports scalar captures."""
     try:
         interface = importlib.import_module("flash_attn.cute.interface")
@@ -195,6 +223,9 @@ flash_attention_backward_cutedsl_template = CuteDSLTemplate(
 
 
 class HierarchicalIndex(sympy.Function):
+    # [CLASS DOC] Inert sympy Function node that carries an N-dimensional index tuple through Inductor IR.
+    # It never simplifies (eval returns nothing), so CuteDSL codegen can recover per-dimension coordinates from its args
+    # instead of a flattened offset. Short-lived; only interpreted by the CuteDSL kernel codegen.
     """
     Inert wrapper to carry an N-D index tuple through Inductor's SymPy-based IR.
 
@@ -214,6 +245,7 @@ class HierarchicalIndex(sympy.Function):
 
     @classmethod
     def eval(cls, *args):
+        # [FUNCTION DOC] HELPER: Sympy eval hook that always returns None so the node stays unevaluated.
         return None
 
 
@@ -222,9 +254,15 @@ def _hierarchical_indexer_cute(
     stride: Sequence[int] | None = None,
     offset: Expr = Integer(0),
 ) -> Callable[[Sequence[Expr]], Expr]:
+    # [FUNCTION DOC] HELPER: Return an indexer function that preserves multi-dimensional indices for CuteDSL.
+    # Takes tensor size, optional stride and offset (stride is unused). The returned indexer rejects a non-zero offset
+    # or a rank mismatch (AssertionError), returns zero for no indices, the index itself for one dimension, and a
+    # HierarchicalIndex wrapping all indices otherwise.
     """Return an indexer that preserves multi-dimensional indices for CuteDSL."""
 
     def indexer(indices: Sequence[Expr]) -> Expr:
+        # [FUNCTION DOC] HELPER: Map a list of per-dimension indices to a single index expression (see enclosing function).
+        # Raises AssertionError if the captured offset is non-zero or the number of indices differs from the tensor rank.
         if offset != Integer(0):
             raise AssertionError("Offset not supported for hierarchical indexing")
         if len(indices) != len(size):
@@ -242,6 +280,9 @@ def _hierarchical_indexer_cute(
 
 @contextmanager
 def patch_fixed_layout_indexer_for_cutedsl():
+    # [FUNCTION DOC] Context manager that temporarily replaces FixedLayout.make_indexer with the hierarchical indexer.
+    # Mutates the class attribute for the duration of the block (global, not thread safe) and always restores the
+    # original on exit. Safe only because flex flash attention emits pointwise reads and no stores.
     """
     Temporarily swap FixedLayout.make_indexer so CuteDSL sees hierarchical indexing.
 
@@ -253,6 +294,7 @@ def patch_fixed_layout_indexer_for_cutedsl():
     original_make_indexer = FixedLayout.make_indexer
 
     def cutedsl_make_indexer(self):
+    # [FUNCTION DOC] HELPER: Replacement make_indexer that builds the hierarchical indexer from the layout's size, stride, offset.
         return _hierarchical_indexer_cute(self.size, self.stride, self.offset)
 
     FixedLayout.make_indexer = cutedsl_make_indexer  # type: ignore[assignment]
@@ -263,6 +305,8 @@ def patch_fixed_layout_indexer_for_cutedsl():
 
 
 def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
+    # [FUNCTION DOC] Wrap a template choice's make_kernel_render so rendering runs under the CuteDSL indexer patch.
+    # Mutates the choice in place (replaces its make_kernel_render attribute); returns None.
     """
     Wrap a template choice's kernel render to apply CuteDSL indexer patching.
 
@@ -273,9 +317,11 @@ def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
     original_make_kernel_render = choice.make_kernel_render
 
     def make_kernel_render_with_patch(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Call the original make_kernel_render and return its render_kernel plus a patched render callable.
         render_kernel, render = original_make_kernel_render(*args, **kwargs)
 
         def render_with_patch():
+        # [FUNCTION DOC] HELPER: Run the original render with the CuteDSL indexer patch active and return its result.
             with patch_fixed_layout_indexer_for_cutedsl():
                 return render()
 
@@ -285,6 +331,9 @@ def wrap_choice_render_with_cutedsl_indexer(choice: Any) -> None:
 
 
 def input_buffers_require_grads(graph_module, num_score_mod_placeholders: int):
+    # [FUNCTION DOC] Return True if any graph input beyond the first num_score_mod_placeholders requires gradients.
+    # Walks the placeholders of the graph module; the extra ones are captured buffers, whose requires_grad flag comes
+    # from tensor_meta metadata (missing metadata counts as False). Returns False when there are no extra inputs.
     """Check if any of the input buffers (beyond the score mod placeholders) require gradients."""
     inputs = []
     for node in graph_module.graph.nodes:
@@ -294,6 +343,7 @@ def input_buffers_require_grads(graph_module, num_score_mod_placeholders: int):
         return False
 
     def requires_grad(n):
+    # [FUNCTION DOC] HELPER: Return the requires_grad flag from a node's tensor_meta, or False if absent.
         tensor_meta = n.meta.get("tensor_meta")
         return tensor_meta.requires_grad if tensor_meta is not None else False
 
@@ -301,6 +351,8 @@ def input_buffers_require_grads(graph_module, num_score_mod_placeholders: int):
 
 
 def is_trivial_score_graph(graph_module: GraphModule) -> bool:
+    # [FUNCTION DOC] Return True if the score_mod graph is the identity (output is the first placeholder).
+    # Raises AssertionError if the graph does not have exactly one output node.
     """Backwards currently doesn't support score_mods, match against identity"""
     graph = graph_module.graph
     nodes = list(graph.nodes)
@@ -314,6 +366,9 @@ def is_trivial_score_graph(graph_module: GraphModule) -> bool:
 
 
 def is_trivial_mask_graph(graph_module: GraphModule) -> bool:
+    # [FUNCTION DOC] Return True if the mask_mod graph is trivial: exactly four placeholders and an output produced by
+    # aten.full.default. Raises AssertionError if there is not exactly one output node.
+    # KNOWN ISSUE: does not check the fill value, so a full-False mask would also be treated as trivial.
     """Mask graph is trivial when it only gates via the default full op."""
     graph = graph_module.graph
     nodes = list(graph.nodes)
@@ -331,6 +386,8 @@ def has_unsupported_cpu_scalar_tensor_captures(
     score_mod_other_buffers: Sequence[Any],
     mask_mod_other_buffers: Sequence[Any],
 ) -> bool:
+    # [FUNCTION DOC] Return True if any captured buffer is a TensorBox on CPU with zero dimensions.
+    # Such captures are not supported until scalarized. Inspects both buffer lists; pure.
     """Return True for CPU 0-d tensor captures that need scalarization first."""
     for buf in list(score_mod_other_buffers) + list(mask_mod_other_buffers):
         if isinstance(buf, TensorBox):
@@ -346,6 +403,10 @@ def _can_use_flex_flash_attention(
     mask_graph: Subgraph,
     num_score_mod_placeholders: int,
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC] Check whether flex flash attention (forward) can run.
+    # Returns (can_use, reason): False with an install message when flash_attn.cute is missing, False when captured
+    # inputs of the score_mod graph require gradients, otherwise (True, empty string).
+    # KNOWN ISSUE: the mask_graph argument is accepted but never used.
     """Check if flex flash attention can be used for the given inputs.
 
     Returns:
@@ -370,6 +431,10 @@ def _use_flex_flash_attention(
     num_score_mod_placeholders: int,
     backend: Literal["AUTO", "TRITON", "FLASH", "TRITON_DECODE"],
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the FLASH backend is used for the forward pass.
+    # Returns False unless backend is FLASH. For FLASH, raises RuntimeError with the reason if
+    # _can_use_flex_flash_attention fails; returns True otherwise.
+    # KNOWN ISSUE: kernel_options is accepted but unused.
     """Determine if we should use flex flash attention for the given inputs.
 
     Args:
@@ -420,6 +485,16 @@ def create_flex_flash_attention_kernel(
     mask_graph: Subgraph,
     subgraph: Subgraph | None = None,
 ) -> tuple[TensorBox, TensorBox]:
+    # [FUNCTION DOC] Build and autotune the CuteDSL flash attention forward kernel.
+    # Inputs: query/key/value, block mask pieces (kv_num_blocks, kv_indices and optional full-block versions), scale,
+    # score_mod and mask_mod subgraph buffers and captured buffers, sparse block sizes, graphs. Validates equal dtypes
+    # (ValueError) and flash availability (RuntimeError), allocates output (dense strides matched to query) and a
+    # float32 logsumexp buffer, decides which of score_mod, mask_mod and block mask are needed, and checks aux scalar
+    # support. For each config it appends a template choice (under the indexer patch); errors from the template raise
+    # RuntimeError when only one config exists or no choice results. Then it builds fake input generators for block
+    # metadata and selects the best choice with autotune_select_algorithm.
+    # Returns (output, logsumexp). Side effects: guards sparse block sizes as ints, registers choices in the graph.
+    # Note: logsumexp is passed as a mutated input of the template.
     """Create a flex flash attention kernel using CuteDSL template."""
     if query.dtype != key.dtype or query.dtype != value.dtype:
         raise ValueError(
@@ -597,6 +672,10 @@ def _can_use_flex_flash_attention_backward(
     score_mod_other_buffers: Sequence[TensorBox] | None = None,
     num_score_mod_placeholders: int = 5,
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC] HELPER: Check whether flex flash attention backward can run.
+    # Returns (can_use, reason): False when flash is missing, when captured inputs require grads, or when joint outputs
+    # include captured grads or mutated grads (not yet supported); otherwise (True, empty string).
+    # KNOWN ISSUE: mask_graph and score_mod_other_buffers are unused.
     if not ensure_flash_available():
         return False, _flash_attention_unavailable_message()
 
@@ -630,6 +709,9 @@ def _use_flex_flash_attention_backward(
     joint_outputs: Any | None = None,
     score_mod_other_buffers: Sequence[TensorBox] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Decide whether the FLASH backend is used for the backward pass.
+    # Returns False unless backend is FLASH; raises RuntimeError with the reason if the backward cannot be used.
+    # KNOWN ISSUE: does not forward a placeholder count, so the helper's default of 5 is always used.
     """Determine if we should use flex flash attention for the given inputs.
 
     Args:
@@ -687,6 +769,17 @@ def create_flex_flash_attention_backward_kernel(
     dq_kv_order: TensorBox | None = None,
     dq_kv_order_spt: bool | None = None,
 ) -> tuple[TensorBox | ShapeAsConstantBuffer, TensorBox, TensorBox, tuple]:
+    # [FUNCTION DOC] Build and autotune the CuteDSL flash attention backward kernel.
+    # Allocates grad_query/grad_key/grad_value buffers with strides matched to the inputs, uses the dq layout as the
+    # template output layout, and assembles input nodes (q, k, v, out, grad_out, logsumexp, grad buffers, then block
+    # mask metadata, dq write-order/kv-order tensors and optional grad_logsumexp). Checks capability of the installed
+    # flash_attn (dq_kv_order / spt support) and raises NotImplementedError when requested features are missing, plus
+    # NotImplementedError for dLSE with head_dim 256 on SM100/110. Handles deterministic mode: with block mask it needs
+    # SM100+, dq write-order and kv-order metadata, else raises (NotImplementedError / ValueError) or, in warn-only mode,
+    # disables determinism and emits a warning. Appends template choices and autotunes them.
+    # Returns (dq output, grad_key, grad_value, empty tuple); grad_key/grad_value are mutated inputs of the template.
+    # Raises RuntimeError when flash is unavailable, aux scalars unsupported, or no template choice could be built.
+    # KNOWN ISSUE: grad_key is sized with the query head_dim, which assumes key and query share head_dim.
     """Create a CuteDSL flash attention backward kernel for the default mod path."""
     if not ensure_flash_available():
         raise RuntimeError(_flash_attention_unavailable_message())

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] MPS (Apple Metal) lowering of flex attention in Inductor.
+# Defines the query-row tile size BLOCK_M and lower_mps, which validates inputs, generates a Metal shader for the
+# score_mod and mask_mod graphs, and wraps it in a MetalFlexAttentionNode. No import-time side effects besides constants.
 """MPS-specific lowering for flex attention."""
 
 import sympy
@@ -27,6 +30,15 @@ def lower_mps(
     score_mod_other_buffers,
     mask_mod_other_buffers,
 ):
+    # [FUNCTION DOC] Lower flex_attention to a Metal shader node for MPS.
+    # Inputs: query, key, value, score_mod subgraph, the block_mask tuple (sparse block metadata, block sizes, mask graph),
+    # scale, kernel_options (OUTPUT_LOGSUMEXP / OUTPUT_MAX flags) and captured buffers for score_mod and mask_mod.
+    # Raises NotImplementedError for dtypes other than float32/16/bfloat16, mixed dtypes, differing q/k head dims,
+    # SPARSE_Q_BLOCK_SIZE not a multiple of BLOCK_M, or Hq not a multiple of Hkv; AssertionError if batch sizes are not
+    # broadcastable. Realizes inputs, classifies captures as tensors (extra Metal buffers) or scalars (packed scalar args),
+    # generates the shader source, builds the output layout, scalar argument list (order must match the template) and a
+    # launch grid of (query blocks, Hq, B). Returns (output TensorBox, logsumexp, max_scores); the latter two are
+    # float32 buffers only written (and realized) when requested. Checks scalar captures fit in int32 when possible.
     """Lower flex_attention to a Metal shader for MPS."""
     from ...codegen.metal_flex_attention_template import (
         _generate_metal_shader,
@@ -132,6 +144,9 @@ def lower_mps(
     # passes SymInts through untouched. `metas` keeps the placeholder order so
     # the subgraph codegen can bind each capture (tensor or scalar) by position.
     def _capture_meta(items):
+    # [FUNCTION DOC] HELPER: Split captured buffers into metadata, tensors and scalars.
+    # Realizes tensors; SymInt/sympy/int captures become scalar entries, tensors record guarded sizes, strides and dtype.
+    # Returns (metas in placeholder order, tensor list, scalar list).
         metas, tensors, scalars = [], [], []
         for cap in maybe_realize(list(items)):
             if isinstance(cap, ShapeAsConstantBuffer):
@@ -274,12 +289,15 @@ def lower_mps(
 
 
 def _get_strides(node):
+    # [FUNCTION DOC] HELPER: Return the stride list of a node, or an empty list when the node is None.
     if node is None:
         return []
     return list(node.get_stride())
 
 
 def _pad_strides(strides, target_len):
+    # [FUNCTION DOC] HELPER: Left-pad strides with zeros to target_len (zero stride broadcasts missing leading dims);
+    # if longer than target_len, keep only the last target_len entries.
     """Left-pad strides to target_len with 0 (broadcast over missing leading dims)."""
     strides = list(strides)
     if len(strides) > target_len:
