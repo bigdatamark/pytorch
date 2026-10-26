@@ -1,3 +1,8 @@
+# [MODULE DOC] Post-functionalization FX graph pass that rewrites complex-valued
+# ops into real-valued ops. Main entry point is decompose_complex_in_graph; the
+# private helpers detect complex tensors, wrap/unwrap them as ComplexTensor
+# subclass instances, and reject in-place mutation of complex tensors. Retracing
+# uses make_fx under WrapComplexMode. No import-time side effects.
 """
 Graph pass to decompose complex-valued operations into real-valued operations.
 
@@ -29,6 +34,9 @@ if TYPE_CHECKING:
 
 
 def _can_wrap(value: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if value is a plain (non-ComplexTensor)
+    # tensor with a complex dtype, i.e. one that should be wrapped. Anything else
+    # (non-tensors, real tensors, already-wrapped ComplexTensors) gives False.
     return (
         isinstance(value, Tensor)
         and value.dtype.is_complex
@@ -37,18 +45,26 @@ def _can_wrap(value: Any) -> bool:
 
 
 def _maybe_wrap(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: If value is a wrappable complex tensor, returns a
+    # ComplexTensor built from its real and imaginary parts; otherwise returns
+    # value unchanged.
     if _can_wrap(value):
         return ComplexTensor(torch.real(value), torch.imag(value))
     return value
 
 
 def _maybe_unwrap(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: If value is a ComplexTensor, converts it back to an
+    # ordinary interleaved complex tensor; otherwise returns value unchanged.
     if isinstance(value, ComplexTensor):
         return value.as_interleaved()
     return value
 
 
 def _has_complex(gm: fx.GraphModule, flat_args: list[Any]) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any flat input is a wrappable complex
+    # tensor, or any call_function node in the graph has a complex tensor in its
+    # recorded "val" metadata. Pure query, no mutation.
     for arg in flat_args:
         if _can_wrap(arg):
             return True
@@ -61,6 +77,10 @@ def _has_complex(gm: fx.GraphModule, flat_args: list[Any]) -> bool:
 
 
 def _aliased_input_indices(op: torch._ops.OpOverload) -> list[int]:
+    # [FUNCTION DOC] HELPER: Using the op schema, collects the alias sets that
+    # returns belong to, then returns the positions of arguments whose alias set
+    # overlaps them (arguments the output may alias). Empty list if no return
+    # carries alias info.
     schema = op._schema
     ret_aliases = set()
     idxs = []
@@ -84,6 +104,10 @@ def _aliased_input_indices(op: torch._ops.OpOverload) -> list[int]:
 
 
 def _collect_storage_aliases(node: fx.Node) -> set[fx.Node]:
+    # [FUNCTION DOC] HELPER: Walks backward from node through OpOverload nodes,
+    # following the arguments each op may alias (per schema), and returns the set
+    # of all visited nodes including node itself. Non-OpOverload nodes are
+    # included but not expanded. Currently unused within this module.
     seen: set[fx.Node] = set()
     stack: list[fx.Node] = [node]
     while stack:
@@ -102,6 +126,13 @@ def _collect_storage_aliases(node: fx.Node) -> set[fx.Node]:
 
 
 def _assert_no_incorrect_aliasing_mutation(gm: fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Scans graph nodes and raises RuntimeError if any
+    # aten copy_ call has a complex-dtype destination (first argument, read from
+    # its "val" metadata), since in-place mutation of complex tensors is
+    # unsupported in a compiled region. Otherwise returns None.
+    # KNOWN ISSUE: the docstring describes three checks (incorrect aliases,
+    # mutated complex inputs, input/output aliasing) and mentions an
+    # INCORRECT_ALIASING_OPS list, but only the copy_ on complex check exists.
     """
     In this function, we check that the compiled graph respects aliasing semantics.
 
@@ -132,12 +163,22 @@ def decompose_complex_in_graph(
     flat_args: list[Any],
     decompositions: Mapping[OpOverload, Callable[..., Any]] | None = None,
 ) -> fx.GraphModule:
+    # [FUNCTION DOC] Entry point of the pass. If neither the flat inputs nor graph
+    # node metadata contain complex tensors, returns gm untouched. Otherwise
+    # validates there is no complex in-place mutation (may raise RuntimeError),
+    # then retraces gm with make_fx under WrapComplexMode: complex inputs are
+    # wrapped as ComplexTensor (real/imag parts), the graph is interpreted, and
+    # outputs are unwrapped back to complex. Optional decompositions is a table
+    # passed to make_fx. Returns a new GraphModule with the same signature.
     if not _has_complex(gm, flat_args):
         return gm
 
     _assert_no_incorrect_aliasing_mutation(gm)
 
     def wrapper(*args: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Traced function. Wraps complex args, runs gm with
+        # an fx Interpreter inside WrapComplexMode so complex ops decompose, and
+        # returns the result pytree with ComplexTensors converted back to complex.
         wrapped = tuple(_maybe_wrap(a) for a in args)
         with WrapComplexMode():
             result = fx.Interpreter(gm).run(*wrapped)

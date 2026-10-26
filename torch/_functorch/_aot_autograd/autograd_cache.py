@@ -1,3 +1,11 @@
+# [MODULE DOC] Local/remote caching of AOTAutograd compile results. Provides the
+# policy predicates (should_use_*_autograd_cache), cacheability checks over FX
+# graphs (check_node_safe, check_cacheable), the cache-key machinery
+# (AOTAutogradCacheDetails, AOTAutogradCachePickler, autograd_cache_key,
+# normalize_placeholder_names) and the AOTAutogradCache class that loads, saves
+# and bypasses entries on disk or in a remote cache. Cache misses or unsafe graphs
+# are signalled with BypassAOTAutogradCache/FXGraphCacheMiss. Import-time side
+# effects: creates a module logger only.
 """
 Utils for caching the outputs of AOTAutograd
 """
@@ -104,15 +112,25 @@ log = logging.getLogger(__name__)
 
 
 class BypassAOTAutogradCache(Exception):
+    # [CLASS DOC] Exception signalling that AOTAutograd caching must be skipped for
+    # the current graph (unsupported content, disabled features, cache failure).
+    # Carries only a message; callers catch it and fall back to a normal compile.
     pass
 
 
 # Used to signify when FXGraphCache missed when AOTAutogradCache uses it
 class FXGraphCacheMiss(BypassAOTAutogradCache):
+    # [CLASS DOC] Subclass of BypassAOTAutogradCache raised when the inner FX graph
+    # cache lookup missed, so the whole AOTAutograd entry is treated as a miss.
     pass
 
 
 def should_use_remote_autograd_cache() -> bool:
+    # [FUNCTION DOC] Decides whether the remote AOTAutograd cache is enabled.
+    # Returns False if caches are force-disabled; otherwise the explicit config
+    # value if set; otherwise False outside fbcode and in FB unit tests; otherwise
+    # compares the remote cache version against a justknob value (False if the
+    # internal remote cache module is missing).
     if torch.compiler.config.force_disable_caches:
         return False
     if config.enable_remote_autograd_cache is not None:
@@ -134,16 +152,28 @@ def should_use_remote_autograd_cache() -> bool:
 
 
 def should_use_local_autograd_cache() -> bool:
+    # [FUNCTION DOC] Returns False if caches are force-disabled globally, otherwise
+    # the enable_autograd_cache config value.
     if torch.compiler.config.force_disable_caches:
         return False
     return config.enable_autograd_cache
 
 
 def should_bundle_autograd_cache() -> bool:
+    # [FUNCTION DOC] Returns True if the bundled autograd cache config is on or
+    # dynamo's caching precompile mode is on (entries embed compiled artifacts).
     return config.bundled_autograd_cache or torch._dynamo.config.caching_precompile
 
 
 def check_node_safe(node: Node) -> None:
+    # [FUNCTION DOC] Validates that one FX node can be cached. call_function nodes
+    # need an allowlisted target (op overloads, safe numpy wrappers, public torch
+    # functional APIs, builtins, allowlisted functions, cacheable higher-order ops,
+    # or fx.wrap functions with a user cache hash); call_method nodes must act on a
+    # tensor-valued node with a string or method-descriptor name; placeholder,
+    # get_attr, call_module and output are accepted. Returns None when safe, raises
+    # BypassAOTAutogradCache otherwise (also for unknown ops). Raises AssertionError
+    # on malformed nodes (string call_function target, non-Node method receiver).
     """
     Checks that the node only uses supported operators. We are starting with very
     conservative cacheability constraints, and incrementally adding more support as we expand.
@@ -186,6 +216,8 @@ def check_node_safe(node: Node) -> None:
     )
 
     def is_public_torch_api(target: Callable[..., Any]) -> bool:
+        # [FUNCTION DOC] HELPER: True if target is defined in torch.functional or
+        # torch.nn.functional and its name does not start with an underscore.
         # Don't blindly allow private functions in the torch namespace
         is_private = target.__name__.startswith("_")
 
@@ -194,6 +226,10 @@ def check_node_safe(node: Node) -> None:
         )
 
     def is_safe_torch_function(target: Callable[..., Any]) -> bool:
+        # [FUNCTION DOC] HELPER: True if the qualified name of target is on an
+        # allowlist: the non-C-binding in-graph function set, the local safe list,
+        # or the inductor config's unsafe-marked-cacheable list. The custom autograd
+        # FunctionCtx is allowed only if the corresponding functorch config is on.
         """Allowlisted torch functions"""
         function_name = f"{target.__module__}.{target.__name__}"
         # Allow torch.autograd.function.FunctionCtx if custom autograd functions are allowed
@@ -212,6 +248,10 @@ def check_node_safe(node: Node) -> None:
         )
 
     def is_cacheable_function(target: Callable[..., Any]) -> bool:
+        # [FUNCTION DOC] HELPER: True if target is an op overload/packet, safe numpy
+        # wrapper, public torch API, builtin, allowlisted torch function or
+        # allowlisted non-torch function; for a higher-order operator, returns its
+        # own cacheable() answer.
         if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
             return True
         if is_safe_numpy_wrapper(target):
@@ -233,6 +273,8 @@ def check_node_safe(node: Node) -> None:
         return False
 
     def is_tensor(target: Node) -> bool:
+        # [FUNCTION DOC] HELPER: True if the node carries an example value in its
+        # metadata, which is used as the signal that it represents a tensor.
         # Tensors always have example values in meta field
         return "example_value" in target.meta
 
@@ -289,6 +331,11 @@ def check_node_safe(node: Node) -> None:
 
 
 def check_cacheable(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] Raises BypassAOTAutogradCache if inductor freezing is on, if
+    # neither the local nor remote FX graph cache is enabled, if the current tracing
+    # context fakifies on first call, or if any node is unsafe (see check_node_safe).
+    # Also recursively checks the saved-tensors-hook pack and unpack subgraphs when
+    # present. Returns None if cacheable.
     """
     Checks that the graph module only uses supported operators
     """
@@ -320,6 +367,8 @@ def check_cacheable(gm: torch.fx.GraphModule) -> None:
 
 
 def _get_context_fn_cache_hash(context_fn: Callable[..., Any]) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the user-supplied cache_hash attribute of a
+    # selective-activation-checkpointing context function, or None if absent.
     """
     Extract a cache hash from a context_fn used for selective activation checkpointing (SAC).
 
@@ -344,12 +393,17 @@ def _get_context_fn_cache_hash(context_fn: Callable[..., Any]) -> str | None:
 def _iter_graph_modules(
     gm: torch.fx.GraphModule,
 ) -> Generator[torch.fx.GraphModule, None, None]:
+    # [FUNCTION DOC] HELPER: Generator yielding gm and every nested submodule that
+    # is itself a GraphModule, in module traversal order.
     for module in gm.modules():
         if isinstance(module, torch.fx.GraphModule):
             yield module
 
 
 def _collect_context_fn_hashes(gm: torch.fx.GraphModule) -> list[str]:
+    # [FUNCTION DOC] HELPER: For each graph module (including nested ones) holding a
+    # checkpoint context function in its metadata, collects that function's cache
+    # hash. Raises BypassAOTAutogradCache if any such function has no hash.
     """
     Collect cache hashes from all context_fn used in SAC HOPs within the graph module.
 
@@ -375,6 +429,10 @@ def _collect_context_fn_hashes(gm: torch.fx.GraphModule) -> list[str]:
 
 
 def _collect_wrapped_user_cache_hashes(gm: torch.fx.GraphModule) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the user_cache_hash metadata of every node in
+    # gm marked as an fx.wrap function, in graph order.
+    # KNOWN ISSUE: indexes the metadata key directly, so a wrapped node lacking
+    # user_cache_hash raises a lookup error instead of a cache bypass.
     wrapped_user_cache_hashes = []
     for node in gm.graph.nodes:
         if node.meta and node.meta.get("is_wrapped", False):
@@ -385,6 +443,9 @@ def _collect_wrapped_user_cache_hashes(gm: torch.fx.GraphModule) -> list[str]:
 def _collect_saved_tensors_hooks_fx_wrap_cache_hashes(
     gm: torch.fx.GraphModule,
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] HELPER: If gm has saved-tensors-hook subgraphs, returns the
+    # wrapped-function user cache hashes of the pack subgraph and of the unpack
+    # subgraph as two lists; otherwise two empty lists.
     if not hasattr(gm, "saved_tensors_hooks_pack_0"):
         return ([], [])
 
@@ -403,6 +464,10 @@ def _collect_saved_tensors_hooks_fx_wrap_cache_hashes(
 def _get_custom_estimator_solver_uuids(
     autograd_config: Any,
 ) -> tuple[object | None, object | None]:
+    # [FUNCTION DOC] HELPER: Reads the memory-budget runtime estimator and knapsack
+    # solver from the given config object and returns their uuids as a pair (None
+    # for unset or string-named built-ins). Raises BypassAOTAutogradCache if a custom
+    # object's uuid is None or if the value is a raw callable without uuid support.
     """
     Extract uuid values from custom runtime estimator and solver configs if they have uuid() methods.
 
@@ -454,12 +519,23 @@ def _get_custom_estimator_solver_uuids(
 
 
 class AOTAutogradCacheDetails(FxGraphHashDetails):
+    # [CLASS DOC] Bag of everything that goes into an AOTAutograd cache key, built on
+    # the inductor FX graph hash details. Attributes set at construction: aot_config,
+    # act_input_paths, saved-tensors-hook wrap hashes, SAC context-fn hashes, region
+    # activation memory budget, custom estimator/solver uuids, grad mode, per-device
+    # autocast dtypes, deterministic-algorithms flag, saved autograd config and (if
+    # triton is installed) user triton kernel sources. It is then pickled by
+    # AOTAutogradCachePickler to produce the key.
     """
     Object to capture all the details for a dynamo graph module relevant to computing
     a safe and stable cache key for AOTAutograd.
     """
 
     def _iter_triton_kernels_from_node(self, node: Node) -> Generator[Any, None, None]:
+        # [FUNCTION DOC] HELPER: Yields registered user-defined triton kernels
+        # associated with the node's target: for an op packet, every overload
+        # attribute found; for a single overload, its own op name. Other targets
+        # yield nothing.
         if isinstance(node.target, torch._ops.OpOverloadPacket):
             for attr in node.target._dir:
                 custom_op = getattr(node.target, attr, None)
@@ -477,6 +553,10 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
         self,
         gm: torch.fx.GraphModule,
     ) -> list[str]:
+        # [FUNCTION DOC] Collects user-defined triton kernels referenced by any node
+        # in gm or its nested graph modules and returns, per kernel, the transitive
+        # source code string (autotuned kernels are unwrapped to the inner function).
+        # Raises AssertionError if triton is unavailable.
         if not has_triton_package():
             raise AssertionError("Triton is not available")
 
@@ -511,6 +591,12 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
         fx_config: _CompileFxKwargs,
         act_input_paths: ActInputPaths = (),
     ) -> None:
+        # [FUNCTION DOC] Captures runtime state (grad mode, autocast, determinism,
+        # autograd config, triton sources), saved-tensors-hook and SAC hashes, the
+        # graph-wide activation memory budget taken from the first node, and custom
+        # estimator/solver uuids (read from the live config module), then initializes
+        # the inductor hash details. Raises BypassAOTAutogradCache when anything is
+        # not hashable or inductor says the graph cannot be cached.
         # FxGraphHashDetails contains all the keys related to inductor. Also
         # includes some system info.
         self.aot_config = aot_config
@@ -542,6 +628,10 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
         self._init_fx_graph_hash_details(gm, example_inputs, fx_config)
 
     def _record_runtime_state(self, gm: torch.fx.GraphModule) -> None:
+        # [FUNCTION DOC] HELPER: Snapshots grad-enabled state, the autocast dtype of
+        # each enabled autocast device, the deterministic-algorithms flag and the
+        # saved functorch config onto self; if triton is installed also records the
+        # triton kernel sources used by gm.
         self.grad_enabled = torch.is_grad_enabled()
         # Include per-device autocast dtype in cache key to avoid reusing
         # a graph compiled for one autocast dtype (e.g. bfloat16) when
@@ -561,6 +651,10 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
         example_inputs: Sequence[Any],
         fx_config: _CompileFxKwargs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks that inductor's FX graph cache can handle the
+        # graph and config, then runs the parent hash-details initializer (with no
+        # extra inputs list). Converts inductor's BypassFxGraphCache into
+        # BypassAOTAutogradCache.
         try:
             # FXGraphCache has constraints on what can be pickled in its inductor
             # config. Check that the gm is cacheable by inductor first,
@@ -573,12 +667,22 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
 
 
 class AOTAutogradCachePickler(FxGraphCachePickler):
+    # [CLASS DOC] Pickler producing deterministic bytes for cache keys. Extends the
+    # inductor FX graph pickler with stable reducers for AOTConfig, tensors (metadata
+    # only), tensor subclasses (stable hash), fake script objects, graph modules
+    # (generated code plus non-graph state) and numpy wrappers. State: a mapping from
+    # raw symint names to normalized names and the set of symint names appearing in
+    # the graph.
     def __init__(
         self,
         gm: torch.fx.GraphModule,
         symint_name_map: dict[str, str] | None = None,
         graph_symint_names: set[str] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base pickler for gm, stores the optional
+        # symint name normalization map and graph symint name set (default empty),
+        # and registers the AOTConfig, tensor and fake script object reducers in
+        # the dispatch table.
         super().__init__(gm)
         self._symint_name_map: dict[str, str] = symint_name_map or {}
         self._graph_symint_names: set[str] = graph_symint_names or set()
@@ -594,6 +698,12 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     def _reduce_symint(
         self, s: torch.SymInt
     ) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        # [FUNCTION DOC] HELPER: Reducer for symbolic ints. Looks up the normalized
+        # name; for graph symints returns just the normalized name, for other
+        # normalized symints returns the normalized name with the symbolic hint (when
+        # available), and for unknown names returns the raw name. Result is an
+        # identity-reconstruction pair used by the pickler.
+        # KNOWN ISSUE: not registered in the dispatch table in this class.
         name = str(s)
         normalized = self._symint_name_map.get(name)
         if normalized is not None:
@@ -608,6 +718,11 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
 
     # pyrefly: ignore [bad-override]
     def reducer_override(self, obj: Any) -> Any:
+        # [FUNCTION DOC] Pickler hook called for every object. Graph modules go to the
+        # graph module reducer; numpy wrappers reduce to their cache key; tensor
+        # subclasses (not exact tensors) go to the subclass reducer; everything else
+        # falls back to the parent implementation. Returns a reduce tuple or the
+        # parent's result.
         """
         Override to handle tensor subclasses (like DTensor) that aren't caught
         by the dispatch_table's exact type matching.
@@ -629,6 +744,10 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
 
     @staticmethod
     def _format_global_for_cache_key(name: str, obj: Any) -> str:
+        # [FUNCTION DOC] HELPER: Static method rendering one generated-code global as
+        # a line of text for the key: a comment line with the numpy wrapper cache key
+        # for numpy wrappers, otherwise the import statement for the object computed
+        # with the package system importer.
         if (numpy_key := numpy_wrapper_cache_key(obj)) is not None:
             return f"# cache_key_numpy_wrapper {name}: {numpy_key!r}"
 
@@ -640,6 +759,11 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     def _reduce_graph_module_for_cache_key(
         self, gm: torch.fx.GraphModule
     ) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        # [FUNCTION DOC] HELPER: Reducer for GraphModules. Regenerates the Python code
+        # (using the real recompile if the module overrides it), copies the module
+        # state dict minus the graph object, and builds a sorted block of import lines
+        # for the code's globals. The pair (state, import block) is the stable payload.
+        # Side effect: triggers a recompile of gm.
         recompile = getattr(gm, "_real_recompile", gm.recompile)
         python_code = recompile()
         # FxGraphCache strips user-defined Triton side-table indices from
@@ -672,12 +796,20 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     # hash inner tensors and metadata.
 
     def _hash_bytes_for_cache(self, data: bytes) -> str:
+        # [FUNCTION DOC] HELPER: Returns a 16-byte blake2b hex digest of data, stable
+        # across processes (unlike the built-in hash).
         return hashlib.blake2b(data, digest_size=16).hexdigest()
 
     def _hash_pickled_value_for_cache(self, value: Any) -> str:
+        # [FUNCTION DOC] HELPER: Serializes value with the standard pickler and
+        # returns the stable digest of the bytes. Raises whatever pickling raises.
         return self._hash_bytes_for_cache(pickle.dumps(value))
 
     def _stable_hash_for_cache_value(self, obj: Any) -> str:
+        # [FUNCTION DOC] HELPER: Stable hash of an object found in subclass metadata.
+        # Order: object-provided stable hash method; traceable wrapper subclass via
+        # the default recursive hash; opaque custom class instance via its type name
+        # only; plain tensor via cache-key metadata; anything else via pickled bytes.
         """Get a stable hash for an object used inside tensor subclass metadata."""
         from torch._custom_class_base import CustomClassBase
         from torch.utils._python_dispatch import is_traceable_wrapper_subclass
@@ -699,6 +831,10 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     def _reduce_tensor_subclass(
         self, tensor: torch.Tensor
     ) -> tuple[Callable[..., Any], tuple[Any]]:
+        # [FUNCTION DOC] HELPER: Reducer for tensor subclass instances. Uses the
+        # subclass's own stable-hash method if present; else for traceable wrapper
+        # subclasses warns once and uses the default recursive hash; else falls back
+        # to the plain tensor metadata reducer. Returns an identity-reconstruction pair.
         from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
         if hasattr(tensor, "_stable_hash_for_caching"):
@@ -715,6 +851,8 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     def _collect_inner_tensor_hashes(
         self, tensor: torch.Tensor, inner_tensor_names: Sequence[str]
     ) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Maps each named inner tensor attribute of a subclass
+        # to its stable hash string.
         inner_hashes = {}
         for name in inner_tensor_names:
             inner_hashes[name] = self._stable_hash_for_cache_value(
@@ -723,6 +861,9 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
         return inner_hashes
 
     def _stabilize_tensor_subclass_metadata(self, obj: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Recursively rebuilds tuples, lists and mappings of
+        # subclass metadata, replacing opaque custom class instances by their type
+        # qualified name so the result is deterministic. Other values are unchanged.
         from torch._custom_class_base import CustomClassBase
 
         if isinstance(obj, CustomClassBase):
@@ -738,6 +879,9 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
         return obj
 
     def _default_stable_hash_for_caching(self, tensor: torch.Tensor) -> str:
+        # [FUNCTION DOC] HELPER: Stable hash for a traceable wrapper subclass built
+        # from its shape, requires_grad flag, stabilized flatten metadata and the
+        # stable hashes of its inner tensors.
         """
         Default stable hash implementation for traceable wrapper subclasses.
         """
@@ -753,6 +897,11 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
     def _reduce_aot_config(
         self, aot_config: AOTConfig
     ) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        # [FUNCTION DOC] HELPER: Reducer for AOTConfig. Converts to the cacheable
+        # config and keeps only key-relevant fields (parameter/buffer count, input
+        # mutation flag, export, no-tangents, dynamic shapes, arg position sources,
+        # static input indices, logging flag, pre-dispatch, precompile backend id),
+        # deliberately omitting the debug aot_id.
         """
         Reduce the config to a stable key for caching.
         """
@@ -776,6 +925,8 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
         )
 
     def _reduce_tensor(self, t: torch.Tensor) -> tuple[Callable[..., Any], tuple[Any]]:
+        # [FUNCTION DOC] HELPER: Reducer for plain tensors; only the cache-key
+        # metadata of the tensor is used, never its data or addresses.
         """
         Reduce the tensor to a stable key for caching.
         """
@@ -787,6 +938,13 @@ class AOTAutogradCachePickler(FxGraphCachePickler):
 def normalize_placeholder_names(
     gm: torch.fx.GraphModule,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that temporarily renames graph placeholders to
+    # canonical names (plain inputs p_0, p_1, ... and symbolic-int inputs s_0, ...,
+    # in sorted placeholder order), recompiling the module, so isomorphic graphs hash
+    # alike. Does nothing when normalization is disabled in config or gm has no graph.
+    # On exit (even on error) restores the original node names, targets and the
+    # graph's used-name set, recompiles again, and raises AssertionError if the
+    # restored counts mismatch. Mutates gm in place for the duration.
     """
     Context manager that normalizes the placeholder names in the graph module.
     This is used while generating a cache key for AOTAutogradCache, so that two graphs
@@ -861,6 +1019,10 @@ def create_fx_config(
     compiler_config_extra: CompilerConfigExtra | None = None,
     compile_region_name: str | None = None,
 ) -> _CompileFxKwargs:
+    # [FUNCTION DOC] Builds the inductor compile keyword mapping used for hashing and
+    # loading: cudagraphs flag, forward device index and compile region name. Without
+    # extra config, cudagraphs comes from a boxed copy of the inductor triton
+    # cudagraphs setting and the device index is None.
     if compiler_config_extra is None:
         cudagraphs = BoxedBool(torch._inductor.config.triton.cudagraphs)
         boxed_forward_device_index = None
@@ -875,6 +1037,11 @@ def create_fx_config(
 
 
 def _check_triton_cache_version() -> None:
+    # [FUNCTION DOC] HELPER: Raises BypassAOTAutogradCache if triton is installed
+    # with a version string below 3.2.0 (known CUDA-context init problem when
+    # loading cache entries); returns None otherwise or when triton is absent.
+    # KNOWN ISSUE: compares version strings lexicographically, which misorders
+    # versions such as 3.10.
     if not has_triton_package():
         return
 
@@ -895,6 +1062,9 @@ def _get_debug_lines_for_cache_key(
     details: AOTAutogradCacheDetails,
     key: str,
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns per-attribute hash description lines of the
+    # details object from the pickler, and logs them at debug level; returns an empty
+    # list (skipping the costly work) unless debug logging is enabled.
     # debug_lines re-hashes every attribute individually and is expensive. Only
     # compute when debug logging is enabled.
     if not log.isEnabledFor(logging.DEBUG):
@@ -917,6 +1087,13 @@ def autograd_cache_key(
     act_input_paths: ActInputPaths = (),
     # TODO: add args and parameters
 ) -> tuple[str, list[str]]:
+    # [FUNCTION DOC] Computes the AOTAutograd cache key for a graph module (or its
+    # wrapper) and example inputs. Records graph and input symint names for
+    # normalization, then, with the module sanitized, checks cacheability and the
+    # triton version, builds the details object and pickler, and returns the key
+    # (cache prefix plus hash) with the debug description lines. If key generation
+    # fails, returns a random nonce key and no lines when the bypass-key config is on,
+    # otherwise re-raises (typically BypassAOTAutogradCache).
     """
     Generate a unique hash of the FX graph for caching.
     """
@@ -971,6 +1148,10 @@ def autograd_cache_key(
 def sanitize_gm_for_cache(
     gm: torch.fx.GraphModule,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that resets unstable Dynamo-supplied attributes
+    # of gm (meta, compile reason, parameter-name sources, backend id) to defaults
+    # and normalizes placeholder names while the body runs, so the cache key is
+    # canonical. Always restores the original attribute values on exit.
     """
     Clears a few fields in a dynamo supplied Graph Module that are not stable between graph inputs, but don't
     affect inductor or aotdispatch correctness.
@@ -1004,17 +1185,27 @@ def sanitize_gm_for_cache(
 
 @CacheArtifactFactory.register
 class AOTAutogradCacheArtifact(CacheArtifact):
+    # [CLASS DOC] Registered cache artifact type for serialized AOTAutograd entries
+    # (key plus pickled bytes), used to export and re-import compiler caches.
     @override
     def populate_cache(self) -> None:
+        # [FUNCTION DOC] Writes this artifact's content into the local AOTAutograd
+        # cache directory under its key. Side effect: file I/O.
         AOTAutogradCache._write_to_local_cache(self.key, self.content)
 
     @override
     @staticmethod
     def type() -> str:
+        # [FUNCTION DOC] Returns the artifact type tag "aot_autograd".
         return "aot_autograd"
 
 
 class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
+    # [CLASS DOC] Stateless (all static/class methods) front end for saving and loading
+    # AOTAutograd compile results in a local directory and/or remote cache, keyed by
+    # autograd_cache_key and guarded by dynamic-shape guard expressions. Entries are
+    # pickled GenericAOTAutogradResult objects. Key methods: try_load, save, make_entry,
+    # clear, generate_guards_expression, evaluate_guards.
     """
     Caches the results of running AOTAutograd. This class mostly handles the save and load logic, whereas
     AOTAutogradResult handles the wrapping/unwrapping logic.
@@ -1052,6 +1243,8 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @staticmethod
     def clear() -> None:
+        # [FUNCTION DOC] Deletes the whole local AOTAutograd cache directory tree,
+        # ignoring errors. Side effect: file deletion.
         """Clear the cache"""
         shutil.rmtree(AOTAutogradCache._get_tmp_dir(), ignore_errors=True)
 
@@ -1066,6 +1259,17 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
         act_input_paths: ActInputPaths = (),
         compile_region_name: str | None = None,
     ) -> tuple[Callable[..., Any] | None, AOTConfig]:
+        # [FUNCTION DOC] Main load entry. Computes the key, looks up local and/or
+        # remote caches, and on a hit rebuilds the runtime-wrapped compiled function
+        # (made serializable by re-unpickling the stored bytes), reporting time saved
+        # and any distributed timeout increase. On a miss or bypass, returns None and,
+        # if a key exists, an AOT config copy carrying cache info (key, timestamp,
+        # backed forward symints) for the later save. Never raises on cache problems
+        # (counts hit/miss/bypass, records reasons), except re-raising in strict
+        # autograd-cache or strict-precompile mode. Side effects: counters, logging,
+        # structured-trace and chromium event logging.
+        # KNOWN ISSUE: time saved values use float division by one million with
+        # floor, so they are floats, not ints.
         """
         Load a result from the cache, and reconstruct a runtime wrapper around
         the object. On a cache miss, return an updated config carrying the
@@ -1212,6 +1416,10 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
     def generate_guards_expression(
         cls: type[AOTAutogradCache], cache_info: AOTAutogradCacheInfo
     ) -> str | None:
+        # [FUNCTION DOC] Builds the dynamic-shape guard expression string for the
+        # forward symint inputs from the active shape env: prunes guards to those
+        # relevant to the symints, then renders them. Returns None if there is no
+        # shape env.
         shape_env = cls._get_shape_env()
 
         if shape_env is None:
@@ -1223,6 +1431,8 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @classmethod
     def _get_tmp_dir(cls: type[AOTAutogradCache]) -> str:
+        # [FUNCTION DOC] HELPER: Returns the root directory of the local cache (an
+        # aotautograd folder inside the inductor cache dir).
         """
         Get the toplevel temporary directory for storing compiled graphs.
         """
@@ -1230,6 +1440,10 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @classmethod
     def _get_tmp_dir_for_key(cls: type[AOTAutogradCache], _key: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the per-key subdirectory (root joined with
+        # the key) holding entries for that key.
+        # KNOWN ISSUE: the docstring repeats the toplevel-directory description,
+        # but the code returns the per-key subdirectory.
         """
         Get the toplevel temporary directory for storing compiled graphs.
         """
@@ -1244,6 +1458,9 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
         remote_hit: bool,
         remote_miss: bool,
     ) -> None:
+        # [FUNCTION DOC] Callback from the guarded cache base class. Updates cache
+        # statistics for local hits and misses and increments top-level compile event
+        # counters for local/remote hits and misses. The key argument is unused.
         """
         Called by GuardedCache to record hit/miss statistics.
         """
@@ -1272,6 +1489,10 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @staticmethod
     def evaluate_guards(guard_expr: str, hints: list[int] | list[torch.SymInt]) -> bool:
+        # [FUNCTION DOC] Evaluates a stored guard expression against the given symint
+        # hint values using the active shape env; returns True (accept) immediately
+        # when the inductor config skips dynamic-shape cache guards. Raises
+        # AssertionError if no shape env exists.
         if torch._inductor.config.unsafe_skip_cache_dynamic_shape_guards:
             return True
         shape_env = AOTAutogradCache._get_shape_env()
@@ -1289,6 +1510,12 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
         cache_info: dict[str, Any],
         aot_config: AOTConfig | None,
     ) -> tuple[GenericAOTAutogradResult[Any, Any], bytes] | None:
+        # [FUNCTION DOC] HELPER: Finds a cached entry for key in local and/or remote
+        # cache whose guards pass for the backed symint hints of args. Fills cache_info
+        # with guard lookup details, bumps a guard-miss counter, records the artifact
+        # for cache export, and (in bundling mode with a backend id) records a bundled
+        # precompile artifact. Returns (entry, pickled bytes) or None. Errors while
+        # loading are logged and swallowed unless strict mode is on.
         """Given a key generated by AOTAutogradCachePickler, look up its location in the cache."""
         remote_cache: RemoteCache[JsonDataTy] | None = None
         if remote:
@@ -1342,6 +1569,9 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @staticmethod
     def _write_to_local_cache(key: str, content: bytes) -> None:
+        # [FUNCTION DOC] HELPER: Atomically writes content to a file named by its
+        # sha256 inside the per-key directory, creating the directory if needed.
+        # Side effect: file I/O and info logging.
         """Write an entry to the local cache."""
         subdir = AOTAutogradCache._get_tmp_dir_for_key(key)
         if not os.path.exists(subdir):
@@ -1358,6 +1588,9 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
     def _find_unpicklable_field(
         entry: GenericAOTAutogradResult[Any, Any],
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Diagnostic. Tries to pickle each dataclass field (or
+        # instance attribute) of entry separately and returns the name of the first
+        # one that fails, or None if all succeed.
         """Find which field of entry is causing pickle to fail."""
         # pyrefly: ignore [implicit-any]
         fields = []
@@ -1377,6 +1610,10 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
     def _pickle_entry(
         entry: GenericAOTAutogradResult[Any, Any], remote: bool
     ) -> bytes | None:
+        # [FUNCTION DOC] HELPER: Pickles entry with dispatch modes disabled and returns
+        # the bytes. On pickling, type or attribute errors, logs a warning, emits a
+        # structured-trace artifact naming the unpicklable field, reports a remote
+        # bypass if remote, and returns None (re-raises in strict mode).
         """Pickle entry, returning None on failure."""
         try:
             with torch.utils._python_dispatch._disable_current_modes():
@@ -1403,6 +1640,9 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @staticmethod
     def _handle_save_error(e: Exception, remote: bool, is_bypass: bool) -> None:
+        # [FUNCTION DOC] HELPER: Logs a save failure. A bypass increments the bypass
+        # counter; any other error warns about serialization. Reports to the remote
+        # bypass log when remote, and re-raises e in strict mode.
         """Handle exceptions during save, re-raising if strict mode is enabled."""
         if is_bypass:
             counters["aot_autograd"]["autograd_cache_bypass"] += 1
@@ -1418,6 +1658,12 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
 
     @staticmethod
     def save(key: str, entry: GenericAOTAutogradResult[Any, Any], remote: bool) -> None:
+        # [FUNCTION DOC] Saves one entry under key: runs the entry's pre-save hook,
+        # pickles it, records the cache artifact, in bundling mode hands a bundled
+        # precompile artifact to the precompile context (and clears the backend id on
+        # the sanitized config), writes to the local cache and, if remote, uploads
+        # base64 content plus time taken to the remote cache. Failures are routed to
+        # the save error handler and nothing is raised outside strict mode. Returns None.
         """Save a single entry into the cache."""
         content: bytes | None = None
         try:
@@ -1459,6 +1705,9 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
     @staticmethod
     @functools.cache
     def get_remote_cache() -> RemoteCache[JsonDataTy] | None:
+        # [FUNCTION DOC] Creates (memoized for the process) the remote cache client
+        # with the fixed id "autograd-experimental"; returns None when no remote
+        # backend is available.
         """
         Attempts to load the remote cache, returns None on error.
         """
@@ -1491,10 +1740,22 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
         serialized_bw_module: SerializedGraphModule | None,
         min_cut_info_str: str | None,
     ) -> GenericAOTAutogradResult[Any, Any]:
+        # [FUNCTION DOC] Packages compile results into a cache entry. In bundling mode,
+        # unwraps the compiled forward/backward back to their OutputCode objects and
+        # returns a BundledAOTAutogradResult embedding them. Otherwise requires the
+        # forward (and backward) functions to carry an FX graph cache key and returns
+        # an AOTAutogradResult referencing them by key and guard expression. Other
+        # arguments (metadata, wrappers, graph strings, timings, sanitized config,
+        # guards, serialized backward module) are stored as-is. Raises AssertionError
+        # for missing keys, or missing backward state indices or saved symint count
+        # when a backward exists.
         if should_bundle_autograd_cache():
             # Helper function to unwrap all the wrappers we added during aotdispatch
             # They get reapplied on cache load
             def unwrap_output_code(obj: object) -> OutputCode:
+                # [FUNCTION DOC] HELPER: Follows the chain of wrapped-function links
+                # to the innermost object and returns it; raises AssertionError if it
+                # is not an OutputCode.
                 while hasattr(obj, "__wrapped__"):
                     obj = obj.__wrapped__
                 if not isinstance(obj, OutputCode):

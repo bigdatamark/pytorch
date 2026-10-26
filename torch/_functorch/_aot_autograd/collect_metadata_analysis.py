@@ -1,3 +1,11 @@
+# [MODULE DOC] AOTAutograd analysis module. Runs a user function once under
+# functionalization (with fake tensors) to build ViewAndMutationMeta: per-input
+# mutation info, per-output alias info, intermediate bases, traced tangents (with
+# guessed memory format/subclass layout), subclass metadata, grad-mode mutation and
+# static input indices. Main contents: coerce_tangent_and_suggest_memory_format and
+# run_functionalized_fw_and_collect_metadata. Import-time side effects: creates a
+# module logger and a cudagraph static-input artifact logger, and rebinds the
+# module-level name zip to a strict (length-checked) zip.
 from __future__ import annotations
 
 
@@ -84,6 +92,17 @@ static_input_logger = getArtifactLogger("torch._dynamo", "cudagraph_static_input
 def coerce_tangent_and_suggest_memory_format(
     x: Tensor,
 ) -> tuple[Any, MemoryFormatMeta | list[Any] | None, bool]:
+    # [FUNCTION DOC] Recursively coerces a traced tangent and records its guessed
+    # memory format. Non-tensors are returned as (value, None, False). A tensor is
+    # detached and, if its memory format is a known dense format, made contiguous in
+    # that format. For traceable wrapper subclasses, the subclass may first normalize
+    # its metadata through a coerce-tangent-metadata hook, then each inner tensor
+    # attribute is processed recursively and replaced in place on the (detached)
+    # subclass if it changed. Returns (tensor, memory format info, updated flag). The
+    # format info is a single MemoryFormatMeta for plain tensors, or a list whose
+    # first entry is the outer format followed by one entry per inner attribute for
+    # subclasses. The flag reports whether any contiguous() call produced a new
+    # tensor at this level; note it is not propagated up from inner attributes.
     updated = False
     if not isinstance(x, Tensor):
         return x, None, updated
@@ -173,11 +192,22 @@ def run_functionalized_fw_and_collect_metadata(
     static_input_indices: list[int] | None = None,
     pre_dispatch: bool = False,
 ) -> Callable[..., ViewAndMutationMeta]:
+    # [FUNCTION DOC] Factory. Given a flat-argument function f (already taking and
+    # returning flat lists, with no output descriptors), the input descriptors,
+    # whether input mutations are kept in the graph, optional static input indices
+    # and a pre-dispatch flag (unused in the body), returns a callable that takes flat
+    # real/fake args and returns a ViewAndMutationMeta. The returned callable runs f
+    # once under functionalization, so it has side effects on the active fake mode
+    # (epoch bump) but restores grad mode. Sharing a memo of functionalized inputs
+    # across calls means the same tensor maps to one wrapper.
     memo: dict[Tensor, Tensor] = {}
 
     # TODO: see if we can rewrite this to be more accurate using
     # overload
     def _to_fun(t: object) -> object:
+        # [FUNCTION DOC] HELPER: Converts a tensor to its functionalized wrapper,
+        # caching by tensor in the enclosing memo so repeated tensors share one
+        # wrapper. Non-tensors are returned unchanged.
         if isinstance(t, Tensor):
             if t in memo:
                 return memo[t]
@@ -189,6 +219,27 @@ def run_functionalized_fw_and_collect_metadata(
 
     @simple_wraps(f)
     def inner(*flat_args: Any) -> ViewAndMutationMeta:
+        # [FUNCTION DOC] Runs f on functionalized copies of flat_args (under a
+        # FunctionalTensorMode with the Functionalize key excluded above it, shape-env
+        # unbacked-symbol tracking suppressed and the autocast cache disabled) and
+        # derives metadata. Steps: (1) per input, record mutation kinds (data,
+        # metadata, storage metadata, hidden from autograd, under no_grad,
+        # shallow-copy, inductor storage resize) into InputAliasInfo; (2) per output,
+        # classify aliasing (non_alias, is_input, alias_of_input, custom_function_view,
+        # unsafe_view_alias, alias_of_intermediate variants) using storage identity,
+        # multi-output-view detection and ._base, collecting intermediate bases that
+        # must be returned from the graph; (3) build tangents (mutated-input tangents,
+        # differentiable non-aliased output tangents, intermediate bases), convert them
+        # back from functional wrappers, view them to avoid aliasing primals and coerce
+        # their memory format; (4) compute static input indices (inside compiled
+        # autograd, parameters plus passed indices), subclass metadata and any
+        # grad-mode mutation. Raises AssertionError if args are of unknown types or f
+        # returns AOT output descriptors, and RuntimeError if f changed autocast state.
+        # Side effects: bumps the fake mode epoch, resets grad mode to its prior value
+        # after recording a mutation, and rebinds the enclosing static_input_indices.
+        # Returns the assembled ViewAndMutationMeta.
+        # KNOWN ISSUE: a comment further down refers to a stale line number ("line
+        # ~539") and the tangent list comprehension has an unused loop index.
         # This function is meant to be run with the forward, which expects a flat list of tensor/symint/other args.
         if not all(
             isinstance(a, tuple(KNOWN_TYPES)) or is_custom_class(type(a))
@@ -703,6 +754,10 @@ from a multi-output view call"
 
         # See Note [AOT Autograd: Views to avoid tangents aliasing inputs]
         def view_avoid_dupes_with_primals(t: object) -> object:
+            # [FUNCTION DOC] HELPER: Returns a fresh same-shape view of tensor t so
+            # tangents never alias primals. Wrapper subclasses are transformed by
+            # applying this recursively to their inner tensors; non-tensors pass
+            # through unchanged.
             if isinstance(t, Tensor) and is_traceable_wrapper_subclass(t):
                 return transform_subclass(
                     t, lambda _, inner_t: view_avoid_dupes_with_primals(inner_t)
@@ -715,6 +770,9 @@ from a multi-output view call"
         # Anything that aliases (inputs returned in the fw due to metadata mutations, or outputs that alias inputs/intermediates)
         # are *regenerated* later, and not used directly in the autograd graph
         def _plain_fake_tensor_like_subclass(x: Any) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Creates an uninitialized plain tensor (under the
+            # detected fake mode, if any) with the same shape, dtype, device and layout
+            # as x; used as the guessed tangent for a mutated subclass input.
             # pyrefly: ignore [bad-context-manager]
             with detect_fake_mode():
                 return torch.empty(
@@ -722,6 +780,10 @@ from a multi-output view call"
                 )
 
         def _is_subclass_mutated_input_tangent_always_subclass(inp: object) -> bool:
+            # [FUNCTION DOC] HELPER: Returns True if the tangent for a mutated subclass
+            # input should be assumed to stay a subclass: when the input is a nested
+            # tensor, or when the functorch config flag disabling the zero-tangent
+            # guess for mutated input subclasses is set. Reads global config only.
             return (
                 isinstance(inp, torch.nested._internal.nested_tensor.NestedTensor)
                 or torch._functorch.config.disable_guess_zero_tangent_for_mutated_input_subclass
