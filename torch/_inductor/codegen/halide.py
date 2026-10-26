@@ -156,7 +156,7 @@ class HalidePrinter(PythonPrinter):  # noqa: docstring_linter
 
     def _print_Where(self, expr):
         # [FUNCTION DOC] HELPER: Prints a three-argument conditional as a Halide select.
-        c =self.doprint(expr.args[0])
+        c = self.doprint(expr.args[0])
         p = self.doprint(expr.args[1])
         q = self.doprint(expr.args[2])
         return f"hl.select({c}, {p}, {q})"

@@ -89,7 +89,7 @@ class LiveRanges:
         # overlap or touch (end >= next begin) into a single range, storing the
         # result in self.ranges. Empty input gives an empty list.
         # Raises AssertionError if the sorted order invariant is violated.
-        ranges =[*sorted(ranges, key=lambda x: x.begin)]
+        ranges = [*sorted(ranges, key=lambda x: x.begin)]
         self.ranges = ranges[:1]
         for r in ranges[1:]:
             if self.ranges[-1].begin > r.begin:
@@ -105,7 +105,7 @@ class LiveRanges:
         # starting earlier is checked against the other's start, else popped).
         # Does not mutate either object (works on copies).
         """Check if any pair of ranges in self and other overlap"""
-        left =collections.deque(self.ranges)
+        left = collections.deque(self.ranges)
         right = collections.deque(other.ranges)
         while left and right:
             if left[0].begin > right[0].begin:
