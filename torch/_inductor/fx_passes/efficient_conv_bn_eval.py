@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor pre-grad FX passes that fold an eval-mode BatchNorm into the
+# preceding conv/linear ("Efficient ConvBN Blocks", arXiv 2305.11624) by rescaling the conv
+# weight and bias on the fly. Registers three graph patterns on efficient_conv_bn_eval_pass:
+# functional batch_norm, aten batch_norm.default and nn BatchNorm modules.
+# Import-time side effects: caches the batch_norm signature and registers the patterns.
 import inspect
 
 import torch
@@ -24,6 +29,11 @@ _BATCH_NORM_SIGNATURE = inspect.signature(torch.nn.functional.batch_norm)
 def efficient_conv_bn_eval(
     bn: nn.modules.batchnorm._BatchNorm, conv: nn.modules.conv._ConvNd, x: torch.Tensor
 ):
+    # [FUNCTION DOC] Module-level fused conv+bn computation: builds the effective weight and bias from the
+    # BatchNorm statistics (running mean/var, eps, optional affine weight/bias) and the conv
+    # parameters, then runs the conv functionally with those parameters on x. Handles missing
+    # conv bias / bn affine params and transposed convs (output channel is dim 1).
+    # Raises AssertionError if running_var or running_mean is None. Returns the conv output.
     """
     Implementation based on https://arxiv.org/abs/2305.11624
     "Efficient ConvBN Blocks for Transfer Learning and Beyond"
@@ -96,6 +106,12 @@ def efficient_conv_bn_eval_decomposed(
     x,
     conv_remaining_args,
 ):
+    # [FUNCTION DOC] Same fusion as efficient_conv_bn_eval but on raw tensors for graphs where conv and bn were
+    # already decomposed to function calls. conv is the conv OpOverload called with the fused
+    # weight/bias, x and conv_remaining_args (the args after bias). Transposed conv is detected by
+    # the substring conv_transpose in the op name. Raises AssertionError if bn_running_var is None.
+    # Returns the conv output tensor.
+    # KNOWN ISSUE: the docstring has an empty Args section; running_mean is not checked for None.
     """
     Implementation based on https://arxiv.org/abs/2305.11624
     "Efficient ConvBN Blocks for Transfer Learning and Beyond"
@@ -156,6 +172,11 @@ def efficient_conv_bn_eval_decomposed(
     and inductor_config.efficient_conv_bn_eval_fx_passes,
 )
 def efficient_conv_bn_eval_graph_transform_inlined(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler for torch.nn.functional.batch_norm call nodes. Normalizes the node args via
+    # the cached signature (applying defaults), skips if training is a symbolic Node or true, if
+    # the input is not a single-user supported conv/linear call_function, then replaces conv+bn
+    # with a call to efficient_conv_bn_eval_decomposed and erases both old nodes. Increments the
+    # efficient_conv_bn_eval counter. Mutates the graph; returns nothing.
     """
     Graph transformation pass for fusing F.batch_norm with preceding conv operations.
 
@@ -271,6 +292,10 @@ def efficient_conv_bn_eval_graph_transform_inlined(match: Match, *args, **kwargs
     and inductor_config.efficient_conv_bn_eval_fx_passes,
 )
 def efficient_conv_bn_eval_graph_transform_decomposed(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler for aten.batch_norm.default nodes (9 args, else raises AssertionError).
+    # Skips if training is set, or if the input is not a single-user aten linear/conv call.
+    # Otherwise replaces conv+bn with a call to efficient_conv_bn_eval_decomposed built from the
+    # bn and conv node args, erasing both nodes and bumping the efficient_conv_bn_eval counter.
     bn_node = match.nodes[0]
     graph = match.graph
     if len(bn_node.args) != 9:
@@ -371,6 +396,11 @@ def efficient_conv_bn_eval_graph_transform_decomposed(match: Match, *args, **kwa
     and inductor_config.efficient_conv_bn_eval_fx_passes,
 )
 def efficient_conv_bn_eval_graph_transform(match: Match, *args, **kwargs):
+    # [FUNCTION DOC] Pattern handler for BatchNorm call_module nodes. Requires an eval-mode bn with
+    # track_running_stats whose input is a single-user call_module of a Linear/ConvNd module
+    # present on the owning module. Inserts get_attr nodes for both modules and a call to
+    # efficient_conv_bn_eval, redirects bn users to it and erases the bn and conv nodes.
+    # Bumps the efficient_conv_bn_eval counter; returns nothing.
     # We matched a BN node
     bn_node = match.nodes[0]
     graph = match.graph

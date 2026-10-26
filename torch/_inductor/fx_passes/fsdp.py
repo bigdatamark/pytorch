@@ -1,3 +1,7 @@
+# [MODULE DOC] Inductor FX passes specialized for FSDP-style collectives: identifying FSDP
+# all_gather / reduce_scatter / all_reduce nodes by graph structure, deduplicating summed
+# reduce_scatters, and bucketing (merging) them with a bandwidth-based size cap before overlap
+# scheduling. Import-time side effect: sets this module logger level to INFO.
 import json
 import logging
 import math
@@ -32,6 +36,9 @@ logger.setLevel(logging.INFO)
 
 
 def is_fsdp_all_gather(n: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Returns True if the all_gather node n has exactly one placeholder (parameter) among its
+    # transitive inputs, found by a backward walk over all input branches. Raises AssertionError
+    # if n is not an all_gather.
     """Check if an all_gather derives from exactly one placeholder (parameter).
 
     Uses backward BFS to count placeholder ancestors across all input branches.
@@ -58,11 +65,14 @@ def is_fsdp_all_gather(n: torch.fx.Node) -> bool:
 
 
 def is_fsdp_all_gather_wait(wait: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Returns whether the wait node waits on an FSDP all_gather (its first arg).
     ag_node = wait.args[0]  # type: ignore[arg-type, union-attr]
     return is_fsdp_all_gather(ag_node)  # type: ignore[arg-type]
 
 
 def is_fsdp_reduce_scatter_wait(wait: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Returns True if the wait node has users and every forward path from it reaches the graph
+    # output through single-input nodes only (conservative; rejects gradient accumulation adds).
     """Check if a reduce_scatter wait flows only to graph outputs through unary ops.
 
     Uses forward walk to verify every path from *wait* reaches an output node and
@@ -99,6 +109,9 @@ _dedup_rs_pass: PatternMatcherPass | None = None
 
 
 def _get_dedup_rs_pass() -> PatternMatcherPass:
+    # [FUNCTION DOC] HELPER: lazily builds and caches a PatternMatcherPass that rewrites the sum of two waited
+    # reduce_scatters (linear reduce op sum/avg, single-user nodes, same dtype) into one
+    # reduce_scatter of the summed inputs. Mutates the global cache; returns the pass.
     global _dedup_rs_pass
 
     if _dedup_rs_pass is not None:
@@ -109,6 +122,7 @@ def _get_dedup_rs_pass() -> PatternMatcherPass:
     dedup_rs_pass = PatternMatcherPass(pass_name="dedup_reduce_scatter")
 
     def wait_rs(name: str) -> CallFunction:
+        # [FUNCTION DOC] HELPER: builds the pattern for wait_tensor of reduce_scatter_tensor with input named name.
         return CallFunction(
             c10d.wait_tensor.default,
             CallFunction(
@@ -121,6 +135,8 @@ def _get_dedup_rs_pass() -> PatternMatcherPass:
         )
 
     def dedup_rs_extra_check(match: Match) -> bool:
+        # [FUNCTION DOC] HELPER: match check, requires a linear reduce op, single-user wait/reduce_scatter nodes
+        # and equal input dtypes. Returns a bool.
         if match.kwargs["reduce_op"] not in _LINEAR_REDUCE_OPS:
             return False
         for node in match.nodes:
@@ -150,7 +166,10 @@ def _get_dedup_rs_pass() -> PatternMatcherPass:
         pass_dict=dedup_rs_pass,
     )
     def _(match: Match, input_a, input_b, reduce_op, group_size, group_name):
+        # [FUNCTION DOC] HELPER: pattern handler that replaces the matched add of two waited reduce_scatters with one
+        # reduce_scatter of the added inputs followed by a wait.
         def repl(input_a, input_b):
+            # [FUNCTION DOC] HELPER: replacement graph, add inputs, reduce_scatter the sum, wait and return the result.
             combined = aten.add.Tensor(input_a, input_b)
             rs = c10d.reduce_scatter_tensor.default(
                 combined, reduce_op, group_size, group_name
@@ -165,6 +184,8 @@ def _get_dedup_rs_pass() -> PatternMatcherPass:
 
 
 def dedup_fsdp_reduce_scatter(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] Repeatedly applies the dedup reduce_scatter pass on gm until no more matches (N-way
+    # sums are fused pair by pair), then lints and recompiles gm. Mutates gm in place.
     """
     Fuse duplicate reduce_scatter ops whose waited results are summed.
 
@@ -192,6 +213,9 @@ def bucket_fsdp_all_gather(
     bucket_cap_mb_by_bucket_idx: Callable[[int], float] | None = None,
     mode: BucketMode = "default",
 ) -> None:
+    # [FUNCTION DOC] Buckets FSDP all_gather ops in gm by size cap in MB (callback of bucket index, default
+    # from bucketing module) and merges each bucket using mode. No-op if no buckets.
+    # KNOWN ISSUE: the docstring omits the mode argument.
     """
     Bucketing pass for SimpleFSDP all_gather ops.
 
@@ -223,6 +247,9 @@ def bucket_fsdp_reduce_scatter(
     bucket_cap_mb_by_bucket_idx: Callable[[int], float] | None = None,
     mode: BucketMode = "default",
 ) -> None:
+    # [FUNCTION DOC] Buckets FSDP reduce_scatter ops (filtered by is_fsdp_reduce_scatter_wait) and merges them.
+    # The multidtype suffix is stripped from the mode for bucketing since it is unsupported.
+    # KNOWN ISSUE: merge_reduce_scatter receives the original mode, not the stripped one.
     """
     Bucketing pass for SimpleFSDP reduce_scatter ops.
 
@@ -260,6 +287,8 @@ def bucket_fsdp_all_reduce(
     bucket_cap_mb_by_bucket_idx: Callable[[int], float] | None = None,
     fsdp_groups: OrderedSet[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Buckets all_reduce ops whose group is in fsdp_groups (any group if None) by size cap
+    # and merges each bucket in the graph. Mutates gm.
     """Bucketing pass for FSDP all_reduce ops.
 
     For all_gather and reduce_scatter we use structural heuristics
@@ -276,6 +305,7 @@ def bucket_fsdp_all_reduce(
         bucket_cap_mb_by_bucket_idx = bucket_cap_mb_by_bucket_idx_default
 
     def is_fsdp_all_reduce_wait(wait: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: filter, true if wait is for an all_reduce in an FSDP group (or any when no groups).
         ar_node = wait.args[0]
         if not is_all_reduce_tensor(ar_node):  # type: ignore[arg-type]
             return False
@@ -291,6 +321,8 @@ def bucket_fsdp_all_reduce(
 
 
 def _get_collective_kwargs(n: fx.Node) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: normalizes a collective node call into a keyword-only mapping. Raises
+    # AssertionError if normalization fails.
     """Normalize a collective node's args into keyword args."""
     from torch.fx.operator_schemas import normalize_function
 
@@ -307,14 +339,17 @@ def _get_collective_kwargs(n: fx.Node) -> dict[str, object]:
 
 
 def _get_group_name(n: fx.Node) -> str:
+    # [FUNCTION DOC] HELPER: returns the process group name of a collective node.
     return _get_collective_kwargs(n)["group_name"]  # type: ignore[return-value]
 
 
 def _get_group_size_from_node(n: fx.Node) -> int:
+    # [FUNCTION DOC] HELPER: returns the group size of a collective node.
     return _get_collective_kwargs(n)["group_size"]  # type: ignore[return-value]
 
 
 def _find_all_gathers(graph: torch.fx.Graph) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: lists all_gather nodes (default and out variants) in the graph.
     """Return all all_gather nodes (both default and _out variants) via O(1) lookup."""
     return [
         *graph.find_nodes(
@@ -329,6 +364,7 @@ def _find_all_gathers(graph: torch.fx.Graph) -> list[torch.fx.Node]:
 
 
 def _find_reduce_scatters(graph: torch.fx.Graph) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: lists reduce_scatter_tensor nodes in the graph.
     """Return all reduce_scatter nodes via O(1) lookup."""
     return graph.find_nodes(
         op="call_function",
@@ -337,6 +373,7 @@ def _find_reduce_scatters(graph: torch.fx.Graph) -> list[torch.fx.Node]:
 
 
 def _find_all_reduces(graph: torch.fx.Graph) -> list[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: lists all_reduce nodes in the graph.
     """Return all all_reduce nodes via O(1) lookup."""
     return graph.find_nodes(
         op="call_function",
@@ -347,6 +384,8 @@ def _find_all_reduces(graph: torch.fx.Graph) -> list[torch.fx.Node]:
 def identify_fsdp_groups(
     gm: torch.fx.GraphModule,
 ) -> tuple[OrderedSet[str], int | None]:
+    # [FUNCTION DOC] Returns (set of FSDP group names, group size of the first matching all_gather or None),
+    # using the single-placeholder all_gather heuristic.
     """Identify FSDP process groups and return (group_names, group_size).
 
     Uses is_fsdp_all_gather heuristic on all_gather nodes to find FSDP groups,
@@ -368,6 +407,10 @@ def compute_pre_bucket_cap_mb(
     group_size: int,
     bucket_cap_mb_override: float | None = None,
 ) -> float:
+    # [FUNCTION DOC] Returns the bucket cap in MB for a group size: the override if given, otherwise a value
+    # derived from the minimum bytes saturating bandwidth times a calibration multiplier, clamped
+    # to configured floor and ceiling (floor if comm analysis is unavailable). Optionally logs
+    # interconnect details when verbose configured.
     """Compute the bucket cap for pre-bucketing based on bandwidth saturation.
 
     Returns a bucket size in MB that targets saturation of the process group's
@@ -429,6 +472,7 @@ def compute_pre_bucket_cap_mb(
 
 
 def _tensor_size_mb(val: torch.Tensor) -> float:
+    # [FUNCTION DOC] HELPER: tensor size in MB using a size hint for dynamic shapes.
     """Return tensor size in MB, using size hints for dynamic shapes."""
     from torch.fx.experimental.symbolic_shapes import optimization_hint
 
@@ -439,6 +483,8 @@ def _tensor_size_mb(val: torch.Tensor) -> float:
 def _collect_collective_sizes(
     gm: torch.fx.GraphModule, fsdp_groups: OrderedSet[str]
 ) -> list[dict[str, object]]:
+    # [FUNCTION DOC] HELPER: lists dicts (type AG/RS/AR, size in MB, node name) for FSDP collectives, using
+    # output size for AG and input size for RS and AR.
     """Collect per-collective transfer sizes (MB) for FSDP collectives in graph order.
 
     AG: output tensor size (the gathered result, i.e. bytes on the wire).
@@ -466,6 +512,10 @@ def pre_bucket_fsdp_collectives(
     mode: BucketMode | None = None,
     bucket_cap_mb: float | None = None,
 ) -> None:
+    # [FUNCTION DOC] Pre-buckets FSDP collectives in gm: finds FSDP groups (returns if none), computes the
+    # bucket cap, buckets all_gather, reduce_scatter and all_reduce, and logs counts before and
+    # after. In verbose mode also logs sizes and emits structured trace artifacts; always emits
+    # a summary artifact. Mutates gm.
     """Pre-bucket FSDP collectives before overlap scheduling.
 
     Identifies FSDP process groups via all_gather structural heuristics,
@@ -482,6 +532,7 @@ def pre_bucket_fsdp_collectives(
         return
 
     def _count_fsdp(nodes: list[fx.Node]) -> int:
+        # [FUNCTION DOC] HELPER: counts nodes whose group name is an FSDP group.
         return sum(1 for n in nodes if _get_group_name(n) in fsdp_groups)
 
     ag_count = _count_fsdp(_find_all_gathers(gm.graph))
@@ -513,6 +564,7 @@ def pre_bucket_fsdp_collectives(
         cap_mb = bucket_cap_mb if bucket_cap_mb is not None else 500.0
 
     def bucket_cap_fn(_idx: int) -> float:
+        # [FUNCTION DOC] HELPER: returns the constant cap for any bucket index.
         return cap_mb
 
     resolved_mode: BucketMode = mode or "default"

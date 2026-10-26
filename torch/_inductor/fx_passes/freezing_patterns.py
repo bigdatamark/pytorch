@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Pattern-matcher passes run on frozen (constant-parameter) inference graphs in
+# Inductor: binary folding, concat of sibling matmul/addmm/int8 weight-only GEMMs, and removal
+# of no-op dtype conversions. Holds the global pass lists pass_patterns (applied in order) and
+# binary_folding_pass, plus registration helpers. Import-time side effects: creates the
+# PatternMatcherPass objects and registers the unnecessary_dtype_convert pattern.
 import functools
 
 import torch
@@ -35,6 +40,12 @@ binary_folding_pass = PatternMatcherPass()
 
 
 def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
+    # [FUNCTION DOC] Entry point of freezing optimizations on gm. Initializes patterns lazily, then runs up to
+    # four rounds of constant folding, fake-tensor propagation and binary folding (stopping when
+    # the binary_folding counter stops changing), restores folded-op precision, folds again and
+    # applies each pattern pass in pass_patterns. With mkldnn weight prepack and layout
+    # optimization enabled, removes duplicate packed nodes. Finally topologically sorts,
+    # recompiles and lints gm. Mutates gm in place and updates global counters.
     """
     Passes that are applied to the graph to freeze pass.
     """
@@ -90,6 +101,9 @@ def freezing_passes(gm: torch.fx.GraphModule, aot_example_inputs):
 
 @init_once_fakemode
 def lazy_init(input_device: torch.device | None = None):
+    # [FUNCTION DOC] Once-only (fake mode) initialization of freezing patterns: mkldnn weight packing patterns when
+    # available and enabled, addmm/concat patterns and binary folding patterns. input_device is
+    # accepted but unused. Side effect: registers patterns in global pass lists.
     if torch._C._has_mkldnn and config.cpp.weight_prepack:
         from .mkldnn_fusion import _mkldnn_weight_pack_init
 
@@ -102,6 +116,9 @@ def lazy_init(input_device: torch.device | None = None):
 
 
 def register_freezing_graph_pattern(pattern, extra_check=_return_true, pass_number=0):
+    # [FUNCTION DOC] Registers a graph pattern into pass_patterns[pass_number], growing the list with new
+    # PatternMatcherPass objects as needed. extra_check defaults to always true. Returns the
+    # decorator produced by register_graph_pattern. Mutates the global list.
     while pass_number > len(pass_patterns) - 1:
         pass_patterns.append(PatternMatcherPass())
     return register_graph_pattern(
@@ -113,6 +130,8 @@ def register_freezing_graph_pattern(pattern, extra_check=_return_true, pass_numb
 
 
 def register_binary_folding_pattern(pattern, extra_check=_return_true):
+    # [FUNCTION DOC] Registers a graph pattern into the binary_folding_pass pass with an optional extra_check
+    # (default always true). Returns the decorator from register_graph_pattern.
     return register_graph_pattern(
         pattern,
         extra_check=extra_check,
@@ -123,6 +142,11 @@ def register_binary_folding_pattern(pattern, extra_check=_return_true):
 
 @functools.cache
 def addmm_patterns_init():
+    # [FUNCTION DOC] Cached one-time registration of replacement patterns that merge sibling GEMMs sharing the
+    # same input into one GEMM on concatenated weights (int8 weight-only scaled 3-way matmul,
+    # plain 3-way and 2-way matmul, 3-way addmm) followed by a split. Example tensors are made on
+    # the first available GPU else CPU. All registered into pass_patterns[0] with exclusive arg
+    # names. Side effect: mutates global pass lists.
     """
     addmm related patterns.
     To avoid duplication, also includes int8 WoQ GEMM pattern without bias.
@@ -134,6 +158,8 @@ def addmm_patterns_init():
     scale = functools.partial(torch.empty, (10,), device=device, requires_grad=False)
 
     def check_int8_woq_concat_linear_weights(match):
+        # [FUNCTION DOC] HELPER: extra check for the int8 weight-only pattern. True only on CPU with concat linear
+        # enabled, where every weight is a convert_element_type of an int8 tensor to bfloat16.
         is_cpu = match.kwargs["inp"].meta["val"].is_cpu
         if not is_cpu or not config.cpp.enable_concat_linear:
             # Currently, this pattern is only supported on CPU
@@ -165,6 +191,9 @@ def addmm_patterns_init():
         return True
 
     def check_concat_weights(match):
+        # [FUNCTION DOC] HELPER: extra check for concat patterns. Rejects CPU when concat linear is disabled;
+        # requires weights (and biases if present) to be get_attr nodes with equal shapes apart from
+        # the last dimension. Returns a bool.
         is_cpu = match.kwargs["inp"].meta["val"].is_cpu
         if is_cpu and not config.cpp.enable_concat_linear:
             return False
@@ -194,9 +223,12 @@ def addmm_patterns_init():
         return True
 
     def int8_woq_fusion_pattern(inp, w1, w2, w3, s1, s2, s3):
+        # [FUNCTION DOC] HELPER: search pattern, three matmuls of one input with three weights each scaled.
         return ((inp @ w1) * s1, (inp @ w2) * s2, (inp @ w3) * s3)
 
     def int8_woq_fusion_replacement(inp, w1, w2, w3, s1, s2, s3):
+        # [FUNCTION DOC] HELPER: replacement, one matmul against concatenated weights scaled by concatenated
+        # scales, then split along the last dimension at the weight widths.
         cat_w = torch.cat((w1, w2, w3), dim=1)
         cat_s = torch.cat((s1, s2, s3), dim=0)
         mm = (inp @ cat_w).mul(cat_s)
@@ -218,9 +250,11 @@ def addmm_patterns_init():
     )
 
     def matmul_fuse_pattern(inp, w1, w2, w3):
+        # [FUNCTION DOC] HELPER: search pattern, one input multiplied by three weights.
         return (inp @ w1, inp @ w2, inp @ w3)
 
     def matmul_replacement(inp, w1, w2, w3):
+        # [FUNCTION DOC] HELPER: replacement, one matmul with concatenated weights then split by weight widths.
         weights = (w1, w2, w3)
         cat_t = torch.cat(weights, dim=1)
         mm = inp @ cat_t
@@ -241,9 +275,11 @@ def addmm_patterns_init():
     )
 
     def matmul_fuse_pattern_two(inp, w1, w2):
+        # [FUNCTION DOC] HELPER: search pattern, one input multiplied by two weights.
         return (inp @ w1, inp @ w2)
 
     def matmul_replacement_two(inp, w1, w2):
+        # [FUNCTION DOC] HELPER: replacement, concatenated weights matmul then split into two outputs.
         weights = (w1, w2)
         cat_t = torch.cat(weights, dim=1)
         mm = inp @ cat_t
@@ -264,6 +300,7 @@ def addmm_patterns_init():
     )
 
     def addmm_fuse_pattern_second(inp, w1, w2, w3, b1, b2, b3):
+        # [FUNCTION DOC] HELPER: search pattern, three addmm calls sharing one input.
         return (
             aten.addmm(b1, inp, w1),
             aten.addmm(b2, inp, w2),
@@ -271,6 +308,7 @@ def addmm_patterns_init():
         )
 
     def addmm_fuse_replacement_second(inp, w1, w2, w3, b1, b2, b3):
+        # [FUNCTION DOC] HELPER: replacement, one addmm on concatenated bias and weights then split.
         weights = (w1, w2, w3)
         cat_w = torch.cat(weights, dim=1)
         cat_b = torch.cat((b1, b2, b3))
@@ -292,6 +330,7 @@ def addmm_patterns_init():
 
 
 def same_dtype(match):
+    # [FUNCTION DOC] HELPER: extra check, true if the matched convert op input already has the target dtype.
     return match.output_node().args[0].meta["val"].dtype == match.kwargs["dtype"]
 
 
@@ -306,6 +345,8 @@ def same_dtype(match):
     extra_check=same_dtype,
 )
 def unnecessary_dtype_convert(match: Match, **kwargs):
+    # [FUNCTION DOC] Pattern handler removing a dtype conversion whose input already has the requested dtype
+    # (e.g. left by conv-bn folding): rewires users of the node to its input and erases the node.
     """Remove unnecessary dtype conversion op, probably left as a result of Conv-Bn folding"""
     graph = match.graph
     node = match.output_node()

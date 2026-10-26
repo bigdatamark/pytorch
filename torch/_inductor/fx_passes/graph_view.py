@@ -1,3 +1,6 @@
+# [MODULE DOC] Builds a tree (GraphView) of FX nodes organized by their module hierarchy
+# (nn_module_stack metadata) and extracts subgraphs by dotted module path. No import-time
+# side effects.
 from __future__ import annotations
 
 import itertools
@@ -13,6 +16,8 @@ if TYPE_CHECKING:
 
 
 def _get_module_stack(node: fx.Node) -> list[tuple[str, type[Any]]]:
+    # [FUNCTION DOC] HELPER: returns the list of (path, class) entries from nn_module_stack metadata, else
+    # fwd_nn_module_stack, else an empty list.
     nn_stack = node.meta.get("nn_module_stack", "")
     if nn_stack:
         return list(nn_stack.values())
@@ -25,6 +30,7 @@ def _get_module_stack(node: fx.Node) -> list[tuple[str, type[Any]]]:
 
 
 def _addindent(s_: str, num_spaces: int) -> str:
+    # [FUNCTION DOC] HELPER: indents all lines but the first of a multi-line string by num_spaces.
     s: list[str] = s_.split("\n")
     # don't do anything for single-line stuff
     if len(s) == 1:
@@ -37,6 +43,10 @@ def _addindent(s_: str, num_spaces: int) -> str:
 
 
 class GraphView:
+    # [CLASS DOC] Tree node for one module scope. Attributes: name, klass, data (ordered list of nodes),
+    # unique_nodes (set preventing duplicates in data) and children (mapping of child name to
+    # GraphView). Supports item and attribute access to children and a nested repr.
+    # KNOWN ISSUE: attribute access to a missing child raises KeyError, not AttributeError.
     """
     A hierarchical class for organizing and managing torch.fx nodes by their module stack.
 
@@ -54,6 +64,7 @@ class GraphView:
     """
 
     def __init__(self, name: str, klass: type[Any]) -> None:
+        # [FUNCTION DOC] Creates an empty node with the given name and class.
         self.name: str = name
         self.klass: type[Any] = klass
         self.data: list[fx.Node] = []
@@ -61,23 +72,29 @@ class GraphView:
         self.children: dict[str, GraphView] = {}
 
     def add(self, data: fx.Node) -> None:
+        # [FUNCTION DOC] Appends the fx node to data if not already present.
         if data not in self.unique_nodes:
             self.data.append(data)
             self.unique_nodes.add(data)
 
     def get_child(self, module_stack: str, klass: type[Any] | None = None) -> GraphView:
+        # [FUNCTION DOC] Returns the child named module_stack, creating it (class defaults to the parent's class)
+        # if missing.
         if module_stack not in self.children:
             new_stack = GraphView(module_stack, klass or self.klass)
             self.children[module_stack] = new_stack
         return self.children[module_stack]
 
     def __getitem__(self, name: str) -> GraphView:
+        # [FUNCTION DOC] Returns the child with the given name; raises KeyError if absent.
         return self.children[name]
 
     def __getattr__(self, name: str) -> GraphView:
+        # [FUNCTION DOC] Returns the child with the given name. Raises KeyError, not AttributeError, if absent.
         return self.children[name]
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a module-style multi-line string: class name and indented children.
         child_lines: list[str] = []
         for name, child in self.children.items():
             mod_str = repr(child)
@@ -91,6 +108,8 @@ class GraphView:
 
 
 def _clean_stack_name(stack_name: str) -> str:
+    # [FUNCTION DOC] HELPER: converts an nn_module_stack key such as the L self modules form into a dotted
+    # module path by dropping the root prefix and joining quoted names.
     """
     Clean up FX node's nn_module_stack metadata string to match the module name hierarchies
 
@@ -104,6 +123,7 @@ def _clean_stack_name(stack_name: str) -> str:
 
 
 def _is_root(stack: str) -> bool:
+    # [FUNCTION DOC] HELPER: true if the stack name is the empty string.
     return stack == ""
 
 
@@ -111,6 +131,10 @@ def make_graph_view(
     graph: fx.Graph,
     module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]] | None = None,
 ) -> GraphView | None:
+    # [FUNCTION DOC] Builds a GraphView tree from graph. For each node, module_stack_fn (default: cleaned
+    # nn_module_stack metadata) gives (path, class) entries; for each, every dotted path component
+    # is walked or created and the node is added at each level. Returns the root, or None if no
+    # node has a module stack.
     """
     Code from: https://github.com/meta-pytorch/autoparallel/pull/158
 
@@ -179,6 +203,7 @@ def make_graph_view(
     """
 
     def nn_module_stack_meta(node: fx.Node) -> list[tuple[str, type[Any]]]:
+        # [FUNCTION DOC] HELPER: default stack function, returns cleaned (path, class) pairs for a node.
         result = []
         for module_stack, module_class in _get_module_stack(node):
             module_stack = _clean_stack_name(module_stack)
@@ -209,6 +234,8 @@ def make_graph_view(
 def get_subgraph_by_path(
     graph_view: GraphView, paths: str | list[str]
 ) -> list[fx.Node]:
+    # [FUNCTION DOC] Returns the fx nodes in the subtree at a dotted path or concatenated for a list of paths.
+    # Unknown paths yield an empty result.
     """
     Get subgraph by path(s).
     Args:
@@ -219,6 +246,7 @@ def get_subgraph_by_path(
     """
 
     def get_node_by_path(node: GraphView, path: str) -> GraphView:
+        # [FUNCTION DOC] HELPER: walks dotted path through children; returns an empty GraphView if a part is missing.
         for p in path.split("."):
             if p in node.children:
                 node = node.children[p]

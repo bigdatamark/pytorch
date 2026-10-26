@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor joint-graph pass fusing hand-written attention (matmul, scale, mask,
+# softmax, dropout, matmul) into scaled_dot_product_attention. Defines about thirty paired
+# search patterns and replacements for model-specific forms (BERT, DistilBert, GPT2, T5,
+# Visformer ...), match checks, and generators that register training and inference variants.
+# Import-time side effects: creates loggers and the inference-only pattern name set.
 import functools
 import inspect
 import logging
@@ -41,6 +46,7 @@ _INFERENCE_ONLY_SFDP_PATTERNS = frozenset(
 
 
 def _sfdp_pattern_1(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 1 traced for matching: matmul(q, k^T), divide by inv_scale, softmax, matmul with value.
     return (
         torch.matmul(query, key.transpose(-2, -1))
         .div(inv_scale)
@@ -50,6 +56,7 @@ def _sfdp_pattern_1(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_1(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 1: bumps the fuse_attention counter and calls SDPA with scale 1/inv_scale, no mask, no dropout.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -63,6 +70,7 @@ def _sfdp_replacement_1(query, key, value, inv_scale):
 
 
 def _sfdp_pattern_2(query, key, value, scale_factor):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 2 traced for matching: matmul(q, k^T), multiply by scale_factor, softmax, matmul with value.
     return (
         torch.matmul(query, key.transpose(-2, -1))
         .mul(scale_factor)
@@ -72,6 +80,7 @@ def _sfdp_pattern_2(query, key, value, scale_factor):
 
 
 def _sfdp_replacement_2(query, key, value, scale_factor):
+    # [FUNCTION DOC] HELPER: replacement for pattern 2: bumps the fuse_attention counter and calls SDPA with scale = scale_factor, no mask, no dropout.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -85,6 +94,7 @@ def _sfdp_replacement_2(query, key, value, scale_factor):
 
 
 def _sfdp_pattern_3(query, key, value, inv_scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 3 traced for matching: matmul(q, k^T), divide by inv_scale_factor, softmax, dropout, matmul with value.
     return torch.nn.functional.dropout(
         torch.matmul(query, key.transpose(-2, -1))
         .div(inv_scale_factor)
@@ -94,6 +104,7 @@ def _sfdp_pattern_3(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_3(query, key, value, inv_scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 3: bumps the fuse_attention counter and calls SDPA with scale 1/inv_scale_factor and the dropout probability.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -107,6 +118,7 @@ def _sfdp_replacement_3(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_pattern_4(query, key, value, scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 4 traced for matching: matmul(q, k^T), multiply by scale_factor, softmax, dropout, matmul with value.
     return torch.nn.functional.dropout(
         torch.matmul(query, key.transpose(-2, -1)).mul(scale_factor).softmax(dim=-1),
         p=dropout_p,
@@ -114,6 +126,7 @@ def _sfdp_pattern_4(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_replacement_4(query, key, value, scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 4: bumps the fuse_attention counter and calls SDPA with scale = scale_factor and the dropout probability.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -127,6 +140,7 @@ def _sfdp_replacement_4(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_pattern_5(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 5 traced for matching: matmul(q, k^T) divided by inv_scale plus additive attn_mask, softmax, matmul with value (no dropout).
     attn_weight = torch.softmax(
         (query @ key.transpose(-2, -1) / (inv_scale)) + attn_mask, dim=-1
     )
@@ -135,6 +149,7 @@ def _sfdp_pattern_5(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_5(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 5: bumps the fuse_attention counter and calls SDPA with the mask cast to the query dtype and scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -148,6 +163,7 @@ def _sfdp_replacement_5(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_pattern_6(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 6 traced for matching: same as pattern 5 with dropout after softmax.
     attn_weight = torch.softmax(
         (query @ key.transpose(-2, -1) / inv_scale) + attn_mask, dim=-1
     )
@@ -156,6 +172,7 @@ def _sfdp_pattern_6(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_6(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 6: bumps the fuse_attention counter and calls SDPA with mask cast to query dtype, scale 1/inv_scale and dropout.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -169,6 +186,7 @@ def _sfdp_replacement_6(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_7(query, key, value, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 7 traced for matching: permuted q/k/v (so clones appear as in real graphs), divide by inv_scale, fp32 softmax, dropout, cast to float16, matmul with value.
     # in real workloads inputs to matmul are permuted
     # causing matmul to expand to a series of expand and clone calls
     # we want the same to happen during pattern tracing
@@ -185,6 +203,7 @@ def _sfdp_pattern_7(query, key, value, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_7(query, key, value, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 7: bumps the fuse_attention counter and calls SDPA on permuted q/k/v with scale 1/inv_scale and dropout, no mask.
     # sdpa prefers inputs in permuted format
     # it makes a copy to put them in this format
     # if they aren't already
@@ -206,6 +225,7 @@ def _sfdp_replacement_7(query, key, value, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_8(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 8 traced for matching: pattern 7 without dropout.
     # no dropout version of pattern 7
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -219,6 +239,7 @@ def _sfdp_pattern_8(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_8(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 8: bumps the fuse_attention counter and calls SDPA on permuted q/k/v with scale 1/inv_scale, no dropout, no mask.
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -235,6 +256,7 @@ def _sfdp_replacement_8(query, key, value, inv_scale):
 
 
 def _sfdp_pattern_9(query, key, value, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 9 traced for matching: permuted q/k/v, q divided by inv_scale before matmul, fp32 softmax, dropout, cast to float16.
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -249,6 +271,7 @@ def _sfdp_pattern_9(query, key, value, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_9(query, key, value, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 9: bumps the fuse_attention counter and calls SDPA on permuted q/k/v with scale 1/inv_scale and dropout.
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -265,6 +288,7 @@ def _sfdp_replacement_9(query, key, value, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_10(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 10 traced for matching: pattern 9 without dropout.
     # no dropout version of 9
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -279,6 +303,7 @@ def _sfdp_pattern_10(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_10(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 10: bumps the fuse_attention counter and calls SDPA on permuted q/k/v with scale 1/inv_scale, no dropout.
     counters["inductor"]["fuse_attention"] += 1
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -295,6 +320,7 @@ def _sfdp_replacement_10(query, key, value, inv_scale):
 
 
 def _sfdp_pattern_11(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 11 traced for matching: HuggingFace style: permuted q/k/v, matmul, divide by inv_scale, softmax, matmul with value.
     # Mainly for huggingface models
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
@@ -303,6 +329,7 @@ def _sfdp_pattern_11(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_11(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 11: bumps the fuse_attention counter and calls SDPA on q/k/v transposed over dims 1 and 2 with scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -316,6 +343,7 @@ def _sfdp_replacement_11(query, key, value, inv_scale):
 
 
 def _sfdp_pattern_12(query, key, value, inv_scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 12 traced for matching: pattern 11 with dropout after softmax.
     q = query.permute(0, 2, 1, 3)
     k = key.permute(0, 2, 1, 3)
     v = value.permute(0, 2, 1, 3)
@@ -326,6 +354,7 @@ def _sfdp_pattern_12(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_replacement_12(query, key, value, inv_scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 12: bumps the fuse_attention counter and calls SDPA on transposed q/k/v with scale 1/inv_scale and dropout.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -339,12 +368,14 @@ def _sfdp_replacement_12(query, key, value, inv_scale_factor, dropout_p):
 
 
 def _sfdp_pattern_13(query, key, value, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 13 traced for matching: 3D batched matmul via bmm, softmax, dropout, bmm with value (inference only).
     attn_weight = torch.bmm(query, key.transpose(1, 2)).softmax(dim=-1)
     attn_weight = torch.nn.functional.dropout(attn_weight, p=dropout_p)
     return torch.bmm(attn_weight, value)
 
 
 def _sfdp_replacement_13(query, key, value, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 13: bumps the fuse_attention counter and calls SDPA after adding a leading batch dim to q/k/v, scale 1.0, then removing it.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.unsqueeze(0),
@@ -356,6 +387,7 @@ def _sfdp_replacement_13(query, key, value, dropout_p):
 
 
 def _sfdp_pattern_14(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 14 traced for matching: BertLarge: permuted q/k/v, divide by inv_scale plus additive mask, softmax, matmul.
     # for BertLarge
     # Permutations are needed to create clones in graph.
     q = query.permute([0, 2, 1, 3])
@@ -369,6 +401,7 @@ def _sfdp_pattern_14(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_14(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 14: bumps the fuse_attention counter and calls SDPA on transposed q/k/v with mask cast to query dtype and scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -382,6 +415,7 @@ def _sfdp_replacement_14(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_pattern_15(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 15 traced for matching: DistilBert: scores divided by inv_scale, positions where mask equals zero filled with -inf, softmax, matmul (inference only).
     # for DistilBert
     # Permutations are needed to create clones in graph.
     # Ref: https://github.com/pytorch/pytorch/issues/119911
@@ -398,6 +432,7 @@ def _sfdp_pattern_15(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_15(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 15: bumps the fuse_attention counter and calls SDPA with a boolean mask (mask equals one) expanded to batch, heads, q_len, k_len; scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -419,6 +454,7 @@ def _sfdp_replacement_15(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_pattern_16(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 16 traced for matching: BertLarge with dropout: additive mask, softmax, dropout, cast to query dtype, matmul.
     # for BertLarge with dropout
     q = query.permute([0, 2, 1, 3])
     k = key.permute([0, 2, 1, 3])
@@ -436,6 +472,7 @@ def _sfdp_pattern_16(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_16(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 16: bumps the fuse_attention counter and calls SDPA with mask cast to query dtype; on CUDA (non-ROCm) it instead recomputes the math path explicitly to keep numerics.
     counters["inductor"]["fuse_attention"] += 1
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
@@ -462,6 +499,7 @@ def _sfdp_replacement_16(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_17(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 17 traced for matching: DistilBert with dropout (pattern 15 plus dropout; inference only).
     # for DistilBert with dropout
     q = query.permute([0, 2, 1, 3])
     k = key.permute([0, 2, 1, 3])
@@ -481,6 +519,7 @@ def _sfdp_pattern_17(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 17: bumps the fuse_attention counter and calls SDPA with expanded boolean mask, dropout and scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -502,6 +541,7 @@ def _sfdp_replacement_17(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_18(query, key, value, causal_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 18 traced for matching: GPT2 inference with dropout: scores divided by a tensor-valued inv_scale, causal mask applied with where against the dtype minimum, softmax, dropout, matmul; also returns permuted key and value.
     # for hf_GPT2 with dropout (introduces clone node) for inference
     # it also returns permuted key & value
     query = query.permute([0, 2, 1, 3])
@@ -531,6 +571,7 @@ def _sfdp_pattern_18(query, key, value, causal_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_18(query, key, value, causal_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 18: bumps the fuse_attention counter and calls SDPA using causal_mask as attn_mask, returning the transposed key and value too.
     counters["inductor"]["fuse_attention"] += 1
     permuted_key = key.transpose(1, 2)
     permuted_value = value.transpose(1, 2)
@@ -550,6 +591,7 @@ def _sfdp_replacement_18(query, key, value, causal_mask, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_19(query, key, value, causal_mask, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 19 traced for matching: GPT2 variant of pattern 18 plus an additive attn_mask and cast to value dtype (inference only).
     # for token-classification+gpt2 / text-generation+gpt2
     attn_weights = torch.matmul(query, key.permute(0, 1, 3, 2))
     inv_scale = torch.full(
@@ -571,6 +613,7 @@ def _sfdp_pattern_19(query, key, value, causal_mask, attn_mask, inv_scale, dropo
 def _sfdp_replacement_19(
     query, key, value, causal_mask, attn_mask, inv_scale, dropout_p
 ):
+    # [FUNCTION DOC] HELPER: replacement for pattern 19: bumps the fuse_attention counter and calls SDPA whose mask is where(causal_mask, attn_mask, -inf).
     counters["inductor"]["fuse_attention"] += 1
     fill_value = torch.full((), -float("inf"), dtype=query.dtype, device=query.device)
     attn_mask = torch.where(causal_mask, attn_mask, fill_value)
@@ -586,6 +629,7 @@ def _sfdp_replacement_19(
 
 
 def _sfdp_pattern_20(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 20 traced for matching: DistilBert with dropout where q is divided by inv_scale before matmul (transformers 4.44.2; inference only).
     # for DistilBert with dropout transformers==4.44.2
     q = query.permute([0, 2, 1, 3])
     k = key.permute([0, 2, 1, 3])
@@ -605,6 +649,7 @@ def _sfdp_pattern_20(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_replacement_20(query, key, value, attn_mask, inv_scale, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 20: bumps the fuse_attention counter and calls SDPA with expanded boolean mask, dropout and scale 1/inv_scale.
     counters["inductor"]["fuse_attention"] += 1
     bs = query.size(0)
     n_head = query.size(2)
@@ -626,6 +671,7 @@ def _sfdp_replacement_20(query, key, value, attn_mask, inv_scale, dropout_p):
 
 
 def _sfdp_pattern_21(query, key, value, attn_mask):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 21 traced for matching: T5 with in-place add: scores plus attn_mask, fp32 softmax, cast to query dtype, matmul (inference only).
     # for T5 with inplace add
     query = query.permute([0, 2, 1, 3])
     key = key.permute([0, 2, 1, 3])
@@ -637,6 +683,7 @@ def _sfdp_pattern_21(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_21(query, key, value, attn_mask):
+    # [FUNCTION DOC] HELPER: replacement for pattern 21: bumps the fuse_attention counter and calls SDPA on permuted q/k/v with mask cast to query dtype and scale 1.0.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -652,6 +699,7 @@ def _sfdp_replacement_21(query, key, value, attn_mask):
 
 
 def _sfdp_pattern_22(query, key, value, attn_mask):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 22 traced for matching: pattern 21 that also returns permuted key and value (inference only).
     # for T5 with inplace add and return key and value
     query = query.permute([0, 2, 1, 3])
     key = key.permute([0, 2, 1, 3])
@@ -663,6 +711,7 @@ def _sfdp_pattern_22(query, key, value, attn_mask):
 
 
 def _sfdp_replacement_22(query, key, value, attn_mask):
+    # [FUNCTION DOC] HELPER: replacement for pattern 22: bumps the fuse_attention counter and calls SDPA as in 21, also returning the permuted key and value.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -682,6 +731,7 @@ def _sfdp_replacement_22(query, key, value, attn_mask):
 
 
 def _sfdp_pattern_23(query, key, value):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 23 traced for matching: T5 without explicit mask (generated by full of zeros), returns key and value (inference only).
     # for T5 with inplace add and
     # return key and value and
     # attn_mask is generated by atem.full(..., 0)
@@ -695,6 +745,7 @@ def _sfdp_pattern_23(query, key, value):
 
 
 def _sfdp_replacement_23(query, key, value):
+    # [FUNCTION DOC] HELPER: replacement for pattern 23: bumps the fuse_attention counter and calls SDPA with no mask, scale 1.0, also returning permuted key and value.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -714,6 +765,7 @@ def _sfdp_replacement_23(query, key, value):
 
 
 def _sfdp_pattern_24(query, key, value, attention_mask):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 24 traced for matching: MBart/PLBart causal LM: bmm attention with a mask of possibly different dtype, no scale (inference only).
     """
     this pattern is for MBartForCausalLM/PLBartForCausalLM.
     attn_mask has a different dtype with QKV.
@@ -738,6 +790,7 @@ def _sfdp_pattern_24(query, key, value, attention_mask):
 
 
 def _sfdp_replacement_24(query, key, value, attention_mask):
+    # [FUNCTION DOC] HELPER: replacement for pattern 24: bumps the fuse_attention counter and calls SDPA with mask cast to query dtype and scale 1.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query,
@@ -750,6 +803,7 @@ def _sfdp_replacement_24(query, key, value, attention_mask):
 
 
 def _sfdp_pattern_25(query, key, value, attn_mask, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 25 traced for matching: T5 with in-place add and dropout.
     # for T5 with inplace add
     query = query.permute([0, 2, 1, 3])
     key = key.permute([0, 2, 1, 3])
@@ -762,6 +816,7 @@ def _sfdp_pattern_25(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_25(query, key, value, attn_mask, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 25: bumps the fuse_attention counter and calls SDPA with the mask (made contiguous on xpu), dropout and scale 1.0.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -780,6 +835,7 @@ def _sfdp_replacement_25(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_pattern_26(query, key, value, attn_mask, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 26 traced for matching: pattern 25 that also returns key and value.
     # for T5 with inplace add and return key and value
     query = query.permute([0, 2, 1, 3])
     key = key.permute([0, 2, 1, 3])
@@ -796,6 +852,7 @@ def _sfdp_pattern_26(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_replacement_26(query, key, value, attn_mask, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 26: bumps the fuse_attention counter and calls SDPA as in 25, also returning the permuted key and value.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -818,6 +875,7 @@ def _sfdp_replacement_26(query, key, value, attn_mask, dropout_p):
 
 
 def _sfdp_pattern_27(query, key, value, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 27 traced for matching: T5 with dropout and no explicit mask, returns key and value.
     # for T5 with inplace add and
     # return key and value and
     # attn_mask is generated by atem.full(..., 0)
@@ -835,6 +893,7 @@ def _sfdp_pattern_27(query, key, value, dropout_p):
 
 
 def _sfdp_replacement_27(query, key, value, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 27: bumps the fuse_attention counter and calls SDPA with no mask, dropout, scale 1.0, returning key and value.
     counters["inductor"]["fuse_attention"] += 1
     query = query.permute(0, 2, 1, 3)
     key = key.permute(0, 2, 1, 3)
@@ -855,12 +914,14 @@ def _sfdp_replacement_27(query, key, value, dropout_p):
 
 
 def _sfdp_pattern_28(query, key, value, scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 28 traced for matching: Visformer: delegates to pattern 4 (the point is non-contiguous q/k/v traced from the caller).
     # Visformer pattern
     # same as pattern 4 but non-contiguous q/k/v
     return _sfdp_pattern_4(query, key, value, scale_factor, dropout_p)
 
 
 def _sfdp_replacement_28(query, key, value, scale_factor, dropout_p):
+    # [FUNCTION DOC] HELPER: replacement for pattern 28: bumps the fuse_attention counter and calls SDPA on contiguous copies of q/k/v with scale_factor and dropout.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.contiguous(),
@@ -874,6 +935,7 @@ def _sfdp_replacement_28(query, key, value, scale_factor, dropout_p):
 
 
 def _sfdp_pattern_29(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 29 traced for matching: decomposed SDPA math for BERT-like models with mask: q and k^T each scaled by inv_scale, additive mask, _safe_softmax, matmul.
     # Matches _scaled_dot_product_attention_math decomposition for
     # BERT-like models calling F.scaled_dot_product_attention with attn_mask.
     # Scale is split as sqrt across Q and K (mul.Scalar in fp16), bmm stays
@@ -891,6 +953,7 @@ def _sfdp_pattern_29(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_replacement_29(query, key, value, attn_mask, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 29: bumps the fuse_attention counter and calls SDPA on transposed q/k/v with mask cast to query dtype and scale inv_scale squared.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -904,6 +967,7 @@ def _sfdp_replacement_29(query, key, value, attn_mask, inv_scale):
 
 
 def _sfdp_pattern_30(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: SDPA search pattern 30 traced for matching: pattern 29 without attention mask.
     # Same as pattern 29 but without attention mask.
     # Permutations are needed to create clones in graph.
     q = query.permute([0, 2, 1, 3])
@@ -917,6 +981,7 @@ def _sfdp_pattern_30(query, key, value, inv_scale):
 
 
 def _sfdp_replacement_30(query, key, value, inv_scale):
+    # [FUNCTION DOC] HELPER: replacement for pattern 30: bumps the fuse_attention counter and calls SDPA with no mask and scale inv_scale squared.
     counters["inductor"]["fuse_attention"] += 1
     return _scaled_dot_product_attention(
         query.transpose(1, 2),
@@ -931,6 +996,8 @@ def _sfdp_replacement_30(query, key, value, inv_scale):
 
 @functools.lru_cache(None)
 def _warn_tf32_disabled() -> None:
+    # [FUNCTION DOC] HELPER: cached; logs a perf hint once if a CUDA device with capability 8.0+ is present but
+    # fp32 matmul precision is not tf32 (so flash attention patterns are skipped).
     if (
         torch.cuda.is_available()
         and torch.backends.cuda.matmul.fp32_precision != "tf32"
@@ -944,6 +1011,10 @@ def _warn_tf32_disabled() -> None:
 
 
 def _sfdp_params_check(match):
+    # [FUNCTION DOC] HELPER: common match check. Requires query/key/value of equal dtype and device, rejects CUDA
+    # float32 unless tf32 is enabled (warning once), and if an attention-mask add is present
+    # requires a tensor mask (same device, non-scalar) of query dtype, bool or float. Returns a bool.
+    # Raises AssertionError if query/key/value are missing from the match.
     if not all(k in match.kwargs for k in ("query", "key", "value")):
         raise AssertionError("expected query, key, value in match.kwargs")
     query = match.kwargs["query"].meta["val"]
@@ -993,6 +1064,8 @@ def _sfdp_params_check(match):
 
 
 def _sfdp_pattern_13_check(match):
+    # [FUNCTION DOC] HELPER: extra check for pattern 13; requires common checks and exactly one permute whose
+    # dims are (0, 2, 1). Returns a bool.
     if not _sfdp_params_check(match):
         return False
     permutes = filter_nodes(match.nodes, aten.permute.default)
@@ -1004,7 +1077,11 @@ def _sfdp_pattern_13_check(match):
 
 
 def _sfdp_extra_check(scale_factor_op=None, disable_cuda=False):
+    # [FUNCTION DOC] HELPER: returns a match-check function. It optionally rejects CUDA queries (disable_cuda),
+    # requires the scale factor of the matched scale_factor_op node to be a Python float or int,
+    # then applies the common parameter checks.
     def fn(match):
+        # [FUNCTION DOC] HELPER: the match check produced by _sfdp_extra_check; returns a bool.
         if (
             disable_cuda
             and "query" in match.kwargs
@@ -1024,6 +1101,8 @@ def _sfdp_extra_check(scale_factor_op=None, disable_cuda=False):
 
 
 def partialize_and_update_signature(func, **kwargs):
+    # [FUNCTION DOC] Like partial binding of keyword args but the returned wrapper also has a signature
+    # without the bound parameters and the original name. Used to turn dropout into a constant.
     """
     Equivalent to functools.partial but also updates the signature on returned function
     """
@@ -1038,6 +1117,7 @@ def partialize_and_update_signature(func, **kwargs):
     partial_func = functools.partial(func, **kwargs)
 
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: forwards the call to the partially applied function.
         return partial_func(*args, **kwargs)
 
     wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
@@ -1047,6 +1127,11 @@ def partialize_and_update_signature(func, **kwargs):
 
 
 def _get_sfdp_patterns(input_device: torch.device | None = None):
+    # [FUNCTION DOC] HELPER generator: for float and half dtypes builds example inputs (device from argument,
+    # else CUDA, XPU or CPU) and candidate (pattern, replacement, inputs, scalar workaround, check)
+    # tuples. Yields (name, registration kwargs) for training (joint graph; skipped for
+    # inference-only patterns) and inference (forward only, dropout fixed to 0) variants.
+    # Raises AssertionError on malformed workaround entries.
     from .joint_graph import patterns
 
     if input_device:
@@ -1509,5 +1594,7 @@ def _get_sfdp_patterns(input_device: torch.device | None = None):
 
 @functools.cache
 def _sfdp_init(input_device: torch.device | None = None):
+    # [FUNCTION DOC] HELPER: cached; registers all SDPA fusion patterns via gen_register_replacement.
+    # Side effect: populates the pattern matcher pass dicts.
     for key, register_replacement_kwargs in _get_sfdp_patterns(input_device):
         gen_register_replacement(key, **register_replacement_kwargs)

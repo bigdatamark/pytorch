@@ -1,3 +1,6 @@
+# [MODULE DOC] Detects fusion regions for overlap scheduling: groups contiguous fusible aten
+# nodes (those Inductor can lower and fuse) into connected components, and estimates per-node
+# costs counting only memory traffic crossing region boundaries. No import-time side effects.
 """Detect fusion regions for overlap scheduling."""
 
 import torch
@@ -6,6 +9,7 @@ from torch.utils._ordered_set import OrderedSet
 
 
 def is_view_node(n: fx.Node) -> bool:
+    # [FUNCTION DOC] True if the node targets an aten or prims view op (no cost, no allocation).
     """Check if a node is a view operation (zero cost, no memory allocation)."""
 
     return isinstance(n.target, torch._ops.OpOverload) and (
@@ -14,6 +18,9 @@ def is_view_node(n: fx.Node) -> bool:
 
 
 def is_fusible_node(n: fx.Node) -> bool:
+    # [FUNCTION DOC] True for a call_function aten op that has an Inductor lowering, is not a fallback, has no
+    # flop counter, is not a c10d functional collective/wait, and for cat has no more inputs than
+    # the configured pointwise cat limit.
     """Check if a node is fusible based on whether it has an inductor lowering.
 
     A node is fusible if:
@@ -63,6 +70,8 @@ def is_fusible_node(n: fx.Node) -> bool:
 
 
 def _get_contiguous_fusible_spans(gm: fx.GraphModule) -> list[list[fx.Node]]:
+    # [FUNCTION DOC] HELPER: scans gm in order and returns lists of consecutive fusible nodes; non-fusible
+    # nodes split spans.
     """Get contiguous spans of fusible nodes from the graph.
 
     Walks the graph in topological order and groups consecutive fusible
@@ -87,6 +96,8 @@ def _get_contiguous_fusible_spans(gm: fx.GraphModule) -> list[list[fx.Node]]:
 
 
 def _find_connected_components(span: list[fx.Node]) -> list[list[fx.Node]]:
+    # [FUNCTION DOC] HELPER: groups span nodes by direct data dependency within the span using union-find.
+    # Returns a list of node lists (empty for empty span).
     """Find connected components within a span of fusible nodes.
 
     Two nodes are connected if one is an input to the other (direct data dependency).
@@ -124,6 +135,9 @@ def _find_connected_components(span: list[fx.Node]) -> list[list[fx.Node]]:
 def build_fusion_regions(
     gm: fx.GraphModule,
 ) -> dict[fx.Node, OrderedSet[fx.Node]]:
+    # [FUNCTION DOC] Builds regions: per contiguous span of at least 2 nodes, takes connected components having
+    # at least 2 non-view nodes, sorts them in graph order and returns a mapping from each node to
+    # its shared ordered set of region nodes.
     """Build fusion regions from contiguous spans of fusible nodes.
 
     1. Identify contiguous spans of fusible nodes (separated by non-fusible nodes)
@@ -169,6 +183,9 @@ def build_fusion_regions(
 def estimate_fused_node_costs(
     region_of: dict[fx.Node, OrderedSet[fx.Node]],
 ) -> dict[fx.Node, float]:
+    # [FUNCTION DOC] Returns a per-node cost mapping (milliseconds-scale, transfer time divided by 1e6) for
+    # nodes in the regions. Only external inputs and outputs used outside the region count;
+    # nodes with none cost 0. Each distinct region is processed once.
     """Estimate per-node costs accounting for fusion (no graph collapse).
 
     For each node in a fusion region, only count I/O that crosses the
