@@ -1,3 +1,16 @@
+# [MODULE DOC] Higher-order ops (HOPs) that let user-defined Triton kernels live in FX graphs.
+# Contains: a process-global KernelSideTable (kernel and non-graphable constant args stored by integer id,
+# since FX nodes cannot hold arbitrary objects); TTIR mutation/read analysis (generate_ttir,
+# ttir_to_functions, analyze_kernel_access, identify_accessed_tensors) that decides which tensor arguments
+# a kernel reads/writes; the two HOPs triton_kernel_wrapper_mutation and triton_kernel_wrapper_functional
+# with their dense, fake, meta, proxy-tracing and functionalization implementations; the abstract
+# TritonHOPifier (turns a kernel call into a HOP call, handling autotune/heuristics/grid normalization),
+# its tracing subclass, and TraceableTritonKernelWrapper (the object returned by wrap_triton).
+# Import-time side effects: instantiates the two HOP singletons, registers their py_impl/functionalize/fake
+# handlers, registers fallthroughs for several dispatch keys, and redirects the mutation HOP to the
+# SAC caching dispatch modes. Triton itself is imported lazily inside functions.
+# KNOWN ISSUE: the AutogradCUDA fallthrough is registered twice for triton_kernel_wrapper_functional
+# (harmless duplicate).
 import ast
 import collections
 import copy
@@ -95,12 +108,16 @@ def create_tma_experimental_metadata(
     block_dims: list[IntLikeType],
     element_size: IntLikeType,
 ) -> TMAExperimentalMetadata:
+    # [FUNCTION DOC] Build the raw tuple metadata for the experimental TMA API: the string "experimental"
+    # paired with (dims, block_dims, element_size). Pure; no validation.
     return ("experimental", (dims, block_dims, element_size))
 
 
 def maybe_unpack_tma_experimental_metadata(
     tma_meta: TMAExperimentalMetadata | TMAStableMetadata,
 ) -> tuple[list[IntLikeType], list[IntLikeType], IntLikeType] | None:
+    # [FUNCTION DOC] Return the (dims, block_dims, element_size) payload if the metadata is a non-empty
+    # pair tagged "experimental"; return None for empty metadata, wrong length, or the "stable" tag.
     if not tma_meta or len(tma_meta) != 2:
         return None
     if tma_meta[0] == "experimental":
@@ -111,12 +128,16 @@ def maybe_unpack_tma_experimental_metadata(
 def create_tma_stable_metadata(
     block_shape: list[IntLikeType],
 ) -> TMAStableMetadata:
+    # [FUNCTION DOC] Build the raw tuple metadata for the stable TMA API: the string "stable" paired with
+    # a one-element tuple holding block_shape. Pure; no validation.
     return ("stable", (block_shape,))
 
 
 def maybe_unpack_tma_stable_metadata(
     tma_meta: TMAExperimentalMetadata | TMAStableMetadata,
 ) -> tuple[list[IntLikeType]] | None:
+    # [FUNCTION DOC] Return the (block_shape,) payload if the metadata is a non-empty pair tagged
+    # "stable"; return None for empty metadata, wrong length, or the "experimental" tag.
     if not tma_meta or len(tma_meta) != 2:
         return None
     if tma_meta[0] == "stable":
@@ -149,6 +170,11 @@ TMADescriptorMetadata = dict[
 # Use a side table.
 # We use two dicts so that fetching both the kernel and id are O(1)
 class KernelSideTable:
+    # [CLASS DOC] Registry mapping integer ids to Triton kernel objects and to dicts of constant (non-graph)
+    # kernel arguments, so FX graphs can refer to them by id. State: id_to_kernel, kernel_to_id (reverse
+    # mapping so lookups are O(1) both ways), constant_args, and a lock guarding the mutating adds.
+    # These dicts are class-level attributes, hence shared by all instances until reset_table rebinds
+    # per-instance copies. Ids are dense indices assigned in insertion order.
     id_to_kernel: dict[int, "TritonKernelType"] = {}
     kernel_to_id: dict["TritonKernelType", int] = {}
     constant_args: dict[int, dict[str, Any]] = {}
@@ -156,6 +182,8 @@ class KernelSideTable:
 
     # Returns index on the table
     def add_kernel(self, kernel: "TritonKernelType") -> int:
+        # [FUNCTION DOC] Register a kernel (under the lock) and return its id; if the kernel is already
+        # registered its existing id is returned, otherwise a new id equal to the current table size is used.
         with self.lock:
             if kernel in self.kernel_to_id:
                 return self.kernel_to_id[kernel]
@@ -167,6 +195,7 @@ class KernelSideTable:
 
     # Returns the triton kernel at the given index
     def get_kernel(self, idx: int) -> "TritonKernelType":
+        # [FUNCTION DOC] Look up a kernel by id without locking; raises an AssertionError if the id is unknown.
         # No need to lock here as fetching from dict is atomic
         if idx not in self.id_to_kernel:
             raise AssertionError(f"Kernel index {idx} not found in id_to_kernel")
@@ -175,6 +204,8 @@ class KernelSideTable:
     # Not every constant arg can be added to the graph. Use this side table
     # for constant args.
     def add_constant_args(self, args: dict[str, Any]) -> int:
+        # [FUNCTION DOC] Store a dict of non-graphable kernel arguments (under the lock) and return its new id.
+        # Every call creates a new entry; there is no de-duplication.
         with self.lock:
             idx = len(self.constant_args)
             self.constant_args[idx] = args
@@ -182,6 +213,8 @@ class KernelSideTable:
 
     # Returns the constant args
     def get_constant_args(self, idx: int) -> dict[str, Any]:
+        # [FUNCTION DOC] Look up a stored constant-args dict by id without locking; raises an AssertionError
+        # if the id is unknown. Returns the stored dict itself (not a copy).
         # No need to lock here as fetching from dict is atomic
         if idx not in self.constant_args:
             raise AssertionError(
@@ -192,6 +225,8 @@ class KernelSideTable:
     # Resets the table (only meant to be used in unit tests)
     # This is only safe assuming single threaded execution
     def reset_table(self) -> None:
+        # [FUNCTION DOC] Replace all three dicts with fresh empty ones on this instance (test-only; not
+        # thread safe and does not take the lock). Previously issued ids become invalid.
         self.id_to_kernel = {}
         self.kernel_to_id = {}
         self.constant_args = {}
@@ -206,19 +241,28 @@ kernel_side_table = KernelSideTable()
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Param:
+    # [CLASS DOC] Frozen record naming a function parameter of a captured TTIR function by position idx.
     idx: int
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Intermediate:
+    # [CLASS DOC] Frozen record naming an SSA value (op result) in a captured TTIR function by a re-indexed
+    # integer id. Negative ids denote synthetic ("fake") values created for ops without results or for
+    # inlined block arguments.
     idx: int
 
     def fake(self) -> bool:
+        # [FUNCTION DOC] True when this is a synthetic value (negative idx) not produced by a real op.
         return self.idx < 0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Op:
+    # [CLASS DOC] Frozen record of one TTIR operation: MLIR op name, callee name (only for tt.call),
+    # argument list of Param/Intermediate, the Intermediate it produces, optional sub_idx (used when
+    # scf.yield is split per result), and is_pure (only meaningful for tt.elementwise_inline_asm).
+    # Invariant (checked in __post_init__): fn_call_name is set iff name is tt.call.
     name: str
     fn_call_name: str | None
     args: list[Param | Intermediate]
@@ -230,6 +274,8 @@ class Op:
     is_pure: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate the invariant that fn_call_name is present for tt.call ops and absent for
+        # all others; raises an AssertionError otherwise.
         if self.name == "tt.call":
             if self.fn_call_name is None:
                 raise AssertionError("fn_call_name must not be None for tt.call op")
@@ -245,6 +291,14 @@ def generate_ttir(
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
 ) -> tuple["TritonIRModule", list[str]]:
+    # [FUNCTION DOC] Compile a Triton kernel (JITFunction, or the first config of an Autotuner) to a
+    # verified TTIR module without running it. Args: kernel; kwargs mapping argument name to value
+    # (symbolic values become a dummy int, fake tensors/TensorBox become small real tensors, stable TMA
+    # descriptors are rebuilt from metadata); tma_descriptor_metadata. Returns (ttir_module, ordered names
+    # of TTIR parameters), where TMA descriptors expand into extra placeholder stride/size names and
+    # constexpr/None args are omitted. Raises ValueError on wrong argument count, RuntimeError if TTIR
+    # verification fails. Handles many Triton versions (attrs descriptor, make_ir signature, specialization).
+    # Side effect: removes backend-option entries from the caller's kwargs dict in place.
     """
     Uses Triton's internal code generation to create TTIR
     """
@@ -327,6 +381,8 @@ def generate_ttir(
             ordered_args[name] = a
 
     def is_stable_tensor_descriptor_arg(arg: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if host-side stable TMA is available in Triton and arg is a Triton
+        # TensorDescriptor instance.
         if has_triton_tensor_descriptor_host_tma():
             from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -335,6 +391,8 @@ def generate_ttir(
         return False
 
     def _is_constexpr_or_none(name: str, arg: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if the named kernel parameter is declared constexpr or its value is None
+        # (such args are baked into the kernel and do not appear as TTIR parameters).
         param_idx = kernel.arg_names.index(name)
         return kernel.params[param_idx].is_constexpr or arg is None
 
@@ -352,6 +410,9 @@ def generate_ttir(
     # scalars and tensors as this matters for "odd" ordering,
     # eg. [tensor, scalar, tensor].
     def get_arg_names(name: str, arg: Any) -> list[str]:
+        # [FUNCTION DOC] HELPER: TTIR parameter names contributed by one kernel argument: none for
+        # constexpr/None, the name plus rank STRIDE and rank SIZE placeholder names for a stable TMA
+        # descriptor, otherwise just the name. Raises AssertionError if stable metadata cannot be unpacked.
         if _is_constexpr_or_none(name, arg):
             return []
 
@@ -377,6 +438,10 @@ def generate_ttir(
     )
 
     def _get_specialization(args):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Compute the specialization attributes needed to build an ASTSource for the
+        # given argument values, mirroring JITFunction.run for the detected Triton version (old compiler
+        # config, backend attrs descriptor, or the newer dict-of-attrs path using specialize_impl variants).
+        # Raises AssertionError if the version is not the expected dict-based one in the final branch.
         # Support multiple triton versions.
         # This code basically copies JITFunction.run() logic to get the attrs to construct an ASTSource.
         if triton_version == TritonAttrsDescriptorVersion.V1_COMPILER:
@@ -425,6 +490,8 @@ def generate_ttir(
                     specialize_value: bool = True,
                     align: bool = True,
                 ) -> Callable:
+                    # [FUNCTION DOC] HELPER: Adapter that calls Triton's native_specialize_impl with
+                    # BaseBackend prepended, matching the signature of the older specialize_impl.
                     return native_specialize_impl(
                         BaseBackend, arg, is_const, specialize_value, align
                     )
@@ -473,6 +540,9 @@ def generate_ttir(
     if (mangle_type := getattr(triton.runtime.jit, "mangle_type", None)) is not None:
 
         def get_signature_value(idx: int, arg: Any) -> str:
+            # [FUNCTION DOC] HELPER: Triton signature type string for argument idx: "constexpr" for constexpr
+            # params, otherwise the mangled type of the value, except that bool tensor pointer types
+            # (i1/u1) are rewritten to u8 to avoid bit-packed loads (AOTI workaround).
             if kernel.params[idx].is_constexpr:
                 return "constexpr"
             # pyrefly: ignore [not-callable]
@@ -488,6 +558,8 @@ def generate_ttir(
     else:
 
         def get_signature_value(idx: int, arg: Any) -> str:
+            # [FUNCTION DOC] HELPER: Fallback for Triton versions without mangle_type: type string from the
+            # kernel's key_of/_type_of methods.
             return kernel._type_of(kernel.key_of(arg))
 
     if triton_version_uses_attrs_dict():
@@ -545,6 +617,12 @@ def generate_ttir(
 def ttir_to_functions(
     ttir_module: "TritonIRModule",
 ) -> dict[str, dict[Intermediate, list[Op]]]:
+    # [FUNCTION DOC] Convert a TTIR module into a mapping from tt.func name to a mapping from result
+    # Intermediate to the list of Ops producing it. Walks the MLIR ops bottom-up, flattening structured
+    # control flow (scf.if/for/while, tt.reduce/scan) by inlining child block ops into the parent block and
+    # substituting block arguments with the operands they alias (or fresh fake Intermediates); function block
+    # arguments become Param(i). Raises RuntimeError for unknown ops with regions, AssertionError on
+    # malformed reduce/scan. Local state only; no global side effects.
     """
     Walk the `ttir_module` bottom up to mine the `functions` from
     the structured MLIR entities representing the Triton kernel
@@ -563,11 +641,19 @@ def ttir_to_functions(
     next_fake_intermediate = 0
 
     def reindex(idx: int) -> int:
+        # [FUNCTION DOC] HELPER: Map an MLIR object id to a dense small integer, assigning the next number on
+        # first sight (mutates reindex_map).
         if idx not in reindex_map:
             reindex_map[idx] = len(reindex_map)
         return reindex_map[idx]
 
     def mlir_to_functions(op: "TritonIROperation") -> None:
+        # [FUNCTION DOC] HELPER: Walk callback invoked once per MLIR op (children before parents). Records
+        # block/region membership, then: for tt.func collects all child-block ops into functions and resolves
+        # block-argument replacements to Params; for scf/reduce/scan ops inlines child ops into the parent
+        # block and forwards yields (splitting scf.yield into one sub-yield per result, see the note below);
+        # for ordinary ops appends an Op keyed by each result (or a fake result). builtin.module is ignored.
+        # Mutates the enclosing op_stack, replacements, functions and counter state.
         name: str = op.get_name()
         if name == "builtin.module":
             # this wraps all tt.func ops
@@ -805,10 +891,15 @@ def ttir_to_functions(
 
 
 class MemoizeWithCycleCheck:
+    # [CLASS DOC] Callable decorator class that memoizes analysis functions taking (functions, fn_name, *args)
+    # and detects recursion: a key is first stored as None while computing, so re-entry with the same key
+    # reads None and raises. State: fn (wrapped callable) and cache keyed by (fn_name, *args) -- the
+    # functions mapping itself is not part of the key. reset() clears the cache.
     fn: Callable[..., Any]
     cache: dict[tuple[Any], Any]
 
     def __init__(self, fn: Callable[..., Any]) -> None:
+        # [FUNCTION DOC] Store the wrapped function and start with an empty cache.
         self.fn = fn
         self.reset()
 
@@ -818,6 +909,9 @@ class MemoizeWithCycleCheck:
         fn_name: str,
         *args: Any,
     ) -> Any:
+        # [FUNCTION DOC] Return the cached result for (fn_name, *args), computing it with the wrapped function
+        # on first use. A placeholder None is cached during computation, so a recursive call with the same
+        # key (or a function that legitimately returns None) raises RuntimeError("Recursion is not supported").
         key: tuple[Any, ...] = (fn_name, *args)
         if key not in self.cache:
             self.cache[key] = None
@@ -827,6 +921,7 @@ class MemoizeWithCycleCheck:
         return self.cache[key]
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Discard all memoized results by rebinding the cache to an empty dict.
         self.cache = {}
 
 
@@ -834,6 +929,11 @@ class MemoizeWithCycleCheck:
 def get_tma_stores(
     functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str
 ) -> set[Intermediate | Param]:
+    # [FUNCTION DOC] Memoized. Collect the values (Intermediates/Params) of function fn_name that are the
+    # target of a TMA store op (per the _KERNEL_ACCESS_OPS table), plus the first argument of any
+    # reinterpret_tensor_descriptor op producing such a value. Calls to nested functions are analyzed
+    # recursively and a caller argument is included when the matching callee Param is TMA-stored.
+    # Raises AssertionError for a call to an unknown function; RuntimeError on recursion. Pure otherwise.
     """
     Identifies all intermediates and parameters that are written to by a
     `tt.experimental_descriptor_store`. It tracks only the specific values
@@ -900,23 +1000,32 @@ def get_tma_stores(
 
 @dataclasses.dataclass
 class TensorAccesses:
+    # [CLASS DOC] Result of kernel access analysis: read_writes holds inductor StarDep reads/writes by
+    # tensor argument name; can_fuse_epilogue says whether an epilogue may be fused onto the kernel's
+    # single, once-written, never-read output.
     read_writes: "ReadWrites"
     can_fuse_epilogue: bool
 
 
 class IgnoreUnknownOp(Protocol):
+    # [CLASS DOC] Protocol for a predicate over an Op: returns True if the op may be skipped by access analysis
+    # (analysis raises otherwise). Its single method body is a bare ellipsis, so it carries no function doc.
     """Returns True if the op should be skipped; otherwise the caller raises."""
 
     def __call__(self, op: Op) -> bool: ...
 
 
 class ReadWriteIndexes(Protocol):
+    # [CLASS DOC] Protocol for a function mapping an Op to the sequence of its argument positions that are
+    # read (or written). Its single method body is a bare ellipsis, so it carries no function doc.
     """Return the argument indexes read / written."""
 
     def __call__(self, op: Op) -> Sequence[int]: ...
 
 
 def first_arg(op: Op) -> list[int]:
+    # [FUNCTION DOC] ReadWriteIndexes implementation selecting only argument 0; raises AssertionError if the
+    # op has no arguments.
     """Return the first argument index after checking that it exists."""
     if len(op.args) < 1:
         raise AssertionError(f"{op.name} expected at least 1 arg, got {len(op.args)}")
@@ -925,6 +1034,9 @@ def first_arg(op: Op) -> list[int]:
 
 @dataclasses.dataclass(frozen=True)
 class _KernelAccessOpInfo:
+    # [CLASS DOC] HELPER: Frozen description of how a Triton op touches memory: optional read_indexes and
+    # write_indexes callables (arg positions read / written), is_tma_store flag, and optional ignore_if
+    # predicate for ops whose effects cannot be analyzed but may be assumed harmless.
     read_indexes: ReadWriteIndexes | None = None
     write_indexes: ReadWriteIndexes | None = None
     is_tma_store: bool = False
@@ -954,6 +1066,8 @@ _KERNEL_ACCESS_OPS: dict[str, _KernelAccessOpInfo] = {
 
 
 def _read_write_indexes(indexes: Sequence[int] | ReadWriteIndexes) -> ReadWriteIndexes:
+    # [FUNCTION DOC] HELPER: Normalize either a callable or a fixed sequence of positions into a
+    # ReadWriteIndexes callable (a sequence becomes a function ignoring the op and returning that tuple).
     if callable(indexes):
         return indexes
     index_tuple = tuple(indexes)
@@ -968,6 +1082,10 @@ def register_kernel_access_op(
     is_tma_store: bool = False,
     ignore_if: IgnoreUnknownOp | None = None,
 ) -> None:
+    # [FUNCTION DOC] Add or overwrite an entry in the global _KERNEL_ACCESS_OPS table for op name, with
+    # read/write argument positions (sequence or callable), TMA-store flag, and ignore predicate. Raises
+    # AssertionError if marked TMA store without write indexes, or if ignore_if is combined with indexes.
+    # Side effect: mutates global table; does not reset memoized analysis caches.
     """Register a Triton op for kernel read/write analysis."""
     if is_tma_store and write_indexes is None:
         raise AssertionError(
@@ -991,6 +1109,8 @@ def register_kernel_access_op(
 
 
 def unregister_kernel_access_op(name: str) -> None:
+    # [FUNCTION DOC] Remove op name from the global _KERNEL_ACCESS_OPS table if present (no error if
+    # absent). Does not clear memoized analysis caches.
     """
     Unregister a Triton op from kernel read/write analysis.
 
@@ -1009,6 +1129,14 @@ def analyze_kernel_access(
     tensor_names: tuple[str, ...],
     tensor_arg_indices: frozenset[int] | None,
 ) -> TensorAccesses:
+    # [FUNCTION DOC] Memoized. For function fn_name, find which of its first num_args parameters are written
+    # and read. Seeds write/read stacks from ops listed in _KERNEL_ACCESS_OPS (plus TMA tensormap creation
+    # and nested tt.call results, analyzed recursively with placeholder names), then walks operands backwards
+    # (skipping loads when tracing writes; for pointer-only ops following just the base pointer) counting
+    # Param hits, optionally limited to tensor_arg_indices. Returns TensorAccesses with StarDeps named via
+    # tensor_names and can_fuse_epilogue true only for exactly one output written once and never read.
+    # Raises RuntimeError for an op whose ignore_if predicate returns False or on recursion;
+    # AssertionError for malformed ops or unknown callees.
     """
     Analyzes the graph to detect which arguments are written to and which are read.
 
@@ -1104,6 +1232,9 @@ def analyze_kernel_access(
         initial_stack: list[Param | Intermediate],
         skip_loads: bool,
     ) -> dict[int, int]:
+        # [FUNCTION DOC] HELPER: Depth-first walk from the seed values through producing ops' arguments;
+        # returns a mapping from parameter index to number of times reached. Ignores out-of-range or
+        # non-tensor parameters and fake intermediates; optionally does not expand tt.load ops.
         """DFS traversal to find argument indices that are accessed (and how many times they are accessed)."""
         access_count = dict()
         stack = initial_stack[:]
@@ -1148,6 +1279,8 @@ def analyze_kernel_access(
     )
 
     def _decide_can_fuse_epilogue():
+        # [FUNCTION DOC] HELPER: True only if the kernel writes exactly one tensor, that tensor is reached
+        # exactly once by write tracing, and the kernel does not also read it.
         # only do epilogue fusion if the kernel has a single output tensor
         if len(write_count) != 1:
             return False
@@ -1174,6 +1307,11 @@ def identify_accessed_tensors(
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
 ) -> TensorAccesses:
+    # [FUNCTION DOC] Top-level read/write analysis of a Triton kernel call: generate TTIR, convert to
+    # functions, reset the memo caches, and run analyze_kernel_access on the first (kernel) function with
+    # tensor-typed arguments identified. On any exception it logs a warning (plus debug dumps of TTIR) and
+    # conservatively returns every Tensor/TensorBox kwarg as both read and written with epilogue fusion
+    # disallowed. Side effects: resets global memo caches; logging.
     """
     Given a triton kernel and the arguments for this kernel, this function
     1) Retrieves the TTIR converted version of the kernel from Triton's API.
@@ -1259,6 +1397,8 @@ def identify_accessed_tensors(
 
 @dataclasses.dataclass
 class TritonStore:
+    # [CLASS DOC] One tl.store call found in kernel source: the whole call node plus the AST nodes of its
+    # pointer and value arguments.
     store_node: ast.Call
     store_pointer_node: ast.Expr
     store_value_node: ast.Expr
@@ -1266,11 +1406,15 @@ class TritonStore:
 
 @dataclasses.dataclass
 class TritonStores:
+    # [CLASS DOC] Container holding the list of TritonStore entries found in a kernel.
     stores: list[TritonStore]
 
 
 @functools.cache
 def identify_triton_stores(source_code: str) -> TritonStores:
+    # [FUNCTION DOC] Cached (functools.cache) wrapper: parse Python source text into an AST and return the
+    # tl.store calls found. Raises SyntaxError on unparsable source.
+    # KNOWN ISSUE: the docstring says mask info is returned, but only pointer and value nodes are captured.
     """
     Parse Python source code of triton kernel and find all tl.store calls.
     Returns a TritonStores object containing information about pointer, value, and mask.
@@ -1281,9 +1425,14 @@ def identify_triton_stores(source_code: str) -> TritonStores:
 
 
 def identify_triton_stores_from_ast(tree: ast.Module) -> TritonStores:
+    # [FUNCTION DOC] Walk every node of the AST and, for each call whose callee is the attribute store on a
+    # name tl, extract the pointer (arg 0 or keyword) and value (arg 1 or keyword) nodes; calls missing
+    # either are skipped. Returns them as TritonStores in walk order. Pure.
     stores = []
 
     def _extract_arg(node, arg_name, positional_index):
+        # [FUNCTION DOC] HELPER: Return the call argument at the given position if present, else the keyword
+        # argument with the given name, else None.
         """
         Extract an argument from a Call node, checking both positional and keyword args.
         Returns the AST node for the argument, or None if not found.
@@ -1325,9 +1474,14 @@ def identify_triton_stores_from_ast(tree: ast.Module) -> TritonStores:
 
 
 class _TritonKernelWrapper(HigherOrderOperator):
+    # [CLASS DOC] HELPER: Base class for the two Triton kernel HOPs. Its only customization is to extend the
+    # set of overloaded (Python-dispatch) args with Tensor values inside the nested kwargs dict.
     def _get_overloaded_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[Tensor, ...]:
+        # [FUNCTION DOC] Return the base class's overloaded args plus any Tensors found in the nested
+        # "kwargs" dict that have the Python dispatch key set, so tensor subclasses inside the kernel kwargs
+        # participate in dispatch.
         overloaded_args = list(super()._get_overloaded_args(args, kwargs))
         triton_kwargs = kwargs.get("kwargs")
         if isinstance(triton_kwargs, dict):
@@ -1341,7 +1495,11 @@ class _TritonKernelWrapper(HigherOrderOperator):
 
 # Used for wrapping a Triton Kernel
 class TritonKernelWrapperMutation(_TritonKernelWrapper):
+    # [CLASS DOC] Cacheable HOP "triton_kernel_wrapper_mutation": launches a Triton kernel (looked up by id in
+    # the side table) that mutates its tensor kwargs in place and returns nothing. A single module-level
+    # instance exists.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Register the HOP under its name, marked cacheable.
         super().__init__("triton_kernel_wrapper_mutation", cacheable=True)
 
     def __call__(
@@ -1353,6 +1511,9 @@ class TritonKernelWrapperMutation(_TritonKernelWrapper):
         kwargs: dict[str, Any],
         launch_kwargs: tuple[str, ...] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Invoke the HOP with keyword arguments kernel_idx, constant_args_idx, grid (list of
+        # grids, one per autotune config), tma_descriptor_metadata and kwargs; launch_kwargs is forwarded
+        # only when non-empty. Returns whatever the dispatched implementation returns (None).
         hop_kwargs: dict[str, Any] = {
             "kernel_idx": kernel_idx,
             "constant_args_idx": constant_args_idx,
@@ -1372,7 +1533,11 @@ triton_kernel_wrapper_mutation = TritonKernelWrapperMutation()
 
 # Used for wrapping a Triton Kernel in a functional manner
 class TritonKernelWrapperFunctional(_TritonKernelWrapper):
+    # [CLASS DOC] Cacheable HOP "triton_kernel_wrapper_functional": functional variant of the mutation HOP
+    # that clones the tensors named in tensors_to_clone, runs the kernel on the clones, and returns a dict of
+    # those clones. A single module-level instance exists.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Register the HOP under its name, marked cacheable.
         super().__init__("triton_kernel_wrapper_functional", cacheable=True)
 
     def __call__(
@@ -1385,6 +1550,9 @@ class TritonKernelWrapperFunctional(_TritonKernelWrapper):
         tensors_to_clone: list[str],
         launch_kwargs: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Invoke the HOP with the same arguments as the mutation HOP plus tensors_to_clone
+        # (names of kwargs to clone); launch_kwargs is forwarded only when non-empty. Returns a mapping from
+        # name to the updated cloned tensor.
         hop_kwargs: dict[str, Any] = {
             "kernel_idx": kernel_idx,
             "constant_args_idx": constant_args_idx,
@@ -1404,6 +1572,7 @@ triton_kernel_wrapper_functional = TritonKernelWrapperFunctional()
 
 
 def get_kernel(kernel_idx: int) -> "TritonKernelType":
+    # [FUNCTION DOC] Fetch a kernel from the global side table by id (AssertionError if unknown).
     return kernel_side_table.get_kernel(kernel_idx)
 
 
@@ -1417,6 +1586,13 @@ def triton_kernel_wrapper_mutation_dense(
     kwargs: dict[str, Any],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Eager implementation of the mutation HOP: actually launches the Triton kernel. Looks up
+    # kernel and constant args in the side table; with one grid uses it directly, otherwise generates and
+    # executes (dynamic code execution) a grid function dispatching on autotune config. Rebuilds TMA
+    # descriptors (experimental or stable) from tma_descriptor_metadata in place of the tensors, then moves
+    # leading kernel params from kwargs/constant args into positional args (workaround for a Triton
+    # pre/post-hook bug; stops at the first launch kwarg or missing name) and calls the kernel on the grid.
+    # Copies kwargs and constant args so inputs are not mutated; the kernel itself mutates tensors. Returns None.
     from torch._inductor.codegen.wrapper import user_defined_kernel_grid_fn_code
 
     kernel = kernel_side_table.get_kernel(kernel_idx)
@@ -1521,6 +1697,8 @@ def triton_kernel_wrapper_mutation_fake_tensor_mode(
     kwargs: dict[str, Any],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Fake-tensor-mode implementation of the mutation HOP: does nothing and returns None
+    # (the kernel has no outputs; all arguments are ignored).
     return None
 
 
@@ -1534,6 +1712,7 @@ def _(
     kwargs: dict[str, Any],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Meta-key implementation of the mutation HOP: does nothing and returns None.
     return None
 
 
@@ -1542,6 +1721,11 @@ def trace_triton_kernel_wrapper(
     func_overload: Callable[..., Any],
     node_args: dict[str, Any],
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Record a call to one of the kernel HOPs in the FX graph being built by proxy_mode.
+    # Runs func_overload eagerly on node_args with proxy tracing disabled to get real outputs, unwraps
+    # node_args to proxies, creates a call_function node (named after the op plus "_proxy"), and attaches
+    # the node to the outputs via tensor-tree tracking. Returns the traced outputs (None for the mutation
+    # HOP). Side effect: adds a node to the tracer's graph.
     with disable_proxy_modes_tracing():
         out = func_overload(**node_args)
 
@@ -1572,6 +1756,9 @@ def triton_kernel_wrapper_mutation_proxy_torch_dispatch_mode(
     kwargs: dict[str, Any],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> None:
+    # [FUNCTION DOC] ProxyTorchDispatchMode implementation of the mutation HOP: bundles the arguments
+    # (launch_kwargs only if non-empty) and traces a call into the graph via trace_triton_kernel_wrapper.
+    # Returns None.
     node_args: dict[str, Any] = {
         "kernel_idx": kernel_idx,
         "constant_args_idx": constant_args_idx,
@@ -1597,6 +1784,9 @@ def get_mutated_tensors(
     kwargs: dict[str, Any],
     tma_descriptor_metadata: TMADescriptorMetadata,
 ) -> list[str]:
+    # [FUNCTION DOC] Return the names of tensor kwargs that the kernel writes. Looks up kernel and constant
+    # args in the side table, runs identify_accessed_tensors on the combined arguments, and keeps written
+    # names whose value in kwargs is actually a Tensor (scalars/SymInts are dropped).
     kernel = kernel_side_table.get_kernel(kernel_idx)
     constant_args = kernel_side_table.get_constant_args(constant_args_idx)
     tensor_accesses = identify_accessed_tensors(
@@ -1621,6 +1811,11 @@ def triton_kernel_wrapper_mutation_functionalize(
     kwargs: dict[str, Any],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Functionalization rule for the mutation HOP: unwrap functional tensors, determine which
+    # tensors the kernel mutates, redispatch to the functional HOP (cloning those tensors), then for each
+    # returned tensor replace the original input's contents with the output, mark the mutation hidden from
+    # autograd, commit and sync the update. Raises AssertionError if outputs are not a subset of the input
+    # keys or an output's input is not a Tensor. Mutates the functionalized inputs; returns None.
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)  # type: ignore[arg-type]
     # TODO(oulgen): Preexisting bug, if two kernel inputs are views of each
     # other, and one gets mutated in kernel, and later another gets mutated,
@@ -1674,6 +1869,9 @@ def triton_kernel_wrapper_functional_dense(
     tensors_to_clone: list[str],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Eager implementation of the functional HOP: clone (stride-preserving) every kwarg named
+    # in tensors_to_clone, run the mutation HOP on the new kwargs, and return a dict of just the cloned
+    # tensors (which now hold the kernel's writes). Inputs are left unmodified.
     # TODO(oulgen): For performance reasons, we want to ensure that these
     # `clone_preserve_strides` calls are never executed at runtime
     # (inductor should always optimize them away).
@@ -1706,6 +1904,8 @@ def triton_kernel_wrapper_functional_fake_tensor_mode(
     tensors_to_clone: list[str],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Fake-tensor-mode implementation of the functional HOP: returns a dict of stride-preserving
+    # clones of the kwargs named in tensors_to_clone without launching the kernel.
     # TODO(oulgen): For performance reasons, we want to ensure that these
     # `clone_preserve_strides` calls are never executed at runtime
     # (inductor should always optimize them away).
@@ -1729,6 +1929,9 @@ def triton_kernel_wrapper_functional_proxy_torch_dispatch_mode(
     tensors_to_clone: list[str],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] ProxyTorchDispatchMode implementation of the functional HOP: bundles arguments
+    # (launch_kwargs only if non-empty), traces the call into the graph, and returns the traced output dict.
+    # Raises AssertionError if tracing returned None.
     node_args: dict[str, Any] = {
         "kernel_idx": kernel_idx,
         "constant_args_idx": constant_args_idx,
@@ -1761,6 +1964,9 @@ def triton_kernel_wrapper_functional_functionalize(
     tensors_to_clone: list[str],
     launch_kwargs: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Functionalization rule for the functional HOP: unwrap functional tensors, redispatch the
+    # functional HOP below the functionalization key, and wrap the returned tensors back into functional
+    # tensors. Returns the wrapped output dict.
     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)  # type: ignore[arg-type]
     with ctx.redispatch_to_next():
         functional_kwargs: dict[str, Any] = {
@@ -1806,6 +2012,14 @@ redirect_to_mode(triton_kernel_wrapper_mutation, _CachedTorchDispatchMode)
 
 
 class TritonHOPifier:
+    # [CLASS DOC] Abstract orchestrator turning a call to a user-defined Triton kernel (JITFunction, possibly
+    # wrapped in Autotuner/Heuristics) into a call to the mutation HOP. Concrete subclasses (Dynamo's and
+    # TracingTritonHOPifier) supply the environment-specific hooks: raise_unsupported, is_callable, get_value,
+    # call_grid, wrap_user_defined_obj, call_user_defined_fn, maybe_unpack_configs,
+    # maybe_unpack_heuristic_result, call_HOP, check_grid. Shared logic lives in init_variable,
+    # call_getitem, call_run and call_triton_kernel, which normalize autotune/heuristics/special config
+    # kwargs, evaluate grids, and finally call call_HOP. Holds no state of its own; "variable" objects carry
+    # kernel, kernel_idx and grid.
     """Orchestrator for converting a user-defined triton kernel into a call
     to the triton_kernel_wrapper_mutation HOP.
 
@@ -1826,12 +2040,15 @@ class TritonHOPifier:
     """
 
     def raise_unsupported(self, msg: str) -> Never:
+        # [FUNCTION DOC] Abstract hook: report an unsupported usage with message msg (never returns).
         raise NotImplementedError("abstract method")
 
     def is_callable(self, maybe_callable: Any) -> bool:
+        # [FUNCTION DOC] Abstract hook: tell whether a value (possibly a Dynamo variable) is callable.
         raise NotImplementedError("abstract method")
 
     def get_value(self, val: Any) -> Any:
+        # [FUNCTION DOC] Abstract hook: convert a possibly wrapped value to its plain Python value.
         raise NotImplementedError("abstract method")
 
     def call_grid(  # type: ignore[no-untyped-def]
@@ -1840,6 +2057,8 @@ class TritonHOPifier:
         meta,
         tx,
     ) -> tuple[int | sympy.Expr | SymInt, ...] | tuple["Proxy", ...]:
+        # [FUNCTION DOC] Abstract hook: evaluate a callable grid with the meta-parameter mapping and return
+        # the resulting grid tuple.
         raise NotImplementedError("abstract method")
 
     def wrap_user_defined_obj(
@@ -1849,6 +2068,8 @@ class TritonHOPifier:
         variable: Union["TritonKernelVariable", "TraceableTritonKernelWrapper"] | None,
         name: str,
     ) -> Any:
+        # [FUNCTION DOC] Abstract hook: wrap a user object found on the kernel (e.g. a prune function or
+        # configs) so the environment can track it, with name identifying which attribute it came from.
         raise NotImplementedError("abstract method")
 
     def call_user_defined_fn(
@@ -1859,14 +2080,20 @@ class TritonHOPifier:
         tx: Optional["InstructionTranslatorBase"],
         variable: Union["TritonKernelVariable", "TraceableTritonKernelWrapper"] | None,
     ) -> Any:
+        # [FUNCTION DOC] Abstract hook: call a user-defined function with positional args and keyword args
+        # in the environment's calling convention and return its result.
         raise NotImplementedError("abstract method")
 
     def maybe_unpack_configs(
         self, configs: list["TritonConfig"], tx: Optional["InstructionTranslatorBase"]
     ) -> list["TritonConfig"]:
+        # [FUNCTION DOC] Abstract hook: convert the environment's representation of a config list into a
+        # real list of Triton Config objects.
         raise NotImplementedError("abstract method")
 
     def maybe_unpack_heuristic_result(self, result: Any) -> Any:
+        # [FUNCTION DOC] Abstract hook: convert a heuristic function's result to a plain constant value
+        # (implementations should reject non-constant results).
         raise NotImplementedError("abstract method")
 
     @staticmethod
@@ -1879,6 +2106,11 @@ class TritonHOPifier:
         named_args: dict,
         kwargs: dict,
     ) -> list["TritonConfig"]:
+        # [FUNCTION DOC] Static method reimplementing Triton's Autotuner config pruning so user-defined
+        # early_config_prune and perf_model functions can be sandboxed. First applies early_config_prune
+        # (if given) to the configs; then, if a perf_model is given, converts a float top_k <= 1.0 into a
+        # count, estimates timing for each config via the model, and keeps the top_k fastest. Raises
+        # TypeError if top_k is neither a float <= 1.0 nor an int. Returns the pruned list.
         # Reimplement autotuner.prune_configs(...) here
         # see: https://github.com/triton-lang/triton/blob/e57b46897191b3b3061c78d0d60e58e94be565b6/python/triton/runtime/autotuner.py
         # We do this to avoid calling prune_configs, which in turn calls early_config_prune and perf_model
@@ -1923,11 +2155,14 @@ class TritonHOPifier:
         kernel_arg_names: set[str],
         tx,
     ) -> Optional["ConstantVariable"]:
+        # [FUNCTION DOC] Abstract hook: emit the actual HOP call given the variable, per-config grids, combined
+        # kernel args, names passed as launch kwargs, and the set of JIT kernel parameter names.
         raise NotImplementedError("abstract method")
 
     def check_grid(  # type: ignore[no-untyped-def]
         self, grid
     ) -> tuple[int | sympy.Expr | SymInt, ...] | tuple["Proxy", ...]:
+        # [FUNCTION DOC] Abstract hook: validate a resolved grid and return it as a tuple.
         raise NotImplementedError("abstract method")
 
     def init_variable(
@@ -1937,6 +2172,12 @@ class TritonHOPifier:
         kernel_idx: int | None,
         grid: Optional["TritonGridType"],
     ) -> None:
+        # [FUNCTION DOC] Initialize a kernel variable in place: store the kernel, register it in the side table
+        # (setting kernel_idx, which must equal the supplied kernel_idx if one is given), and store the grid.
+        # For Autotuner kernels, reports unsupported (via raise_unsupported) unless only configs, keys,
+        # restore_value and reset_to_zero are used: non-default warmup/rep/cuda-graph settings, pre/post hooks
+        # and Config pre_hooks are rejected unless the inductor config flag to ignore them is set.
+        # Raises AssertionError if kernel is None or the index mismatches.
         from triton.runtime.autotuner import Autotuner
 
         if kernel is None:
@@ -1966,6 +2207,9 @@ class TritonHOPifier:
             def defaults_ok(
                 attr: str, alternates: tuple[str, ...], values: tuple[Any, ...]
             ) -> bool:
+                # [FUNCTION DOC] HELPER: True if the Autotuner constructor has no such argument, or the
+                # kernel's value (read under attr or an alternate name) equals the constructor default or
+                # is one of the accepted values.
                 if attr not in defaults:
                     return True
                 value = torch._dynamo.utils.get_first_attr(kernel, attr, *alternates)
@@ -2013,6 +2257,8 @@ class TritonHOPifier:
     def get_kernel_source(
         variable: "TritonKernelVariable | TraceableTritonKernelWrapper",
     ) -> "Source | None":
+        # [FUNCTION DOC] Static method: return the variable's kernel_source attribute, falling back to its
+        # source attribute, or None if neither is set.
         kernel_source = getattr(variable, "kernel_source", None)
         if kernel_source is None:
             kernel_source = getattr(variable, "source", None)
@@ -2026,6 +2272,8 @@ class TritonHOPifier:
         kernel_idx: int | None,
         grid: "TritonGridType | None",
     ) -> "TritonKernelVariable | TraceableTritonKernelWrapper":
+        # [FUNCTION DOC] Build a new variable of the same class as variable with the given kernel, kernel_idx
+        # (None means register as a new side-table entry) and grid, carrying over the original's kernel source.
         return type(variable)(
             kernel=kernel,
             kernel_idx=kernel_idx,
@@ -2038,6 +2286,8 @@ class TritonHOPifier:
         variable: Union["TritonKernelVariable", "TraceableTritonKernelWrapper"],
         args: Sequence[Any],
     ) -> Union["TritonKernelVariable", "TraceableTritonKernelWrapper"]:
+        # [FUNCTION DOC] Handle subscripting a kernel with a grid: reports unsupported if a grid was already
+        # set or args is not exactly one item; otherwise returns a new variable with that grid.
         # __getitem__ should only be called if we don't already have a grid
         # Only grid needs to be passed
         if variable.grid is not None or len(args) != 1:
@@ -2059,6 +2309,9 @@ class TritonHOPifier:
         kwargs: dict[str, Any],
         tx: Optional["InstructionTranslatorBase"],
     ) -> Optional["ConstantVariable"]:
+        # [FUNCTION DOC] Handle the kernel's run method: requires a grid keyword (else unsupported), removes
+        # grid (and any warmup) from kwargs -- mutating the passed kwargs -- and rewrites the call as a
+        # subscripted-grid kernel call via call_triton_kernel.
         if "grid" not in kwargs:
             self.raise_unsupported("Triton kernel requires to be called with a grid")
         grid = kwargs.pop("grid")
@@ -2083,6 +2336,18 @@ class TritonHOPifier:
         kwargs: dict[str, Any],
         tx: Optional["InstructionTranslatorBase"],
     ) -> Optional["ConstantVariable"]:
+        # [FUNCTION DOC] Core conversion of a kernel call into a HOP call. Rejects num_ctas kwargs, a missing
+        # grid, and stacked autotune decorators. Then rewrites the kernel by recursion (each time creating a
+        # new variable with a fresh side-table entry) to: apply @triton.heuristics results into every
+        # autotune config; move special config kwargs (num_warps, num_stages, ...) into autotune configs;
+        # copy special config values into config kwargs when the JIT function has parameters of that name;
+        # and prune configs with the user's early_config_prune/perf_model. Finally records launch kwarg names,
+        # checks they do not conflict with config kwargs or duplicate positional args, evaluates the grid
+        # for every config (calling callable grids with the merged meta mapping) and pads each grid to
+        # three dimensions, specializes constexpr args via variable.specialize_symbolic, and calls call_HOP.
+        # Calls raise_unsupported on unsupported usage; AssertionError on internal inconsistencies.
+        # KNOWN ISSUE: num_ctas is rejected at the top, so its presence in SPECIAL_CONFIG_NAMES only matters
+        # for the config-parameter handling, not for kwargs.
         from triton import JITFunction
         from triton.runtime.autotuner import autotune, Autotuner, Config, Heuristics
 
@@ -2454,13 +2719,19 @@ class TritonHOPifier:
 
 
 class TracingTritonHOPifier(TritonHOPifier):
+    # [CLASS DOC] TritonHOPifier for plain make_fx / export tracing (no Dynamo): values are ordinary Python
+    # objects, tx is always None, unsupported usage raises RuntimeError, and call_HOP emits the mutation HOP
+    # directly (stashing non-graphable args in the side table). Stateless; one singleton is used.
     def raise_unsupported(self, msg: str) -> Never:
+        # [FUNCTION DOC] Raise RuntimeError with message msg.
         raise RuntimeError(msg)
 
     def is_callable(self, maybe_callable: Any) -> bool:
+        # [FUNCTION DOC] Plain callable check.
         return callable(maybe_callable)
 
     def get_value(self, val: Any) -> Any:
+        # [FUNCTION DOC] Identity: values are already plain.
         return val
 
     def call_grid(
@@ -2469,6 +2740,8 @@ class TracingTritonHOPifier(TritonHOPifier):
         meta: "TritonMetaParamsType",
         tx: None,
     ) -> tuple[int | sympy.Expr | SymInt, ...]:
+        # [FUNCTION DOC] Evaluate a callable grid by calling it with the meta dict. Raises AssertionError if
+        # tx is not None, meta is not a dict, or grid is not callable.
         if tx is not None:
             raise AssertionError("tx must be None for TracingTritonHOPifier")
         if not isinstance(meta, dict):
@@ -2484,6 +2757,7 @@ class TracingTritonHOPifier(TritonHOPifier):
         variable: Union["TritonKernelVariable", "TraceableTritonKernelWrapper"] | None,
         name: str,
     ) -> Any:
+        # [FUNCTION DOC] Identity wrapper: returns user_obj unchanged; AssertionError if tx is not None.
         if tx is not None:
             raise AssertionError("tx must be None for TracingTritonHOPifier")
         return user_obj
@@ -2496,6 +2770,8 @@ class TracingTritonHOPifier(TritonHOPifier):
         tx: Optional["InstructionTranslatorBase"],
         variable: Union["TritonKernelVariable", "TraceableTritonKernelWrapper"] | None,
     ) -> Any:
+        # [FUNCTION DOC] Directly call user_fn with the positional list args and keyword dict kwargs.
+        # Raises AssertionError if args is not a list, kwargs not a dict, or user_fn not callable.
         if not isinstance(args, list):
             raise AssertionError(f"args must be a list, got {type(args)}")
         if not isinstance(kwargs, dict):
@@ -2507,17 +2783,20 @@ class TracingTritonHOPifier(TritonHOPifier):
     def maybe_unpack_configs(
         self, configs: list["TritonConfig"], tx: Optional["InstructionTranslatorBase"]
     ) -> list["TritonConfig"]:
+        # [FUNCTION DOC] Validate that configs is a list (AssertionError otherwise) and return it unchanged.
         if not isinstance(configs, list):
             raise AssertionError(f"configs must be a list, got {type(configs)}")
         return configs
 
     def maybe_unpack_heuristic_result(self, result: Any) -> Any:
+        # [FUNCTION DOC] Identity: heuristic results are already plain values.
         return result
 
     def check_grid(
         self,
         grid: "TritonGridType",
     ) -> tuple[int | sympy.Expr | SymInt, ...]:
+        # [FUNCTION DOC] Require the grid to be a sequence (RuntimeError otherwise) and return it as a tuple.
         if not isinstance(grid, collections.abc.Sequence):
             raise RuntimeError(
                 "wrap_triton can only handle grids that resolve to Sequence[int]."
@@ -2529,12 +2808,16 @@ class TracingTritonHOPifier(TritonHOPifier):
         self,
         combined_args: dict[str, Any],
     ) -> tuple[dict, int]:
+        # [FUNCTION DOC] Split combined_args into graphable values (FX base types or nodes) and others;
+        # store the others in the global side table (side effect: adds a constant-args entry) and return
+        # (graphable_args, constant_args_idx).
         """
         Some args cannot be stored in the FX graph.
         Put them in the side table.
         """
 
         def is_graphable(val: Any) -> bool:
+            # [FUNCTION DOC] HELPER: True if val is an FX base type value or an FX Node.
             return isinstance(val, (fx.node.base_types, fx.Node))
 
         non_graphable_args = {
@@ -2547,6 +2830,8 @@ class TracingTritonHOPifier(TritonHOPifier):
         return graphable_args, constant_args_idx
 
     def is_dynamic_backend_option(self, value: Any) -> bool:
+        # [FUNCTION DOC] True if any leaf of the (nested) value is a tracing object (FX node/proxy, Tensor,
+        # SymInt/SymBool/SymFloat), meaning it is not a concrete compile-time backend option.
         # Backend options are compile-time values. In proxy tracing, a value can
         # be a Proxy/Node directly or be nested inside a tuple/list option such
         # as backend_option=(sym_size,). Reject those unless the name is later
@@ -2576,6 +2861,12 @@ class TracingTritonHOPifier(TritonHOPifier):
         kernel_arg_names: set[str],
         tx: None,
     ) -> None:
+        # [FUNCTION DOC] Emit the mutation HOP for a traced kernel call: moves non-graphable args to the side
+        # table, rejects launch kwargs that are not kernel parameters and hold dynamic (traced) values via
+        # raise_unsupported, and calls triton_kernel_wrapper_mutation with the kernel id, constant-args id,
+        # grids, empty TMA metadata (not supported here) and launch kwargs. Raises AssertionError if tx is
+        # set or variable is the wrong type or has a non-int kernel_idx. Side effect: side table entry plus
+        # a traced graph node.
         if tx is not None:
             raise AssertionError("tx must be None for TracingTritonHOPifier")
         if not isinstance(variable, TraceableTritonKernelWrapper):
@@ -2621,6 +2912,10 @@ tracing_triton_hopifier_singleton = TracingTritonHOPifier()
 
 
 class TraceableTritonKernelWrapper:
+    # [CLASS DOC] User-facing wrapper around a Triton kernel returned by wrap_triton. Attributes: kernel,
+    # kernel_idx (side-table id), grid (None until subscripted), kernel_source. When wrap-triton tracing is
+    # enabled, subscripting/calling/run route through the singleton TracingTritonHOPifier to emit the HOP;
+    # otherwise they fall through to the underlying kernel.
     kernel: "TritonKernelType"
     kernel_idx: int | None
     grid: Optional["TritonGridType"]
@@ -2633,6 +2928,9 @@ class TraceableTritonKernelWrapper:
         grid: Optional["TritonGridType"],
         kernel_source: "Source | None" = None,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_source and let the tracing hopifier initialize kernel, kernel_idx and
+        # grid (registering the kernel in the side table; may reject unsupported autotune options).
+        # Raises AssertionError if kernel did not get set.
         self.kernel = None
         self.grid = None
         self.kernel_source = kernel_source
@@ -2641,9 +2939,13 @@ class TraceableTritonKernelWrapper:
             raise AssertionError("kernel was not initialized properly")
 
     def __getitem__(self, *args: Sequence[Any]) -> "TraceableTritonKernelWrapper":
+        # [FUNCTION DOC] Subscript with a grid: returns a new wrapper bound to that grid (RuntimeError if a
+        # grid is already set or not exactly one grid is given).
         return tracing_triton_hopifier_singleton.call_getitem(self, args)  # type: ignore[return-value]
 
     def run(self, *args: Sequence[Any], **kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] Mirror of the Triton kernel run method. If wrap_triton is enabled, traces it into
+        # the HOP (a grid keyword is required); otherwise delegates to the real kernel's run.
         from torch._library.triton import is_wrap_triton_enabled
 
         if is_wrap_triton_enabled():
@@ -2655,6 +2957,8 @@ class TraceableTritonKernelWrapper:
             return self.kernel.run(*args, **kwargs)
 
     def __call__(self, *args: Sequence[Any], **kwargs: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] Launch the kernel. If wrap_triton is enabled, traces the call into the mutation HOP;
+        # otherwise runs the real kernel on the stored grid. AssertionError if kernel is unset.
         from torch._library.triton import is_wrap_triton_enabled
 
         if is_wrap_triton_enabled():
@@ -2668,6 +2972,8 @@ class TraceableTritonKernelWrapper:
             return self.kernel[self.grid](*args, **kwargs)
 
     def specialize_symbolic(self, arg: Sequence[Any]) -> Any:
+        # [FUNCTION DOC] Turn a symbolic scalar (SymInt/SymBool/SymFloat) into its concrete value by guarding
+        # on it (side effect: installs a shape-env guard); other values pass through unchanged.
         import torch
 
         # See [Note: Specialize tl.constexpr args in user-defined triton kernels]
