@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Partitioned scatter optimization pass for high-contention index_put
+# (accumulate) ops on accelerators. Instead of many writes atomically accumulating
+# into the same slots, writes are spread over a power-of-two number of partitions in
+# an expanded buffer, the partitions are summed, and the result is added to the
+# original input. Main contents: ScatterCandidate, ScatterMemoryState and
+# ScatterPassContext (state), cheap pre-scan gates, a memory-budget estimate based
+# on the memory profile, a pattern-matcher replacement, and the entry point
+# partitioned_scatter_optimization_pass (the only exported name). Import-time side
+# effects: creates module loggers and a partitioned_scatter artifact logger; no
+# registration happens until the pass runs.
 """
 Partitioned scatter optimization for high-contention index_put operations.
 
@@ -41,6 +51,11 @@ _INDEX_PUT_TARGETS = (aten.index_put.default, aten.index_put_.default)
 
 @dataclass
 class ScatterCandidate:
+    # [CLASS DOC] Immutable-by-convention record of an index_put op
+    # (accumulate=True) that passed the cheap gates: output node, index node,
+    # scatter dimension, element counts of output and index, size of the scatter
+    # dimension, element size in bytes, contention ratio (index size divided by
+    # scatter dim size) and dtype.
     """An index_put(accumulate=True) op that passed the cheap (non-memory) gates."""
 
     output_node: fx.Node
@@ -56,6 +71,12 @@ class ScatterCandidate:
 
 @dataclass
 class ScatterMemoryState:
+    # [CLASS DOC] Memory budget state for one pass invocation: peak live GPU bytes
+    # per compute node (profile of the original graph at allocation time), mapping
+    # from node to profile index, allowed peak (total GPU memory minus the non-model
+    # floor), the raw totals, and committed_overhead_bytes, a running sum of
+    # expanded-buffer bytes already granted to earlier transformed scatters (so
+    # candidates do not all claim the same budget).
     # Peak live GPU bytes at each compute node in the original (un-transformed)
     # graph, taken at the allocation phase (before this node's last-use inputs
     # are freed) so the expanded scatter buffer is charged against the true peak.
@@ -79,6 +100,10 @@ class ScatterMemoryState:
 
 @dataclass
 class ScatterPassContext:
+    # [CLASS DOC] Per-invocation mutable state shared with pattern callbacks via
+    # closures: candidate map keyed by output node, lazily built memory state (None
+    # when unavailable), counters of candidates and applied rewrites, per-reason
+    # skip counts, and the list of partition counts applied.
     """Per-invocation state, passed to the pattern callbacks via closures."""
 
     # index_put nodes that survived the cheap pre-scan, keyed by output node.
@@ -96,6 +121,10 @@ class ScatterPassContext:
 def _record_skip(
     ctx: ScatterPassContext, reason: str, node_name: str, *args: Any
 ) -> None:
+    # [FUNCTION DOC] HELPER: Record why a candidate was skipped: increments the
+    # reason count in ctx and the inductor counter for that reason, and at debug
+    # level logs the node name and any extra detail arguments to the artifact
+    # logger.
     ctx.skip_reasons[reason] += 1
     counters["inductor"][f"partitioned_scatter_skipped_{reason}"] += 1
     if _artifact_log.isEnabledFor(logging.DEBUG):
@@ -108,6 +137,15 @@ def _record_skip(
 def _evaluate_candidate(
     output_node: fx.Node, force: bool, ctx: ScatterPassContext
 ) -> "ScatterCandidate | None":
+    # [FUNCTION DOC] Apply the cheap (non-memory) gates to an index_put node and
+    # return a ScatterCandidate or None (recording a skip reason). Gates in order:
+    # input is an FX node; exactly one non-None index; tensor metadata available;
+    # device is not CPU; neither input nor index dtype is bool; scatter dim in
+    # range; sizes resolvable and non-zero; index size at least the configured
+    # minimum; contention ratio at least the configured threshold. The last two are
+    # bypassed when force is true.
+    # KNOWN ISSUE: the gate list says the op must run on a CUDA device, but the code
+    # only rejects CPU, so any non-CPU device passes.
     """
     Cheap (non-memory) gates, in order:
       1. Single non-None index (multi-axis not supported)
@@ -207,6 +245,11 @@ def _evaluate_candidate(
 
 
 def _scan_candidates(graph: fx.Graph, ctx: ScatterPassContext) -> None:
+    # [FUNCTION DOC] HELPER: Pre-scan the graph for index_put or in-place index_put
+    # calls whose fourth positional argument is the literal true (accumulate), count
+    # them in ctx.n_candidates, and store those that pass the cheap gates in
+    # ctx.candidates. Lets the pass avoid building the memory profile when nothing
+    # qualifies. Calls with accumulate passed by keyword are not counted.
     """
     Cheap pre-scan for index_put(accumulate=True) ops that could be rewritten.
 
@@ -230,6 +273,12 @@ def _scan_candidates(graph: fx.Graph, ctx: ScatterPassContext) -> None:
 
 
 def _build_scatter_memory_state(graph: fx.Graph) -> "ScatterMemoryState | None":
+    # [FUNCTION DOC] HELPER: Build the memory state from a per-node peak memory
+    # profile of the original graph. Returns None if CUDA is unavailable or the
+    # profile cannot be built (any exception is logged at debug and swallowed), in
+    # which case the pass runs without memory gating. Uses total GPU memory minus
+    # the configured non-model floor as the allowed peak, and indexes the
+    # allocation-time entry (every second profile entry) of each compute node.
     """
     Build a per-node peak-memory profile of the original graph.
     Returns None when CUDA is unavailable or the profile can't be built; the
@@ -244,6 +293,8 @@ def _build_scatter_memory_state(graph: fx.Graph) -> "ScatterMemoryState | None":
     allowed_peak = max(0, total_gpu - floor_bytes)
 
     def is_releasable(n: fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate for the memory profile: a node's memory
+        # is releasable unless its name starts with primals.
         return not n.name.startswith("primals")
 
     # build_memory_profile emits two entries per compute node: the first after
@@ -305,6 +356,13 @@ def _compute_num_partitions(
     scatter_dim_size: int = 0,
     force: bool = False,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Return the largest power-of-two partition count P in
+    # the range min_p to max_p such that the extra memory output_size times
+    # element_bytes times (P minus 1) fits in available_bytes, additionally capped
+    # (unless force) at about 4 times the writes per scatter-dim slot but never
+    # below min_p. Returns 0 if available bytes, output size or element size is non-
+    # positive, or min_p does not fit. Power of two is needed for the bitwise-and
+    # partition assignment.
     """
     Return the largest power-of-2 P in [min_p, max_p] satisfying:
       1. Memory: output_size * element_bytes * (P - 1) <= available_bytes
@@ -339,6 +397,11 @@ def _check_memory(
     candidate: ScatterCandidate,
     force: bool = False,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Compute the partition count for a candidate from the
+    # memory state: available bytes are the allowed peak minus the node's baseline
+    # peak minus committed overhead. Returns 0 (fail closed) when the node has no
+    # profile entry; otherwise the result of the partition computation. Logs details
+    # at debug level.
     """
     Compute num_partitions for this candidate given the peak-memory profile.
     Returns num_partitions >= min_p, or 0 if the memory constraint cannot be met.
@@ -391,6 +454,9 @@ def _check_memory(
 
 
 def _resolve_numel(numel: Any) -> int | None:
+    # [FUNCTION DOC] HELPER: Convert a numel or size to a concrete integer. A SymInt
+    # is resolved through its optimization hint and doubled as a safety margin;
+    # returns None when no hint exists. Other values are converted to int.
     """Resolve numel to a concrete int, handling SymInt via optimization_hint."""
     if isinstance(numel, torch.SymInt):
         hint = optimization_hint(numel)
@@ -401,6 +467,13 @@ def _resolve_numel(numel: Any) -> int | None:
 
 
 def _validate_memory(match: Match, ctx: ScatterPassContext, force: bool) -> bool:
+    # [FUNCTION DOC] HELPER: Second-stage gate of the pattern matcher (extra check):
+    # look up the candidate for the matched output node, compute the partition count
+    # with or without the memory state, and reject (recording a memory_budget skip)
+    # if it is below the configured minimum. On success stores num_partitions,
+    # scatter dim, index node, output size and element bytes as attributes on the
+    # match object for the replacement, and returns True. Returns False if the node
+    # was not a pre-scan candidate.
     """
     Second-stage gate (the memory budget) for a matched index_put node.
 
@@ -468,12 +541,26 @@ def _validate_memory(match: Match, ctx: ScatterPassContext, force: bool) -> bool
 def _create_replacement(
     match: Match, ctx: ScatterPassContext, input_tensor, indices, values
 ) -> None:
+    # [FUNCTION DOC] HELPER: Pattern replacement callback: rewrites the matched
+    # index_put by tracing a replacement function with the matcher
+    # (replace_by_example) using the stored partition count, scatter dim and index
+    # node, then charges the expanded buffer bytes to the memory state, increments
+    # the applied counters, records the partition count and bumps the inductor
+    # counter.
     """Replace high-contention index_put with partitioned scatter."""
     num_partitions: int = match._num_partitions  # type: ignore[attr-defined]
     scatter_dim: int = match._scatter_dim  # type: ignore[attr-defined]
     index_node = match._index_node  # type: ignore[attr-defined]
 
     def repl(input_tensor, index_node, values):
+        # [FUNCTION DOC] HELPER: Traced replacement body: flatten multi-dimensional
+        # indices and corresponding values to 1-D; assign write i to partition i
+        # bitwise-and (num_partitions minus 1); allocate a zero buffer whose scatter
+        # dimension is multiplied by num_partitions; shift each index by partition
+        # id times original dim size; accumulate-scatter into the buffer; view as
+        # partitions by dim size along the scatter dim and sum over the partition
+        # axis (keeping small integer dtypes); finally return the input plus the
+        # reduced result.
         dim_size = input_tensor.shape[scatter_dim]
         num_operations = index_node.numel()
 
@@ -563,6 +650,10 @@ def _create_replacement(
 
 
 def _build_pattern_pass(ctx: ScatterPassContext) -> PatternMatcherPass:
+    # [FUNCTION DOC] HELPER: Create a fresh PatternMatcherPass for this invocation
+    # and register the index_put (and in-place) accumulate patterns with callbacks
+    # bound to ctx, so no module-level mutable state is shared across concurrent
+    # compilations. Returns the pass.
     """
     Construct a per-invocation PatternMatcherPass whose callbacks close over
     `ctx`, avoiding module-level global state (which is unsafe under concurrent
@@ -572,9 +663,13 @@ def _build_pattern_pass(ctx: ScatterPassContext) -> PatternMatcherPass:
     force: bool = config.partitioned_scatter_force
 
     def extra_check(match: Match) -> bool:
+        # [FUNCTION DOC] HELPER: Pattern extra check: delegate to the memory
+        # validation with the captured context and force flag.
         return _validate_memory(match, ctx, force)
 
     def replacement(match: Match, input_tensor, indices, values) -> None:
+        # [FUNCTION DOC] HELPER: Pattern replacement: delegate to the replacement
+        # builder with the captured context.
         _create_replacement(match, ctx, input_tensor, indices, values)
 
     for target in _INDEX_PUT_TARGETS:
@@ -588,6 +683,9 @@ def _build_pattern_pass(ctx: ScatterPassContext) -> PatternMatcherPass:
 
 
 def _log_summary(ctx: ScatterPassContext, num_matches: int) -> None:
+    # [FUNCTION DOC] HELPER: Log an info-level summary (candidates, applied,
+    # skipped, partitions per op, skip breakdown and memory numbers if available)
+    # when at least one candidate existed. The num_matches parameter is unused.
     if ctx.n_candidates == 0:
         return
 
@@ -619,6 +717,11 @@ def _log_summary(ctx: ScatterPassContext, num_matches: int) -> None:
 
 
 def partitioned_scatter_optimization_pass(graph: fx.Graph) -> fx.Graph:
+    # [FUNCTION DOC] Entry point: apply the partitioned scatter optimization to the
+    # graph when config.partitioned_scatter_enabled is set. Stage one pre-scans for
+    # candidates; if none, returns early. Stage two builds the memory state, runs
+    # the pattern pass, logs a summary and lints the graph if any rewrites happened.
+    # Mutates and returns the same graph.
     """
     Apply partitioned scatter optimization to high-contention index_put operations.
     Controlled by config.partitioned_scatter_enabled.
@@ -651,6 +754,10 @@ def partitioned_scatter_optimization_pass(graph: fx.Graph) -> fx.Graph:
 def _extract_scatter_dim_and_index(
     indices_arg: Any,
 ) -> tuple[int | None, fx.Node | None]:
+    # [FUNCTION DOC] HELPER: Return the scatter dimension and index node from an
+    # index_put indices argument. A non-sequence argument is treated as the index
+    # for dimension 0. For a sequence, returns the position and value of the single
+    # non-None entry, or a pair of None values if there are several (or none).
     """Extract scatter dimension and index node from indices argument."""
     if not isinstance(indices_arg, (list, tuple)):
         return 0, indices_arg
@@ -669,6 +776,9 @@ def _extract_scatter_dim_and_index(
 
 
 def _get_tensor_meta(node: fx.Node) -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Return a mapping with shape (tuple), dtype, device and
+    # numel taken from the node's fake value, or None if the node has no value or
+    # the value lacks shape or dtype.
     """Extract tensor metadata from an FX node's meta['val'] FakeTensor."""
     if not hasattr(node, "meta") or "val" not in node.meta:
         return None

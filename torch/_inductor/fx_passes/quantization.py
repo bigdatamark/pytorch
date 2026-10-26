@@ -1,5 +1,13 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Inductor FX passes for quantization fusion on CPU/oneDNN: registers
+# pattern-matcher lowerings that turn matched quantized qconv/qlinear (unary and
+# binary post-op) ops, quantized max_pool2d, cat and reshape patterns into Inductor
+# IR, plus weight-only-quantization (WOQ) int8 mm and concat-linear patterns, an
+# int4 concat-linear graph pass, and a quant lift-up pass. Also defines pattern
+# builders and validity checks used by those registrations. Import-time side
+# effects: creates aten/prims/quantized op aliases and module-level pattern objects;
+# lowering registration happens only when the register functions are called.
 import copy
 import itertools
 import math
@@ -59,6 +67,10 @@ fusion patterns that used to live here have been moved to TorchAO.
 
 
 def _get_pattern_output_dtype(match: Match):
+    # [FUNCTION DOC] HELPER: Return the dtype of the single output node of a match,
+    # read from the node's fake value. Raises AssertionError if the match does not
+    # have exactly one output node, the node is not an FX node, or the dtype is not
+    # one of int8, uint8, float32, bfloat16, float8_e4m3fn.
     """
     Get the pattern's output dtype from node's meta
     Assume only 1 output node in this matched pattern.
@@ -86,6 +98,9 @@ def _get_pattern_output_dtype(match: Match):
 def _may_generate_pattern_with_dtype_convert(
     pattern, dtype=Arg(), with_dtype_convert=True, users=1
 ):
+    # [FUNCTION DOC] HELPER: Wrap a pattern in a convert_element_type call pattern
+    # (with the given dtype pattern and user count) when with_dtype_convert is true;
+    # otherwise return the pattern unchanged.
     if with_dtype_convert:
         return CallFunction(
             prims.convert_element_type.default,
@@ -98,6 +113,8 @@ def _may_generate_pattern_with_dtype_convert(
 
 
 def _may_generate_pattern_with_reshape(pattern, reshape_size=Arg(), with_reshape=True):
+    # [FUNCTION DOC] HELPER: Wrap a pattern in a reshape call pattern with the given
+    # size pattern when with_reshape is true; otherwise return it unchanged.
     if with_reshape:
         return CallFunction(
             torch.ops.aten.reshape.default,
@@ -112,6 +129,10 @@ def _generate_linear_t_pattern(
     _dequant_per_channel_pattern,
     dtype,
 ):
+    # [FUNCTION DOC] HELPER: Build the transposed-weight pattern: a permute of the
+    # dequantized per-channel weight pattern, with an optional dtype convert
+    # (keyword autocast_wgt_dtype) only when dtype is bfloat16. Raises
+    # AssertionError if dtype is not float32 or bfloat16.
     if dtype not in [torch.float32, torch.bfloat16]:
         raise AssertionError(f"expected float32 or bfloat16, got {dtype}")
     t_pattern = CallFunction(
@@ -127,6 +148,9 @@ def _generate_linear_t_pattern(
 
 
 def _unary_fusion_pattern(unary_fusion, call_fn, users, is_bf16):
+    # [FUNCTION DOC] HELPER: Build a unary-fusion pattern: wrap call_fn with an
+    # optional dtype convert (inserted only when is_bf16, keyword to_float, given
+    # user count) and apply the unary_fusion pattern builder to it.
     # only insert to_dtype if is_bf16 is True
     computation_call = _may_generate_pattern_with_dtype_convert(
         call_fn, dtype=KeywordArg("to_float"), with_dtype_convert=is_bf16, users=users
@@ -135,6 +159,9 @@ def _unary_fusion_pattern(unary_fusion, call_fn, users, is_bf16):
 
 
 def get_dequantize_per_tensor_activation_pattern(is_tensor_overload=False):
+    # [FUNCTION DOC] Return a pattern matching dequantize_per_tensor on an
+    # activation x with scale, zero point, quant min/max and dtype keywords; uses
+    # the tensor-scale overload when is_tensor_overload is true.
     dequantize_per_tensor_activation_pattern = CallFunction(
         quantized_decomposed.dequantize_per_tensor.tensor
         if is_tensor_overload
@@ -181,6 +208,10 @@ dequantize_per_channel_to_bf16_clone_weight_pattern = CallFunction(
 
 
 def get_qconv_pt2e_pattern(x_scale_zp_are_tensors=False, users=1):
+    # [FUNCTION DOC] Return a pattern matching a oneDNN qconv_pointwise op (tensor
+    # overload when x_scale_zp_are_tensors) with all keyword arguments for
+    # activation and weight qparams, conv params, output qparams and post-op,
+    # constrained to the given number of users.
     qconv_op = (
         torch.ops.onednn.qconv_pointwise.tensor
         if x_scale_zp_are_tensors
@@ -210,6 +241,10 @@ def get_qconv_pt2e_pattern(x_scale_zp_are_tensors=False, users=1):
 
 
 def get_qconv2d_binary_pt2e_pattern(x_scale_zp_are_tensors=False, users=1):
+    # [FUNCTION DOC] Return a pattern matching a oneDNN qconv2d_pointwise binary op
+    # (tensor overload when x_scale_zp_are_tensors) with keywords for qparams, the
+    # accumulation input, conv params, binary and unary post-op settings,
+    # constrained to the given number of users.
     qconv_op = (
         torch.ops.onednn.qconv2d_pointwise.binary_tensor
         if x_scale_zp_are_tensors
@@ -244,6 +279,10 @@ def get_qconv2d_binary_pt2e_pattern(x_scale_zp_are_tensors=False, users=1):
 
 
 def get_qlinear_pt2e_pattern(x_scale_zp_are_tensors, users=1):
+    # [FUNCTION DOC] Return a pattern matching a oneDNN qlinear_pointwise op (tensor
+    # overload when x_scale_zp_are_tensors) with keywords for activation, weight and
+    # output qparams, bias and post-op settings, constrained to the given number of
+    # users.
     qlinear_op = (
         torch.ops.onednn.qlinear_pointwise.tensor
         if x_scale_zp_are_tensors
@@ -269,6 +308,10 @@ def get_qlinear_pt2e_pattern(x_scale_zp_are_tensors, users=1):
 
 
 def get_qlinear_binary_pt2e_pattern(x_scale_zp_are_tensors, users=1):
+    # [FUNCTION DOC] Return a pattern matching a oneDNN qlinear_pointwise binary op
+    # (tensor overload when x_scale_zp_are_tensors) with keywords for qparams, the
+    # second input x_2 and its qparams, binary and unary post-op settings,
+    # constrained to the given number of users.
     qlinear_op = (
         torch.ops.onednn.qlinear_pointwise.binary_tensor
         if x_scale_zp_are_tensors
@@ -316,6 +359,10 @@ def generate_pattern_with_binary(
     dtype_convert=False,
     swap_inputs=False,
 ):
+    # [FUNCTION DOC] Build a binary post-op pattern over the computation call and an
+    # extra input pattern, with operand order swapped when swap_inputs is set,
+    # optionally followed by a dtype convert (keyword
+    # convert_dtype_after_inplace_add) when dtype_convert is true.
     binary_pattern = (
         CallFunction(
             binary_post_op,
@@ -337,6 +384,8 @@ def generate_pattern_with_binary(
 
 
 def generate_pattern_with_unary(computation_call, unary_post_op):
+    # [FUNCTION DOC] Apply a unary post-op to the computation call pattern, or
+    # return the computation call pattern unchanged when unary_post_op is None.
     if unary_post_op is not None:
         return CallFunction(
             unary_post_op,
@@ -346,6 +395,9 @@ def generate_pattern_with_unary(computation_call, unary_post_op):
 
 
 def generate_pattern_with_output_quant(computation_call, with_dtype_convert=False):
+    # [FUNCTION DOC] Build a pattern for a quantize_per_tensor applied to the
+    # computation call (optionally through a dtype convert), with keywords
+    # o_inv_scale, o_zp, o_qmin, o_qmax and o_dtype.
     quantized_op_output_pattern_pt2e = CallFunction(
         quantized_decomposed.quantize_per_tensor.default,
         _may_generate_pattern_with_dtype_convert(
@@ -363,6 +415,10 @@ def generate_pattern_with_output_quant(computation_call, with_dtype_convert=Fals
 
 
 def _check_node_kwarg_arg_value(check_node, kwarg_name, args_index, expected_value):
+    # [FUNCTION DOC] HELPER: Compare a node's argument against an expected value,
+    # looking it up by keyword name if present in kwargs, otherwise by positional
+    # index. Returns the equality result. Raises AssertionError if the positional
+    # argument is missing.
     if kwarg_name in check_node.kwargs:
         actual_value = check_node.kwargs[kwarg_name]
         return actual_value == expected_value
@@ -376,7 +432,13 @@ def _check_node_kwarg_arg_value(check_node, kwarg_name, args_index, expected_val
 
 
 def _is_valid_quantized_conv_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter for quantized conv patterns. For
+    # float32 or bfloat16 outputs it requires the qconv node's output_dtype argument
+    # (positional index 13) to equal the pattern output dtype; for other dtypes it
+    # accepts.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter: see enclosing function. Returns True
+        # or False for a match.
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype in [torch.float32, torch.bfloat16]:
             # Only keep matched pattern with same output_dtype
@@ -392,6 +454,8 @@ def _is_valid_quantized_conv_optimization_pattern():
 
 
 def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
+    # [FUNCTION DOC] HELPER: Select the match filter for qconv post-op fusion: the
+    # binary variant if has_binary_post_op, else the unary variant.
     return (
         _is_valid_qconv_binary_optimization_pattern()
         if has_binary_post_op
@@ -400,7 +464,12 @@ def _is_valid_qconv_post_op_fusion_pattern(has_binary_post_op=False):
 
 
 def _is_valid_qconv_lowering_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter accepting only single-node
+    # matches whose target is a qconv_pointwise or qconv2d_pointwise binary op
+    # overload.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter: True only for a one-node match with a
+        # qconv target.
         if len(match.nodes) != 1:
             return False
         return match.nodes[0].target in (
@@ -418,12 +487,23 @@ def _register_quantized_conv_lowering(
     pass_number,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a qconv pattern at the given
+    # pass number, which replaces the matched qconv node with the lowering of
+    # computation_op applied to the matched arguments. Registers a lowering pattern
+    # (via register_lowering_pattern) and returns the inner lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_qconv_lowering_pattern(),
         pass_number=pass_number,
     )
     def qconv(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: gathers activation, weight, conv
+        # and post-op arguments from kwargs, validates the pattern output dtype,
+        # bumps qconv_unary_lower counters and returns the Inductor lowering of
+        # computation_op.
+        # KNOWN ISSUE: output_dtype is first computed from the match and validated,
+        # then overwritten with the kwarg output_dtype, so the validated value is
+        # not the one passed on.
         # Activation QParams
         x, x_scale, x_zp = (
             kwargs["x"],
@@ -489,7 +569,12 @@ def _register_quantized_conv_lowering(
 
 
 def _is_valid_quantized_linear_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter for quantized linear patterns.
+    # For float32 or bfloat16 outputs it requires the qlinear node's output_dtype
+    # argument (positional index 9) to equal the pattern output dtype; otherwise
+    # accepts.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter: see enclosing function.
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype in [torch.float32, torch.bfloat16]:
             # Only keep matched pattern with same output_dtype
@@ -505,6 +590,8 @@ def _is_valid_quantized_linear_optimization_pattern():
 
 
 def _is_valid_qlinear_post_op_fusion_pattern(has_binary_post_op=False):
+    # [FUNCTION DOC] HELPER: Select the match filter for qlinear post-op fusion: the
+    # binary variant if has_binary_post_op, else the unary variant.
     return (
         _is_valid_qlinear_binary_optimization_pattern()
         if has_binary_post_op
@@ -513,7 +600,12 @@ def _is_valid_qlinear_post_op_fusion_pattern(has_binary_post_op=False):
 
 
 def _is_valid_qlinear_lowering_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter accepting only single-node
+    # matches whose target is a qlinear_pointwise op overload (default, tensor,
+    # binary or binary_tensor).
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter: True only for a one-node match with a
+        # qlinear target.
         if len(match.nodes) != 1:
             return False
         return match.nodes[0].target in (
@@ -531,12 +623,18 @@ def _register_quantized_linear_unary_lowering(
     pass_number,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a unary-post-op qlinear pattern
+    # at the given pass number using computation_op. Registers a lowering pattern
+    # (via register_lowering_pattern) and returns the inner lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_qlinear_lowering_pattern(),
         pass_number=pass_number,
     )
     def qlinear(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: gathers activation, weight,
+        # optional bias, output qparams and post-op kwargs, bumps
+        # qlinear_unary_lower counters and returns the lowering of computation_op.
         output_dtype = _get_pattern_output_dtype(match)
         # Activation QParams
         x, x_scale, x_zp = (
@@ -590,12 +688,21 @@ def _register_quantized_linear_binary_lowering(
     pass_number,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a binary-post-op qlinear
+    # pattern at the given pass number using computation_op. Registers a lowering
+    # pattern (via register_lowering_pattern) and returns the inner lowering
+    # function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_qlinear_lowering_pattern(),
         pass_number=pass_number,
     )
     def qlinear_binary(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: gathers qparams, the second
+        # input x2 and its qparams, bias and post-op kwargs; realizes x2; changes a
+        # sum binary op to add when x2 cannot be updated in place; bumps
+        # qlinear_binary_lower counters and returns the lowering of computation_op.
+        # Raises AssertionError if the output dtype is None.
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype is None:
             raise AssertionError("expected non-None output dtype")
@@ -666,12 +773,17 @@ def _register_quantized_linear_binary_lowering(
 
 
 def _is_valid_qconv_binary_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return the binary-pattern validity filter for qconv,
+    # built with the generic helper for the qconv_pointwise op.
     return _is_valid_quantized_op_binary_optimization_pattern(
         torch.ops.onednn.qconv_pointwise
     )
 
 
 def _is_valid_qlinear_binary_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return the binary-pattern validity filter for qlinear
+    # (qlinear_pointwise op); the extra input is not required to come from a dequant
+    # because no q-dq is inserted for it due to accuracy concerns.
     return _is_valid_quantized_op_binary_optimization_pattern(
         torch.ops.onednn.qlinear_pointwise,
         # we don't insert q-dq for extra input due to accuracy issues
@@ -682,6 +794,13 @@ def _is_valid_qlinear_binary_optimization_pattern():
 def _is_valid_quantized_op_binary_optimization_pattern(
     qop, extra_input_from_dequant=True
 ):
+    # [FUNCTION DOC] HELPER: Return a match filter validating a binary-fusion
+    # pattern for qop: the op must have exactly one user (the binary node with 2
+    # inputs, else AssertionError); for float outputs the extra input must come from
+    # a dequantize_per_tensor when extra_input_from_dequant; both binary inputs must
+    # carry tensor values of the same size; and the extra input of the pattern must
+    # not have other remaining users beyond the compute node and must not be the
+    # compute node's first argument.
     # Check if it's a valid Binary Pattern for qconv2d and qlinear:
     # * qop_pointwise should only has one users
     # * If extra_input_from_dequant is True, extra input of binary node should come from dequant pattern
@@ -691,6 +810,8 @@ def _is_valid_quantized_op_binary_optimization_pattern(
     #   ancestor nodes of the compute node, except for the binary node
     #   connected to the compute node.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter implementing the checks described in
+        # the enclosing function; returns True if the pattern may be fused.
         output_dtype = _get_pattern_output_dtype(match)
         compute_node = filter_nodes(match.nodes, qop)[0]
         # qop_pointwise should only have one user
@@ -764,12 +885,20 @@ def _register_quantized_conv_binary_lowering(
     pass_number,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a qconv binary pattern at the
+    # given pass number using computation_op. Registers a lowering pattern (via
+    # register_lowering_pattern) and returns the inner lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_qconv_lowering_pattern(),
         pass_number=pass_number,
     )
     def qconv_binary(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: gathers qparams, the
+        # accumulation input, conv params and post-op kwargs, realizes accum,
+        # requires it to be safely updatable in place (AssertionError otherwise,
+        # also if the output dtype is None), bumps qconv2d_binary_lower counters and
+        # returns the lowering of computation_op.
         output_dtype = _get_pattern_output_dtype(match)
         if output_dtype is None:
             raise AssertionError("expected non-None output dtype")
@@ -840,6 +969,9 @@ def _register_quantized_conv_binary_lowering(
 
 
 def _register_quantization_unary_lowering():
+    # [FUNCTION DOC] HELPER: Register unary lowerings: qconv patterns for every
+    # combination of tensor-or-scalar qparams and user counts 1 and 2, and qlinear
+    # patterns for tensor-or-scalar qparams, all at pass number 2.
     # QConv2d
     for x_scale_zp_are_tensors, users in itertools.product([False, True], [1, 2]):
         qconv_pattern = get_qconv_pt2e_pattern(x_scale_zp_are_tensors, users)
@@ -870,6 +1002,9 @@ def _register_quantization_unary_lowering():
 
 
 def _register_quantization_binary_lowering():
+    # [FUNCTION DOC] HELPER: Register binary lowerings: qconv2d binary patterns for
+    # tensor-or-scalar qparams and user counts 1 and 2, and qlinear binary patterns
+    # for tensor-or-scalar qparams, all at pass number 2.
     # QConv2d
     for x_scale_zp_are_tensors, users in itertools.product([False, True], [1, 2]):
         qconv_pattern = get_qconv2d_binary_pt2e_pattern(x_scale_zp_are_tensors, users)
@@ -900,7 +1035,12 @@ def _register_quantization_binary_lowering():
 
 
 def _is_valid_quantized_maxpool2d_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter for the max_pool2d pattern that
+    # only accepts when the getitem selects the values output (index 0), not the
+    # indices.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter: True when the getitem node's index
+        # equals 0.
         # Only match the pattern which max_pool2d_with_indices returns value
         # instead of indices.
         get_item_node = filter_nodes(match.nodes, operator.getitem)[0]
@@ -913,11 +1053,20 @@ def _register_quantized_maxpool2d_lowering(
     pattern,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a quantized max_pool2d pattern
+    # with the given computation_op and an extra check for values-only output.
+    # Registers a lowering pattern (via register_lowering_pattern) and returns the
+    # inner lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_quantized_maxpool2d_optimization_pattern(),
     )
     def qmaxpool2d(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: reads kernel_size and optional
+        # stride, padding, dilation, ceil_mode; fills defaults (stride defaults to
+        # kernel_size), pads each to length 2, validates lengths (AssertionError),
+        # requires channels-last input, bumps qmaxpool2d matcher counters and
+        # returns the lowering of computation_op.
         x = kwargs["x"]
         kernel_size = kwargs["kernel_size"]
         stride = kwargs.get("stride")
@@ -964,6 +1113,10 @@ def _register_quantized_maxpool2d_lowering(
 
 
 def _register_quantization_maxpool2d():
+    # [FUNCTION DOC] HELPER: Register quantized max_pool2d lowerings for the four
+    # argument-count variants (stride, padding, dilation, ceil_mode keywords present
+    # or not), for both the standard and low-memory max pool ops, each wrapped in
+    # getitem and output quantization patterns, lowering to quantized.max_pool2d.
     # Currently, the default parameters are not in FX Graph generated by Dynamo export.
     # So, if user defines nn.MaxPool2d with different assignment of default parameter,
     # it will generate graph with different number of input nodes and hence
@@ -1027,7 +1180,15 @@ def _register_quantization_maxpool2d():
 
 def _is_input_output_same_scale_zp(check_node):
     def fn(match):
+    # [FUNCTION DOC] HELPER: Return a match filter that requires all dequant input
+    # zero points and the single quant output zero point to be equal and all scales
+    # to be close (relative tolerance 1e-5). Raises AssertionError if the match does
+    # not have exactly one quantize node. The check_node argument is unused.
+    # KNOWN ISSUE: the parameter check_node is accepted but never used by the inner
+    # filter.
         # Ensure all the inputs and output has same scale and zero point
+        # [FUNCTION DOC] HELPER: Match filter implementing the same-scale and same-
+        # zero-point check; returns True or False.
         # Step 1: Check inputs/output zero point
         # Get dequant nodes at input
         dequant_nodes = filter_nodes(
@@ -1059,11 +1220,18 @@ def _register_quantized_cat_lowering(
     pattern,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a quantized cat pattern with an
+    # input/output same-qparams check. Registers a lowering pattern (via
+    # register_lowering_pattern) and returns the inner lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_input_output_same_scale_zp(aten.cat.default),
     )
     def qcat(match: Match, inputs, dim, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: takes the list of matched inputs
+        # (each a list whose first entry is the quantized tensor), bumps qcat
+        # matcher counters and returns the lowering of computation_op on the
+        # quantized tensors and dim.
         # inputs is with format: [[x1, x1_dq_dtype, x1_zp, x1_scale], ...]
         uint8_inputs = [input[0] for input in inputs]
         counters["inductor"]["qcat_matcher_count"] += 1
@@ -1085,6 +1253,9 @@ _raw_dequantize_per_tensor_activation_pattern = CallFunction(
 
 
 def _register_quantization_cat():
+    # [FUNCTION DOC] HELPER: Register the quantized cat lowering: dequantize each
+    # input, cat along keyword dim, then quantize the output, lowered to cat on the
+    # quantized tensors.
     dequantize_cat_pattern = CallFunction(
         aten.cat.default,
         ListOf(_raw_dequantize_per_tensor_activation_pattern),
@@ -1100,7 +1271,13 @@ def _register_quantized_reshape_lowering(
     pattern,
     computation_op,
 ):
+    # [FUNCTION DOC] HELPER: Register a lowering for a quantized reshape pattern
+    # with an input/output same-qparams check; output metadata is computed as a
+    # plain reshape of the input. Registers a lowering pattern (via
+    # register_lowering_pattern) and returns the inner lowering function.
     def qreshape_output_metadata(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Compute output metadata for the matched reshape by
+        # applying aten reshape to the x and shape keyword arguments.
         return aten.reshape.default(kwargs["x"], kwargs["shape"])
 
     @register_lowering_pattern(
@@ -1110,6 +1287,9 @@ def _register_quantized_reshape_lowering(
         output_metadata_fn=qreshape_output_metadata,
     )
     def qreshape(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: reads quantized input x and
+        # shape, bumps qreshape matcher counters and returns the lowering of
+        # computation_op.
         qx = kwargs["x"]
         shape = kwargs["shape"]
         counters["inductor"]["qreshape_matcher_count"] += 1
@@ -1120,6 +1300,9 @@ def _register_quantized_reshape_lowering(
 
 
 def _register_quantization_reshape():
+    # [FUNCTION DOC] HELPER: Register the quantized reshape lowering: dequantize,
+    # reshape to keyword shape, quantize output, lowered to reshape on the quantized
+    # tensor.
     dequantize_reshape_pattern = CallFunction(
         torch.ops.aten.reshape.default,
         get_dequantize_per_tensor_activation_pattern(),
@@ -1132,7 +1315,16 @@ def _register_quantization_reshape():
 
 
 def _is_valid_concat_linear_int8_woq_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter for int8 WOQ concat-linear
+    # patterns. Returns False if config.cpp.enable_concat_linear is off, if the
+    # needed matched nodes lack metadata, or if scales is more than 1-D. Accepts
+    # only when x and scales are bfloat16, the three weights are int8, x is on cpu
+    # or cuda with all tensors on the same device, and the scale count equals the
+    # total output rows of the three weights. Raises AssertionError if required
+    # kwargs are missing.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter implementing the checks described in
+        # the enclosing function.
         if not config.cpp.enable_concat_linear:
             return False
         if not all(k in match.kwargs for k in ("x", "w1", "w2", "w3", "scales")):
@@ -1173,7 +1365,13 @@ def _is_valid_concat_linear_int8_woq_optimization_pattern():
 
 
 def _is_valid_woq_optimization_pattern():
+    # [FUNCTION DOC] HELPER: Return a match filter for int8 WOQ mm patterns:
+    # requires x and scales in bfloat16, weight int8, device in cpu, cuda or xpu,
+    # all on the same device; returns False if metadata is missing. Raises
+    # AssertionError if x, weight or scales kwargs are absent.
     def fn(match):
+        # [FUNCTION DOC] HELPER: Match filter implementing the checks described in
+        # the enclosing function.
         if not all(k in match.kwargs for k in ("x", "weight", "scales")):
             raise AssertionError("expected x, weight, scales in match kwargs")
         if not all(
@@ -1200,12 +1398,24 @@ def _is_valid_woq_optimization_pattern():
 def _register_concat_linear_int8_woq_lowering(
     pattern, computation_woq, computation_reshape
 ):
+    # [FUNCTION DOC] HELPER: Register a freezing-graph pattern (pass number 4) that
+    # fuses three WOQ int8 linears sharing an input into one concatenated WOQ call.
+    # Registers a lowering pattern (via register_lowering_pattern) and returns the
+    # inner lowering function.
     @register_freezing_graph_pattern(
         pattern,
         extra_check=_is_valid_concat_linear_int8_woq_optimization_pattern(),
         pass_number=4,
     )
     def woq_int8(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement callback: finds the mm node using x
+        # with a cat weight, concatenates the three weights, reshapes x to 2-D,
+        # calls the fused WOQ op with the scales, reshapes the result to the
+        # original leading dims with the summed output features, redirects uses of
+        # the scaling node and erases the old scaling, mm and cat nodes. Sorts the
+        # graph topologically first as a workaround and lints afterwards. Mutates
+        # the graph and bumps woq matcher counters. Raises AssertionError if the mm
+        # node is not found.
         x = kwargs["x"]
         w1 = kwargs["w1"]
         w2 = kwargs["w2"]
@@ -1266,11 +1476,19 @@ def _register_concat_linear_int8_woq_lowering(
 
 
 def _register_woq_lowering(pattern, computation_woq, computation_reshape):
+    # [FUNCTION DOC] HELPER: Register a lowering pattern for WOQ int8 mm using
+    # computation_woq and computation_reshape and a validity filter. Registers a
+    # lowering pattern (via register_lowering_pattern) and returns the inner
+    # lowering function.
     @register_lowering_pattern(
         pattern,
         extra_check=_is_valid_woq_optimization_pattern(),
     )
     def woq_int8(match: Match, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Lowering callback: flattens x to 2-D with reshape,
+        # calls the WOQ int8 op with weight and scales, reshapes back to the
+        # original leading dims plus out_features, and bumps woq matcher counters.
+        # Returns the lowered result.
         x = kwargs["x"]
         weight = kwargs["weight"]
         scales = kwargs["scales"]
@@ -1290,6 +1508,9 @@ def _register_woq_lowering(pattern, computation_woq, computation_reshape):
 
 
 def _register_woq_mm_int8_pattern1():
+    # [FUNCTION DOC] HELPER: Register the WOQ int8 pattern: multiply of reshape of
+    # mm (with reshaped x and permuted, dtype-converted weight) by scales, lowered
+    # to the int8 pack mm op.
     # F.linear(x, weight.to(dtype=x.dtype)) * scales
     # case of dispatching to mm, with x reshape
     _woq_pattern = CallFunction(
@@ -1315,6 +1536,9 @@ def _register_woq_mm_int8_pattern1():
 
 
 def _register_woq_mm_int8_pattern2():
+    # [FUNCTION DOC] HELPER: Register the WOQ int8 pattern for mm without an x
+    # reshape: reshape of mm of x and the permuted converted weight, multiplied by
+    # scales.
     # F.linear(x, weight.to(dtype=x.dtype)) * scales
     # case of dispatching to mm, w/o x reshape
     _woq_pattern = CallFunction(
@@ -1340,6 +1564,8 @@ def _register_woq_mm_int8_pattern2():
 
 
 def _register_woq_mm_int8_pattern3():
+    # [FUNCTION DOC] HELPER: Register the WOQ int8 pattern for the bmm case: bmm of
+    # an expanded x and an expanded permuted converted weight, multiplied by scales.
     # F.linear(x, weight.to(dtype=x.dtype)) * scales
     # case of dispatching to bmm
     _woq_pattern = CallFunction(
@@ -1365,6 +1591,8 @@ def _register_woq_mm_int8_pattern3():
 
 
 def _register_woq_mm_int8_pattern4():
+    # [FUNCTION DOC] HELPER: Register the WOQ int8 pattern where mm of x with a
+    # dtype-converted permuted weight is multiplied by scales.
     _woq_pattern = CallFunction(
         aten.mul.Tensor,
         CallFunction(
@@ -1386,7 +1614,12 @@ def _register_woq_mm_int8_pattern4():
 
 
 def _register_int8_woq_concat_linear_pattern():
+    # [FUNCTION DOC] HELPER: Register the concat-linear WOQ int8 pattern: mm of x
+    # with a concatenation (dim 1) of three permuted, dtype-converted weights w1,
+    # w2, w3, multiplied by scales.
     def _create_wgt_node(wgt_node_name: str):
+        # [FUNCTION DOC] HELPER: Build a pattern for one weight (keyword given by
+        # wgt_node_name): a dtype convert of a permute.
         return CallFunction(
             prims.convert_element_type.default,
             CallFunction(
@@ -1412,6 +1645,8 @@ def _register_int8_woq_concat_linear_pattern():
 
 
 def _register_quantization_lowerings():
+    # [FUNCTION DOC] Register all quantization lowerings: unary, binary, max_pool2d,
+    # cat and reshape.
     _register_quantization_unary_lowering()
     _register_quantization_binary_lowering()
     _register_quantization_maxpool2d()
@@ -1420,6 +1655,8 @@ def _register_quantization_lowerings():
 
 
 def _register_woq_lowerings():
+    # [FUNCTION DOC] Register all weight-only-quantization int8 mm lowerings
+    # (patterns 1 to 4).
     _register_woq_mm_int8_pattern1()
     _register_woq_mm_int8_pattern2()
     _register_woq_mm_int8_pattern3()
@@ -1427,6 +1664,10 @@ def _register_woq_lowerings():
 
 
 def _is_valid_concat_linear_woq_int4_fusion(computation_nodes):
+    # [FUNCTION DOC] HELPER: Check that a list of int4 WOQ mm nodes can be fused: at
+    # least two nodes, all with the same target, the same activation, the same input
+    # feature size and group size, all weights constants (get_attr) and distinct
+    # from the first weight except at the first index.
     computation_op = torch.ops.aten._weight_int4pack_mm_for_cpu.default
     act = computation_nodes[0].args[0]
     wgt = computation_nodes[0].args[1]
@@ -1448,6 +1689,13 @@ def _is_valid_concat_linear_woq_int4_fusion(computation_nodes):
 
 
 def concat_linear_woq_int4(gm: torch.fx.GraphModule):
+    # [FUNCTION DOC] Graph pass that fuses several int4 WOQ CPU linears sharing the
+    # same activation into a single call on concatenated weights and scale/zero-
+    # point buffers, followed by a split and per-output clone nodes. Mutates the
+    # graph module: registers new concatenated buffers, creates nodes, replaces and
+    # erases the original gemm nodes. Raises AssertionError on inconsistent users.
+    # KNOWN ISSUE: each new concatenated buffer is registered as a buffer and then
+    # set again as a plain attribute, which is redundant.
     """
     Concat Linear optimization pass for WOQ int4
     This pass fuses the original pattern:
@@ -1460,6 +1708,11 @@ def concat_linear_woq_int4(gm: torch.fx.GraphModule):
     """
 
     def concat_wgt(packed_wgts, scale_zps, group_size, act_dtype):
+        # [FUNCTION DOC] HELPER: Unpack each int4 packed weight by multiplying an
+        # identity matrix through the int4 mm op with fixed scales and zeros,
+        # transpose and cast to int32, concatenate along rows, and repack with the
+        # int4 conversion op; also concatenate the scale/zero-point tensors along
+        # dim 1. Returns the repacked weight and concatenated scale/zero-point.
         # Concat the wgts and scale_zps, and repack the wgt
         unpacked_wgts = []
         for packed_wgt in packed_wgts:
@@ -1582,6 +1835,12 @@ def concat_linear_woq_int4(gm: torch.fx.GraphModule):
 
 
 def quant_lift_up(graph_module: torch.fx.GraphModule):
+    # [FUNCTION DOC] Graph pass that moves a per-tensor quantize node up before a
+    # chain of view-like ops (transpose, permute, view, reshape) whose intermediate
+    # nodes each have exactly one user, so a dequant-linear-quant pattern forms.
+    # Creates a copy of the quant node on the chain's input, rewires users, erases
+    # the original, bumps quant_lift_up_count, then lints and recompiles the graph
+    # module. Mutates the module in place.
     """
     Lift up the quant node before view like nodes. It can benefit performance
     of Attention like block. For example, we have the pattern as:
@@ -1617,6 +1876,8 @@ def quant_lift_up(graph_module: torch.fx.GraphModule):
     """
 
     def is_view_op(node):
+        # [FUNCTION DOC] HELPER: Return True if the node is a call_function whose
+        # target is a view-like op.
         return node.op == "call_function" and node.target in _VIEW_OPS
 
     for node in graph_module.graph.nodes:
@@ -1658,6 +1919,9 @@ def quant_lift_up(graph_module: torch.fx.GraphModule):
 
                     # Update inputs of new_quant_node
                     def maybe_replace_node(n: torch.fx.Node) -> torch.fx.Node:
+                        # [FUNCTION DOC] HELPER: Return input_node in place of the
+                        # original quant input node, other nodes unchanged; used to
+                        # remap the copied quant node's arguments.
                         if n == input_node_of_quant:
                             return input_node
                         else:

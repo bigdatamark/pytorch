@@ -1,3 +1,11 @@
+# [MODULE DOC] Profile-guided runtime estimation (PGE) for the overlap scheduler.
+# Parses a Chrome Trace JSON produced by the torch profiler into lookup tables of
+# collective and per-op GPU kernel durations, and exposes ProfileGuidedEstimator, a
+# callable that maps an FX node to an estimated runtime in milliseconds (or None to
+# fall back to analytical models).
+# Main contents: CollectiveRecord and OpRecord (observations), ProfileData (parser,
+# indices, interpolation), FX-node helper extractors, and ProfileGuidedEstimator. No
+# import-time side effects besides creating a module logger.
 """
 Profile-Guided Estimation (PGE) for overlap scheduling.
 
@@ -41,6 +49,10 @@ log = logging.getLogger(__name__)
 
 
 def _rank_stride(ranks: tuple[int, ...]) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the constant stride of a sorted tuple of ranks,
+    # or None when there is at most one rank, the first step is not positive, or the
+    # steps are not all equal. Used to identify which mesh dimension a process group
+    # belongs to.
     """Compute the stride of a sorted rank tuple, or None if non-uniform.
 
     Examples:
@@ -62,6 +74,11 @@ def _rank_stride(ranks: tuple[int, ...]) -> int | None:
 
 @dataclass
 class CollectiveRecord:
+    # [CLASS DOC] A single collective kernel observation from the profile:
+    # normalized-later collective name, sorted process-group ranks, group size,
+    # input and output message element counts, dtype name string (e.g. Float,
+    # BFloat16) and kernel duration in microseconds. Plain data container with no
+    # behavior.
     """A single collective kernel observation from the profile."""
 
     collective_name: str  # "all_gather_into_tensor", "reduce_scatter_tensor", etc.
@@ -75,6 +92,10 @@ class CollectiveRecord:
 
 @dataclass
 class OpRecord:
+    # [CLASS DOC] A single CPU-op observation from the profile: op name, per-tensor
+    # input shapes and strides (nested tuples), dtype of the first input (or None),
+    # and the summed duration in microseconds of all GPU kernels launched by that
+    # CPU op. Plain data container.
     """A single op observation from the profile (any CPU op with GPU kernels)."""
 
     op_name: str  # normalized name, e.g. "aten::mm", "mylib::my_custom_op"
@@ -85,6 +106,8 @@ class OpRecord:
 
 
 def _to_nested_tuple(x: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively convert nested lists or tuples into nested
+    # tuples so the result is hashable; non-sequence values are returned unchanged.
     """Recursively convert nested lists to tuples for hashability."""
     if isinstance(x, (list, tuple)):
         return tuple(_to_nested_tuple(i) for i in x)
@@ -93,6 +116,16 @@ def _to_nested_tuple(x: Any) -> Any:
 
 @dataclass
 class ProfileData:
+    # [CLASS DOC] Parsed contents of one profile trace plus lookup indices. State:
+    # collectives and ops (raw records), pg_configs (process group name to sorted
+    # ranks), and indices built after load: exact collective index keyed by name,
+    # ranks and dtype with size-sorted (out_nelems, duration_us) lists; a mesh-
+    # dimension fallback index keyed by name, stride, group size and dtype; a count
+    # of distinct process groups per mesh dimension; an op index mapping (op name,
+    # shapes, strides, dtype) to average duration in microseconds; and peak observed
+    # bandwidth per process group and per mesh dimension (GB/s).
+    # Key methods: load (parse and index), lookup_collective (ms estimate by exact,
+    # interpolated or bandwidth-based lookup), lookup_op (exact match lookup in ms).
     """Parse Chrome Trace JSON and build lookup tables for kernel runtimes."""
 
     collectives: list[CollectiveRecord] = field(default_factory=list)
@@ -128,6 +161,10 @@ class ProfileData:
     _mesh_dim_peak_bw: dict[tuple[int, int], float] = field(default_factory=dict)
 
     def load(self, trace_path: str) -> None:
+        # [FUNCTION DOC] Load a Chrome Trace JSON file, parse process group configs,
+        # events, and build all indices. Raises FileNotFoundError (with a hint about
+        # the config option) if the path is not a file; JSON decoding errors
+        # propagate. Mutates this object and logs a summary at info level.
         """Load and parse a Chrome Trace JSON file."""
         import os
 
@@ -152,6 +189,10 @@ class ProfileData:
         )
 
     def _parse_pg_configs(self, data: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Fill pg_configs from the trace distributedInfo
+        # section. The pg_config entry may be a list of records (with pg_name and
+        # ranks) or a mapping from name to record; entries with empty or missing
+        # ranks are ignored. Stores sorted rank tuples keyed by process group name.
         dist_info = data.get("distributedInfo", {})
         pg_config = dist_info.get("pg_config", {})
         # pg_config can be a list of dicts or a dict of dicts
@@ -168,6 +209,15 @@ class ProfileData:
                     self.pg_configs[pg_name] = tuple(sorted(ranks))
 
     def _parse_events(self, data: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Extract collective and CPU-op records from the
+        # trace events. First builds the External id to CPU op mapping (using the
+        # profile analysis helper, falling back to a manual scan of cpu_op events if
+        # the trace is malformed), then sums kernel durations per External id. Every
+        # kernel event that carries a collective name and positive duration becomes
+        # a CollectiveRecord (ranks parsed from the event or from pg_configs). Every
+        # External id with positive total kernel time is turned into an op record
+        # using the first CPU event for that id. Appends to self.collectives and
+        # self.ops.
         events = data.get("traceEvents", [])
         # Reuse profile_analysis's External id -> CPU op mapping
         try:
@@ -239,6 +289,10 @@ class ProfileData:
             self._parse_op(cpu_ev.get("name", ""), cpu_ev.get("args", {}), total_dur)
 
     def _parse_ranks(self, ranks_str: str, pg_name: str) -> tuple[int, ...]:
+        # [FUNCTION DOC] HELPER: Parse a process group rank list from its JSON
+        # string form (sorted tuple). If the string is not a JSON list or fails to
+        # decode, fall back to the ranks registered for pg_name in pg_configs, else
+        # return an empty tuple.
         """Parse rank list from profile string or fall back to pg_configs."""
         if isinstance(ranks_str, str) and ranks_str.startswith("["):
             try:
@@ -252,6 +306,11 @@ class ProfileData:
         return ()
 
     def _parse_op(self, name: str, args: dict[str, Any], total_dur: float) -> None:
+        # [FUNCTION DOC] HELPER: Convert one CPU op's trace args into an OpRecord
+        # and append it to self.ops. Skips ops without Input Dims or without any
+        # non-empty tensor shape. Dtype is looked up from the first input type
+        # string (None if unknown). Empty entries (non-tensor args) are dropped from
+        # shapes and strides so they match what is extracted from FX nodes.
         """Parse any CPU op into a generic OpRecord."""
         input_dims = args.get("Input Dims", [])
         input_strides = args.get("Input Strides", [])
@@ -285,6 +344,13 @@ class ProfileData:
         )
 
     def _build_indices(self) -> None:
+        # [FUNCTION DOC] HELPER: Build all lookup structures from the parsed
+        # records. Collective indices (exact by ranks and by mesh dimension) hold
+        # lists of (out_nelems, duration) sorted by size, plus the number of
+        # distinct process groups per mesh dimension. The op index averages
+        # durations of identical keys. Peak bandwidth per process group and per mesh
+        # dimension is the maximum bandwidth among the top five largest messages,
+        # using output-size bytes.
         """Build lookup indices from parsed records."""
         coll_idx: dict[tuple[str, tuple[int, ...], str], list[tuple[int, float]]] = (
             defaultdict(list)
@@ -359,6 +425,9 @@ class ProfileData:
         def _peak_bw_from_samples(
             samples: list[tuple[int, float]],
         ) -> float:
+        # [FUNCTION DOC] HELPER: Return the maximum bandwidth among the five
+        # largest-message samples (each a bytes and bandwidth pair), or 0.0 if there
+        # are no samples.
             """Get peak BW from the top-N largest messages."""
             # Sort by message size descending, take top N, return max BW
             sorted_samples = sorted(samples, key=lambda x: x[0], reverse=True)
@@ -377,25 +446,37 @@ class ProfileData:
         }
 
     def get_collective_keys(self) -> list[tuple[str, tuple[int, ...], str]]:
+        # [FUNCTION DOC] Return the list of exact collective index keys, each a
+        # tuple of normalized collective name, sorted ranks and dtype string.
         """Return the collective index keys: (name, pg_ranks, dtype)."""
         return list(self._collective_index.keys())
 
     @property
     def op_count(self) -> int:
+        # [FUNCTION DOC] Property: number of distinct (op, shapes, strides, dtype)
+        # entries in the op index.
         """Number of distinct op shapes in the index."""
         return len(self._op_index)
 
     def get_op_names(self) -> list[str]:
+        # [FUNCTION DOC] Return the distinct op names present in the op index, in
+        # first-seen order.
         """Return distinct op names in the op index."""
         return list(OrderedSet(name for name, _, _, _ in self._op_index))
 
     @staticmethod
     def _dtype_elem_bytes(dtype: str) -> int:
+        # [FUNCTION DOC] HELPER: Return bytes per element for a dtype name string by
+        # lowercasing it and using the profile analysis size lookup.
         """Return bytes per element for a dtype string (NCCL CamelCase or TypeMeta)."""
         return _get_size_from_string(dtype.lower())
 
     @staticmethod
     def _normalize_collective_name(name: str) -> str:
+        # [FUNCTION DOC] HELPER: Map profile or FX collective names to a canonical
+        # family: all_gather, reduce_scatter, all_reduce or all_to_all (case-
+        # insensitive substring matching, checked in that order). Unrecognized names
+        # are returned unchanged.
         """Normalize collective name between profile and FX conventions.
 
         Profile uses: _allgather_base, allreduce, reduce_scatter_tensor_coalesced
@@ -422,6 +503,11 @@ class ProfileData:
         nelems: int,
         dtype: str,
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Estimate collective duration in milliseconds from
+        # peak observed bandwidth for the given process group, falling back to the
+        # mesh-dimension peak bandwidth when the group has none. Total bytes is
+        # element count times element size. Returns None if no positive bandwidth is
+        # known (caller then uses another model).
         """Estimate collective duration using peak observed bandwidth for this PG.
 
         Used when the target size exceeds the extrapolation cap. Returns ms or None.
@@ -447,6 +533,15 @@ class ProfileData:
         nelems: int,
         dtype: str,
     ) -> tuple[float, str] | None:
+        # [FUNCTION DOC] Look up a collective duration. Returns a pair of (duration
+        # in ms, source) or None. Source is profile for exact or interpolated
+        # matches and pg_bandwidth for bandwidth-based extrapolation. Tries the
+        # exact (name, ranks, dtype) index first, then the mesh-dimension index but
+        # only when exactly one process group exists with that stride and size
+        # (otherwise ambiguous). An exact size match is returned directly. If the
+        # target exceeds EXTRAPOLATION_CAP times the largest observed size,
+        # bandwidth estimation is tried first; otherwise or on failure log-log
+        # interpolation is used. Returns None when nothing matches.
         """Look up collective duration in ms. Returns (duration_ms, source) or None.
 
         ``source`` is ``"profile"`` for exact/interpolated matches, or
@@ -499,6 +594,15 @@ class ProfileData:
     def _interpolate_log_log(
         self, entries: list[tuple[int, float]], target_nelems: int
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Interpolate duration (ms) for target element count
+        # from size-sorted (nelems, duration_us) entries. Entries with non-positive
+        # values are ignored. With bracketing entries, interpolates linearly in log-
+        # log space; with only a lower neighbor or only an upper neighbor, scales
+        # linearly from that neighbor. Returns None for empty entries or non-
+        # positive target.
+        # KNOWN ISSUE: the lower bound is the last entry not above the target, so
+        # the result relies on entries being sorted by size; the extrapolation
+        # branches are linear in size, not log-log.
         """Interpolate duration in log-log space (log(nelems) vs log(dur))."""
         if not entries or target_nelems <= 0:
             return None
@@ -541,6 +645,8 @@ class ProfileData:
         input_strides: tuple[tuple[int, ...], ...],
         dtype: torch.dtype | None,
     ) -> float | None:
+        # [FUNCTION DOC] Return the average profiled duration in ms for an exact (op
+        # name, shapes, strides, dtype) match, or None on a miss.
         """Look up op duration in ms by exact shape+stride match. Returns None on miss."""
         key = (op_name, input_shapes, input_strides, dtype)
         dur_us = self._op_index.get(key)
@@ -551,6 +657,9 @@ class ProfileData:
 
 @functools.cache
 def _dtype_to_nccl_str(dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] HELPER: Return the NCCL-style dtype name for a torch dtype
+    # (e.g. BFloat16) by building an empty tensor and stripping the torch prefix and
+    # Tensor suffix from its type string. Cached.
     """Convert torch.dtype to NCCL/ScalarType name (for collective matching).
 
     Derives the name from torch.Tensor.type() which returns e.g.
@@ -565,6 +674,9 @@ def _dtype_to_nccl_str(dtype: torch.dtype) -> str:
 
 
 def _get_node_dtype(node: fx.Node) -> torch.dtype | None:
+    # [FUNCTION DOC] HELPER: Return the dtype of the node's fake value, or of the
+    # first element if the value is a non-empty list or tuple of tensors; None
+    # otherwise.
     """Extract dtype from FX node metadata."""
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
@@ -577,6 +689,9 @@ def _get_node_dtype(node: fx.Node) -> torch.dtype | None:
 
 
 def _fx_target_to_profile_name(node: fx.Node) -> str | None:
+    # [FUNCTION DOC] HELPER: Convert an FX node target to the profile op name
+    # format: namespace::op for operator overloads, the function name for other
+    # callables with a name, else None.
     """Convert FX node target to the profile op name format.
 
     FX: torch.ops.aten.mm.default → "aten::mm"
@@ -596,6 +711,10 @@ def _fx_target_to_profile_name(node: fx.Node) -> str | None:
 def _get_node_input_shapes_and_strides(
     node: fx.Node,
 ) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]] | None:
+    # [FUNCTION DOC] HELPER: Collect concrete shapes and strides of all tensor-
+    # valued Node args of an FX node, resolving symbolic sizes via get_hint. Returns
+    # a pair of tuples or None if there are no tensor args or any dimension cannot
+    # be resolved.
     """Extract input shapes and strides from FX node tensor args.
 
     Returns (shapes, strides) or None if no tensor args or symbolic dims.
@@ -629,6 +748,8 @@ def _get_node_input_shapes_and_strides(
 
 
 def _is_collective_node(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the node is an all-gather, reduce-
+    # scatter, all-reduce or all-to-all collective op.
     """Check if node is a collective communication op."""
     return (
         is_all_gather_into_tensor(node)
@@ -641,6 +762,15 @@ def _is_collective_node(node: fx.Node) -> bool:
 def _get_collective_info(
     node: fx.Node,
 ) -> tuple[str, tuple[int, ...], int, str] | None:
+    # [FUNCTION DOC] HELPER: Extract (collective name, sorted process group ranks,
+    # element count, dtype string) from a collective FX node. Returns None if
+    # torch.distributed is not initialized, the target is not an operator overload,
+    # argument normalization fails, the process group cannot be resolved (logged at
+    # debug), or no tensor value is available. Element count comes from the node's
+    # own fake value, else from its first argument.
+    # KNOWN ISSUE: the element count is taken from the node output (or input) shape,
+    # while the profile index is keyed by output element count; for ops where input
+    # and output sizes differ this depends on which tensor is used.
     """Extract (collective_name, pg_ranks, nelems, dtype) from collective node."""
     import torch.distributed as c10d
     from torch.fx.operator_schemas import normalize_function
@@ -703,6 +833,11 @@ def _get_collective_info(
 
 
 class ProfileGuidedEstimator:
+    # [CLASS DOC] Profile-guided runtime estimator implementing the
+    # custom_runtime_estimation hook: called with an FX node and an optional size
+    # override, returns milliseconds or None to signal fallback. Holds a loaded
+    # ProfileData. Collectives use interpolation or bandwidth-based lookup; every
+    # other op uses exact shape and stride matching.
     """Profile-guided runtime estimator for FX nodes.
 
     Implements the ``custom_runtime_estimation`` interface:
@@ -718,6 +853,10 @@ class ProfileGuidedEstimator:
         trace_path: str,
         diagnostics_gm: torch.fx.GraphModule | None = None,
     ) -> None:
+        # [FUNCTION DOC] Create the estimator: load and index the trace at
+        # trace_path (may raise FileNotFoundError) and emit a structured-trace
+        # artifact with the profile contents, optionally compared against analytical
+        # estimates over diagnostics_gm.
         self.profile = ProfileData()
         self.profile.load(trace_path)
         self._log_profile_vs_analytical_comparison(diagnostics_gm)
@@ -725,6 +864,13 @@ class ProfileGuidedEstimator:
     def _log_profile_vs_analytical_comparison(
         self, diagnostics_gm: torch.fx.GraphModule | None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emit a structured-trace artifact named
+        # pge_profile_vs_analytical with the collective count, op count and every op
+        # index entry (name, shapes, strides, dtype, profile ms). If diagnostics_gm
+        # is given, also walk its nodes and record, for each node that has a PGE
+        # estimate, the estimate and an analytical estimate (NCCL model for
+        # collectives, roofline for others) when available; analytical collective
+        # failures are ignored. Side effect: writes a trace artifact.
         """Log profile data and PGE vs analytical comparison to trace_structured.
 
         Logs all profile entries (collectives, ops with durations).
@@ -791,6 +937,9 @@ class ProfileGuidedEstimator:
         )
 
     def __call__(self, node: fx.Node, override_size: int | None = None) -> float | None:
+        # [FUNCTION DOC] Estimate runtime in ms for a node: dispatches to collective
+        # estimation (with optional override_size in bytes) or to op estimation.
+        # Returns None when no estimate is available.
         if _is_collective_node(node):
             return self._estimate_collective(node, override_size)
         return self._estimate_op(node)
@@ -798,6 +947,11 @@ class ProfileGuidedEstimator:
     def _estimate_collective(
         self, node: fx.Node, override_size: int | None
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Estimate a collective node. Returns None if
+        # collective info cannot be extracted or override_size is zero. When
+        # override_size (bytes) is given and the node value is a tensor, the element
+        # count is recomputed as bytes divided by element size. Returns the duration
+        # in ms from the profile lookup or None.
         info = _get_collective_info(node)
         if info is None:
             return None
@@ -816,6 +970,9 @@ class ProfileGuidedEstimator:
         return None
 
     def _estimate_op(self, node: fx.Node) -> float | None:
+        # [FUNCTION DOC] HELPER: Estimate a non-collective op by exact match of op
+        # name, tensor input shapes and strides, and dtype in the profile. Returns
+        # None if the name, shapes (e.g. symbolic dims) or profile entry is missing.
         """Estimate any non-collective op via exact shape+stride match in profile."""
         profile_name = _fx_target_to_profile_name(node)
         if profile_name is None:
