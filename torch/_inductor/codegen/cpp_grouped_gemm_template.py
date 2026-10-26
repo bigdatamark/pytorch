@@ -1,3 +1,9 @@
+# [MODULE DOC] Inductor CPP codegen template for a group of GEMMs that share dimensions
+# (e.g. several linear layers fed by the same or different activations). Holds the C++
+# source template string GEMM_TEMPLATE, a dedup helper for activations, and the
+# CppGroupedGemmTemplate class (subclass of CppGemmTemplate) that packs weights, picks a
+# micro gemm and renders one fused kernel computing all GEMMs per tile.
+# Import-time side effects: creates the module logger only.
 import contextlib
 import logging
 import os
@@ -154,6 +160,9 @@ extern "C" {{export_declaration}}
 
 
 def get_deduplicated_act(act_mapping: dict[int, ir.IRNode]) -> list[ir.IRNode]:
+    # [FUNCTION DOC] Given a mapping from gemm index (0..n-1, contiguous) to its activation
+    # node, returns the list of activation nodes with duplicates removed (by node name),
+    # keeping first-seen order. Raises a key error if indices are not contiguous from 0.
     act_deduplicated = []
     act_deduplicated_name: OrderedSet[str] = OrderedSet()
     for act_idx in range(len(act_mapping.values())):
@@ -165,6 +174,12 @@ def get_deduplicated_act(act_mapping: dict[int, ir.IRNode]) -> list[ir.IRNode]:
 
 
 class CppGroupedGemmTemplate(CppGemmTemplate):
+    # [CLASS DOC] CPP GEMM template that computes several same-shaped GEMMs in one kernel.
+    # State: act_mapping (gemm index -> activation node, activations may be shared),
+    # gemm_grouped_num (number of GEMMs), output_node (one placeholder buffer per GEMM).
+    # Input node order is: deduplicated activations, then one weight per GEMM, then biases
+    # for the GEMMs that have one. Epilogue_creator is not supported; bias is added via
+    # pointwise epilogues. Key methods: add_choices, get_kernel_prefix_name, render.
     def __init__(
         self,
         input_nodes: list[ir.IRNode],
@@ -178,6 +193,9 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         act_mapping: dict[int, ir.IRNode] | None = None,
         gemm_grouped_num: int = 1,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base GEMM template with the shared arguments, then
+        # stores act_mapping and gemm_grouped_num and creates one output buffer named
+        # buf_out<idx> per GEMM (all using the given layout).
         """
         Template for Group of GEMMs:
         * Each GEMM has the same dimensions (m, n, k) and the same leading dimensions (lda, ldb, ldc)
@@ -219,6 +237,16 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         epilogue_creator: Callable[[ir.Buffer], ir.Pointwise] | None = None,
         act_mapping: dict[int, ir.IRNode] | None = None,  # gemm idx to its act buf
     ) -> DataProcessorTemplateWrapper:
+        # [FUNCTION DOC] Builds a grouped-GEMM template wrapper and registers it in choices.
+        # Args: choices (list appended to), layout, input_nodes (activations, weights,
+        # biases in that order), beta/alpha scaling, has_bias (one flag per GEMM; its length
+        # is the group size), trans_w (weights need transposing), act_mapping (required,
+        # gemm idx to activation). Defines inner preprocessors (reorder, densify mkldnn
+        # weights, transpose weights and expand biases, block and VNNI-pack weights) and a
+        # postprocessor that packs the constant weights and replaces them in the template
+        # buffer inputs. Creates a micro gemm from the first activation and weight dtypes.
+        # Returns the wrapper. Raises an error if act_mapping is empty or no micro gemm exists.
+        # Side effects: appends to choices, adds packed constants to the graph.
         # Input nodes order: x, optional[x1], ... w0, w1, ... optional[b0], optional[b1], ...
         gemm_grouped_num = len(has_bias)
         if not act_mapping:
@@ -235,6 +263,8 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             inputs: list[_T],
             layout_or_out: _U,
         ) -> tuple[list[_T], _U]:
+            # [FUNCTION DOC] HELPER: Selects inputs by input_indices (all inputs, in order);
+            # returns the new input list and the unchanged layout/output.
             if input_indices is None:
                 raise AssertionError("input_indices must be set")
             return [inputs[idx] for idx in input_indices], layout_or_out
@@ -245,6 +275,8 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             inputs: list[_T],
             layout_or_out: _U,
         ) -> tuple[list[_T], _U]:
+            # [FUNCTION DOC] HELPER: Copies inputs and converts any weight tensor stored in
+            # mkldnn layout to dense. Non-tensor (IR node) weights are left alone.
             new_inputs = list(inputs)
             for idx in range(wgt_start_idx, wgt_start_idx + gemm_grouped_num):
                 if isinstance(inputs[idx], torch.Tensor):
@@ -259,6 +291,9 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             inputs: list[_T],
             layout_or_out: _U,
         ) -> tuple[list[_T], _U]:
+            # [FUNCTION DOC] HELPER: If trans_w is false returns inputs unchanged. Otherwise
+            # transposes every weight and expands every bias to match the first activation.
+            # Raises an error if a bias expansion yields nothing.
             new_inputs: list[_T] = list(inputs)
             if not trans_w:
                 return new_inputs, layout_or_out
@@ -305,6 +340,8 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             inputs: list[_T],
             layout_or_out: _U,
         ) -> tuple[list[_T], _U]:
+            # [FUNCTION DOC] HELPER: Blocks each weight (with padding to a multiple of block_n)
+            # and VNNI-packs it for the micro gemm; returns inputs with the weights replaced.
             new_W_list = []
             new_inputs = list(inputs)
             W_list = new_inputs[wgt_start_idx : wgt_start_idx + gemm_grouped_num]
@@ -318,11 +355,18 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             inputs: list[_T],
             layout: _U,
         ) -> tuple[list[_T], _U]:
+            # [FUNCTION DOC] HELPER: Full input pipeline: reorder, densify, normalize shapes,
+            # then pack weights. Returns the processed inputs and layout.
             return pack_weight(
                 *normalize_shapes(*maybe_to_dense(*reorder_and_filter(inputs, layout)))
             )
 
         def postprocessor(output: _T) -> _T:
+            # [FUNCTION DOC] HELPER: For a TensorBox output backed by a CppTemplateBuffer,
+            # fetches the constant weights from the graph, runs the same normalize/pack steps,
+            # prunes now-unused tensors, registers the packed weights as graph constants and
+            # points the template buffer inputs at them. Returns output. Raises an error if a
+            # weight is not a graph constant or the packed weight is not a tensor.
             if isinstance(output, ir.TensorBox):
                 template_buffer = ir.InputsKernel.unwrap_storage_for_input(output)
                 if not isinstance(template_buffer, ir.CppTemplateBuffer):
@@ -380,6 +424,7 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         return template
 
     def get_kernel_prefix_name(self) -> str:
+        # [FUNCTION DOC] Returns the kernel name prefix encoding group size and m, n, k.
         return f"grouped_gemm_g{self.gemm_grouped_num}m{self.m}n{self.n}k{self.k}"
 
     def render(  # type: ignore[override,return,no-untyped-def]
@@ -390,6 +435,14 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
         epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> str:
+        # [FUNCTION DOC] Renders the C++ grouped GEMM kernel source. Splits input nodes into
+        # activations, weights and optional biases; uses template_buffer_node outputs and
+        # packed weights when given. Creates the micro gemm, reads per-core L1/L2 cache sizes,
+        # builds bias-add epilogues (one per biased GEMM) plus any fused epilogue_nodes,
+        # and renders GEMM_TEMPLATE with the assembled options. Raises an error if act_mapping
+        # is empty, no micro gemm is found, cache sizes are not positive, or epilogue_creator is
+        # set. Side effects: increments inductor counters, logs blockings.
+        # KNOWN ISSUE: flag_template_buffer_has_other_users is accepted but unused.
         if not self.act_mapping:
             raise AssertionError("expected non-empty self.act_mapping")
         act_deduplicated = get_deduplicated_act(self.act_mapping)
@@ -486,6 +539,8 @@ class CppGroupedGemmTemplate(CppGemmTemplate):
             kernel_args["inp" + str(inp_idx)] = inp_list[inp_idx]
 
         def _bias_add_epilogue(buf: ir.IRNode, inp: ir.IRNode) -> ir.Pointwise:
+            # [FUNCTION DOC] HELPER: Builds a pointwise bias-add epilogue on buf with bias inp,
+            # scaled by beta, in the layout dtype.
             return create_epilogue_with_attr(
                 buf, "bias_add", other=inp, beta=self.beta, dtype=self.layout.dtype
             )
