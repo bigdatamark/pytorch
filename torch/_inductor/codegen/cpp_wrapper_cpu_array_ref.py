@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Cpp wrapper code generator for CPU AOTInductor that represents tensors as ArrayRefTensor
+# (stack or thread-local backed views, see arrayref_tensor.h) instead of heap tensor handles.
+# Main content: CppWrapperCpuArrayRef (a fork of CppWrapperCpu) and MAX_STACK_ALLOCATION_SIZE.
+# No import-time side effects beyond imports and defining module constants.
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -35,6 +39,12 @@ MAX_STACK_ALLOCATION_SIZE = 1024 * 100
 
 
 class CppWrapperCpuArrayRef(CppWrapperCpu):
+    # [CLASS DOC] Variant of CppWrapperCpu that emits C++ using ArrayRefTensor for CPU-only AOTI models,
+    # optionally stack allocating small static-shape contiguous buffers and offering a minimal
+    # arrayref interface (typed tuple and a C-ABI V2 raw entry point).
+    # State: allow_stack_allocation flag (turned off by any fallback/extern kernel), stack_allocated_buffers
+    # (name to buffer), v2_raw_wrapper_body (copy of the body for the V2 raw entry), v2_raw_output_refs.
+    # Invariant: device must be cpu.
     """
     Generates cpp wrapper for running on CPU and calls cpp kernels
 
@@ -43,6 +53,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initialize the base wrapper, require the device to be cpu (raises AssertionError otherwise),
+        # read the stack-allocation setting from config, and create empty stack-allocation and V2 raw state.
         super().__init__()
         if self.device != "cpu":
             raise AssertionError("ArrayRefTensor only supported on CPU!")
@@ -58,12 +70,18 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         parent_wrapper: PythonWrapperCodegen | None,
         partition_signatures: ir.GraphPartitionSignature | None = None,
     ):
+        # [FUNCTION DOC] Factory used by the wrapper-selection machinery; ignores all arguments and returns a new
+        # CppWrapperCpuArrayRef (subgraph codegen is not supported yet, see TODO).
         # TODO - support subgraph codegen by lifting functions. Check the
         # comment at CppWrapperCpu `codegen_subgraph` function.
         return CppWrapperCpuArrayRef()
 
     @staticmethod
     def get_input_cpp_type(input):
+        # [FUNCTION DOC] Return the C++ type string of a graph input in the minimal arrayref interface: the scalar C++
+        # type for symbolic expressions (dtype looked up from the constant buffer dtype) or an ArrayRefTensor
+        # of the element type for tensors. Raises AssertionError if the minimal arrayref config is off or
+        # the dtype of a symbolic expression cannot be determined.
         if not config.aot_inductor.use_minimal_arrayref_interface:
             raise AssertionError(
                 "expected config.aot_inductor.use_minimal_arrayref_interface to be set"
@@ -80,6 +98,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
 
     @staticmethod
     def get_input_element_cpp_type(input):
+        # [FUNCTION DOC] Return the C++ element type of a graph input: the scalar type for symbolic expressions or the
+        # tensor element type. Raises AssertionError when the dtype of a symbolic expression is unknown.
         if isinstance(input, sympy.Expr):
             from ..graph import may_get_constant_buffer_dtype
 
@@ -91,17 +111,21 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
 
     @staticmethod
     def get_device_include_path_jit(device: str) -> str:
+        # [FUNCTION DOC] Return the include directive for the JIT arrayref header. Raises AssertionError for non-cpu devices.
         if device != "cpu":
             raise AssertionError("ArrayRef only supported on CPU!")
         return "#include <torch/csrc/inductor/cpp_wrapper/array_ref.h>"
 
     @staticmethod
     def get_device_include_path_aot(device: str) -> str:
+        # [FUNCTION DOC] Return the include directive for the AOT arrayref header. Raises AssertionError for non-cpu devices.
         if device != "cpu":
             raise AssertionError("ArrayRef only supported on CPU!")
         return "#include <torch/csrc/inductor/aoti_include/array_ref.h>"
 
     def codegen_input_numel_asserts(self, indented_buffer=None):
+        # [FUNCTION DOC] Emit assert_numel checks for every tensor graph input into the given buffer (default: the prefix).
+        # Symbolic inputs and zero-sized tensors are skipped. Side effect: writes lines to the buffer.
         writer = indented_buffer or self.prefix
         for name, buf in V.graph.graph_inputs.items():
             if isinstance(buf, sympy.Expr):
@@ -122,11 +146,16 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         op_name: str,
         dtype: torch.dtype | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Intentionally a no-op override: inputs/outputs are ArrayRefTensor, for which the size and
+        # stride assertion would not compile.
         # Inputs/outputs are ArrayRefTensor, not AtenTensorHandle, so
         # assert_size_stride would fail to compile.
         return
 
     def _codegen_v2_raw_input_bindings(self, code: IndentedBuffer):
+        # [FUNCTION DOC] HELPER: For the V2 raw entry point, emit code converting each C input descriptor into an arrayref
+        # tensor named after the graph input; for symbolic scalar inputs also unpack the scalar value from the
+        # descriptor. Raises AssertionError if a symbolic input dtype is unknown. Writes to the given buffer.
         for idx, (input_key, input_value) in enumerate(V.graph.graph_inputs.items()):
             input_cpp_type = CppWrapperCpuArrayRef.get_input_element_cpp_type(
                 input_value
@@ -149,6 +178,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                 )
 
     def _codegen_v2_raw_input_symbols(self, code: IndentedBuffer) -> None:
+        # [FUNCTION DOC] HELPER: For the V2 raw entry point, emit assignments for symbolic sizes/strides derived from
+        # inputs (symbol inputs first), temporarily redirecting the prefix into the given buffer, and then
+        # verify every free symbol in tensor sizes/strides was bound. Raises AssertionError if not.
         bound_vars = OrderedSet[sympy.Symbol]()
         graph_inputs = self.get_graph_inputs()
         inputs = [
@@ -180,6 +212,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                     )
 
     def _codegen_v2_raw_prelude(self, code: IndentedBuffer):
+        # [FUNCTION DOC] HELPER: Emit the whole V2 raw prelude: input bindings, constant lookups from constants_, symbol
+        # assignments, numel asserts and the kernels reference. Raises AssertionError if a constant is not a Tensor.
         self._codegen_v2_raw_input_bindings(code)
 
         if not all(
@@ -199,9 +233,13 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
     def _codegen_v2_raw_outputs(
         self, code: IndentedBuffer, output_refs: list[str]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emit code converting each non-null output reference into a C arrayref descriptor in c_outputs.
+        # Handle-typed outputs are cached in thread-local RAII handles (cloned if constants) and converted;
+        # arrayref outputs are copied into a thread-local cached array. Scalar-shape outputs are converted to tensors.
         cst_names = V.graph.constants.keys()
 
         def write_output_to_c_array(idx: int, output: str) -> None:
+            # [FUNCTION DOC] HELPER: Emit code converting an output handle to an arrayref tensor and storing it in c_outputs at idx.
             output_arrayref_name = f"output_arrayref_{idx}"
             code.splice(
                 f"""
@@ -280,16 +318,19 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             code.writeline("}")
 
     def generate_extern_kernel_alloc(self, *args, **kwargs):
+        # [FUNCTION DOC] Disable stack allocation (extern kernels need real tensors) then delegate to the base class.
         # Disable stack allocation for extern kernels.
         self.allow_stack_allocation = False
         super().generate_extern_kernel_alloc(*args, **kwargs)
 
     def generate_extern_kernel_out(self, *args, **kwargs):
+        # [FUNCTION DOC] Disable stack allocation (extern kernels need real tensors) then delegate to the base class.
         # Disable stack allocation for extern kernels.
         self.allow_stack_allocation = False
         super().generate_extern_kernel_out(*args, **kwargs)
 
     def generate_fallback_kernel(self, node: ir.FallbackKernel) -> None:
+        # [FUNCTION DOC] Disable stack allocation (fallback kernels need real tensors) then delegate to the base class.
         # Disable stack allocation for extern kernels.
         self.allow_stack_allocation = False
         super().generate_fallback_kernel(node)
@@ -310,6 +351,10 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         original_fxnode_name=None,
         current_stream_idx=None,
     ):
+        # [FUNCTION DOC] Emit the call of a CPU (cpp) kernel: pointer-typed args are fetched via get_data_ptr_wrapper into
+        # temporaries and cast to the declared type, scalars pass through; the call is wrapped by the debug
+        # printer. Raises AssertionError if triton is true or call_args/arg_types lengths differ.
+        # KNOWN ISSUE: the docstring refers to a cuda flag that does not exist in this signature.
         """
         Generates kernel call code.
 
@@ -347,6 +392,12 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             self.writeline(self.wrap_kernel_call(kernel_name, new_args))
 
     def write_wrapper_decl(self):
+        # [FUNCTION DOC] Emit the function declaration/prologue of the generated entry point into prefix/suffix.
+        # AOT mode: optional tuple type aliases for the minimal arrayref interface, const-graph splicing,
+        # _const_run_impl or run_impl definitions, plus extern C entry points (typed and V2 flat-descriptor
+        # variant that validates input/output counts and null pointers). JIT mode: inductor_entry_impl.
+        # Then emits input unpacking (handles stolen into RAII, or tuple get), constant lookups, codegen_inputs,
+        # and numel asserts or inputs.clear(). Raises AssertionError on missing const graph code or non-Tensor constants.
         """Declare the generated AOTI wrapper entry points."""
         inputs_len = len(V.graph.graph_inputs.keys())
         if V.graph.aot_mode:
@@ -611,6 +662,11 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                 )
 
     def generate_return(self, output_refs: list[str]):
+        # [FUNCTION DOC] Emit the return logic of the model: for each non-null output, copy/steal into output_handles or,
+        # in the arrayref interface, fill the output tuple of arrayref tensors (constants are cloned since they
+        # are not owned by the model; duplicate outputs reuse the first handle in the non-arrayref path).
+        # Also snapshots the wrapper body and output refs for the V2 raw entry. Raises AssertionError if an
+        # output view does not unwrap to a BaseView or MutableBox.
         cst_names = V.graph.constants.keys()
         arr_iface = (
             not V.graph.is_const_graph
@@ -623,6 +679,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             self.v2_raw_output_refs = list(output_refs)
 
         def use_thread_local_cached_output_tensor(idx, output):
+            # [FUNCTION DOC] HELPER: Emit code that copies a non-handle output into a thread-local cached output (array or
+            # tensor flavor) and publishes it either as arrayref tuple entry idx or as a new tensor handle in output_handles.
             cached_output_name = f"cached_output_{next(self.cached_output_id)}"
             cache_type = "Array" if arr_iface else "Tensor"
             self.wrapper_call.writeline(
@@ -751,6 +809,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             self.wrapper_call.writeline("return output_arrayref_tensors;")
 
     def generate_before_suffix(self, result):
+        # [FUNCTION DOC] After the base class hook, if a V2 raw output list was recorded, append the definition of the V2 raw
+        # run function (prelude, saved body, outputs conversion) to the result buffer.
         super().generate_before_suffix(result)
         if self.v2_raw_output_refs is None:
             return
@@ -776,6 +836,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         result.splice(raw_impl)
 
     def memory_plan(self):
+        # [FUNCTION DOC] Run the memory planner over the lines and disable stack allocation (planning and stack allocation
+        # are not integrated, see TODO). Mutates self.lines and allow_stack_allocation.
         from .memory_planning import MemoryPlanner
 
         self.lines = MemoryPlanner(self).plan(self.lines)
@@ -783,6 +845,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         self.allow_stack_allocation = False
 
     def memory_plan_reuse(self):
+        # [FUNCTION DOC] Plan buffer reuse: drop trailing planning lines for non-output buffers, run the planning pass with a
+        # state per subgraph scope, then enable stack allocation only if it was not disabled, config allows it and
+        # the summed allocated size is within MAX_STACK_ALLOCATION_SIZE. Raises AssertionError on unbalanced scopes.
         out_names = V.graph.get_output_names()
 
         while (
@@ -824,6 +889,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         )
 
     def can_stack_allocate_buffer(self, buffer):
+        # [FUNCTION DOC] Return True if a buffer can be stack allocated: stack allocation allowed, cpu device, provably static
+        # shape and contiguous strides.
         return (
             self.allow_stack_allocation
             and buffer.get_device().type == "cpu"
@@ -834,6 +901,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         )
 
     def make_buffer_free(self, buffer):
+        # [FUNCTION DOC] Return the C++ statement freeing a buffer (reset call), or an empty string for multi-output layouts,
+        # stack-allocated buffers, and graph inputs under the minimal arrayref interface in AOT mode.
         return (
             ""
             if isinstance(buffer.get_output_spec(), ir.MultiOutputLayout)
@@ -847,6 +916,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         )
 
     def make_buffer_allocation(self, buffer):
+        # [FUNCTION DOC] Return the allocation statement for a buffer, using stack allocation when permitted.
         return self.make_allocation(
             buffer.get_name(),
             buffer.get_device(),
@@ -867,6 +937,10 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         buffer_if_can_stack_allocate=None,
         is_pinned=False,
     ):
+        # [FUNCTION DOC] Return the C++ declaration for a new tensor. Stack path: emits a storage array and returns an
+        # ArrayRefTensor declaration (records the buffer in stack_allocated_buffers). Heap path: emits a handle
+        # variable and an aoti_torch_empty_strided (or pinned) call, returning a RAII handle declaration.
+        # Writes helper lines to wrapper_call as a side effect.
         orig_stride = stride
         device_str = self.codegen_device(device)
         dtype_code = self.codegen_dtype(dtype)
@@ -920,6 +994,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         return f"RAIIAtenTensorHandle {name}({name}_handle);"
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
+        # [FUNCTION DOC] Return code reusing old buffer as new: exact aliasing when size and stride match (propagating
+        # stack-allocation status), else a reinterpret view. Frees old when delete_old and old is not an output.
+        # Raises AssertionError if dtypes differ.
         if old.get_dtype() != new.get_dtype():
             raise AssertionError(
                 f"expected matching dtypes, got {old.get_dtype()} and {new.get_dtype()}"
@@ -946,6 +1023,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  // reuse"
 
     def _assert_safe_to_use_borrow_arrayref_tensor_as_tensor(self):
+        # [FUNCTION DOC] HELPER: Raise AssertionError if borrowing arrayref tensors as tensors is unsafe (stack allocation on).
         # Borrowing arguments to shim functions is only safe because we know
         # that the arguments can't be stack-allocated. Otherwise, to be sure
         # we can't return a dangling pointer, we need to either 1) be
@@ -959,9 +1037,13 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             )
 
     def is_safe_to_use_borrow_arrayref_tensor_as_tensor(self):
+        # [FUNCTION DOC] Return True when no stack allocation is enabled or has happened, so borrowed arguments cannot dangle.
         return not self.allow_stack_allocation and not self.stack_allocated_buffers
 
     def codegen_subgraph_prefix(self, subgraph, outer_inputs, outer_outputs):
+        # [FUNCTION DOC] Emit code binding subgraph input names to RAII handles assigned from the outer inputs, borrowing
+        # arrayref tensors when needed via a generic lambda. Only tensor inputs are handled. Raises AssertionError
+        # if the input counts mismatch.
         if len(subgraph.graph.graph_inputs) != len(outer_inputs):
             raise AssertionError(
                 f"expected {len(outer_inputs)} subgraph inputs, got "
@@ -992,6 +1074,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             self.writeline(f"RAIIAtenTensorHandle {inner_input}({inner_input}_handle);")
 
     def codegen_while_loop(self, while_loop, stack_output=False):
+        # [FUNCTION DOC] Emit a C++ loop for a while_loop node: copies carried inputs to fresh handles, runs the cond subgraph
+        # and breaks if its result (bool or tensor item) is false, then runs the body subgraph.
+        # Raises NotImplementedError when stack_output is requested.
         if stack_output:
             raise NotImplementedError("NYI cpp wrapper for while_loop_stack_output")
         is_bool_pred = isinstance(
@@ -1052,6 +1137,9 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
     def generate_c_shim_extern_kernel_call(
         self, kernel: str, args: list[str], device: str, **_
     ) -> None:
+        # [FUNCTION DOC] Emit a call to a C shim extern kernel after disabling stack allocation; arguments that look like
+        # tensors (name prefixes buf, arg, wrap_with_raii_handle_if_needed) are wrapped in borrow_arrayref_tensor_as_tensor.
+        # KNOWN ISSUE: tensor detection is a name-prefix heuristic (acknowledged as hacky in the code).
         # In the abi_compatible mode, we call fallback aten ops through a C shim layer
         # Setting self.allow_stack_allocation to False because the exchange between
         # ArrayRefTensor and at::Tensor is still fragile.
@@ -1076,11 +1164,13 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         )
 
     def generate_scatter_fallback(self, node: ir.ScatterFallback):
+        # [FUNCTION DOC] Disable stack allocation then delegate scatter fallback generation to the base class.
         # No stack allocation when there is a fallback op
         self.allow_stack_allocation = False
         super().generate_scatter_fallback(node)
 
     def _generate_scatter_fallback_args(self, inputs: Sequence[Any]) -> list[str]:
+        # [FUNCTION DOC] HELPER: Return scatter fallback args, borrowing string args as tensors (asserts safety first).
         self._assert_safe_to_use_borrow_arrayref_tensor_as_tensor()
         return [
             f"borrow_arrayref_tensor_as_tensor({x})" if isinstance(x, str) else str(x)
@@ -1088,11 +1178,14 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         ]
 
     def generate_index_put_fallback(self, node: ir.IndexPutFallback) -> None:
+        # [FUNCTION DOC] Disable stack allocation then delegate index_put fallback generation to the base class.
         # No stack allocation when there is a fallback op
         self.allow_stack_allocation = False
         super().generate_index_put_fallback(node)
 
     def _generate_index_put_fallback(self, kernel, x, indices, values, accumulate):
+        # [FUNCTION DOC] HELPER: Emit a checked call to the index_put shim kernel with borrowed tensors and a temporary array of
+        # index handles; x is passed both as output and as input since the op mutates it.
         self._assert_safe_to_use_borrow_arrayref_tensor_as_tensor()
         # TODO: update aoti_torch_index_put_out in ir.py to use autogen out version
         # See the comment in codegen_reinterpret_view about why having something like
@@ -1125,6 +1218,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         raw_args: Sequence[Any],
         outputs: Sequence[ir.Buffer],
     ) -> None:
+        # [FUNCTION DOC] Disable stack allocation then delegate runtime-lookup fallback kernel generation to the base class.
         # No stack allocation when there is a fallback op
         self.allow_stack_allocation = False
         super().generate_fallback_kernel_with_runtime_lookup(
@@ -1134,10 +1228,13 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
     def codegen_runtime_lookup_tensor_call_args(
         self, tensor_call_args: Sequence[str]
     ) -> Sequence[str]:
+        # [FUNCTION DOC] Return the tensor call args each wrapped in borrow_arrayref_tensor_as_tensor (asserts safety first).
         self._assert_safe_to_use_borrow_arrayref_tensor_as_tensor()
         return [f"borrow_arrayref_tensor_as_tensor({arg})" for arg in tensor_call_args]
 
     def codegen_device_copy(self, src, dst, non_blocking: bool | str):
+        # [FUNCTION DOC] Emit a checked aoti_torch_copy_ from src into dst (converting dst if needed) and disable stack
+        # allocation, since the copy shim needs real tensor handles.
         # aoti_torch_tensor_copy_ takes AtenTensorHandle as input,
         # while stack-allocation results in ArrayRefTensor
         # so disable stack allocation here
@@ -1155,12 +1252,16 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         writeline: Callable[..., None],
         dtype=None,
     ) -> str:
+        # [FUNCTION DOC] Return an expression for a reinterpreted view. If the requested layout equals the data layout, return
+        # the stack-allocated name itself or a new RAII handle (emitting the creating lines via writeline);
+        # otherwise defer to the base class.
         """Returns a newly-created, temporary RAII tensor handle containing the
         reinterpreted tensor data.  Callers of this function are responsible for saving
         the handle if persistent access is needed."""
         dim = str(len(size))
 
         def create_reinterpret_call() -> str:
+            # [FUNCTION DOC] HELPER: Build the wrapped reinterpret_tensor_wrapper call expression string.
             args = [
                 f"{data.get_name()}",
                 dim,
@@ -1181,6 +1282,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
             return f"wrap_with_raii_handle_if_needed(reinterpret_tensor_wrapper({', '.join(args)}))"
 
         def create_new_tensor_handle() -> tuple[str, list[str]]:
+            # [FUNCTION DOC] HELPER: Return the expression for a new handle to the data plus the lines that create it;
+            # stack-allocated data is returned by name with no extra lines.
             # Calling reset() on ArrayRefTensor does nothing, since the array is
             # const-allocated on the stack.  Thus, it's safe to return a reference to
             # the original array.
@@ -1210,6 +1313,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
         )
 
     def val_to_arg_str(self, val, type_=None) -> str:
+        # [FUNCTION DOC] Convert a value to a C++ argument string; optional tensors get a borrowed or copied tensor and a
+        # temporary reference to its handle, everything else defers to the base class.
         if (
             val is not None
             and isinstance(type_, torch.OptionalType)
@@ -1229,6 +1334,8 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
     def codegen_tensor_item(
         self, dtype: torch.dtype, tensor: str, scalar: str, indented_buffer=None
     ):
+        # [FUNCTION DOC] Emit code extracting a scalar from a one-element tensor via the aoti item shim (half/bfloat16 go
+        # through a temporary converted to float). Borrows the arrayref tensor. Writes to the buffer or self.
         dtype_str = str(dtype).split(".")[-1]
         writer = indented_buffer or self
 

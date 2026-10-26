@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] C++ wrapper codegen for GPU (CUDA/HIP/XPU) in cpp_wrapper and AOTInductor modes.
+# Main content: helpers for C string escaping, TMA descriptor signature handling and the AOTI lazy kernel
+# config header; DeferredTritonCallWrapper (generates Triton kernel load/launch C++ once autotuning is done,
+# eagerly or lazily); CppWrapperGpu (the wrapper codegen class); UnwrapUnspecArg marker.
+# No import-time side effects beyond imports and constants.
 from __future__ import annotations
 
 import dataclasses
@@ -67,6 +72,7 @@ _cpp_string_literal_pattern = re.compile(r'["\\\n\t\r]')
 
 
 def cpp_string_literal(s: str) -> str:
+    # [FUNCTION DOC] Return the string as a quoted C++ string literal, escaping backslash, quote, newline, tab and CR.
     escaped = _cpp_string_literal_pattern.sub(
         lambda match: _cpp_string_literal_escapes[match.group(0)], s
     )
@@ -74,6 +80,11 @@ def cpp_string_literal(s: str) -> str:
 
 
 def generate_aoti_kernel_config_header(kernel_names: list[str]) -> str:
+    # [FUNCTION DOC] Build the text of a C header with one block of macros per lazily compiled kernel (cubin path, mangled
+    # name, warps, shared memory, per-subkernel block sizes, RSPLIT values, precomputed grid config index, scratch
+    # sizes), read from CudaKernelParamCache after the JIT first pass. Combo kernel default configs are merged.
+    # Raises RuntimeError if a kernel has no cached params.
+    # KNOWN ISSUE: the error message prints the whole kernel_names list rather than the missing kernel.
     """Generate a C header defining macros for each lazy-compiled kernel.
 
     Called after the JIT first-pass runs and populates CudaKernelParamCache.
@@ -82,6 +93,7 @@ def generate_aoti_kernel_config_header(kernel_names: list[str]) -> str:
     """
 
     def braced(values: list[int]) -> str:
+        # [FUNCTION DOC] HELPER: Format a list of ints as a C brace initializer string.
         return "{" + ", ".join(str(v) for v in values) + "}"
 
     buf = IndentedBuffer()
@@ -190,6 +202,7 @@ TRITON_SIGNATURE_TO_CPP = {
 
 
 def signature_is_tma_desc(sig: str | None) -> bool:
+    # [FUNCTION DOC] Return True if the Triton signature string denotes a TMA descriptor (nvTmaDesc or tensordesc type).
     """Check if a Triton signature represents a TMA descriptor."""
     if not sig:
         return False
@@ -201,6 +214,9 @@ def signature_is_tma_desc(sig: str | None) -> bool:
 
 
 def _unpack_tma_descriptor_args(var_name: str, sig_type: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Given a variable holding a stable TMA descriptor and its tensordesc signature, return the list
+    # of address-of expressions for its kernel args: the descriptor handle, then block shape and strides entries
+    # per dimension (rank parsed from the signature). Raises AssertionError if the signature cannot be parsed.
     """Unpack a StableTMADescriptor into kernel launch args.
 
     Given a variable name holding a StableTMADescriptor and its tensordesc<...>
@@ -220,19 +236,28 @@ def _unpack_tma_descriptor_args(var_name: str, sig_type: str) -> list[str]:
 
 
 class _LazyTritonCompileKickoffLine(DeferredLineBase):
+    # [CLASS DOC] HELPER: Deferred line that renders its text only if the list of lazy kernel names is non-empty at
+    # render time; used to emit the compile kickoff call only when lazy kernels exist.
     def __init__(self, lazy_kernel_names: list[str], line: str):
+        # [FUNCTION DOC] HELPER: Store the line text and the (shared, later mutated) list of lazy kernel names.
         super().__init__(line)
         self.lazy_kernel_names = lazy_kernel_names
 
     def __call__(self) -> str | None:
+        # [FUNCTION DOC] HELPER: Return the line if any lazy kernel exists, otherwise None (line dropped).
         return self.line if self.lazy_kernel_names else None
 
     def _new_line(self, line: str) -> _LazyTritonCompileKickoffLine:
+        # [FUNCTION DOC] HELPER: Return a copy with new text sharing the same kernel name list.
         return _LazyTritonCompileKickoffLine(self.lazy_kernel_names, line)
 
 
 @dataclasses.dataclass
 class DeferredTritonCallWrapper:
+    # [CLASS DOC] Dataclass describing the deferred C++ wrapper around one Triton kernel (wrapper function name, kernel
+    # name, kernel source bodies, argument types, optional triton/inductor meta and TMA tensor arg names).
+    # Its generate method writes the wrapper function (kernel load, grid, launch) into the wrapper prefix after
+    # autotuning has finished, either from cached params or in lazy-compile (dual JIT/AOTI) form.
     """
     When using cpp wrapper, GPU kernel load and launch needs to wait for Triton kernels
     to be tuned and stored as cubin files, so use a deferred generating the final wrapper around
@@ -249,6 +274,8 @@ class DeferredTritonCallWrapper:
 
     @cache_on_self
     def _get_tma_args(self) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Return a mapping of TMA descriptor argument name to tensordesc signature type (cached).
+        # Raises RuntimeError if the experimental nvTmaDesc API is used, since lazy compile does not support it.
         """Get mapping of TMA descriptor arg names to their signature types."""
         triton_meta = self.triton_meta or {}
         signature = triton_meta.get("signature", {})
@@ -267,6 +294,9 @@ class DeferredTritonCallWrapper:
     def _get_cpp_param_type(
         self, name: str, arg_type: Any, signature: dict[str, str] | None = None
     ) -> str:
+        # [FUNCTION DOC] HELPER: Return the C++ parameter declaration for an argument: const template-typed reference for tensors
+        # and unwrapped scalars (non-const for TMA descriptors), 64-bit int for integers/symbolic, float, or bool.
+        # Raises ValueError for other types.
         """Get the C++ parameter declaration for a given arg type."""
         if isinstance(arg_type, (torch_dtype, UnwrapUnspecArg)):
             # TMA descriptors need non-const references since their fields
@@ -291,6 +321,8 @@ class DeferredTritonCallWrapper:
         arg_types: list[Any] | None = None,
         signature: dict[str, str] | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Write the template header and signature of the wrapper function, with JIT and AOTI variants
+        # (AOTI adds the kernels object; both add device index, stream and optional cubin directory parameters).
         """Write the wrapper function signature including template and parameters."""
         if arg_types is None:
             arg_types = self.arg_types
@@ -321,6 +353,7 @@ class DeferredTritonCallWrapper:
         )
 
         def emit(writer, params):
+            # [FUNCTION DOC] HELPER: Write each parameter followed by a comma except the last.
             for p in params[:-1]:
                 writer(f"{p},")
             writer(params[-1])
@@ -332,6 +365,11 @@ class DeferredTritonCallWrapper:
         prefix.writeline("){")
 
     def generate(self, wrapper: CppWrapperGpu):
+        # [FUNCTION DOC] Write the wrapper function for the kernel into the wrapper prefix: resolve multi-kernel choice, defer to
+        # generate_lazy when autotune_at_compile_time is false, otherwise read cached params, emit a static kernel
+        # variable (JIT only), signature, grid, kernel load and launch. In AOT mode the original Triton source is
+        # included as a comment, and the cubin path is recorded as an additional file unless the binary is embedded.
+        # Raises AssertionError if the param cache is missing or extra launcher args are inconsistent.
         """
         Generate the GPU kernel definition, as well as load and launch code.
         """
@@ -398,6 +436,9 @@ class DeferredTritonCallWrapper:
             )
 
     def _resolve_lazy_arg_names(self) -> tuple[list[str], list[str]]:
+        # [FUNCTION DOC] HELPER: From the triton signature compute wrapper argument names (excluding internal block/split config
+        # params and declared constexprs, plus grid args and TMA tensor args appended) and kernel argument names
+        # (non-constexpr only). Raises AssertionError on missing triton_meta or count/order mismatches.
         """Compute wrapper and kernel arg names from triton_meta signature.
 
         Returns (wrapper_arg_names, kernel_arg_names) where:
@@ -460,6 +501,8 @@ class DeferredTritonCallWrapper:
         return wrapper_arg_names, kernel_arg_names
 
     def _generate_lazy_grid(self, prefix: IndentedBuffer) -> None:
+        # [FUNCTION DOC] HELPER: Emit grid size computation for lazy kernels: a switch over the runtime config index for
+        # precomputed grids, otherwise from GridExpr; returns early from the wrapper when grid_0 is zero.
         """Generate grid computation code for lazy-compiled kernels."""
         kernel_name = self.kernel_name
         grid_type = self.inductor_meta.get("grid_type") if self.inductor_meta else None
@@ -522,6 +565,8 @@ class DeferredTritonCallWrapper:
         tma_arg_names: OrderedSet[str],
         signature: dict[str, str],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Append the unpacked descriptor pointer args of each TMA kernel arg to the kernel call arg
+        # string and return the new string.
         """Unpack TMA descriptor args into kernel launch args."""
         for arg_name in kernel_arg_names:
             if arg_name in tma_arg_names:
@@ -538,6 +583,8 @@ class DeferredTritonCallWrapper:
         wrapper: CppWrapperGpu,
         call_args_str: str,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Emit scratch tensor allocations (global and profile scratch) sized by the runtime result scratch
+        # size times the full launch grid, and append their addresses to the call arg string, which is returned.
         """Generate scratch space allocations with runtime-known sizes."""
         kernel_name = self.kernel_name
         dtype_str = wrapper.codegen_dtype(torch.uint8)
@@ -572,6 +619,8 @@ class DeferredTritonCallWrapper:
         wrapper_arg_names: list[str],
         kernel_arg_names: list[str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Emit the lazy kernel launch: declare non-TMA args, add unpacked TMA args and scratch args, build
+        # the kernel args array, then launch (JIT launchKernel; AOTI plain or profiled launch).
         """Generate kernel launch code for lazy-compiled kernels."""
         kernel_name = self.kernel_name
         signature = (self.triton_meta or {}).get("signature", {})
@@ -660,6 +709,10 @@ class DeferredTritonCallWrapper:
             )
 
     def generate_lazy(self, wrapper: CppWrapperGpu):
+        # [FUNCTION DOC] Emit the dual JIT/AOTI wrapper for a lazily compiled kernel: records the kernel name, emits the static
+        # kernel handle, embedded Triton source and result struct (runtime filled for JIT, compile-time macros for
+        # AOTI), the signature, a first-call init (JIT compiles and autotunes then returns after the first run; AOTI
+        # loads the cubin), then shared grid and launch code. Scalar tensor args are extracted for autotuning.
         """
         Generate dual-wrapper-mode C++ code for lazy Triton kernel compilation.
 
@@ -819,6 +872,7 @@ class DeferredTritonCallWrapper:
         inductor_meta: dict[str, Any],
         params: dict[str, Any],
     ):
+        # [FUNCTION DOC] Emit grid_0/1/2 computation from GridExpr in cpp mode, plus an early return if any grid dimension is zero.
         from ..runtime.triton_heuristics import GridExpr
 
         grid = GridExpr.from_meta(
@@ -836,6 +890,9 @@ class DeferredTritonCallWrapper:
         prefix.writeline("if (grid_0 == 0 || grid_1 == 0 || grid_2 == 0) return;")
 
     def generate_load_kernel(self, prefix, kernel_var_name, params):
+        # [FUNCTION DOC] Emit a guarded load of the kernel on first use, passing either embedded binary symbols (AOT embed mode,
+        # plus XPU end symbol and format flag) or the cubin path, mangled name, shared memory size and cubin dir;
+        # in AOT mode on non-XPU devices also passes the loaded modules vector so modules can be unloaded.
         prefix.writeline(f"if ({kernel_var_name} == nullptr) {{")
         with prefix.indent():
             embed_kernel_args = [f"__{params['inductor_meta']['kernel_name']}_start"]
@@ -878,6 +935,9 @@ class DeferredTritonCallWrapper:
         prefix.writeline("}")
 
     def generate_launch_kernel(self, prefix, wrapper, kernel_var_name, params):
+        # [FUNCTION DOC] Emit the launch: compute launch args (skipping constants) with arg_types/signatures, scale scratch sizes by
+        # num_ctas, declare args, build the kernel args array and call launchKernel, or the profiled variant when kernel
+        # profiling is enabled on linux/win32. Raises AssertionError if arg_types and def_args lengths differ.
         """
         Generate the GPU kernel launching code.
         This is where all the call args are sorted out and generated.
@@ -949,6 +1009,8 @@ class DeferredTritonCallWrapper:
         num_warps: str,
         shared_mem: str,
     ) -> None:
+        # [FUNCTION DOC] Emit a block that records launch args and input names/shapes as IValues for an AOTI record function
+        # scope (non-tensor args as dummy scalars, TMA descriptors skipped), starts the record, then launches the kernel.
         """Wrap a kernel launch in an AOTI record_function profiling scope."""
         normalized_kernel_name = re.sub(r"[^a-zA-Z0-9_]", "_", kernel_var_name)
         prefix.writeline("{")
@@ -985,6 +1047,7 @@ class DeferredTritonCallWrapper:
             ordered_argsname = []
 
             def write_dummy_scalar_ivalue(arg_name):
+                # [FUNCTION DOC] HELPER: Emit a dummy int64 IValue for the current argument and remember its handle.
                 # We only care about the shape, therefore we create a dummy scalar here.
                 prefix.writelines(
                     [
@@ -998,6 +1061,8 @@ class DeferredTritonCallWrapper:
                 total_args.append(f"tmp_{arg_name}")
 
             def process_args_for_input_shape(arg, arg_type, arg_signature=None):
+                # [FUNCTION DOC] HELPER: Advance the arg counter and emit the IValue for one kernel argument by kind (tensor, scalar,
+                # unwrapped scalar, or skipped TMA descriptor).
                 nonlocal curr_arg_id
                 curr_arg_id += 1
                 arg_name = f"{normalized_kernel_name}_arg_{curr_arg_id}"
@@ -1084,11 +1149,16 @@ class DeferredTritonCallWrapper:
 
 
 class CppWrapperGpu(CppWrapperCpu):
+    # [CLASS DOC] Wrapper codegen subclass of CppWrapperCpu for GPU devices. Emits C++ kernel launch code via deferred
+    # Triton call wrappers, handles TMA descriptors, input alignment copies, debug sync, and multi-stream AOTI
+    # event/stream code. State: device and device_codegen overrides, grid_id counter, kernel body map, triton
+    # call wrapper map, lazy kernel names, declared aux stream slots, and stream guard / helper emission flags.
     """
     Generates cpp wrapper for running on GPU and calls CUDA kernels
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Set the GPU device type and its device op overrides, then initialize the base wrapper and GPU state.
         self.device = get_gpu_type()
         self.device_codegen = get_device_op_overrides(self.device)
         super().__init__()
@@ -1102,6 +1172,8 @@ class CppWrapperGpu(CppWrapperCpu):
         self._aoti_stream_helpers_emitted = False
 
     def generate_debug_sync(self, buffer):
+        # [FUNCTION DOC] Emit a device synchronization into the buffer for cuda (driver cuCtxSynchronize, or runtime device sync on
+        # ROCm). Raises NotImplementedError for other devices.
         if self.device == "cuda":
             # The fbcode JIT cpp_wrapper CUDA build links only the CUDA driver
             # (libcuda), not libcudart, so the runtime cudaDeviceSynchronize symbol
@@ -1130,11 +1202,14 @@ class CppWrapperGpu(CppWrapperCpu):
         parent_wrapper: PythonWrapperCodegen | None,
         partition_signatures: GraphPartitionSignature | None = None,
     ):
+        # [FUNCTION DOC] Factory ignoring its arguments; returns a new CppWrapperGpu.
         # TODO - support subgraph codegen by lifting functions. Check the
         # comment at CppWrapperCpu `codegen_subgraph` function.
         return CppWrapperGpu()
 
     def write_header(self):
+        # [FUNCTION DOC] Write the file header; const graphs skip it unless in dual wrapper mode, in which case only JIT device
+        # includes and the kernel driver code are emitted for them. Otherwise adds the (hipified) kernel driver code.
         if V.graph.is_const_graph and not V.graph.is_dual_wrapper_mode:
             # We do not write header for constant graph, it will be written by main module.
             return
@@ -1157,6 +1232,8 @@ class CppWrapperGpu(CppWrapperCpu):
             self.header.splice(kernel_driver)
 
     def _generate(self, is_inference):
+        # [FUNCTION DOC] HELPER: Reset per-run auxiliary stream state, then run the base class generation. Stream helper emission
+        # flag is deliberately not reset to avoid redefinitions.
         # Per-Run()-function state, reset each generation. Do NOT reset
         # _aoti_stream_helpers_emitted here: the helper structs are spliced into
         # the file-level header once per instance, and _generate can run more
@@ -1168,9 +1245,12 @@ class CppWrapperGpu(CppWrapperCpu):
 
     @cache_on_self
     def write_tma_descriptor_helpers_once(self):
+        # [FUNCTION DOC] Splice the device TMA descriptor helper code into the header, once per instance (cached).
         self.header.splice(self.device_codegen.tma_descriptor_helpers())
 
     def write_get_raw_stream(self, device_idx: int, graph_name: str) -> str:
+        # [FUNCTION DOC] Return the name of the stream expression: stream parameter in pure AOT mode, a predeclared name in dual
+        # mode, or a newly declared variable filled by the get-stream shim (emits lines) otherwise.
         # Pure AOTI receives the stream as a function parameter. JIT and
         # dual-wrapper-mode code use an explicit stream variable so the shared kernel
         # call arguments are valid for the JIT entry point.
@@ -1195,6 +1275,8 @@ class CppWrapperGpu(CppWrapperCpu):
         return name
 
     def _ensure_aoti_stream_helpers_emitted(self) -> None:
+        # [FUNCTION DOC] HELPER: Once per instance, splice the CUDA-only stream/event helper header and thread-local caches into
+        # the header; skipped for XPU. Reads streams.h from disk.
         if self._aoti_stream_helpers_emitted:
             return
         # The stream/event helpers in streams.h are CUDA-specific (cudaEvent_t,
@@ -1227,6 +1309,9 @@ class CppWrapperGpu(CppWrapperCpu):
         num_streams: int,
         stream_idx_to_user_obj_idx: dict[int, int],
     ) -> None:
+        # [FUNCTION DOC] Emit setup for multi-stream AOTI: ensure helpers, aux stream cache sizing, a stream guard variable, and
+        # declarations for auxiliary streams not yet declared. Does nothing for one stream; raises NotImplementedError
+        # when not in AOT mode.
         if num_streams <= 1:
             return
         if not V.graph.aot_mode:
@@ -1259,6 +1344,8 @@ class CppWrapperGpu(CppWrapperCpu):
     def codegen_enter_cuda_stream_context(
         self, code: IndentedBuffer, stream_idx: int
     ) -> None:
+        # [FUNCTION DOC] Emit code entering the stream context for a non-default stream index by creating a stream guard;
+        # no-op for index zero.
         if stream_idx == 0:
             return
         code.writeline(
@@ -1268,14 +1355,19 @@ class CppWrapperGpu(CppWrapperCpu):
         )
 
     def codegen_exit_cuda_stream_context(self, code: IndentedBuffer) -> None:
+        # [FUNCTION DOC] Emit code resetting the stream guard to leave the stream context.
         code.writeline("_aoti_current_stream_guard.reset();")
 
     def _stream_expr_for_idx(self, stream_idx: int) -> str:
+        # [FUNCTION DOC] HELPER: Return the stream expression for an index: the main stream for zero, else the cached aux stream.
         if stream_idx == 0:
             return "stream"
         return f"_aoti_aux_stream_cache.get({stream_idx}, this->device_idx_, stream)"
 
     def _emit_stream_op_inline(self, kernel_name: str | None, args: list[str]) -> bool:
+        # [FUNCTION DOC] HELPER: In AOT mode on non-XPU devices, emit inline event record/wait/synchronize calls for supported
+        # stream ops and return True; return False if not applicable. Raises NotImplementedError for ops known to be
+        # unsupported.
         if kernel_name is None or not V.graph.aot_mode:
             return False
         if self.device == "xpu":
@@ -1290,6 +1382,7 @@ class CppWrapperGpu(CppWrapperCpu):
             return False
 
         def _parse_idx(arg: str) -> int:
+            # [FUNCTION DOC] HELPER: Parse a C integer literal string with optional L suffix into an int.
             return int(arg.rstrip("Ll"))
 
         self._ensure_aoti_stream_helpers_emitted()
@@ -1325,6 +1418,8 @@ class CppWrapperGpu(CppWrapperCpu):
         return False
 
     def _generate_extern_kernel_alloc_helper(self, extern_kernel, args):
+        # [FUNCTION DOC] Emit extern kernel allocation unless it is an inline-able stream op (then drop the extern node record);
+        # otherwise delegate to the base class.
         kernel_name = getattr(extern_kernel, "python_kernel_name", None)
         if self._emit_stream_op_inline(kernel_name, args):
             if V.extern_kernel_nodes:
@@ -1341,6 +1436,8 @@ class CppWrapperGpu(CppWrapperCpu):
         raw_args,
         outputs,
     ):
+        # [FUNCTION DOC] Emit a runtime-lookup fallback kernel unless it is an inline stream op (then drop the extern node record);
+        # otherwise delegate to the base class.
         if self._emit_stream_op_inline(python_kernel_name, list(get_args())):
             if V.extern_kernel_nodes:
                 V.extern_kernel_nodes.pop()
@@ -1355,9 +1452,12 @@ class CppWrapperGpu(CppWrapperCpu):
         )
 
     def get_autotuning_input_name(self, idx):
+        # [FUNCTION DOC] Return the generated name of the idx-th autotune input.
         return f"{self.autotune_input_prefix}_{idx}"
 
     def codegen_inputs(self):
+        # [FUNCTION DOC] Emit input handling; in AOT mode (outside fbcode) first emit AOT-only code copying inputs that are
+        # misaligned at runtime into aligned clones with a warning. Raises AssertionError for non-tensor checked inputs.
         # See Note: [Input Alignment handling in Inductor]
         #
         # JIT Inductor does not guard on input alignment. It relies on copy_misaligned_inputs to
@@ -1403,6 +1503,8 @@ class CppWrapperGpu(CppWrapperCpu):
         gpu: bool = True,
         cpp_definition: str | None = None,
     ):
+        # [FUNCTION DOC] HELPER: For GPU kernels store the kernel body, and (when autotuning at compile time) also create the python
+        # autotune block; for cpu kernels delegate to the CPU wrapper and return its result.
         if gpu:
             self._kernel_name_to_body[kernel_name] = kernel_body
             if config.triton.autotune_at_compile_time:
@@ -1416,10 +1518,13 @@ class CppWrapperGpu(CppWrapperCpu):
             )
 
     def generate(self, is_inference):
+        # [FUNCTION DOC] Run base class generation under a timing context and return its result.
         with dynamo_timed("CppWrapperGpu.generate", log_pt2_compile_event=True):
             return super().generate(is_inference)
 
     def _codegen_entry_impl_prologue(self):
+        # [FUNCTION DOC] HELPER: After the base prologue, emit (JIT only) the lazy Triton compile kickoff call, and in dual wrapper
+        # mode declare the JIT streams per device index.
         super()._codegen_entry_impl_prologue()
         # ensure_triton_kernel_compiles_started() is JIT-only; AOTI has no
         # Python-dependent lazy compile flow.
@@ -1446,6 +1551,9 @@ class CppWrapperGpu(CppWrapperCpu):
                 )
 
     def finalize_prefix(self):
+        # [FUNCTION DOC] Generate the Triton call wrappers into a separate buffer (after autotuning is finished), emit the parallel
+        # lazy compile init functions (JIT only) when there are lazy kernels, run the base finalize, and assemble the
+        # prefix as base prefix content, Triton wrappers, then old prefix. Mutates self.prefix.
         """Define the triton kernels now that autotuning is finished"""
         old_prefix = self.prefix  # new content should go at start of prefix
 
@@ -1499,6 +1607,8 @@ static inline void ensure_triton_kernel_compiles_started() {{
         self.prefix.splice(old_prefix)
 
     def generate_tma_descriptor(self, desc):
+        # [FUNCTION DOC] Emit code for a TMA descriptor node, using the experimental or stable implementation by type.
+        # Raises AssertionError for unknown types.
         self.write_tma_descriptor_helpers_once()
 
         if isinstance(desc, TMADescriptorExperimental):
@@ -1509,6 +1619,8 @@ static inline void ensure_triton_kernel_compiles_started() {{
             self._generate_stable_tma_descriptor(desc)
 
     def _generate_experimental_tma_descriptor(self, desc):
+        # [FUNCTION DOC] HELPER: Emit a CUtensorMap declaration and a call to the rank-specific init helper with data pointer,
+        # dims, block dims and element size.
         # generate data pointer for the source tensor
         source = self.generate_args_decl(
             code=self,
@@ -1535,6 +1647,8 @@ static inline void ensure_triton_kernel_compiles_started() {{
         self.writeline(f"{fn}({args});")
 
     def _generate_stable_tma_descriptor(self, desc):
+        # [FUNCTION DOC] HELPER: Emit a StableTMADescriptor declaration, fill its block shape, global shape and strides, and call
+        # initTMADescriptor on it (see AOTI TMA stable handling note).
         source = self.generate_args_decl(
             code=self,
             call_args=[self.val_to_arg_str(desc.tensor)],
@@ -1550,6 +1664,7 @@ static inline void ensure_triton_kernel_compiles_started() {{
         self.writeline(f"alignas(64) StableTMADescriptor {desc_name};")
 
         def fill_array(name, values):
+            # [FUNCTION DOC] HELPER: Emit assignments of each value into the named C array.
             for i, val in enumerate(values):
                 self.writeline(f"{name}[{i}] = {val};")
 
@@ -1585,6 +1700,9 @@ static inline void ensure_triton_kernel_compiles_started() {{
         is_triton_kernel=True,
         scratch_spaces: dict[str, int] | None = None,
     ):
+        # [FUNCTION DOC] Emit declarations for kernel call arguments (tensor data pointers, extracted scalars, typed symbolic and
+        # numeric values, unpacked stable TMA descriptors, and optional scratch pointers for Triton kernels) and
+        # return the comma separated list of address-of arg names. Writes lines to code as a side effect.
         """
         Generates any declarations of args to pass into a kernel call, and then returns the arg names.
 
@@ -1602,6 +1720,7 @@ static inline void ensure_triton_kernel_compiles_started() {{
         new_args: list[str] = []
 
         def process_tma_stable_arg(arg, arg_type, arg_signature, var_name):
+            # [FUNCTION DOC] HELPER: Declare the TMA descriptor variable and return its unpacked kernel arg expressions.
             # [Note: AOTI TMA Stable handling]
             # For most args, a single arg passed to the python triton interface
             # maps to a single arg in the cubin interface. However, for host-side
@@ -1615,6 +1734,7 @@ static inline void ensure_triton_kernel_compiles_started() {{
             return _unpack_tma_descriptor_args(var_name, arg_signature)
 
         def process_args(arg, arg_type, arg_signature=None):
+            # [FUNCTION DOC] HELPER: Emit the declaration for one argument by type/signature and append its kernel args.
             var_name = f"var_{next(self.arg_var_id)}"
             # ignore tma descriptors, as host-side TMA descriptors need
             # to be passed to the compiled Triton kernel by value
@@ -1712,6 +1832,10 @@ static inline void ensure_triton_kernel_compiles_started() {{
         original_fxnode_name=None,
         current_stream_idx=None,
     ):
+        # [FUNCTION DOC] Emit a kernel call. CPU kernels defer to the CPU wrapper. For Triton: optionally create the python autotune
+        # block, choose the stream, register a DeferredTritonCallWrapper once per kernel, handle TMA tensors in lazy
+        # mode, then write JIT and AOT call lines under the debug printer. For non-Triton kernels, cast args and call
+        # the kernel directly. Raises AssertionError for unsupported TMA descriptor types.
         """
         Override the default value of argument 'gpu' to True here.
         generate_kernel_call can still be called with gpu=False because of
@@ -1853,6 +1977,8 @@ static inline void ensure_triton_kernel_compiles_started() {{
     def prepare_triton_wrapper_args(
         self, call_args: list[Any], arg_types: list[Any]
     ) -> tuple[list[Any], list[Any]]:
+        # [FUNCTION DOC] Normalize Triton call args into strings and matching types: unwrap unspecialized 0d tensors, lower bools,
+        # format floats and symbolic values. Raises AssertionError if lengths differ.
         if len(call_args) != len(arg_types):
             raise AssertionError((call_args, arg_types))
         new_args = []
@@ -1876,11 +2002,13 @@ static inline void ensure_triton_kernel_compiles_started() {{
         return new_args, new_args_types
 
     def make_zero_buffer(self, name):
+        # [FUNCTION DOC] Return C++ code zeroing the named tensor via the aoti zero shim.
         return f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_zero_({name}.get()));"
 
 
 @dataclasses.dataclass
 class UnwrapUnspecArg:
+    # [CLASS DOC] Marker dataclass wrapping a dtype: a 0-d CPU tensor argument that must be converted to a scalar (item) before use as a kernel arg.
     """Marker that we need to call .item() on the tensor"""
 
     dtype: torch_dtype

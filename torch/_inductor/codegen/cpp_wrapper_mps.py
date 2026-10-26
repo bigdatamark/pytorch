@@ -1,3 +1,6 @@
+# [MODULE DOC] Cpp wrapper code generator for Apple MPS (Metal) in AOTInductor / cpp_wrapper mode.
+# Main content: CppWrapperMps, which emits lambda-based Metal kernel dispatches and per-library lazy
+# singleton shader library handles. No import-time side effects.
 from typing import Any
 
 import sympy
@@ -14,11 +17,15 @@ from .wrapper import KernelCallLine, PythonWrapperCodegen
 
 
 class CppWrapperMps(CppWrapperGpu):
+    # [CLASS DOC] CppWrapperGpu subclass for MPS. Emits C++ that encodes tensor/int args and dispatches Metal kernels,
+    # and a lazily created shader library handle getter per kernel library.
+    # State: _used_kernel_names (libraries already given a handle getter), _lambda_counter (unique suffixes).
     """
     Generates cpp wrapper for running on MPS and calls metal kernels
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initialize the GPU wrapper base and empty tracking state for kernel names and lambda counter.
         super().__init__()
         self._used_kernel_names: OrderedSet[str] = OrderedSet()
         self._lambda_counter: int = 0
@@ -30,6 +37,7 @@ class CppWrapperMps(CppWrapperGpu):
         parent_wrapper: PythonWrapperCodegen | None,
         partition_signatures: GraphPartitionSignature | None = None,
     ) -> "CppWrapperMps":
+        # [FUNCTION DOC] Factory ignoring its arguments; returns a new CppWrapperMps.
         return CppWrapperMps()
 
     def _generate_kernel_call_helper(
@@ -48,6 +56,12 @@ class CppWrapperMps(CppWrapperGpu):
         original_fxnode_name: str | None = None,
         current_stream_idx: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Emit the Metal dispatch for one kernel call. CPU kernels defer to the CPU wrapper. For mps, builds
+        # statements setting tensor or int args (all but the last two call args), then dispatches using the last two
+        # args (threads and group size): single value, or array form with local arrays when braced lists are given.
+        # Finally writes the call via write_mps_kernel_call under the debug printer.
+        # Raises AssertionError for non-mps device or missing arg_types, NotImplementedError for unsupported arg types
+        # or missing threads.
         """
         Generates MPS kernel call code. It should look something like:
         ```
@@ -137,6 +151,8 @@ class CppWrapperMps(CppWrapperGpu):
 
             # Extract array size from the initializer list string
             def get_array_size(array_str: str) -> int:
+                # [FUNCTION DOC] HELPER: Return the element count of a braced initializer list string by counting top-level commas
+                # (nesting-aware); empty content gives zero.
                 # Remove braces and whitespace
                 content = array_str.strip()
                 if content.startswith("{") and content.endswith("}"):
@@ -192,6 +208,9 @@ class CppWrapperMps(CppWrapperGpu):
             self.write_mps_kernel_call(kernel_name, new_args)
 
     def write_mps_kernel_call(self, name: str, call_args: list[str]) -> None:
+        # [FUNCTION DOC] Emit a lambda capturing by reference that starts encoding, runs the given statements, then runs it with
+        # aoti_torch_mps_run_command_block on the kernel library handle. Names get a unique counter suffix to avoid
+        # duplicate declarations; increments _lambda_counter.
         # Generate unique variable names to avoid duplicate declarations
         # when the same MPS lib is used multiple times
         unique_suffix = self._lambda_counter
@@ -223,12 +242,16 @@ class CppWrapperMps(CppWrapperGpu):
 
     @staticmethod
     def get_device_include_path_aot(device: str) -> str:
+        # [FUNCTION DOC] Return the include directives for the MPS AOTI headers; the device argument is ignored.
         return (
             "#include <torch/csrc/inductor/aoti_include/mps.h>\n"
             "#include <torch/csrc/inductor/aoti_torch/c/shim_mps.h>"
         )
 
     def codegen_additional_funcs(self) -> None:
+        # [FUNCTION DOC] Emit into the prefix, for each MPS kernel library used by kernel call lines (once per name), a getter that
+        # lazily creates the shader library and kernel function in a thread-safe function-local static, with RAII
+        # cleanup of the library. Expects the shader source constant to be generated elsewhere. Mutates _used_kernel_names.
         """
         Generate thread-safe lazy singleton pattern for MPS shader libraries with RAII cleanup.
 
