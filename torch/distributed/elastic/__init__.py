@@ -1,4 +1,8 @@
 #!/usr/bin/env/python3
+# [PACKAGE DOC] Top-level package of torchelastic. Contains no code; the module docstring
+# documents the failover contract between the elastic agent and user workers (restart
+# accounting, re-rendezvous on scale up, scale down handling, finalization barrier).
+# Submodules (agent, events, metrics, multiprocessing, rendezvous, ...) hold the implementation.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

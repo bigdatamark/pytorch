@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] LocalElasticAgent: the SimpleElasticAgent implementation managing host-local
+# worker processes via the multiprocessing package. Also defines the environment variable names
+# for the file timer watchdog, health check port and uninterruptible-state timeout, plus helpers
+# for resolving that timeout and a mutable alive-callback proxy. Import only creates a logger.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -75,6 +79,9 @@ TORCHELASTIC_UNINTERRUPTIBLE_STATE_TIMEOUT = (
 
 
 def _resolve_uninterruptible_state_timeout(explicit: float | None) -> float:
+    # [FUNCTION DOC] HELPER: Returns the D-state timeout in seconds: the explicit value if given,
+    # else the value of the TORCHELASTIC_UNINTERRUPTIBLE_STATE_TIMEOUT environment variable,
+    # else 0. Negative or unparsable values yield 0 (check disabled). Never raises for bad env text.
     """Resolve the uninterruptible-state timeout once.
 
     Precedence: explicit constructor arg > ``TORCHELASTIC_UNINTERRUPTIBLE_STATE_TIMEOUT``
@@ -93,6 +100,8 @@ def _resolve_uninterruptible_state_timeout(explicit: float | None) -> float:
 
 
 class _AliveCallbackProxy:
+    # [CLASS DOC] HELPER: Callable wrapper used as the health check server's alive callback; returns
+    # the current time until a delegate callable is installed with set_delegate, then forwards to it.
     """Mutable callback wrapper for the health check server.
 
     The C++ pybind ``HealthCheckThriftServer`` binds its ``alive_callback``
@@ -104,18 +113,27 @@ class _AliveCallbackProxy:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with no delegate.
         self._delegate: Callable[[], int] | None = None
 
     def __call__(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the delegate's result if set, else the current time in whole seconds.
         if self._delegate is not None:
             return self._delegate()
         return int(time.time())
 
     def set_delegate(self, delegate: Callable[[], int]) -> None:
+        # [FUNCTION DOC] HELPER: Installs the callable that later calls are forwarded to.
         self._delegate = delegate
 
 
 class LocalElasticAgent(SimpleElasticAgent):
+    # [CLASS DOC] Per-host agent that spawns and monitors local worker processes via
+    # start_processes. State: start method, process context, rendezvous handler, log line prefix
+    # template, optional file timer watchdog server, logs specs, optional health check server, the
+    # resolved D-state timeout and a pid-to-first-seen map for D-state tracking. Sets per-worker
+    # environment variables (ranks, sizes, master address/port, restart info), reports
+    # HEALTHY/FAILED/SUCCEEDED/UNHEALTHY/UNKNOWN from monitoring, and does not talk to other agents.
     """An implementation of :py:class:`torchelastic.agent.server.ElasticAgent` that handles host-local workers.
 
     This agent is deployed per host and is configured to spawn ``n`` workers.
@@ -220,6 +238,10 @@ class LocalElasticAgent(SimpleElasticAgent):
         health_check_server: HealthCheckServer | None = None,
         uninterruptible_state_timeout: float | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base agent and stores start method, logs specs, optional
+        # log line prefix template, optional pre-made health check server, and the rendezvous
+        # handler. Resolves the D-state timeout once (explicit argument, else environment
+        # variable). No process context or watchdog exists until workers are started.
         super().__init__(spec, exit_barrier_timeout, shutdown_timeout)
         self._start_method = start_method
         self._pcontext: PContext | None = None
@@ -240,6 +262,11 @@ class LocalElasticAgent(SimpleElasticAgent):
         self._uninterruptible_state_first_seen: dict[int, float] = {}
 
     def _setup_local_watchdog(self, envs: dict[int, dict[str, str]]) -> None:
+        # [FUNCTION DOC] HELPER: If TORCHELASTIC_ENABLE_FILE_TIMER is "1", starts a daemon
+        # FileTimerServer on the file named by TORCHELASTIC_TIMER_FILE (or a generated unique temp
+        # file), using the run id of rank 0's env (empty if no envs), and keeps it in the agent.
+        # In every case where a file path is known, writes it into each worker's env mapping
+        # (mutates envs) so workers can connect.
         enable_watchdog_env_name = TORCHELASTIC_ENABLE_FILE_TIMER
         watchdog_enabled = os.getenv(enable_watchdog_env_name)
         watchdog_file_env_name = TORCHELASTIC_TIMER_FILE
@@ -278,9 +305,12 @@ class LocalElasticAgent(SimpleElasticAgent):
 
     @staticmethod
     def _get_current_time_secs() -> int:
+        # [FUNCTION DOC] HELPER: Returns the current time in whole seconds (dummy alive callback).
         return int(time.time())
 
     def _get_alive_time(self) -> int:
+        # [FUNCTION DOC] HELPER: Alive callback for the health check server. Returns the current
+        # time while in the exit barrier or when no watchdog exists; otherwise the watchdog's last progress time.
         """Return the last progress time from the watchdog, or the current time.
 
         This callback is passed to the health check server at startup and
@@ -302,6 +332,12 @@ class LocalElasticAgent(SimpleElasticAgent):
         return int(time.time())
 
     def _setup_healthcheck(self) -> None:
+        # [FUNCTION DOC] HELPER: If the TORCHELASTIC_HEALTH_CHECK_PORT environment variable is set,
+        # creates and starts a health check server on that port (timeout 60). When the
+        # before-rendezvous knob is enabled, returns early if a server already exists and uses
+        # the agent's alive time callback; otherwise uses the watchdog's progress callback or the
+        # current time if no watchdog exists. A non-integer port is logged and no server starts.
+        # Does nothing (logs) when the variable is absent.
         healthcheck_port_env_name = TORCHELASTIC_HEALTH_CHECK_PORT
         healthcheck_port = os.getenv(healthcheck_port_env_name)
         if healthcheck_port is not None:
@@ -353,6 +389,7 @@ class LocalElasticAgent(SimpleElasticAgent):
             )
 
     def _get_fq_hostname(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns this host's fully qualified domain name.
         return socket.getfqdn(socket.gethostname())
 
     def _log_watchdog_event(
@@ -360,6 +397,10 @@ class LocalElasticAgent(SimpleElasticAgent):
         name: str,
         request: timer.FileTimerRequest | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Callback for the file timer server: records an agent-sourced event
+        # named by the watchdog event, with RUNNING state and agent metadata (run id, group rank,
+        # role, host, restarts) plus, when a timer request is given, its worker pid, scope id,
+        # expiration time and signal in the JSON metadata string. Uses the spec's event log handler.
         wg = self._worker_group
         spec = wg.spec
         md = {"watchdog_event": name}
@@ -395,12 +436,21 @@ class LocalElasticAgent(SimpleElasticAgent):
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def _stop_workers(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Stops workers by running the full agent shutdown (watchdog,
+        # health check server and process context) with default signal and timeout.
         self._shutdown()
 
     # pyre-fixme[56]: Pyre was not able to infer the type of the decorator
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def _start_workers(self, worker_group: WorkerGroup) -> dict[int, Any]:
+        # [FUNCTION DOC] HELPER: Builds per-local-rank environment (RANK, GROUP_RANK, ROLE_*,
+        # WORLD_SIZE variants, MASTER_ADDR/PORT, restart count, max restarts, run id, agent store
+        # flag, NCCL async error handling default, local rank and CUDA device settings, OMP thread
+        # count if set) and arguments (with macro substitution of the local rank) and optional
+        # log line prefixes from the template (role, rank, local rank, short hostname). Then sets
+        # up watchdog and health check, launches the processes, stores the process context and
+        # returns the mapping of local rank to pid. Raises AssertionError if the store, entrypoint or logs specs are missing.
         spec = worker_group.spec
         store = worker_group.store
         if store is None:
@@ -487,6 +537,11 @@ class LocalElasticAgent(SimpleElasticAgent):
     def _set_local_rank_env(
         self, worker_env: dict[str, str | None], local_rank: int, spec: WorkerSpec
     ) -> None:
+        # [FUNCTION DOC] HELPER: Fills LOCAL_RANK and CUDA_VISIBLE_DEVICES in the worker env. In
+        # virtual local rank mode LOCAL_RANK is "0" and the device is the local-rank-th entry of
+        # the parent's CUDA_VISIBLE_DEVICES (or the local rank itself if unset); raises ValueError
+        # if the local rank exceeds that list. Otherwise LOCAL_RANK is the real local rank and the
+        # parent's CUDA_VISIBLE_DEVICES is copied if present.
         # Set CUDA_VISIBLE_DEVICES and LOCAL_RANK based on virtual_local_rank mode.
         # Virtual mode: Each worker sees only its assigned GPU as device 0, LOCAL_RANK=0
         # Traditional mode: Workers see all GPUs, LOCAL_RANK matches actual local rank
@@ -527,6 +582,8 @@ class LocalElasticAgent(SimpleElasticAgent):
     def _shutdown(
         self, death_sig: signal.Signals = signal.SIGTERM, timeout: int = 30
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stops and clears the watchdog and health check server if present,
+        # then closes the process context (if any) with the given signal and timeout seconds.
         if self._worker_watchdog is not None:
             self._worker_watchdog.stop()
             self._worker_watchdog = None
@@ -539,6 +596,10 @@ class LocalElasticAgent(SimpleElasticAgent):
     def _check_uninterruptible_state_timeout(
         self, worker_group: WorkerGroup, timeout: float
     ) -> RunResult | None:
+        # [FUNCTION DOC] HELPER: Returns None if there is no process context or no live worker has
+        # been in uninterruptible sleep for at least the timeout. Otherwise logs each offender,
+        # sets the remaining restarts to zero (so the run loop stops rather than restarts) and
+        # returns an UNHEALTHY RunResult. Also prunes tracking entries for exited pids.
         """Return UNHEALTHY when any worker has been in Linux uninterruptible
         sleep (D-state) for at least ``timeout`` seconds; otherwise update
         bookkeeping and return None.
@@ -580,6 +641,9 @@ class LocalElasticAgent(SimpleElasticAgent):
     def _update_uninterruptible_dwell(
         self, pid: int, role: str, timeout: float
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Reads the pid's process state. Returns None if unreadable or not
+        # in uninterruptible sleep (clearing its tracking entry). On first observation records the
+        # time, logs a warning and returns 0.0; later returns seconds since first seen.
         """Update bookkeeping for ``pid`` and return how long (seconds) it has
         been continuously in uninterruptible sleep, or ``None`` if it isn't
         (or its state can't be read).
@@ -607,6 +671,11 @@ class LocalElasticAgent(SimpleElasticAgent):
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def _monitor_workers(self, worker_group: WorkerGroup) -> RunResult:
+        # [FUNCTION DOC] HELPER: Polls the process context without blocking. Returns UNKNOWN if
+        # worker pids differ from the context's pids (raises AssertionError if no context).
+        # If processes finished: FAILED with failures re-keyed by global rank, or SUCCEEDED with
+        # return values re-keyed by global rank. If still running: UNHEALTHY when the D-state
+        # check trips (timeout enabled), otherwise HEALTHY.
         role = worker_group.spec.role
         worker_pids = {w.id for w in worker_group.workers}
         if self._pcontext is None:

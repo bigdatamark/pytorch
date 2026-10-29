@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [PACKAGE DOC] Launches and manages n worker subprocesses, either python functions (via
+# torch.multiprocessing) or binaries (via subprocess). Exports start_processes plus the api
+# types: PContext, MultiprocessContext, SubprocessContext, ProcessFailure, RunProcsResult,
+# SignalException, Std, LogsDest, LogsSpecs, DefaultLogsSpecs and to_map.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -112,6 +116,14 @@ def start_processes(
     duplicate_stdout_filters: list[str] | None = None,
     duplicate_stderr_filters: list[str] | None = None,
 ) -> PContext:
+    # [FUNCTION DOC] Starts one worker per local rank and returns the process context. The args
+    # and envs mappings must both have exactly the keys 0..n-1 (validated; an error is raised
+    # otherwise), n being the number of args entries. A string entrypoint creates a
+    # SubprocessContext (binary); anything else a MultiprocessContext (function, honoring
+    # start_method). Log configuration comes from logs_specs; optional line prefixes, NUMA
+    # options and duplicate stdout/stderr filters are passed through. If start fails, the
+    # context is closed and the exception re-raised.
+    # KNOWN ISSUE: the docstring mentions a log_dir argument and local_ranks_filter that are not parameters.
     """
     Start ``n`` copies of ``entrypoint`` processes with the provided options.
 

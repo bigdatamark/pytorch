@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# [PACKAGE DOC] Elastic agent server package. Re-exports the agent API types (ElasticAgent,
+# SimpleElasticAgent, Worker, WorkerGroup, WorkerSpec, WorkerState, RunResult) from api and the
+# file-timer environment variable names from local_elastic_agent. Importing has no other side effects.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

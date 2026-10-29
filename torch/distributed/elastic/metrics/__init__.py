@@ -159,9 +159,12 @@ from .api import (
 
 
 def initialize_metrics(cfg: MetricsConfig | None = None):
+    # [FUNCTION DOC] No-op hook for initializing metrics from a MetricsConfig; the config is ignored.
     pass
 
 
+# Import-time side effect: optionally star-imports a static_init module if present (for
+# deployment-specific setup); silently ignored when the module does not exist.
 try:
     from torch.distributed.elastic.metrics.static_init import *  # type: ignore[import] # noqa: F403
 except ModuleNotFoundError:

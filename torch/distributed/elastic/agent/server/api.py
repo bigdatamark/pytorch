@@ -1,4 +1,8 @@
 # mypy: ignore-errors
+# [MODULE DOC] Core API of the elastic agent server: WorkerSpec (worker blueprint), Worker,
+# WorkerState, WorkerGroup, RunResult, the abstract ElasticAgent, and SimpleElasticAgent, which
+# implements the rendezvous / start / monitor / restart state machine for a single worker role
+# and leaves start, stop, monitor and shutdown of workers to subclasses. Import creates a module logger only.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -48,6 +52,11 @@ logger = get_logger(__name__)
 
 @dataclass
 class WorkerSpec:
+    # [CLASS DOC] Dataclass blueprint for one worker role (one spec per role, homogeneous across
+    # nodes): role, local world size, rendezvous handler, entrypoint (function or binary name) and
+    # args, restart budget, monitor interval, master address/port overrides, event log handler name,
+    # NUMA options, stdout/stderr duplicate filters and virtual local rank mode. The deprecated fn
+    # field is folded into entrypoint on construction. Std stream redirect/tee settings in the docstring are not fields here.
     """
     Blueprint information about a particular type of worker.
 
@@ -105,6 +114,9 @@ class WorkerSpec:
     virtual_local_rank: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates the spec: raises AssertionError if local_world_size or
+        # monitor_interval is not positive, or if no entrypoint is available. If the deprecated
+        # fn is given, emits a DeprecationWarning and copies it to entrypoint (overriding it).
         if self.local_world_size <= 0:
             raise AssertionError
         if self.monitor_interval <= 0:
@@ -122,6 +134,8 @@ class WorkerSpec:
             raise AssertionError
 
     def get_entrypoint_name(self):
+        # [FUNCTION DOC] Returns the base file name for a string (binary) entrypoint, otherwise the
+        # qualified name of the entrypoint function. Raises AssertionError if the entrypoint is None.
         """Get the entry point name.
 
         If the entrypoint is a function (e.g. ``Callable``) returns its ``__qualname__``
@@ -136,6 +150,9 @@ class WorkerSpec:
 
 
 class Worker:
+    # [CLASS DOC] Slotted record of one worker instance: agent-interpreted id (e.g. pid), local
+    # rank, global rank, role rank, world size and role world size. Ranks and sizes default to -1
+    # until assigned at rendezvous and may change across re-rendezvous.
     """A worker instance.
 
     Contrast this with ``WorkerSpec`` that represents the specifications of a
@@ -173,6 +190,7 @@ class Worker:
         world_size: int = -1,
         role_world_size: int = -1,
     ):
+        # [FUNCTION DOC] Initializes the rank and size attributes from arguments; id starts as None.
         # unique identifier for this worker
         self.id: Any = None
 
@@ -199,6 +217,7 @@ class Worker:
         self.role_world_size: int = role_world_size
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a comma separated description of the ranks and world sizes (id excluded).
         return (
             f"local_rank={self.local_rank},global_rank={self.global_rank}"
             f",role_rank={self.role_rank},world_size={self.world_size}"
@@ -206,10 +225,13 @@ class Worker:
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] Same text as the string conversion.
         return str(self)
 
 
 class WorkerState(str, Enum):
+    # [CLASS DOC] String enum of worker group states: UNKNOWN, INIT, HEALTHY, UNHEALTHY, STOPPED,
+    # SUCCEEDED, FAILED. A group changes state as a unit; SUCCEEDED and FAILED are terminal.
     """A state of the ``WorkerGroup``.
 
     Workers in a worker group change state as a unit. If a single worker
@@ -254,6 +276,7 @@ class WorkerState(str, Enum):
 
     @staticmethod
     def is_running(state: "WorkerState") -> bool:
+        # [FUNCTION DOC] Returns True only for HEALTHY or UNHEALTHY states.
         """Return the state of the Worker.
 
         Returns:
@@ -264,6 +287,9 @@ class WorkerState(str, Enum):
 
 
 class WorkerGroup:
+    # [CLASS DOC] Slotted container of the Worker list for one WorkerSpec plus rendezvous results
+    # (store, group rank, group world size, master address and port, all None until rendezvous)
+    # and the group state (starts INIT).
     """A set of ``Worker`` instances.
 
     The class defines a set of ``Worker`` instances for the given ``WorkerSpec`` managed by ``ElasticAgent``. Whether the worker
@@ -282,6 +308,8 @@ class WorkerGroup:
     ]
 
     def __init__(self, spec: WorkerSpec):
+        # [FUNCTION DOC] Stores the spec, creates one Worker per local rank (local_world_size of
+        # them), clears rendezvous fields to None and sets state to INIT.
         self.spec = spec
         self.workers = [Worker(local_rank=i) for i in range(self.spec.local_world_size)]
 
@@ -296,6 +324,9 @@ class WorkerGroup:
 
 
 class _RoleInstanceInfo:
+    # [CLASS DOC] HELPER: Slotted record (role, agent rank, local world size) exchanged between
+    # agents through the store to compute global worker ranks; JSON/bytes serializable and
+    # orderable by role then rank.
     """The class is used by the agent to exchange the information with other agents.
 
     The information is used to determine the rank of the workers that agent
@@ -306,6 +337,7 @@ class _RoleInstanceInfo:
     __slots__ = ["role", "rank", "local_world_size"]
 
     def __init__(self, role: str, rank: int, local_world_size: int):
+        # [FUNCTION DOC] HELPER: Stores role, rank and local world size.
         r"""Initialize the agent class instance.
 
         Args:
@@ -318,6 +350,7 @@ class _RoleInstanceInfo:
         self.local_world_size = local_world_size
 
     def serialize(self) -> bytes:
+        # [FUNCTION DOC] HELPER: Returns the three fields encoded as UTF-8 JSON bytes.
         dict_data = {
             "role": self.role,
             "rank": self.rank,
@@ -327,6 +360,7 @@ class _RoleInstanceInfo:
 
     @staticmethod
     def deserialize(data: bytes):
+        # [FUNCTION DOC] HELPER: Parses UTF-8 JSON bytes (as produced by serialize) into a new _RoleInstanceInfo.
         dict_data = json.loads(data.decode(encoding="UTF-8"))
         return _RoleInstanceInfo(
             dict_data["role"], dict_data["rank"], dict_data["local_world_size"]
@@ -334,6 +368,8 @@ class _RoleInstanceInfo:
 
     @staticmethod
     def compare(obj1, obj2) -> int:
+        # [FUNCTION DOC] HELPER: Comparator ordering by role name first (1 or -1), and for equal
+        # roles returns the rank difference. Usable as a sort comparison.
         if obj1.role == obj2.role:
             return obj1.rank - obj2.rank
         elif obj1.role > obj2.role:
@@ -343,6 +379,8 @@ class _RoleInstanceInfo:
 
     @staticmethod
     def find_role_boundaries(roles_infos: list, role: str) -> tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Returns the first and last index (inclusive) of entries with the
+        # given role in the list, or (-1, -1) if none match.
         start_idx, end_idx = -1, -1
         for idx, role_info in enumerate(roles_infos):
             if role_info.role == role:
@@ -354,6 +392,9 @@ class _RoleInstanceInfo:
 
 @dataclass
 class RunResult:
+    # [CLASS DOC] Dataclass result of an agent run: final WorkerState, return values keyed by
+    # global rank (function entrypoints, successful runs) and ProcessFailure records keyed by
+    # global rank (failed runs). All-or-nothing: successful only if all local workers succeed.
     """Return results of the worker executions.
 
     Run results follow an "all-or-nothing" policy where the run is successful if and
@@ -383,14 +424,19 @@ class RunResult:
     failures: dict[int, ProcessFailure] = field(default_factory=dict)
 
     def is_failed(self) -> bool:
+        # [FUNCTION DOC] Returns True if the state is FAILED.
         return self.state == WorkerState.FAILED
 
 
 def _get_fq_hostname() -> str:
+    # [FUNCTION DOC] HELPER: Returns the fully qualified domain name of this host.
     return socket.getfqdn(socket.gethostname())
 
 
 class ElasticAgent(abc.ABC):
+    # [CLASS DOC] Abstract interface of an agent managing worker processes that are ordinary
+    # distributed PyTorch scripts: run executes the workers (with restarts) and returns a
+    # RunResult; get_worker_group returns the WorkerGroup for a role.
     """An agent process responsible for managing one or more worker processes.
 
     The worker processes are assumed to be regular distributed PyTorch scripts.
@@ -427,6 +473,8 @@ class ElasticAgent(abc.ABC):
 
     @abc.abstractmethod
     def run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        # [FUNCTION DOC] Abstract: run the workers for the role, retrying on failure up to the
+        # restart budget, and return the RunResult. Raises for failures unrelated to worker processes.
         """Run the agent.
 
         Supports retrying the worker group on failures up to ``max_restarts``.
@@ -442,6 +490,7 @@ class ElasticAgent(abc.ABC):
 
     @abc.abstractmethod
     def get_worker_group(self, role: str = DEFAULT_ROLE) -> WorkerGroup:
+        # [FUNCTION DOC] Abstract: return the (mutable) WorkerGroup for the role.
         """Return the ``WorkerGroup`` for the given ``role``.
 
         Note that the worker group is a mutable object and hence in a
@@ -453,6 +502,10 @@ class ElasticAgent(abc.ABC):
 
 
 class SimpleElasticAgent(ElasticAgent):
+    # [CLASS DOC] ElasticAgent for a single WorkerSpec/role. State: one WorkerGroup, remaining
+    # restart budget, rendezvous store, exit barrier and shutdown timeouts, total execution time
+    # and an in-exit-barrier flag. Drives rendezvous, worker start, monitoring and restart;
+    # subclasses implement _start_workers, _stop_workers, _monitor_workers and _shutdown.
     """An ``ElasticAgent`` that manages one particular type of worker role.
 
     An ``ElasticAgent`` that manages workers (``WorkerGroup``) for a single ``WorkerSpec``
@@ -465,6 +518,9 @@ class SimpleElasticAgent(ElasticAgent):
         exit_barrier_timeout: float = 300,
         shutdown_timeout: int = 30,
     ):
+        # [FUNCTION DOC] Creates the worker group from the spec, initializes the remaining
+        # restarts to the spec's max_restarts, and stores the exit barrier timeout (seconds) and
+        # shutdown timeout; no store yet, execution time zero, not in exit barrier.
         self._worker_group = WorkerGroup(spec)
         self._remaining_restarts = self._worker_group.spec.max_restarts
         self._store = None
@@ -474,10 +530,12 @@ class SimpleElasticAgent(ElasticAgent):
         self._in_exit_barrier: bool = False
 
     def get_worker_group(self, role: str = DEFAULT_ROLE) -> WorkerGroup:
+        # [FUNCTION DOC] Returns the single worker group; the role argument is ignored.
         return self._worker_group
 
     @abc.abstractmethod
     def _start_workers(self, worker_group: WorkerGroup) -> dict[int, Any]:
+        # [FUNCTION DOC] HELPER: Abstract: start local_world_size workers for the group and return a mapping of local rank to worker id.
         r"""Start ``worker_group.spec.local_world_size`` number of workers.
 
         This is according to worker spec for the worker group .
@@ -487,6 +545,7 @@ class SimpleElasticAgent(ElasticAgent):
 
     @abc.abstractmethod
     def _stop_workers(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: stop all workers in the group, tolerating non-existent or stuck workers.
         r"""Stop all workers in the given worker group.
 
         Implementers must deal with workers in all states defined by
@@ -497,6 +556,7 @@ class SimpleElasticAgent(ElasticAgent):
 
     @abc.abstractmethod
     def _monitor_workers(self, worker_group: WorkerGroup) -> RunResult:
+        # [FUNCTION DOC] HELPER: Abstract: inspect the workers and return a RunResult carrying the group's new state.
         r"""Check on the workers for the ``worker_group``.
 
         This function also returns the new state of the worker group.
@@ -507,6 +567,7 @@ class SimpleElasticAgent(ElasticAgent):
     def _shutdown(
         self, death_sig: signal.Signals = signal.SIGTERM, timeout: int = 30
     ) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: release agent resources, sending death_sig to children and escalating to a kill after timeout seconds.
         """Clean up any resources that were allocated during the agent's work.
 
         Args:
@@ -517,6 +578,10 @@ class SimpleElasticAgent(ElasticAgent):
 
     @prof
     def _rendezvous(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Runs the next rendezvous via the spec's handler, saves the store,
+        # assigns worker ranks, and records store, group rank, world size and master address/port
+        # (spec overrides win over the bootstrap values) on the worker group. Replaces the group's
+        # workers list. Logs the result including the restart count.
         r"""Run rendezvous for the workers specified by the worker spec.
 
         Assigns workers a new global rank and world size.
@@ -585,6 +650,12 @@ class SimpleElasticAgent(ElasticAgent):
     def _assign_worker_ranks(
         self, store, group_rank: int, group_world_size: int, spec: WorkerSpec
     ) -> list[Worker]:
+        # [FUNCTION DOC] HELPER: Returns one Worker per local rank with global rank, role rank,
+        # world size and role world size filled in. If the environment variable
+        # TORCH_ELASTIC_WORKER_IDENTICAL is "1", ranks are computed arithmetically from group rank
+        # (no store use). Otherwise each agent writes its role info to the store; group rank 0
+        # reads all of them, computes cumulative base ranks per agent (global and per role) and
+        # writes them back; every agent then reads its assigned values (blocking until available).
         """Determine proper ranks for worker processes.
 
         Fast Path: when all workers have the same role and world size. We calculate
@@ -693,6 +764,9 @@ class SimpleElasticAgent(ElasticAgent):
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def _initialize_workers(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Runs rendezvous, starts the workers, stores each returned worker
+        # id on its Worker, records a START worker event per worker, and optimistically marks the
+        # group HEALTHY. Callers must stop running workers first.
         r"""Start a fresh set of workers for the worker_group.
 
         Essentially, a rendezvous followed by a ``start_workers``.
@@ -728,6 +802,7 @@ class SimpleElasticAgent(ElasticAgent):
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def _restart_workers(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Stops all workers, marks the group STOPPED, then re-initializes it (rendezvous and start).
         """Restart (stops, rendezvous, starts) all local workers in the group."""
         role = worker_group.spec.role
         logger.info("[%s] Stopping worker group", role)
@@ -739,6 +814,11 @@ class SimpleElasticAgent(ElasticAgent):
     #  `torch.distributed.elastic.metrics.prof`.
     @prof
     def run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        # [FUNCTION DOC] Runs the worker group via the monitor loop and returns the RunResult,
+        # recording metrics and worker events and the total execution time. A graceful rendezvous
+        # exit is logged and swallowed. On a SignalException the workers are shut down with that
+        # signal and the exception re-raised. Otherwise shutdown always runs in the finally step.
+        # KNOWN ISSUE: on graceful rendezvous exit the function returns None, not a RunResult.
         start_time = time.monotonic()
         shutdown_called: bool = False
         try:
@@ -761,6 +841,7 @@ class SimpleElasticAgent(ElasticAgent):
             self._total_execution_time = int(time.monotonic() - start_time)
 
     def get_event_failed(self) -> Event:
+        # [FUNCTION DOC] Builds an agent-sourced FAILED event including the current exception traceback.
         return self._construct_event(
             state="FAILED",
             source=EventSource.AGENT,
@@ -768,12 +849,15 @@ class SimpleElasticAgent(ElasticAgent):
         )
 
     def get_event_succeeded(self) -> Event:
+        # [FUNCTION DOC] Builds an agent-sourced SUCCEEDED event.
         return self._construct_event(
             state="SUCCEEDED",
             source=EventSource.AGENT,
         )
 
     def _record_worker_events(self, result: RunResult) -> None:
+        # [FUNCTION DOC] HELPER: Records one worker-sourced event per worker with its final state
+        # and, for failed workers, the error file data, exit code and pid, using the spec's event log handler.
         for worker in self._worker_group.workers:
             failure = result.failures.get(worker.global_rank)
             state: str = self._get_worker_state(worker, result)
@@ -793,6 +877,9 @@ class SimpleElasticAgent(ElasticAgent):
             )
 
     def _get_worker_state(self, worker: Worker, result: RunResult) -> str:
+        # [FUNCTION DOC] HELPER: Returns "TERMINATED" for a worker without failure when the group
+        # is UNHEALTHY or FAILED (killed by the agent); the group state name if the worker failed
+        # or has a return value; otherwise raises ValueError for an unknown worker.
         failure = result.failures.get(worker.global_rank)
         if result.state in {WorkerState.UNHEALTHY, WorkerState.FAILED} and not failure:
             # The worker got terminated by the torchelastic agent via SIGTERM signal
@@ -804,6 +891,7 @@ class SimpleElasticAgent(ElasticAgent):
 
     @contextmanager
     def record_duration(self, state: str):
+        # [FUNCTION DOC] Context manager that times its body and, on exit (even on error), records an agent event for the given state carrying the duration in milliseconds.
         start_time = time.perf_counter()
         try:
             yield
@@ -827,6 +915,10 @@ class SimpleElasticAgent(ElasticAgent):
         exit_code: int | None = None,
         worker_pid: int | None = None,
     ) -> Event:
+        # [FUNCTION DOC] HELPER: Builds an Event named by the state with metadata: run id, global
+        # and group rank, worker id, role, host name, state, total run time, rendezvous backend,
+        # error text, agent restarts used, duration, and a JSON string with entry point, group
+        # world size and (when a worker is given) its rank info, exit code and pid.
         wg = self._worker_group
         spec = wg.spec
         md = {
@@ -866,6 +958,8 @@ class SimpleElasticAgent(ElasticAgent):
         )
 
     def _record_metrics(self, group_results: RunResult):
+        # [FUNCTION DOC] HELPER: Emits flakiness plus run total and exactly-one-of success/failed
+        # with/without retries metrics (1 or 0 each) for the role.
         is_failed = group_results.is_failed()
         self._record_flakiness_metric(is_failed)
         spec = self._worker_group.spec
@@ -885,6 +979,7 @@ class SimpleElasticAgent(ElasticAgent):
         )
 
     def _record_metric_with_condition(self, metric_name, condition):
+        # [FUNCTION DOC] HELPER: Publishes the role-scoped metric with value 1 if condition is true, else 0.
         spec = self._worker_group.spec
         if condition:
             put_metric(f"workers.{spec.role}.{metric_name}", 1)
@@ -892,6 +987,8 @@ class SimpleElasticAgent(ElasticAgent):
             put_metric(f"workers.{spec.role}.{metric_name}", 0)
 
     def _record_flakiness_metric(self, is_failed: bool = False):
+        # [FUNCTION DOC] HELPER: Publishes an integer flakiness percentage: 100 if failed, else
+        # the percentage of the restart budget consumed (counting the final attempt).
         if is_failed:
             flakiness = 100.0
         else:
@@ -904,6 +1001,12 @@ class SimpleElasticAgent(ElasticAgent):
         put_metric(f"workers.{spec.role}.flakiness", int(flakiness))
 
     def _invoke_run(self, role: str = DEFAULT_ROLE) -> RunResult:
+        # [FUNCTION DOC] HELPER: Main monitor loop (single role only; the role argument is
+        # overridden by the spec's role). Initializes workers, then each monitor interval checks
+        # state and publishes metrics. SUCCEEDED: waits at the exit barrier and returns. UNHEALTHY
+        # or FAILED: if restarts remain, decrements and restarts the group, otherwise stops
+        # workers, marks FAILED and returns. HEALTHY: restarts (without using budget) when new
+        # nodes are waiting in rendezvous. Any other state raises a generic exception.
         # NOTE: currently only works for a single role
 
         spec = self._worker_group.spec
@@ -974,6 +1077,9 @@ class SimpleElasticAgent(ElasticAgent):
                 )
 
     def _exit_barrier(self):
+        # [FUNCTION DOC] HELPER: Blocks on a store barrier across all agents for up to the exit
+        # barrier timeout, flagging the in-exit-barrier state meanwhile. A SignalException is
+        # logged and re-raised; any other error (including timeout) is logged and swallowed.
         """
         Define a barrier that keeps the agent process alive until all workers finish.
 

@@ -1,4 +1,8 @@
 #!/usr/bin/env/python3
+# [PACKAGE DOC] Elastic events package integrated with python logging. Keeps a module-level cache
+# of per-destination loggers and provides record (generic Event), record_rdzv_event and
+# construct_and_record_rdzv_event (rendezvous events). Re-exports Event, EventSource, NodeState,
+# RdzvEvent, EventMetadataValue from api and get_logging_handler from handlers.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -38,6 +42,9 @@ _events_loggers: dict[str, logging.Logger] = {}
 
 
 def _get_or_create_logger(destination: str = "null") -> logging.Logger:
+    # [FUNCTION DOC] HELPER: Returns the cached logger for the destination, creating it on first
+    # use: named per destination, level from the LOGLEVEL environment variable (default INFO),
+    # propagation disabled, with the destination's handler attached. Mutates the module cache.
     """
     Construct python logger based on the destination type or extends if provided.
 
@@ -67,10 +74,14 @@ def _get_or_create_logger(destination: str = "null") -> logging.Logger:
 
 
 def record(event: Event, destination: str = "null") -> None:
+    # [FUNCTION DOC] Serializes the event to JSON and logs it at info level on the logger for the
+    # destination (default null, which discards it). Returns nothing.
     _get_or_create_logger(destination).info(event.serialize())
 
 
 def record_rdzv_event(event: RdzvEvent) -> None:
+    # [FUNCTION DOC] Serializes the rendezvous event to JSON and logs it at info level on the
+    # dynamic_rendezvous destination logger.
     _get_or_create_logger("dynamic_rendezvous").info(event.serialize())
 
 
@@ -85,6 +96,11 @@ def construct_and_record_rdzv_event(
     local_id: int | None = None,
     rank: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] Builds an RdzvEvent and records it. Returns immediately if the
+    # dynamic_rendezvous handler is a null handler. Defaults hostname to the fully qualified
+    # host name and pid to the current process id (a zero pid is also replaced). The event name
+    # becomes the caller's file base name plus the given name (defaulting to the caller's
+    # function name). For FAILED state the current exception traceback is attached.
     """
     Initialize rendezvous event object and record its operations.
 

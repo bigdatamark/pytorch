@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Event data model for torchelastic: EventSource and NodeState enums plus the Event
+# and RdzvEvent dataclasses, each serializable to and from a JSON string. No import-time side effects.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -19,6 +21,7 @@ EventMetadataValue = str | int | float | bool | None
 
 
 class EventSource(str, Enum):
+    # [CLASS DOC] String enum of event producers: AGENT and WORKER.
     """Known identifiers of the event producers."""
 
     AGENT = "AGENT"
@@ -27,6 +30,9 @@ class EventSource(str, Enum):
 
 @dataclass
 class Event:
+    # [CLASS DOC] Dataclass for a generic job event: name, source (EventSource), timestamp in
+    # milliseconds (default 0) and a metadata mapping of primitive values. JSON round-trippable
+    # via serialize and deserialize; string conversion yields the JSON.
     """
     The class represents the generic event that occurs during the torchelastic job execution.
 
@@ -45,10 +51,15 @@ class Event:
     metadata: dict[str, EventMetadataValue] = field(default_factory=dict)
 
     def __str__(self):
+        # [FUNCTION DOC] Returns the JSON serialization of the event.
         return self.serialize()
 
     @staticmethod
     def deserialize(data: Union[str, "Event"]) -> "Event":
+        # [FUNCTION DOC] Returns an Event: an Event input is returned unchanged; a JSON string is
+        # parsed and its source name converted to EventSource before constructing the Event.
+        # KNOWN ISSUE: input of any other type leaves the parsed dict undefined and fails with an
+        # unbound-variable error rather than a clear type error.
         if isinstance(data, Event):
             return data
         if isinstance(data, str):
@@ -58,10 +69,12 @@ class Event:
         return Event(**data_dict)
 
     def serialize(self) -> str:
+        # [FUNCTION DOC] Returns the event converted to a plain mapping and dumped as a JSON string.
         return json.dumps(asdict(self))
 
 
 class NodeState(str, Enum):
+    # [CLASS DOC] String enum of node states in rendezvous: INIT, RUNNING, SUCCEEDED, FAILED.
     """The states that a node can be in rendezvous."""
 
     INIT = "INIT"
@@ -72,6 +85,8 @@ class NodeState(str, Enum):
 
 @dataclass
 class RdzvEvent:
+    # [CLASS DOC] Dataclass describing a rendezvous event: name, run id, message, hostname, pid,
+    # node state, and optional master endpoint, rank, local id and error trace. JSON round-trippable.
     """
     Dataclass to represent any rendezvous event.
 
@@ -100,10 +115,14 @@ class RdzvEvent:
     error_trace: str = ""
 
     def __str__(self):
+        # [FUNCTION DOC] Returns the JSON serialization of the event.
         return self.serialize()
 
     @staticmethod
     def deserialize(data: Union[str, "RdzvEvent"]) -> "RdzvEvent":
+        # [FUNCTION DOC] Returns an RdzvEvent: an RdzvEvent input is returned unchanged; a JSON
+        # string is parsed and its node state name converted to NodeState before construction.
+        # KNOWN ISSUE: input of any other type fails with an unbound-variable error.
         if isinstance(data, RdzvEvent):
             return data
         if isinstance(data, str):
@@ -113,4 +132,5 @@ class RdzvEvent:
         return RdzvEvent(**data_dict)
 
     def serialize(self) -> str:
+        # [FUNCTION DOC] Returns the event converted to a plain mapping and dumped as a JSON string.
         return json.dumps(asdict(self))
