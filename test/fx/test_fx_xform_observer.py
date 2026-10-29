@@ -1,5 +1,9 @@
 # Owner(s): ["module: fx"]
 
+# [MODULE DOC] Tests for GraphTransformObserver (torch.fx.passes.graph_transform_observer): it
+# records created and erased nodes during graph rewrites, writes dot files of input and output
+# graphs to a log directory, attaches NodeSource provenance to node metadata, and removes its
+# hooks on exit. The main guard raises RuntimeError since the file is not run directly.
 import copy
 import os
 import tempfile
@@ -12,16 +16,27 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class TestGraphTransformObserver(TestCase):
+    # [CLASS DOC] Tests the GraphTransformObserver context manager around pattern replacement and
+    # manual graph edits, covering node tracking, dot file output, hooks cleanup and deepcopy.
     def test_graph_transform_observer(self):
+        # [FUNCTION DOC] Replaces a negation pattern with relu inside the observer using a
+        # temporary log directory. Asserts the observer lists relu as created and neg as erased,
+        # and that dot files for the input and output graphs named after the current pass count
+        # exist in the log directory. Side effect: creates a temporary directory that is not
+        # removed.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that negates its input and adds the result to itself.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the negation of x added to itself.
                 val = torch.neg(x)
                 return torch.add(val, val)
 
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern for the rewrite: negation of x.
             return torch.neg(x)
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement for the rewrite: relu of x.
             return torch.relu(x)
 
         traced = symbolic_trace(M())
@@ -57,23 +72,37 @@ class TestGraphTransformObserver(TestCase):
 
     @torch._inductor.config.patch("trace.provenance_tracking_level", 1)
     def test_graph_transform_observer_node_tracking(self):
+        # [FUNCTION DOC] Runs with provenance tracking level 1. Applies two successive rewrites
+        # (neg to relu, then relu to cos) under the observer and checks that created and erased
+        # nodes are reported, that all hook lists on the traced module are empty after exit, and
+        # that from_node provenance chains hold the replaced node with the replace and create
+        # actions, the pass name and graph id. Then repeats on an exported module where a manually
+        # added add node replaces all uses of neg, checking its provenance names neg and the pass
+        # test.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that negates its input and adds the result to itself.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the negation of x added to itself.
                 val = torch.neg(x)
                 return torch.add(val, val)
 
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern for the rewrite: negation of x.
             return torch.neg(x)
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: First replacement: relu of x.
             return torch.relu(x)
 
         def replacement2(x):
+            # [FUNCTION DOC] HELPER: Second replacement: cosine of x.
             return torch.cos(x)
 
         traced = symbolic_trace(M())
 
         def check_node_source(node_source, node_name, target, id, pass_name, action):
+            # [FUNCTION DOC] HELPER: Asserts that a NodeSource has the expected name, target, pass
+            # name, graph id and action.
             self.assertEqual(node_source.name, node_name)
             self.assertEqual(node_source.target, target)
             self.assertEqual(node_source.pass_name, pass_name)
@@ -132,7 +161,9 @@ class TestGraphTransformObserver(TestCase):
                 )
 
         class SimpleLinearModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that returns the negation of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the negation of x.
                 return torch.neg(x)
 
         model = SimpleLinearModel()
@@ -158,8 +189,14 @@ class TestGraphTransformObserver(TestCase):
 
     @torch._inductor.config.patch("trace.provenance_tracking_level", 1)
     def test_graph_transform_observer_deepcopy(self):
+        # [FUNCTION DOC] Runs with provenance tracking level 1. Deep copies an exported graph
+        # module inside the observer and checks the copy has the same node names and that none of
+        # the replace, create-node, erase-node or deepcopy hook lists remain on the copy after the
+        # context exits.
         class SimpleLinearModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that returns the negation of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the negation of x.
                 return torch.neg(x)
 
         model = SimpleLinearModel()
@@ -181,9 +218,18 @@ class TestGraphTransformObserver(TestCase):
 
     @torch._inductor.config.patch("trace.provenance_tracking_level", 1)
     def test_graph_transform_observer_replace(self):
+        # [FUNCTION DOC] Runs with provenance tracking level 1. Inside the observer, replaces all
+        # uses of the add node of a traced module with a newly created aten add node renamed
+        # new_add, then checks the new node has exactly one from_node entry naming the original
+        # add node with pass name test, i.e. the replaced node is not duplicated in the
+        # provenance.
         # the node should should not be duplicated
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing a sum with one, then returning two different
+            # products of it (times two and times three).
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to x and returns a tuple of the sum times two and
+                # times three.
                 y = x + 1
                 z = y * 2
                 w = y * 3

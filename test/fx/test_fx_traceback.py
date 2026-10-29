@@ -1,5 +1,9 @@
 # Owner(s): ["module: fx"]
 
+# [MODULE DOC] Tests for FX node provenance tracking (NodeSource, graph provenance JSON) in
+# torch.fx.traceback. The module-level constant CREATE_STR is the lowercase name of the CREATE
+# action. The main guard raises RuntimeError since the file is not run directly and must be
+# enabled in the test discovery list instead.
 import torch
 from torch._inductor.compile_fx import aot_export_module
 from torch.export import default_decompositions
@@ -11,7 +15,14 @@ CREATE_STR = NodeSourceAction.CREATE.name.lower()
 
 
 class TestFXNodeSource(TestCase):
+    # [CLASS DOC] Tests NodeSource construction, printing, dict round trip, equality and
+    # hashing, and provenance recorded through export, decomposition and AOT export.
     def test_node_source(self):
+        # [FUNCTION DOC] Checks NodeSource with no node and with a dummy add node: readable text,
+        # the dict form (name, target, pass_name, action, graph_id, from_node) and round trip
+        # through the dict conversion. Also checks equal sources are equal with equal hashes
+        # (usable as one set or dict key), different pass names or actions compare unequal with
+        # different hashes.
         node_source = NodeSource(
             node=None, pass_name="test_pass", action=NodeSourceAction.CREATE
         )
@@ -124,12 +135,22 @@ class TestFXNodeSource(TestCase):
         self.assertNotEqual(hash(node_source_replace), hash(node_source_create))
 
     def test_graph_provenance(self):
+        # [FUNCTION DOC] Exports a small MLP (linear, relu, linear, sigmoid) strictly, decomposes
+        # it and checks from_node metadata: decomposed nodes from the same ancestor share equal
+        # provenance and others differ. Then checks the provenance JSON keys of the exported module
+        # and of the module after AOT export (non-joint), and walks the from_node chains to verify
+        # the expected pass names (PropagateUnbackedSymInts, DynamoGraphTransformer) and node
+        # names.
         def check_node_source(node_source_dict, name, pass_name, action):
+            # [FUNCTION DOC] HELPER: Asserts that a node source dictionary has the given name,
+            # pass_name and action values.
             self.assertEqual(node_source_dict["name"], name)
             self.assertEqual(node_source_dict["pass_name"], pass_name)
             self.assertEqual(node_source_dict["action"], action)
 
         def get_first_node_source_and_check(node_source_dict):
+            # [FUNCTION DOC] HELPER: Asserts the dictionary from_node list has exactly one entry
+            # and returns that entry.
             """
             Get the first node source from the from_node list.
             """
@@ -137,7 +158,9 @@ class TestFXNodeSource(TestCase):
             return node_source_dict["from_node"][0]
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Four layer model: linear 10 to 16, relu, linear 16 to 1, sigmoid.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the fc1, relu, fc2 and sigmoid submodules.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(10, 16)
                 self.relu = torch.nn.ReLU()
@@ -145,6 +168,8 @@ class TestFXNodeSource(TestCase):
                 self.sigmoid = torch.nn.Sigmoid()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, relu, fc2 and sigmoid in order and returns
+                # the result in a one element tuple.
                 x = self.fc1(x)
                 x = self.relu(x)
                 x = self.fc2(x)

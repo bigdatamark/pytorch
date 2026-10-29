@@ -1,5 +1,11 @@
 # Owner(s): ["module: fx"]
 
+# [MODULE DOC] Tests for the FX gradual type system: tensor type annotations, the consistency and
+# precision relations, broadcasting of types, the GraphTypeChecker pass (type inference through
+# add, reshape, transpose, flatten, batch norm, conv2d, maxpool2d and so on), and symbolic type
+# inference with Refine and infer_symbolic_types. Import-time side effect: tries to import
+# torchvision resnet50 and sets HAS_TORCHVISION and the skipIfNoTorchVision decorator accordingly.
+# Running the file directly is refused through raise_on_run_directly in favor of test/test_fx.py.
 import unittest
 
 import sympy
@@ -30,6 +36,8 @@ skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, "no torchvision")
 
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    # [FUNCTION DOC] HELPER: Builds and returns a bias-free 3x3 convolution layer with the given
+    # input and output channels, stride, groups and dilation, using padding equal to the dilation.
     """3x3 convolution with padding"""
     return torch.nn.Conv2d(
         in_planes,
@@ -44,7 +52,13 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
 
 
 class AnnotationsTest(TestCase):
+    # [CLASS DOC] Tests tensor type annotations on traced graphs plus the consistency, precision
+    # and broadcasting helpers of the tensor type module. Stateless; each test builds its own
+    # inputs.
     def test_annotations(self):
+        # [FUNCTION DOC] Traces a module whose forward annotates three arguments (a four
+        # dimensional type with an unknown last dimension, the unknown type, a three dimensional
+        # type) and asserts each placeholder node carries the matching type, in order.
         """
         Test type annotations in the forward function.
         The annotation should appear in the n.graph
@@ -52,9 +66,13 @@ class AnnotationsTest(TestCase):
         """
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding its first two inputs and then a third, with
+            # annotated args.
             def forward(
                 self, x: TensorType((1, 2, 3, Dyn)), y: Dyn, z: TensorType[Dyn, 3, Dyn]
             ):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y plus z; only the annotations
+                # matter.
                 return torch.add(x, y) + z
 
         module = M()
@@ -70,8 +88,13 @@ class AnnotationsTest(TestCase):
                     raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_annotate(self):
+        # [FUNCTION DOC] Traces a module that wraps its input with the annotate helper and a four
+        # dimensional type, then asserts every placeholder node has that type. Raises
+        # AssertionError on mismatch.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that annotates its input and adds it to the original.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x added to its annotated alias.
                 y = annotate(x, TensorType((1, 2, 3, Dyn)))
                 return torch.add(x, y)
 
@@ -85,6 +108,9 @@ class AnnotationsTest(TestCase):
                     )
 
     def test_consistency(self):
+        # [FUNCTION DOC] Checks is_consistent: a concrete tensor type is consistent with one that
+        # has an unknown dimension, Dyn is consistent with int, int with int, and tensor types of
+        # different rank or a tensor type versus int are not.
         """
         Test the consistency relation.
         """
@@ -95,6 +121,11 @@ class AnnotationsTest(TestCase):
         self.assertFalse(is_consistent(TensorType((1, 2, 3)), int))
 
     def test_precision(self):
+        # [FUNCTION DOC] Checks is_more_precise: a concrete tensor type is more precise than one
+        # with an unknown dimension, int is more precise than Dyn and than int, and differing
+        # ranks or tensor versus int are not.
+        # KNOWN ISSUE: the docstring says it tests the consistency relation, but the body tests
+        #     precision.
         """
         Test the consistency relation.
         """
@@ -107,6 +138,10 @@ class AnnotationsTest(TestCase):
         self.assertFalse(is_more_precise(TensorType((1, 2, 3)), int))
 
     def test_broadcasting1(self):
+        # [FUNCTION DOC] Checks broadcast_types on tensor types of rank four, rank four with a
+        # size one dim, scalar-like empty shape, a two dimensional shape and a list-based shape:
+        # both operands come back broadcast to the common shape. Raises AssertionError on
+        # mismatch.
         t1 = TensorType((1, 2, 3, 4))
         t2 = TensorType((1, 2, 1, 4))
         t3 = TensorType(())
@@ -124,6 +159,8 @@ class AnnotationsTest(TestCase):
             raise AssertionError("broadcast_types(t5, t6) mismatch")
 
     def test_broadcasting2(self):
+        # [FUNCTION DOC] Checks broadcast_types of a rank three and a rank four type, expecting
+        # both to be returned as the same rank four type.
         t1 = TensorType((2, 3, 4))
         t2 = TensorType((1, 2, 1, 4))
 
@@ -133,6 +170,9 @@ class AnnotationsTest(TestCase):
             raise AssertionError(f"Expected {expected}, got {result}")
 
     def test_broadcasting3(self):
+        # [FUNCTION DOC] Checks broadcast_types when one operand has an unknown dimension: the
+        # result keeps the unknown dimension for the first operand and the concrete size for the
+        # second.
         t1 = TensorType((1, 2, 3, Dyn))
         t2 = TensorType((2, 3, 4))
         result = broadcast_types(t1, t2)
@@ -142,9 +182,17 @@ class AnnotationsTest(TestCase):
 
 
 class TypeCheckerTest(TestCase):
+    # [CLASS DOC] Tests GraphTypeChecker and symbolic inference over small traced modules (add,
+    # reshape, transpose, batch norm, conv2d, flatten, maxpool2d, resnet50). Many cases build a
+    # module, trace it, run type checking and assert node types or a TypeError.
     def test_type_check_add_with_broadcast(self):
+        # [FUNCTION DOC] Type checks adding a four dimensional type with an unknown last dim to a
+        # rank three type. Every call_function node must have its broadcast metadata flag set and
+        # the node types must be x, y and then the broadcast result for the add and the output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two annotated inputs.
             def forward(self, x: TensorType((1, 2, 3, Dyn)), y: TensorType((2, 3, 4))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -168,8 +216,12 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_type_check_add_with_scalar(self):
+        # [FUNCTION DOC] Type checks adding an int argument to a rank three tensor type: expects
+        # node types int, the tensor type, and the tensor type for both the add and the output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding an int input to an annotated tensor input.
             def forward(self, x: int, y: TensorType((2, 3, 4))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -190,8 +242,12 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_type_check_add_false(self):
+        # [FUNCTION DOC] Type checks adding rank four to rank three types whose dimensions
+        # disagree; expects type_check to raise TypeError.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two annotated inputs of incompatible shapes.
             def forward(self, x: TensorType((1, 2, 3, Dyn)), y: TensorType((1, 2, 3))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -201,8 +257,13 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_add_true(self):
+        # [FUNCTION DOC] Type checks adding two rank three types where one has an unknown
+        # dimension. type_check must return true, placeholders keep their annotations and the
+        # output type is the type with the unknown dimension.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two compatible annotated inputs.
             def forward(self, x: TensorType((1, 2, Dyn)), y: TensorType((1, 2, 3))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -225,8 +286,13 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_reshape_true(self):
+        # [FUNCTION DOC] Type checks reshaping a one by six type to one by two by three.
+        # type_check returns true and placeholder, call_function and output nodes get the expected
+        # types.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input to one by two by three.
             def forward(self, x: TensorType((1, 6))):
+                # [FUNCTION DOC] HELPER: Returns x reshaped to one by two by three.
                 return torch.reshape(x, [1, 2, 3])
 
         module = M()
@@ -254,8 +320,12 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_reshape_false(self):
+        # [FUNCTION DOC] Reshaping a one by five type to one by two by three has mismatched
+        # element counts; expects type_check to raise TypeError.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input to one by two by three.
             def forward(self, x: TensorType((1, 5))):
+                # [FUNCTION DOC] HELPER: Returns x reshaped to one by two by three.
                 return torch.reshape(x, [1, 2, 3])
 
         module = M()
@@ -265,8 +335,12 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_reshape_dyn_false(self):
+        # [FUNCTION DOC] Reshaping a one by five type with an inferred dimension (minus one) to a
+        # target with a fixed two cannot divide evenly; expects type_check to raise TypeError.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input using an inferred last dimension.
             def forward(self, x: TensorType((1, 5))):
+                # [FUNCTION DOC] HELPER: Returns x reshaped to one by two by inferred.
                 return torch.reshape(x, [1, 2, -1])
 
         module = M()
@@ -276,8 +350,12 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_reshape_dyn_true(self):
+        # [FUNCTION DOC] Reshaping a one by fifteen type to one by five by inferred is valid;
+        # type_check must return true.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input using an inferred last dimension.
             def forward(self, x: TensorType((1, 15))):
+                # [FUNCTION DOC] HELPER: Returns x reshaped to one by five by inferred.
                 return torch.reshape(x, [1, 5, -1])
 
         module = M()
@@ -286,8 +364,12 @@ class TypeCheckerTest(TestCase):
         self.assertTrue(tc.type_check())
 
     def test_type_check_reshape_dyn_true_param_false(self):
+        # [FUNCTION DOC] Reshaping an unknown by five type to one by two by inferred is rejected;
+        # expects type_check to raise TypeError.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that reshapes its input using an inferred last dimension.
             def forward(self, x: TensorType((Dyn, 5))):
+                # [FUNCTION DOC] HELPER: Returns x reshaped to one by two by inferred.
                 return torch.reshape(x, [1, 2, -1])
 
         module = M()
@@ -297,8 +379,15 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_transpose_true(self):
+        # [FUNCTION DOC] Type checks swapping dims zero and one of a four dimensional type.
+        # type_check returns true and call_function and output nodes are expected to have the
+        # swapped type.
+        # KNOWN ISSUE: the third branch tests a node op equal to the string x, which never occurs,
+        #     so that placeholder check is dead code.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that transposes dims zero and one of its input.
             def forward(self, x: TensorType((1, 2, 3, 5))):
+                # [FUNCTION DOC] HELPER: Returns x transposed over dims zero and one.
                 return torch.transpose(x, 0, 1)
 
         module = M()
@@ -325,8 +414,12 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_transpose_False(self):
+        # [FUNCTION DOC] Transposing with dimension ten on a four dimensional type is out of
+        # range; expects type_check to raise TypeError.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that transposes dims zero and ten of its input.
             def forward(self, x: TensorType((1, 2, 3, 5))):
+                # [FUNCTION DOC] HELPER: Returns x transposed over dims zero and ten.
                 return torch.transpose(x, 0, 10)
 
         module = M()
@@ -336,13 +429,23 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_batch_norm_2D(self):
+        # [FUNCTION DOC] Traces with RewritingTracer (so annotations in the body are kept) a block
+        # applying batch norm to an input of shape two by two by five by four, with an
+        # intermediate annotation having an unknown third dimension. After type_check all
+        # placeholder, output, call_module and call_function nodes must have the full input shape.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a batch norm layer; forward applies it and adds the
+            # input back.
             def __init__(self, inplanes, planes):
+                # [FUNCTION DOC] HELPER: Stores a BatchNorm2d layer sized by planes as bn1;
+                # inplanes is unused.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: TensorType((2, 2, 5, 4))):
+                # [FUNCTION DOC] HELPER: Applies bn1 to x, adds x to the result in place and
+                # returns it; the result carries an intermediate type annotation.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.bn1(x)
                 out += identity
@@ -378,13 +481,21 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_batch_norm_2D_false(self):
+        # [FUNCTION DOC] Same batch norm block but the input is annotated as rank three while the
+        # intermediate annotation is rank four; expects type_check to raise TypeError.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a batch norm layer; forward applies it and adds the
+            # input back.
             def __init__(self, inplanes, planes):
+                # [FUNCTION DOC] HELPER: Stores a BatchNorm2d layer sized by planes as bn1;
+                # inplanes is unused.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: TensorType((2, 2, 5))):
+                # [FUNCTION DOC] HELPER: Applies bn1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.bn1(x)
                 out += identity
@@ -399,13 +510,23 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_batch_norm_2D_broadcast(self):
+        # [FUNCTION DOC] Batch norm block with an unknown input type. After type_check,
+        # placeholder, call_function and output nodes are expected to be a rank four type of all
+        # unknown dims and the call_module node the annotated type. Then a block with one channel
+        # (mismatching the annotated two) must raise TypeError.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a batch norm layer; forward applies it and adds the
+            # input back.
             def __init__(self, inplanes, planes):
+                # [FUNCTION DOC] HELPER: Stores a BatchNorm2d layer sized by planes as bn1;
+                # inplanes is unused.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: Dyn):
+                # [FUNCTION DOC] HELPER: Applies bn1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.bn1(x)
                 out += identity
@@ -451,14 +572,23 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_conv2D(self):
+        # [FUNCTION DOC] Same checks as the broadcast batch norm test but with a 3x3 convolution
+        # layer as the annotated intermediate: nodes are all unknown rank four types except the
+        # call_module node, which has the annotated type.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a 3x3 convolution and batch norm; forward uses the
+            # convolution.
             def __init__(self, inplanes, planes, stride=1):
+                # [FUNCTION DOC] HELPER: Builds conv1 through the conv3x3 helper and bn1 as
+                # BatchNorm2d.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.conv1 = conv3x3(inplanes, planes, stride)
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: Dyn):
+                # [FUNCTION DOC] HELPER: Applies conv1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.conv1(x)
                 out += identity
@@ -496,14 +626,25 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_conv2D_2(self):
+        # [FUNCTION DOC] Convolution block with input shape five by two by three by four. Runs the
+        # real forward for the expected output shape; after type_check all placeholder,
+        # call_function and call_module nodes have the input type and the output type dims equal
+        # the runtime shape. A block built with mismatched channels (one in, two out) must raise
+        # TypeError.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a 3x3 convolution and batch norm; forward uses the
+            # convolution.
             def __init__(self, inplanes, planes, stride=1):
+                # [FUNCTION DOC] HELPER: Builds conv1 through the conv3x3 helper and bn1 as
+                # BatchNorm2d.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.conv1 = conv3x3(inplanes, planes, stride)
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: TensorType((5, 2, 3, 4))):
+                # [FUNCTION DOC] HELPER: Applies conv1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out = self.conv1(x)
                 out += identity
@@ -544,6 +685,12 @@ class TypeCheckerTest(TestCase):
             tc.type_check()
 
     def test_type_check_conv2D_2_fully_static(self):
+        # [FUNCTION DOC] Table driven check over five configurations of annotation, runtime input
+        # shape, channels, stride, groups, dilation, padding and kernel size. For each, a single
+        # convolution module is traced, its placeholder annotated and type checked; the output
+        # type must be consistent with the real output size. A second module also gets an
+        # intermediate annotation on call_module nodes and its output type must equal the expected
+        # table entry and stay consistent.
         annotation_list = [
             (1, 2, 3, 5),
             (2, 5, 6, 9),
@@ -593,6 +740,8 @@ class TypeCheckerTest(TestCase):
             intermediate_type = intermediate_types[i]
 
             class BasicBlock(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module holding one convolution configured from the loop
+                # variables.
                 def __init__(
                     self,
                     in_planes,
@@ -603,6 +752,8 @@ class TypeCheckerTest(TestCase):
                     groups,
                     dilation,
                 ):
+                    # [FUNCTION DOC] HELPER: Creates conv1 as a bias-free Conv2d from the given
+                    # channel counts, kernel size, stride, padding, groups and dilation.
                     super().__init__()
                     self.conv1 = torch.nn.Conv2d(
                         in_channels=in_planes,
@@ -616,6 +767,7 @@ class TypeCheckerTest(TestCase):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns conv1 applied to x.
                     out = self.conv1(x)
                     return out
 
@@ -644,6 +796,8 @@ class TypeCheckerTest(TestCase):
 
             # test with intermediate annotations
             class BasicBlock(torch.nn.Module):
+                # [CLASS DOC] HELPER: Same single convolution module, redefined for the
+                # intermediate annotation variant of the test.
                 def __init__(
                     self,
                     in_planes,
@@ -654,6 +808,8 @@ class TypeCheckerTest(TestCase):
                     groups,
                     dilation,
                 ):
+                    # [FUNCTION DOC] HELPER: Creates conv1 as a bias-free Conv2d from the given
+                    # channel counts, kernel size, stride, padding, groups and dilation.
                     super().__init__()
                     self.conv1 = torch.nn.Conv2d(
                         in_channels=in_planes,
@@ -667,6 +823,7 @@ class TypeCheckerTest(TestCase):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns conv1 applied to x.
                     out = self.conv1(x)
                     return out
 
@@ -698,7 +855,13 @@ class TypeCheckerTest(TestCase):
                         )
 
     def test_typecheck_basicblock(self):
+        # [FUNCTION DOC] Type checks a ResNet style basic block on an annotated input of shape two
+        # by two by four by five, then asserts the output node type has dims equal to the size of
+        # the real forward result.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: ResNet basic block: two 3x3 convolutions with batch norm and
+            # relu, with an optional downsample branch added to the residual. Only stride one,
+            # groups one, base width 64 and dilation one are supported.
             expansion = 1
 
             def __init__(
@@ -711,6 +874,9 @@ class TypeCheckerTest(TestCase):
                 base_width=64,
                 dilation=1,
             ):
+                # [FUNCTION DOC] HELPER: Builds the convolutions, batch norms, relu, optional
+                # downsample and stride. Raises ValueError if groups is not one or base_width is
+                # not 64, and NotImplementedError if dilation is above one.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 if groups != 1 or base_width != 64:
@@ -731,6 +897,8 @@ class TypeCheckerTest(TestCase):
                 self.stride = stride
 
             def forward(self, x: TensorType((2, 2, 4, 5))):
+                # [FUNCTION DOC] HELPER: Runs conv1, bn1, relu, conv2, bn2, adds the identity (or
+                # the downsample of x if present), applies relu and returns the result.
                 identity = x
 
                 out = self.conv1(x)
@@ -771,8 +939,15 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_conv2D_maxpool2d_flatten(self):
+        # [FUNCTION DOC] Type checks a block of convolution, max pool, convolution, max pool,
+        # linear, adaptive average pool and flatten on a four by three by 32 by 32 input. After
+        # eliminating dead code, every remaining node must match the expected list of tensor types
+        # layer by layer.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block chaining conv, pool, conv, pool, a linear layer on the
+            # last dim, adaptive average pooling and flatten.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1, pool, conv2, fc1 and pool2 layers.
                 super().__init__()
 
                 self.conv1 = torch.nn.Conv2d(3, 6, 5)
@@ -782,6 +957,8 @@ class TypeCheckerTest(TestCase):
                 self.pool2 = torch.nn.AdaptiveAvgPool2d((6, 7))
 
             def forward(self, x: TensorType((4, 3, 32, 32))):
+                # [FUNCTION DOC] HELPER: Applies the layers in order and flattens from dim one;
+                # returns the result.
                 out = self.conv1(x)
                 out = self.pool(out)
                 out = self.conv2(out)
@@ -819,8 +996,13 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_type_check_flatten(self):
+        # [FUNCTION DOC] Type checks flattening dims one to two of a five dimensional type; the
+        # output node type must be the merged rank four type with the product of the flattened
+        # sizes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that flattens dims one through two of its input.
             def forward(self, x: TensorType((1, 2, 3, 5, Dyn))):
+                # [FUNCTION DOC] HELPER: Returns x flattened over dims one to two.
                 return torch.flatten(x, 1, 2)
 
         module = M()
@@ -835,8 +1017,12 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_flatten_2(self):
+        # [FUNCTION DOC] Like the previous flatten test but with an unknown size inside the
+        # flattened range; the merged dimension must come out as unknown.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that flattens dims one through two of its input.
             def forward(self, x: TensorType((1, Dyn, 3, 5, Dyn))):
+                # [FUNCTION DOC] HELPER: Returns x flattened over dims one to two.
                 return torch.flatten(x, 1, 2)
 
         module = M()
@@ -851,8 +1037,13 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_flatten3(self):
+        # [FUNCTION DOC] Flattening dims one to three of a two by three by four by five type must
+        # give a two by sixty output type. Then runs Refine and asserts the collected constraints
+        # are exactly one equality between two and two.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that flattens from start dim one to end dim three.
             def forward(self, x: TensorType((2, 3, 4, 5))):
+                # [FUNCTION DOC] HELPER: Returns x flattened from dim one to dim three.
                 return torch.flatten(x, start_dim=1, end_dim=3)
 
         module = M()
@@ -870,12 +1061,18 @@ class TypeCheckerTest(TestCase):
             raise AssertionError(f"Expected [Equality(2, 2)], got {c}")
 
     def test_type_typechecl_maxpool2d_3dinput(self):
+        # [FUNCTION DOC] Type checks a 2d max pool with window five and stride eight on a three
+        # dimensional input of 64 by 8 by 8; the output node type must be 64 by 1 by 1.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a single max pool layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the pool layer with kernel size five and stride
+                # eight.
                 super().__init__()
                 self.pool = torch.nn.MaxPool2d(5, 8)
 
             def forward(self, x: TensorType((64, 8, 8))):
+                # [FUNCTION DOC] HELPER: Returns pool applied to x.
                 out = self.pool(x)
                 return out
 
@@ -894,6 +1091,10 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_maxpool2d_fully_static(self):
+        # [FUNCTION DOC] Table driven check over five max pool configurations (annotation, input
+        # shape, stride, dilation, padding, kernel size). Each is traced with the placeholder
+        # annotated and checked for output consistency with the real result, then redone with an
+        # intermediate type set on call_module nodes and compared with the expected output type.
         annotation_list = [
             (Dyn, Dyn, 3, 5),
             (2, 5, 6, 9),
@@ -937,7 +1138,11 @@ class TypeCheckerTest(TestCase):
             intermediate_type = intermediate_types[i]
 
             class BasicBlock(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module holding one max pool layer built from the loop
+                # variables.
                 def __init__(self, kernel_size, stride, padding, dilation):
+                    # [FUNCTION DOC] HELPER: Creates pool as a max pool with the given kernel
+                    # size, stride, padding and dilation, without indices and without ceil mode.
                     super().__init__()
                     self.pool = torch.nn.MaxPool2d(
                         kernel_size,
@@ -949,6 +1154,7 @@ class TypeCheckerTest(TestCase):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns pool applied to x.
                     out = self.pool(x)
                     return out
 
@@ -975,7 +1181,11 @@ class TypeCheckerTest(TestCase):
 
             # test with intermediate annotations
             class BasicBlock(torch.nn.Module):
+                # [CLASS DOC] HELPER: Same max pool module, redefined for the intermediate
+                # annotation variant.
                 def __init__(self, kernel_size, stride, padding, dilation):
+                    # [FUNCTION DOC] HELPER: Creates pool as a max pool with the given kernel
+                    # size, stride, padding and dilation, without indices and without ceil mode.
                     super().__init__()
                     self.pool = torch.nn.MaxPool2d(
                         kernel_size,
@@ -987,6 +1197,7 @@ class TypeCheckerTest(TestCase):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns pool applied to x.
                     out = self.pool(x)
                     return out
 
@@ -1021,6 +1232,10 @@ class TypeCheckerTest(TestCase):
                         )
 
     def test_flatten_fully_static(self):
+        # [FUNCTION DOC] Table driven check over five flatten configurations (start and end dims,
+        # with annotations from fully unknown to partly known). For each, the output type after
+        # type_check must be consistent with the size of the real forward result. The intermediate
+        # list in the test is unused.
         annotation_list = [
             Dyn,
             TensorType((2, 5, 6, 9)),
@@ -1053,12 +1268,16 @@ class TypeCheckerTest(TestCase):
             # intermediate_type = intermediate_list[i]
 
             class BasicBlock(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module that flattens its input between stored start and end
+                # dims.
                 def __init__(self, start, end):
+                    # [FUNCTION DOC] HELPER: Stores the start and end dims.
                     super().__init__()
                     self.start = start
                     self.end = end
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns x flattened between the stored dims.
                     out = torch.flatten(x, self.start, self.end)
                     return out
 
@@ -1085,6 +1304,11 @@ class TypeCheckerTest(TestCase):
 
     @skipIfNoTorchVision
     def test_resnet50(self):
+        # [FUNCTION DOC] Skipped without torchvision. Runs shape propagation on a traced resnet50
+        # as the reference, then type checks a copy with all node types cleared and checks each
+        # node type is consistent with the real shape. A second copy whose placeholder is typed to
+        # the sample input must match the real shapes exactly. Finally runs symbolic inference and
+        # asserts every node has a tensor type and all nodes share a single batch size entry.
         gm_run = symbolic_trace(resnet50())
         sample_input = torch.randn(1, 3, 224, 224)
 
@@ -1143,13 +1367,22 @@ class TypeCheckerTest(TestCase):
             )
 
     def test_type_check_batch_norm_symbolic(self):
+        # [FUNCTION DOC] Type checks the batch norm block with an unknown input, then runs
+        # symbolic type inference and asserts that each node type becomes a rank four type with
+        # one shared symbolic third dimension (the test hard-codes the generated symbol name).
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a batch norm layer; forward applies it and adds the
+            # input back.
             def __init__(self, inplanes, planes):
+                # [FUNCTION DOC] HELPER: Stores a BatchNorm2d layer sized by planes as bn1;
+                # inplanes is unused.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: Dyn):
+                # [FUNCTION DOC] HELPER: Applies bn1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.bn1(x)
                 out += identity
@@ -1179,8 +1412,14 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_symbolic_add_with_broadcast(self):
+        # [FUNCTION DOC] Type checks an add with broadcasting, then symbolic inference and Refine.
+        # The collected constraints must be equalities for the matching dims one, two and three
+        # (none for the unknown vs four pair, since the unknown could be one or four). Node types
+        # after inference must use shared symbolic names for the unknown dimension.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two annotated inputs.
             def forward(self, x: TensorType((1, 2, 3, Dyn)), y: TensorType((2, 3, 4))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -1215,8 +1454,13 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_symbolic_add_with_broadcast_2(self):
+        # [FUNCTION DOC] Symbolic inference for adding a one by two type to an unknown by two
+        # type. The second input, the add and the output must all get the same symbolic first
+        # dimension.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two annotated inputs.
             def forward(self, x: TensorType((1, 2)), y: TensorType((Dyn, 2))):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y.
                 return torch.add(x, y)
 
         module = M()
@@ -1241,14 +1485,22 @@ class TypeCheckerTest(TestCase):
                 raise AssertionError(f"Expected n.type == {expected}, got {n.type}")
 
     def test_type_check_conv2D_types(self):
+        # [FUNCTION DOC] Type checks the convolution block and infers symbolic types; the height
+        # and width dims of each call_module node type must be floor expressions from sympy.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with a 3x3 convolution and batch norm; forward uses the
+            # convolution.
             def __init__(self, inplanes, planes, stride=1):
+                # [FUNCTION DOC] HELPER: Builds conv1 through the conv3x3 helper and bn1 as
+                # BatchNorm2d.
                 super().__init__()
                 norm_layer = torch.nn.BatchNorm2d
                 self.conv1 = conv3x3(inplanes, planes, stride)
                 self.bn1 = norm_layer(planes)
 
             def forward(self, x: Dyn):
+                # [FUNCTION DOC] HELPER: Applies conv1 to x, adds x to the result in place and
+                # returns it.
                 identity = x
                 out: TensorType((2, 2, Dyn, 4)) = self.conv1(x)
                 out += identity
@@ -1276,8 +1528,16 @@ class TypeCheckerTest(TestCase):
                     )
 
     def test_type_check_symbolic_inferenceconv2D_maxpool2d_flatten(self):
+        # [FUNCTION DOC] Type checks the conv, pool, conv, pool, linear, adaptive pool, flatten
+        # block with unknown height and width, using plain symbolic tracing, then infers symbolic
+        # types and asserts conv1 and conv2 outputs have floor expressions of symbols minus four
+        # for height and width. The unused RewritingTracer variable is silenced with a lint
+        # exemption.
         class BasicBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block chaining conv, pool, conv, pool, a linear layer on the
+            # last dim, adaptive average pooling and flatten.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1, pool, conv2, fc1 and pool2 layers.
                 super().__init__()
 
                 self.conv1 = torch.nn.Conv2d(3, 6, 5)
@@ -1287,6 +1547,8 @@ class TypeCheckerTest(TestCase):
                 self.pool2 = torch.nn.AdaptiveAvgPool2d((6, 7))
 
             def forward(self, x: TensorType((4, 3, Dyn, Dyn))):
+                # [FUNCTION DOC] HELPER: Applies the layers in order and flattens from dim one;
+                # returns the result.
                 out = self.conv1(x)
                 out = self.pool(out)
                 out = self.conv2(out)
