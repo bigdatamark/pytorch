@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+    # [MODULE DOC] Tests for the fake process group backend (backend name fake) of
+    # torch.distributed. They check that collectives (all_reduce, all_gather, reduce_scatter,
+    # scatter, gather, all_to_all, send/recv, broadcast) run without real communication, that
+    # outputs get copy semantics even when inputs require grad, that argument validation errors
+    # are raised, and that FSDP, tensor parallel, tracing and split_group work on a fake world.
+    # Import-time side effects: exits the process with status 0 if torch.distributed is
+    # unavailable, and computes the module-level device_type from get_devtype. Running the file
+    # as a script calls run_tests.
 
 import sys
 import unittest
@@ -41,7 +49,15 @@ device_type = get_devtype().type
 
 
 class TestFakePG(TestCase):
+    # [CLASS DOC] Test case for FakeProcessGroup and the fake backend. Each test initializes a
+    # default process group with the fake backend (varying rank and world size, optionally with
+    # a FakeStore or HashStore) and calls collectives or higher-level wrappers on it. tearDown
+    # destroys the default group so tests do not leak state. Parametrized tests are expanded by
+    # instantiate_parametrized_tests at module end.
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the base tearDown, then destroys the default process
+        # group, ignoring the AssertionError raised when no group was initialized (for example
+        # in tests that never created one).
         super().tearDown()
         try:
             dist.destroy_process_group()
@@ -49,12 +65,16 @@ class TestFakePG(TestCase):
             pass
 
     def test_invalid_rank(self):
+        # [FUNCTION DOC] Checks that init_process_group with the fake backend, rank 3 and world
+        # size 2 raises a RuntimeError whose message says the rank must be below the world size.
         with self.assertRaisesRegex(
             RuntimeError, "Cannot init process group where rank .* >= world_size"
         ):
             dist.init_process_group(backend="fake", rank=3, world_size=2)
 
     def test_all_reduce(self):
+        # [FUNCTION DOC] Initializes a 2-rank fake group as rank 1 and runs all_reduce on a 3x3
+        # tensor in place; asserts only that the shape is unchanged.
         dist.init_process_group(backend="fake", rank=1, world_size=2)
 
         output = torch.ones(3, 3) * dist.get_rank()
@@ -62,6 +82,9 @@ class TestFakePG(TestCase):
         self.assertEqual(tuple(output.shape), (3, 3))
 
     def test_set_timeout(self):
+        # [FUNCTION DOC] Creates a FakeProcessGroup directly via the internal constructor and
+        # calls set_timeout on it; asserts nothing and passes if no exception is raised (setting
+        # a timeout is a no-op on the fake group).
         # FakeProcessGroup used to inherit Backend's default set_timeout, which
         # raised "does not support setting timeout". Setting a timeout is a
         # no-op for a group that does no real communication, but it must not
@@ -70,6 +93,9 @@ class TestFakePG(TestCase):
         backend.set_timeout(timedelta(seconds=42))
 
     def test_set_timeout_via_dist(self):
+        # [FUNCTION DOC] Initializes a fake default group with a FakeStore and calls the dist
+        # level set_timeout with 30 seconds; passes if it does not raise, which covers
+        # forwarding through ProcessGroup to a backend that has null options.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
         # Forwards through ProcessGroup to the fake backend; must not raise (the
@@ -77,6 +103,9 @@ class TestFakePG(TestCase):
         dist.set_timeout(timedelta(seconds=30))
 
     def test_add_ephemeral_timeout_is_noop(self):
+        # [FUNCTION DOC] Checks that adding an ephemeral timeout is a no-op that does not raise,
+        # both on a directly created FakeProcessGroup and through the internal helper that
+        # applies it to all process groups of an initialized fake world.
         backend = FakeProcessGroup._create_internal(0, world_size=2)
         backend._add_ephemeral_timeout(timedelta(seconds=42))
 
@@ -85,6 +114,8 @@ class TestFakePG(TestCase):
         dist.distributed_c10d._add_ephemeral_timeout_for_all_pgs(timedelta(seconds=42))
 
     def test_allgather(self):
+        # [FUNCTION DOC] Runs all_gather as rank 1 of 2 into a list of two empty tensors and
+        # asserts each output keeps shape 3x3.
         dist.init_process_group(backend="fake", rank=1, world_size=2)
 
         input_tensor = torch.ones(3, 3) * dist.get_rank()
@@ -94,6 +125,10 @@ class TestFakePG(TestCase):
             self.assertEqual(tuple(out_tensor.shape), (3, 3))
 
     def test_allgather_into_tensor_requires_grad(self):
+        # [FUNCTION DOC] Regression test: all_gather_single into a flat output of size 4 times
+        # world size from an input that requires grad must succeed (it used to hit an autograd
+        # safety check because the fake backend writes into chunk views of the output). Asserts
+        # the output shape.
         # Regression test: fake PG's _allgather_base uses chunk() which
         # produces multi-output views. Writing into those views inplace when
         # the input requires grad used to trip an autograd safety check.
@@ -106,6 +141,8 @@ class TestFakePG(TestCase):
         self.assertEqual(output_tensor.shape, (4 * world_size,))
 
     def test_reduce_scatter(self):
+        # [FUNCTION DOC] Runs reduce_scatter as rank 1 of 2 with a list of two 3x3 tensors and
+        # asserts the output shape stays 3x3.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -117,6 +154,9 @@ class TestFakePG(TestCase):
 
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_construct_fsdp(self):
+        # [FUNCTION DOC] Skipped without an accelerator. Initializes a fake 2-rank group with a
+        # FakeStore and constructs an FSDP wrapper around a small linear layer on the
+        # accelerator; passes if construction does not raise.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
         FSDP(nn.Linear(2, 3, device=device_type))
@@ -124,6 +164,9 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_fsdp_fake_e2e(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Wraps a small three-layer
+        # module in FSDP with use_orig_params on a fake 2-rank group, then runs one forward
+        # pass, a backward pass and an Adam step; passes if nothing raises.
         store = dist.HashStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
         my_module = nn.Sequential(
@@ -142,18 +185,26 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_fake_pg_tracing(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Traces a function calling the
+        # functional all_gather_single on the default fake group with make_fx and uses FileCheck
+        # to assert that the graph contains an all_gather node followed by a wait_tensor node.
         store = dist.HashStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
         default_pg = dist.distributed_c10d._get_default_group()
 
         def allgather_fn(tensor):
+            # [FUNCTION DOC] HELPER: Traced function that all-gathers its input along dim 0 over
+            # the default group via the functional collectives API and returns the result.
             return funcol.all_gather_single(tensor, 0, default_pg)
 
         gm = make_fx(allgather_fn)(torch.randn(2, 2, device=device_type))
         FileCheck().check("all_gather").check("wait_tensor").run(str(gm.graph))
 
     def test_broadcast(self):
+        # [FUNCTION DOC] Runs broadcast on a fake 2-rank group as rank 0 with src equal to the
+        # rank and with src not equal to the rank; asserts the tensor shape is unchanged in
+        # both cases.
         dist.init_process_group(backend="fake", rank=0, world_size=2)
 
         # src == rank
@@ -167,6 +218,9 @@ class TestFakePG(TestCase):
         self.assertEqual(tuple(output.shape), (3, 3))
 
     def test_scatter(self):
+        # [FUNCTION DOC] Runs scatter as rank 0, once as the source with a list of two tensors
+        # and once as a non-source with no list and src 1; asserts the output shape is unchanged
+        # each time.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -182,6 +236,8 @@ class TestFakePG(TestCase):
         self.assertEqual(tuple(output.shape), (3, 3))
 
     def test_alltoall(self):
+        # [FUNCTION DOC] Runs all_to_all on a fake 2-rank group with two 3x3 inputs and outputs;
+        # asserts the output list length is 2 and each shape is 3x3.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -193,6 +249,8 @@ class TestFakePG(TestCase):
             self.assertEqual(tuple(output.shape), (3, 3))
 
     def test_alltoall_base(self):
+        # [FUNCTION DOC] Runs all_to_all_single with explicit equal split sizes on 4x3 tensors;
+        # asserts the output shape is unchanged.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -204,6 +262,8 @@ class TestFakePG(TestCase):
         self.assertEqual(tuple(out_tensor.shape), (4, 3))
 
     def test_send(self):
+        # [FUNCTION DOC] Sends a 3x3 tensor to rank 1 on a fake group as rank 0; asserts only
+        # that the call returns and the tensor shape is intact.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -212,6 +272,8 @@ class TestFakePG(TestCase):
         self.assertEqual(tuple(tensor.shape), (3, 3))
 
     def test_recv(self):
+        # [FUNCTION DOC] Receives into a 3x3 tensor from rank 1 on a fake group as rank 0;
+        # asserts only that the call returns and the shape is intact.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -222,6 +284,11 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_fsdp_tp_fake_e2e(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. On a fake world of 4 ranks
+        # builds a 2x2 device mesh (dp, tp), applies tensor parallel plans (sequence-parallel
+        # layouts and plain colwise/rowwise) to an MLP module, wraps it in FSDP over the dp
+        # mesh, and runs 10 forward/backward/Adam steps per plan with seeded random inputs;
+        # passes if nothing raises.
         world_size = 4
         tp_size = 2
 
@@ -265,6 +332,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_reduce_scatter_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs reduce_scatter with inputs equal
+        # to the rank index times ones and asserts the output equals the input slot at this
+        # rank, i.e. the fake group copies the local slot rather than reducing.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -274,6 +344,8 @@ class TestFakePG(TestCase):
         self.assertEqual(output, to_reduce_scatter[rank])
 
     def test_reduce_scatter_requires_grad(self):
+        # [FUNCTION DOC] Runs reduce_scatter as rank 1 with inputs that require grad; asserts
+        # the output equals the input at index 1 and that the output does not require grad.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -288,6 +360,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_scatter_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Rank 0 scatters a list and asserts it
+        # receives the first element; rank 1 scatters with no list and asserts its output tensor
+        # is left unchanged.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -302,6 +377,8 @@ class TestFakePG(TestCase):
             self.assertEqual(output, torch.ones(3, 3) * 5)
 
     def test_scatter_requires_grad(self):
+        # [FUNCTION DOC] Scatters from rank 0 a list of inputs that require grad; asserts the
+        # output equals the first input and does not require grad.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -316,6 +393,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_reduce_scatter_base_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Calls the base reduce-scatter on a
+        # 6x2 input into a 3x2 output and asserts the output equals the chunk of the input at
+        # this rank.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -326,6 +406,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_reduce_scatter_tensor_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Calls reduce_scatter_tensor on a 4x2
+        # input into a 2x2 output and asserts the output equals the chunk of the input at
+        # this rank.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -335,6 +418,8 @@ class TestFakePG(TestCase):
         self.assertEqual(out_tensor, in_tensor.chunk(2)[rank])
 
     def test_reduce_scatter_base_requires_grad(self):
+        # [FUNCTION DOC] As rank 1, calls the base reduce-scatter with an input that requires
+        # grad and asserts the output equals the input chunk at index 1.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -344,6 +429,8 @@ class TestFakePG(TestCase):
         self.assertEqual(out_tensor, in_tensor.chunk(2)[1])
 
     def test_reduce_scatter_tensor_coalesced_requires_grad(self):
+        # [FUNCTION DOC] As rank 1, calls reduce_scatter_tensor inside a coalescing manager with
+        # an input that requires grad; asserts the output equals the input chunk at index 1.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -355,6 +442,8 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_allgather_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_gather of a constant tensor
+        # valued 42 and asserts every gathered output equals the input.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -365,6 +454,8 @@ class TestFakePG(TestCase):
             self.assertEqual(out, input_tensor)
 
     def test_allgather_requires_grad(self):
+        # [FUNCTION DOC] As rank 1, all_gathers an input that requires grad; asserts every
+        # output equals the input and none requires grad.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -377,6 +468,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_gather_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Rank 0 gathers into a list and asserts
+        # each entry equals the input; rank 1 gathers with no list and destination 0, which must
+        # simply not raise.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -390,6 +484,8 @@ class TestFakePG(TestCase):
             dist.gather(input_tensor, None, dst=0)
 
     def test_gather_requires_grad(self):
+        # [FUNCTION DOC] As rank 0, gathers an input that requires grad into a list; asserts
+        # each output equals the input and does not require grad.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -402,6 +498,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_allgather_coalesced_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_gather_coalesced of three
+        # tensors into two output lists and asserts each output entry equals the
+        # corresponding input.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -413,6 +512,8 @@ class TestFakePG(TestCase):
                 self.assertEqual(out, inputs[i])
 
     def test_allgather_coalesced_requires_grad(self):
+        # [FUNCTION DOC] As rank 1, runs all_gather_coalesced on inputs that require grad;
+        # asserts each output equals its input and does not require grad.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -429,6 +530,8 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_alltoall_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_to_all with two tensors and
+        # asserts each output equals the input at the same index.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -439,6 +542,8 @@ class TestFakePG(TestCase):
             self.assertEqual(output_list[i], input_list[i])
 
     def test_alltoall_requires_grad(self):
+        # [FUNCTION DOC] As rank 1, runs all_to_all on inputs that require grad and asserts each
+        # output equals the input at the same index.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -453,6 +558,8 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_alltoall_base_copy_semantics(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_to_all_single with default
+        # splits on a 4x2 tensor and asserts the output equals the input.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -463,6 +570,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_alltoall_base_split_sizes_repeat(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_to_all_single with output
+        # splits 2 and 6 and input splits 1 and 3; asserts the output has the input data
+        # repeated cyclically to fill the larger slot, matching a hard-coded expected tensor.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -483,6 +593,9 @@ class TestFakePG(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_alltoall_base_split_sizes_truncate(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1. Runs all_to_all_single with output
+        # splits 1 and 3 and input splits 4 and 4; asserts each output slot holds the input
+        # truncated to the slot size, matching a hard-coded expected tensor.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=rank, world_size=2, store=store)
 
@@ -500,6 +613,10 @@ class TestFakePG(TestCase):
         self.assertEqual(out_tensor, expected)
 
     def test_alltoall_base_split_size_validation(self):
+        # [FUNCTION DOC] Checks that all_to_all_single raises RuntimeError for three bad cases:
+        # a first dimension not divisible by group size, a split list whose length differs from
+        # group size, and split sizes that do not sum to the dim 0 size. Each is matched by
+        # error message.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -529,6 +646,8 @@ class TestFakePG(TestCase):
             )
 
     def test_alltoall_base_empty_input_with_output(self):
+        # [FUNCTION DOC] Checks that all_to_all_single with an empty input but a non-empty
+        # output split raises a RuntimeError mentioning an empty input buffer.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -541,6 +660,8 @@ class TestFakePG(TestCase):
             )
 
     def test_alltoall_list_size_validation(self):
+        # [FUNCTION DOC] Checks that all_to_all with one output tensor and two input tensors
+        # raises a RuntimeError saying the list size does not match the world size.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -551,6 +672,9 @@ class TestFakePG(TestCase):
             )
 
     def test_alltoall_base_requires_grad(self):
+        # [FUNCTION DOC] Regression test: all_to_all_single with an input requiring grad must
+        # not fail, in both the default-split and the uneven split case, because the fake
+        # backend writes outputs below autograd. Only checks that no exception is raised.
         # Real backends write into output from C++ kernels autograd never sees.
         # Without AutoDispatchBelowAutograd, copy_ into a narrow()/chunk() view
         # would fail when input requires grad.
@@ -571,6 +695,11 @@ class TestFakePG(TestCase):
         )
 
     def test_error_on_collective(self):
+        # [FUNCTION DOC] First runs all_reduce on a default fake group without error. Then
+        # destroys the group, re-initializes it with FakeProcessGroup options having
+        # error_on_collective set, and asserts that all_reduce, all_gather, broadcast and
+        # barrier each raise a RuntimeError containing the fake process group collective error
+        # text. Re-imports FakeStore and FakeProcessGroup locally.
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
         # Test with error_on_collective=False (default behavior)
@@ -619,8 +748,16 @@ class TestFakePG(TestCase):
             dist.barrier()
 
     def test_fake_process_group_direct_usage_error(self):
+        # [FUNCTION DOC] Checks that constructing FakeProcessGroup directly with rank and world
+        # size raises a TypeError saying no constructor is defined; the dispatch-mode block
+        # inside the assertion is never reached.
         class SimpleTensorMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Minimal TorchDispatchMode that forwards every call unchanged.
+            # Used only inside the enclosing test.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Dispatch hook that defaults kwargs to an empty
+                # mapping and calls the intercepted function with the same arguments,
+                # returning its result.
                 if kwargs is None:
                     kwargs = {}
                 return func(*args, **kwargs)
@@ -633,11 +770,22 @@ class TestFakePG(TestCase):
                 dist.all_reduce(tensor, group=fake_pg)
 
     def test_fake_process_group_proper_usage_dispatch(self):
+        # [FUNCTION DOC] Initializes a fake 3-rank group, then runs a tensor creation and
+        # all_reduce under a recording dispatch mode; asserts the recorded op names include the
+        # lift_fresh op and the c10d allreduce_ op, showing the fake collective dispatches
+        # through the c10d op.
         class SimpleTensorMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: TorchDispatchMode that appends the string form of each
+            # dispatched function to its ops list and then runs it unchanged.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the recorded op list as empty. Does not
+                # call the base class initializer.
                 self.ops = []
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Records the string form of the function in the ops
+                # list, defaults kwargs to an empty mapping, and returns the result of calling
+                # the function.
                 self.ops.append(str(func))
                 if kwargs is None:
                     kwargs = {}
@@ -655,6 +803,8 @@ class TestFakePG(TestCase):
         self.assertIn("c10d.allreduce_.default", op_names)
 
     def test_reduce_scatter_wrong_input_list_size(self):
+        # [FUNCTION DOC] Checks that reduce_scatter with a one-element input list on a 2-rank
+        # fake group raises a RuntimeError saying the list size must equal the world size.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
 
@@ -665,6 +815,8 @@ class TestFakePG(TestCase):
             dist.reduce_scatter(output, [torch.ones(3, 3)])
 
     def test_scatter_wrong_input_list_size(self):
+        # [FUNCTION DOC] Checks that scatter as rank 0 with a one-element input list on a 2-rank
+        # fake group raises a RuntimeError about an incorrect input list size.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -673,6 +825,9 @@ class TestFakePG(TestCase):
             dist.scatter(output, [torch.ones(3, 3)])
 
     def test_scatter_non_root_rejects_input_list(self):
+        # [FUNCTION DOC] As rank 1 with root 0, calls the process group scatter directly with
+        # a non-empty input list and asserts a RuntimeError saying non-root ranks require
+        # empty input.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
         pg = dist.distributed_c10d._get_default_group()
@@ -685,6 +840,9 @@ class TestFakePG(TestCase):
             pg.scatter([output], inputs, opts)
 
     def test_gather_non_root_rejects_output_list(self):
+        # [FUNCTION DOC] As rank 1 with root 0, calls the process group gather directly with
+        # a non-empty output list and asserts a RuntimeError saying non-root ranks require
+        # empty output.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=1, world_size=2, store=store)
         pg = dist.distributed_c10d._get_default_group()
@@ -696,6 +854,8 @@ class TestFakePG(TestCase):
             pg.gather(output, [torch.ones(3, 3)], opts)
 
     def test_gather_invalid_root_rank(self):
+        # [FUNCTION DOC] Calls the process group gather directly with root rank 3 on a 2-rank
+        # group and asserts a RuntimeError mentioning an invalid root rank.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
         pg = dist.distributed_c10d._get_default_group()
@@ -707,6 +867,9 @@ class TestFakePG(TestCase):
             pg.gather(output, [torch.ones(3, 3)], opts)
 
     def test_reduce_scatter_wrong_output_list_size(self):
+        # [FUNCTION DOC] Calls the process group reduce_scatter directly with two outputs but
+        # one input list and asserts a RuntimeError saying input and output lists must have the
+        # same length.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
         pg = dist.distributed_c10d._get_default_group()
@@ -720,6 +883,8 @@ class TestFakePG(TestCase):
             pg.reduce_scatter(outputs, inputs, opts)
 
     def test_reduce_scatter_base_wrong_input_size(self):
+        # [FUNCTION DOC] Calls the base reduce-scatter with an input the same size as the output
+        # (not world size times larger) and asserts a RuntimeError about the input size.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -732,6 +897,9 @@ class TestFakePG(TestCase):
             dist._reduce_scatter_base(out_buf, in_buf)
 
     def test_allgather_coalesced_wrong_inner_list_size(self):
+        # [FUNCTION DOC] Calls all_gather_coalesced with an output list containing an inner list
+        # of the wrong length (one list has one entry, the other is empty) and asserts a
+        # RuntimeError mentioning an invalid output size.
         store = FakeStore()
         dist.init_process_group(backend="fake", rank=0, world_size=2, store=store)
 
@@ -744,6 +912,12 @@ class TestFakePG(TestCase):
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     @parametrize("rank", [0, 1, 2, 3])
     def test_split_group(self, rank):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Parametrized over ranks 0 to
+        # 3 of a fake world of 4 with device_id set. Asserts the parent backend supports
+        # splitting, calls split_group with unsorted interleaved groups [2,0] and [3,1], and
+        # checks the new group size, that its rank equals the position of this rank in its
+        # listed subgroup, and that the global rank mapping maps back to the original rank.
+        # Finally runs all_reduce on the split group.
         world_size = 4
         store = FakeStore()
         dist.init_process_group(
@@ -786,6 +960,11 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_split_group_backend_filter(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Calls split_group with
+        # several backend filters on a fake world: bare fake keeps all parent device types,
+        # cpu:fake keeps only cpu, a cpu plus accelerator filter keeps both, and mps:fake,
+        # cpu:gloo and gloo are rejected with ValueError (not present in the parent, or backend
+        # mismatch). Regression test for filter validation of a bare fake backend string.
         # A fake world's backend string is the bare name "fake", which
         # BackendConfig expands to every device fake supports. split_group's
         # filter validation used to re-expand it through
@@ -830,6 +1009,9 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_split_group_non_member(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. As rank 0 of 4, splits into
+        # the single group [1,2,3] and asserts the result is the NON_GROUP_MEMBER sentinel
+        # because this rank is in no group.
         store = FakeStore()
         dist.init_process_group(
             backend="fake",
@@ -846,12 +1028,19 @@ class TestFakePG(TestCase):
     @skipIfHpu
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     def test_split_group_store_not_retained(self):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Regression test that
+        # initializes the fake group in a helper so the Python reference to the FakeStore is
+        # dropped, then calls split_group; asserts the split group has size 2, which only works
+        # if the store clone is a real C++ method.
         # split_group clones the parent's store, and the process group holds the
         # store only at the C++ level. FakeStore.clone() must therefore be a
         # real C++ method: a pure-Python Store.clone() override would be garbage
         # collected once the caller drops its reference, and the split would
         # fail with "pure virtual function Store::clone".
         def setup():
+            # [FUNCTION DOC] HELPER: Initializes a 2-rank fake default group as rank 0 with a
+            # fresh FakeStore created inline and device_id set, so no Python reference to the
+            # store survives after return.
             dist.init_process_group(
                 backend="fake",
                 rank=0,
@@ -869,6 +1058,13 @@ class TestFakePG(TestCase):
     @unittest.skipIf(not HAS_ACCELERATOR, "No accelerator")
     @parametrize("rank", [0, 1, 2, 3])
     def test_split_group_consistent_naming_after_partial_split(self, rank):
+        # [FUNCTION DOC] Skipped on HPU or without an accelerator. Regression test for issue
+        # 190396, parametrized over ranks 0 to 3 of a fake world of 4. Records the world group
+        # counter, does a partial split [0,1,2] and asserts the counter advances by one on every
+        # rank (non-member rank 3 gets a non-process-group result), then does a full split
+        # [[0,2],[1,3]] and asserts the counter advances again. Finally asserts the new group
+        # name equals the hex sha1 digest of the joined member ranks and the counter value
+        # before the second split.
         # Regression test for https://github.com/pytorch/pytorch/issues/190396.
         #
         # _hash_ranks_to_str previously used len(_world.pg_names) as the

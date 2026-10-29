@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests of the autograd formulas of the functional collectives (all_reduce,
+# all_gather, reduce_scatter, all_to_all_single and their coalesced forms): forward results,
+# backward results (all_reduce backward is all_reduce, all_gather backward is reduce_scatter,
+# reduce_scatter backward is all_gather, all_to_all backward is all_to_all),
+# torch.library.opcheck checks for the c10d functional ops and their _autograd variants, and
+# torch.compile integration. Import-time side effects: exits with status 0 if distributed is
+# unavailable; builds devices as cpu plus the current accelerator type, if any; DEVICE stays
+# cuda. Running as a script calls run_tests.
 
 import sys
 from functools import partial, wraps
@@ -32,11 +40,20 @@ if acc := torch.accelerator.current_accelerator(True):
 
 
 def with_comms(func=None):
+    # [FUNCTION DOC] Decorator for test methods. When called with no function it returns a
+    # partial that decorates later; otherwise wraps func so that if CUDA is available with fewer
+    # accelerators than world size it exits with the skip exit code, then creates a process
+    # group via create_pg for DEVICE, stores it as pg and the device name as device on the test,
+    # runs func and always destroys the process group.
+    # KNOWN ISSUE: the skip check only looks at CUDA while devices may include other
+    # accelerators, and DEVICE is hard-coded to cuda regardless of the accelerator found.
     if func is None:
         return partial(with_comms)
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that applies the skip check, process group setup and
+        # cleanup described above, forwarding all arguments to the test function.
         if (
             torch.cuda.is_available()
             and torch.accelerator.device_count() < self.world_size
@@ -55,11 +72,18 @@ def with_comms(func=None):
 
 @instantiate_parametrized_tests
 class TestFunctionalDifferentials(MultiThreadedTestCase):
+    # [CLASS DOC] Forward and backward correctness tests, opcheck registration tests and
+    # autograd-op compatibility tests of the functional collectives on 4 multi-threaded fake
+    # ranks. Most tests are parametrized over devices; test_utils and autograd_test_utils are
+    # class attribute lists of opcheck test names used by parametrize.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property returning 4, the number of threads the multithreaded test
+        # case spawns.
         return 4
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the base setUp and then spawns the rank threads.
         super().setUp()
         self._spawn_threads()
 
@@ -69,6 +93,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_reduce_forward(self, device):
+        # [FUNCTION DOC] Forward of all_reduce with sum on a tensor filled with the rank value;
+        # asserts every rank gets the sum of ranks. Tensors are different on each rank and the
+        # expected values are computed from the rank index. Parametrized over devices.
         """Test all_reduce does all_reduce in forward.
 
         Tensor is VARYING (different across ranks).
@@ -92,6 +119,10 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
     @parametrize("device", devices)
     @parametrize("gather_dim", [0, 1, 2])
     def test_all_gather_tensor_forward(self, device, gather_dim):
+        # [FUNCTION DOC] Forward of all_gather_single along gather_dim 0, 1 or 2 on a 3x3x3
+        # tensor filled with the rank value; asserts the output shape has gather_dim multiplied
+        # by world size and each 3-wide chunk along that dim holds the corresponding rank value.
+        # Parametrized over devices and gather_dim.
         """Test all_gather_tensor produces correct output shape.
 
         Tensor is VARYING (different across ranks).
@@ -121,6 +152,10 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
     @parametrize("device", devices)
     @parametrize("scatter_dim", [0, 1])
     def test_reduce_scatter_tensor_forward(self, device, scatter_dim):
+        # [FUNCTION DOC] Forward of reduce_scatter_single along scatter_dim 0 or 1, with
+        # each rank contributing its rank value; asserts the output shape divides that dim
+        # by world size and every element equals the sum of ranks. Parametrized over devices
+        # and scatter_dim.
         """Test reduce_scatter_tensor produces correct output shape.
 
         Tensor is VARYING (different across ranks).
@@ -155,6 +190,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_to_all_single_forward(self, device):
+        # [FUNCTION DOC] Forward of all_to_all_single with no split sizes (uniform) on a tensor
+        # filled with the rank value; asserts the output has the input shape and the chunk of
+        # rows from position r holds value r. Parametrized over devices.
         """Test all_to_all_single with uniform splits.
 
         Tensor is VARYING (different across ranks).
@@ -187,6 +225,8 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_reduce_coalesced_forward(self, device):
+        # [FUNCTION DOC] Forward of all_reduce_coalesced on two tensors filled with the rank
+        # value; asserts each output equals the sum of ranks. Parametrized over devices.
         """Test all_reduce_coalesced does all_reduce on each tensor.
 
         Tensors are VARYING (different across ranks).
@@ -210,6 +250,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_gather_into_tensor_coalesced_forward(self, device):
+        # [FUNCTION DOC] Forward of all_gather_single_coalesced on two tensors; asserts each
+        # output shape has the first dim multiplied by world size. Values are not checked.
+        # Parametrized over devices.
         """Test all_gather_into_tensor_coalesced gathers each tensor.
 
         Tensors are VARYING (different across ranks).
@@ -233,6 +276,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_reduce_scatter_tensor_coalesced_forward(self, device):
+        # [FUNCTION DOC] Forward of reduce_scatter_single_coalesced on two tensors with scatter
+        # dims 0; asserts output shapes divide the first dim by world size and values equal the
+        # sum of ranks. Parametrized over devices.
         """Test reduce_scatter_tensor_coalesced reduces and scatters each tensor.
 
         Tensors are VARYING (different across ranks).
@@ -267,6 +313,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_reduce_backward(self, device):
+        # [FUNCTION DOC] Backward of all_reduce with sum: asserts the gradient after a sum
+        # backward equals world size, and that the gradient from autograd.grad with random grad
+        # outputs equals an all_reduce of those grad outputs. Parametrized over devices.
         """Test all_reduce backward does all_reduce.
 
         Both tensor AND gradients are VARYING (different across ranks).
@@ -296,6 +345,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_reduce_avg_backward(self, device):
+        # [FUNCTION DOC] Backward of all_reduce with avg: asserts the gradient of a sum backward
+        # equals ones, and that autograd.grad with random grad outputs equals an avg all_reduce
+        # of those grad outputs. Parametrized over devices.
         """Test all_reduce backward with the 'avg' reduction.
 
         Both tensor AND gradients are VARYING (different across ranks).
@@ -322,6 +374,10 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
     @parametrize("device", devices)
     @parametrize("gather_dim", [0, 1, 2])
     def test_all_gather_tensor_backward(self, device, gather_dim):
+        # [FUNCTION DOC] Backward of all_gather_single along gather_dim: asserts the sum
+        # backward gradient equals world size and that autograd.grad with random grad outputs
+        # equals reduce_scatter_single of them along gather_dim. Parametrized over devices
+        # and gather_dim.
         """Test all_gather_tensor backward does reduce_scatter.
 
         Both tensor AND gradients are VARYING (different across ranks).
@@ -358,6 +414,10 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
     @parametrize("device", devices)
     @parametrize("scatter_dim", [0, 1])
     def test_reduce_scatter_tensor_backward(self, device, scatter_dim):
+        # [FUNCTION DOC] Backward of reduce_scatter_single along scatter_dim: asserts the
+        # gradient has the input shape and equals ones, and that autograd.grad with random grad
+        # outputs equals all_gather_single of them along scatter_dim. Parametrized over devices
+        # and scatter_dim.
         """Test reduce_scatter_tensor backward does all_gather.
 
         Both tensor AND gradients are VARYING (different across ranks).
@@ -402,6 +462,12 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_to_all_single_backward(self, device):
+        # [FUNCTION DOC] Backward of all_to_all_single with uniform splits: asserts the gradient
+        # has the input shape and equals ones, and that autograd.grad with random grad outputs
+        # equals all_to_all_single of them with no split sizes. Parametrized over devices.
+        # KNOWN ISSUE: the docstring says backward reverses split sizes and a comment says
+        # backward is all_gather, but only uniform splits are tested and the backward is
+        # an all_to_all.
         """Test all_to_all_single backward reverses split sizes.
 
         Both tensor AND gradients are VARYING (different across ranks).
@@ -440,6 +506,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_reduce_coalesced_backward(self, device):
+        # [FUNCTION DOC] Backward of all_reduce_coalesced on two tensors: sums all output
+        # elements, backpropagates and asserts each gradient equals world size. Parametrized
+        # over devices.
         """Test all_reduce_coalesced backward does all_reduce on each gradient.
 
         Tensors AND gradients are VARYING (different across ranks).
@@ -467,6 +536,8 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_gather_into_tensor_coalesced_backward(self, device):
+        # [FUNCTION DOC] Backward of all_gather_single_coalesced on two tensors: asserts each
+        # gradient equals world size after a sum backward. Parametrized over devices.
         """Test all_gather_into_tensor_coalesced backward does reduce_scatter on each gradient.
 
         Tensors AND gradients are VARYING (different across ranks).
@@ -494,6 +565,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_reduce_scatter_tensor_coalesced_backward(self, device):
+        # [FUNCTION DOC] Backward of reduce_scatter_single_coalesced on two tensors with
+        # scatter dims 0: asserts each gradient equals ones after a sum backward. Parametrized
+        # over devices.
         """Test reduce_scatter_tensor_coalesced backward does all_gather on each gradient.
 
         Tensors AND gradients are VARYING (different across ranks).
@@ -534,6 +608,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", test_utils)
     def test_all_reduce_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs torch.library.opcheck on the c10d functional all_reduce op with an
+        # input requiring grad, for the selected test utility (schema, autograd registration or
+        # fake tensor). Parametrized over test_utils.
         """Test all_reduce op registration with torch.library.opcheck.
 
         Verifies all aspects of op registration including:
@@ -554,6 +631,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", test_utils)
     def test_all_gather_into_tensor_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs torch.library.opcheck on the functional all_gather_into_tensor
+        # op with group size equal to world size, for the selected test utility. Parametrized
+        # over test_utils.
         """Test all_gather_into_tensor op registration with torch.library.opcheck.
 
         Verifies all aspects of op registration including:
@@ -574,6 +654,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", test_utils)
     def test_reduce_scatter_tensor_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs torch.library.opcheck on the functional reduce_scatter_tensor op
+        # with sum, a first dim divisible by world size, for the selected test utility.
+        # Parametrized over test_utils.
         """Test reduce_scatter_tensor op registration with torch.library.opcheck.
 
         Verifies all aspects of op registration including:
@@ -595,6 +678,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", test_utils)
     def test_all_to_all_single_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs torch.library.opcheck on the functional all_to_all_single op with
+        # explicit equal output and input split sizes derived from the group size, for the
+        # selected test utility. Parametrized over test_utils.
         """Test all_to_all_single op registration with torch.library.opcheck.
 
         Verifies all aspects of op registration including:
@@ -624,6 +710,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_gather_into_tensor_autograd_backward(self, device):
+        # [FUNCTION DOC] Calls the autograd variant of all_gather_into_tensor, waits on the
+        # result, backpropagates a sum and asserts the gradient equals world size. Parametrized
+        # over devices.
         """Test _c10d_functional_autograd.all_gather_into_tensor backward.
 
         Verifies backward compatibility: the autograd ops should have the same
@@ -649,6 +738,8 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_reduce_scatter_tensor_autograd_backward(self, device):
+        # [FUNCTION DOC] Calls the autograd variant of reduce_scatter_tensor with sum, waits,
+        # backpropagates a sum and asserts the gradient equals ones. Parametrized over devices.
         """Test _c10d_functional_autograd.reduce_scatter_tensor backward.
 
         Verifies backward compatibility: the autograd ops should have the same
@@ -674,6 +765,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("device", devices)
     def test_all_to_all_single_autograd_backward(self, device):
+        # [FUNCTION DOC] Calls the autograd variant of all_to_all_single with explicit equal
+        # splits, waits, backpropagates a sum and asserts the gradient has input shape and
+        # equals ones. Parametrized over devices.
         """Test _c10d_functional_autograd.all_to_all_single backward.
 
         Verifies backward compatibility: the autograd ops should have the same
@@ -714,6 +808,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", autograd_test_utils)
     def test_all_gather_into_tensor_autograd_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs opcheck on the autograd variant of all_gather_into_tensor for the
+        # schema and autograd registration utilities (fake tensor is skipped as it shares its
+        # implementation). Parametrized over autograd_test_utils.
         """Test _c10d_functional_autograd.all_gather_into_tensor op registration."""
         group_name = dist.group.WORLD.group_name
 
@@ -727,6 +824,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", autograd_test_utils)
     def test_reduce_scatter_tensor_autograd_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs opcheck on the autograd variant of reduce_scatter_tensor
+        # with sum for the schema and autograd registration utilities. Parametrized
+        # over autograd_test_utils.
         """Test _c10d_functional_autograd.reduce_scatter_tensor op registration."""
         group_name = dist.group.WORLD.group_name
 
@@ -740,6 +840,9 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
     @parametrize("test_utils", autograd_test_utils)
     def test_all_to_all_single_autograd_opcheck(self, test_utils):
+        # [FUNCTION DOC] Runs opcheck on the autograd variant of all_to_all_single with explicit
+        # equal split sizes for the schema and autograd registration utilities. Parametrized
+        # over autograd_test_utils.
         """Test _c10d_functional_autograd.all_to_all_single op registration."""
         group_name = dist.group.WORLD.group_name
         group_size = dist.group.WORLD.size()
@@ -757,21 +860,30 @@ class TestFunctionalDifferentials(MultiThreadedTestCase):
 
 @instantiate_parametrized_tests
 class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
+    # [CLASS DOC] torch.compile integration tests of the functional collectives and their
+    # autograd variants on a 2-rank DistributedTestBase, using with_comms to create the process
+    # group for DEVICE. Instantiated per device for DEVICE only.
     # ============================================================
     # torch.compile Integration Tests
     # ============================================================
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property returning 2 as the world size.
         return 2
 
     @with_comms
     def test_all_reduce_compile(self):
+        # [FUNCTION DOC] Compiles with fullgraph a function that returns the sum of all_reduce
+        # of its input, then runs it, backpropagates and asserts the gradient equals world
+        # size everywhere.
         """Test that all_reduce backward works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sum of the sum all_reduce
+            # of the tensor over the captured group name.
             output = fcols.all_reduce(tensor, "sum", group=group_name)
             return output.sum()
 
@@ -787,11 +899,15 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_all_gather_tensor_compile(self):
+        # [FUNCTION DOC] Compiles a function returning the sum of all_gather_single along dim 0,
+        # backpropagates and asserts the gradient equals world size.
         """Test that all_gather_tensor backward works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sum of the gathered tensor
+            # along dim 0.
             output = fcols.all_gather_single(tensor, gather_dim=0, group=group_name)
             return output.sum()
 
@@ -807,11 +923,15 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_reduce_scatter_tensor_compile(self):
+        # [FUNCTION DOC] Compiles a function returning the sum of reduce_scatter_single along
+        # dim 0 and asserts the backward gradient equals ones.
         """Test that reduce_scatter_tensor backward works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sum of the sum reduce-
+            # scatter of the tensor along dim 0.
             output = fcols.reduce_scatter_single(
                 tensor, "sum", scatter_dim=0, group=group_name
             )
@@ -832,11 +952,15 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_all_to_all_single_compile(self):
+        # [FUNCTION DOC] Compiles a function returning the sum of all_to_all_single with no
+        # split sizes and asserts the backward gradient equals ones.
         """Test that all_to_all_single backward works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sum of the
+            # all_to_all_single of the tensor with default splits.
             output = fcols.all_to_all_single(
                 tensor,
                 output_split_sizes=None,
@@ -864,11 +988,16 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_all_gather_into_tensor_autograd_compile(self):
+        # [FUNCTION DOC] Compiles a function using the autograd variant of
+        # all_gather_into_tensor followed by wait_tensor and asserts the backward gradient
+        # equals world size.
         """Test that _c10d_functional_autograd.all_gather_into_tensor works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function applying the autograd
+            # all_gather_into_tensor, waiting on the result and returning its sum.
             output = torch.ops._c10d_functional_autograd.all_gather_into_tensor(
                 tensor, self.world_size, group_name
             )
@@ -887,11 +1016,15 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_reduce_scatter_tensor_autograd_compile(self):
+        # [FUNCTION DOC] Compiles a function using the autograd variant of reduce_scatter_tensor
+        # with wait_tensor and asserts the backward gradient equals ones.
         """Test that _c10d_functional_autograd.reduce_scatter_tensor works with torch.compile."""
         group_name = dist.group.WORLD.group_name
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function applying the autograd
+            # reduce_scatter_tensor, waiting and returning the sum.
             output = torch.ops._c10d_functional_autograd.reduce_scatter_tensor(
                 tensor, "sum", self.world_size, group_name
             )
@@ -912,6 +1045,9 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
     @with_comms
     def test_all_to_all_single_autograd_compile(self):
+        # [FUNCTION DOC] Compiles a function using the autograd variant of all_to_all_single
+        # with explicit equal split sizes computed outside the compiled function (the raw op
+        # needs explicit sizes) and asserts the backward gradient equals ones.
         """Test that _c10d_functional_autograd.all_to_all_single works with torch.compile."""
         group_name = dist.group.WORLD.group_name
         group_size = dist.group.WORLD.size()
@@ -926,6 +1062,8 @@ class TestFunctionalDifferentialsWithCompile(DistributedTestBase):
 
         @torch.compile(fullgraph=True)
         def compiled_fn(tensor):
+            # [FUNCTION DOC] HELPER: Compiled function applying the autograd all_to_all_single
+            # with the captured split sizes, waiting and returning the sum.
             output = torch.ops._c10d_functional_autograd.all_to_all_single(
                 tensor,
                 output_split_sizes,
