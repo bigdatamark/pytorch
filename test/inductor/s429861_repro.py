@@ -1,5 +1,9 @@
 # flake8: noqa
 # ruff: noqa: F841
+# [MODULE DOC] Standalone reproducer for an Inductor issue, consisting of a single dumped FX
+# graph (function forward) for a Shampoo optimizer step with 79 parameter blocks on CUDA.
+# Defines the constant inf at import time and imports torch; nothing is executed or registered
+# on import, and there is no test class or main entry point.
 import torch
 
 
@@ -168,6 +172,17 @@ def forward(
     arg157_1: "f32[512][1]cuda:0",
     arg158_1: "f32[512][1]cuda:0",
 ):
+    # [FUNCTION DOC] Machine-generated (Inductor/AOT graph dump style) straight-line forward graph
+    # of a Shampoo optimizer step over 79 parameter blocks. Takes self (unused) plus 158 float32
+    # CUDA tensor arguments: arg0_1 is a scalar learning rate; arg1_1..arg79_1 are the blocks
+    # (the updated search directions) and arg80_1..arg158_1 are the matching parameters. Steps:
+    # negate the learning rate; clippy shrinkage (foreach multiply by the negated lr, foreach
+    # absolute value scaled by 0.5 plus 0.01, foreach divide, foreach inf-norm, foreach maximum
+    # against 1.0, then divide the per-block repeated negative lr by that shrinkage via split and
+    # slice_scatter bookkeeping); decoupled weight decay via foreach add; foreach multiply by the
+    # adjusted lr; finally in-place copy_ of the 79 results back into the first 79 inputs.
+    # Intermediate names are set to None to free memory early. Returns an empty tuple; the effect
+    # is the mutation of the arg1_1..arg79_1 input buffers.
     # File: <torch_package_0>.caffe2/torch/fb/optim/shampoo_wrapper.py:328 in torch_dynamo_resume_in__per_group_step_impl_at_316, code: -lr,
     neg: "f32[][]cuda:0" = torch.ops.aten.neg.default(arg0_1)
     arg0_1 = None
