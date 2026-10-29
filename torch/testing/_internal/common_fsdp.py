@@ -1,5 +1,15 @@
 # mypy: allow-untyped-defs
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Shared utilities for FSDP (FullyShardedDataParallel and fully_shard) unit tests.
+# Contents: device/backend selection constants (DEVICE_TYPE, DISTRIBUTED_BACKEND, DEVICE_COUNT),
+# init-mode enums, the FSDPTestModel interface with several test models (transformer with shared
+# params, nested wrapped modules, delay and mixture-of-experts variants, MLP stacks, skip
+# models), context managers that monkeypatch distributed collectives or FSDP internals, parity-
+# check helpers, test base classes (FSDPTestMultiThread, FSDPTestMixin, FSDPTest,
+# FSDPTestContinuous) and the compiled_fsdp_test decorator. Import-time side effects: selects
+# DEVICE_TYPE, DISTRIBUTED_BACKEND and DEVICE_COUNT from the available accelerator (cuda/nccl,
+# hpu/hccl, xpu/xccl, else cpu/gloo with a count of 1); the default DEVICE_COUNT (ROCm
+# dependent) is replaced for cuda, xpu and cpu but kept for hpu.
 
 import contextlib
 import os
@@ -91,6 +101,8 @@ else:
 
 
 class FSDPInitMode(Enum):
+    # [CLASS DOC] Enum of how a test model is wrapped: NO_FSDP (plain module) or RECURSIVE
+    # (nested wrapping through an auto wrap policy). Non-recursive wrapping is only a TODO.
     # No FSDP wrapping
     NO_FSDP = auto()
     # FSDP recursive wrapping
@@ -100,6 +112,9 @@ class FSDPInitMode(Enum):
 
 
 class DEVICEInitMode(Enum):
+    # [CLASS DOC] Enum of where a test model lives relative to FSDP construction: DEVICE_BEFORE
+    # (moved to the accelerator first), DEVICE_AFTER (moved after wrapping) or DEVICE_NEVER
+    # (stay on CPU).
     # Move model to DEVICE before passing to the FSDP constructor
     DEVICE_BEFORE = auto()
     # Move model to DEVICE after passing to the FSDP constructor
@@ -109,27 +124,40 @@ class DEVICEInitMode(Enum):
 
 
 class FSDPTestModel(nn.Module, ABC):
+    # [CLASS DOC] Abstract interface for models used by common FSDP tests. Subclasses provide
+    # input generation (get_input), loss computation (get_loss), the backward pass
+    # (run_backward) and a static factory (init) that builds the model with an FSDP init mode
+    # and device init mode.
     """This defines the interface expected from all models used commonly for
     FSDP unit tests."""
 
     @abstractmethod
     def get_input(self, device) -> tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] Abstract. Returns a tuple of input tensors for this model on the given
+        # device.
         """Returns an input for the model as a tuple."""
         ...
 
     @abstractmethod
     def get_loss(self, input, output) -> torch.Tensor:
+        # [FUNCTION DOC] Abstract. Returns the scalar loss tensor computed from the input and
+        # the model output.
         """Returns the loss given the input and output."""
         ...
 
     @abstractmethod
     def run_backward(self, loss) -> None:
+        # [FUNCTION DOC] Abstract. Runs the backward pass for loss, including any extra
+        # reduction a model needs.
         """Runs the backward pass (e.g. including ``loss.backward()``)."""
         ...
 
     @staticmethod
     @abstractmethod
     def init(*args: Any, **kwargs: Any) -> nn.Module:
+        # [FUNCTION DOC] Abstract static factory. Builds an instance of the model and returns
+        # it, possibly wrapped with FSDP, according to the arguments chosen by the concrete
+        # subclass.
         """Initializes an instance of this model."""
         ...
 
@@ -139,6 +167,11 @@ def _assert_module_states(
     process_group: dist.ProcessGroup,
     assert_fn: Callable,
 ):
+    # [FUNCTION DOC] HELPER: Checks that module states (parameters then buffers) match across
+    # ranks. Moves them to CPU, all-gathers them as Python objects over process_group, then
+    # calls assert_fn on each pair of corresponding states from rank 0 and every other rank.
+    # Raises an assertion error if any gathered entry is None. Communicates collectively, so all
+    # ranks must call it.
     """
     All-gathers module states across ranks and calls ``assert_fn`` on each pair
     of corresponding states from rank 0 and a nonzero rank. For example, if
@@ -168,6 +201,7 @@ def _assert_module_states(
 
 
 def get_devtype():
+    # [FUNCTION DOC] Returns the torch device object for the module-level DEVICE_TYPE.
     return torch.device(DEVICE_TYPE)
 
 
@@ -176,6 +210,10 @@ def _zero_model(
     zero_buffers: bool = False,
     summon_full=True,
 ):
+    # [FUNCTION DOC] HELPER: Zeros all parameters, and buffers if zero_buffers is set, of model
+    # in place under no-grad. If summon_full is true it first gathers full FSDP parameters via
+    # summon_full_params so the unsharded values are zeroed; otherwise it acts on the parameters
+    # as they are.
     """Zeros the parameters and optionally buffers of ``model`` in place."""
     ctx = FSDP.summon_full_params(model) if summon_full else nullcontext()
     with ctx:
@@ -189,6 +227,9 @@ def _zero_model(
 
 
 def _get_state_dict(model, cpu_offload=False, half=False):
+    # [FUNCTION DOC] HELPER: Returns the state dict of model. Unless cpu_offload is set the
+    # model is first moved to DEVICE_TYPE, and if half is set it is converted to half precision;
+    # both mutate the model in place (state tensors are not cloned).
     if not cpu_offload:
         model = model.to(DEVICE_TYPE)
     if half:
@@ -198,12 +239,19 @@ def _get_state_dict(model, cpu_offload=False, half=False):
 
 
 def subtest_name(test_name_mapping, *args):
+    # [FUNCTION DOC] Builds a subtest name by joining, with underscores, the mapped string for
+    # each argument (looked up by its string form in test_name_mapping) or the word none for a
+    # None argument. Raises KeyError for an argument missing from the mapping.
     return "_".join(
         [test_name_mapping[str(s)] if s is not None else "none" for s in args]
     )
 
 
 def _broadcast_state_dict(rank, state_dict):
+    # [FUNCTION DOC] HELPER: Broadcasts rank 0's state dict to all ranks. Moves rank 0 tensors
+    # to CPU in place, broadcasts them as an object list, then moves every received tensor to
+    # DEVICE_TYPE and returns the resulting dict. Mutates the input dict on rank 0; collective
+    # call.
     # For non-FSDP roots, some parts of the model state on rank 0 may
     # not be on CPU, so we move everything to CPU to avoid issues like:
     # https://github.com/pytorch/pytorch/issues/77113.
@@ -221,6 +269,11 @@ def _broadcast_state_dict(rank, state_dict):
 
 
 def get_full_params(model: nn.Module, recurse: bool = True):
+    # [FUNCTION DOC] Returns a deep copy of the model's parameters taken while inside
+    # summon_full_params, so FSDP-sharded parameters appear unsharded. recurse selects whether
+    # nested modules are also unsharded.
+    # KNOWN ISSUE: the docstring says CPU-offloaded parameters are moved to GPU; the code only
+    #   deep-copies the parameters and moves nothing explicitly.
     """
     Returns the full unsharded parameters of ``model``. Any FSDP-managed
     parameters offloaded to CPU are moved to GPU in the returned list.
@@ -235,28 +288,42 @@ def get_full_params(model: nn.Module, recurse: bool = True):
 
 
 def _move_to_device(model: nn.Module, move_to_device: bool):
+    # [FUNCTION DOC] HELPER: Returns model moved to DEVICE_TYPE if move_to_device is true, else
+    # returns it unchanged.
     return model.to(DEVICE_TYPE) if move_to_device else model
 
 
 def _maybe_wrap_fsdp(model: nn.Module, wrap_fsdp: bool, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Returns model wrapped in FSDP (forwarding extra arguments) if
+    # wrap_fsdp is true, else the model itself.
     return model if not wrap_fsdp else FSDP(model, *args, **kwargs)
 
 
 class DummyProcessGroup:
+    # [CLASS DOC] HELPER: Minimal fake process group exposing rank, size and an allreduce that
+    # returns an already-completed work-like mock. State: the rank and size given at
+    # construction.
     def __init__(self, rank: int, size: int):
+        # [FUNCTION DOC] HELPER: Stores the given rank and size.
         self._rank = rank
         self._size = size
 
     def rank(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the stored rank.
         return self._rank
 
     def size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the stored size.
         return self._size
 
     def allreduce(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Ignores its arguments, performs no communication and returns a
+        # mock work object whose get_future returns a Future already completed with the value
+        # one.
         dist_wait = mock.Mock()
 
         def get_future():
+            # [FUNCTION DOC] HELPER: Returns a new Future already set to the result one.
             future: torch.futures.Future = torch.futures.Future()
             future.set_result(1)
             return future
@@ -266,6 +333,11 @@ class DummyProcessGroup:
 
 
 class TransformerWithSharedParams(FSDPTestModel):
+    # [CLASS DOC] Test model: embedding, nn.Transformer and output projection with the output
+    # weight tied to the embedding weight, plus a float and a long buffer and an optional batch
+    # norm. State: rank and world_size from the group, batch size bs of two, and the submodules.
+    # Used to test shared parameters and ignored modules. Implements the FSDPTestModel
+    # interface.
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -273,6 +345,10 @@ class TransformerWithSharedParams(FSDPTestModel):
         add_bn: bool,
         deterministic: bool,
     ):
+        # [FUNCTION DOC] Builds the model for the given process group. Seeds the RNG with zero
+        # if deterministic, ties output_proj weight to the embedding weight, registers buffers,
+        # uses batch norm (or identity) over the batch dimension, moves to the device when
+        # device_init_mode is DEVICE_BEFORE and puts the model in eval mode if deterministic.
         super().__init__()
         self.rank = group.rank()
         self.world_size = group.size()
@@ -309,12 +385,18 @@ class TransformerWithSharedParams(FSDPTestModel):
             self.eval()
 
     def get_input(self, device):
+        # [FUNCTION DOC] Seeds the RNG based on rank and returns a tuple of source ids (6 by
+        # batch) and target ids (4 by batch) as integer tensors on device. Mutates the global
+        # RNG seed.
         torch.manual_seed(1 + self.rank)  # keep everything deterministic
         src = torch.arange(12, device=device).view(6, self.bs)  # T x B
         tgt = torch.arange(self.bs * 4, device=device).view(4, self.bs)  # T x B
         return (src, tgt)
 
     def forward(self, src_ids, tgt_ids):
+        # [FUNCTION DOC] Embeds source ids and adds the bias and long buffer, embeds target ids
+        # and applies batch norm, runs the transformer and returns the output projection
+        # (logits).
         src = self.embed_tokens(src_ids)
         src = src + self.vocab_bias + self.long_buffer.type_as(src)  # type: ignore[operator]
         tgt = self.embed_tokens(tgt_ids)
@@ -323,12 +405,15 @@ class TransformerWithSharedParams(FSDPTestModel):
         return self.output_proj(x)
 
     def get_loss(self, input, output):
+        # [FUNCTION DOC] Returns the summed cross entropy between the flattened logits and the
+        # flattened target ids taken from the input tuple.
         _, tgt = input
         return nn.functional.cross_entropy(
             output.view(-1, output.size(-1)), tgt.view(-1), reduction="sum"
         )
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] Calls backward on loss.
         loss.backward()
 
     @staticmethod
@@ -340,6 +425,14 @@ class TransformerWithSharedParams(FSDPTestModel):
         deterministic: bool = False,
         add_bn: bool = True,
     ) -> nn.Module | FSDP:
+        # [FUNCTION DOC] Static factory. With NO_FSDP returns a plain model (the first element
+        # if group is a tuple). With RECURSIVE builds the model and wraps it with FSDP,
+        # defaulting the auto wrap policy to wrapping transformer encoder and decoder layers; a
+        # policy in fsdp_kwargs is removed from that dict and used. For hybrid sharding
+        # strategies with a non-tuple group the FSDP process group is None. Moves to the device
+        # afterwards for DEVICE_AFTER. Raises ValueError for other modes.
+        # KNOWN ISSUE: pops auto_wrap_policy from the caller's fsdp_kwargs dict (mutation), and
+        #   device_init_mode DEVICE_AFTER only has an effect in the RECURSIVE branch.
         """
         Initializes a :class:`TransformerWithSharedParams` instance.
 
@@ -410,10 +503,16 @@ class TransformerWithSharedParams(FSDPTestModel):
         raise ValueError(f"Unsupported FSDP init mode: {fsdp_init_mode}")
 
     def get_ignored_modules(self):
+        # [FUNCTION DOC] Returns a list holding only the transformer submodule, for tests of
+        # FSDP ignored modules.
         return [self.transformer]
 
 
 class NestedWrappedModule(FSDPTestModel):
+    # [CLASS DOC] Test model: a sequential stack of four linear layers in which the middle two
+    # are optionally wrapped in nested FSDP instances (with a nested sequential in between) so
+    # that FSDP modules nest. State: rank, world_size and the module sequential. Implements the
+    # FSDPTestModel interface; init builds the plain or recursively wrapped variant.
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -422,12 +521,18 @@ class NestedWrappedModule(FSDPTestModel):
         deterministic: bool,
         **fsdp_kwargs,
     ):
+        # [FUNCTION DOC] Builds the stack. When wrap_fsdp is true wraps selected layers with
+        # FSDP on group and fsdp_kwargs. Seeds the RNG with zero if deterministic. Moves each
+        # layer to the device when device_init_mode is DEVICE_BEFORE. Records rank and
+        # world_size from group.
         super().__init__()
         self.rank = group.rank()
         self.world_size = group.size()
         move_to_device = device_init_mode == DEVICEInitMode.DEVICE_BEFORE
 
         def _maybe_wrap(layer):
+            # [FUNCTION DOC] HELPER: Returns layer wrapped in FSDP over group if wrap_fsdp is
+            # set, else layer unchanged.
             if wrap_fsdp:
                 return FSDP(layer, group, **fsdp_kwargs)
             return layer
@@ -447,17 +552,22 @@ class NestedWrappedModule(FSDPTestModel):
         )
 
     def get_input(self, device):
+        # [FUNCTION DOC] Seeds the RNG by rank and returns a one-element tuple holding a random
+        # 4 by 8 tensor.
         torch.manual_seed(1 + self.rank)  # keep everything deterministic
         return (torch.rand(4, 8, device=device),)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs the input through the sequential module and returns the result.
         return self.module(x)
 
     def get_loss(self, input, output):
+        # [FUNCTION DOC] Returns the sum of all elements of the output as the loss.
         loss = output.sum()
         return loss
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] Calls backward on loss.
         loss.backward()
 
     @staticmethod
@@ -468,6 +578,9 @@ class NestedWrappedModule(FSDPTestModel):
         fsdp_kwargs: dict[str, Any] | None = None,
         deterministic: bool = False,
     ) -> nn.Module:
+        # [FUNCTION DOC] Static factory. NO_FSDP returns an unwrapped model. RECURSIVE returns a
+        # model whose nested layers are FSDP-wrapped with fsdp_kwargs but with no top-level
+        # FSDP, moved to the device if DEVICE_AFTER. Raises ValueError for other modes.
         """
         Initializes a :class:`NestedWrappedModule` instance.
 
@@ -508,6 +621,8 @@ class NestedWrappedModule(FSDPTestModel):
 
 
 class AlwaysWrapNestedWrappedModule(NestedWrappedModule):
+    # [CLASS DOC] NestedWrappedModule variant whose init additionally wraps the whole model with
+    # a top-level FSDP using the always-wrap auto wrap policy for the RECURSIVE mode.
     @staticmethod
     def init(
         group: dist.ProcessGroup,
@@ -516,6 +631,11 @@ class AlwaysWrapNestedWrappedModule(NestedWrappedModule):
         fsdp_kwargs: dict[str, Any] | None = None,
         deterministic: bool = False,
     ):
+        # [FUNCTION DOC] Static factory. Builds an unwrapped NestedWrappedModule, returns it for
+        # NO_FSDP, and for RECURSIVE wraps it in FSDP with the always-wrap policy plus
+        # fsdp_kwargs, moving to the device for DEVICE_AFTER.
+        # KNOWN ISSUE: returns None (no error) for any other init mode, unlike sibling factories
+        #   that raise ValueError.
         """
         Initializes a :class:`NestedWrappedModule` instance, but unlike
         :meth:`NestedWrappedModule.init`, for the ``RECURSIVE`` init mode, this
@@ -542,6 +662,10 @@ class AlwaysWrapNestedWrappedModule(NestedWrappedModule):
 
 
 class NonUniformReqGradNWM(NestedWrappedModule):
+    # [CLASS DOC] NestedWrappedModule variant for ShardedGradScaler tests: the last two linears
+    # are wrapped together in one FSDP sequential, and all parameters except those are later
+    # frozen, so some ranks hold no non-zero-sized gradient shard. Built through the static init
+    # factory.
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -550,6 +674,10 @@ class NonUniformReqGradNWM(NestedWrappedModule):
         deterministic: bool,
         **fsdp_kwargs,
     ):
+        # [FUNCTION DOC] Builds the three-part stack (linear, nested wrapped group, wrapped
+        # group of the last two linears). Deliberately bypasses NestedWrappedModule.__init__ and
+        # calls the nn.Module initializer. Records rank and world size, seeds if deterministic,
+        # optionally wraps with FSDP.
         super(NestedWrappedModule, self).__init__()
         # This `__init__` only differs from `NestedWrappedModule.__init__` in that
         # the last two `nn.Linear` layers are FSDP wrapped in a `nn.Sequential`
@@ -562,6 +690,8 @@ class NonUniformReqGradNWM(NestedWrappedModule):
         move_to_device = device_init_mode == DEVICEInitMode.DEVICE_BEFORE
 
         def _maybe_wrap(layer):
+            # [FUNCTION DOC] HELPER: Returns layer wrapped in FSDP over group if wrap_fsdp is
+            # set, else layer unchanged.
             if wrap_fsdp:
                 return FSDP(layer, group, **fsdp_kwargs)
             return layer
@@ -586,6 +716,9 @@ class NonUniformReqGradNWM(NestedWrappedModule):
 
     @staticmethod
     def _set_nonuniform_req_grad(model, req_grad_mask) -> None:
+        # [FUNCTION DOC] HELPER: Disables requires_grad, in place, on every parameter of model
+        # whose name does not match the regular expression req_grad_mask (matched from the start
+        # of the name).
         for n, p in model.named_parameters():
             if not re.match(req_grad_mask, n):
                 p.requires_grad_(False)
@@ -598,6 +731,11 @@ class NonUniformReqGradNWM(NestedWrappedModule):
         fsdp_kwargs: dict[str, Any] | None = None,
         deterministic: bool = False,
     ):
+        # [FUNCTION DOC] Static factory. Builds the model without FSDP (NO_FSDP) or with nested
+        # FSDP (RECURSIVE, moved to the device for DEVICE_AFTER), then freezes all parameters
+        # except those under the last wrapped group using a name pattern that works with or
+        # without FSDP name prefixes. Raises ValueError for other modes. KNOWN ISSUE:
+        # fsdp_kwargs is ignored for NO_FSDP.
         """
         Initializes a :class:`NestedWrappedModule` instance, but unlike
         :meth:`NestedWrappedModule.init`, it wraps a second :class:`torch.nn.Sequential`
@@ -638,6 +776,9 @@ class NonUniformReqGradNWM(NestedWrappedModule):
 
 
 class ModuleWithDelay(FSDPTestModel):
+    # [CLASS DOC] Wrapper around an FSDPTestModel that can add artificial delays after computing
+    # the loss and before gradient reduce-scatter, to exercise timing-dependent FSDP behavior.
+    # State: the wrapped module and the two delay values in milliseconds.
     """This class wraps a :class:`FSDPTestModel` to optionally add a delay
     after computing the loss and/or before the gradient reduction."""
 
@@ -647,18 +788,24 @@ class ModuleWithDelay(FSDPTestModel):
         delay_after_loss_ms: int,
         delay_before_reduction_ms: int,
     ):
+        # [FUNCTION DOC] Stores the wrapped module and the two delay values in milliseconds.
         super().__init__()
         self.delay_after_loss_ms = delay_after_loss_ms
         self.delay_before_reduction_ms = delay_before_reduction_ms
         self.module = module
 
     def get_input(self, device):
+        # [FUNCTION DOC] Delegates to the wrapped module's get_input for the device.
         return self.module.get_input(device)  # type: ignore[operator]
 
     def forward(self, x):
+        # [FUNCTION DOC] Delegates to the wrapped module's forward.
         return self.module(x)
 
     def get_loss(self, input, output):
+        # [FUNCTION DOC] Computes the loss with the wrapped module, then, if delay_after_loss_ms
+        # is positive, sleeps (wall-clock sleep on HPU or XPU, a device-side sleep of the
+        # equivalent cycles on CUDA). Returns the loss.
         loss = self.module.get_loss(input, output)  # type: ignore[operator]
         if self.delay_after_loss_ms > 0:
             if TEST_HPU or TEST_XPU:
@@ -669,9 +816,19 @@ class ModuleWithDelay(FSDPTestModel):
         return loss
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] Runs the wrapped module's backward while the reduce-scatter function in
+        # the distributed package is temporarily patched by a wrapper that first delays (when
+        # delay_before_reduction_ms is positive) and then calls the original. The patch is
+        # removed on exit.
+        # KNOWN ISSUE: patches dist.reduce_scatter_single, which does not appear to exist in
+        #   torch.distributed (it lives in the functional collectives module), so this may fail
+        #   or patch a name that FSDP never calls.
         orig_reduce_scatter = torch.distributed.reduce_scatter_single
 
         def _delayed_reduce_scatter(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Sleeps for delay_before_reduction_ms (device sleep on CUDA,
+            # wall-clock on HPU/XPU) when positive, then forwards all arguments to the original
+            # reduce-scatter and returns its result.
             if self.delay_before_reduction_ms > 0:
                 if TEST_CUDA:
                     torch.cuda._sleep(
@@ -694,6 +851,9 @@ class ModuleWithDelay(FSDPTestModel):
         delay_before_reduction_ms: int,
         **model_kwargs: Any,
     ):
+        # [FUNCTION DOC] Static factory. Builds the underlying model with module_class.init
+        # using the given positional and keyword arguments and wraps it in a ModuleWithDelay
+        # with the two delays.
         """
         Args:
             module_class (Type[FSDPTestModel]): Wrapped module class to which
@@ -715,6 +875,8 @@ class ModuleWithDelay(FSDPTestModel):
 
 
 class NestedWrappedModuleWithDelay(ModuleWithDelay):
+    # [CLASS DOC] ModuleWithDelay specialization whose init builds a NestedWrappedModule with
+    # delays.
     @staticmethod
     def init(  # type: ignore[override]
         group: dist.ProcessGroup,
@@ -725,6 +887,9 @@ class NestedWrappedModuleWithDelay(ModuleWithDelay):
         delay_after_loss_ms: int = 0,
         delay_before_reduction_ms: int = 0,
     ):
+        # [FUNCTION DOC] Static factory. Calls ModuleWithDelay.init for NestedWrappedModule,
+        # forwarding all arguments, and returns the delay wrapper. The device mode defaults to
+        # DEVICE_AFTER.
         return ModuleWithDelay.init(
             NestedWrappedModule,
             group=group,
@@ -738,15 +903,24 @@ class NestedWrappedModuleWithDelay(ModuleWithDelay):
 
 
 class DummyDDP(nn.Module):
+    # [CLASS DOC] HELPER: Trivial wrapper that mimics DistributedDataParallel by exposing the
+    # wrapped module as the attribute module and forwarding calls to it.
     def __init__(self, module):
+        # [FUNCTION DOC] HELPER: Stores the module as the attribute module.
         super().__init__()
         self.module = module
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the wrapped module with the given arguments and returns
+        # its result.
         return self.module(*args, **kwargs)
 
 
 class MixtureOfExperts(NestedWrappedModule):
+    # [CLASS DOC] NestedWrappedModule variant with a per-rank expert linear (parameters flagged
+    # expert, and wrapped in FSDP over a single-rank group so it is never sharded) and a shared
+    # linear. State: group, delay_before_free_ms, wrap_fsdp, move_to_device, num_expert_params.
+    # Without FSDP, run_backward manually averages and all-reduces non-expert gradients.
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -756,6 +930,13 @@ class MixtureOfExperts(NestedWrappedModule):
         deterministic: bool,
         **fsdp_kwargs,
     ):
+        # [FUNCTION DOC] Builds the model. Runs the parent initializer, records configuration,
+        # seeds so experts differ per rank (seed offset by rank) while other layers are
+        # identical (seed zero) when deterministic, flags expert parameters, and creates a
+        # single-rank process group (a collective call) to wrap the expert with FSDP when
+        # wrap_fsdp is set; the shared layer uses group. Builds the final sequential of input
+        # linear, shared, expert and output linear. Note the parent initializer's module
+        # attribute is replaced.
         super().__init__(
             group=group,
             wrap_fsdp=wrap_fsdp,
@@ -800,12 +981,18 @@ class MixtureOfExperts(NestedWrappedModule):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs the sequential module. If delay_before_free_ms is positive and the
+        # expert is an FSDP module, temporarily patches FSDP's internal reshard function with a
+        # version that sleeps first, so resharding of the expert is delayed. Otherwise a plain
+        # forward. Returns the output.
         if self.delay_before_free_ms > 0:
             expert = self.module[2]
             if isinstance(expert, FSDP):
                 orig_reshard = torch.distributed.fsdp._runtime_utils._reshard
 
                 def _delayed_reshard(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Sleeps for delay_before_free_ms (device sleep on CUDA,
+                    # wall-clock on HPU/XPU), then calls and returns the original reshard.
                     if TEST_CUDA:
                         torch.cuda._sleep(
                             int(self.delay_before_free_ms * get_cycles_per_ms())
@@ -824,6 +1011,9 @@ class MixtureOfExperts(NestedWrappedModule):
         return self.module(x)
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] Runs backward on loss. If the model is not FSDP-wrapped, divides each
+        # non-expert gradient by the world size and all-reduces it over the group, emulating
+        # data parallel reduction; expert parameters are skipped. Mutates gradients in place.
         loss.backward()
         # Manually reduce gradients if not wrapped in FullyShardedDataParallel
         if not self.wrap_fsdp:
@@ -844,6 +1034,9 @@ class MixtureOfExperts(NestedWrappedModule):
         deterministic: bool = False,
         delay_before_free_ms: int = 0,
     ):
+        # [FUNCTION DOC] Static factory. NO_FSDP returns an unwrapped model; RECURSIVE returns
+        # one with expert and shared layers wrapped in FSDP (no top-level wrapper), moved to the
+        # device for DEVICE_AFTER. Raises ValueError for other modes.
         """
         Initializes a :class:`MixtureOfExperts` instance.
 
@@ -888,6 +1081,9 @@ class MixtureOfExperts(NestedWrappedModule):
 
 
 class MLP(nn.Module):
+    # [CLASS DOC] Two-layer MLP (input projection, ReLU, output projection, ReLU) with an
+    # optional additive buffer. State: in_proj and out_proj linears and buffer (None when
+    # disabled).
     def __init__(
         self,
         dim: int,
@@ -897,6 +1093,9 @@ class MLP(nn.Module):
         with_buffer: bool = False,
         dim_multiplier: int = 4,
     ):
+        # [FUNCTION DOC] Creates in_proj (dim to dim times dim_multiplier) and out_proj (back to
+        # dim) linears with the given device and bias; registers a random buffer of size dim if
+        # with_buffer, else the buffer attribute is None.
         super().__init__()
         self.in_proj = nn.Linear(dim, dim_multiplier * dim, device=device, bias=bias)
         self.out_proj = nn.Linear(dim_multiplier * dim, dim, device=device, bias=bias)
@@ -906,6 +1105,8 @@ class MLP(nn.Module):
             self.buffer = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Applies in_proj, ReLU, out_proj, ReLU, then adds the buffer if present.
+        # Returns the result.
         z = self.in_proj(x)
         z = F.relu(z)
         z = self.out_proj(z)
@@ -915,12 +1116,19 @@ class MLP(nn.Module):
         return z
 
     def reset_parameters(self):
+        # [FUNCTION DOC] Re-initializes only the buffer, if present, from a normal distribution;
+        # linear weights are not reset.
         if self.buffer is not None:
             torch.nn.init.normal_(self.buffer)
 
 
 class MLPStack(nn.Sequential):
+    # [CLASS DOC] Sequential of three MLPs (multipliers 3, 1 default, 3 to exercise uneven
+    # sharding) and optionally a bias-free LayerNorm. State: with_seq_parallel. parallelize
+    # applies tensor parallelism then FSDP2 sharding.
     def __init__(self, mlp_dim: int, *, with_seq_parallel: bool = False):
+        # [FUNCTION DOC] Builds the three MLPs and an optional LayerNorm (when
+        # with_seq_parallel) and records the flag.
         modules: list[nn.Module] = [
             # Use multiplier of 3 to exercise uneven case
             MLP(mlp_dim, dim_multiplier=3),
@@ -939,6 +1147,11 @@ class MLPStack(nn.Sequential):
         use_activation_checkpointing: bool,
         **fsdp_kwargs,
     ) -> "MLPStack":
+        # [FUNCTION DOC] Applies tensor parallelism over tp_mesh (column-wise in-projections,
+        # row-wise out-projections, sequence parallel on the norm layer if enabled), then for
+        # each non-norm child optionally applies activation checkpointing and fully_shard over
+        # dp_mesh with fsdp_kwargs, then fully shards the whole stack. Mutates the stack in
+        # place and returns self.
         parallelize_plan = {
             # Pass `use_local_output=False` to keep as DTensor to preserve
             # uneven activation dims
@@ -965,12 +1178,15 @@ class MLPStack(nn.Sequential):
 
 
 class DoubleLinear(nn.Module):
+    # [CLASS DOC] Module with two linear layers and a ReLU used to return two outputs
+    # (use_second_linear true) or to leave the second linear unused (false).
     """
     This can be used for returning multiple outputs from a module
     (``use_second_linear=True``) or for having an unused module (``False``).
     """
 
     def __init__(self, dim: int, use_second_linear: bool = True):
+        # [FUNCTION DOC] Creates two dim by dim linears, a ReLU and records use_second_linear.
         super().__init__()
         self.lin1 = nn.Linear(dim, dim)
         self.lin2 = nn.Linear(dim, dim)
@@ -980,6 +1196,9 @@ class DoubleLinear(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        # [FUNCTION DOC] Returns a tuple of ReLU of each linear's output when use_second_linear
+        # is true, otherwise only the first linear's ReLU output; the second linear is unused in
+        # that case.
         if self.use_second_linear:
             return self.relu(self.lin1(x)), self.relu(self.lin2(x))
         return self.relu(self.lin1(x))
@@ -993,6 +1212,11 @@ class DoubleLinear(nn.Module):
 # all threads use the patched value inside the context
 @contextlib.contextmanager
 def patch_all_gather(new_all_gather_into_tensor: Callable):
+    # [FUNCTION DOC] Context manager that, after a barrier, replaces dist.all_gather_single with
+    # the given function, yields, and restores the original after a second barrier (in a finally
+    # block). Barriers keep threads of a multi-threaded process group in sync.
+    # KNOWN ISSUE: torch.distributed does not appear to define all_gather_single (only the
+    #   functional collectives module does), so reading it may raise an attribute error.
     orig_all_gather = dist.all_gather_single
     dist.barrier()
     dist.all_gather_single = new_all_gather_into_tensor
@@ -1005,6 +1229,9 @@ def patch_all_gather(new_all_gather_into_tensor: Callable):
 
 @contextlib.contextmanager
 def patch_foreach_all_gather(new_foreach_all_gather: Callable):
+    # [FUNCTION DOC] Context manager that swaps the foreach_all_gather function in the FSDP2
+    # param group module with the given function for the duration of the block, with barriers
+    # before patching and before restoring (restore happens in a finally block).
     orig_foreach_all_gather = (
         torch.distributed.fsdp._fully_shard._fsdp_param_group.foreach_all_gather
     )
@@ -1023,6 +1250,9 @@ def patch_foreach_all_gather(new_foreach_all_gather: Callable):
 
 @contextlib.contextmanager
 def patch_foreach_reduce(new_foreach_reduce: Callable):
+    # [FUNCTION DOC] Context manager that swaps the foreach_reduce function in the FSDP2 param
+    # group module with the given function for the duration of the block, with barriers before
+    # patching and before restoring (restore happens in a finally block).
     orig_foreach_foreach_reduce = (
         torch.distributed.fsdp._fully_shard._fsdp_param_group.foreach_reduce
     )
@@ -1041,6 +1271,11 @@ def patch_foreach_reduce(new_foreach_reduce: Callable):
 
 @contextlib.contextmanager
 def patch_reduce_scatter(new_reduce_scatter_tensor: Callable):
+    # [FUNCTION DOC] Context manager that, after a barrier, replaces dist.reduce_scatter_single
+    # with the given function, yields, and restores the original after a second barrier (finally
+    # block).
+    # KNOWN ISSUE: torch.distributed does not appear to define reduce_scatter_single (only the
+    #   functional collectives module does), so reading it may raise an attribute error.
     orig_reduce_scatter = dist.reduce_scatter_single
     dist.barrier()
     dist.reduce_scatter_single = new_reduce_scatter_tensor
@@ -1053,6 +1288,8 @@ def patch_reduce_scatter(new_reduce_scatter_tensor: Callable):
 
 @contextlib.contextmanager
 def patch_all_reduce(new_all_reduce: Callable):
+    # [FUNCTION DOC] Context manager that, after a barrier, replaces dist.all_reduce with the
+    # given function, yields, and restores the original after a second barrier (finally block).
     orig_all_reduce = dist.all_reduce
     dist.barrier()
     dist.all_reduce = new_all_reduce
@@ -1066,6 +1303,8 @@ def patch_all_reduce(new_all_reduce: Callable):
 @no_type_check
 @contextlib.contextmanager
 def patch_unshard(new_unshard: Callable):
+    # [FUNCTION DOC] Context manager that swaps FSDPParamGroup.unshard with the given function
+    # for the block, with barriers before patching and before restoring (finally block).
     orig_unshard = FSDPParamGroup.unshard
     dist.barrier()
     FSDPParamGroup.unshard = new_unshard
@@ -1079,6 +1318,8 @@ def patch_unshard(new_unshard: Callable):
 @no_type_check
 @contextlib.contextmanager
 def patch_reshard(new_reshard: Callable):
+    # [FUNCTION DOC] Context manager that swaps FSDPParamGroup.reshard with the given function
+    # for the block, with barriers before patching and before restoring (finally block).
     orig_reshard = FSDPParamGroup.reshard
     dist.barrier()
     FSDPParamGroup.reshard = new_reshard
@@ -1092,6 +1333,9 @@ def patch_reshard(new_reshard: Callable):
 @no_type_check
 @contextlib.contextmanager
 def patch_post_backward(new_post_backward: Callable):
+    # [FUNCTION DOC] Context manager that swaps FSDPParamGroup.post_backward with the given
+    # function for the block, with barriers before patching and before restoring (finally
+    # block).
     orig_post_backward = FSDPParamGroup.post_backward
     dist.barrier()
     FSDPParamGroup.post_backward = new_post_backward
@@ -1105,6 +1349,9 @@ def patch_post_backward(new_post_backward: Callable):
 @no_type_check
 @contextlib.contextmanager
 def patch_register_post_backward_hook_backward(new_backward: Callable):
+    # [FUNCTION DOC] Context manager that swaps the backward method of
+    # RegisterPostBackwardFunction with the given function for the block, with barriers before
+    # patching and before restoring (finally).
     orig_backward = RegisterPostBackwardFunction.backward
     dist.barrier()
     RegisterPostBackwardFunction.backward = new_backward
@@ -1122,6 +1369,10 @@ def reduce_scatter_with_assert(
     *args: Any,
     **kwargs: Any,
 ):
+    # [FUNCTION DOC] Wrapper for a reduce-scatter call: finds the output tensor (first
+    # positional argument or the keyword named output), calls assert_fn on it, then calls and
+    # returns orig_reduce_scatter with the original arguments. Raises an assertion error if no
+    # output can be found. The cls argument is unused.
     if len(args) > 0:
         output = args[0]
     elif "output" in kwargs:
@@ -1140,6 +1391,12 @@ def check_sharded_parity(
     sharded_module: nn.Module,
     prefixes_to_ignore: tuple[str, ...] = (),
 ):
+    # [FUNCTION DOC] Asserts that sharded_module's parameters (DTensors) match a replicated
+    # module. Pairs parameters in order (lengths must match), compares names after removing
+    # prefixes_to_ignore, checks each sharded parameter is a DTensor, distributes the replicated
+    # parameter and its gradient the same way and compares local shards; both gradients must be
+    # None together. Raises an assertion error if placements are the double Shard(0) layout,
+    # which cannot be compared. cls is the test case supplying assertion methods.
     for (replicated_name, replicated_param), (sharded_name, sharded_param) in zip(
         replicated_module.named_parameters(),
         sharded_module.named_parameters(),
@@ -1172,44 +1429,73 @@ def check_sharded_parity(
 
 
 class FSDPTestMultiThread(MultiThreadedTestCase):
+    # [CLASS DOC] Multi-threaded test base class for FSDP tests, with world size equal to
+    # DEVICE_COUNT. Spawns threads in setUp and resets dynamo before and after the test in each
+    # thread.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property returning DEVICE_COUNT as the number of threads.
         return DEVICE_COUNT
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp and then spawns the test threads.
         super().setUp()
         self._spawn_threads()
 
     def run_subtests(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the shared run_subtests helper on this test with the given
+        # arguments and returns its result.
         return run_subtests(self, *args, **kwargs)
 
     def perThreadSetUp(self):
+        # [FUNCTION DOC] Resets torch dynamo state at the start of each thread.
         torch._dynamo.reset()
 
     def perThreadTearDown(self):
+        # [FUNCTION DOC] Resets torch dynamo state at the end of each thread.
         torch._dynamo.reset()
 
 
 class FSDPTestMixin:
+    # [CLASS DOC] Mixin of shared helpers for FSDP test cases: configuration checks, subtest
+    # running, the per-process run entry point, a training loop and a DDP-versus-FSDP parity
+    # test. Requires the host class to provide assertion methods, rank, world_size,
+    # process_group and run_test.
     """
     Mixin class containing shared test utilities for FSDP tests.
     Provides common helper methods for both FSDPTest and FSDPTestContinuous.
     """
 
     def _check_cpu_offload(self, fsdp_model, cpu_offload):
+        # [FUNCTION DOC] HELPER: Asserts the FSDP model's cpu_offload setting equals the
+        # expected value.
         self.assertEqual(cpu_offload, fsdp_model.cpu_offload)
 
     def _check_backward_prefetch(self, fsdp_model, backward_prefetch):
+        # [FUNCTION DOC] HELPER: Asserts the FSDP model's backward_prefetch setting equals the
+        # expected value.
         self.assertEqual(backward_prefetch, fsdp_model.backward_prefetch)
 
     def _check_forward_prefetch(self, fsdp_model, forward_prefetch):
+        # [FUNCTION DOC] HELPER: Asserts the FSDP model's forward_prefetch setting equals the
+        # expected value.
         self.assertEqual(forward_prefetch, fsdp_model.forward_prefetch)
 
     def run_subtests(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the shared run_subtests helper on this test with the given
+        # arguments and returns its result.
         return run_subtests(self, *args, **kwargs)
 
     @classmethod
     def _run(cls, rank, test_name, file_name, pipe, **kwargs):  # type: ignore[override]
+        # [FUNCTION DOC] Per-process entry point. Builds the test instance for test_name,
+        # records rank and file name, skips (exits with the multi-gpu skip code) if fewer
+        # accelerators than world size exist on a non-CPU device, initializes the process group
+        # (fake store backend when fake_pg is passed, else the file-based init method with
+        # DISTRIBUTED_BACKEND; exits with the backend unavailable code on a RuntimeError
+        # mentioning recompile, otherwise re-raises), sets the device index for CUDA/XPU, runs
+        # barrier, resets dynamo, seeds RNG, runs the test, resets again, barriers and destroys
+        # the process group. Side effects: process-global distributed state and process exit.
         self = cls(test_name)
         self.rank = rank
         self.file_name = file_name
@@ -1276,6 +1562,15 @@ class FSDPTestMixin:
         use_pure_fp16: bool = False,
         sharded_grad_scaler_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Trains model for num_steps with SGD (momentum) and an optional
+        # ShardedGradScaler, returning the detached last loss. Each step gets inputs from the
+        # wrapped module, optionally casts them to half, runs forward under autocast, checks
+        # (for CPU-offloaded FSDP) that parameters are on CPU after forward and backward, checks
+        # the loss dtype against the precision mode, runs the wrapped module's backward and
+        # steps the scaler. With save_model it clones the state dict, zeros the model and
+        # reloads it. Finally asserts the FSDP state is idle. Raises assertion errors on
+        # violated expectations.
+        # KNOWN ISSUE: if num_steps is zero, loss is never assigned and the return fails.
         cpu_offload_params = fsdp_cpu_offload and fsdp_cpu_offload.offload_params
 
         model_device = next(model.parameters()).device
@@ -1374,6 +1669,17 @@ class FSDPTestMixin:
         sharded_grad_scaler_kwargs: dict[str, Any] | None = None,
         **fsdp_kwargs,
     ):
+        # [FUNCTION DOC] Compares FSDP training against a reference (DDP by default or
+        # ref_init_fn). Builds a plain deterministic model, wraps it as the reference and trains
+        # it, builds the FSDP model through model_class.init (re-raising initialization errors
+        # as ValueError) and wraps it with FSDP at top level if needed, applies half precision
+        # and device moves, then trains it. When CPU offload is combined with DEVICE_AFTER,
+        # expects a RuntimeError about parameters on the device and returns. Otherwise checks
+        # parameters are on CPU when offloading, compares final losses and, without mixed
+        # precision or pure fp16, compares unsharded FSDP parameters to the reference. Raises an
+        # assertion error if fsdp_init_mode is NO_FSDP. Mutates fsdp_kwargs.
+        # KNOWN ISSUE: the docstring omits most arguments; the default CPUOffload instance is a
+        #   shared default value evaluated once.
         """
         Tests FSDP training against a reference, which defaults to DDP but
         may be customized with ``ref_init_fn``.
@@ -1526,7 +1832,13 @@ class FSDPTestMixin:
 
 
 class FSDPTest(FSDPTestMixin, MultiProcessTestCase):
+    # [CLASS DOC] Multi-process FSDP test base class: spawns one process per device in setUp and
+    # runs each test in those processes via _run. Provides world_size (DEVICE_COUNT),
+    # process_group (the default group) and init_method (file store) properties.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp, sets the environment variable that disables NCCL
+        # desync debugging (a global process side effect, to avoid flakiness) and spawns the
+        # worker processes.
         super().setUp()
         # Set TORCH_NCCL_DESYNC_DEBUG=0 to disable the NCCL `workCleanupLoop()`,
         # which can cause unit test flakiness:
@@ -1536,23 +1848,36 @@ class FSDPTest(FSDPTestMixin, MultiProcessTestCase):
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property returning DEVICE_COUNT as the number of processes.
         return DEVICE_COUNT
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] Property returning the default distributed process group.
         return dist.distributed_c10d._get_default_group()
 
     @property
     def destroy_pg_upon_exit(self) -> bool:
+        # [FUNCTION DOC] Property returning False so the base class does not destroy the process
+        # group on exit (it is destroyed at the end of _run).
         # Overriding base test class: do not auto destroy PG upon exit.
         return False
 
     @property
     def init_method(self):
+        # [FUNCTION DOC] Property returning the file-based rendezvous URL built from the file
+        # schema and file name.
         return f"{FILE_SCHEMA}{self.file_name}"
 
     @classmethod
     def _run(cls, rank, test_name, file_name, pipe, **kwargs):  # type: ignore[override]
+        # [FUNCTION DOC] Per-process entry point, same as the mixin version except that the
+        # accelerator count check is unconditional, so it exits with the multi-gpu skip code if
+        # fewer devices than the world size exist, even on CPU. Initializes the process group
+        # (fake or real), sets the device index, barriers, resets dynamo, seeds, runs the test,
+        # barriers and destroys the process group.
+        # KNOWN ISSUE: duplicates FSDPTestMixin._run, which it overrides, with a slight
+        #   difference in the device count check.
         self = cls(test_name)
         self.rank = rank
         self.file_name = file_name
@@ -1608,6 +1933,10 @@ class FSDPTest(FSDPTestMixin, MultiProcessTestCase):
 
 
 class FSDPTestContinuous(FSDPTestMixin, MultiProcContinuousTest):
+    # [CLASS DOC] FSDP test base class on top of the continuous multi-process test harness,
+    # whose worker processes are reused across tests. Provides backend and device type from
+    # module constants, process group setup and barriers around each test. World size is
+    # DEVICE_COUNT.
     """
     FSDP test base class using MultiProcContinuousTest for faster test execution.
     This class reuses worker processes across tests, reducing process spawn overhead.
@@ -1618,14 +1947,21 @@ class FSDPTestContinuous(FSDPTestMixin, MultiProcContinuousTest):
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Class method returning the distributed backend name
+        # DISTRIBUTED_BACKEND.
         return DISTRIBUTED_BACKEND
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Class method returning the device type string DEVICE_TYPE.
         return DEVICE_TYPE
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Worker process group init. Sets the environment variable
+        # disabling NCCL desync debugging, exits with the multi-gpu skip code if fewer
+        # accelerators than world_size exist, sets the device index for CUDA/XPU, then calls the
+        # parent implementation with rank, world size and rendezvous file.
         # Set TORCH_NCCL_DESYNC_DEBUG=0 to disable the NCCL `workCleanupLoop()`,
         # which can cause unit test flakiness:
         # https://github.com/pytorch/pytorch/issues/90848
@@ -1641,6 +1977,8 @@ class FSDPTestContinuous(FSDPTestMixin, MultiProcContinuousTest):
         super()._init_pg(rank, world_size, rdvz_file)
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp, barriers across worker (non-main) ranks, resets
+        # dynamo and seeds the RNG.
         super().setUp()
         # Barrier to synchronize workers before test, similar to FSDPTest._run().
         # This ensures all workers start the test together and prevents NCCL
@@ -1651,6 +1989,8 @@ class FSDPTestContinuous(FSDPTestMixin, MultiProcContinuousTest):
         set_rng_seed()
 
     def tearDown(self):
+        # [FUNCTION DOC] Barriers across worker (non-main) ranks, runs the base tearDown and
+        # resets dynamo.
         # Barrier to synchronize workers after test, similar to FSDPTest._run().
         if self.rank != self.MAIN_PROCESS_RANK:
             dist.barrier()
@@ -1659,11 +1999,21 @@ class FSDPTestContinuous(FSDPTestMixin, MultiProcContinuousTest):
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] Property returning the class-level process group shared by all tests of
+        # the class.
         return self.__class__.pg
 
 
 def compiled_fsdp_test(compile_compute_on_module: type | None = None):
+    # [FUNCTION DOC] Decorator factory that runs a test once per mode: with the normal
+    # fully_shard (eager) and with a fully_shard replacement that also compiles each sharded
+    # module (optionally only instances of compile_compute_on_module). Returns the decorator.
     def fully_shard_with_compiled_compute(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for fully_shard: applies the real fully_shard, then
+        # calls compile on the first argument if no module type filter was given or it is an
+        # instance of that type.
+        # KNOWN ISSUE: returns None, whereas the real fully_shard returns the module, so callers
+        #   that use the returned value break.
         torch.distributed.fsdp.fully_shard(*args, **kwargs)  # type: ignore[operator]
         if compile_compute_on_module is None or isinstance(
             args[0], compile_compute_on_module
@@ -1671,12 +2021,23 @@ def compiled_fsdp_test(compile_compute_on_module: type | None = None):
             args[0].compile()
 
     class FullyShardMode(Enum):
+        # [CLASS DOC] HELPER: Enum of modes the decorator iterates over: EAGER or
+        # COMPILED_COMPUTE.
         EAGER = auto()
         COMPILED_COMPUTE = auto()
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wraps func with the multi-mode runner and returns the wrapper
+        # (functools wraps applied).
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Runs func once per mode. Skips non-eager modes with a
+            # warning if Triton is unavailable. Per mode it barriers, saves the inductor compile
+            # thread setting (set to one for compiled mode), overwrites the fully_shard name in
+            # func's module globals with the mode's version, calls func, barriers, then restores
+            # the global and the setting. Raises NotImplementedError for unknown modes.
+            # KNOWN ISSUE: restore is not in a finally block, so if func raises the patched
+            #   fully_shard and compile thread count are left modified.
             original_fully_shard: Any = torch.distributed.fsdp.fully_shard
             for mode in FullyShardMode:
                 if mode != FullyShardMode.EAGER and not has_triton():
@@ -1713,16 +2074,23 @@ def compiled_fsdp_test(compile_compute_on_module: type | None = None):
 
 
 class SkipModule(nn.Module):
+    # [CLASS DOC] HELPER: Small module holding one bias-free 10 by 10 linear layer.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the linear layer.
         super().__init__()
         self.lin = nn.Linear(10, 10, bias=False)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer.
         return self.lin(x)
 
 
 class NestedLinear(nn.Module):
+    # [CLASS DOC] HELPER: Module holding a bias-free 10 by 10 linear on the device, wrapped with
+    # the wrap function (FSDP wrapping within an enclosing wrap context) when fsdp_wrap is true.
     def __init__(self, fsdp_wrap):
+        # [FUNCTION DOC] HELPER: Creates the linear layer on DEVICE_TYPE, passing it through
+        # wrap if fsdp_wrap is set.
         super().__init__()
         if fsdp_wrap:
             self.nested_linear = wrap(nn.Linear(10, 10, bias=False).to(DEVICE_TYPE))
@@ -1730,11 +2098,16 @@ class NestedLinear(nn.Module):
             self.nested_linear = nn.Linear(10, 10, bias=False).to(DEVICE_TYPE)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the nested linear.
         return self.nested_linear(x)
 
 
 class SkipModel(nn.Module):
+    # [CLASS DOC] HELPER: Model of a linear, a SkipModule and a wrapped NestedLinear (used to
+    # test modules that FSDP wrap policies skip). All layers are on DEVICE_TYPE.
     def __init__(self, double_nest):
+        # [FUNCTION DOC] HELPER: Creates the linear, skip module and a NestedLinear (nested
+        # wrapping if double_nest) passed through wrap with the device id.
         super().__init__()
         self.linear = nn.Linear(10, 10, bias=False).to(DEVICE_TYPE)
         self.linear_skip = SkipModule().to(DEVICE_TYPE)
@@ -1743,6 +2116,8 @@ class SkipModel(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear, skip module and nested linear in order and
+        # returns the result.
         x = self.linear(x)
         x = self.linear_skip(x)
         x = self.nested_linear(x)

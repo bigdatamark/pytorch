@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] Shared helpers for JIT tests: reference-vs-JIT comparison, TorchScript
+# export/import round trips, autodiff node checks and shape analysis checks. Main contents:
+# check_output_types, nn_functional_single_grad (set of test names that only get a first
+# derivative check), check_against_reference and the JitCommonTestCase base class. Import side
+# effects: only imports (including torch.jit submodules); enable_profiling_mode is re-exported
+# for other tests. No global state is changed at import time.
 
 # Torch
 import torch
@@ -21,6 +27,12 @@ from torch._C import TensorType
 import io
 
 def check_output_types(self, func, ref_outputs, args, kwargs):
+    # [FUNCTION DOC] Asserts the JIT-recorded output type of func matches the actual outputs.
+    # Reads the last_graph attribute of func, requires the graph to have exactly one output, and
+    # asks the runtime to assert that ref_outputs is an instance of that output type. Args: self
+    # is the test case; args and kwargs are unused. Raises an assertion error on mismatch or
+    # when the output count is not one.
+    # KNOWN ISSUE: if func has no last_graph the graph is None and an attribute error is raised.
     graph = getattr(func, 'last_graph', None)
     types = [o.type() for o in graph.outputs()]
     self.assertTrue(len(types) == 1)
@@ -41,6 +53,13 @@ nn_functional_single_grad = frozenset('test_nn_' + name for name in [
 
 def check_against_reference(self, func, reference_func, output_func, args, kwargs=None,
                             allow_unused=True, check_types=True, no_grad=False, no_gradgrad=False):
+    # [FUNCTION DOC] Verifies func matches reference_func in outputs, grads and double
+    # grads. Runs both on cloned inputs without grad and compares outputs, then (optionally)
+    # checks the output types. Unless no_grad is set, compares first-order gradients of a
+    # weighted sum of outputs, and unless no_gradgrad is set (or the test name is in
+    # nn_functional_single_grad) also compares second-order gradients with loosened
+    # tolerances. self must provide runAndSaveRNG and assertEqual. Raises assertion errors
+    # on mismatches. Returns nothing.
     """Verifies a function performs identically to some reference implementation.
 
     Commonly, this is used to verify that a JIT implementation
@@ -50,6 +69,9 @@ def check_against_reference(self, func, reference_func, output_func, args, kwarg
     kwargs = kwargs if kwargs else {}
 
     def allSum(vs):
+        # [FUNCTION DOC] HELPER: Builds a scalar loss from a tensor or sequence of tensors. Sums
+        # each floating or complex tensor weighted by its position plus one (absolute value of
+        # the sum for complex tensors); skips None entries and non-floating dtypes.
         if isinstance(vs, torch.Tensor):
             vs = (vs,)
         return sum((i + 1) * v.sum().abs() if v.dtype.is_complex else (i + 1) * v.sum()
@@ -57,10 +79,15 @@ def check_against_reference(self, func, reference_func, output_func, args, kwarg
                    if v is not None and v.dtype in floating_and_complex_types_and(torch.half, torch.bfloat16))
 
     def clone_tensor(t, preserve_requires_grad):
+        # [FUNCTION DOC] HELPER: Returns a detached clone of t, with requires_grad set only if
+        # preserve_requires_grad is true and t required grad.
         require_grad = preserve_requires_grad and t.requires_grad
         return t.detach().clone().requires_grad_(require_grad)
 
     def clone_inputs(preserve_requires_grad: bool):
+        # [FUNCTION DOC] HELPER: Clones the enclosing args list; tensors and iterables of
+        # tensors are cloned (optionally preserving requires_grad), other values are passed
+        # through unchanged.
         inputs: list[torch.Tensor | list[torch.Tensor]] = []
 
         for arg in args:
@@ -75,6 +102,8 @@ def check_against_reference(self, func, reference_func, output_func, args, kwarg
 
     # Returns tensors in args that requires_grad, including tensors in TensorList args
     def get_recording_tensors(args):
+        # [FUNCTION DOC] HELPER: Collects tensors from args (including inside tensor lists) that
+        # require grad, in order, for use as autograd.grad inputs.
         recording_tensors: list[torch.Tensor] = []
 
         for arg in args:
@@ -140,15 +169,26 @@ def check_against_reference(self, func, reference_func, output_func, args, kwarg
             self.assertEqual(g2, g2_test, atol=5e-4, rtol=1e-4)
 
 class JitCommonTestCase(TestCase):
+    # [CLASS DOC] Base test case with JIT utilities: building functions from graphs,
+    # export/import round trips through torch.jit.save and load, RNG-preserving runs, autodiff
+    # node assertions and shape analysis checks. Stateless; all behavior is in methods called by
+    # JIT test classes.
     def createFunctionFromGraph(self, trace):
+        # [FUNCTION DOC] Returns a runtime function named forward built from trace, which is
+        # either a Graph or an object with a graph method (such as a traced module).
         graph = trace if isinstance(trace, torch._C.Graph) else trace.graph()
         return torch._C._create_function_from_graph("forward", graph)
 
     def assertExportImport(self, trace, inputs):
+        # [FUNCTION DOC] Builds a function from the trace graph and runs the export/import round
+        # trip check (assertExportImportModule) with the given inputs.
         m = self.createFunctionFromGraph(trace)
         self.assertExportImportModule(m, inputs)
 
     def assertExportImportModule(self, m, inputs):
+        # [FUNCTION DOC] Saves and reloads module m, runs original and reloaded on inputs with
+        # the same RNG state, and asserts equal results. Raises an assertion error with a
+        # message on a diff.
         m_import = self.getExportImportCopy(m)
         a = self.runAndSaveRNG(m, inputs)
         b = self.runAndSaveRNG(m_import, inputs)
@@ -156,12 +196,19 @@ class JitCommonTestCase(TestCase):
                                "exported/imported version of model differed")
 
     def runAndSaveRNG(self, func, inputs, kwargs=None):
+        # [FUNCTION DOC] Calls func with inputs and kwargs under freeze_rng_state, so the RNG
+        # state is restored afterwards and repeated calls see the same random numbers. Returns
+        # func results.
         kwargs = kwargs if kwargs else {}
         with freeze_rng_state():
             results = func(*inputs, **kwargs)
         return results
 
     def getExportImportCopy(self, m, also_test_file=True, map_location=None):
+        # [FUNCTION DOC] Returns a copy of m obtained by torch.jit.save into an in-memory buffer
+        # and torch.jit.load with map_location. If also_test_file is true, additionally saves
+        # the imported module to a temporary file and loads it back, returning that copy. Temp
+        # file is removed.
         buffer = io.BytesIO()
         torch.jit.save(m, buffer)
         buffer.seek(0)
@@ -177,6 +224,12 @@ class JitCommonTestCase(TestCase):
     def autoDiffErrorMessage(self, should_autodiff_node, nodes_not_in_diff_graph,
                              fusion_nodes_not_found, non_fusible_nodes_being_fused,
                              fusion_nodes_found, nodes_in_diff_graph):
+        # [FUNCTION DOC] Builds the failure message for assertAutodiffNode. When autodiff was
+        # expected, classifies missing nodes into: not in any DifferentiableGraph, wrongly
+        # inside a fusion group, missing from fusion groups, or found only in the outer
+        # differentiable graph, and appends advice for each non-empty class. Otherwise reports
+        # nodes that unexpectedly were autodiffed. Args are lists of node kind names. Returns
+        # the message string; no side effects.
         err_msg = "\nFailure in testing nodes' autodifferentiation. "
         if should_autodiff_node:
             err_msg += "One or more nodes were expected to be autodiffed, " \
@@ -243,6 +296,11 @@ class JitCommonTestCase(TestCase):
         return err_msg
 
     def assertAutodiffNode(self, graph, should_autodiff_node, nonfusible_nodes, fusible_nodes):
+        # [FUNCTION DOC] Checks whether the named nodes were autodiffed in graph. Looks for
+        # nodes inside DifferentiableGraph subgraphs (nonfusible_nodes) and inside FusionGroup
+        # subgraphs nested in them (fusible_nodes). If should_autodiff_node is not None, asserts
+        # it equals whether all of both lists were found, using autoDiffErrorMessage for the
+        # message. If None, checks nothing.
         diff_nodes = graph.findAllNodes('prim::DifferentiableGraph')
         diff_subgraphs = [node.g('Subgraph') for node in diff_nodes]
 
@@ -285,6 +343,13 @@ class JitCommonTestCase(TestCase):
 
     def checkShapeAnalysis(self, out_sizes: list[int] | list[list[int]],
                            traced_graph, assert_propagation, constant_prop=True):
+        # [FUNCTION DOC] Checks shape analysis on traced_graph against expected out_sizes (one
+        # size list, or one per tuple element). Runs twice, with symbolic-shape test mode on and
+        # off: erases non-input shape info, optionally runs constant propagation, propagates
+        # shapes, then asserts the actual size is a subtype of the inferred type and, if
+        # assert_propagation, equals it exactly. Mutates traced_graph. Temporarily sets the
+        # global symbolic shapes test mode and restores it at the end (not restored if an
+        # assertion fails).
         # repropagte input shapes provided by tracing,
         prev_symbolic_shapes_test_enabled = torch._C._jit_symbolic_shapes_test_mode_enabled()
         for enable_test_mode in [True, False]:
@@ -300,6 +365,9 @@ class JitCommonTestCase(TestCase):
             output = next(traced_graph.outputs()).type()
 
             def test_type(type, actual_size):
+                # [FUNCTION DOC] HELPER: Compares inferred symbolic sizes of type to
+                # actual_size. Asserts actual_size is a subtype of the inferred type; if
+                # assert_propagation is set, also asserts the inferred sizes equal actual_size.
                 sizes = type.symbolic_sizes()
                 out_type = TensorType.get().with_sizes(sizes)
                 actual_type = TensorType.get().with_sizes(actual_size)
