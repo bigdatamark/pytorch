@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines PythonDispatcher, a thin Python binding over the C++ dispatcher that shows the computed dispatch
+# table after registering kernels to a chosen set of dispatch keys. Debugging/teaching aid; tests live in
+# test/test_dispatch.py. Imports torch._C; no import-time side effects.
 import re
 
 import torch._C as C
@@ -53,6 +56,10 @@ test/test_dispatch.py
 
 
 class PythonDispatcher:
+    # [CLASS DOC] Registers a fake operator (foo in the __test__ namespace) in the C++ dispatcher and lets callers register
+    # dummy kernels to supported runtime and alias keys, then dump registrations and the computed dispatch table.
+    # Class attributes: namespace, name, runtime_keys, alias_keys, supported_keys. The string literals between
+    # methods are documentation text, not real docstrings.
     namespace = "__test__"
     name = "foo"
     # fmt: off
@@ -71,6 +78,7 @@ class PythonDispatcher:
     supported_keys = runtime_keys + alias_keys
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Checks dispatcher invariants for the op name, creates a FRAGMENT library handle in the namespace, and defines the foo schema.
         C._dispatch_check_invariants(self.name)  # type: ignore[attr-defined]
         self.ref = C._dispatch_library("FRAGMENT", self.namespace, "")
         self.ref.def_("foo(Tensor x) -> Tensor")
@@ -81,6 +89,7 @@ class PythonDispatcher:
     """
 
     def keys(self):
+        # [FUNCTION DOC] Returns the list of supported dispatch keys (runtime keys plus alias keys).
         return self.supported_keys
 
     """
@@ -92,6 +101,8 @@ class PythonDispatcher:
     """
 
     def register(self, dispatchKeys):
+        # [FUNCTION DOC] Registers a dummy kernel for each given key. Raises RuntimeError on duplicate keys, on registering both
+        # CompositeImplicitAutograd and CompositeExplicitAutograd, or on an unsupported key. Mutates C++ dispatcher state.
         # Overridden is not supported and triggers a warning in C++ dispatcher.
         if len(set(dispatchKeys)) != len(dispatchKeys):
             raise RuntimeError(
@@ -117,6 +128,7 @@ class PythonDispatcher:
     """
 
     def _format_line(self, key, kernel):
+        # [FUNCTION DOC] HELPER: Formats a key padded to 15 chars followed by the kernel and a newline.
         return f"{key:<15} {kernel}\n"
 
     """
@@ -124,6 +136,7 @@ class PythonDispatcher:
     """
 
     def _format_header(self, header):
+        # [FUNCTION DOC] HELPER: Builds a table header string: the header text, a key/kernel column line, and a separator.
         s = f"""
 {header}
 """
@@ -137,6 +150,7 @@ class PythonDispatcher:
     """
 
     def rawRegistrations(self):
+        # [FUNCTION DOC] Returns the raw C++ dump of all registrations for the op (debug only).
         return C._dispatch_dump(f"{self.namespace}::{self.name}")  # type: ignore[attr-defined]
 
     """
@@ -145,6 +159,7 @@ class PythonDispatcher:
     """
 
     def rawDispatchTable(self):
+        # [FUNCTION DOC] Returns the raw C++ dump of the computed dispatch table for the op (debug only).
         return C._dispatch_dump_table(f"{self.namespace}::{self.name}")  # type: ignore[attr-defined]
 
     """
@@ -153,6 +168,7 @@ class PythonDispatcher:
     """
 
     def registrations(self):
+        # [FUNCTION DOC] Returns a formatted table string of user registrations (runtime and alias keys), parsed from the raw dump.
         output = self._format_header("Registered Kernels")
         state = self.rawRegistrations()
         state_entries = state.split("\n")
@@ -170,6 +186,8 @@ class PythonDispatcher:
     """
 
     def dispatchTable(self):
+        # [FUNCTION DOC] Returns a formatted table string of the computed dispatch table limited to runtime keys, stripping
+        # fallback kernel source location text from entries.
         output = self._format_header("Computed Dispatch Table")
         table = self.rawDispatchTable()
         table_entries = table.split("\n")

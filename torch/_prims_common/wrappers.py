@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers and decorators for Python reference implementations of ops (prims_common).
+# Provides dtype/scalar conversion helpers, an elementwise type promotion wrapper class, an out= wrapper
+# factory (resizes and safely copies into out tensors, rewrites signature and annotations), a wrapper that
+# disables autograd for prims, and a unary scalar wrapper. No import-time side effects beyond definitions.
 import inspect
 import types
 import typing
@@ -54,6 +58,9 @@ def _maybe_convert_to_dtype(a: None, dtype: torch.dtype) -> None:
 
 # TODO: implement ref.cast with an option to enforce safe casting
 def _maybe_convert_to_dtype(a, dtype):
+# [FUNCTION DOC] HELPER: Converts a tensor, number, or sequence to the given dtype. Tensors are cast with to() only if
+# the dtype differs; numbers are converted via the dtype's Python scalar type; sequences are converted
+# elementwise into a tuple; None passes through. Raises ValueError for other types. Preceded by overload stubs.
     if isinstance(a, TensorLike):
         if a.dtype != dtype:
             return a.to(dtype)
@@ -73,6 +80,8 @@ def _maybe_convert_to_dtype(a, dtype):
 
 
 def _maybe_convert_to_type(a: NumberType, typ: type) -> NumberType:
+# [FUNCTION DOC] HELPER: Converts a Python number to the given scalar type. Raises ValueError if the input is not a number
+# or if the cast would not be safe (the number's type is not weakly lesser than the target type).
     if not isinstance(a, Number):
         msg = f"Found unknown type {type(a)} when trying to convert scalars!"
         raise ValueError(msg)
@@ -84,6 +93,8 @@ def _maybe_convert_to_type(a: NumberType, typ: type) -> NumberType:
 
 
 def _annotation_has_type(*, typ, annotation):
+# [FUNCTION DOC] HELPER: Returns True if the keyword-only typ appears in the annotation, recursing through generic type
+# arguments (e.g. unions); otherwise compares the annotation to typ by identity.
     args = typing.get_args(annotation)
     if args:
         return any(_annotation_has_type(typ=typ, annotation=a) for a in args)
@@ -91,6 +102,9 @@ def _annotation_has_type(*, typ, annotation):
 
 
 class elementwise_type_promotion_wrapper:
+    # [CLASS DOC] Decorator class adding elementwise type promotion to a reference implementation. Stores the names of
+    # the arguments to promote and the promotion kind; calling an instance on a function returns a wrapper
+    # that promotes inputs to the compute dtype, calls the function, and casts results to the result dtype.
     """
     Adds elementwise type promotion to a Python reference implementation.
 
@@ -117,10 +131,15 @@ class elementwise_type_promotion_wrapper:
         type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND,
         type_promoting_args: Sequence[str] | None = None,
     ):
+        # [FUNCTION DOC] Stores the type promotion kind and the optional list of argument names that take part in promotion.
         self.type_promoting_arg_names = type_promoting_args
         self.type_promotion_kind = type_promotion_kind
 
     def __call__(self, fn: Callable) -> Callable:
+        # [FUNCTION DOC] Wraps fn: captures its signature and returns a wrapper (dynamo-disabled, with fn's metadata and
+        # signature preserved) that binds arguments, computes compute/result dtypes from the promoting args,
+        # converts those args to the compute dtype, calls fn, and converts the result (tensor or sequence) to the
+        # result dtype. A non-None dtype argument overrides the result dtype.
         sig = inspect.signature(fn)
 
         # TorchDynamo tracing of inspect causes fake tensor dynamo_wrapped tests to fail
@@ -128,6 +147,7 @@ class elementwise_type_promotion_wrapper:
         @torch._disable_dynamo
         @wraps(fn)
         def _fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper body. Raises AssertionError if fn returns something other than a tensor or sequence.
             bound = _fast_bind(sig, *args, **kwargs)
             type_promoting_args = tuple(
                 bound.arguments[x]
@@ -168,6 +188,9 @@ class elementwise_type_promotion_wrapper:
 
 # Returns True if resize is necessary
 def _resize_output_check(out: TensorLikeType, shape: ShapeType):
+# [FUNCTION DOC] HELPER: Returns True if out must be resized to the given shape. Warns (deprecation) if out has elements
+# and its shape differs; returns False when shapes already match.
+# KNOWN ISSUE: the second line of the warning message lacks an f prefix, so the required shape is printed literally.
     # If the shapes are correct there's nothing to do
     if utils.same_shape(out.shape, shape):
         return False
@@ -189,6 +212,7 @@ def _maybe_resize_out(
     shape: ShapeType,
     memory_format: torch.memory_format | None = None,
 ):
+# [FUNCTION DOC] HELPER: Resizes out in place to shape (with optional memory format) if needed and returns it; else returns out unchanged.
     if _resize_output_check(out, shape):
         return out.resize_(shape, memory_format=memory_format)
     else:
@@ -196,10 +220,12 @@ def _maybe_resize_out(
 
 
 def is_cpu_scalar(x: TensorLikeType) -> bool:
+# [FUNCTION DOC] Returns True if the tensor is zero-dimensional and on the CPU device.
     return x.dim() == 0 and x.device.type == "cpu"
 
 
 def check_copy_devices(*, copy_from: TensorLikeType, copy_to: TensorLikeType) -> None:
+# [FUNCTION DOC] Raises RuntimeError if the two tensors are on different devices.
     if copy_from.device != copy_to.device:
         msg = (
             f"Attempting to copy from device {copy_from.device} "
@@ -211,6 +237,8 @@ def check_copy_devices(*, copy_from: TensorLikeType, copy_to: TensorLikeType) ->
 def _safe_copy_out(
     *, copy_from: TensorLikeType, copy_to: TensorLikeType, exact_dtype: bool = False
 ):
+# [FUNCTION DOC] HELPER: Copies copy_from into copy_to in place and returns copy_to. Checks devices (unless the source is a
+# CPU scalar) and then either exact dtype equality (exact_dtype) or that the cast is safe; errors are raised via torch._check.
     # Checks same device
     if not is_cpu_scalar(copy_from):
         check_copy_devices(copy_from=copy_from, copy_to=copy_to)
@@ -238,6 +266,11 @@ def out_wrapper(
     pass_is_out: bool = False,
     preserve_memory_format: bool = False,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Decorator factory adding an out= keyword to a reference function. out_names names the output(s) (default
+    # a single one called out); exact_dtype requires matching dtypes; pass_is_out passes an is_out flag to the
+    # function; preserve_memory_format uses the result's suggested memory format when resizing out. The wrapped
+    # function resizes/copies results into out, returns out (or a named tuple for multiple outputs), and
+    # gets an updated signature, annotations and a marker attribute.
     # The wrapped function needs to convert the output parameters to ensure
     # compatibility between the Python API (which always uses "out" as the
     # parameter name and may be a tuple) and the Aten API (which may have
@@ -252,9 +285,12 @@ def out_wrapper(
     is_tensor = len(out_names) == 1
 
     def maybe_compute_memory_format(t):
+        # [FUNCTION DOC] HELPER: Returns the suggested memory format of t if preserve_memory_format is set, else None.
         return utils.suggest_memory_format(t) if preserve_memory_format else None
 
     def _out_wrapper(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: Applies the out wrapping to fn: builds out/return types, the wrapper, and the new signature.
+        # Raises AssertionError if the existing return annotation is not compatible with the out type.
         """
         Adds the out parameter to a Python reference.
         """
@@ -290,6 +326,9 @@ def out_wrapper(
 
         @wraps(fn)
         def _fn(*args: _P.args, **kwargs: _P.kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper body. Pops out, copies factory kwargs (device, dtype) from out when applicable, checks
+            # devices, calls fn, validates the result shape, then resizes and copies into out (tensor or tuple/list
+            # for unbind). Raises AssertionError on unexpected result/out types; returns NotImplemented if fn does.
             out = kwargs.pop("out", None)
             if is_factory_fn and out is not None:
                 for k in factory_kwargs:
@@ -298,6 +337,7 @@ def out_wrapper(
                         kwargs[k] = out_attr
 
             def maybe_check_copy_devices(out):
+                # [FUNCTION DOC] HELPER: Checks that the first positional tensor argument and out are on the same device.
                 if isinstance(out, TensorLike) and isinstance(args[0], TensorLike):
                     check_copy_devices(copy_from=args[0], copy_to=out)
 
@@ -432,6 +472,7 @@ def out_wrapper(
 
 
 def _maybe_remove_out_wrapper(fn: Callable):
+# [FUNCTION DOC] HELPER: Unwraps fn through the wrapped chain until a function without the out wrapper marker is reached.
     return inspect.unwrap(
         fn,
         stop=lambda f: not hasattr(f, "_torch_decompositions_out_wrapper"),
@@ -439,23 +480,31 @@ def _maybe_remove_out_wrapper(fn: Callable):
 
 
 def backwards_not_supported(prim):
+# [FUNCTION DOC] Wraps a prim so that when grad mode is on and any tensor input requires grad, it runs inside a custom
+# autograd Function whose backward raises RuntimeError; otherwise the prim is redispatched below autograd.
+# KNOWN ISSUE: prims that mutate and return their input may be turned into views (see TODO in code).
     def redispatch_prim(args, kwargs):
+        # [FUNCTION DOC] HELPER: Calls the prim with args/kwargs with autograd dispatch disabled.
         with torch._C._AutoDispatchBelowAutograd():
             return prim(*args, **kwargs)
 
     class BackwardsNotSupported(torch.autograd.Function):
+        # [CLASS DOC] HELPER: Custom autograd Function whose forward calls the prim without autograd and whose backward always raises.
         @staticmethod
         # pyrefly: ignore [bad-override]
         def forward(ctx, args_spec, *flat_args):
+            # [FUNCTION DOC] HELPER: Unflattens args per args_spec and runs the prim below autograd.
             args, kwargs = tree_unflatten(flat_args, args_spec)  # type: ignore[arg-type]
             return redispatch_prim(args, kwargs)
 
         @staticmethod
         def backward(ctx, *args):
+            # [FUNCTION DOC] HELPER: Always raises RuntimeError: backwards not supported on prim.
             raise RuntimeError("backwards not supported on prim")
 
     @wraps(prim)
     def _autograd_impl(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Flattens args and dispatches to the backward-raising Function if grad is needed, else redispatches.
         flat_args, args_spec = tree_flatten((args, kwargs))
         if torch.is_grad_enabled() and any(
             a.requires_grad for a in flat_args if isinstance(a, torch.Tensor)
@@ -483,6 +532,9 @@ def backwards_not_supported(prim):
 def elementwise_unary_scalar_wrapper(
     fn: Callable[_P, _T],
 ) -> Callable[_P, _T | NumberType]:
+# [FUNCTION DOC] Decorator letting a unary tensor function accept a Python number: the number is converted to a tensor of
+# the matching dtype, fn is applied, and the result is returned as a Python number via item().
+# Non-number first args pass straight through. Raises AssertionError if fn does not return a tensor.
     """
     Allows unary operators that accept tensors to work with Python numbers.
     """
@@ -490,6 +542,7 @@ def elementwise_unary_scalar_wrapper(
 
     @wraps(fn)
     def _fn(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Wrapper body implementing the scalar conversion described above.
         if len(args) > 0 and isinstance(args[0], Number):
             dtype = utils.type_to_dtype(type(args[0]))
             args_ = list(args)
