@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for RuntimeEstimator on CUDA: trains a Transformer and a simple CNN for
+# real, times a train step with CUDA events, and compares with estimates from the operator-level
+# benchmark and operator-level cost model modes computed under FakeTensorMode. Estimates and
+# accuracy ratios are only printed; no accuracy assertions run in CI because benchmarks are
+# noisy. Defines the ConvArgs dataclass and the SimpleCNN model.
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,12 +23,20 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 @dataclass
 class ConvArgs:
+    # [CLASS DOC] HELPER: Dataclass with the CNN input image side length and number of output
+    # classes.
     image_size: int
     num_classes: int
 
 
 class SimpleCNN(nn.Module):
+    # [CLASS DOC] HELPER: Four-convolution, three-linear image classifier with max pooling and
+    # relu, sized from ConvArgs; the first linear layer input size is computed from the image
+    # size.
     def __init__(self, conv_args: ConvArgs):
+        # [FUNCTION DOC] HELPER: Stores the image size, builds the convolution layers (3 to 32,
+        # 32 to 64, 64 to 128, 128 to 256 channels), a 2 by 2 max pool, computes the flattened
+        # feature size and builds three linear layers ending in num_classes outputs.
         super().__init__()
         image_size = conv_args.image_size
         num_classes = conv_args.num_classes
@@ -39,6 +52,12 @@ class SimpleCNN(nn.Module):
         self.fc3 = nn.Linear(256, num_classes)
 
     def _calculate_fc1_size(self):
+        # [FUNCTION DOC] HELPER: Returns the flattened feature size for the first linear layer by
+        # tracking the spatial size through the convolutions and pools and multiplying by 512 and
+        # the square of the final size.
+        # KNOWN ISSUE: the last convolution has 256 output channels but the result uses 512, so
+        # the flattened size is double the real feature count; the forward reshape with an
+        # inferred batch dimension then silently halves the batch instead of failing.
         size = self.image_size
         size = (size - 5 + 1) // 2  # conv1 and pool
         size = (size - 5 + 1) // 2  # conv2 and pool
@@ -47,6 +66,9 @@ class SimpleCNN(nn.Module):
         return 512 * size * size
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs convolution, relu and pooling stages, flattens with a
+        # reshape to the precomputed feature size and an inferred batch dimension, applies two
+        # relu linear layers and the final linear layer, and returns the logits.
         x = self.pool(nn.functional.relu(self.conv1(x)))
         x = self.pool(nn.functional.relu(self.conv2(x)))
         x = nn.functional.relu(self.conv3(x))
@@ -59,12 +81,17 @@ class SimpleCNN(nn.Module):
 
 
 class TestRuntimeEstimator(TestCase):
+    # [CLASS DOC] CUDA test case comparing measured and estimated runtime of one training step
+    # for a Transformer and a CNN.
     def _train_step(
         self,
         model: nn.Module,
         optimizer: optim.Optimizer,
         inp: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: One training step: forward pass, sum of the output as the loss,
+        # backward, optimizer step and gradient zeroing. Mutates model parameters and optimizer
+        # state.
         out = model(inp)
         loss = out.sum()
         loss.backward()
@@ -76,6 +103,9 @@ class TestRuntimeEstimator(TestCase):
         func: Callable,
         args: tuple[Any, ...],
     ) -> float:
+        # [FUNCTION DOC] HELPER: Calls the function with the args for 2 warmup iterations, then
+        # times 5 iterations with CUDA events and a device synchronize, and returns the average
+        # time in milliseconds per iteration.
         warmup_iters, actual_iters = 2, 5
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -95,6 +125,9 @@ class TestRuntimeEstimator(TestCase):
         func: Callable,
         args: tuple[Any, ...],
     ) -> float:
+        # [FUNCTION DOC] HELPER: Calls the function once outside the estimator (to initialise
+        # optimizer state), then calls it once more inside a RuntimeEstimator context with the
+        # given estimate mode and returns the estimator's total runtime.
         # Optimizer init step
         func(*args)
         runtime_estimator = RuntimeEstimator()
@@ -108,6 +141,10 @@ class TestRuntimeEstimator(TestCase):
         model_args: ConvArgs | ModelArgs,
         bsz: int,
     ) -> tuple[nn.Module, optim.Optimizer, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Builds a model, optimizer and input batch on the current CUDA
+        # device. A Transformer uses Adam and random token ids; a CNN uses SGD and random images.
+        # Both use foreach. Raises NotImplementedError for any other model type. Returns the
+        # tuple of model, optimizer and input.
         dev = torch.cuda.current_device()
         if model_type == "Transformer":
             model_args = cast(ModelArgs, model_args)
@@ -133,6 +170,10 @@ class TestRuntimeEstimator(TestCase):
     def test_transformer_runtime(
         self,
     ):
+        # [FUNCTION DOC] Measures the real train step time of a 4-layer 768-wide Transformer,
+        # then under FakeTensorMode builds fake inputs and gets benchmark and cost-model
+        # estimates, and prints the actual time, estimates and accuracy ratios. No assertions on
+        # accuracy. Skipped without CUDA.
         """Runs a basic GPT-2 model"""
         vocab_size = 8192
         bsz, seq_len = 8, 1024
@@ -169,6 +210,9 @@ class TestRuntimeEstimator(TestCase):
     def test_conv_model_runtime(
         self,
     ):
+        # [FUNCTION DOC] Same comparison for the simple CNN with 100 classes, batch 256 and image
+        # side 128: real timing versus fake-mode benchmark and cost-model estimates, printed
+        # only. Skipped without CUDA.
         """Runs a simple CNN model"""
         num_classes = 100
         bsz, img_sz = 256, 128

@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for ModTracker (torch.distributed._tools.mod_tracker): the set of parent
+# module names and backward flag seen inside forward and backward hooks, backward detection,
+# user-registered pre and post hooks for forward and backward (including after the module is
+# deleted), and behavior under non-reentrant activation checkpointing. Several tests are expected
+# failures under TorchDynamo.
 
 from copy import copy
 
@@ -9,14 +14,29 @@ from torch.utils.checkpoint import checkpoint
 
 
 class TestModTracker(TestCase):
+    # [CLASS DOC] Single-process test case for ModTracker parent tracking and user hooks.
     # "https://github.com/pytorch/pytorch/issues/127112
     @xfailIfTorchDynamo
     def test_module_hierarchy(self):
+        # [FUNCTION DOC] Runs a nested module whose children record a copy of the tracker's
+        # parents and backward flag during forward, and again from a gradient hook during
+        # backward, over two iterations under ModTracker. Asserts forward records show Global,
+        # Mod and the active child path in call order (c.0, a, b.nest) with the flag false, and
+        # backward records show the reverse order with the flag true. Expected failure under
+        # Dynamo.
         seen_fw = []
         seen_bw = []
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Leaf module that applies in-place relu to the input mapping's
+            # tensor, records the tracker state in the forward, registers a gradient hook
+            # recording the state in backward, and returns a mapping with the matrix product of
+            # the tensor with itself.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes a mapping with key a, applies in-place relu,
+                # appends the current parents and backward flag to the forward log, adds a hook
+                # that appends them to the backward log, and returns a mapping with the matrix
+                # product.
                 x = x["a"].relu_()
                 seen_fw.append((copy(tracker.parents), tracker.is_bw))
                 x.register_hook(
@@ -25,13 +45,19 @@ class TestModTracker(TestCase):
                 return {"a": torch.mm(x, x)}
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Container with child Foo modules held directly (a), in a
+            # ModuleDict (b.nest) and in a ModuleList (c.0); forward calls c.0, then a, then
+            # b.nest.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the three Foo children.
                 super().__init__()
                 self.a = Foo()
                 self.b = torch.nn.ModuleDict({"nest": Foo()})
                 self.c = torch.nn.ModuleList([Foo()])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Passes the input through c.0, then a, then b.nest and
+                # returns the result.
                 x = self.c[0](x)
                 return self.b["nest"](self.a(x))
 
@@ -70,6 +96,9 @@ class TestModTracker(TestCase):
         )
 
     def test_bw_detection(self):
+        # [FUNCTION DOC] Runs a linear layer forward and backward under ModTracker and checks
+        # that after the backward call the tracker reports it is not in backward and only Global
+        # is in the parents set.
         mod = torch.nn.Linear(2, 2)
 
         with ModTracker() as tracker:
@@ -79,18 +108,31 @@ class TestModTracker(TestCase):
 
     @xfailIfTorchDynamo
     def test_user_hooks(self):
+        # [FUNCTION DOC] Registers user hooks (pre and post forward, pre and post backward) that
+        # log hook name, the known qualified name of the module, whether it is among the tracker
+        # parents, and the backward flag. Checks the exact log for forward and backward of a
+        # small module, that registering hooks again raises AssertionError, and that when the
+        # module is deleted before backward the backward hooks log a missing name and false
+        # parent membership. Expected failure under Dynamo.
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper holding one linear layer and applying in-place relu to
+            # its output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer named foo.
                 super().__init__()
                 self.foo = torch.nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the in-place relu of the linear layer output.
                 return self.foo(x).relu_()
 
         mt = ModTracker()
         test_op = []
 
         def hook(mod, hook_name):
+            # [FUNCTION DOC] HELPER: Appends to the shared log a tuple of hook name, the
+            # tracker's known qualified name for the module (None if the module is None), whether
+            # that name is among current parents, and the backward flag.
             mfqn = mt.get_known_fqn(mod) if mod is not None else None
             test_op.append((hook_name, mfqn, mfqn in mt.parents, mt.is_bw))
 
@@ -138,8 +180,17 @@ class TestModTracker(TestCase):
 
     @xfailIfTorchDynamo
     def test_ac(self):
+        # [FUNCTION DOC] Checks the hook sequence when blocks after the first are activation
+        # checkpointed: forward hooks run in order, and during backward the checkpointed layer's
+        # forward hooks fire again (recomputation) while the tracker is already in backward mode.
+        # Compares against an exact expected log. Expected failure under Dynamo.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stack of linear layers with relu after each; when use_ac is
+            # set, every layer after the first runs through non-reentrant checkpoint with RNG
+            # state preserved.
             def __init__(self, n_layers: int, dim: int, use_ac: bool = False):
+                # [FUNCTION DOC] HELPER: Builds the list of linear layers and stores the
+                # checkpointing flag.
                 super().__init__()
                 self.linears = torch.nn.ModuleList()
                 self.use_ac = use_ac
@@ -147,6 +198,9 @@ class TestModTracker(TestCase):
                     self.linears.append(torch.nn.Linear(dim, dim))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies each layer (checkpointed after the first when
+                # enabled), raises AssertionError if the result is None, applies relu and returns
+                # the final tensor.
                 for i, block in enumerate(self.linears):
                     if i >= 1 and self.use_ac:
                         x = checkpoint(
@@ -165,6 +219,9 @@ class TestModTracker(TestCase):
         test_op = []
 
         def hook(mod, mt, hook_name):
+        # [FUNCTION DOC] HELPER: Appends to the shared log a tuple of hook name, the tracker's
+        # known qualified name for the module (None if None), whether the name is among the
+        # tracker's parents, and the backward flag.
             mfqn = mt.get_known_fqn(mod) if mod is not None else None
             test_op.append((hook_name, mfqn, mfqn in mt.parents, mt.is_bw))
 

@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests for ShardingPlan and shard_module: validation errors for malformed
+# plans, a custom ShardingPlanner that chunks every parameter, and sharding within a sub process
+# group. Defines the example planner ChunkAllShardingPlanner. Skips the whole file at import
+# (exit 0) under dev-asan builds.
 import sys
 
 import torch
@@ -32,14 +36,23 @@ if TEST_WITH_DEV_DBG_ASAN:
 # Example ShardingPlanner that chunks every parameter in the module
 # to all available devices defined.
 class ChunkAllShardingPlanner(ShardingPlanner):
+    # [CLASS DOC] Example ShardingPlanner that builds a plan assigning one chunk sharding spec
+    # (fixed dim, placements on devices 0..device_count-1) to every named parameter of a module.
+    # Class attributes dim and devices are overridden per instance in the constructor.
     dim = 0
     devices = []
 
     def __init__(self, chunk_dim=0, device_count=0):
+        # [FUNCTION DOC] Stores the chunk dimension and builds the placement list of rank-and-
+        # cuda device strings, one per device index up to device_count (empty if device_count is
+        # 0).
         self.dim = chunk_dim
         self.devices = [f"rank:{i}/cuda:{i}" for i in range(device_count)]
 
     def build_plan(self, module: nn.Module) -> ShardingPlan:
+        # [FUNCTION DOC] Walks the module's named parameters and returns a ShardingPlan whose
+        # plan mapping gives each parameter name a ChunkShardingSpec over the configured dim and
+        # placements. No output plan is set; the module is not modified.
         named_params = module.named_parameters()
         plan = {}
         for name, _ in named_params:
@@ -49,10 +62,16 @@ class ChunkAllShardingPlanner(ShardingPlanner):
 
 
 class TestShardingPlan(ShardedTensorTestBase):
+    # [CLASS DOC] Test case on ShardedTensorTestBase exercising ShardingPlan handling in
+    # shard_module with real GPUs and NCCL.
     @with_comms(init_rpc=False)
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_nccl()
     def test_sharding_plan_errors(self):
+        # [FUNCTION DOC] Verifies shard_module rejects bad plans on a small Megatron-style
+        # module: a plain tensor as plan value raises TypeError (only ShardingSpec and Sharder
+        # allowed), a tensor as output plan value raises TypeError, and an unknown submodule or
+        # parameter path raises AttributeError.
         rowwise_sharding_spec = generate_chunk_sharding_specs_for_test(1)[0]
         sharding_plan_wrong_plan = ShardingPlan(
             plan={
@@ -104,6 +123,9 @@ class TestShardingPlan(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_nccl()
     def test_custom_sharding_planner(self):
+        # [FUNCTION DOC] Builds a plan with the custom ChunkAllShardingPlanner for the module,
+        # shards the module with it, and asserts that both weights and both biases of the two
+        # linear layers became ShardedTensor instances.
         megatron_lm = SimpleMegatronLM([[17, 12], [12, 29]], rank=self.rank).cuda(
             self.rank
         )
@@ -122,6 +144,10 @@ class TestShardingPlan(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(TEST_GPU_NUM)
     @requires_nccl()
     def test_shard_module_sub_process_group(self):
+        # [FUNCTION DOC] Creates a process group of ranks 2 and 3 and, only on those ranks,
+        # shards the first two layer weights column-wise and row-wise across those two ranks
+        # passing the group to shard_module. Only checks that sharding completes without raising;
+        # ranks 0 and 1 do nothing.
         megatron_lm = SimpleMegatronLM([[17, 12], [12, 29]], rank=self.rank)
         colwise_sharding_spec = ChunkShardingSpec(
             dim=0,

@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Smoke test for MemoryTracker on a small nested convolution model on the current
+# accelerator: collects operator-level memory stats over one forward and backward pass, saves and
+# loads the trace, prints the summary, and checks internal counters. Writes and removes a file
+# named memory.trace in the working directory.
 import os
 import unittest
 
@@ -9,8 +13,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestMemoryTracker(TestCase):
+    # [CLASS DOC] Test case holding the single MemoryTracker smoke test.
     @unittest.skipIf(not torch.accelerator.is_available(), "no accelerator")
     def test_local_model(self):
+        # [FUNCTION DOC] Builds a seeded nested Sequential model on the accelerator, starts
+        # monitoring, runs a cross entropy forward and backward pass, then checks hooks exist
+        # while monitoring and are removed after stop. Saves stats to memory.trace, loads them
+        # and prints the summary, deleting the file. Asserts that operators were recorded, the
+        # three memory lists each have one entry per operator, two markers exist, the current
+        # module name is set and the retry counter attribute exists. Skipped without an
+        # accelerator.
         """
         Minimal test case to check the memory tracker can collect the expected
         memory stats at operator level, as well as can print the summary result

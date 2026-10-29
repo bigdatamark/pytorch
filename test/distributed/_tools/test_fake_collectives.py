@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests that the fake collectives tooling (CollectiveOp, collective_ops,
+# non_functional_collectives) correctly recognises the process group and computes communication
+# tensor sizes for every c10d and functional collective, using a fake process group of world size
+# 4 under FakeTensorMode on CUDA. Defines a TorchDispatchMode that checks each intercepted
+# collective. No import-time side effects beyond aliasing torch.ops namespaces.
 import unittest
 
 import torch
@@ -37,7 +42,12 @@ _c10d_functional_autograd = torch.ops._c10d_functional_autograd
 
 
 class TestFakeCollectives(TestCase):
+    # [CLASS DOC] Test case that drives one of each supported collective under fake tensors and
+    # the CollectiveTest dispatch mode.
     def _setup_distributed(self):
+        # [FUNCTION DOC] HELPER: Initialises the global default process group with the fake
+        # backend (rank 0, world size 4, a FakeStore) and sets the current CUDA device. Side
+        # effect: creates global distributed state that the caller must destroy.
         world_size = 4
         store = FakeStore()
         dist.init_process_group("fake", rank=0, world_size=world_size, store=store)
@@ -45,6 +55,12 @@ class TestFakeCollectives(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not available")
     def test_collectives(self):
+        # [FUNCTION DOC] Under FakeTensorMode and the CollectiveTest checker, issues
+        # non-functional collectives (broadcast, all reduce, reduce, send, recv, all gather,
+        # reduce scatter, scatter, gather, all to all, barrier) and functional ones (including
+        # autograd and coalesced variants) on fake CUDA tensors. Assertions happen in the
+        # dispatch mode. Always destroys the process group in a finally block. Skipped without
+        # CUDA.
         try:
             self._setup_distributed()
             with FakeTensorMode(), CollectiveTest(test=self):
@@ -112,6 +128,12 @@ class TestFakeCollectives(TestCase):
 
 
 class CollectiveTest(TorchDispatchMode):
+    # [CLASS DOC] TorchDispatchMode that executes each op, and for recognised collectives
+    # asserts: the process group is a ProcessGroup equal to the world group with size 4 and a
+    # non-empty name; the computed communication size equals the expected size (barriers and
+    # wait_tensor are exempt); and non-functional collectives return a fake work object. Holds
+    # the owning test case. The class attribute collective_size_exclude lists ops exempt from
+    # size checks.
     collective_size_exclude = {
         c10d.barrier.default,
         c10d.monitored_barrier_.default,
@@ -119,10 +141,18 @@ class CollectiveTest(TorchDispatchMode):
     }
 
     def __init__(self, test: TestFakeCollectives, _dispatch_key=None):
+        # [FUNCTION DOC] Initialises the dispatch mode with the optional dispatch key and stores
+        # the test case used for assertions.
         super().__init__(_dispatch_key)
         self.test = test
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Runs the intercepted op and returns its result unchanged. For ops in
+        # collective_ops (except wait_tensor) checks the process group extracted from the args;
+        # for those not excluded, compares the computed communication size with the expected size
+        # from get_expected_size; for non-functional collectives other than the monitored
+        # barrier, checks the last result element (or the result itself) unboxes to a FakeWork.
+        # Failures surface as test assertion errors.
         res = func(*args, **(kwargs or {}))
 
         if func in collective_ops:
@@ -167,6 +197,10 @@ class CollectiveTest(TorchDispatchMode):
 
     @staticmethod
     def get_expected_size(func, res, args, kwargs):
+        # [FUNCTION DOC] Looks up the expected byte count of communicated data for an op in a
+        # fixed mapping (assuming world size 4 and the specific 100 and 400 element float tensors
+        # used by the test) and returns it. The result, args and kwargs arguments are unused.
+        # Raises ValueError for an op not in the mapping.
         """Return expected tensor size for collectives explicitly used in run_test()."""
         WORLD_SIZE, TENSOR_100, TENSOR_400 = 4, 100 * 4, 400 * 4
         TENSOR_LIST_100, TENSOR_LIST_400 = (

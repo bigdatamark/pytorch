@@ -1,4 +1,9 @@
 # Owner(s): ["module: fsdp"]
+# [MODULE DOC] Multi-GPU tests for FSDPMemTracker (fsdp2_mem_tracker) with fully_shard (FSDP2):
+# the tracker's peak memory must match the accelerator allocator's active-bytes peak within 10
+# percent for MLP stacks with varied offload, mixed precision and resharding settings, non-root
+# forward and backward, and a Transformer with composable or wrapper activation checkpointing.
+# Defines two module-level helpers that prepare allocator state.
 import functools
 import gc
 
@@ -28,6 +33,9 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 def _init_cublas_workspace(dev: torch.device):
+    # [FUNCTION DOC] HELPER: Runs a forward and backward pass of a 768 by 768 linear layer on the
+    # device so the BLAS workspace is allocated before measurements, then frees the layer and
+    # input.
     lin = torch.nn.Linear(768, 768, device=dev)
     inp = torch.randn(1, 768, device=dev)
     lin(inp).sum().backward()
@@ -37,19 +45,28 @@ def _init_cublas_workspace(dev: torch.device):
 
 def _reset_mem_stats(dev: torch.device):
     mod = torch.get_device_module(dev)
+    # [FUNCTION DOC] HELPER: Empties the device allocator cache and resets the accumulated and
+    # peak memory statistics for the device.
     mod.empty_cache()
     mod.reset_accumulated_memory_stats(dev)
     mod.reset_peak_memory_stats(dev)
 
 
 class TestTrackerFullyShard1DTrainingCore(FSDPTest):
+    # [CLASS DOC] FSDPTest-based multi-process test case for FSDPMemTracker accuracy on pure
+    # FSDP2 training of MLP stacks.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks: the accelerator device count capped at 4.
         return min(4, torch.accelerator.device_count())
 
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/129390")
     @skip_if_lt_x_gpu(2)
     def test_tracker_multi_group_eager(self):
+        # [FUNCTION DOC] Runs the multi-group accuracy check as subtests over
+        # reshard-after-forward true and false, CPU offload without pinned memory versus no
+        # offload, and a float16 parameter and float32 reduce mixed precision policy. Skipped on
+        # ROCm (known issue link in the decorator) and with fewer than 2 GPUs.
         """
         Tests tracker accuracy when using multiple parameter groups for
         communication (for communication and computation overlap plus memory
@@ -77,6 +94,13 @@ class TestTrackerFullyShard1DTrainingCore(FSDPTest):
         offload_policy: OffloadPolicy,
         mp_policy: MixedPrecisionPolicy,
     ):
+        # [FUNCTION DOC] HELPER: Records starting allocator state, builds four MLP layers of
+        # width 2048, applies fully_shard to each layer and the whole model with the given
+        # settings, and trains two iterations with Adam under FSDPMemTracker (module stats reset
+        # after the first, input tracked). Asserts the ratio of the tracker's peak total to the
+        # allocator's peak active bytes growth is 1.0 within 0.1. Optionally prints the accuracy
+        # on rank 0 if the local debug flag is changed. Deletes the model, input and optimizer at
+        # the end.
         debug = False
         dev = torch.device(torch.accelerator.current_device_index())
         _init_cublas_workspace(dev)
@@ -132,6 +156,10 @@ class TestTrackerFullyShard1DTrainingCore(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_tracker_non_root_forward_backward(self):
+        # [FUNCTION DOC] Same accuracy check but with three sharded MLPs where only the first
+        # layer is run (forward and backward) in each iteration, so the root module is never
+        # called directly; the optimizer still steps over all parameters. Requires at least 2
+        # GPUs.
         """
         Tests tracker accuracy when running forward/backward through a non-root.
         """
@@ -181,10 +209,19 @@ class TestTrackerFullyShard1DTrainingCore(FSDPTest):
         del optim
 
     def _test_tracker_multihandler_hook(self):
+        # [FUNCTION DOC] HELPER: Intended to check that FSDPMemTracker can hook a model with
+        # several separately sharded groups (two norm and linear groups plus root) without a
+        # KeyError during forward and backward. It has no assertions.
+        # KNOWN ISSUE: the name starts with an underscore and nothing calls it, so the unittest
+        # runner never executes it.
         """Should run without KeyError."""
 
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: Small model of alternating RMSNorm and linear layers used to
+            # test the tracker with multiple FSDP groups.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Creates two RMSNorm and two linear layers of the given
+                # dim.
                 super().__init__()
                 self.norm1 = nn.RMSNorm(dim)
                 self.output1 = nn.Linear(dim, dim)
@@ -192,6 +229,8 @@ class TestTrackerFullyShard1DTrainingCore(FSDPTest):
                 self.output2 = nn.Linear(dim, dim)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies the first norm, first linear, second norm and
+                # second linear in order and returns the result.
                 x = self.norm1(x)
                 x = self.output1(x)
                 x = self.norm2(x)
@@ -223,12 +262,18 @@ class TestTrackerFullyShard1DTrainingCore(FSDPTest):
 
 
 class TestTrackerFullyShard1DTrainingCompose(FSDPTest):
+    # [CLASS DOC] FSDPTest-based multi-process test case for FSDPMemTracker accuracy when FSDP2
+    # is composed with activation checkpointing.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks: the accelerator device count capped at 4.
         return min(torch.accelerator.device_count(), 4)
 
     @skip_if_lt_x_gpu(2)
     def test_tracker_with_activation_checkpointing(self):
+        # [FUNCTION DOC] Runs the checkpointing accuracy check as subtests over
+        # reshard-after-forward true and false and the composable and wrapper checkpoint
+        # implementations. Requires at least 2 GPUs.
         """
         Tests tracker accuracy when composing with activation checkpointing.
         """
@@ -243,6 +288,12 @@ class TestTrackerFullyShard1DTrainingCompose(FSDPTest):
     def _test_tracker_with_activation_checkpointing(
         self, reshard_after_forward: bool | int, checkpoint_impl: str
     ):
+        # [FUNCTION DOC] HELPER: Raises AssertionError if checkpoint_impl is not composable or
+        # wrapper. Builds a 4-layer Transformer, applies activation checkpointing either through
+        # the wrapper utility (then shards the wrappers) or the composable checkpoint on each
+        # transformer block (then shards the blocks), shards the whole model, trains two
+        # iterations of Adam on random token input under FSDPMemTracker, and asserts the tracker
+        # peak versus allocator peak ratio is 1.0 within 0.1. Deletes tensors at the end.
         if checkpoint_impl not in ("composable", "wrapper"):
             raise AssertionError(
                 f"Expected checkpoint_impl in ('composable', 'wrapper'), got {checkpoint_impl}"

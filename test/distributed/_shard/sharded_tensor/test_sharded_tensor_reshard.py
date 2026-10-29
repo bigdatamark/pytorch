@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests for ShardedTensor.reshard, which converts a chunk-sharded tensor
+# to a different chunk sharding dimension in place. Skips the whole file at import (exit 0) under
+# dev-asan builds. Needs 4 GPUs and NCCL; tests run with comms but no RPC.
 
 import sys
 from itertools import product
@@ -26,7 +29,15 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestReshard(ShardedTensorTestBase):
+    # [CLASS DOC] Test case (ShardedTensorTestBase, one process per rank) covering successful
+    # resharding across chunk dims and the error paths for unsupported specs or multiple local
+    # shards.
     def _run_sharded_tensor_reshard(self, sharding_spec, reshard_spec, input_size):
+        # [FUNCTION DOC] HELPER: Seeds the RNG, builds a random 2D tensor on this rank's GPU,
+        # shards it once with sharding_spec and once with reshard_spec, then reshards the first
+        # in place to reshard_spec. Asserts each has exactly one local shard and that, after
+        # sorting the reference shard metadata by placement rank, the global metadata, the local
+        # tensor and the local shard metadata all match the reference.
         torch.manual_seed(0)
         local_tensor = torch.rand(*input_size).cuda(self.rank)
         st = _shard_tensor(local_tensor, sharding_spec)
@@ -47,6 +58,9 @@ class TestReshard(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
     def test_sharded_tensor_reshard(self):
+        # [FUNCTION DOC] Runs the reshard check for every combination of source and target chunk
+        # dims (0 or 1), using two chunk specs generated with a fixed seed, over four input
+        # shapes whose sizes divide unevenly among the ranks and evenly.
         dims = [0, 1]
         for sharding_dim, reshard_dim in product(dims, dims):
             specs = _chunk_sharding_specs_list_for_test(
@@ -62,6 +76,11 @@ class TestReshard(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
     def test_sharded_tensor_reshard_errors(self):
+        # [FUNCTION DOC] Checks reshard error handling on a sharded random tensor: an enumerable
+        # spec as target raises NotImplementedError (only chunk specs supported); after
+        # duplicating the local shard list so there are two local shards, reshard raises
+        # NotImplementedError (only single local shard supported). Mutates the private local
+        # shard list of the tensor.
         specs = _chunk_sharding_specs_list_for_test([0, 1], seed=6)
         spec, reshard_spec = specs[0], specs[1]
         enumerable_sharding_spec = EnumerableShardingSpec(

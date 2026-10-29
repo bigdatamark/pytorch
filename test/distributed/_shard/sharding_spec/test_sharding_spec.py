@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the sharding spec API (DevicePlacementSpec, ChunkShardingSpec,
+# EnumerableShardingSpec), the internal helpers for split sizes, chunk sharding params, tensor
+# and shard consistency checks, overlap validation, spec inference from shard metadata, and a
+# user-defined GridShardingSpec exercised through the sharded tensor constructors. Defines the
+# GridShardingSpec dataclass. Most spec-only tests need two CUDA GPUs and otherwise pass as
+# skipped; the custom-spec tensor tests need 4 GPUs and NCCL.
 import copy
 from dataclasses import dataclass
 
@@ -41,8 +47,13 @@ from torch.testing._internal.distributed._shard.sharded_tensor._test_st_common i
 
 
 class TestShardingSpec(TestCase):
+    # [CLASS DOC] Single-process test case for sharding spec construction, validation and helper
+    # functions; no process group is used.
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "2 CUDA GPUs are needed")
     def test_device_placement(self):
+        # [FUNCTION DOC] Checks DevicePlacementSpec accepts device strings, torch devices and
+        # rank-qualified strings, and that malformed strings raise ValueError (cannot parse
+        # remote device) or RuntimeError (invalid device string).
         # valid devices
         DevicePlacementSpec("cuda:0")
         DevicePlacementSpec(torch.device(0))
@@ -63,6 +74,10 @@ class TestShardingSpec(TestCase):
 
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "2 CUDA GPUs are needed")
     def test_chunked_sharding_spec(self):
+        # [FUNCTION DOC] Checks ChunkShardingSpec construction: valid dims (including negative)
+        # and placement forms are accepted, a named dimension raises NotImplementedError, a
+        # non-integer dim raises ValueError, and bad placement strings raise ValueError or
+        # RuntimeError.
         # Test valid specs.
         ChunkShardingSpec(0, [torch.device(0), torch.device(1)])
         ChunkShardingSpec(0, [torch.device("cuda:0"), torch.device("cuda:1")])
@@ -96,6 +111,12 @@ class TestShardingSpec(TestCase):
 
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "2 CUDA GPUs are needed")
     def test_enumerable_sharding_spec(self):
+        # [FUNCTION DOC] Checks EnumerableShardingSpec and check_tensor. Valid layouts (row-wise,
+        # row and column, uneven sizes) pass check_tensor against the full tensor size. Invalid
+        # inputs must raise ValueError: unparsable placement, mismatched offset and size lengths,
+        # negative offsets or sizes, empty shard list, inconsistent shard ranks, overlapping
+        # shards, tensor rank mismatch, shards exceeding the tensor, and shard volume not
+        # matching tensor volume.
         # test valid specs
 
         # test row-wise sharding
@@ -264,6 +285,8 @@ class TestShardingSpec(TestCase):
             check_tensor(spec.shards, torch.Size([10, 10]))
 
     def test_get_split_size(self):
+        # [FUNCTION DOC] Checks get_split_size, the ceiling of dim size over number of chunks,
+        # for uneven, even, single-chunk and one-per-element cases.
         self.assertEqual(3, get_split_size(11, 4))
         self.assertEqual(3, get_split_size(12, 4))
         self.assertEqual(4, get_split_size(13, 4))
@@ -273,6 +296,8 @@ class TestShardingSpec(TestCase):
         self.assertEqual(1, get_split_size(11, 11))
 
     def test_get_chunked_dim_size(self):
+        # [FUNCTION DOC] Checks get_chunked_dim_size, the size of one chunk given dim size, split
+        # size and chunk index; the last chunk may be smaller and chunks past the end are size 0.
         self.assertEqual(3, get_chunked_dim_size(11, 3, 0))
         self.assertEqual(2, get_chunked_dim_size(11, 3, 3))
         self.assertEqual(4, get_chunked_dim_size(13, 4, 0))
@@ -280,6 +305,10 @@ class TestShardingSpec(TestCase):
         self.assertEqual(0, get_chunked_dim_size(5, 2, 3))
 
     def test_get_chunk_sharding_params(self):
+        # [FUNCTION DOC] Checks get_chunk_sharding_params for a 4-way chunk spec on a size 21
+        # dim: the offset and length for given ranks, first with natural placement order and then
+        # after the placements list is permuted, where the offset follows the position of the
+        # rank in the placements.
         ranks = [
             "rank:0/cuda:0",
             "rank:1/cuda:1",
@@ -307,6 +336,10 @@ class TestShardingSpec(TestCase):
         self.assertEqual(6, result[1])
 
     def _infer_enum_sharding_spec_case(self):
+        # [FUNCTION DOC] HELPER: Builds three hand-written lists of shard metadata that are not a
+        # regular chunking and checks that inferring a spec from each yields an
+        # EnumerableShardingSpec holding the same shards. Not named as a test, so it only runs
+        # when called by the inference test.
         shards_metadata = [
             ShardMetadata(
                 shard_offsets=[0, 0],
@@ -366,6 +399,11 @@ class TestShardingSpec(TestCase):
         self.assertEqual(spec.shards, shards_metadata)
 
     def _infer_chunk_sharding_spec_case(self, placements, sharding_dim, st_size):
+        # [FUNCTION DOC] HELPER: Builds the shard metadata that a chunk sharding of a tensor of
+        # size st_size along sharding_dim would produce for the given placements (offset by split
+        # size times index, size from the chunked dim size, stored at the position of the
+        # placement rank), then checks that inference returns a ChunkShardingSpec with the same
+        # dim and placements.
         world_size = len(placements)
         split_size = get_split_size(st_size[sharding_dim], world_size)
         shards_metadata = [None] * world_size
@@ -388,6 +426,9 @@ class TestShardingSpec(TestCase):
         self.assertEqual(spec.placements, placements)
 
     def test_infer_sharding_spec_from_shards_metadata(self):
+        # [FUNCTION DOC] Runs the enumerable inference case, then for each random chunk spec
+        # generated with a fixed seed runs the chunk inference case over tensor shapes of rank 2
+        # to 5 and sharding dims 0 to 4.
         self._infer_enum_sharding_spec_case()
         chunk_specs = _chunk_sharding_specs_list_for_test([0, 0, 1, 1], seed=31)
         for spec in chunk_specs:
@@ -401,6 +442,9 @@ class TestShardingSpec(TestCase):
             )
 
     def test_check_overlapping(self):
+        # [FUNCTION DOC] Checks validate_non_overlapping_shards_metadata on 2D and 3D shard
+        # layouts: adjacent, diagonal and grid layouts pass, while shards intersecting in every
+        # dimension raise ValueError mentioning overlap.
         shards = [
             ShardMetadata(
                 shard_offsets=[0, 0],
@@ -556,10 +600,15 @@ class TestShardingSpec(TestCase):
 # Custom ShardingSpec, an simple example to do grid sharding
 @dataclass
 class GridShardingSpec(ShardingSpec):
+    # [CLASS DOC] Example user-defined ShardingSpec (dataclass) that tiles a 2D tensor into
+    # square blocks of side grid_size placed on the given placements. Fields: grid_size and
+    # placements. Only build_metadata is implemented; shard raises NotImplementedError.
     grid_size: int
     placements: list[torch.distributed._remote_device | str]
 
     def __post_init__(self):
+        # [FUNCTION DOC] Dataclass post-init hook: converts, in place in the placements list,
+        # every entry that is not already a remote device into a remote device parsed from it.
         for i, remote_device in enumerate(self.placements):
             if not isinstance(remote_device, torch.distributed._remote_device):
                 self.placements[i] = torch.distributed._remote_device(remote_device)
@@ -569,12 +618,22 @@ class GridShardingSpec(ShardingSpec):
         tensor_sizes: torch.Size,
         tensor_properties: TensorProperties,
     ) -> ShardedTensorMetadata:
+        # [FUNCTION DOC] Builds ShardedTensorMetadata for a 2D tensor: raises AssertionError if
+        # the tensor is not 2D, if either size is not divisible by grid_size, or if the number of
+        # chunk tiles differs from the number of placements. Returns one ShardMetadata per tile
+        # with the stated sizes and placements, plus the given size and properties.
+        # KNOWN ISSUE: the tile count per axis is computed by dividing the size by grid_size, but
+        # offsets use the row or column index times grid_size and the placement index uses the
+        # row index times the row chunk count, which is only correct when the row and column
+        # chunk counts are equal.
         tensor_num_dim = len(tensor_sizes)
         if tensor_num_dim != 2:
             raise AssertionError("only support 2-dim tensor for grid sharding")
         shards_metadata = []
 
         def chunk_num(dim_size, grid_size):
+            # [FUNCTION DOC] HELPER: Returns dim_size divided by grid_size using integer
+            # division; raises AssertionError if the division is not exact.
             if dim_size % grid_size != 0:
                 raise AssertionError("only support dim_size mod grid_size == 0")
             return dim_size // grid_size
@@ -608,11 +667,16 @@ class GridShardingSpec(ShardingSpec):
     def shard(
         self, tensor: torch.Tensor, src_rank: int = 0, process_group=None
     ) -> ShardedTensor:
+        # [FUNCTION DOC] Not supported: always raises NotImplementedError, regardless of
+        # arguments.
         raise NotImplementedError("GridShardingSpec.shard not implemented yet!")
 
 
 class TestCustomShardingSpec(ShardedTensorTestBase):
+    # [CLASS DOC] Test case on ShardedTensorTestBase for a user-defined ShardingSpec subclass.
     def test_custom_sharding_spec(self):
+        # [FUNCTION DOC] Builds a GridShardingSpec of four placements and block size 4, produces
+        # metadata for an 8 by 8 float tensor, and validates it with check_tensor.
         ranks = [
             "rank:0/cuda:0",
             "rank:1/cuda:1",
@@ -637,6 +701,9 @@ class TestCustomShardingSpec(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
     def test_custom_sharding_spec_tensor_ctor(self):
+        # [FUNCTION DOC] Creates a ones sharded tensor of 4 by 4 with a GridShardingSpec over
+        # four ranks and asserts each rank holds a single 2 by 2 local shard of ones on its own
+        # cuda device.
         """Test sharded_tensor.ones(...) with the custom
         grid sharding spec.
         """
@@ -664,6 +731,9 @@ class TestCustomShardingSpec(ShardedTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @requires_nccl()
     def test_custom_sharding_spec_shard_tensor(self):
+        # [FUNCTION DOC] Asserts that sharding a plain tensor through the private shard tensor
+        # entry point with GridShardingSpec raises NotImplementedError, since the spec's shard
+        # method is unimplemented.
         """Test custom spec can be invoked from the
         _shard_tensor callsite.
         """
