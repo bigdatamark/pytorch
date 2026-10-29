@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Lowerings for oneDNN (mkldnn/onednn) fused ops in Inductor, mostly CPU. Defines int8 compensation helpers,
+# the grouped GEMM lowering, a 0-d constant normalizer, and register_onednn_fusion_ops, which (when mkldnn is available)
+# registers lowerings for convolution, linear, RNN and quantized conv/linear ops, choosing between C++ GEMM templates
+# and ATen mkldnn extern kernels via autotuning. Import-time side effects: tags grouped_gemm_lowering with lowering attributes.
 import functools
 
 import torch
@@ -39,6 +43,10 @@ def create_int8_compensation(
     ir.TensorBox,
     ir.TensorBox | None,
 ]:
+    # [FUNCTION DOC] Compute the int8 weight compensation constants for a quantized GEMM. If x_scale, x_zp and w_scale are all graph constants
+    # (fast path), registers constants for the product of scales and for weight column sums scaled by that product and x_zp;
+    # otherwise registers only the plain weight column sums. Returns (fast path flag, compensation tensor, combined
+    # scale or None). Side effect: adds tensor constants to the graph, named from the packed weight.
     x_w_scale: ir.TensorBox | None = None
     use_int8_fast_compensation_path = all(
         isinstance(item, ir.TensorBox)
@@ -85,6 +93,9 @@ def codegen_int8_gemm_template_compensation(
     _w_scale: OpsValue | None,
     _x_w_scale: OpsValue | None,
 ) -> OpsValue:
+    # [FUNCTION DOC] Emit pointwise ops applying int8 compensation to a GEMM output value. Fast path: input times combined scale minus
+    # weight compensation. Otherwise: input times x_scale times w_scale minus x_scale times w_scale times x_zp times
+    # compensation (applied even when x_zp is zero, to cover dynamic quantization). Returns the resulting ops value.
     if use_int8_fast_compensation_path:
         temp = ops.sub(
             ops.mul(
@@ -134,6 +145,10 @@ def grouped_gemm_lowering(
     algorithm=None,
     layout=None,
 ):
+    # [FUNCTION DOC] Lower a grouped linear (several weights sharing one input) via the C++ grouped GEMM template with autotuning.
+    # Flattens inputs with more than two dims, realizes biases, builds choices, selects the best, and exposes each GEMM as a
+    # MultiOutput view reshaped to the original leading dims. Returns the list of output tensors.
+    # Raises an error if max_autotune is not enabled or no choice is produced.
     x_size = x.get_size()
     if len(x_size) > 2:
         # GEMM template needs 2D input, normalize input shape here
@@ -204,6 +219,9 @@ def _convert_to_0d_constant(
     dtype: torch.dtype,
     name_suffix: str = "_0d",
 ) -> ir.TensorBox:
+    # [FUNCTION DOC] HELPER: Reduce an all-ones-shape tensor to a 0-d constant. Reuses graph constants by reshaping to scalar, or uses a known
+    # constant value; otherwise realizes the tensor, makes views contiguous and returns a view to shape []. Side effect:
+    # may add tensor constants to the graph and realize the tensor.
     """
     Normalize a tensor with all dimensions equal to 1 to a 0D ConstantBuffer.
     """
@@ -241,6 +259,9 @@ def _convert_to_0d_constant(
 
 
 def register_onednn_fusion_ops():
+    # [FUNCTION DOC] Register the oneDNN fusion lowerings. Does nothing unless mkldnn is available. Creates extern kernel choices for linear and
+    # qlinear ops, lists ops that need realized inputs, and defines and registers the nested lowerings below.
+    # Side effect: mutates the global lowering registry.
     if torch._C._has_mkldnn:
         from . import mkldnn_ir
 
@@ -292,6 +313,7 @@ def register_onednn_fusion_ops():
             scalars,
             algorithm,
         ):
+            # [FUNCTION DOC] Lower mkldnn unary-fused convolution by creating a ConvolutionUnary node wrapped in a TensorBox.
             return TensorBox.create(
                 mkldnn_ir.ConvolutionUnary.create(
                     x,
@@ -323,6 +345,7 @@ def register_onednn_fusion_ops():
             unary_scalars,
             unary_algorithm,
         ):
+            # [FUNCTION DOC] Lower mkldnn convolution with a binary post-op (with unary post-op) by creating a ConvolutionBinary node.
             return TensorBox.create(
                 mkldnn_ir.ConvolutionBinary.create(
                     x,
@@ -357,6 +380,7 @@ def register_onednn_fusion_ops():
             unary_scalars,
             unary_algorithm,
         ):
+            # [FUNCTION DOC] Lower the in-place variant of the binary-fused convolution via ConvolutionBinaryInplace.
             return TensorBox.create(
                 mkldnn_ir.ConvolutionBinaryInplace.create(
                     x,
@@ -385,6 +409,10 @@ def register_onednn_fusion_ops():
             algorithm,
             layout=None,
         ):
+            # [FUNCTION DOC] Lower mkldnn linear with unary post-op. Flattens input to 2D, realizes the bias, and if max_autotune is on and the C++ GEMM
+            # template applies, adds template choices with an epilogue for the attr. Falls back to (or adds) the ATen mkldnn choice when
+            # there are no choices or ATen kernels are preferred. Autotunes (weight is generated from graph constants) and restores the
+            # original leading dims. Raises an error if the weight is not a graph constant.
             x_size = x.get_size()
             if len(x_size) > 2:
                 # GEMM template needs 2D input, normalize input shape here
@@ -398,6 +426,7 @@ def register_onednn_fusion_ops():
                 if use_cpp_gemm_template(layout, x, transposed_w):
 
                     def epilogue_creator(buf):
+                    # [FUNCTION DOC] HELPER: Build the post-op epilogue for the GEMM template from attr, scalars and algorithm.
                         return create_epilogue_with_attr(
                             buf, attr, scalars=scalars, algorithm=algorithm
                         )
@@ -448,6 +477,8 @@ def register_onednn_fusion_ops():
         def linear_binary(
             x: TensorBox, y: TensorBox, w: TensorBox, b: TensorBox, attr, layout=None
         ):
+            # [FUNCTION DOC] Lower mkldnn linear with a binary post-op (other tensor y). Like linear_unary but flattens both x and y, uses a binary epilogue
+            # for the C++ template and extern kernel choice, and autotunes. Raises an error if the weight is not a graph constant.
             x_size = x.get_size()
             if len(x_size) > 2:
                 # GEMM template needs 2D input, normalize input shape here
@@ -466,6 +497,7 @@ def register_onednn_fusion_ops():
                 if use_cpp_gemm_template(layout, x, transposed_w):
 
                     def epilogue_creator(buf):
+                    # [FUNCTION DOC] HELPER: Build the binary-add epilogue using y as the other operand.
                         return create_epilogue_with_attr(buf, attr, other=y)
 
                     kwargs = {
@@ -523,6 +555,7 @@ def register_onednn_fusion_ops():
             scalars,
             algorithm,
         ):
+            # [FUNCTION DOC] Lower mkldnn transposed convolution with a unary post-op via ConvolutionTransposeUnary.
             return TensorBox.create(
                 mkldnn_ir.ConvolutionTransposeUnary.create(
                     x,
@@ -558,6 +591,7 @@ def register_onednn_fusion_ops():
             batch_first: bool,
             train: bool,
         ):
+            # [FUNCTION DOC] Lower mkldnn_rnn_layer via MkldnnRnnLayer, wrapping each output in a TensorBox.
             return pytree.tree_map(
                 TensorBox.create,
                 mkldnn_ir.MkldnnRnnLayer.create(
@@ -600,6 +634,9 @@ def register_onednn_fusion_ops():
             scalars,
             algorithm,
         ):
+            # [FUNCTION DOC] Lower quantized convolution with unary post-op. Converts Python scalar x_scale and x_zp into graph tensor constants,
+            # defaults missing zero points to constant zeros, then creates a QConvPointWisePT2E node. Raises an error if x_scale is not
+            # a float or x_zp is not an int when not already a tensor.
             if not isinstance(x_scale, ir.TensorBox):
                 if type(x_scale) is not float:
                     raise AssertionError(
@@ -677,6 +714,9 @@ def register_onednn_fusion_ops():
             unary_scalars,
             unary_algorithm,
         ):
+            # [FUNCTION DOC] Lower quantized convolution with binary post-op (registered for binary and binary_tensor overloads). Normalizes x_scale, x_zp
+            # and w_zp as in the unary case, and for sum with differing float32/bfloat16 accum and output dtypes converts accum to the
+            # output dtype first. Creates QConvPointWiseBinaryPT2E. Raises an error for bad scalar types.
             if not isinstance(x_scale, ir.TensorBox):
                 if type(x_scale) is not float:
                     raise AssertionError(
@@ -757,6 +797,12 @@ def register_onednn_fusion_ops():
             algorithm,
             layout=None,
         ):
+            # [FUNCTION DOC] Lower oneDNN quantized linear with unary post-op. Validates int8/e4m3fn packed weight, flattens x to 2D, normalizes x_scale,
+            # x_zp (and w_zp) into tensor constants or 0-d constants, realizes w_scale/w_zp and fixes w_zp dtype to int32. With
+            # max_autotune and symmetric weights, adds C++ GEMM template choices whose epilogue applies int8 compensation, bias,
+            # unary post-op and requantization to the output dtype; otherwise (or additionally when ATen preferred) adds the ATen
+            # qlinear extern kernel choice. Autotunes with graph-constant input generators and restores leading dims.
+            # Raises errors for unsupported weight dtype, bad scalar types, non-scalar x_zp, or non-constant packed weight.
             if packed_weight.get_dtype() not in [torch.int8, torch.float8_e4m3fn]:
                 raise AssertionError(
                     "Only int8 and e4m3fn weights are supported by oneDNN qlinear."
@@ -861,6 +907,9 @@ def register_onednn_fusion_ops():
                     )
 
                     def epilogue_creator(input_buffer):
+                        # [FUNCTION DOC] HELPER: Build the C++ GEMM epilogue: convert int32 GEMM output to float32, apply compensation and optional bias via a
+                        # Pointwise node, then the unary post-op, then cast or requantize to output_dtype. Returns the final buffer.
+                        # Raises an error for unsupported output dtype.
                         # Epilogue to convert from s32 to f32 for u8s8f32
                         if output_dtype not in [
                             torch.float32,
@@ -889,6 +938,8 @@ def register_onednn_fusion_ops():
                             bias_loader = bias.make_loader()
 
                         def inner_fn(index):
+                            # [FUNCTION DOC] HELPER: Per-element function of the epilogue Pointwise: loads the GEMM value, converts to float32, applies int8
+                            # compensation, and adds bias (converted to float32 if bfloat16). Returns the resulting ops value.
                             nonlocal bias
                             input = input_loader(index)
                             # MicroKernel Output is with int32
@@ -954,6 +1005,7 @@ def register_onednn_fusion_ops():
                             output_cast_loader = output_buf.make_loader()
 
                             def inner_fn_cast_output_to_bf16(index):
+                                # [FUNCTION DOC] HELPER: Per-element function: load value and convert it to the output dtype (bfloat16).
                                 input = output_cast_loader(index)
                                 return ops.to_dtype(input, output_dtype)
 
@@ -969,6 +1021,8 @@ def register_onednn_fusion_ops():
                             requant_input_loader = output_buf.make_loader()
 
                             def inner_fn_requant(index, scale, zero_point):
+                                # [FUNCTION DOC] HELPER: Per-element function: requantize a float value using scale and zero_point, round, clamp to the uint8 or int8 range per output_dtype
+                                # and convert to output_dtype.
                                 input = requant_input_loader(index)
                                 inv_scale, zero_point = _create_constants(
                                     1.0 / scale, zero_point, dtype=torch.float32
@@ -1092,6 +1146,12 @@ def register_onednn_fusion_ops():
             unary_algorithm,
             layout=None,
         ):
+            # [FUNCTION DOC] Lower oneDNN quantized linear with binary post-op (add or sum with another tensor x2; registered for binary and
+            # binary_tensor overloads). Similar to qlinear_unary: normalizes scales and zero points, converts float x2 to the output dtype for
+            # sum when needed, and on the C++ template path (per-tensor activation zero point, symmetric weights) builds an epilogue that
+            # compensates, adds bias, adds x2, applies the unary post-op and requantizes; otherwise uses the ATen extern kernel. For sum with a
+            # C++ template result whose layout matches x2, re-wraps the result as a view of x2 since x2 is updated in place.
+            # Raises errors on rank mismatch, bad scalar types, non-matching sum accum dtype, or non-constant packed weight.
             x_size = x.get_size()
             x2_size = x2.get_size()
             if len(x_size) != len(x2_size):
@@ -1211,6 +1271,9 @@ def register_onednn_fusion_ops():
                     )
 
                     def epilogue_creator(input_buffer):
+                        # [FUNCTION DOC] HELPER: Build the C++ GEMM epilogue for the binary case: compensate and add bias, add x2 (converted to float32), apply the unary post-op,
+                        # then cast or requantize to the output dtype. Returns the final buffer. Raises an error for unsupported output dtype.
+                        # KNOWN ISSUE: the int8/uint8 requantization path always converts and creates the output as uint8, even when output_dtype is int8.
                         # Epilogue to convert from s32 to f32 for u8s8f32
                         if output_dtype not in [
                             torch.float32,
@@ -1241,6 +1304,8 @@ def register_onednn_fusion_ops():
                             bias_loader = bias.make_loader()
 
                         def inner_fn(index):
+                            # [FUNCTION DOC] HELPER: Per-element function of the epilogue Pointwise: loads GEMM value and x2, converts to float32, applies int8 compensation,
+                            # bias and then adds x2. Returns the resulting ops value.
                             nonlocal bias
                             input = input_loader(index)
                             _x2 = x2_loader(index)
@@ -1316,6 +1381,7 @@ def register_onednn_fusion_ops():
                             output_cast_loader = output_buf.make_loader()
 
                             def inner_fn_cast_output_to_bf16(index):
+                                # [FUNCTION DOC] HELPER: Per-element function: load value and convert it to the output dtype (bfloat16).
                                 input = output_cast_loader(index)
                                 return ops.to_dtype(input, output_dtype)
 
@@ -1331,6 +1397,8 @@ def register_onednn_fusion_ops():
                             requant_input_loader = output_buf.make_loader()
 
                             def inner_fn_requant(index, scale, zero_point):
+                                # [FUNCTION DOC] HELPER: Per-element function: requantize a float value with scale and zero_point, round and clamp to the uint8 or int8 range.
+                                # KNOWN ISSUE: the final conversion is to uint8 regardless of output_dtype, so int8 outputs would be mishandled.
                                 input = requant_input_loader(index)
                                 inv_scale, zero_point = _create_constants(
                                     1.0 / scale, zero_point, dtype=torch.float32
@@ -1457,6 +1525,10 @@ def register_onednn_fusion_ops():
                 *,
                 layout=None,
             ):
+                # [FUNCTION DOC] Lower mkl packed linear (only registered when MKL is available). With max_autotune and a usable C++ GEMM template, adds
+                # template choices; adds the ATen mkl extern kernel choice if no choices or ATen preferred. Autotunes using the original
+                # weight to generate inputs for the packed mkldnn weight, then adds the bias b if present. Returns the result tensor.
+                # Raises an error if packed or original weight is not a graph constant.
                 choices: list[ChoiceCaller] = []
                 if config.max_autotune or config.max_autotune_gemm:
                     transposed_w = permute(orig_w, [1, 0])

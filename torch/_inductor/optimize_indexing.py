@@ -1,3 +1,7 @@
+# [MODULE DOC] Loop-body index dtype optimizations for Inductor. Contains (1) a value range analysis pass that
+# lowers int64 to_dtype conversions to int32 when all dominated values provably fit, and (2) a backward
+# reachability pass that rewrites index_expr nodes feeding value computation into value_expr nodes.
+# No import-time side effects.
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +18,9 @@ from .utils import dominated_nodes
 
 
 def val_expressable_in_32_bits(val: Any) -> bool:
+    # [FUNCTION DOC] Return whether a constant fits in 32 bits. Booleans always fit; sympy numbers are converted to int or float.
+    # Floats must lie within +-2**24 (mantissa bound), ints within the int32 range.
+    # Raises an error if a sympy expression is not a number, and a type error for other value types.
     if getattr(val, "is_Boolean", False):
         return True
 
@@ -37,6 +44,7 @@ def val_expressable_in_32_bits(val: Any) -> bool:
 
 
 def range_expressable_in_32_bits(range: ValueRanges[sympy.Expr]) -> bool:
+    # [FUNCTION DOC] Return true if both the lower and upper bounds of a ValueRanges fit in 32 bits.
     return val_expressable_in_32_bits(range.lower) and val_expressable_in_32_bits(
         range.upper
     )
@@ -49,10 +57,15 @@ def try_to_reduce_precision(
     indices: dict[Any, sympy.Expr],
     replacement_vals: dict[Any, ValueRanges[sympy.Expr]],
 ) -> None:
+    # [FUNCTION DOC] Try to retarget a to_dtype(int64) node to int32 in place by changing its dtype argument.
+    # Walks nodes dominated by the node (stopping at explicit casts to int32/float32/float64), ignoring store and output.
+    # Gives up silently (leaves node unchanged) if any set_indirect-derived index has infinite or non-32-bit bounds,
+    # or if any dominated node's bounds do not fit in 32 bits. Mutates node.args on success.
     # if a downstream use of a node explicitly converts to int32, or float16/float32/float64,
     # then its precision is set for that chain of uses, and we don't need to consider those
     # dominated values
     def skip_filter(node: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate for dominated-node traversal: true for a to_dtype node casting to int32, float32 or float64.
         return node.target == "to_dtype" and node.args[2] in (
             torch.int32,
             torch.float32,
@@ -98,6 +111,9 @@ def try_to_reduce_precision(
 
 
 def indexing_dtype_strength_reduction(loop_body: LoopBody) -> None:
+    # [FUNCTION DOC] Run value range analysis on the loop body and lower int64 to_dtype nodes with known bounds to int32
+    # when safe (see try_to_reduce_precision). Returns nothing; mutates fx graph nodes in place.
+    # Does nothing if no bounded int64 to_dtype nodes exist.
     """
     Performs Value Range Analysis on LoopBody's fx graph to reduce precision of
     intermediaries from int64 to int32
@@ -132,6 +148,9 @@ def indexing_dtype_strength_reduction(loop_body: LoopBody) -> None:
 
 @dataclass(frozen=True)
 class _ValueUseRule:
+    # [CLASS DOC] HELPER: Immutable description of how an op's arguments are used. value_sinks seed the backward value
+    # walk unconditionally, value_inputs propagate demand only if the op result is value-reachable, and
+    # indexing_inputs (addresses, masks, bounds) block propagation. All fields are tuples of op arguments.
     # These fields are op arguments, so Any covers FX nodes, SymPy exprs,
     # scalars, and nested tuples/lists. value_sinks seed the backward walk
     # unconditionally. value_inputs propagate value demand only when the op's
@@ -144,9 +163,11 @@ class _ValueUseRule:
 
 
 def _collect_fx_nodes(arg: Any) -> OrderedSet[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Collect all fx Nodes found anywhere in a (possibly nested) argument structure into an ordered set.
     nodes: OrderedSet[torch.fx.Node] = OrderedSet()
 
     def add_node(node: torch.fx.Node) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Callback for argument mapping: record the node and return it unchanged.
         nodes.add(node)
         return node
 
@@ -155,6 +176,7 @@ def _collect_fx_nodes(arg: Any) -> OrderedSet[torch.fx.Node]:
 
 
 def _collect_input_nodes(node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: Return the ordered set of input nodes of a node, excluding the receiver (first argument) of a call_method node.
     inputs = OrderedSet(node.all_input_nodes)
     if (
         node.op == "call_method"
@@ -166,14 +188,21 @@ def _collect_input_nodes(node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
 
 
 class _ValueUseRules:
+    # [CLASS DOC] HELPER: Table of per-op rules, looked up by op name via attribute access. Each method mirrors an ops
+    # handler signature and returns a _ValueUseRule classifying its arguments as value sinks, value inputs, or
+    # indexing-only inputs. Ops without a method use default_rule (None), meaning all inputs are value inputs.
+    # Instances get extra attributes set at runtime for call_module targets (subblocks, scan, set_indirect).
     @staticmethod
     def default_rule(*args: Any, **kwargs: Any) -> _ValueUseRule | None:
+        # [FUNCTION DOC] HELPER: Default rule for ops with no specific rule: returns no rule.
         return None
 
     def load(self, name: str, index: sympy.Expr) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: load: the index is indexing-only.
         return _ValueUseRule(indexing_inputs=(index,))
 
     def load_seed(self, name: str, offset: int) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: load_seed: the offset is indexing-only.
         return _ValueUseRule(indexing_inputs=(offset,))
 
     def store(
@@ -183,6 +212,7 @@ class _ValueUseRules:
         value: Any,
         mode: Any = None,
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: store: the stored value is a value sink; the index is indexing-only.
         return _ValueUseRule(
             value_sinks=(value,),
             indexing_inputs=(index,),
@@ -191,6 +221,7 @@ class _ValueUseRules:
     def store_reduction(
         self, name: str, index: sympy.Expr, value: Any
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: store_reduction: the value is a value sink; the index is indexing-only.
         return _ValueUseRule(
             value_sinks=(value,),
             indexing_inputs=(index,),
@@ -203,6 +234,7 @@ class _ValueUseRules:
         reduction_type: str,
         value: Any,
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: reduction: the reduced value is a value sink.
         return _ValueUseRule(value_sinks=(value,))
 
     def partial_accumulate(
@@ -212,6 +244,7 @@ class _ValueUseRules:
         value: Any,
         extra_meta: dict[str, Any],
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: partial_accumulate: the value is a value sink.
         return _ValueUseRule(value_sinks=(value,))
 
     def sort(
@@ -221,6 +254,7 @@ class _ValueUseRules:
         stable: bool,
         descending: bool,
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: sort: the tuple of values is a value sink.
         return _ValueUseRule(value_sinks=(values,))
 
     def scan(
@@ -229,6 +263,7 @@ class _ValueUseRules:
         combine_fn_or_values: Any,
         values: tuple[Any, ...] | None = None,
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: scan: values (or the second argument when values is not given) are value sinks.
         if values is None:
             values = combine_fn_or_values
         return _ValueUseRule(value_sinks=(values,))
@@ -243,6 +278,7 @@ class _ValueUseRules:
         sorter: tuple[str, sympy.Expr] | None = None,
         sorter_indices: Any | None = None,
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: bucketize: values are value inputs; boundaries, sorter and their indices are indexing-only.
         return _ValueUseRule(
             value_inputs=(values,),
             indexing_inputs=(boundaries, boundary_indices, sorter, sorter_indices),
@@ -251,28 +287,38 @@ class _ValueUseRules:
     def indirect_indexing(
         self, x: Any, size: sympy.Expr, check: bool = True, wrap_neg: bool = True
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: indirect_indexing: the index value and size are indexing-only.
         return _ValueUseRule(indexing_inputs=(x, size))
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: check_bounds: expression and size are indexing-only.
         return _ValueUseRule(indexing_inputs=(expr, size))
 
     def masked(self, mask: Any, body: Any, other: Any) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: masked: other is a value input; the mask is indexing-only.
         return _ValueUseRule(value_inputs=(other,), indexing_inputs=(mask,))
 
     def masked_subblock(self, mask: Any, other: Any) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: masked_subblock (installed for subblock call_module nodes): other is a value input; mask is indexing-only.
         return _ValueUseRule(value_inputs=(other,), indexing_inputs=(mask,))
 
     def set_indirect(self, new_var: Any) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: set_indirect: the new variable is indexing-only.
         return _ValueUseRule(indexing_inputs=(new_var,))
 
     def device_assert_async(self, cond: Any, msg: str) -> _ValueUseRule:
+        # [FUNCTION DOC] HELPER: device_assert_async: the condition is indexing-only.
         return _ValueUseRule(indexing_inputs=(cond,))
 
 
 class _ValueUseAnalysis:
+    # [CLASS DOC] HELPER: Backward reachability analysis over a LoopBody's root and sub-block fx graphs. State: rules table,
+    # graphs, a value_reachable set, a worklist of (graph, node) pairs, and a map from indirect symbols to the
+    # set_indirect arguments that define them. run() converts index_expr nodes reachable from value sinks.
     def __init__(self, loop_body: LoopBody) -> None:
+        # [FUNCTION DOC] HELPER: Store the loop body, create the rules table, gather root and sub-block graphs, install call_module rules and init empty state.
         self.loop_body = loop_body
         self.rules = _ValueUseRules()
         self.root_graph = loop_body.root_block.graph
@@ -289,6 +335,8 @@ class _ValueUseAnalysis:
         self.indirect_inputs: dict[sympy.Symbol, tuple[torch.fx.Graph, Any]] = {}
 
     def run(self) -> bool:
+        # [FUNCTION DOC] Run the analysis. Returns false early if no index_expr exists; otherwise seeds sinks and propagates,
+        # returning true if any index_expr node was rewritten.
         if not self.has_index_expr():
             return False
 
@@ -296,12 +344,15 @@ class _ValueUseAnalysis:
         return self.propagate_value_reachability()
 
     def has_index_expr(self) -> bool:
+        # [FUNCTION DOC] HELPER: Return true if any graph contains an index_expr call_method node.
         return any(
             graph.find_nodes(op="call_method", target="index_expr", sort=False)
             for graph in self.graphs
         )
 
     def install_call_module_rules(self) -> None:
+        # [FUNCTION DOC] HELPER: For each call_module node, register a rule on the rules table by target name: sub-blocks use the masked-subblock rule,
+        # scan* targets the scan rule, set_indirect* targets the set_indirect rule.
         for graph in self.graphs:
             for node in graph.find_nodes(op="call_module", sort=False):
                 if not isinstance(node.target, str):
@@ -314,6 +365,8 @@ class _ValueUseAnalysis:
                     setattr(self.rules, node.target, self.rules.set_indirect)
 
     def seed_value_reachable_nodes(self) -> None:
+        # [FUNCTION DOC] HELPER: Seed the worklist with root graph outputs and every node's value sinks; also records set_indirect nodes' arguments
+        # keyed by the corresponding indirect variable.
         self._enqueue_graph_output(self.root_graph)
         for graph in self.graphs:
             for node in graph.nodes:
@@ -330,6 +383,9 @@ class _ValueUseAnalysis:
                     self.worklist.append((graph, sink_node))
 
     def propagate_value_reachability(self) -> bool:
+        # [FUNCTION DOC] HELPER: Process the worklist: mark nodes reachable, rewrite index_expr targets to value_expr, enqueue sub-block outputs,
+        # follow indirect symbols in value-reachable get_index expressions to their set_indirect inputs, and enqueue value inputs.
+        # Returns true if any node was rewritten. Raises an error if a get_index name is not a string.
         changed = False
         while self.worklist:
             graph, node = self.worklist.pop()
@@ -366,6 +422,8 @@ class _ValueUseAnalysis:
         return changed
 
     def rule_for_node(self, node: torch.fx.Node) -> _ValueUseRule | None:
+        # [FUNCTION DOC] HELPER: Return the rule for a call_method or call_module node by calling the matching rules method with the node's
+        # arguments (skipping the receiver for call_method), or None for other nodes or when no rule applies.
         if node.op == "call_method" and isinstance(node.target, str):
             rule_fn = getattr(self.rules, node.target, self.rules.default_rule)
             return rule_fn(*node.args[1:], **node.kwargs)
@@ -375,6 +433,7 @@ class _ValueUseAnalysis:
         return None
 
     def value_input_nodes(self, node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
+        # [FUNCTION DOC] HELPER: Nodes whose values flow into this node: all input nodes if no rule, else the rule's value inputs and sinks.
         rule = self.rule_for_node(node)
         if rule is None:
             return _collect_input_nodes(node)
@@ -383,10 +442,12 @@ class _ValueUseAnalysis:
         )
 
     def value_sink_nodes(self, node: torch.fx.Node) -> OrderedSet[torch.fx.Node]:
+        # [FUNCTION DOC] HELPER: Nodes that this node unconditionally consumes as values (rule's value sinks), empty if no rule.
         rule = self.rule_for_node(node)
         return _collect_fx_nodes(rule.value_sinks) if rule else OrderedSet()
 
     def _enqueue_graph_output(self, graph: torch.fx.Graph) -> None:
+        # [FUNCTION DOC] HELPER: Enqueue the arguments of a graph's single output node. Raises an error if there is not exactly one output node.
         output_nodes = graph.find_nodes(op="output", sort=False)
         if len(output_nodes) != 1:
             raise AssertionError(
@@ -396,6 +457,8 @@ class _ValueUseAnalysis:
 
 
 def convert_index_expr_to_value_expr(loop_body: LoopBody) -> None:
+    # [FUNCTION DOC] Rewrite index_expr nodes that feed value computation into value_expr, in place. If anything changed, clears the cached
+    # get_nodes and bounds on the loop body. See the docstring for the classification and mixed-use policy.
     """
     Rewrite ``index_expr`` nodes that participate in value computation to
     ``value_expr``, so codegen can honor the requested dtype instead of
