@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Defines TensorInfo, a small record describing the underlying tensor, dimension levels and
+# batched tensor of any value accepted by first-class dimension operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,29 +15,40 @@ if TYPE_CHECKING:
 
 @dataclass
 class TensorInfo:
+    # [CLASS DOC] Dataclass holding the plain tensor (or None), the list of DimEntry levels
+    # describing each dimension, whether the value carries a device, and the batched tensor
+    # (or None). Truthiness means a tensor is present. Use create to build from user values.
     tensor: torch.Tensor | None
     levels: list[DimEntry]
     has_device: bool
     batchedtensor: torch.Tensor | None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates that every level is a DimEntry; raises AssertionError if not.
         from ._dim_entry import DimEntry
 
         if not all(isinstance(l, DimEntry) for l in self.levels):
             raise AssertionError("All levels must be DimEntry instances")
 
     def ndim(self) -> int:
+        # [FUNCTION DOC] Returns the number of positional dimensions among the levels.
         from ._dim_entry import ndim_of_levels
 
         return ndim_of_levels(self.levels)
 
     def __bool__(self) -> bool:
+        # [FUNCTION DOC] True when a tensor is present.
         return self.tensor is not None
 
     @staticmethod
     def create(
         h: Any, ensure_batched: bool = True, ensure_present: bool = True
     ) -> TensorInfo:
+        # [FUNCTION DOC] Builds a TensorInfo from h: a first-class Tensor (its tensor, levels,
+        # device flag and, if ensure_batched, batched tensor), a Dim (range tensor and batched
+        # tensor only when bound), or a plain torch tensor (all-positional levels, device
+        # flag true, itself as batched tensor). Otherwise returns an empty info, or raises
+        # ValueError when ensure_present is true.
         from . import Dim, DimEntry, Tensor
 
         if Tensor.check_exact(h):

@@ -3,6 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC]
+# Provides a context manager that profiles the current process with the external magic-trace
+# tool. May download the tool at use time; no import-time side effects beyond imports.
 import os
 import signal
 import subprocess
@@ -14,6 +17,12 @@ from contextlib import contextmanager
 def magic_trace(
     output: str = "trace.fxt", magic_trace_cache: str = "/tmp/magic-trace"
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager: downloads the magic-trace binary to magic_trace_cache
+    # if missing (wget, chmod; prints progress), attaches it to the current process writing
+    # a trace to output, and waits until it reports "Attached" before running the body. On
+    # exit it interrupts the tracer, prints its remaining stderr, and raises ValueError if
+    # it exited non-zero.
+    # KNOWN ISSUE: the wait loop never ends if the tracer exits without printing "Attached".
     pid = os.getpid()
     if not os.path.exists(magic_trace_cache):
         print(f"Downloading magic_trace to: {magic_trace_cache}")

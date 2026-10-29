@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Implements an einops-style rearrange on top of first-class dimensions. A pattern is
+# translated into Python source for a small function (compiled with dynamic code execution)
+# that indexes the tensor with fresh dims, reorders them and sums away length-1 anonymous
+# axes; results are cached by tensor rank, pattern and axis lengths. Exports: rearrange.
 from __future__ import annotations
 
 import functools
@@ -25,6 +30,12 @@ __all__ = ["rearrange"]
 def _create_rearrange_callable(
     tensor_ndim: int, pattern: str, **axes_lengths: int
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Cached (up to 256 entries) builder of the rearrange function.
+    # Parses and validates the pattern, checks the pattern rank against tensor_ndim (an ellipsis
+    # absorbs extra dims), maps each left-hand identifier to a generated dim name, then
+    # generates and executes source text defining a function that creates dims, sets given
+    # sizes, indexes and reorders the tensor, and sums out unit anonymous axes. Returns that
+    # function (identity for rank zero). Raises ValueError on rank mismatch.
     r"""Translate an `einops`-style pattern into a callable that performs the rearrange using first-class dimensions.
 
     Since the an equivalent result is computed for tensors with the same number of dimensions, with the same pattern and
@@ -99,6 +110,9 @@ def _create_rearrange_callable(
     def composition_to_dims(
         composition: Sequence[list[str | AnonymousAxis] | str],
     ) -> list[str | tuple[str, ...]]:
+        # [FUNCTION DOC] HELPER: Maps each composition entry to dim names: a group becomes a
+        # tuple of the dims of its identifiers, an ellipsis expands to its dims in place.
+        # Raises ValueError for any other entry.
         """Convert a `ParsedExpression.composition` into a `Tensor.__getitem__` index of strings representing first
         class dims."""
         dim_composition: list[str | tuple[str, ...]] = []
@@ -155,6 +169,10 @@ def rearrange(
     pattern: str,
     **axes_lengths: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Rearranges a tensor (or a list/tuple of tensors, stacked along a new first
+    # dimension) according to the einops-style pattern, with optional named axis lengths.
+    # Returns the rearranged tensor. Raises ValueError or TypeError for invalid patterns or
+    # lengths. Uses a cached compiled helper per rank, pattern and lengths.
     r"""A native implementation of `einops.rearrange`, a reader-friendly smart element reordering for multidimensional
     tensors. This operation includes functionality of transpose (axes permutation), reshape (view), squeeze, unsqueeze,
     stack, concatenate and other operations.

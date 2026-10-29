@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Wraps torch functions that take a dim argument (reductions etc.) so they accept first-class
+# Dim objects: WrappedOperator holds per-op settings, patched_dim_method translates dims to
+# integer indices on the underlying tensor and re-wraps results, _wrap builds the wrapper.
+# No import-time side effects beyond imports.
 """
 Python implementation of function wrapping functionality for functorch.dim.
 """
@@ -20,11 +25,16 @@ if TYPE_CHECKING:
 
 
 def handle_from_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Identity hook; returns the given tensor unchanged.
     """Handle tensor conversion for torch function integration."""
     return tensor
 
 
 class WrappedOperator:
+    # [CLASS DOC] Describes one wrapped torch operation: the original callable, the wrapper
+    # implementation to dispatch to, name, doc (extended with a note about the dim argument),
+    # the dim argument name, and tuning flags (is_pointwise, dim_offset, keepdim_offset,
+    # single_dim, reduce). The function method produces the user-facing wrapper function.
     """
     This class wraps PyTorch operations to support first-class dimensions.
     """
@@ -32,6 +42,9 @@ class WrappedOperator:
     def __init__(
         self, orig: Callable, wrapper_implementation: Callable, dim_name: str = "dim"
     ):
+        # [FUNCTION DOC] Stores orig and wrapper_implementation, copies name and doc from
+        # orig, appends a note about dim_name to the doc when both exist, and sets defaults
+        # (dim offset 0, keepdim offset 1, not single-dim, reducing, not pointwise).
         self.orig = orig
         self.wrapper_implementation = wrapper_implementation
         self.name = getattr(orig, "__name__", "")
@@ -49,9 +62,14 @@ class WrappedOperator:
             self.doc = f"{self.doc}\nArgument '{self.dim_name}' can be either an integer or a torchdim.Dim object.\n"
 
     def function(self) -> Callable:
+        # [FUNCTION DOC] Returns a plain function that forwards all arguments to the wrapper
+        # implementation together with this operator; it carries orig's name and the
+        # extended doc.
         """Create a wrapped function that calls our wrapper implementation."""
 
         def wrapped_func(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Calls the wrapper implementation with the operator
+            # and all given arguments and returns its result.
             return self.wrapper_implementation(self, *args, **kwargs)
 
         # Copy metadata using functools.update_wrapper for just __name__ and __doc__
@@ -64,6 +82,9 @@ class WrappedOperator:
 
 
 def _wrap_dim(dim: Any, ndim: int, keepdim: bool = False) -> DimEntry:
+    # [FUNCTION DOC] HELPER: Converts one dim spec to a DimEntry: a Dim gives a dim entry
+    # (raises ValueError if keepdim is true), an int gives a negative positional entry
+    # counted from the right, anything else gives an empty entry.
     """Convert single dimension specification to DimEntry object."""
     from . import Dim
 
@@ -81,6 +102,9 @@ def _wrap_dim(dim: Any, ndim: int, keepdim: bool = False) -> DimEntry:
 
 
 def _wrap_dims(dim: Any, ndim: int, keepdim: bool = False) -> list[DimEntry]:
+    # [FUNCTION DOC] HELPER: Converts a dim spec (single dim/int, or an iterable of them) into
+    # a list of DimEntry. Raises ValueError for a Dim with keepdim, and a TypeError if the
+    # non-single spec is not iterable.
     """Convert dimension specification to list of DimEntry objects."""
     de = _wrap_dim(dim, ndim, keepdim)
     result = []
@@ -93,6 +117,15 @@ def _wrap_dims(dim: Any, ndim: int, keepdim: bool = False) -> list[DimEntry]:
 
 
 def patched_dim_method(wrapper: WrappedOperator, *args: Any, **kwargs: Any) -> Any:
+    # [FUNCTION DOC] Runs the wrapped operation with first-class dim support. The first
+    # argument is the tensor; the dim argument is read by keyword or position. Without a dim
+    # argument the op runs on the batched tensor with all layers enabled. With one, dims are
+    # resolved to integer indices into the levels, the op runs on the plain tensor, and
+    # tensor results are re-wrapped with levels minus reduced dims (kept if keepdim or not a
+    # reduction). Raises ValueError when no args, or a dim is not among the tensor levels, or
+    # a Dim is combined with keepdim.
+    # KNOWN ISSUE: keepdim_offset is compared to the arg count separately from dim_offset,
+    # so positional keepdim detection assumes self precedes both.
     """
     This is the core method that handles dimension-aware operations.
     """
@@ -205,6 +238,8 @@ def patched_dim_method(wrapper: WrappedOperator, *args: Any, **kwargs: Any) -> A
 
     # Wrap results
     def wrap_result(obj: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Wraps a torch tensor into a first-class Tensor using the
+        # computed new levels; other objects pass through unchanged.
         if isinstance(obj, torch.Tensor):
             from . import Tensor
 
@@ -222,6 +257,9 @@ def _wrap(
     single_dim: bool | None = None,
     reduce: bool | None = None,
 ) -> Callable:
+    # [FUNCTION DOC] Builds a WrappedOperator around orig with patched_dim_method as the
+    # implementation, applies any non-None option overrides (dim_name defaults to "dim"),
+    # and returns the resulting wrapper function.
     """
     Wrap a PyTorch function to support first-class dimensions.
 
@@ -256,6 +294,9 @@ def call_torch_function(
     args: tuple = (),
     kwargs: dict | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Forwards a torch function call to the first-class tensor class's
+    # torch-function handler with func, types, args and kwargs (empty mapping if None).
+    # The wrapper argument is unused.
     """
     Handle __torch_function__ calls for wrapped operators.
     """

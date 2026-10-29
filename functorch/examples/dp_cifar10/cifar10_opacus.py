@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+# [MODULE DOC]
+# Command-line example that trains a torchvision model on CIFAR10, optionally with differential
+# privacy via the Opacus privacy engine. Provides training, evaluation, checkpoint saving and
+# argument parsing; runs main when executed as a script. Import-time side effects: configures
+# root logging to standard output and sets the "ddp" logger to INFO level.
+# KNOWN ISSUE: the options for resume, evaluate, seed and log directory are parsed but never used.
 """
 Runs CIFAR10 training with differential privacy.
 """
@@ -33,16 +39,24 @@ logger.setLevel(level=logging.INFO)
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.tar"):
+    # [FUNCTION DOC] Saves state to filename; if is_best, also copies the file to a fixed
+    # best-model file in the current directory. Writes files; returns nothing.
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, "model_best.pth.tar")
 
 
 def accuracy(preds, labels):
+    # [FUNCTION DOC] Returns the fraction of predictions equal to labels (numpy arrays).
     return (preds == labels).mean()
 
 
 def train(args, model, train_loader, optimizer, privacy_engine, epoch, device):
+    # [FUNCTION DOC] Trains the model for one epoch: for each batch, forwards, computes
+    # cross-entropy loss and accuracy, backpropagates, steps the optimizer and clears
+    # gradients. Every print_freq batches prints running loss and accuracy, plus epsilon,
+    # delta and best alpha from the privacy accountant unless DP is disabled. Returns the
+    # elapsed time as a time delta. Mutates model and optimizer state.
     start_time = datetime.now()
 
     model.train()
@@ -98,6 +112,9 @@ def train(args, model, train_loader, optimizer, privacy_engine, epoch, device):
 
 
 def test(args, model, test_loader, device):
+    # [FUNCTION DOC] Evaluates the model in eval mode without gradients over the test loader,
+    # prints mean loss and mean accuracy, and returns the mean accuracy. The args parameter
+    # is unused.
     model.eval()
     criterion = nn.CrossEntropyLoss()
     losses = []
@@ -124,6 +141,15 @@ def test(args, model, test_loader, device):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parses arguments, builds transforms, CIFAR10 loaders (downloads
+    # data if missing), the chosen torchvision model with group normalization, and the
+    # optimizer (SGD, RMSprop or Adam). Unless DP is disabled, wraps model, optimizer and
+    # loader with the Opacus privacy engine (flat or per-layer clipping). Then trains and
+    # tests for each epoch (optional cosine learning rate), saves a checkpoint each epoch, and
+    # logs final metrics. Raises ImportError if secure RNG is requested without its package,
+    # and NotImplementedError for an unknown optimizer.
+    # KNOWN ISSUE: augmentation is applied only when DP is disabled (likely intended, since
+    # per-sample privacy accounting assumes none), and the train loader does not shuffle.
     args = parse_args()
 
     if args.debug >= 1:
@@ -279,6 +305,10 @@ def main():
 
 
 def parse_args():
+    # [FUNCTION DOC] Defines the command-line options (data loading, epochs, learning rate,
+    # privacy parameters, device, architecture, clipping, debug level, paths) and returns the
+    # parsed namespace from the process arguments. May exit on invalid input.
+    # KNOWN ISSUE: several help strings disagree with defaults (sigma and clipping norm).
     parser = argparse.ArgumentParser(description="PyTorch CIFAR10 DP Training")
     parser.add_argument(
         "-j",

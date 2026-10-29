@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Tutorial script on per-sample gradients. Importing it runs everything: seeds the RNG,
+# builds random data on a CUDA device (needs a GPU), computes per-sample gradients with a
+# loop, then with functorch grad plus vmap, and raises AssertionError if they differ.
 """
 ==========================
 Per-sample-gradients
@@ -20,7 +24,10 @@ torch.manual_seed(0)
 
 # Here's a simple CNN
 class SimpleCNN(nn.Module):
+    # [CLASS DOC] Small MNIST-style CNN: two convolutions, max pooling, two linear layers.
+    # Maps a batch of 1x28x28 images to 10 raw class scores.
     def __init__(self):
+        # [FUNCTION DOC] Creates the two conv layers and two linear layers.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -28,6 +35,11 @@ class SimpleCNN(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs conv, relu, conv, relu, pool, flatten, linear, relu, linear and
+        # returns the final linear output.
+        # KNOWN ISSUE: the log-softmax result is computed but then overwritten by the raw
+        # linear output, so the returned value is not log-probabilities (yet loss_fn feeds
+        # it to a negative log-likelihood loss).
         x = self.conv1(x)
         x = F.relu(x)
         x = self.conv2(x)
@@ -43,6 +55,7 @@ class SimpleCNN(nn.Module):
 
 
 def loss_fn(predictions, targets):
+    # [FUNCTION DOC] Returns the negative log-likelihood loss of predictions for targets.
     return F.nll_loss(predictions, targets)
 
 
@@ -66,6 +79,8 @@ loss.backward()
 # Conceptually, per-sample-gradient computation is equivalent to: for each sample
 # of the data, perform a forward and a backward pass to get a gradient.
 def compute_grad(sample, target):
+    # [FUNCTION DOC] Runs the global model on one sample (given a batch dimension of one) and
+    # returns the tuple of gradients of the loss with respect to every model parameter.
     sample = sample.unsqueeze(0)
     target = target.unsqueeze(0)
     prediction = model(sample)
@@ -74,6 +89,9 @@ def compute_grad(sample, target):
 
 
 def compute_sample_grads(data, targets):
+    # [FUNCTION DOC] Loops over the global batch size computing each sample's gradients, then
+    # stacks them per parameter. Returns a list with one stacked tensor per parameter whose
+    # first dimension is the sample index.
     sample_grads = [compute_grad(data[i], targets[i]) for i in range(batch_size)]
     sample_grads = zip(*sample_grads)
     sample_grads = [torch.stack(shards) for shards in sample_grads]
@@ -106,6 +124,8 @@ fmodel, params, buffers = make_functional_with_buffers(model)
 # Because the model was originally written to handle batches, we'll use
 # ``torch.unsqueeze`` to add a batch dimension.
 def compute_loss(params, buffers, sample, target):
+    # [FUNCTION DOC] Computes the loss for one sample with the stateless model, adding a batch
+    # dimension of one to the sample and target. Returns the scalar loss.
     batch = sample.unsqueeze(0)
     targets = target.unsqueeze(0)
     predictions = fmodel(params, buffers, batch)

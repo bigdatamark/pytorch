@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tutorial script on computing jacobians and hessians with functorch (vjp, vmap, jacrev,
+# jacfwd, hessian). Importing it runs everything: seeds the RNG, builds random CPU data,
+# compares naive and transformed jacobians (raising AssertionError on mismatch), prints
+# benchmark timings, and computes hessians and batched jacobians/hessians.
 """
 =============================
 Jacobians, hessians, and more
@@ -24,6 +29,8 @@ torch.manual_seed(0)
 # Let's start with a function that we'd like to compute the jacobian of.
 # This is a simple linear function with non-linear activation.
 def predict(weight, bias, x):
+    # [FUNCTION DOC] Applies a linear layer with the given weight and bias to x, then tanh.
+    # Returns the activated tensor.
     return F.linear(x, weight, bias).tanh()
 
 
@@ -42,6 +49,9 @@ unit_vectors = torch.eye(D)
 
 
 def compute_jac(xp):
+    # [FUNCTION DOC] Computes the full jacobian of predict with respect to xp row by row:
+    # one reverse-mode gradient per unit vector (global), stacked into a matrix. Uses the
+    # global weight, bias and unit_vectors. Returns the jacobian tensor.
     jacobian_rows = [
         torch.autograd.grad(predict(weight, bias, xp), xp, vec)[0]
         for vec in unit_vectors
@@ -171,6 +181,8 @@ hess2 = jacrev(jacrev(predict, argnums=2), argnums=2)(weight, bias, x)
 
 
 def predict_with_output_summed(weight, bias, x):
+    # [FUNCTION DOC] Runs predict on a batch and sums over the batch dimension, so the
+    # jacobian of the sum gives per-sample jacobians. Returns the summed output.
     return predict(weight, bias, x).sum(0)
 
 

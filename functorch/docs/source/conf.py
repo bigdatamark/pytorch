@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Sphinx configuration for the functorch documentation: extensions, project metadata, theme
+# and HTML context, LaTeX/man/texinfo outputs, intersphinx and doctest settings. Import-time
+# side effects: imports functorch and the theme package, inserts the parent directory into
+# sys.path, raises RuntimeError if the RELEASE environment variable is set, and replaces
+# the Sphinx TypedField make_field method with a patched version.
 #
 # This file is execfile()d with the current directory set to its
 # containing dir.
@@ -329,11 +335,19 @@ except ImportError:
 
 
 def patched_make_field(self, types, domain, items, **kw):
+    # [FUNCTION DOC] HELPER: Replacement for Sphinx TypedField.make_field. Builds a field node
+    # where each argument name is a plain literal (no cross-reference), followed by its type
+    # (prefixed for a few builtin names so they link to the Python docs) and the description.
+    # A single item may collapse to one paragraph, otherwise a list is used. Returns the
+    # field node. Extra keyword arguments are passed to the xref builder.
     # `kw` catches `env=None` needed for newer sphinx while maintaining
     #  backwards compatibility when passed along further down!
 
     # (List, unicode, Tuple) -> nodes.field
     def handle_item(fieldarg, content):
+        # [FUNCTION DOC] HELPER: Builds a paragraph for one documented argument: name, optional
+        # type in parentheses (consumed from types), a dash, then the content. Mutates types
+        # by removing the entry. Returns the paragraph node.
         par = nodes.paragraph()
         par += addnodes.literal_strong("", fieldarg)  # Patch: this line added
         # par.extend(self.make_xrefs(self.rolename, domain, fieldarg,

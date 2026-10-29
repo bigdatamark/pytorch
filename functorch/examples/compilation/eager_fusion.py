@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example script benchmarking an eager function against its ahead-of-time compiled version
+# (TVM backend, forward and backward). Importing it runs everything: creates random inputs,
+# compiles and runs once with backward, then prints timings of both versions. May write TVM
+# tuning log files in the current directory. The JAX benchmark is defined but not called.
 import time
 
 import torch
@@ -10,6 +15,8 @@ b = torch.randn(1, 2000, 4)
 
 
 def f(a):
+    # [FUNCTION DOC] Multiplies a by the global b with broadcasting and sums over the first
+    # dimension. Returns the reduced tensor.
     return (a * b).sum(dim=0)
 
 
@@ -25,6 +32,9 @@ out.sum().backward()
 
 
 def bench(func):
+    # [FUNCTION DOC] Times a number of iterations (global iters) of calling func on the global
+    # input, applying sine, summing and running backward, clearing the input gradient each
+    # time. Prints the elapsed seconds; returns nothing.
     begin = time.time()
     for _ in range(iters):
         out = func(a).sin()
@@ -34,6 +44,9 @@ def bench(func):
 
 
 def bench_jax():
+    # [FUNCTION DOC] Optional comparison: converts the globals to JAX arrays, jit-compiles the
+    # gradient of an equivalent function, runs it iters times and prints elapsed seconds.
+    # Requires jax; never called in this script.
     import jax
     import jax.numpy as jnp
 
@@ -41,6 +54,8 @@ def bench_jax():
     jax_b = jnp.array(b.detach().numpy())
 
     def f(a):
+        # [FUNCTION DOC] HELPER: JAX version of the benchmark function; returns the scalar sum
+        # of the sine of the reduced product.
         return jnp.sin((a * jax_b).sum(axis=[0])).sum()
 
     jit_f = jax.jit(jax.grad(f))

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tutorial script showing how to vectorize model ensembling with vmap. Importing it runs the
+# whole example: seeds the RNG, builds random data on a CUDA device (so it needs a GPU),
+# creates ten CNNs, computes loop-based predictions, then stacks model state and compares
+# vmap predictions against them, raising AssertionError on mismatch.
 """
 ==========================
 Model ensembling
@@ -27,7 +32,10 @@ torch.manual_seed(0)
 
 # Here's a simple CNN
 class SimpleCNN(nn.Module):
+    # [CLASS DOC] Small MNIST-style CNN: two convolutions, max pooling, two linear layers.
+    # Maps a batch of 1x28x28 images to 10 raw class scores.
     def __init__(self):
+        # [FUNCTION DOC] Creates the two conv layers and two linear layers.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -35,6 +43,10 @@ class SimpleCNN(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs conv, relu, conv, relu, pool, flatten, linear, relu, linear and
+        # returns the final linear output.
+        # KNOWN ISSUE: the log-softmax result is computed but then overwritten by the raw
+        # linear output, so the returned value is not log-probabilities.
         x = self.conv1(x)
         x = F.relu(x)
         x = self.conv2(x)

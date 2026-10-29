@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Implements the order operation for first-class dimensions: reorders (and optionally
+# flattens) the dimensions of a first-class tensor or of a single Dim, turning the chosen
+# dims into new positional dimensions. No import-time side effects beyond imports.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -12,6 +16,10 @@ from ._dim_entry import _match_levels, DimEntry, ndim_of_levels
 
 
 def _wrap_dim(arg: Any, orig_ndim: int, allow_none: bool = True) -> DimEntry:
+    # [FUNCTION DOC] HELPER: Converts arg into a DimEntry. None (when allowed) gives an empty
+    # entry, a Dim gives a dim entry, and an int gives a positional entry (negative ints are
+    # kept as is, non-negative ints are shifted to count from the right using orig_ndim).
+    # Any other value gives an empty entry. Never raises.
     """
     Convert various dimension representations to DimEntry.
 
@@ -42,6 +50,13 @@ def _wrap_dim(arg: Any, orig_ndim: int, allow_none: bool = True) -> DimEntry:
 def order(
     tensor_or_dim: torch.Tensor | Any, *dims: Any | Sequence[Any]
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Moves the given dims (Dim objects, ints, DimLists) to be the new
+    # positional dims of the result, in the given order. A sequence argument is flattened
+    # into one positional dim. Accepts a first-class Tensor or a single Dim (whose range
+    # tensor is used). Returns a first-class Tensor. Raises ValueError if the first argument
+    # is not a Tensor/Dim, a dim is missing or given twice, or an argument is not a dim.
+    # KNOWN ISSUE: the sequence-argument error message mentions Sequence[Dim] but ints are
+    # also accepted inside sequences.
     """
     Reorder the dimensions of a tensor or create a tensor from a dimension.
 
@@ -86,6 +101,9 @@ def order(
     orig_ndim = ndim_of_levels(levels)
 
     def append_dim(d: DimEntry) -> None:
+        # [FUNCTION DOC] HELPER: Marks the level matching d as consumed in the enclosing
+        # levels list and records d in the flat list of new positional dims. Raises
+        # ValueError if d is not present (or was already used).
         """Add a dimension to the reordering, removing it from available levels."""
         try:
             idx = levels.index(d)

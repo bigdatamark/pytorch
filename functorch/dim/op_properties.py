@@ -3,6 +3,12 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC]
+# Data-only module listing pointwise operators eligible for the fast path in first-class
+# dimensions: dunder-name stems (with reverse variants) and the tuple "pointwise" of torch
+# functions and Tensor methods built from them by attribute lookup at import time.
+# KNOWN ISSUE: "gt" appears twice in the comparison names, and tensor_magic_methods is
+# unused here and contains an empty string.
 import torch
 
 
