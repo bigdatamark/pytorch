@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Core of the PyTorch merge bot (trymerge). Fetches PR data through the GitHub GraphQL API
+# (GitHubPR), loads merge_rules.yaml, evaluates mergeability (approvals, required checks,
+# flaky / broken-trunk classification, labels, docker-build constraints), then merges,
+# reverts, or only checks mergeability, posting status comments and labels along the way.
+# Main contents: GraphQL query strings, regexes, check-state types, GitHubPR, merge rule
+# data classes and matching, check classification helpers, and the main CLI entry point.
+# No significant import-time side effects (queries and regexes are compiled/built only).
 
 from __future__ import annotations
 
@@ -57,6 +65,10 @@ MERGE_COMPLETE_LABEL = "merged"
 
 
 class JobCheckState(NamedTuple):
+    # [CLASS DOC]
+    # Immutable record of one CI job / check run: name, details url, conclusion status
+    # (may be None), classification label (e.g. flaky / broken trunk, None if unclassified),
+    # GitHub job id, and optional check run title and summary text.
     name: str
     url: str
     status: str | None
@@ -70,7 +82,12 @@ JobNameToStateDict = dict[str, JobCheckState]
 
 
 class WorkflowCheckState:
+    # [CLASS DOC]
+    # Mutable record of one workflow run: name, url, run id, conclusion status, and a
+    # mapping of check run name to JobCheckState for the jobs seen in that run.
     def __init__(self, name: str, url: str, run_id: int, status: str | None):
+        # [FUNCTION DOC]
+        # Stores the arguments and starts with an empty jobs mapping.
         self.name: str = name
         self.url: str = url
         self.run_id: int = run_id
@@ -463,6 +480,13 @@ DOCKER_BUILDS_WORKFLOW_NAME = "docker-builds"
 def iter_issue_timeline_until_comment(
     org: str, repo: str, issue_number: int, target_comment_id: int, max_pages: int = 200
 ) -> Any:
+    # [FUNCTION DOC]
+    # Generator over the issue timeline events fetched page by page (100 per page, via the
+    # REST timeline endpoint), yielding each event in order and stopping right after the
+    # "commented" event whose id equals target_comment_id. Stops early on an empty or short
+    # page. Raises RuntimeError if the comment is not found within max_pages pages.
+    # KNOWN ISSUE: if a page is exactly the last one and no match, the error path reuses the
+    # url variable, which is undefined when max_pages is less than 1.
     """
     Yield timeline entries in order until (and including) the entry whose id == target_comment_id
     for a 'commented' event. Stops once the target comment is encountered.
@@ -499,11 +523,15 @@ def iter_issue_timeline_until_comment(
 
 
 def sha_from_committed_event(ev: dict[str, Any]) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the sha field of a timeline committed event, or None.
     """Extract SHA from committed event in timeline"""
     return ev.get("sha")
 
 
 def sha_from_force_push_after(ev: dict[str, Any]) -> str | None:
+    # [FUNCTION DOC] HELPER: Extracts the post-force-push head sha from a timeline event.
+    # Prefers the commit_id field (current API); otherwise falls back to legacy fields
+    # (after / after_commit objects with sha or oid, then after_sha / head_sha). May be None.
     """Extract SHA from force push event in timeline"""
     # The current GitHub API format
     commit_id = ev.get("commit_id")
@@ -518,12 +546,19 @@ def sha_from_force_push_after(ev: dict[str, Any]) -> str | None:
 
 
 def gh_get_pr_info(org: str, proj: str, pr_no: int) -> Any:
+    # [FUNCTION DOC]
+    # Runs the main PR info GraphQL query and returns the pullRequest object (nested
+    # mappings with reviews, commits, check suites, files, comments, labels). Network call.
     rc = gh_graphql(GH_GET_PR_INFO_QUERY, name=proj, owner=org, number=pr_no)
     return rc["data"]["repository"]["pullRequest"]
 
 
 @cache
 def gh_get_team_members(org: str, name: str) -> list[str]:
+    # [FUNCTION DOC]
+    # Returns all member logins of a GitHub org team, paging through GraphQL results.
+    # Returns an empty list (and emits a warning) if the team does not exist. Results are
+    # cached per (org, name) for the process lifetime. Needs read-org permission.
     rc: list[str] = []
     team_members: dict[str, Any] = {
         "pageInfo": {"hasNextPage": "true", "endCursor": None}
@@ -545,6 +580,8 @@ def gh_get_team_members(org: str, name: str) -> list[str]:
 
 
 def get_check_run_name_prefix(workflow_run: Any) -> str:
+    # [FUNCTION DOC] HELPER: Returns the workflow name followed by a slash separator to
+    # prefix check run names, or an empty string when there is no workflow run.
     if workflow_run is None:
         return ""
     else:
@@ -552,10 +589,15 @@ def get_check_run_name_prefix(workflow_run: Any) -> str:
 
 
 def is_passing_status(status: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: True if the status is non-None and, case-insensitively, one of
+    # success, skipped or neutral.
     return status is not None and status.upper() in ["SUCCESS", "SKIPPED", "NEUTRAL"]
 
 
 def is_docker_affecting_files(files: Iterable[str]) -> bool:
+    # [FUNCTION DOC]
+    # True if any path equals or lies under the CI docker directory (these change the
+    # docker image tag).
     """Whether any of the given files change the CI docker image tree hash.
 
     The docker image tag is derived purely from the .ci/docker tree, so only
@@ -566,6 +608,9 @@ def is_docker_affecting_files(files: Iterable[str]) -> bool:
 
 
 def get_docker_build_checks(checks: JobNameToStateDict) -> JobNameToStateDict:
+    # [FUNCTION DOC]
+    # Filters the checks mapping to entries whose name is the docker-builds workflow or
+    # starts with that workflow name plus a slash separator.
     """Return the subset of checks that belong to the docker-builds workflow."""
     return {
         name: check
@@ -580,6 +625,13 @@ def add_workflow_conclusions(
     get_next_checkruns_page: Callable[[list[dict[str, dict[str, Any]]], int, Any], Any],
     get_next_checksuites: Callable[[Any], Any],
 ) -> JobNameToStateDict:
+    # [FUNCTION DOC]
+    # Converts GraphQL check suite data into a mapping of job name to JobCheckState.
+    # Pages through extra check suites and check runs using the two callbacks, keeps only
+    # the newest run (largest run id) per workflow, ignores cancelled runs that would
+    # override an existing workflow, and keeps a non-passing duplicate job over a passing
+    # one. Workflows with jobs contribute their jobs only; empty workflows contribute
+    # themselves; jobs without a workflow are added last.
     # graphql seems to favor the most recent workflow run, so in theory we
     # shouldn't need to account for reruns, but do it just in case
 
@@ -590,6 +642,11 @@ def add_workflow_conclusions(
     no_workflow_obj: WorkflowCheckState = WorkflowCheckState("", "", 0, None)
 
     def add_conclusions(edges: Any) -> None:
+        # [FUNCTION DOC] HELPER: Walks check suite edges, registers each workflow run and
+        # records its check runs as jobs (following check run pagination via the callback).
+        # Mutates the enclosing workflows mapping and the no-workflow holder.
+        # KNOWN ISSUE: the cancelled-run test looks up workflow_name in a mapping keyed by
+        # workflow_id, so it never matches.
         for edge_idx, edge in enumerate(edges):
             node = edge["node"]
             workflow_run = node["workflowRun"]
@@ -679,6 +736,9 @@ def add_workflow_conclusions(
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses the command line: positional pr_num, flags --dry-run,
+    # --revert, --force, --ignore-current, --check-mergeability, and options --comment-id
+    # (int) and --reason (str). Returns the argparse namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("Merge PR into default branch")
@@ -696,6 +756,8 @@ def parse_args() -> Any:
 def _unedited_comment_author(
     pr: GitHubPR, comment_id: int | None
 ) -> tuple[str, str | None] | None:
+    # [FUNCTION DOC] HELPER: Looks up the triggering comment and returns its author login
+    # and author url, or None if there is no comment id or the comment was edited.
     """(author_login, author_url) of the triggering comment.
 
     None when there is no comment or it has been edited, so a caller can never
@@ -710,6 +772,10 @@ def _unedited_comment_author(
 
 
 def can_skip_internal_checks(pr: GitHubPR, comment_id: int | None = None) -> bool:
+    # [FUNCTION DOC]
+    # True if the unedited triggering comment was written by the facebook-github-bot user
+    # or by the facebook-github-tools GitHub App (matched by app url); such merges may skip
+    # the internal-diff checks. False when the comment is missing or edited.
     author = _unedited_comment_author(pr, comment_id)
     if author is None:
         return False
@@ -752,6 +818,9 @@ CODEV_MERGE_BOT_APP_URLS = frozenset(
 
 
 def is_bot_initiated_codev_merge(pr: GitHubPR, comment_id: int | None) -> bool:
+    # [FUNCTION DOC]
+    # True when the PR has a Differential Revision line and the unedited triggering comment
+    # was authored by a known co-dev merge bot (by login or app url). Cheap local check first.
     # A co-dev merge is initiated by one of the Meta export bots once the
     # internal Phabricator diff has landed. Such a PR always carries a
     # "Differential Revision:" line (get_diff_revision); the local check runs
@@ -770,6 +839,11 @@ def is_bot_initiated_codev_merge(pr: GitHubPR, comment_id: int | None) -> bool:
 def ensure_mergeable_labels(
     pr: GitHubPR, comment_id: int | None, dry_run: bool
 ) -> None:
+    # [FUNCTION DOC]
+    # Ensures the PR has the required release-notes labels. If missing and the merge was
+    # initiated by a co-dev bot, posts an audit comment and then adds the not-user-facing
+    # label (comment first by design). Otherwise raises RuntimeError with the label error
+    # message. Side effects: PR comment and label change (skipped when dry_run).
     if has_required_labels(pr):
         return
     # A co-dev merge runs after the internal diff already landed, so the author
@@ -803,6 +877,10 @@ def _revlist_to_prs(
     rev_list: Iterable[str],
     should_skip: Callable[[int, GitHubPR], bool] | None = None,
 ) -> list[tuple[GitHubPR, str]]:
+    # [FUNCTION DOC] HELPER: Maps commit revisions to (GitHubPR, revision) pairs by parsing
+    # the single "Pull Request resolved" url in each commit message. Reuses the given pr
+    # object for its own number; skips entries for which should_skip(index, pr) is true.
+    # Raises RuntimeError if a commit mentions zero or several PRs or a different repo.
     rc: list[tuple[GitHubPR, str]] = []
     for idx, rev in enumerate(rev_list):
         msg = repo.commit_message(rev)
@@ -832,6 +910,12 @@ def _revlist_to_prs(
 def get_ghstack_prs(
     repo: GitRepo, pr: GitHubPR, open_only: bool = True
 ) -> list[tuple[GitHubPR, str]]:
+    # [FUNCTION DOC]
+    # Returns the ghstack PRs at and below this PR as (pr, commit revision) pairs, oldest
+    # first, from the commits between the default branch and the origin orig ref. Closed
+    # PRs are skipped when open_only. Raises AssertionError if the PR is not ghstack, and
+    # RuntimeError if any open PR's head branch is out of sync with its orig revision.
+    # Prints progress.
     """
     Get the PRs in the stack that are below this PR (inclusive).  Throws error if any of the open PRs are out of sync.
     @:param open_only: Only return open PRs
@@ -841,6 +925,8 @@ def get_ghstack_prs(
     rev_list = repo.revlist(f"{pr.default_branch()}..{orig_ref}")
 
     def skip_func(idx: int, candidate: GitHubPR) -> bool:
+        # [FUNCTION DOC] HELPER: True (with a printed note) when only open PRs are wanted and
+        # the candidate is already closed.
         if not open_only or not candidate.is_closed():
             return False
         print(
@@ -876,7 +962,17 @@ def get_ghstack_prs(
 
 
 class GitHubPR:
+    # [CLASS DOC]
+    # Wrapper around one pull request. State: org, project, pr_num, the raw GraphQL info
+    # mapping fetched at construction, and lazily filled caches (changed files, labels, CI
+    # conclusions, comments, authors, reviews, merge base, submodules). Provides accessors
+    # for refs and ghstack status, comment / review / author retrieval, check status
+    # gathering, merge rule evaluation (find_matching_merge_rule), commit message
+    # construction, and merge / close helpers.
     def __init__(self, org: str, project: str, pr_num: int) -> None:
+        # [FUNCTION DOC]
+        # Fetches PR info from GitHub and initializes empty caches. Raises AssertionError if
+        # pr_num is not an int. Network call.
         if not isinstance(pr_num, int):
             raise AssertionError(
                 f"pr_num must be an int, got {type(pr_num).__name__}: {pr_num}"
@@ -895,24 +991,32 @@ class GitHubPR:
         self.submodules: list[str] | None = None
 
     def is_closed(self) -> bool:
+        # [FUNCTION DOC] True if the PR is closed (merged or abandoned).
         return bool(self.info["closed"])
 
     def is_cross_repo(self) -> bool:
+        # [FUNCTION DOC] True if the PR head lives in a different repository (a fork).
         return bool(self.info["isCrossRepository"])
 
     def base_ref(self) -> str:
+        # [FUNCTION DOC] Returns the name of the PR base branch.
         return cast(str, self.info["baseRefName"])
 
     def default_branch(self) -> str:
+        # [FUNCTION DOC] Returns the default branch name of the base repository.
         return cast(str, self.info["baseRepository"]["defaultBranchRef"]["name"])
 
     def head_ref(self) -> str:
+        # [FUNCTION DOC] Returns the name of the PR head branch.
         return cast(str, self.info["headRefName"])
 
     def is_ghstack_pr(self) -> bool:
+        # [FUNCTION DOC] True if the head branch name looks like a ghstack head branch.
         return RE_GHSTACK_HEAD_REF.match(self.head_ref()) is not None
 
     def get_ghstack_orig_ref(self) -> str:
+        # [FUNCTION DOC] Returns the ghstack orig branch name derived from the head branch
+        # (head suffix replaced by orig). Raises AssertionError for non-ghstack PRs.
         if not self.is_ghstack_pr():
             raise AssertionError(
                 f"get_ghstack_orig_ref called on non-ghstack PR #{self.pr_num}"
@@ -920,15 +1024,20 @@ class GitHubPR:
         return re.sub(r"/head$", "/orig", self.head_ref())
 
     def is_base_repo_private(self) -> bool:
+        # [FUNCTION DOC] True if the base repository is private.
         return bool(self.info["baseRepository"]["isPrivate"])
 
     def get_changed_files_count(self) -> int:
+        # [FUNCTION DOC] Returns the changed file count reported by GitHub.
         return int(self.info["changedFiles"])
 
     def last_commit(self) -> Any:
+        # [FUNCTION DOC] Returns the commit object of the PR's last commit from the info.
         return self.info["commits"]["nodes"][-1]["commit"]
 
     def last_commit_sha(self, default: str | None = None) -> str:
+        # [FUNCTION DOC] Returns the sha of the last commit. With no default, a missing oid
+        # raises KeyError; with a default, that value is returned when the oid is absent.
         # for commits, the oid is the sha
 
         if default is None:
@@ -937,6 +1046,10 @@ class GitHubPR:
         return str(self.last_commit().get("oid", default))
 
     def get_merge_base(self) -> str:
+        # [FUNCTION DOC]
+        # Returns (and caches) the merge base of the last commit against the default branch
+        # via the GitHub API, falling back to the PR's base ref oid when the call yields
+        # nothing (e.g. rate limiting).
         if self.merge_base:
             return self.merge_base
 
@@ -959,6 +1072,10 @@ class GitHubPR:
         return self.merge_base
 
     def get_changed_files(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns (and caches) the unique changed file paths, paging through GraphQL file
+        # results up to 100 pages. Raises RuntimeError if the number collected differs from
+        # the count GitHub reports.
         if self.changed_files is None:
             info = self.info
             unique_changed_files = set()
@@ -982,6 +1099,7 @@ class GitHubPR:
         return self.changed_files
 
     def get_submodules(self) -> list[str]:
+        # [FUNCTION DOC] Returns (and caches) the submodule paths of the repository.
         if self.submodules is None:
             rc = gh_graphql(GH_GET_REPO_SUBMODULES, name=self.project, owner=self.org)
             info = rc["data"]["repository"]["submodules"]
@@ -989,14 +1107,19 @@ class GitHubPR:
         return self.submodules
 
     def get_changed_submodules(self) -> list[str]:
+        # [FUNCTION DOC] Returns the changed files that are submodule paths.
         submodules = self.get_submodules()
         return [f for f in self.get_changed_files() if f in submodules]
 
     def is_docker_affecting(self) -> bool:
+        # [FUNCTION DOC] True if any changed file affects the CI docker image tag.
         """Whether this PR modifies files that change the CI docker image tag."""
         return is_docker_affecting_files(self.get_changed_files())
 
     def has_invalid_submodule_updates(self) -> bool:
+        # [FUNCTION DOC]
+        # True if the PR changes any submodule but the word submodule appears in none of the
+        # title, body or labels (case-insensitive for title/body).
         """Submodule updates in PR are invalid if submodule keyword
         is not mentioned in neither the title nor body/description
         nor in any of the labels.
@@ -1009,6 +1132,9 @@ class GitHubPR:
         )
 
     def _get_reviews(self) -> list[tuple[str, str]]:
+        # [FUNCTION DOC] HELPER: Collects (author login, state) review pairs in chronological
+        # order (paging backwards through up to 100 pages) and caches the raw list. Returns the
+        # latest non-comment review state per author as a list of pairs.
         if self._reviews is None:
             self._reviews = []
             info = self.info
@@ -1033,12 +1159,22 @@ class GitHubPR:
         return list(reviews.items())
 
     def get_approved_by(self) -> list[str]:
+        # [FUNCTION DOC] Returns logins whose latest non-comment review state is approved.
         return [login for (login, state) in self._get_reviews() if state == "APPROVED"]
 
     def get_commit_count(self) -> int:
+        # [FUNCTION DOC] Returns the total number of commits in the PR as reported by GitHub.
         return int(self.info["commits_with_authors"]["totalCount"])
 
     def get_commit_sha_at_comment(self, comment_id: int) -> str | None:
+        # [FUNCTION DOC]
+        # Replays the issue timeline up to the given comment, tracking the latest head sha
+        # from committed and force-push events, and returns the head at the comment time.
+        # Returns None if the comment is not found or any error occurs (a warning is printed).
+        # Prints progress lines.
+        # KNOWN ISSUE: the final print uses the variable sha from the last head-changing
+        # event, which is unbound if none occurred; the resulting NameError is swallowed by
+        # the broad exception handler, which then returns None.
         """
         Get the PR head commit SHA that was present when a specific comment was posted.
         This ensures we only merge the state of the PR at the time the merge command was issued,
@@ -1077,17 +1213,24 @@ class GitHubPR:
         return None
 
     def get_pr_creator_login(self) -> str:
+        # [FUNCTION DOC] Returns the login of the user who opened the PR.
         return cast(str, self.info["author"]["login"])
 
     def is_dependabot_pr(self) -> bool:
+        # [FUNCTION DOC] True if the PR was opened by the dependabot bot account.
         return self.get_pr_creator_login() == "dependabot[bot]"
 
     def _fetch_authors(self) -> list[tuple[str, str]]:
+        # [FUNCTION DOC] HELPER: Returns (and caches) a list of (login, "Name <email>") pairs
+        # for the authors of all PR commits, paging up to 100 pages. Login is empty when the
+        # commit author is not a GitHub user.
         if self._authors is not None:
             return self._authors
         authors: list[tuple[str, str]] = []
 
         def add_authors(info: dict[str, Any]) -> None:
+            # [FUNCTION DOC] HELPER: Appends (login, formatted author) pairs from one page of
+            # commit author data to the enclosing authors list.
             for node in info["commits_with_authors"]["nodes"]:
                 for author_node in node["commit"]["authors"]["nodes"]:
                     user_node = author_node["user"]
@@ -1115,12 +1258,16 @@ class GitHubPR:
         return authors
 
     def get_committer_login(self, num: int = 0) -> str:
+        # [FUNCTION DOC] Returns the GitHub login of the num-th commit author (may be empty).
         return self._fetch_authors()[num][0]
 
     def get_committer_author(self, num: int = 0) -> str:
+        # [FUNCTION DOC] Returns the "Name <email>" string of the num-th commit author.
         return self._fetch_authors()[num][1]
 
     def get_labels(self) -> list[str]:
+        # [FUNCTION DOC] Returns (and caches) the label names from the fetched PR info,
+        # or an empty list if the info has no labels field.
         if self.labels is not None:
             return self.labels
         labels = (
@@ -1132,6 +1279,11 @@ class GitHubPR:
         return self.labels
 
     def get_checkrun_conclusions(self) -> JobNameToStateDict:
+        # [FUNCTION DOC]
+        # Returns (and caches) the mapping of job name to JobCheckState for the last commit,
+        # built from check suites (with pagination callbacks) plus legacy commit statuses.
+        # Removes the Claude Code check, which would block merges. Raises RuntimeError if the
+        # last commit changes during pagination. Network calls.
         """Returns dict of checkrun -> [conclusion, url]"""
         if self.conclusions is not None:
             return self.conclusions
@@ -1140,6 +1292,8 @@ class GitHubPR:
         def get_pr_next_check_runs(
             edges: list[dict[str, dict[str, Any]]], edge_idx: int, checkruns: Any
         ) -> Any:
+            # [FUNCTION DOC] HELPER: Fetches the next page of check runs for the check suite at
+            # edge_idx (using the previous edge's cursor) and returns its checkRuns object.
             rc = gh_graphql(
                 GH_GET_PR_NEXT_CHECK_RUNS,
                 name=self.project,
@@ -1155,6 +1309,8 @@ class GitHubPR:
             return checkruns
 
         def get_pr_next_checksuites(checksuites: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Fetches the next page of check suites after the last edge
+            # cursor. Raises RuntimeError if the PR head commit changed meanwhile.
             rc = gh_graphql(
                 GH_GET_PR_NEXT_CHECKSUITES,
                 name=self.project,
@@ -1196,6 +1352,8 @@ class GitHubPR:
         return self.conclusions
 
     def get_authors(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns a mapping of author login to "Name <email>" over all commit
+        # authors (later commits overwrite earlier ones for the same login).
         rc = {}
         for idx in range(len(self._fetch_authors())):
             rc[self.get_committer_login(idx)] = self.get_committer_author(idx)
@@ -1203,6 +1361,8 @@ class GitHubPR:
         return rc
 
     def get_author(self) -> str:
+        # [FUNCTION DOC] Returns the "Name <email>" of the main PR author: the only author if
+        # unique, else the PR creator's entry, else the first commit author.
         authors = self.get_authors()
         if len(authors) == 1:
             return next(iter(authors.values()))
@@ -1214,20 +1374,27 @@ class GitHubPR:
         return authors[creator]
 
     def get_title(self) -> str:
+        # [FUNCTION DOC] Returns the PR title.
         return cast(str, self.info["title"])
 
     def get_body(self) -> str:
+        # [FUNCTION DOC] Returns the PR description text.
         return cast(str, self.info["body"])
 
     def get_merge_commit(self) -> str | None:
+        # [FUNCTION DOC] Returns the merge commit sha if the PR has one, else None.
         mc = self.info["mergeCommit"]
         return mc["oid"] if mc is not None else None
 
     def get_pr_url(self) -> str:
+        # [FUNCTION DOC] Returns the web url of the PR.
         return f"https://github.com/{self.org}/{self.project}/pull/{self.pr_num}"
 
     @staticmethod
     def _comment_from_node(node: Any) -> GitHubComment:
+        # [FUNCTION DOC] HELPER: Converts a GraphQL comment (or review) node into a
+        # GitHubComment record; missing createdAt becomes empty, missing author url becomes
+        # None, and editor login is None when there is no editor.
         editor = node["editor"]
         return GitHubComment(
             body_text=node["bodyText"],
@@ -1241,6 +1408,8 @@ class GitHubPR:
         )
 
     def get_comments(self) -> list[GitHubComment]:
+        # [FUNCTION DOC] Returns (and caches) all PR comments in chronological order, paging
+        # backwards from the prefetched last comments, up to 100 pages.
         if self.comments is not None:
             return self.comments
         self.comments = []
@@ -1263,9 +1432,13 @@ class GitHubPR:
         return self.comments
 
     def get_last_comment(self) -> GitHubComment:
+        # [FUNCTION DOC] Returns the newest comment from the prefetched comment window.
         return self._comment_from_node(self.info["comments"]["nodes"][-1])
 
     def get_comment_by_id(self, database_id: int) -> GitHubComment:
+        # [FUNCTION DOC] Finds a comment by database id: first in the prefetched window (if
+        # comments are not yet fully loaded), then in all comments, then in review bodies.
+        # Raises RuntimeError if not found.
         if self.comments is None:
             # Fastpath - try searching in partial prefetched comments
             for node in self.info["comments"]["nodes"]:
@@ -1289,10 +1462,14 @@ class GitHubPR:
         raise RuntimeError(f"Comment with id {database_id} not found")
 
     def get_diff_revision(self) -> str | None:
+        # [FUNCTION DOC] Returns the internal Phabricator diff id (D followed by digits) from
+        # the PR body's Differential Revision line, or None.
         rc = RE_DIFF_REV.search(self.get_body())
         return rc.group(1) if rc is not None else None
 
     def has_internal_changes(self) -> bool:
+        # [FUNCTION DOC] True if the PR has a connected internal diff and the Meta
+        # internal-only changes check exists but did not succeed.
         checkrun_name = INTERNAL_CHANGES_CHECKRUN_NAME
         if self.get_diff_revision() is None:
             return False
@@ -1302,6 +1479,8 @@ class GitHubPR:
         return checks[checkrun_name].status != "SUCCESS"
 
     def has_no_connected_diff(self) -> bool:
+        # [FUNCTION DOC] True if the internal changes check reports the "no internal diff
+        # connected" title.
         checkrun_name = INTERNAL_CHANGES_CHECKRUN_NAME
         checks = self.get_checkrun_conclusions()
         if checks is None or checkrun_name not in checks:
@@ -1316,6 +1495,13 @@ class GitHubPR:
         skip_all_rule_checks: bool = False,
         ghstack_prs: list[tuple[GitHubPR, str]] | None = None,
     ) -> list[GitHubPR]:
+        # [FUNCTION DOC]
+        # Cherry-picks every open PR of the ghstack (bottom to top) onto the current local
+        # branch, amending each commit message with the generated message (ghstack info
+        # filtered, closed PRs listed as dependencies). Non-self PRs are first checked against
+        # merge rules unless skip_all_rule_checks; a failure is re-raised with the stacked PR
+        # number. Returns the list of open PRs merged. Raises AssertionError if not ghstack.
+        # Side effects: local git commits.
         if not self.is_ghstack_pr():
             raise AssertionError(
                 f"merge_ghstack_into called on non-ghstack PR #{self.pr_num}"
@@ -1356,6 +1542,11 @@ class GitHubPR:
         filter_ghstack: bool = False,
         ghstack_deps: list[GitHubPR] | None = None,
     ) -> str:
+        # [FUNCTION DOC]
+        # Builds the squash commit message: title with PR number, body without cc lines (and
+        # without the ghstack stack section if filter_ghstack), the PR url, approver profile
+        # urls, optional ghstack dependency numbers, and Co-authored-by lines for authors
+        # other than the PR creator.
         """Fetches title and body from PR description
         adds reviewed by, pull request resolved and optionally
         filters out ghstack info"""
@@ -1387,6 +1578,9 @@ class GitHubPR:
         return msg
 
     def add_numbered_label(self, label_base: str, dry_run: bool) -> None:
+        # [FUNCTION DOC] Adds a label named from label_base; if cached labels already contain
+        # the base, the new name gets an X plus running count suffix. Side effect: label API
+        # call (skipped when dry_run).
         labels = self.get_labels() if self.labels is not None else []
         full_label = label_base
         count = 0
@@ -1397,6 +1591,7 @@ class GitHubPR:
         self.add_label(full_label, dry_run)
 
     def add_label(self, label: str, dry_run: bool) -> None:
+        # [FUNCTION DOC] Adds one label to the PR through the API (no-op when dry_run).
         gh_add_labels(self.org, self.project, self.pr_num, [label], dry_run)
 
     def merge_into(
@@ -1408,6 +1603,13 @@ class GitHubPR:
         comment_id: int,
         ignore_current_checks: list[str] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Full merge flow: finds a matching merge rule (raises if none), gathers the ghstack
+        # PRs, verifies docker image builds are ready for docker-affecting changes, then merges
+        # (dependabot via the GitHub API, otherwise local squash / cherry-pick and push to the
+        # default branch). Afterwards adds the merged label, uploads a merge record when a
+        # comment id exists, sleeps 60 seconds, and closes still-open merged PRs manually.
+        # Side effects: git push, labels, record upload, PR state change (dry_run limits some).
         # Raises exception if matching rule is not found
         (
             merge_rule,
@@ -1499,6 +1701,9 @@ class GitHubPR:
         )
 
     def merge_via_github_api(self, dry_run: bool = False) -> str:
+        # [FUNCTION DOC]
+        # Squash merges through the GitHub merge API, splitting the generated commit message
+        # into title and body and pinning to the last commit sha. Returns the merge commit sha.
         """Squash-and-merge this PR through GitHub's merge API, pinned to the
         commit that was reviewed, and return the resulting merge commit sha."""
         msg = self.gen_commit_message()
@@ -1523,6 +1728,13 @@ class GitHubPR:
         skip_all_rule_checks: bool = False,
         ghstack_prs: list[tuple[GitHubPR, str]] | None = None,
     ) -> list[GitHubPR]:
+        # [FUNCTION DOC]
+        # Applies the PR onto the local target branch (default branch unless given). Ghstack
+        # PRs delegate to merge_ghstack_into and return the merged PRs. For regular PRs a
+        # comment_id is required (ValueError otherwise); the head commit at that comment time
+        # must equal the current PR head (RuntimeError otherwise); the commit is fetched,
+        # squash merged and committed with the PR author, then the PR is re-fetched and
+        # RuntimeError is raised if it changed. Returns an empty list for regular PRs.
         """
         :param skip_all_rule_checks: If true, skips all rule checks on ghstack PRs, useful for dry-running merge locally
         """
@@ -1585,21 +1797,31 @@ class GitHubPR:
 
 
 class MergeRuleFailedError(RuntimeError):
+    # [CLASS DOC]
+    # Error raised when a merge rule check fails; carries the rule that failed (or the
+    # closest rule) in the rule attribute, which may be None.
     def __init__(self, message: str, rule: MergeRule | None = None) -> None:
+        # [FUNCTION DOC] Initializes the error with its message and stores the optional rule.
         super().__init__(message)
         self.rule = rule
 
 
 class MandatoryChecksMissingError(MergeRuleFailedError):
+    # [CLASS DOC] Merge rule failure specifically due to missing or unfinished mandatory checks.
     pass
 
 
 class PostCommentError(Exception):
+    # [CLASS DOC] Error signalling that posting a comment to GitHub failed (message only).
     pass
 
 
 @dataclass
 class MergeRule:
+    # [CLASS DOC]
+    # One entry of merge_rules.yaml: rule name, file patterns it covers (a leading dash
+    # marks an exclusion), logins allowed to approve, mandatory check names (or None), and
+    # whether flaky failures may be ignored (default true).
     name: str
     patterns: list[str]
     approved_by: list[str]
@@ -1610,6 +1832,8 @@ class MergeRule:
 def gen_new_issue_link(
     org: str, project: str, labels: list[str], template: str = "bug-report.yml"
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds a prefilled new-issue url for the repo with url-quoted
+    # comma-joined labels and the issue template name.
     labels_str = ",".join(labels)
     return (
         f"https://github.com/{org}/{project}/issues/new?"
@@ -1619,6 +1843,10 @@ def gen_new_issue_link(
 
 
 def read_merge_rules(repo: GitRepo | None, org: str, project: str) -> list[MergeRule]:
+    # [FUNCTION DOC]
+    # Loads merge rules as MergeRule objects. Without a repo, downloads and decodes the rules
+    # file through the GitHub contents API; with a repo, reads it from the checkout (prints
+    # a note and returns an empty list if the file is absent). Raises on bad YAML or fields.
     """Returns the list of all merge rules for the repo or project.
 
     NB: this function is used in Meta-internal workflows, see the comment
@@ -1644,6 +1872,8 @@ def read_merge_rules(repo: GitRepo | None, org: str, project: str) -> list[Merge
 
 
 def _find_non_matching_files(patterns: list[str], files: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns files not covered by the rule patterns, i.e. not
+    # matching any positive pattern or matching an exclusion (dash-prefixed) pattern.
     """Return files that do not match the given patterns.
 
     Patterns prefixed with '-' are exclusions: a file matches the rule if it
@@ -1672,6 +1902,15 @@ def find_matching_merge_rule(
     list[tuple[str, str | None, int | None]],
     dict[str, list[Any]],
 ]:
+    # [FUNCTION DOC]
+    # Finds the first merge rule the PR satisfies and returns (rule, pending checks, failed
+    # checks, ignorable checks by category). A rule passes when all changed files match its
+    # patterns, an allowed approver (users or org/team members) approved, mandatory checks
+    # (all, or only CLA checks when skip_mandatory_checks) are neither failed nor pending, and
+    # internal changes are absent unless skip_internal_checks. Raises RuntimeError when no
+    # rules exist or internal changes block; otherwise raises MandatoryChecksMissingError
+    # (best score is pending checks) or MergeRuleFailedError with the most relevant reason.
+    # Network calls via the PR object, rule loading, and classification.
     """
     Returns merge rule matching to this pr together with the list of associated pending
     and failing jobs OR raises an exception.
@@ -1852,11 +2091,17 @@ def find_matching_merge_rule(
 
 
 def get_topmost_docker_pr(prs: list[GitHubPR]) -> GitHubPR | None:
+    # [FUNCTION DOC]
+    # Returns the last docker-affecting PR in the bottom-to-top list, or None if none are.
     """Find the highest docker-affecting PR in a bottom-to-top stack."""
     return next((pr for pr in reversed(prs) if pr.is_docker_affecting()), None)
 
 
 def check_docker_builds_ready(pr: GitHubPR) -> None:
+    # [FUNCTION DOC]
+    # No-op for PRs not touching docker files. Otherwise inspects the docker-builds checks:
+    # raises MergeRuleFailedError if none ran or any failed, and MandatoryChecksMissingError
+    # (retryable) if any are still pending. Applies even to force merges.
     """Block merge of a docker-affecting PR unless its docker images have been
     pre-built.
 
@@ -1911,6 +2156,10 @@ def check_docker_builds_ready(pr: GitHubPR) -> None:
 
 
 def warn_on_docker_merge_skew(repo: GitRepo, pr: GitHubPR) -> None:
+    # [FUNCTION DOC]
+    # For docker-affecting PRs, compares the docker directory tree hash of the local merge
+    # commit (HEAD) with that of the PR head (fetched first) and prints a warning if they
+    # differ. Never blocks the merge. Errors from git lookups propagate.
     """Log when a docker-affecting PR raced with another docker change.
 
     The CI docker images are tagged by the git tree hash of .ci/docker, so a
@@ -1948,12 +2197,16 @@ def warn_on_docker_merge_skew(repo: GitRepo, pr: GitHubPR) -> None:
 
 
 def checks_to_str(checks: list[tuple[str, str | None]]) -> str:
+    # [FUNCTION DOC] HELPER: Renders (name, url) pairs as a comma separated string of markdown
+    # links, or plain names when the url is None.
     return ", ".join(f"[{c[0]}]({c[1]})" if c[1] is not None else c[0] for c in checks)
 
 
 def checks_to_markdown_bullets(
     checks: list[tuple[str, str | None, int | None]],
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Renders at most the first five (name, url, id) checks as markdown
+    # bullet lines, linking the url when present.
     return [
         f"- [{c[0]}]({c[1]})" if c[1] is not None else f"- {c[0]}" for c in checks[:5]
     ]
@@ -1966,6 +2219,10 @@ def post_starting_merge_comment(
     dry_run: bool,
     ignore_current_checks_info: list[tuple[str, str | None, int | None]] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Posts the "merge started" explainer comment on the PR and, for ghstack PRs, a short
+    # "starting merge as part of stack" comment on each other open PR in the stack.
+    # Side effects: PR comments (skipped when dry_run).
     """Post the initial merge starting message on the PR. Also post a short
     message on all PRs in the stack."""
     gh_post_pr_comment(
@@ -1993,7 +2250,13 @@ def manually_close_merged_pr(
     merge_commit_sha: str,
     dry_run: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Safety net for when GitHub leaves a merged PR open: for the PR and each additional
+    # stacked PR, refreshes its state and, if still open, comments explaining the merge commit
+    # and closes it. Prints a completion line. Side effects: comments and closing (dry_run aware).
     def _comment_and_close(pr: GitHubPR, comment: str) -> None:
+        # [FUNCTION DOC] HELPER: Re-fetches the PR and, if still open, posts the comment and
+        # closes it.
         pr = GitHubPR(pr.org, pr.project, pr.pr_num)  # Refresh the PR
         if not pr.is_closed():
             gh_post_pr_comment(pr.org, pr.project, pr.pr_num, comment, dry_run)
@@ -2036,6 +2299,13 @@ def save_merge_record(
     ignore_current: bool = False,
     error: str = "",
 ) -> None:
+    # [FUNCTION DOC]
+    # Writes a one-element JSON list describing the merge attempt (ids, author, check
+    # categories, shas, flags, error text, and a dedup id built from project, PR, comment and
+    # the GITHUB_RUN_ID env var) to merge_record.json at the repository root, for a later
+    # upload step. Retried on failure by the decorator.
+    # KNOWN ISSUE: the docstring and caller comments speak of uploading to s3, but this only
+    # writes a local file.
     """
     This saves the merge records as a json, which can later be uploaded to s3
     """
@@ -2075,6 +2345,10 @@ def save_merge_record(
 
 @retries_decorator()
 def get_drci_classifications(pr_num: int, project: str = "pytorch") -> Any:
+    # [FUNCTION DOC]
+    # Calls the HUD Dr.CI API (POST, auth keys from env vars DRCI_BOT_KEY and HUD_API_TOKEN)
+    # and returns the failure classification mapping for the PR (category -> list of jobs), or
+    # an empty mapping if none. Retried by the decorator. Network call.
     """
     Query HUD API to find similar failures to decide if they are flaky
     """
@@ -2099,6 +2373,8 @@ REMOVE_JOB_NAME_SUFFIX_REGEX = re.compile(r", [0-9]+, [0-9]+, .+\)$")
 
 
 def remove_job_name_suffix(name: str, replacement: str = ")") -> str:
+    # [FUNCTION DOC] HELPER: Replaces a trailing shard suffix (comma, two numbers, comma,
+    # rest, closing paren) in a job name with the replacement text.
     return re.sub(REMOVE_JOB_NAME_SUFFIX_REGEX, replacement, name)
 
 
@@ -2106,6 +2382,8 @@ def is_broken_trunk(
     check: JobCheckState,
     drci_classifications: Any,
 ) -> bool:
+    # [FUNCTION DOC] True if Dr.CI lists the check (by name or job id) under broken trunk
+    # failures. False when the check or classifications are empty.
     if not check or not drci_classifications:
         return False
 
@@ -2123,6 +2401,8 @@ def is_unstable(
     check: JobCheckState,
     drci_classifications: Any,
 ) -> bool:
+    # [FUNCTION DOC] True if the job name contains the unstable keyword or Dr.CI lists the
+    # check (by name or job id) as unstable. False when the check or classifications are empty.
     if not check or not drci_classifications:
         return False
 
@@ -2145,6 +2425,8 @@ def is_flaky(
     check: JobCheckState,
     drci_classifications: Any,
 ) -> bool:
+    # [FUNCTION DOC] True if Dr.CI lists the check (by name or job id) under flaky failures.
+    # False when the check or classifications are empty.
     if not check or not drci_classifications:
         return False
 
@@ -2163,6 +2445,10 @@ def is_invalid_cancel(
     conclusion: str | None,
     drci_classifications: Any,
 ) -> bool:
+    # [FUNCTION DOC]
+    # True if the job concluded as cancelled and Dr.CI lists it neither as a failure nor as
+    # an unknown-status failure, meaning the cancel is an invalid signal to ignore. False when
+    # any input is empty or the conclusion is not cancelled.
     """
     After https://github.com/pytorch/test-infra/pull/4579, invalid cancelled
     signals have been removed from HUD and Dr.CI. The same needs to be done
@@ -2188,6 +2474,9 @@ def is_invalid_cancel(
 
 
 def is_crcr_l3(check: JobCheckState, drci_classifications: Any) -> bool:
+    # [FUNCTION DOC]
+    # True if Dr.CI lists the check (by name or job id) under the cross-repo CI L3 category,
+    # whose failures do not block merging. False for empty inputs.
     """Return True if this check is a non-blocking CRCR L3 failure.
 
     Dr.CI is the classification authority. A check is L3 non-blocking when
@@ -2213,12 +2502,20 @@ def get_classifications(
     checks: dict[str, JobCheckState],
     ignore_current_checks: list[str] | None,
 ) -> dict[str, JobCheckState]:
+    # [FUNCTION DOC]
+    # Returns a copy of checks where each non-successful check gets a classification string:
+    # UNSTABLE, BROKEN_TRUNK, FLAKY, INVALID_CANCEL, CRCR_L3 (first match wins, in that order,
+    # from Dr.CI data) or IGNORE_CURRENT_CHECK when its name is in ignore_current_checks.
+    # Dr.CI data comes from the API, falling back to the Dr.CI check run summary parsed as
+    # JSON (invalid JSON warns and yields no classifications). Prints the Dr.CI results.
     # Get the failure classification from Dr.CI, which is the source of truth
     # going forward. It's preferable to try calling Dr.CI API directly first
     # to get the latest results as well as update Dr.CI PR comment
     drci_classifications = get_drci_classifications(pr_num=pr_num, project=project)
 
     def get_readable_drci_results(drci_classifications: Any) -> str:
+        # [FUNCTION DOC] HELPER: Formats the Dr.CI classification mapping as an indented text
+        # listing (job id and name per category), or a JSON dump if the shape is unexpected.
         try:
             s = f"From Dr.CI API ({pr_num}):\n"
             for classification, jobs in drci_classifications.items():
@@ -2334,10 +2631,13 @@ def get_classifications(
 def filter_checks_with_lambda(
     checks: JobNameToStateDict, status_filter: Callable[[str | None], bool]
 ) -> list[JobCheckState]:
+    # [FUNCTION DOC] HELPER: Returns the checks whose status satisfies the predicate.
     return [check for check in checks.values() if status_filter(check.status)]
 
 
 def get_pr_commit_sha(repo: GitRepo, pr: GitHubPR) -> str:
+    # [FUNCTION DOC] Returns the PR merge commit sha from GitHub, or else the first local
+    # commit resolving the PR. Raises PostCommentError if none is found.
     commit_sha = pr.get_merge_commit()
     if commit_sha is not None:
         return commit_sha
@@ -2350,6 +2650,11 @@ def get_pr_commit_sha(repo: GitRepo, pr: GitHubPR) -> str:
 def validate_revert(
     repo: GitRepo, pr: GitHubPR, *, comment_id: int | None = None
 ) -> tuple[str, str]:
+    # [FUNCTION DOC]
+    # Validates a revert request: the revert comment (given id or the last comment) must be
+    # unedited and written by an allowed author association (collaborator, member, owner, plus
+    # contributor for private repos, or one of a few GitHub Apps). Returns (author login,
+    # commit sha to revert). Raises PostCommentError with a user-facing message on failure.
     comment = (
         pr.get_last_comment()
         if comment_id is None
@@ -2388,6 +2693,12 @@ def validate_revert(
 def get_ghstack_dependent_prs(
     repo: GitRepo, pr: GitHubPR, only_closed: bool = True
 ) -> list[tuple[str, GitHubPR]]:
+    # [FUNCTION DOC]
+    # Returns (merge commit sha, PR) pairs for the PRs in the ghstack from this PR upward.
+    # Open PRs are skipped, or included with an empty sha when only_closed is false. Verifies
+    # that all branches containing the orig ref are consistent prefixes of the longest
+    # revision list. Raises AssertionError for non-ghstack PRs and RuntimeError when no
+    # revisions exist or branches diverge.
     """
     Get the PRs in the stack that are above this PR (inclusive).
     Throws error if stack have branched or original branches are gone
@@ -2437,6 +2748,12 @@ def do_revert_prs(
     skip_internal_checks: bool = False,
     dry_run: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Reverts the given merged commits on the default branch (one revert commit each, with the
+    # PR-resolved line removed and a "Reverted ... on behalf of" note appended), pushes them,
+    # then for each PR posts a comment (with an internal-changes warning when applicable),
+    # adds the reverted and ci-no-td labels, comments on the commit and updates the PR state.
+    # Side effects: git commits and push, PR comments and labels (dry_run limits some).
     # Prepare and push revert commits
     for commit_sha, pr in shas_and_prs:
         revert_msg = f"\nReverted {pr.get_pr_url()} on behalf of {prefix_with_github_url(author_login)}"
@@ -2487,6 +2804,11 @@ def try_revert(
     comment_id: int | None = None,
     reason: str | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Entry for the revert command: validates the request (posting the error as a PR comment
+    # and returning on failure), builds the explanatory message (reason and comment link),
+    # expands to dependent stacked PRs for ghstack (falling back to a single revert on any
+    # error), and performs the revert. Raises RuntimeError if the stack yields nothing.
     try:
         author_login, commit_sha = validate_revert(repo, pr, comment_id=comment_id)
     except PostCommentError as e:
@@ -2529,10 +2851,15 @@ def try_revert(
 
 
 def prefix_with_github_url(suffix_str: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the GitHub site url followed by the given path or login.
     return f"https://github.com/{suffix_str}"
 
 
 def check_for_sev(org: str, project: str, skip_mandatory_checks: bool) -> None:
+    # [FUNCTION DOC]
+    # Unless mandatory checks are skipped (force), searches for open issues labeled as both
+    # a CI sev and merge blocking in the repo; raises RuntimeError naming the first one found.
+    # Network call.
     if skip_mandatory_checks:
         return
     response = cast(
@@ -2555,6 +2882,7 @@ def check_for_sev(org: str, project: str, skip_mandatory_checks: bool) -> None:
 
 
 def has_label(labels: list[str], pattern: Pattern[str] = CIFLOW_LABEL) -> bool:
+    # [FUNCTION DOC] True if any label matches the regex at its start (default: ciflow labels).
     return len(list(filter(pattern.match, labels))) > 0
 
 
@@ -2567,6 +2895,14 @@ def categorize_checks(
     list[tuple[str, str | None, int | None]],
     dict[str, list[Any]],
 ]:
+    # [FUNCTION DOC]
+    # Splits checks into pending and failed lists of (name, url, job id), plus a mapping of
+    # ignorable failure categories. Only checks whose name contains a required name are
+    # considered (all if none required); missing required checks count as pending; unstable
+    # pending jobs and invalid cancels are skipped; failures classified as ignore-current,
+    # broken trunk, flaky, unstable or cross-repo L3 are put in the category mapping. If the
+    # flaky plus broken-trunk count exceeds ok_failed_checks_threshold (when set) they are
+    # also added to failed. Emits a warning listing flaky/broken failures.
     """
     Categories all jobs into the list of pending and failing jobs. All known flaky
     failures and broken trunk are ignored by defaults when ok_failed_checks_threshold
@@ -2654,6 +2990,14 @@ def merge(
     stale_pr_days: int = 3,
     ignore_current: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Drives a merge request: adds the merging label, checks for blocking sevs, and for force
+    # merges posts the start comment and merges immediately. Otherwise verifies approvals and
+    # labels, optionally snapshots currently failing checks to ignore, posts the start comment,
+    # then polls (retrying every 5 minutes on pending mandatory checks, up to timeout_minutes)
+    # re-fetching the PR and merging once rules pass. Raises RuntimeError on new commits pushed,
+    # startup failures, failed jobs, or timeout (after adding the land-failed label).
+    # KNOWN ISSUE: stale_pr_days is accepted but never used.
     initial_commit_sha = pr.last_commit_sha()
     pr_link = f"https://github.com/{pr.org}/{pr.project}/pull/{pr.pr_num}"
     print(f"Attempting merge of {initial_commit_sha} ({pr_link})")
@@ -2804,12 +3148,22 @@ def merge(
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # CLI entry point. Builds the repo and PR objects, then handles: revert (posts a start
+    # comment and calls try_revert), closed PR, unsupported cross-repo ghstack, wrong base
+    # branch, mergeability check only (local dry merge), unexplained submodule updates, and
+    # the normal merge. Failures are posted as PR comments and recorded; the merging label is
+    # removed at the end unless only checking mergeability. Most problems are reported via PR
+    # comments rather than exit codes.
     args = parse_args()
     repo = GitRepo(get_git_repo_dir(), get_git_remote_name())
     org, project = repo.gh_owner_and_name()
     pr = GitHubPR(org, project, args.pr_num)
 
     def handle_exception(e: Exception, title: str = "Merge failed") -> None:
+        # [FUNCTION DOC] HELPER: Posts a failure comment with the reason and, when GH_RUN_URL
+        # is set, a collapsed details block naming the workflow run and failing merge rule.
+        # Also prints the current traceback.
         exception = f"**Reason**: {e}"
 
         failing_rule = None

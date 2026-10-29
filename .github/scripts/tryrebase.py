@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Merge-bot rebase command: rebases a PR (plain or ghstack) onto a target branch, force
+# pushes the result to the PR head, and posts status comments on the PR. Entry point is
+# main (CLI: pr_num, --branch, --dry-run); exit status 0 on a push, 1 when nothing changed.
+# Depends on trymerge.GitHubPR and the gitutils/github_utils helpers. No import-time effects.
 
 import contextlib
 import os
@@ -20,6 +25,8 @@ SAME_SHA_ERROR = (
 
 
 def parse_args() -> Any:
+    # [FUNCTION DOC] HELPER: Parses command line: positional pr_num (int), optional
+    # --branch (target branch name) and --dry-run flag. Returns the argparse namespace.
     from argparse import ArgumentParser
 
     parser = ArgumentParser("Rebase PR into branch")
@@ -32,6 +39,10 @@ def parse_args() -> Any:
 def post_already_uptodate(
     pr: GitHubPR, repo: GitRepo, onto_branch: str, dry_run: bool
 ) -> None:
+    # [FUNCTION DOC]
+    # Posts a comment that the PR was already up to date. If the chosen target is not the
+    # default branch and differs from it, the comment also suggests rebasing against the
+    # default branch. Side effect: posts a PR comment (skipped when dry_run).
     msg = f"Tried to rebase and push PR #{pr.pr_num}, but it was already up to date."
     def_branch = pr.default_branch()
     def_branch_fcn = f"refs/remotes/{repo.remote}/{def_branch}"
@@ -54,6 +65,11 @@ def post_already_uptodate(
 def rebase_onto(
     pr: GitHubPR, repo: GitRepo, onto_branch: str, dry_run: bool = False
 ) -> bool:
+    # [FUNCTION DOC]
+    # Rebases a non-ghstack PR: fetches the PR head, finds its fork point from the base
+    # branch, replays only the PR's commits onto onto_branch, and force pushes to the head
+    # repo (push is a dry run if dry_run). Raises an error if the result equals the target
+    # sha. Posts a comment: already-up-to-date (returns False) or success (returns True).
     branch = f"pull/{pr.pr_num}/head"
     remote_url = f"https://github.com/{pr.info['headRepository']['nameWithOwner']}.git"
     refspec = f"{branch}:{pr.head_ref()}"
@@ -94,6 +110,13 @@ def rebase_onto(
 def rebase_ghstack_onto(
     pr: GitHubPR, repo: GitRepo, onto_branch: str, dry_run: bool = False
 ) -> bool:
+    # [FUNCTION DOC]
+    # Rebases a ghstack PR: installs ghstack via pip if missing, rebases the orig branch
+    # onto onto_branch, sets the global git identity to the orig commit's author, writes
+    # .ghstackrc and copies GITHUB_TOKEN into OAUTH_TOKEN, then runs ghstack to push.
+    # Posts a comment on each updated PR parsed from the output. Returns False for dry run
+    # (unsupported) or when this PR was skipped as up to date, else True. Raises on same sha
+    # or ghstack failure. Side effects: global git config, env, file write, pip install.
     if (
         subprocess.run(
             [sys.executable, "-m", "ghstack", "--help"],
@@ -185,6 +208,9 @@ def rebase_ghstack_onto(
 
 
 def additional_rebase_failure_info(e: Exception) -> str:
+    # [FUNCTION DOC]
+    # Returns an extra hint paragraph when the error text shows a git permission-denied
+    # push failure (likely maintainer edits disallowed), otherwise an empty string.
     if re.search(
         r"remote: Permission to .* denied to .*\.\nfatal: unable to access", str(e)
     ):
@@ -197,6 +223,8 @@ def additional_rebase_failure_info(e: Exception) -> str:
 
 @contextlib.contextmanager
 def git_config_guard(repo: GitRepo) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager; records user.email and user.name, yields,
+    # and on exit restores any recorded non-empty values to global git config.
     """Restores user.name and user.email global properties after context is finished"""
     user_email = repo._run_git("config", "user.email")
     user_name = repo._run_git("config", "user.name")
@@ -210,6 +238,12 @@ def git_config_guard(repo: GitRepo) -> Generator[None, None, None]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: resolves the target branch (given or the default), posts a "rebase
+    # started" comment, stops if the PR is closed, then rebases (ghstack path guarded by
+    # git_config_guard) and exits with status 0 if pushed, 1 otherwise. Any exception is
+    # reported as a PR comment with hints and the run URL.
+    # KNOWN ISSUE: after reporting a failure it returns normally, so the exit status is 0.
     args = parse_args()
     repo = GitRepo(get_git_repo_dir(), get_git_remote_name(), debug=True)
     org, project = repo.gh_owner_and_name()

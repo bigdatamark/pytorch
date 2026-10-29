@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Builds the markdown messages the merge bot posts as PR comments: the "Merge started"
+# explanation (varies by force / ignore-current flags) and the revert-started message.
+# Defines link constants and CIFLOW label regexes. No import-time side effects besides
+# compiling regexes.
 from __future__ import annotations
 
 import os
@@ -16,10 +21,17 @@ ALTERNATIVES = f"Learn more about merging in the [wiki]({BOT_COMMANDS_WIKI})."
 
 
 def has_label(labels: list[str], pattern: Pattern[str] = CIFLOW_LABEL) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if any label in the list matches the regex pattern at its start
+    # (default: any ciflow label). Pure function, no side effects.
     return len(list(filter(pattern.match, labels))) > 0
 
 
 class TryMergeExplainer:
+    # [CLASS DOC]
+    # Holds the merge request parameters (force flag, ignore-current flag, PR labels and
+    # identity) and renders the markdown comment explaining what the merge command will do.
+    # Key methods: _get_flag_msg (flag-dependent sentence) and get_merge_message (full text).
     force: bool
     labels: list[str]
     pr_num: int
@@ -39,6 +51,9 @@ class TryMergeExplainer:
         project: str,
         ignore_current: bool,
     ):
+        # [FUNCTION DOC]
+        # Stores all arguments as attributes. No validation and no side effects; the
+        # has_trunk_label / has_ciflow_label annotations are never assigned here.
         self.force = force
         self.labels = labels
         self.pr_num = pr_num
@@ -50,6 +65,10 @@ class TryMergeExplainer:
         self,
         ignore_current_checks: list[tuple[str, str | None, int | None]] | None = None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Picks the main sentence of the merge message.
+        # Force: warns the merge bypasses CI. Ignore-current with a provided check list:
+        # lists those checks as markdown links (name, url). Otherwise: merge once checks pass.
+        # Args: ignore_current_checks is a list of (name, url, id) tuples or None.
         if self.force:
             return (
                 "Your change will be merged immediately since you used the force (-f) flag, "
@@ -69,6 +88,12 @@ class TryMergeExplainer:
         self,
         ignore_current_checks: list[tuple[str, str | None, int | None]] | None = None,
     ) -> str:
+        # [FUNCTION DOC]
+        # Assembles the full "Merge started" markdown: title, flag message, wiki link,
+        # contact line, and a collapsed "Advanced Debugging" section linking the workflow
+        # run (env var GH_RUN_URL, which renders as None text if unset).
+        # KNOWN ISSUE: the contact line and the details block are concatenated with no
+        # separating newline.
         title = "### Merge started"
         main_message = self._get_flag_msg(ignore_current_checks)
 
@@ -90,6 +115,10 @@ class TryMergeExplainer:
 
 
 def get_revert_message(org: str, project: str, pr_num: int) -> str:
+    # [FUNCTION DOC]
+    # Returns the comment text announcing a revert job started, linking the run from env
+    # var GH_RUN_URL, followed by the contact line.
+    # KNOWN ISSUE: org, project and pr_num are unused.
     msg = (
         "@pytorchbot successfully started a revert job."
         + f" Check the current status [here]({os.getenv('GH_RUN_URL')}).\n"

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Maintenance script that rewrites the approved_by list of the "Metamates" rule in
+# merge_rules.yaml, using team membership and recent approval counts from git history.
+# Constants: MIN_APPROVALS, SINCE, MERGE_RULES path, METAMATES_RULE name. Entry point is
+# main; no import-time side effects beyond constants.
 """
 Update the "Metamates" rule in merge_rules.yaml.
 
@@ -27,6 +32,9 @@ METAMATES_RULE = "Metamates"
 
 
 def fetch_metamates() -> set[str]:
+    # [FUNCTION DOC]
+    # Runs the gh CLI to list logins of the pytorch/metamates team (paginated) and returns
+    # them as a set. Raises CalledProcessError if gh fails.
     """Fetch pytorch/metamates team members via GitHub API."""
     res = subprocess.run(
         [
@@ -45,6 +53,10 @@ def fetch_metamates() -> set[str]:
 
 
 def fetch_approvers() -> dict[str, int]:
+    # [FUNCTION DOC]
+    # Reads commit message bodies from git log since SINCE, finds lines containing the
+    # approval marker, strips github URL prefixes, splits on commas and counts occurrences
+    # per approver name. Returns a mapping name -> count. Raises CalledProcessError if git fails.
     """Extract approvers and their counts from recent commit history."""
     res = subprocess.run(
         ["git", "log", f"--since={SINCE}", "--format=%b"],
@@ -65,6 +77,9 @@ def fetch_approvers() -> dict[str, int]:
 
 
 def collect_other_wildcard_approvers(rules: list[dict]) -> set[str]:
+    # [FUNCTION DOC]
+    # Returns the lowercased approved_by users of every rule (except Metamates) whose
+    # patterns include the wildcard. Pure function over the parsed rule list.
     """Collect all approvers from wildcard ('*') rules other than Metamates."""
     covered: set[str] = set()
     for rule in rules:
@@ -79,6 +94,11 @@ def collect_other_wildcard_approvers(rules: list[dict]) -> set[str]:
 
 
 def update_approved_by(content: str, new_members: list[str]) -> str:
+    # [FUNCTION DOC]
+    # Scans the raw YAML text line by line to locate the approved_by list inside the
+    # Metamates rule, then returns the text with those list items replaced by new_members
+    # (two-space-indented dash items). Prints an error to stderr and exits with status 1
+    # if the list cannot be found.
     """Replace the approved_by list in the Metamates rule, preserving formatting."""
     lines = content.split("\n")
     in_metamates = False
@@ -116,6 +136,12 @@ def update_approved_by(content: str, new_members: list[str]) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Orchestrates the update: loads merge_rules.yaml, verifies the Metamates rule exists
+    # (exits with status 1 otherwise), fetches team members and approvers, keeps team
+    # members with at least MIN_APPROVALS approvals that are not the bot and not already
+    # in other wildcard rules, sorts them case-insensitively and rewrites the file in place.
+    # Prints progress to stdout.
     content = MERGE_RULES.read_text()
     rules = yaml.safe_load(content)
 
