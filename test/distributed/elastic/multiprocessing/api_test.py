@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
+# [MODULE DOC] Tests for torch.distributed.elastic.multiprocessing (api): RunProcsResult and
+# Std helpers, and start_processes launching workers either as python functions (spawn or
+# forkserver, multiprocessing context) or as binary subprocesses. Covers return values,
+# exit codes, signal and exception failures with error files, stdout/stderr redirects, tee,
+# duplicate-log filters and line prefixes, argument validation, process waiting/closing
+# (including bounded close for unkillable children) and no-zombie behavior when the parent is
+# signaled. Defines many worker functions (echo0 to echo_large, dummy_compute, wait_fn) and
+# helpers (bin, start_processes_zombie_test). Test classes are defined conditionally: most
+# are skipped under dev-debug ASAN, Windows and macOS, and the "not CI" and fork-server
+# groups also under CI. Runs via run_tests when executed as a script.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -51,15 +61,21 @@ from torch.testing._internal.common_utils import (
 
 
 class RunProcResultsTest(TestCase):
+    # [CLASS DOC] Tests for RunProcsResult and ProcessFailure helpers. Each test has a temp
+    # directory (test_dir) removed in tearDown.
     def setUp(self):
+        # [FUNCTION DOC] Creates the per-test temp directory.
         super().setUp()
         self.test_dir = tempfile.mkdtemp(prefix=f"{self.__class__.__name__}_")
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and deletes the temp directory.
         super().tearDown()
         shutil.rmtree(self.test_dir)
 
     def test_is_failed(self):
+        # [FUNCTION DOC] A result with only return values is not failed; a result holding a
+        # failure entry is failed.
         pr_success = RunProcsResult(return_values={0: "a", 1: "b"})
         self.assertFalse(pr_success.is_failed())
 
@@ -70,6 +86,11 @@ class RunProcResultsTest(TestCase):
         self.assertTrue(pr_fail.is_failed())
 
     def test_get_failures(self):
+        # [FUNCTION DOC] Records two exceptions to error files, builds three ProcessFailure
+        # objects (the third with a nonexistent file) and checks their timestamps are
+        # non-decreasing.
+        # KNOWN ISSUE: both exceptions are recorded to the first file, so the second error
+        # file is never written, and no failure collection API is actually exercised.
         error_file0 = os.path.join(self.test_dir, "error0.json")
         error_file1 = os.path.join(self.test_dir, "error1.json")
         eh = ErrorHandler()
@@ -94,17 +115,22 @@ class RunProcResultsTest(TestCase):
 
 
 class StdTest(TestCase):
+    # [CLASS DOC] Tests for parsing Std stream selections with Std.from_str.
     def test_from_value(self):
+        # [FUNCTION DOC] The strings 0, 1, 2 and 3 parse to NONE, OUT, ERR and ALL.
         self.assertEqual(Std.NONE, Std.from_str("0"))
         self.assertEqual(Std.OUT, Std.from_str("1"))
         self.assertEqual(Std.ERR, Std.from_str("2"))
         self.assertEqual(Std.ALL, Std.from_str("3"))
 
     def test_from_value_map(self):
+        # [FUNCTION DOC] Comma-separated rank:value pairs parse into a mapping from rank to Std.
         self.assertEqual({0: Std.OUT}, Std.from_str("0:1"))
         self.assertEqual({0: Std.OUT, 1: Std.OUT}, Std.from_str("0:1,1:1"))
 
     def test_from_str_bad_input(self):
+        # [FUNCTION DOC] Malformed inputs (trailing comma, out-of-range value, missing colon
+        # in a list) must make Std.from_str raise ValueError.
         bad_inputs = ["0:1,", "11", "0:1,1", "1,0:1"]
         for bad in bad_inputs:
             with self.subTest(bad=bad):
@@ -113,6 +139,7 @@ class StdTest(TestCase):
 
 
 def echo0(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Worker entrypoint that prints msg to stdout and returns nothing.
     """
     void function
     """
@@ -120,6 +147,11 @@ def echo0(msg: str) -> None:
 
 
 def echo1(msg: str, exitcode: int = 0) -> str:
+    # [FUNCTION DOC] HELPER: Worker entrypoint reading the RANK environment variable. A
+    # nonzero exitcode prints an exit notice to stderr and terminates the process with that
+    # code. Otherwise, for each comma-separated message it prints a stdout and a stderr line
+    # naming the message and rank, and returns the message joined with the rank by an
+    # underscore.
     """
     returns ``msg`` or exits with the given exitcode (if nonzero)
     """
@@ -136,6 +168,8 @@ def echo1(msg: str, exitcode: int = 0) -> str:
 
 
 def echo2(msg: str, fail: bool = False) -> str:
+    # [FUNCTION DOC] HELPER: Worker entrypoint returning msg, or raising RuntimeError with
+    # msg as its text when fail is true.
     """
     returns ``msg`` or raises a RuntimeError if ``fail`` is set
     """
@@ -145,6 +179,8 @@ def echo2(msg: str, fail: bool = False) -> str:
 
 
 def echo_large(size: int) -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Worker entrypoint returning a mapping of size entries from each
+    # index to a "test<index>" string, used to exceed the pipe buffer when sent back.
     """
     returns a large output ({0: test0", 1: "test1", ..., (size-1):f"test{size-1}"})
     """
@@ -155,6 +191,8 @@ def echo_large(size: int) -> dict[int, str]:
 
 
 def echo3(msg: str, fail: bool = False) -> str:
+    # [FUNCTION DOC] HELPER: Worker entrypoint returning msg, or crashing the process with
+    # SIGSEGV (by reading address zero through ctypes) when fail is true. Currently unused.
     """
     returns ``msg`` or induces a SIGSEGV if ``fail`` is set
     """
@@ -164,6 +202,7 @@ def echo3(msg: str, fail: bool = False) -> str:
 
 
 def dummy_compute() -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Worker entrypoint returning a random 100 by 100 tensor.
     """
     returns a predefined size random Tensor
     """
@@ -171,12 +210,15 @@ def dummy_compute() -> torch.Tensor:
 
 
 def redirects_oss_test() -> list[Std]:
+    # [FUNCTION DOC] HELPER: Returns the redirect settings used in OSS test runs, a list
+    # holding only Std.NONE.
     return [
         Std.NONE,
     ]
 
 
 def redirects_all() -> list[Std]:
+    # [FUNCTION DOC] HELPER: Returns every redirect setting: NONE, OUT, ERR and ALL.
     return [
         Std.NONE,
         Std.OUT,
@@ -186,11 +228,15 @@ def redirects_all() -> list[Std]:
 
 
 def bin(name: str):
+    # [FUNCTION DOC] HELPER: Returns the absolute path of a script in the bin directory next
+    # to this test file. (Shadows the builtin of the same name inside this module.)
     dir = os.path.dirname(__file__)
     return os.path.join(dir, "bin", name)
 
 
 def wait_fn(wait_time: int = 300) -> None:
+    # [FUNCTION DOC] HELPER: Worker entrypoint that sleeps for wait_time seconds (default
+    # 300) and then prints a completion message; tests kill it earlier.
     time.sleep(wait_time)
     print("Finished waiting")
 
@@ -202,6 +248,11 @@ def start_processes_zombie_test(
     log_dir: str,
     nproc: int = 2,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Runs inside a spawned parent process. Starts nproc workers
+    # running entrypoint with empty args and envs, puts its own pid and then each worker pid
+    # on mp_queue, and waits up to 300 seconds for them. If a SignalException arrives (the
+    # test signals this parent), it closes the workers with that signal. The idx parameter is
+    # unused (shadowed by the loop variable).
     """
     Starts processes
     """
@@ -231,19 +282,28 @@ def start_processes_zombie_test(
 
 
 class _StartProcessesTest(TestCase):
+    # [CLASS DOC] HELPER: Base test case for start_processes tests. State: a temp directory
+    # (test_dir) removed in tearDown and the list of multiprocessing start methods to
+    # exercise (_start_methods, default spawn only). Provides log directory creation,
+    # file-content assertions, pid-gone assertions and the zombie-process workflow.
     def setUp(self):
+        # [FUNCTION DOC] Creates the temp directory and sets the start methods to spawn.
         super().setUp()
         self.test_dir = tempfile.mkdtemp(prefix=f"{self.__class__.__name__}_")
         self._start_methods = ["spawn"]
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and deletes the temp directory.
         super().tearDown()
         shutil.rmtree(self.test_dir)
 
     def log_dir(self):
+        # [FUNCTION DOC] HELPER: Returns a new unique directory under the test temp directory.
         return tempfile.mkdtemp(dir=self.test_dir)
 
     def assert_in_file(self, expected: list[str], filename: str) -> None:
+        # [FUNCTION DOC] HELPER: Reads the file's lines and asserts each expected string, with
+        # trailing whitespace trimmed and a newline added, is one of the file's lines.
         expected = [f"{line.rstrip()}\n" for line in expected]
         with open(filename) as fp:
             actual = fp.readlines()
@@ -251,6 +311,8 @@ class _StartProcessesTest(TestCase):
                 self.assertIn(line, actual)
 
     def assert_not_in_file(self, lines: list[str], filename: str) -> None:
+        # [FUNCTION DOC] HELPER: Reads the file's lines and asserts none of the given strings
+        # (trailing whitespace trimmed, newline added) is one of them.
         lines = [f"{line.rstrip()}\n" for line in lines]
         with open(filename) as fp:
             actual = fp.readlines()
@@ -258,6 +320,8 @@ class _StartProcessesTest(TestCase):
                 self.assertNotIn(line, actual)
 
     def assert_pids_noexist(self, pids: dict[int, int]):
+        # [FUNCTION DOC] HELPER: For each pid in the rank-to-pid mapping, sends signal zero
+        # and asserts an OSError results, i.e. the process no longer exists.
         for local_rank, pid in pids.items():
             with self.assertRaises(
                 OSError, msg=f"local_rank: {local_rank} pid: {pid} should not exist"
@@ -267,6 +331,11 @@ class _StartProcessesTest(TestCase):
     def _test_zombie_workflow(
         self, entrypoint: str | Callable, signal_to_send: signal.Signals
     ) -> None:
+        # [FUNCTION DOC] HELPER: Spawns a parent process (start_processes_zombie_test) that
+        # starts two workers on the entrypoint, collects the parent and worker pids from a
+        # queue (120 second timeout each), sends SIGTERM to the parent, waits 5 seconds and
+        # asserts every worker pid is gone.
+        # KNOWN ISSUE: the signal_to_send argument is ignored; SIGTERM is always sent.
         mp_queue = mp.get_context("spawn").Queue()
         child_nproc = 2
         mp.spawn(
@@ -296,7 +365,11 @@ class _StartProcessesTest(TestCase):
 if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
 
     class StartProcessesAsFuncTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes tests with python function entrypoints: argument
+        # validation, waiting and closing, return values and raised exceptions.
         def test_to_map(self):
+            # [FUNCTION DOC] Checks to_map expands a single Std to every local rank, fills
+            # missing ranks of a partial mapping with NONE, and keeps a full mapping unchanged.
             local_world_size = 2
             self.assertEqual(
                 {0: Std.OUT, 1: Std.OUT}, to_map(Std.OUT, local_world_size)
@@ -310,6 +383,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             )
 
         def test_invalid_log_dir(self):
+            # [FUNCTION DOC] Passing the path of a regular file as the log directory makes
+            # start_processes raise NotADirectoryError; any started context is closed.
             with tempfile.NamedTemporaryFile(dir=self.test_dir) as not_a_dir:
                 cases = {
                     not_a_dir.name: NotADirectoryError,
@@ -332,6 +407,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                                     pc.close()
 
         def test_args_env_len_mismatch(self):
+            # [FUNCTION DOC] When the args and envs mappings differ in size (either one
+            # larger), start_processes must raise RuntimeError.
             cases = [
                 # 1 x args; 2 x envs
                 {
@@ -359,6 +436,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                         )
 
         def test_pcontext_wait(self):
+            # [FUNCTION DOC] Starts a one second sleep worker. A wait with a very short
+            # timeout returns None (still running); a later wait without timeout returns a
+            # result, after which every log tail is stopped.
             pc = start_processes(
                 name="sleep",
                 entrypoint=time.sleep,
@@ -374,9 +454,13 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 self.assertTrue(tail_log.stopped())
 
         def test_pcontext_wait_on_a_child_thread(self):
+            # [FUNCTION DOC] Runs the wait test inside a worker thread of an event loop, to
+            # check start and wait work when not called from the main thread.
             asyncio.run(asyncio.to_thread(self.test_pcontext_wait))
 
         def test_multiprocess_context_close(self):
+            # [FUNCTION DOC] Starts a sleep worker, closes the context immediately, and checks
+            # the worker pids no longer exist and all log tails are stopped.
             pc = start_processes(
                 name="sleep",
                 entrypoint=time.sleep,
@@ -393,6 +477,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 self.assertTrue(tail_log.stopped())
 
         def test_function_with_tensor(self):
+            # [FUNCTION DOC] A worker returning a tensor delivers it as the return value with
+            # shape 100 by 100, and the worker process is gone afterwards.
             for start_method in self._start_methods:
                 pc = start_processes(
                     name="dummy_compute",
@@ -410,6 +496,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                     self.assertEqual((100, 100), return_value.shape)
 
         def test_void_function(self):
+            # [FUNCTION DOC] Workers whose function returns nothing yield a return value of
+            # None for each rank.
             for start_method in self._start_methods:
                 with self.subTest(start_method=start_method):
                     pc = start_processes(
@@ -428,6 +516,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             TEST_WITH_DEV_DBG_ASAN, "tests incompatible with asan"
         )
         def test_function_large_ret_val(self):
+            # [FUNCTION DOC] Four workers each return a 200000-entry mapping (about 10 MB);
+            # checks wait does not deadlock on the full pipe and every result has all entries.
             # python multiprocessing.queue module uses pipes and actually PipedQueues
             # This means that if a single object is greater than a pipe size
             # the writer process will block until reader process will start
@@ -455,6 +545,10 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             "Skipped on ROCm due to hang in MultiprocessContext.wait after Kineto bump (PR #177101, 1fd9c49); investigating",
         )
         def test_function_raise(self):
+            # [FUNCTION DOC] Rank 0 raises an exception and rank 1 succeeds. Checks exactly one
+            # failure is reported with exit code 1, no signal, the right pid, an error file
+            # under the run-id log directory ending in attempt_0/0/error.json whose recorded
+            # timestamp matches the failure's, no return values, and stopped log tails.
             """
             run 2x copies of echo2, raise an exception on the first
             """
@@ -500,6 +594,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                         self.assertTrue(tail_log.stopped())
 
         def test_wait_for_all_child_procs_to_exit(self):
+            # [FUNCTION DOC] With the context marked done and the process pool mocked so join
+            # returns true, false, false, true in turn, one poll must call join four times,
+            # i.e. it keeps joining until every child has exited.
             """
             Tests that MultiprocessingContext actually waits for
             the child process to exit (not just that the entrypoint fn has
@@ -526,6 +623,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 self.assertEqual(4, mock_join.call_count)
 
         def test_multiprocessing_context_poll_raises_exception(self):
+            # [FUNCTION DOC] With a mocked pool whose join raises ProcessRaisedException for a
+            # process that has exit code -1, poll (close mocked) returns one failure whose
+            # message is "Signal 1 (SIGHUP) received by PID 123".
             mp_context = MultiprocessContext(
                 name="test_mp",
                 entrypoint=echo0,
@@ -552,11 +652,15 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 )
 
     class StartProcessesAsBinaryTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes tests with script entrypoints run as subprocesses:
+        # closing, exit codes, raised errors, missing entrypoint and rank validation.
         ########################################
         # start_processes as binary tests
         ########################################
 
         def test_subprocess_context_close(self):
+            # [FUNCTION DOC] Starts the long-sleeping zombie_test script, closes the context
+            # and checks its pid no longer exists.
             pc = start_processes(
                 name="sleep",
                 entrypoint=bin("zombie_test.py"),
@@ -570,6 +674,10 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             self.assert_pids_noexist(pids)
 
         def test_binary_exit(self):
+            # [FUNCTION DOC] Runs echo4 with rank 0 exiting 138 and rank 1 sleeping. Expects two
+            # failures: rank 0 with exit 138, no signal, stderr captured, and rank 1 killed by
+            # SIGTERM (exit -15) with the signal message, both with a "<NONE>" error message,
+            # and stopped log tails.
             FAIL = 138
             pc = start_processes(
                 name="echo",
@@ -605,6 +713,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             self.assertIn("Signal 15 (SIGTERM) received by PID", failure.message)
 
         def test_binary_raises(self):
+            # [FUNCTION DOC] Runs echo2 with rank 0 raising an exception; expects one failure
+            # with exit code 1, no signal name, a "<NONE>" error message (no error file), and
+            # no remaining processes.
             pc = start_processes(
                 name="echo",
                 entrypoint=bin("echo2.py"),
@@ -625,6 +736,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             self.assertEqual("<N/A>", failure.signal_name())
 
         def test_binary_incorrect_entrypoint(self):
+            # [FUNCTION DOC] A nonexistent script as entrypoint makes start_processes raise
+            # FileNotFoundError.
+            # KNOWN ISSUE: the args for rank 0 are a plain string, not a one-element tuple.
             with self.assertRaises(FileNotFoundError):
                 start_processes(
                     name="echo",
@@ -635,6 +749,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 )
 
         def test_validate_full_rank(self):
+            # [FUNCTION DOC] _validate_full_rank on an empty mapping with an expected size of
+            # 10 must raise RuntimeError.
             with self.assertRaises(RuntimeError):
                 _validate_full_rank({}, 10, "")
 
@@ -643,7 +759,13 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
 if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
 
     class StartProcessesListAsFuncTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes tests with function entrypoints and redirect settings
+        # limited to those the OSS runs support.
         def test_function(self):
+            # [FUNCTION DOC] For each start method and OSS redirect setting, runs echo1 on two
+            # ranks; checks return values are "hello_<rank>", no processes remain, and the
+            # stdout/stderr files are empty or contain the expected lines depending on the
+            # redirect setting.
             for start_method, redirs in product(
                 self._start_methods, redirects_oss_test()
             ):
@@ -683,10 +805,15 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                             )
 
     class StartProcessesListAsBinaryTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes tests with script entrypoints and redirect/tee/filter
+        # options, including log line prefixes.
         ########################################
         # start_processes as binary tests
         ########################################
         def test_binary(self):
+            # [FUNCTION DOC] Runs the echo1 script on two ranks with line prefixes; checks no
+            # failure, two (empty) return values, no remaining processes, and redirected
+            # output files per the redirect setting.
             for redirs in redirects_oss_test():
                 with self.subTest(redirs=redirs):
                     pc = start_processes(
@@ -728,6 +855,10 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
             "https://github.com/pytorch/pytorch/issues/163230",
         )
         def test_binary_redirect_and_tee(self):
+            # [FUNCTION DOC] Runs echo1 on two ranks with rank 0 redirecting stderr and teeing
+            # stdout, rank 1 teeing stderr. Checks success, the expected lines in the
+            # stdout/stderr files, empty stdout for rank 1, and stopped log tails. Skipped on
+            # Linux and ROCm (linked issue), so it effectively never runs on Linux.
             pc = start_processes(
                 name="trainer",
                 entrypoint=bin("echo1.py"),
@@ -753,6 +884,10 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
                 self.assertTrue(tail_log.stopped())
 
         def test_binary_duplicate_log_filters(self):
+            # [FUNCTION DOC] Runs echo1 with duplicate stdout filter "helloA" and stderr
+            # filters "worldA" and "B". Checks the filtered stdout file has only prefixed
+            # helloA lines (not helloB) and the filtered stderr file has the prefixed worldA
+            # and worldB lines, and the log tails stop.
             envs = {0: {"RANK": "0"}, 1: {"RANK": "1"}}
             logs_specs = DefaultLogsSpecs(
                 log_dir=self.log_dir(),
@@ -795,8 +930,15 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS):
 if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
 
     class StartProcessesNotCIAsFuncTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes function-entrypoint tests excluded from CI: wrapper
+        # behavior, redirect and tee, duplicate filters, all redirect settings, exit codes and
+        # no-zombie checks.
         @skip_if_pytest
         def test_wrap_bad(self):
+            # [FUNCTION DOC] Calls the worker wrapper directly for all four combinations of
+            # stdout/stderr redirect file or none; checks the function result is put on the
+            # queue, redirected files contain the expected lines, and the finished-reading
+            # event is awaited once.
             none = ""
             stdout_log = os.path.join(self.test_dir, "stdout.log")
             stderr_log = os.path.join(self.test_dir, "stderr.log")
@@ -829,6 +971,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
                 worker_finished_event_mock.wait.assert_called_once()
 
         def test_function_redirect_and_tee(self):
+            # [FUNCTION DOC] Runs echo1 on two ranks with rank 0 redirecting stderr and teeing
+            # stdout, and rank 1 teeing stderr; checks success, expected lines in the output
+            # files, empty stdout for rank 1 and stopped log tails.
             for start_method in self._start_methods:
                 with self.subTest(start_method=start_method):
                     pc = start_processes(
@@ -855,6 +1000,9 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
                         self.assertTrue(tail_log.stopped())
 
         def test_function_duplicate_log_filters(self):
+            # [FUNCTION DOC] Same as the binary filter test but with a function entrypoint and
+            # the default trainer-name line prefixes: filtered files keep only helloA on stdout
+            # and worldA and worldB on stderr.
             for start_method in self._start_methods:
                 with self.subTest(start_method=start_method):
                     envs = {0: {"RANK": "0"}, 1: {"RANK": "1"}}
@@ -894,6 +1042,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
                         self.assertTrue(tail_log.stopped())
 
         def test_function(self):
+            # [FUNCTION DOC] Like the OSS variant but iterating over all four redirect
+            # settings (none, out, err, all) for each start method.
             for start_method, redirs in product(self._start_methods, redirects_all()):
                 with self.subTest(start_method=start_method, redirs=redirs):
                     pc = start_processes(
@@ -931,6 +1081,10 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
                             )
 
         def test_function_exit(self):
+            # [FUNCTION DOC] Rank 0 exits with code 138 from python and rank 1 succeeds.
+            # Expects one failure with that exit code, no signal, correct pid, no error file
+            # ("<N/A>"), the generic traceback hint message, a timestamp not in the future,
+            # stderr captured for rank 0, and stopped log tails.
             """
             run 2x copies of echo1 fail (exit) the first
             functions that exit from python do not generate an error file
@@ -980,12 +1134,19 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
                         self.assertTrue(tail_log.stopped())
 
         def test_no_zombie_process_function(self):
+            # [FUNCTION DOC] For each of four signal types, runs the zombie workflow with a
+            # long-waiting function entrypoint to check workers die with their parent.
             signals = [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT]
             for s in signals:
                 self._test_zombie_workflow(wait_fn, s)
 
     class StartProcessesNotCIAsBinaryTest(_StartProcessesTest):
+        # [CLASS DOC] start_processes binary-entrypoint tests excluded from CI: segfault
+        # signal reporting and no-zombie checks.
         def test_binary_signal(self):
+            # [FUNCTION DOC] Runs echo3 with rank 0 segfaulting; expects one failure whose
+            # signal name is SIGSEGV (or "<N/A>" under ASAN or TSAN, which exit with code 1)
+            # and a "<NONE>" error message, and no remaining processes.
             pc = start_processes(
                 name="echo",
                 entrypoint=bin("echo3.py"),
@@ -1012,6 +1173,8 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
             self.assertEqual("<NONE>", failure.error_file_data["message"])
 
         def test_no_zombie_process_binary(self):
+            # [FUNCTION DOC] For each of four signal types, runs the zombie workflow with the
+            # long-sleeping zombie_test script to check workers die with their parent.
             signals = [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT]
             for s in signals:
                 self._test_zombie_workflow(bin("zombie_test.py"), s)
@@ -1021,13 +1184,20 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
         StartProcessesListAsFuncTest,
         StartProcessesNotCIAsFuncTest,
     ):
+        # [CLASS DOC] Re-runs all function-entrypoint start_processes tests using the
+        # forkserver start method with parallel start enabled through an environment variable
+        # that is saved in setUp and restored in tearDown.
         def setUp(self):
+            # [FUNCTION DOC] Switches the start methods to forkserver, remembers the current
+            # parallel-start environment variable and sets it to "1".
             super().setUp()
             self._start_methods = ["forkserver"]
             self.orig_paralell_env_val = os.environ.get(mp.ENV_VAR_PARALLEL_START)
             os.environ[mp.ENV_VAR_PARALLEL_START] = "1"
 
         def tearDown(self):
+            # [FUNCTION DOC] Restores the parallel-start environment variable to its saved
+            # value, deleting it if it was unset, after the parent tearDown.
             super().tearDown()
             if self.orig_paralell_env_val is None:
                 del os.environ[mp.ENV_VAR_PARALLEL_START]
@@ -1036,12 +1206,16 @@ if not (TEST_WITH_DEV_DBG_ASAN or IS_WINDOWS or IS_MACOS or IS_CI):
 
 
 class BoundedCloseTest(TestCase):
+    # [CLASS DOC] Tests that closing a MultiprocessContext or SubprocessContext finishes in
+    # bounded time and never makes an unbounded join/wait call on mocked unkillable children.
     """Verify that _close in MultiprocessContext / SubprocessContext returns
     within a bounded time when child processes refuse to die (simulating a
     Linux D-state worker, which SIGKILL cannot reap).
     """
 
     def _make_multiprocess_context(self) -> MultiprocessContext:
+        # [FUNCTION DOC] HELPER: Builds an unstarted MultiprocessContext for a sleep
+        # entrypoint with a log directory that is registered for cleanup after the test.
         log_dir = tempfile.mkdtemp(prefix="BoundedCloseTest")
         self.addCleanup(shutil.rmtree, log_dir, ignore_errors=True)
         return MultiprocessContext(
@@ -1054,6 +1228,9 @@ class BoundedCloseTest(TestCase):
         )
 
     def test_multiprocess_context_close_bounded_when_unkillable(self):
+        # [FUNCTION DOC] Gives the context a mocked process that stays alive and records the
+        # timeouts passed to join, then calls _close with SIGTERM and timeout 1 (kill
+        # mocked). Asserts join was called and every call used a positive, non-None timeout.
         ctx = self._make_multiprocess_context()
         unkillable = mock.Mock()
         unkillable.pid = 99999
@@ -1064,6 +1241,7 @@ class BoundedCloseTest(TestCase):
         join_calls: list[float | None] = []
 
         def _join(t: float | None = None) -> None:
+            # [FUNCTION DOC] HELPER: Mock join that only records the timeout it was given.
             join_calls.append(t)
 
         unkillable.join.side_effect = _join
@@ -1081,6 +1259,10 @@ class BoundedCloseTest(TestCase):
             self.assertGreater(t, 0)
 
     def test_subprocess_context_close_bounded_when_unkillable(self):
+        # [FUNCTION DOC] Builds a SubprocessContext with a mocked handler whose process never
+        # exits and whose bounded waits raise TimeoutExpired, then calls _close with SIGTERM
+        # and timeout 1. Asserts wait was called and every call used a positive, non-None
+        # timeout.
         log_dir = tempfile.mkdtemp(prefix="BoundedCloseTest")
         self.addCleanup(shutil.rmtree, log_dir, ignore_errors=True)
         from torch.distributed.elastic.multiprocessing.api import SubprocessContext
@@ -1105,6 +1287,8 @@ class BoundedCloseTest(TestCase):
         wait_calls: list[float | None] = []
 
         def _wait(t: float | None = None) -> None:
+            # [FUNCTION DOC] HELPER: Mock wait that records the timeout; with a timeout it
+            # raises TimeoutExpired, with none it returns nothing.
             wait_calls.append(t)
             if t is None:
                 return None

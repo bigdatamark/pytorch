@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] HELPER: Test worker script run as a subprocess by multiprocessing tests.
+# Reads the RANK environment variable (KeyError if unset) and parses an optional
+# --exitcode (default 0) plus a positional comma-separated msg. If exitcode is nonzero it
+# writes "exit <code> from <rank>" to stderr and exits with that code. Otherwise, for each
+# comma-separated message it prints one line to stdout and one to stderr, each naming the
+# message and rank. Only runs when executed as a script.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] HELPER: Test worker script run as a subprocess by multiprocessing tests.
+# Reads RANK from the environment (KeyError if unset) and parses --exitcode (default 0)
+# plus a positional msg. A nonzero exitcode prints "exit <code> from <rank>" to stderr and
+# exits immediately with that code. With exitcode zero it sleeps 1000 seconds (a
+# long-running worker meant to be killed or timed out by the test) before printing the
+# message to stdout and stderr.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

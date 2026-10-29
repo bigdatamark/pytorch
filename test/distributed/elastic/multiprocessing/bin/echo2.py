@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] HELPER: Test worker script run as a subprocess by multiprocessing tests.
+# Reads RANK from the environment (KeyError if unset) and parses --raises plus a positional
+# msg. If --raises is given with any non-empty value it raises a RuntimeError naming the
+# rank; otherwise it prints the message and rank to stdout.
+# KNOWN ISSUE: --raises uses a bool type converter, so any non-empty string (even "False")
+# is truthy and enables raising; only the default (flag absent) avoids the error.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

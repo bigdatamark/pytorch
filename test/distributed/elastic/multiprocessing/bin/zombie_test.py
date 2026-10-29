@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
+# [MODULE DOC] HELPER: Test worker script used to simulate a hung process. When run as a
+# script it sleeps 600 seconds and then prints "finished work"; tests are expected to kill
+# it earlier. No import-time side effects.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
+# [MODULE DOC] Tests for signal handling in torch.distributed.elastic.multiprocessing.api:
+# the _terminate_process_handler raising SignalException, and PContext.start registering that
+# handler for the default signals (SIGTERM, SIGINT, SIGHUP, SIGQUIT) or for those listed in
+# the TORCHELASTIC_SIGNALS_TO_HANDLE environment variable, skipping unknown names with a
+# warning, tolerating unsupported signals on Windows, warning when not on the main thread,
+# and starting the log tails. The api module's signal, threading and logger are mocked and
+# PContext.start is called on a mock instance. Runs via run_tests when run as a script.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -20,7 +27,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class SignalHandlingTest(TestCase):
+    # [CLASS DOC] Tests for signal registration in PContext.start and the terminate handler.
+    # Saves the original TORCHELASTIC_SIGNALS_TO_HANDLE value in setUp and restores it in
+    # tearDown because tests modify the real process environment.
     def setUp(self):
+        # [FUNCTION DOC] Remembers the current value (or absence) of the signals-to-handle
+        # environment variable in original_signals_env.
         super().setUp()
         # Save original environment variable if it exists
         self.original_signals_env = os.environ.get(
@@ -28,6 +40,9 @@ class SignalHandlingTest(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the signals-to-handle environment variable to its saved
+        # value, or deletes it if it was originally unset.
+        # KNOWN ISSUE: does not call the parent tearDown.
         # Restore original environment variable
         if self.original_signals_env is not None:
             os.environ["TORCHELASTIC_SIGNALS_TO_HANDLE"] = self.original_signals_env
@@ -35,6 +50,8 @@ class SignalHandlingTest(TestCase):
             del os.environ["TORCHELASTIC_SIGNALS_TO_HANDLE"]
 
     def test_terminate_process_handler(self):
+        # [FUNCTION DOC] Calling the handler with SIGTERM must raise SignalException whose
+        # sigval is SIGTERM and whose text includes the current pid and the signal number.
         """Test that the terminate process handler raises SignalException with the correct signal."""
         signum = signal.SIGTERM
         with self.assertRaises(SignalException) as cm:
@@ -50,6 +67,9 @@ class SignalHandlingTest(TestCase):
     def test_start_registers_default_signals(
         self, mock_logger, mock_signal, mock_threading
     ):
+        # [FUNCTION DOC] With the env var unset and the current thread treated as the main
+        # thread, PContext.start on a mock must register _terminate_process_handler exactly
+        # four times (default signals), call the private start once and start both log tails.
         """Test that the start method registers the default signals."""
         # Setup
         mock_threading.current_thread.return_value = (
@@ -95,6 +115,8 @@ class SignalHandlingTest(TestCase):
     def test_start_registers_custom_signals(
         self, mock_logger, mock_signal, mock_threading
     ):
+        # [FUNCTION DOC] With the env var set to three signal names, start must register the
+        # terminate handler exactly three times and call the private start once.
         """Test that the start method registers custom signals from the environment variable."""
         # Setup
         mock_threading.current_thread.return_value = (
@@ -136,6 +158,8 @@ class SignalHandlingTest(TestCase):
     def test_start_handles_invalid_signals(
         self, mock_logger, mock_signal, mock_threading
     ):
+        # [FUNCTION DOC] With the env var listing SIGTERM and a nonexistent name, start must
+        # log a warning that mentions the bad name and still call the private start once.
         """Test that the start method handles invalid signals gracefully."""
         # Setup
         mock_threading.current_thread.return_value = (
@@ -178,6 +202,9 @@ class SignalHandlingTest(TestCase):
     def test_start_handles_windows_signals(
         self, mock_logger, mock_signal, mock_threading
     ):
+        # [FUNCTION DOC] Simulates Windows (IS_WINDOWS patched true) where registering SIGHUP
+        # and SIGUSR1 raises RuntimeError. Checks start does not fail, logs an info message
+        # mentioning each signal and Windows, and still calls the private start once.
         """Test that the start method handles Windows-specific signal behavior."""
         # Setup
         mock_threading.current_thread.return_value = (
@@ -201,6 +228,8 @@ class SignalHandlingTest(TestCase):
         with patch("torch.distributed.elastic.multiprocessing.api.IS_WINDOWS", True):
             # Mock signal.signal to raise RuntimeError for Windows-unsupported signals
             def signal_side_effect(sig, handler):
+                # [FUNCTION DOC] HELPER: Mock replacement for signal registration; raises
+                # RuntimeError for SIGHUP and SIGUSR1 and returns nothing for other signals.
                 if sig in [signal.SIGHUP, signal.SIGUSR1]:
                     raise RuntimeError("Signal not supported on Windows")
 
@@ -234,6 +263,9 @@ class SignalHandlingTest(TestCase):
     @patch("torch.distributed.elastic.multiprocessing.api.threading")
     @patch("torch.distributed.elastic.multiprocessing.api.logger")
     def test_start_not_main_thread(self, mock_logger, mock_threading):
+        # [FUNCTION DOC] When the current thread differs from the main thread, start must log
+        # the warning that signal handlers could not be registered (risk of orphaned
+        # workers) and still call the private start once.
         """Test that the start method warns when not called from the main thread."""
         # Setup
         mock_threading.current_thread.return_value = MagicMock()  # Not the main thread
@@ -262,6 +294,9 @@ class SignalHandlingTest(TestCase):
     def test_start_supports_sigusr1_and_sigusr2(
         self, mock_logger, mock_signal, mock_threading
     ):
+        # [FUNCTION DOC] With the env var set to SIGUSR1,SIGUSR2, start must register the
+        # terminate handler for both, log a "Registered signal handler" info message for each,
+        # call the private start once and start both log tails.
         """Test that the start method properly supports SIGUSR1 and SIGUSR2 signals."""
         # Setup
         mock_threading.current_thread.return_value = (

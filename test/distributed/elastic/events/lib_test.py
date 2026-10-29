@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
+# [MODULE DOC] Unit tests for torch.distributed.elastic.events: logger creation, Event
+# construction and JSON serialize/deserialize round trip, and RdzvEvent construction,
+# round trip, string form, and the construct_and_record_rdzv_event helper (which must
+# skip recording when the logging handler is a NullHandler). Uses mocks for logging
+# handlers and the recorder. Runs via run_tests when executed as a script.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -24,7 +29,11 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class EventLibTest(TestCase):
+    # [CLASS DOC] Tests for the generic Event type and logger creation in the events
+    # package; stateless apart from the assert_event comparison helper.
     def assert_event(self, actual_event, expected_event):
+        # [FUNCTION DOC] HELPER: Asserts two Event objects are equal by comparing name,
+        # source, timestamp and (as dictionaries) metadata; fails the test on mismatch.
         self.assertEqual(actual_event.name, expected_event.name)
         self.assertEqual(actual_event.source, expected_event.source)
         self.assertEqual(actual_event.timestamp, expected_event.timestamp)
@@ -32,6 +41,9 @@ class EventLibTest(TestCase):
 
     @patch("torch.distributed.elastic.events.get_logging_handler")
     def test_get_or_create_logger(self, logging_handler_mock):
+        # [FUNCTION DOC] With get_logging_handler patched to return a NullHandler, asserts
+        # _get_or_create_logger for a destination name returns a logger that has exactly one
+        # handler, which is that NullHandler.
         logging_handler_mock.return_value = logging.NullHandler()
         logger = _get_or_create_logger("test_destination")
         self.assertIsNotNone(logger)
@@ -39,6 +51,8 @@ class EventLibTest(TestCase):
         self.assertIsInstance(logger.handlers[0], logging.NullHandler)
 
     def test_event_created(self):
+        # [FUNCTION DOC] Builds an Event with the AGENT source and a metadata mapping and
+        # checks name, source and metadata are stored unchanged.
         event = Event(
             name="test_event",
             source=EventSource.AGENT,
@@ -49,6 +63,8 @@ class EventLibTest(TestCase):
         self.assertDictEqual({"key1": "value1", "key2": 2}, event.metadata)
 
     def test_event_deser(self):
+        # [FUNCTION DOC] Serializes an Event (metadata with str, int and float values) to
+        # JSON, deserializes it, and asserts the result equals the original.
         event = Event(
             name="test_event",
             source=EventSource.AGENT,
@@ -60,9 +76,13 @@ class EventLibTest(TestCase):
 
 
 class RdzvEventLibTest(TestCase):
+    # [CLASS DOC] Tests for RdzvEvent and construct_and_record_rdzv_event, with a
+    # fixture factory (get_test_rdzv_event) and a field-wise comparison helper.
     @patch("torch.distributed.elastic.events.record_rdzv_event")
     @patch("torch.distributed.elastic.events.get_logging_handler")
     def test_construct_and_record_rdzv_event(self, get_mock, record_mock):
+        # [FUNCTION DOC] With a StreamHandler returned as the logging handler, calling
+        # construct_and_record_rdzv_event must invoke the patched record_rdzv_event once.
         get_mock.return_value = logging.StreamHandler()
         construct_and_record_rdzv_event(
             run_id="test_run_id",
@@ -76,6 +96,8 @@ class RdzvEventLibTest(TestCase):
     def test_construct_and_record_rdzv_event_does_not_run_if_invalid_dest(
         self, get_mock, record_mock
     ):
+        # [FUNCTION DOC] With a NullHandler as the logging handler (an invalid destination),
+        # construct_and_record_rdzv_event must not call the patched record_rdzv_event.
         get_mock.return_value = logging.NullHandler()
         construct_and_record_rdzv_event(
             run_id="test_run_id",
@@ -85,6 +107,9 @@ class RdzvEventLibTest(TestCase):
         record_mock.assert_not_called()
 
     def assert_rdzv_event(self, actual_event: RdzvEvent, expected_event: RdzvEvent):
+        # [FUNCTION DOC] HELPER: Asserts two RdzvEvent objects are equal field by field
+        # (name, run_id, message, hostname, pid, node_state, master_endpoint, rank,
+        # local_id, error_trace); fails the test on the first mismatch.
         self.assertEqual(actual_event.name, expected_event.name)
         self.assertEqual(actual_event.run_id, expected_event.run_id)
         self.assertEqual(actual_event.message, expected_event.message)
@@ -97,6 +122,8 @@ class RdzvEventLibTest(TestCase):
         self.assertEqual(actual_event.error_trace, expected_event.error_trace)
 
     def get_test_rdzv_event(self) -> RdzvEvent:
+        # [FUNCTION DOC] HELPER: Returns a RdzvEvent fixture with fixed values for every
+        # field (rank 3, local_id 4, pid 1, RUNNING node state).
         return RdzvEvent(
             name="test_name",
             run_id="test_run_id",
@@ -111,6 +138,8 @@ class RdzvEventLibTest(TestCase):
         )
 
     def test_rdzv_event_created(self):
+        # [FUNCTION DOC] Checks each field of the fixture RdzvEvent holds the value it was
+        # constructed with.
         event = self.get_test_rdzv_event()
         self.assertEqual(event.name, "test_name")
         self.assertEqual(event.run_id, "test_run_id")
@@ -124,6 +153,8 @@ class RdzvEventLibTest(TestCase):
         self.assertEqual(event.error_trace, "test_error_trace")
 
     def test_rdzv_event_deserialize(self):
+        # [FUNCTION DOC] Checks RdzvEvent.deserialize reproduces the original event both
+        # from the serialized JSON string and when passed the event object itself.
         event = self.get_test_rdzv_event()
         json_event = event.serialize()
         deserialized_event = RdzvEvent.deserialize(json_event)
@@ -131,6 +162,8 @@ class RdzvEventLibTest(TestCase):
         self.assert_rdzv_event(event, RdzvEvent.deserialize(event))
 
     def test_rdzv_event_str(self):
+        # [FUNCTION DOC] Checks the string form of a RdzvEvent equals the JSON dump of its
+        # dataclass fields.
         event = self.get_test_rdzv_event()
         self.assertEqual(str(event), json.dumps(asdict(event)))
 
