@@ -1,0 +1,1 @@
+# [PACKAGE DOC] Numeric Suite (ns) package for comparing numerics of float and quantized models; the eager-mode suite is in _numeric_suite and the FX suite lives in _numeric_suite_fx and the fx subpackage.

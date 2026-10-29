@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Matches subgraphs between two FX graphs for the Numeric Suite. Walks each
+# graph backwards from the output, groups fused patterns (e.g. linear followed by relu) into
+# subgraphs, skips unmatchable nodes (observers, quant/dequant, etc.), checks that paired
+# subgraphs have related base ops, and names each pair uniquely. Main entry point is
+# get_matching_subgraph_pairs; also defines GraphMatchingException and SubgraphTypeRelationship.
+# Import-time side effect: binds the module-level alias toq to torch.ops.quantized.
 import collections
 import enum
 from typing import Any
@@ -22,10 +28,15 @@ toq = torch.ops.quantized
 
 
 def _get_output_nodes(g: Graph) -> list[Node]:
+    # [FUNCTION DOC] HELPER: Returns the list of output nodes of the graph.
     return [n for n in g.nodes if n.op == "output"]
 
 
 class _NSGraphMatchableSubgraphsIterator:
+    # [CLASS DOC] HELPER: Iterator over matchable subgraphs of a graph module, produced in
+    # reverse execution order. State: the graph module, the sets of non-matchable
+    # functions/modules/methods, a set of already visited nodes, and a stack of nodes still to
+    # visit (seeded with the output nodes). Each item is an NSSubgraph (start, end, base op).
     """
     Iterates through the graph of gm, starting with the output nodes
     and continuing backwards.
@@ -41,6 +52,8 @@ class _NSGraphMatchableSubgraphsIterator:
         non_matchable_modules: set[NSNodeTargetType],
         non_matchable_methods: set[NSNodeTargetType],
     ):
+        # [FUNCTION DOC] HELPER: Stores the arguments, creates an empty visited set, and
+        # initializes the stack with all output nodes of the graph.
         self.gm: GraphModule = gm
         self.non_matchable_functions: set[NSNodeTargetType] = non_matchable_functions
         self.non_matchable_modules: set[NSNodeTargetType] = non_matchable_modules
@@ -51,9 +64,17 @@ class _NSGraphMatchableSubgraphsIterator:
             self.stack.append(start_node)
 
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns the iterator itself.
         return self
 
     def __next__(self) -> NSSubgraph:
+        # [FUNCTION DOC] HELPER: Pops nodes from the stack until a matchable subgraph is found.
+        # Skips already visited nodes. For each node, greedily detects a reversed fusion pattern
+        # ending there and walks to its start node (marking the walked nodes visited) while
+        # recording the base op node of the pattern. Pushes the input nodes of the start node
+        # on the stack, skips subgraphs whose base op is unmatchable and lone observer or
+        # fake-quantize module nodes. Returns an NSSubgraph; raises StopIteration when the
+        # stack is empty.
         """
         Returns the next matchable subgraph.
         """
@@ -131,6 +152,8 @@ class _NSGraphMatchableSubgraphsIterator:
         raise StopIteration
 
     def _recursively_add_node_arg_to_stack(self, arg: Any) -> None:
+        # [FUNCTION DOC] HELPER: Pushes every graph node found in arg onto the stack, descending
+        # into immutable lists, tuples and immutable dicts (dict values only); other values ignored.
         """
         Adds all of the nodes in this arg to the stack, properly navigating
         through list, dicts and tuples.
@@ -148,6 +171,9 @@ class _NSGraphMatchableSubgraphsIterator:
                 self._recursively_add_node_arg_to_stack(value)
 
     def _is_matchable(self, node: Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true if the node's function target, module type (looked
+        # up by qualified name; raises AssertionError if the target is not a string) or method
+        # target is not in the corresponding non-matchable set. Any other node kind is unmatchable.
         if node.op == "call_function":
             return node.target not in self.non_matchable_functions
         elif node.op == "call_module":
@@ -165,12 +191,16 @@ class _NSGraphMatchableSubgraphsIterator:
 
 
 class GraphMatchingException(Exception):
+    # [CLASS DOC] Error raised when two graphs cannot be matched (unrelated or unequal-count subgraphs).
     """
     Exception raised when two graphs cannot be matched.
     """
 
 
 class SubgraphTypeRelationship(enum.Enum):
+    # [CLASS DOC] Enum of how two subgraph base ops relate: EQUAL (same known type),
+    # EQUAL_BUT_UKNOWN (same type unknown to the suite), RELATED_BUT_NOT_EQUAL (different but
+    # in the same related-ops set) and NOT_RELATED.
     # same type, known
     # example: F.linear and F.linear, or nn.Conv2d and nn.Conv2d
     EQUAL = enum.auto()
@@ -191,6 +221,13 @@ def _get_subgraph_relationship_type(
     gm_b: GraphModule,
     type_a_related_to_b: set[tuple[NSNodeTargetType, NSNodeTargetType]],
 ) -> SubgraphTypeRelationship:
+    # [FUNCTION DOC] HELPER: Classifies the relationship of two subgraphs by their base op
+    # nodes. Different node kinds are unrelated (except function vs method). For functions and
+    # methods, the target pair must be in the related set, otherwise equal targets give
+    # EQUAL_BUT_UKNOWN and different give NOT_RELATED; equal known targets give EQUAL, or
+    # RELATED_BUT_NOT_EQUAL if only one subgraph is a fused pattern; different known targets give
+    # RELATED_BUT_NOT_EQUAL. For modules, compares the module types the same way. Raises
+    # AssertionError for module subgraphs with fused patterns or non-string targets.
     node_a = subgraph_a.base_op_node
     node_b = subgraph_b.base_op_node
 
@@ -266,6 +303,10 @@ def _get_name_for_subgraph(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]],
     existing_names: set[str],
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds a unique subgraph name of the form base_op_<set name>_<n>,
+    # using the name of the related-ops set containing the base op type (the string "None" if
+    # none) and the smallest counter not already in existing_names. Adds the name to
+    # existing_names (mutation) and returns it.
     """
     Returns a unique name for a subgraph. This name is based on two things:
     1. the name of the set containing the underlying type of the base op in the
@@ -314,6 +355,8 @@ def _get_name_for_subgraph(
 
 
 def _get_node_target_type(node: Node, gm: GraphModule) -> NSNodeTargetType | None:
+    # [FUNCTION DOC] HELPER: Returns the target itself for function/method nodes, the module
+    # class for module nodes (AssertionError if the target is not a string), or None otherwise.
     if node.op in ("call_function", "call_method"):
         return node.target
     elif node.op == "call_module":
@@ -330,6 +373,13 @@ def get_matching_subgraph_pairs(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]] | None = None,
     unmatchable_types_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> dict[str, tuple[NSSubgraph, NSSubgraph]]:
+    # [FUNCTION DOC] Walks both graphs backwards in lockstep with the subgraph iterator and
+    # pairs the subgraphs. Defaults for the related-ops sets and unmatchable types come from the
+    # mappings module. For each step: unrelated pair raises GraphMatchingException; equal but
+    # unknown types are skipped; otherwise both get a name that must be identical (else
+    # AssertionError) and the pair is recorded. If only one graph is exhausted, raises
+    # GraphMatchingException. Returns an ordered mapping from name to (subgraph of A,
+    # subgraph of B) in execution order (reversed from traversal order).
     """
     Matches matchable subgraphs of graph_a to graph_b.
 

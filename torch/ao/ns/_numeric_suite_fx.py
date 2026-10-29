@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FX graph mode Numeric Suite public API: compares weights and activations of two
+# FX-traceable models (typically float vs quantized). Offers weight extraction, adding
+# loggers to both models (with error propagation), shadow-logger models (without error
+# propagation), extraction of logger results into the NSResultsType mapping, comparison
+# helpers, and the n-shadows workflow (multiple qconfigs shadowing each subgraph).
+# Defines OutputLogger, OutputComparisonLogger and NSTracer. No import-time side effects
+# beyond imports and defining the RNNReturnType alias.
 """
 This module contains tooling to compare weights and activations
 across models. Example usage::
@@ -135,6 +142,12 @@ RNNReturnType = tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
 
 class OutputLogger(nn.Module):
+    # [CLASS DOC] Module inserted into a graph to record the values flowing through it. It
+    # keeps tensors in stats (and RNN-style tuples in stats_rnn) plus metadata describing
+    # which node and model it logs (ref names, target types, results type, argument
+    # indices, fqn, qconfig string). Flags: enabled (no recording when off) and
+    # save_activations (skip storing to save memory). Marked impure so graph dead-code
+    # elimination keeps it. forward returns its input unchanged.
     """
     Base class for capturing intermediate values.
     """
@@ -159,6 +172,8 @@ class OutputLogger(nn.Module):
         fqn: str | None,
         qconfig_str: str | None = "",
     ):
+        # [FUNCTION DOC] Stores the identifying metadata arguments as attributes, creates empty
+        # stats and stats_rnn lists, and sets enabled and save_activations to true.
         super().__init__()
         self.stats: list[torch.Tensor] = []
         self.stats_rnn: list[RNNReturnType] = []
@@ -213,6 +228,9 @@ class OutputLogger(nn.Module):
     # Note: cannot annotate the type of x because TorchScript does not support
     #   the Union type.
     def forward(self, x):
+        # [FUNCTION DOC] Returns x unchanged. When enabled and saving activations, appends a
+        # detached copy of a tensor to stats, or a detached copy of an RNN-style
+        # (output, (hidden, cell)) tuple to stats_rnn. Other input kinds are not recorded.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -233,6 +251,8 @@ class OutputLogger(nn.Module):
         return x
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string showing the public instance attributes (skipping
+        # the training flag and underscore-prefixed names).
         clean_dict = {
             k: v
             for k, v in self.__dict__.items()
@@ -243,12 +263,17 @@ class OutputLogger(nn.Module):
 
 
 class OutputComparisonLogger(OutputLogger):
+    # [CLASS DOC] OutputLogger variant that also receives the reference activation and, at
+    # each call, computes a comparison (SQNR by default) between its input and the reference,
+    # appending results to the comparisons list.
     """
     Same as OutputLogger, but also requires the original activation
     in order to calculate the comparison at calibration time
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Passes all arguments to OutputLogger and sets the comparison function
+        # to the SQNR computation, its name to sqnr, and an empty comparisons list.
         super().__init__(*args, **kwargs)
         # TODO(future PR): make the comparison function configurable
         self.comparison_fn = torch.ao.ns.fx.utils.compute_sqnr
@@ -258,6 +283,10 @@ class OutputComparisonLogger(OutputLogger):
         # precalculated comparisons function
 
     def forward(self, x, x_ref):  # type: ignore[override]
+        # [FUNCTION DOC] Returns x unchanged. If enabled: requires x to be a tensor (raises
+        # AssertionError otherwise), stores a detached copy in stats when save_activations is
+        # set, and appends the comparison of x against x_ref to comparisons. When disabled,
+        # returns x without recording (and without checking the type).
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -274,6 +303,7 @@ class OutputComparisonLogger(OutputLogger):
         return x
 
     def __repr__(self):
+        # [FUNCTION DOC] Same as the base repr but labeled OutputComparisonLogger.
         clean_dict = {
             k: v
             for k, v in self.__dict__.items()
@@ -284,12 +314,16 @@ class OutputComparisonLogger(OutputLogger):
 
 
 class NSTracer(quantize_fx.QuantizationTracer):
+    # [CLASS DOC] FX quantization tracer that additionally treats observer and fake-quantize
+    # modules as leaf modules so they are kept as single call nodes.
     """
     Just like a regular FX quantization tracer, but treats observers and fake_quantize
     modules as leaf modules.
     """
 
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+        # [FUNCTION DOC] Returns true for observers and fake-quantize modules; otherwise defers
+        # to the parent tracer's decision.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -309,6 +343,10 @@ def _extract_weights_one_model(
     op_to_type_to_weight_extraction_fn: dict[str, dict[Callable, Callable]]
     | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each (node, reference name) pair, extracts the node's weight
+    # (using the optional extraction-function override) and, if one exists, stores it as a
+    # one-element list in the results mapping under reference name, weight result type and
+    # model name. Mutates results.
     torch._C._log_api_usage_once(
         "quantization_api._numeric_suite_fx._extract_weights_one_model"
     )
@@ -333,6 +371,9 @@ def _extract_weights_impl(
     op_to_type_to_weight_extraction_fn: dict[str, dict[Callable, Callable]]
     | None = None,
 ) -> NSResultsType:
+    # [FUNCTION DOC] HELPER: Matches subgraphs between the two graph modules, extracts weights
+    # at the base op node of each matched subgraph for both models, fills in missing fqns,
+    # re-keys the results by node names of model B, and returns the results mapping.
     torch._C._log_api_usage_once(
         "quantization_api._numeric_suite_fx._extract_weights_impl"
     )
@@ -384,6 +425,10 @@ def extract_weights(
     op_to_type_to_weight_extraction_fn: dict[str, dict[Callable, Callable]]
     | None = None,
 ) -> NSResultsType:
+    # [FUNCTION DOC] Public entry point: traces both models into graph modules with NSTracer
+    # (carrying over any recorded node-name-to-scope attribute), then extracts and pairs
+    # weights of matching subgraphs. Optional arguments override the related-ops sets,
+    # unmatchable types and weight extraction functions. Returns the results mapping.
     """
     Extract weights from model A and model B, and return a comparison.
 
@@ -440,6 +485,9 @@ def _add_loggers_one_model(
     nodes_and_names_to_instrument_outputs: list[tuple[Node, str, str]],
     logger_cls: Callable,
 ) -> nn.Module:
+    # [FUNCTION DOC] HELPER: Converts the input and output instrumentation lists (node,
+    # reference name, node type) into mappings keyed by node and inserts loggers of
+    # logger_cls into the model; returns the instrumented model.
     torch._C._log_api_usage_once(
         "quantization_api._numeric_suite_fx._add_loggers_one_model"
     )
@@ -473,6 +521,9 @@ def _add_loggers_impl(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]] | None = None,
     unmatchable_types_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> tuple[nn.Module, nn.Module]:
+    # [FUNCTION DOC] HELPER: Matches subgraphs between both graph modules and instruments each
+    # matched pair: outputs are logged at each subgraph end node, inputs (only if
+    # should_log_inputs) at each start node. Returns the two instrumented models.
     torch._C._log_api_usage_once("quantization_api._numeric_suite_fx._add_loggers_impl")
     matched_subgraph_pairs = get_matching_subgraph_pairs(
         gm_a, gm_b, base_name_to_sets_of_related_ops, unmatchable_types_map
@@ -529,6 +580,9 @@ def add_loggers(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]] | None = None,
     unmatchable_types_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> tuple[nn.Module, nn.Module]:
+    # [FUNCTION DOC] Public entry point: traces both models to graph modules with NSTracer and
+    # adds loggers of logger_cls at matching locations (optionally also on inputs).
+    # Modifies models in place and returns the two instrumented models.
     """
     Instrument model A and model B with loggers.
 
@@ -580,6 +634,15 @@ def _extract_logger_info_one_model(
     results: NSResultsType,
     logger_cls: Callable,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Scans all submodules of model for loggers (instances of
+    # logger_cls, or scripted modules originally named OutputLogger) and appends one record
+    # per logger to results, nested by reference name, results type and model name. A record
+    # holds the logged values (RNN stats if any, else plain stats), node names/types,
+    # argument indices, fqn, qconfig string and comparisons (empty if the logger has none).
+    # Each list is kept sorted by argument index. Raises AssertionError if the logger's model
+    # name already appears directly under the reference name key. Mutates results.
+    # KNOWN ISSUE: that duplicate check looks at the results-type level, not the model-name
+    # level, so it only triggers for unusual result layouts.
     torch._C._log_api_usage_once(
         "quantization_api._numeric_suite_fx._extract_logger_info_one_model"
     )
@@ -635,6 +698,9 @@ def extract_logger_info(
     logger_cls: Callable,
     model_name_to_use_for_layer_names: str,
 ) -> NSResultsType:
+    # [FUNCTION DOC] Collects logger records from both instrumented models into one results
+    # mapping, fills in missing fqns, and re-keys entries by the node names of the model named
+    # by model_name_to_use_for_layer_names. Returns the results mapping.
     """
     Traverse all loggers in `model_a` and `model_b`, and extract the logged
     information.
@@ -675,6 +741,9 @@ def _add_shadow_loggers_impl(
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]] | None = None,
     unmatchable_types_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> nn.Module:
+    # [FUNCTION DOC] HELPER: Matches subgraphs between the two graph modules and builds a
+    # single model in which each matched subgraph of B is added as a shadow of the matching
+    # subgraph of A, with loggers; returns that combined graph module.
     torch._C._log_api_usage_once(
         "quantization_api._numeric_suite_fx._add_shadow_loggers_impl"
     )
@@ -705,6 +774,10 @@ def add_shadow_loggers(
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]] | None = None,
     unmatchable_types_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> nn.Module:
+    # [FUNCTION DOC] Public entry point: traces both models to graph modules with NSTracer and
+    # returns one model that runs A with B's matching subgraphs shadowing it, with loggers
+    # (optionally on inputs too). Inputs of B's subgraphs come from A's activations, so there
+    # is no error propagation.
     """
     Instrument model A and model B with shadow loggers.
 
@@ -756,6 +829,9 @@ def extract_shadow_logger_info(
     logger_cls: Callable,
     model_name_to_use_for_layer_names: str,
 ) -> NSResultsType:
+    # [FUNCTION DOC] Extracts logger records from the shadow model into a results mapping,
+    # fills in missing fqns, re-keys by node names of the named model, and returns a plain
+    # mapping.
     """
     Traverse all loggers in a shadow model, and extract the logged
     information.
@@ -790,6 +866,11 @@ def extend_logger_results_with_comparison(
     comparison_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     comparison_name: str,
 ) -> None:
+    # [FUNCTION DOC] For every result group, pairs each record of model 2 with the record of
+    # model 1 sharing the same argument indices, applies comparison_fn to each pair of logged
+    # values, and stores the list of comparison results in the model 2 record under
+    # comparison_name. Raises AssertionError if either model name is missing in a group or
+    # no matching record of model 1 exists. Mutates results in place.
     """
     Compares the logged values from `model_name_2` against the corresponding
     values in `model_name_1`, using `comparison_fn`. Records the result
@@ -847,6 +928,11 @@ def prepare_n_shadows_model(
     custom_prepare_kwargs: dict[str, Any] | None = None,
     custom_tracer: Any = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Traces the model (with the custom tracer if given), propagates example
+    # inputs to record shapes/values, finds fusion/quantization pattern matches using the
+    # backend config, deduplicates them into subgraphs, computes a node-to-qconfig mapping per
+    # qconfig mapping, and for every subgraph inserts N transformed (prepared) copies with
+    # loggers. Returns the new graph module; the original model is traced, not copied.
     """
     Given a model with a graph with M ops such as
 
@@ -953,6 +1039,10 @@ def _prepare_n_shadows_add_loggers_model(
     qconfig_mapping: QConfigMapping,
     backend_config: BackendConfig,
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Traces the model, propagates example inputs, finds and
+    # deduplicates matched subgraphs, computes the node-to-qconfig mapping for the single
+    # qconfig mapping, then rewrites the graph into an add-loggers graph that compares a
+    # quantized copy against the original at each subgraph. Returns the graph module.
     r"""
     Note: this API is not recommended for wide usage, it is only
     provided for customers who need to migrate from the `add_loggers`
@@ -1034,6 +1124,9 @@ def _n_shadows_compare_weights(
     qconfig_mapping: QConfigMapping,
     backend_config: BackendConfig,
 ) -> NSResultsType:
+    # [FUNCTION DOC] HELPER: Builds an n-shadows model from a single qconfig mapping, runs the
+    # example inputs through it to populate weight observers, converts it, and returns the
+    # extracted weight comparison.
     """
     Note: this API is not recommended for wide usage, it is only
     provided for customers who need to migrate from the `add_loggers`
@@ -1056,6 +1149,7 @@ def _n_shadows_compare_weights(
 # TODO(future PR): consider aligning API signature with other similar quantization
 # functions (enable_fake_quant, etc)
 def loggers_set_enabled(model: torch.nn.Module, enabled: bool) -> None:
+    # [FUNCTION DOC] Sets the enabled flag of every OutputLogger in the model in place.
     """
     Sets the `enabled` setting on a `model`'s loggers
     """
@@ -1070,6 +1164,7 @@ def loggers_set_save_activations(
     model: torch.nn.Module,
     save_activations: bool,
 ) -> None:
+    # [FUNCTION DOC] Sets the save_activations flag of every OutputLogger in the model in place.
     """
     Sets the `save_activations` setting on a `model`'s loggers
     """
@@ -1083,6 +1178,10 @@ def convert_n_shadows_model(
     custom_convert_fn: Callable | None = None,
     custom_convert_kwargs: dict[str, Any] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] For each graph node whose name starts with the shadow-wrapper prefix,
+    # converts the corresponding submodule with the default convert step (or the custom
+    # convert function called with the optional keyword arguments) and replaces the attribute
+    # on the model. Mutates and returns the model.
     """
     Given a model from `prepare_n_shadows_model`, runs `convert_fx`
     on each shadow submodule.
@@ -1104,6 +1203,7 @@ def convert_n_shadows_model(
 
 
 def extract_results_n_shadows_model(model: torch.nn.Module) -> NSResultsType:
+    # [FUNCTION DOC] Returns a new results mapping built from all OutputLogger modules in the model.
     """
     Extracts logger results from `model`.
     """
@@ -1113,6 +1213,8 @@ def extract_results_n_shadows_model(model: torch.nn.Module) -> NSResultsType:
 
 
 def print_comparisons_n_shadows_model(results: NSResultsType) -> None:
+    # [FUNCTION DOC] Groups results by subgraph, builds a comparison table, and prints a
+    # summary to standard output. Returns None.
     """
     Prints a summary of extracted `results`.
     """

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Eager-mode Numeric Suite: utilities to compare weights and activations
+# between a float model and its quantized counterpart. Provides weight comparison, logger
+# modules (Logger, ShadowLogger, OutputLogger), the Shadow wrapper module, and functions to
+# attach shadows/loggers and collect their stats. Defines NON_LEAF_MODULE_TO_ADD_OBSERVER_ALLOW_LIST
+# (module types that get loggers even though they are non-leaf). No import-time side effects.
 from collections.abc import Callable
 from typing import Any
 
@@ -25,6 +30,13 @@ def _find_match(
     key_str: str,
     postfix: str,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Finds the entry of str_list that corresponds to key_str when
+    # key_str ends with the given postfix. Compares the dot-joined prefix of key_str
+    # (without the last component) against the prefix of each candidate with the last one
+    # or two components removed; returns the first match. For the packed-params postfix
+    # it retries with two components removed from key_str. Returns None if the postfix
+    # does not match or no candidate matches.
+    # KNOWN ISSUE: components are joined with an empty string, not a dot, so distinct names can collide.
     split_str = key_str.split(".")
     if split_str[-1] == postfix:
         match_string = "".join(key_str.split(".")[0:-1])
@@ -56,6 +68,14 @@ def _find_match(
 def compare_weights(
     float_dict: dict[str, Any], quantized_dict: dict[str, Any]
 ) -> dict[str, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Pairs float and quantized weights from two state dicts. For each
+    # quantized key, looks for a matching float weight (plain weight keys, or packed-params
+    # keys where the first element of the packed tuple is the quantized weight, or LSTM
+    # per-layer packed weights). Returns a mapping from quantized key to a mapping with
+    # entries float and quantized. Logs API usage.
+    # KNOWN ISSUE: in the LSTM branch the float and quantized entries are assigned twice,
+    # so only the hidden-to-hidden weight pair is kept and the input-to-hidden pair is overwritten.
+    # Also the packed-params branch does not skip the LSTM check after a match (no continue).
     r"""Compare the weights of the float module with its corresponding quantized
     module. Return a dict with key corresponding to module names and each entry being
     a dictionary with two keys 'float' and 'quantized', containing the float and
@@ -126,6 +146,9 @@ def _get_logger_dict_helper(
     target_dict: dict[str, Any],
     prefix: str = "",
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursively walks child modules; when a module has a direct
+    # Logger child, stores that logger's stats in target_dict under the dotted module path
+    # plus "stats". Mutates target_dict; returns nothing.
     r"""This is the helper function for get_logger_dict
 
     Args:
@@ -135,6 +158,7 @@ def _get_logger_dict_helper(
     """
 
     def get_prefix(prefix):
+        # [FUNCTION DOC] HELPER: Returns the prefix with a trailing dot, or empty if empty.
         return prefix if prefix == "" else prefix + "."
 
     for child in mod.children():
@@ -148,6 +172,8 @@ def _get_logger_dict_helper(
 
 
 def get_logger_dict(mod: nn.Module, prefix: str = "") -> dict[str, dict]:
+    # [FUNCTION DOC] Collects the stats of all Logger modules found under mod into a new
+    # mapping keyed by module path plus "stats". Logs API usage. Returns the mapping.
     r"""Traverse the modules and save all logger stats into target dict.
     This is mainly used for quantization accuracy debug.
 
@@ -171,9 +197,12 @@ def get_logger_dict(mod: nn.Module, prefix: str = "") -> dict[str, dict]:
 
 
 class Logger(nn.Module):
+    # [CLASS DOC] Base class for stats-logging modules. Holds a stats mapping and a dtype
+    # (quint8) so it can be attached as an observer in FX mode. Its forward does nothing.
     r"""Base class for stats logging"""
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes an empty stats mapping and sets dtype to quint8.
         super().__init__()
         self.stats = {}
         # We only insert observer if the op is quantized with static quantization,
@@ -182,6 +211,7 @@ class Logger(nn.Module):
         self.dtype = torch.quint8
 
     def forward(self, x):
+        # [FUNCTION DOC] No-op placeholder; returns None and logs nothing.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -189,16 +219,22 @@ class Logger(nn.Module):
 
 
 class ShadowLogger(Logger):
+    # [CLASS DOC] Logger used inside Shadow; stats has two lists, quantized and float,
+    # that record the outputs of the original (quantized) and shadow (float) modules.
     r"""Class used in Shadow module to record the outputs of the original and
     shadow modules.
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates empty float and quantized output lists in stats.
         super().__init__()
         self.stats["float"] = []
         self.stats["quantized"] = []
 
     def forward(self, x, y):  # type: ignore[override]
+        # [FUNCTION DOC] Appends detached x to the quantized list and detached y to the float
+        # list. If an argument has more than one element (a tuple/sequence), its first
+        # element is used. Returns None.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -212,13 +248,17 @@ class ShadowLogger(Logger):
 
 
 class OutputLogger(Logger):
+    # [CLASS DOC] Logger that records every tensor passing through it in the tensor_val
+    # list of stats and passes the tensor on unchanged.
     r"""Class used to log the outputs of the module"""
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an empty tensor_val list in stats.
         super().__init__()
         self.stats["tensor_val"] = []
 
     def forward(self, x):
+        # [FUNCTION DOC] Appends x to tensor_val and returns x unchanged.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -228,10 +268,13 @@ class OutputLogger(Logger):
 
 
 def _convert_tuple_to_list(t: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively converts tuples (exact tuple type) into lists; other values unchanged.
     return [_convert_tuple_to_list(x) for x in t] if type(t) is tuple else t
 
 
 def _dequantize_tensor_list(t: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively dequantizes tensors inside (nested) lists; quantized
+    # tensors are dequantized, other values returned as is.
     return (
         [_dequantize_tensor_list(x) for x in t]
         if type(t) is list
@@ -242,6 +285,10 @@ def _dequantize_tensor_list(t: Any) -> Any:
 
 
 class Shadow(nn.Module):
+    # [CLASS DOC] Wraps a quantized module (orig_module) together with its float
+    # counterpart (shadow_module) and a logger instance. Each call runs both on the same
+    # input (dequantized for the float one), logs both outputs, and returns the quantized
+    # output. Also mirrors the quantized functional-op methods (add, mul, cat, ...).
     r"""Shadow module attaches the float module to its matching quantized module
     as the shadow. Then it uses Logger module to process the outputs of both
     modules.
@@ -254,6 +301,8 @@ class Shadow(nn.Module):
     """
 
     def __init__(self, q_module, float_module, logger_cls):
+        # [FUNCTION DOC] Stores the quantized and float modules, a DeQuantize module, and a
+        # new instance of logger_cls as the logger.
         super().__init__()
         self.orig_module = q_module
         self.shadow_module = float_module
@@ -261,6 +310,9 @@ class Shadow(nn.Module):
         self.logger = logger_cls()
 
     def forward(self, *x) -> torch.Tensor:
+        # [FUNCTION DOC] Runs the quantized module on the inputs (tuples turned into lists),
+        # runs the float module on the dequantized inputs, logs both outputs, and returns the
+        # quantized module output.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -273,6 +325,8 @@ class Shadow(nn.Module):
         return output
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Quantized add on the original module; float add on dequantized inputs
+        # on the shadow; logs both; returns the quantized result.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -285,6 +339,7 @@ class Shadow(nn.Module):
         return output
 
     def add_scalar(self, x: torch.Tensor, y: float) -> torch.Tensor:
+        # [FUNCTION DOC] Same as add but with a scalar second operand; only x is dequantized.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -296,6 +351,7 @@ class Shadow(nn.Module):
         return output
 
     def mul(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Same as add but for multiplication of two tensors.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -308,6 +364,7 @@ class Shadow(nn.Module):
         return output
 
     def mul_scalar(self, x: torch.Tensor, y: float) -> torch.Tensor:
+        # [FUNCTION DOC] Same as add_scalar but for multiplication by a scalar.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -319,6 +376,9 @@ class Shadow(nn.Module):
         return output
 
     def cat(self, x: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
+        # [FUNCTION DOC] Quantized concatenation along dim on the original module; float
+        # concatenation of the dequantized tensors on the shadow; logs both; returns the
+        # quantized result.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -330,6 +390,7 @@ class Shadow(nn.Module):
         return output
 
     def add_relu(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Same as add but using the fused add-then-relu operation.
         # fmt: off
         """
         """  # blank docblock to make autodoc happy
@@ -348,6 +409,11 @@ def prepare_model_with_stubs(
     module_swap_list: set[type],
     logger_cls: Callable,
 ) -> None:
+    # [FUNCTION DOC] Recursively walks the children of q_module in parallel with float_module
+    # (matched by name). Children whose float type is not in module_swap_list are recursed
+    # into; children whose float type is in the list and whose module-type structure differs
+    # from the quantized one get replaced in q_module by a Shadow(quantized, float, logger_cls).
+    # Mutates q_module in place after iteration; returns None. Logs API usage.
     r"""Prepare the model by attaching the float module to its matching quantized
     module as the shadow if the float module type is in module_swap_list.
 
@@ -392,6 +458,7 @@ def prepare_model_with_stubs(
 
 
 def _is_identical_module_type(mod1, mod2):
+    # [FUNCTION DOC] HELPER: Returns True if both modules' submodule type lists (including themselves) are equal.
     # Compare if two modules have the same dtype
     mod1_module_types = [type(mod) for mod in mod1.modules()]
     mod2_module_types = [type(mod) for mod in mod2.modules()]
@@ -405,6 +472,9 @@ def compare_model_stub(
     *data,
     logger_cls=ShadowLogger,
 ) -> dict[str, dict]:
+    # [FUNCTION DOC] Attaches shadow modules to q_model via prepare_model_with_stubs, runs
+    # q_model on data, and returns the logger dict (module path -> stats with float and
+    # quantized outputs). Mutates q_model; logs API usage.
     r"""Compare quantized module in a model with its floating point counterpart,
     feeding both of them the same input. Return a dict with key corresponding to
     module names and each entry being a dictionary with two keys 'float' and
@@ -454,6 +524,10 @@ def get_matching_activations(
     float_module: nn.Module,
     q_module: nn.Module,
 ) -> dict[str, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Reads logger stats of both modules, skips quantized entries with no
+    # recorded outputs, matches each remaining quantized logger key to a float logger key,
+    # and returns a mapping from quantized key to a mapping with float and quantized recorded
+    # tensor lists. Logs API usage.
     r"""Find the matching activation between float and quantized modules.
 
     Args:
@@ -488,6 +562,10 @@ def prepare_model_outputs(
     logger_cls=OutputLogger,
     allow_list=None,
 ) -> None:
+    # [FUNCTION DOC] Sets a debug qconfig whose activation observer is logger_cls on both
+    # modules and runs the standard prepare in place (the quantized one also treats
+    # selected non-leaf modules as leaves) so loggers get attached to modules in allow_list
+    # (default: the default compare-output module list). Mutates both modules; logs API usage.
     r"""Prepare the model by attaching the logger to both float module
     and quantized module if they are in the allow_list.
 
@@ -525,6 +603,9 @@ def compare_model_outputs(
     logger_cls=OutputLogger,
     allow_list=None,
 ) -> dict[str, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Prepares both models with output loggers, runs each on data, and returns
+    # the matching float and quantized activations per quantized module name. Mutates both
+    # models; logs API usage.
     r"""Compare output activations between float and quantized models at
     corresponding locations for the same input. Return a dict with key corresponding
     to quantized module names and each entry being a dictionary with two keys

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Block-sparse quantized (qint8) Linear modules. Defines LinearPackedParams
+# (holds prepacked sparse weight/bias with state-dict and pickle support) and Linear
+# (quantized sparse linear layer built from a float Linear via from_float).
+# Relies on the torch.ops.sparse qlinear prepack/unpack/forward ops. No import-time side effects.
 
 import torch
 from torch.ao.nn.quantized.modules.utils import (
@@ -12,9 +16,16 @@ __all__ = ["LinearPackedParams", "Linear"]
 
 # TODO (zaf): Inherit from `quantized.LinearPackedParams` (T83294430)
 class LinearPackedParams(torch.nn.Module):
+    # [CLASS DOC] Module that stores the prepacked block-sparse quantized weight and bias
+    # of a sparse quantized Linear in an opaque packed object (_packed_params).
+    # Only qint8 is supported. forward is an identity; the class exists to own the packed
+    # state, serialize it to/from state dicts (unpacked form) and pickle it.
     _version = 1
 
     def __init__(self, row_block_size=1, col_block_size=4, dtype=torch.qint8):
+        # [FUNCTION DOC] Creates the module with a placeholder 1x1 quantized weight and no
+        # bias, packed with the given block sizes. Raises NotImplementedError if dtype is
+        # not qint8. Sets self.dtype and self._packed_params.
         super().__init__()
 
         if dtype != torch.qint8:
@@ -26,6 +37,7 @@ class LinearPackedParams(torch.nn.Module):
         self.set_weight_bias(wq, None, row_block_size, col_block_size)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name used in the module repr.
         return "SparseQuantizedLinearPackedParams"
 
     @torch.jit.export
@@ -36,6 +48,9 @@ class LinearPackedParams(torch.nn.Module):
         row_block_size: int | None,
         col_block_size: int | None,
     ) -> None:
+        # [FUNCTION DOC] Packs the quantized weight and optional bias into the sparse
+        # prepacked format and stores it in _packed_params. Both block sizes are
+        # required; raises AssertionError if either is None.
         if row_block_size is None or col_block_size is None:
             raise AssertionError(
                 "row_block_size and col_block_size must not be None, got "
@@ -47,15 +62,20 @@ class LinearPackedParams(torch.nn.Module):
 
     @torch.jit.export
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Unpacks the stored params; returns a tuple of weight,
+        # bias, row block size and column block size.
         (weight, bias, block_sizes) = torch.ops.sparse.qlinear_unpack(
             self._packed_params
         )
         return (weight, bias, block_sizes[0], block_sizes[1])
 
     def forward(self, x):
+        # [FUNCTION DOC] Identity; returns the input unchanged (not a real computation).
         return x
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Writes the dtype and the unpacked (weight, bias, row block,
+        # col block) tuple into the destination mapping under prefixed keys.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + "dtype"] = self.dtype
         destination[prefix + "_packed_params"] = self._weight_bias()
@@ -70,6 +90,10 @@ class LinearPackedParams(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Restores dtype and repacks the weight/bias/block sizes popped
+        # from the state dict, then delegates remaining keys to the base class with strict
+        # disabled. Raises AssertionError if the saved version is newer than supported;
+        # a missing key raises KeyError.
         version = local_metadata.get("version", None)
         if version is not None and version > self._version:
             raise AssertionError(f"version {version} > self._version {self._version}")
@@ -92,18 +116,25 @@ class LinearPackedParams(torch.nn.Module):
 
     @torch.jit.export
     def __getstate__(self):
+        # [FUNCTION DOC] Returns the pickle state: packed params, training flag, dtype.
         return self._packed_params, self.training, self.dtype
 
     @torch.jit.export
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores packed params, training flag and dtype from the state tuple.
         (self._packed_params, self.training, self.dtype) = state
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the repr of the unpacked weight/bias/block-size tuple.
         return self._weight_bias().__repr__()
 
 
 # TODO (zaf): Inherit from `quantized.Linear` (T83294430)
 class Linear(torch.nn.Module):
+    # [CLASS DOC] Quantized block-sparse qint8 linear layer. Holds in_features/out_features,
+    # a LinearPackedParams (_packed_params) with the packed weight/bias, and the output
+    # activation scale and zero_point. Created from a float torch.nn.Linear (_FLOAT_MODULE)
+    # through from_float; forward calls the sparse qlinear op.
     r"""
     A quantized sparse linear module with quantized tensor as inputs and outputs.
     """
@@ -120,6 +151,9 @@ class Linear(torch.nn.Module):
         bias=True,
         dtype=torch.qint8,
     ):
+        # [FUNCTION DOC] Builds the layer with a placeholder weight (scale 1, zero point 0)
+        # and zero bias (if bias is true), packed with the given block sizes; scale=1.0,
+        # zero_point=0. Raises NotImplementedError if dtype is not qint8.
         super().__init__()
 
         if dtype != torch.qint8:
@@ -149,23 +183,30 @@ class Linear(torch.nn.Module):
 
     @classmethod
     def _get_name(cls):
+        # [FUNCTION DOC] HELPER: Returns the display name used in the module repr.
         return "SparseQuantizedLinear"
 
     def extra_repr(self):
+        # [FUNCTION DOC] Returns a string with features, scale, zero point and weight qscheme.
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, scale={self.scale}, "
             f"zero_point={self.zero_point}, qscheme={self.weight().qscheme()}"
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the module repr with the packed-params submodule hidden.
         return _hide_packed_params_repr(self, LinearPackedParams)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Applies the sparse quantized linear op to a quantized input using
+        # the packed params, output scale and zero point; returns a quantized tensor.
         return torch.ops.sparse.qlinear(
             x, self._packed_params._packed_params, self.scale, self.zero_point
         )
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Adds scale and zero_point (as tensors) to the destination
+        # mapping after the base class entries.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + "scale"] = torch.tensor(self.scale)
         destination[prefix + "zero_point"] = torch.tensor(self.zero_point)
@@ -180,6 +221,9 @@ class Linear(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Restores scale and zero_point from the state dict, discards
+        # the op_type entry (KeyError if missing), checks the saved version (AssertionError
+        # if newer than supported), then loads remaining keys with strict disabled.
         self.scale = float(state_dict[prefix + "scale"])
         state_dict.pop(prefix + "scale")
 
@@ -203,12 +247,15 @@ class Linear(torch.nn.Module):
         )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the unpacked (weight, bias, row block, col block).
         return self._packed_params._weight_bias()
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         return self._weight_bias()[0]
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (may be None).
         return self._weight_bias()[1]
 
     def set_weight_bias(
@@ -218,6 +265,8 @@ class Linear(torch.nn.Module):
         row_block_size: int | None,
         col_block_size: int | None,
     ) -> None:
+        # [FUNCTION DOC] Repacks the given weight and bias into the packed params with the
+        # given block sizes. Raises AssertionError if either block size is None.
         if row_block_size is None or col_block_size is None:
             raise AssertionError(
                 "row_block_size and col_block_size must not be None, "
@@ -227,6 +276,12 @@ class Linear(torch.nn.Module):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Converts a float Linear (exact type required) that has sparse_params
+        # with a two-element sparse_block_shape, a qconfig and an activation_post_process
+        # into a quantized sparse Linear. Runs the weight observer, requires qint8 and all
+        # weight zero points equal to 0, quantizes the weight, builds the layer using the
+        # block shape, and sets scale/zero_point from the activation observer. Raises
+        # AssertionError on any violated precondition. use_precomputed_fake_quant is unused.
         r"""Create a quantized sparse module from a float module.
 
         We only care about the convert at this stage, no need for observers just yet.
