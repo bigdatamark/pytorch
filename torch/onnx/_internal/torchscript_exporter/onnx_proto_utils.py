@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for ONNX protobuf files and onnx-script functions. Provides writing and
+# loading of self-contained ONNX test case directories, tensor data serialization, writing model
+# bytes to a file-like target, and embedding registered onnx-script function protos into a
+# serialized model. The onnx package is imported lazily inside functions; no import-time effects.
 """Utilities for manipulating the onnx and onnx-script dependencies and ONNX proto."""
 
 from __future__ import annotations
@@ -22,6 +26,12 @@ if TYPE_CHECKING:
 def export_as_test_case(
     model_bytes: bytes, inputs_data, outputs_data, name: str, dir: str
 ) -> str:
+    # [FUNCTION DOC] Writes a test case directory named test_ plus name under dir, containing
+    # the model file and a data set folder with one protobuf file per model input and output,
+    # paired with the model's declared inputs/outputs in order (extra data is ignored). An
+    # existing data set folder is deleted first. Returns the test case directory path. Raises
+    # ImportError if onnx is missing. Side effects: creates directories and files.
+    # KNOWN ISSUE: the docstring omits the name and dir arguments.
     """Export an ONNX model as a self contained ONNX test case.
 
     The test case contains the model and the inputs/outputs data. The directory structure
@@ -74,6 +84,12 @@ def export_as_test_case(
 
 
 def load_test_case(dir: str) -> tuple[bytes, Any, Any]:
+    # [FUNCTION DOC] Reads a test case folder: the raw model bytes plus all input and output
+    # protobuf tensors from its data set folder, converted to arrays and keyed by tensor name.
+    # Returns (model_bytes, inputs mapping, outputs mapping). Raises ImportError if onnx is
+    # missing; file errors propagate. Read-only.
+    # KNOWN ISSUE: dir must be the test_<name> folder itself, but the docstring tree suggests
+    # the parent folder; files are read in unsorted glob order (harmless since keyed by name).
     """Load a self contained ONNX test case from a directory.
 
     The test case must contain the model and the inputs/outputs data. The directory structure
@@ -124,6 +140,9 @@ def load_test_case(dir: str) -> tuple[bytes, Any, Any]:
 
 
 def export_data(data, value_info_proto, f: str) -> None:
+    # [FUNCTION DOC] Serializes one value to the file at path f (overwritten). The value info
+    # type picks the encoding: map, sequence, optional or tensor (anything else raises an
+    # assertion error). Raises ImportError if onnx is missing. Side effect: file write.
     """Export data to ONNX protobuf format.
 
     Args:
@@ -167,6 +186,8 @@ def _export_file(
     f: io.BytesIO | str,
     export_map: Mapping[str, bytes],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes model bytes to a path or binary stream. Raises an assertion
+    # error if export_map is non-empty (only the single-file mode is supported).
     """export/write model bytes into directory/protobuf/zip"""
     if len(export_map) != 0:
         raise AssertionError(f"export_map must be empty, got {len(export_map)} items")
@@ -178,6 +199,11 @@ def _add_onnxscript_fn(
     model_bytes: bytes,
     custom_opsets: Mapping[str, int],
 ) -> bytes:
+    # [FUNCTION DOC] HELPER: Parses the model, collects function protos for custom-domain ops
+    # used in its graph (including nested graphs) from the symbolic registry, appends them to the
+    # model's function list and returns re-serialized bytes. If none are found, returns the
+    # input bytes unchanged. Raises OnnxExporterError if onnx is missing; unsupported ops raise
+    # from the finder.
     """Insert model-included custom onnx-script function into ModelProto"""
     try:
         import onnx
@@ -212,6 +238,14 @@ def _find_onnxscript_op(
     custom_opsets: Mapping[str, int],
     onnx_function_list: list,
 ):
+    # [FUNCTION DOC] HELPER: Walks a graph proto and its nested subgraphs. For each node outside
+    # the aten, prim and onnx domains that has a registered function group and is not yet
+    # included, looks up the function for the opset chosen by custom_opsets (default 1). If found
+    # and it can produce a function proto, appends it to onnx_function_list and records the node
+    # kind in included_node_func (both mutated in place). If no function exists for that opset,
+    # raises UnsupportedOperatorError. Returns the two collections as a tuple.
+    # KNOWN ISSUE: the subgraph test on each attribute is always true for protobuf messages, so
+    # every attribute is recursed into (harmless but wasteful).
     """Recursively iterate ModelProto to find ONNXFunction op as it may contain control flow Op."""
     for node in graph_proto.node:
         node_kind = node.domain + "::" + node.op_type

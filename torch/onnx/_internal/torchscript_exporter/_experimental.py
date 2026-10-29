@@ -1,3 +1,6 @@
+# [MODULE DOC] Experimental option containers used by ONNX export. Defines the ExportOptions
+# dataclass bundling the arguments of the torch.onnx export entry point. No import-time side
+# effects beyond class creation.
 """Experimental classes and functions used by ONNX export."""
 
 import dataclasses
@@ -9,6 +12,10 @@ import torch._C._onnx as _C_onnx
 
 @dataclasses.dataclass
 class ExportOptions:
+    # [CLASS DOC] Plain dataclass holding export settings: export_params, verbose, training mode,
+    # input/output names, operator export type, opset version, constant folding, dynamic axes,
+    # initializer-as-input flag, custom opsets and modules-as-functions selection. All fields have
+    # defaults; no validation or methods. Marked by a TODO for eventual removal.
     """Arguments used by :func:`torch.onnx.export`."""
 
     # TODO(justinchuby): Deprecate and remove this class.

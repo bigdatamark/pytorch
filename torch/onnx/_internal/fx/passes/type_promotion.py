@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] FX pass that makes implicit type promotion explicit for ONNX export. Defines
+# promotion rule classes (elementwise, division, reduction, all/any, sum-like), a generated
+# plus a hand-curated rule set, a table keyed by namespace and op name, a generator that
+# distills elementwise rules from torch reference ops, an interpreter that inserts dtype
+# casts around nodes, and the InsertTypePromotion pass driving it. Import time: creates the
+# module logger and builds the two rule sets (rule objects only; ops are checked later).
 from __future__ import annotations
 
 import abc
@@ -36,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 
 def _try_getclosurevars(func):
+    # [FUNCTION DOC] HELPER: Returns the closure variable info of a callable, or None if the
+    # object is not a supported kind of callable (type error is swallowed).
     try:
         return inspect.getclosurevars(func)
     except TypeError:
@@ -44,6 +52,9 @@ def _try_getclosurevars(func):
 
 @dataclasses.dataclass
 class TypePromotionSnapshot:
+    # [CLASS DOC] Immutable-by-convention result of previewing a promotion rule: a mapping from
+    # positional argument index to target dtype, a mapping from keyword name to target dtype,
+    # and the expected output dtype. Arguments not listed are left alone.
     """Type promotion snapshot for a fx node and its inputs.
 
     Contains the promoted dtype for args and kwargs that needs promoting.
@@ -61,9 +72,13 @@ class TypePromotionSnapshot:
 
 
 class TypePromotionRule(abc.ABC):
+    # [CLASS DOC] Abstract base for a promotion rule bound to one op (namespace plus op name).
+    # State: namespace and op_name. Subclasses must supply hash, repr, equality and
+    # preview_type_promotion; this base provides is_valid.
     """Base class for type promotion rule per 'torch.ops.{namespace}.{op_name}'."""
 
     def __init__(self, namespace: str, op_name: str) -> None:
+        # [FUNCTION DOC] Stores the op namespace and op name for this rule.
         self.namespace = namespace
         self.op_name = op_name
 
@@ -80,6 +95,9 @@ class TypePromotionRule(abc.ABC):
     def __eq__(self, other: object) -> bool: ...
 
     def is_valid(self) -> bool:
+        # [FUNCTION DOC] Checks that the namespace and op name resolve to an operator packet in
+        # the torch ops registry. Returns false (with a logged warning) if the op is missing or is
+        # not a packet. Side effect: looking up an unknown namespace creates an empty module.
         """Check if the rule is valid."""
         # This always returns a module. If the module does not exist it will be created.
         module = getattr(torch.ops, self.namespace)
@@ -104,6 +122,8 @@ class TypePromotionRule(abc.ABC):
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Abstract: computes which args and kwargs get which dtype and the
+        # expected output dtype for concrete call arguments. Returns a snapshot.
         """Preview type promotion results for provided set of args and kwargs.
 
         Returns a TypePromotionSnapshot object that contains the promoted dtypes for
@@ -113,6 +133,11 @@ class TypePromotionRule(abc.ABC):
 
 
 class ElementwiseTypePromotionRule(TypePromotionRule):
+    # [CLASS DOC] Rule for elementwise ops. State: positions of positional args and names of
+    # keyword args that take part in promotion, and the promotion kind from the prims helpers.
+    # Previewing computes the common dtype of the participating args. A class flag (off) controls
+    # whether the lower-precision compute dtype is used for inputs; when off, inputs are cast
+    # straight to the result dtype for the default and int-to-float kinds.
     """Defines how to perform elementwise type promotion for 'torch.ops.{namespace}.{op_name}'."""
 
     _USE_OPMATH: bool = False
@@ -129,6 +154,7 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
         promote_kwargs_names: Sequence[str],
         promotion_kind: _prims_common.ELEMENTWISE_TYPE_PROMOTION_KIND,
     ) -> None:
+        # [FUNCTION DOC] Stores the op identity, arg positions, kwarg names and promotion kind.
         """Constructs a TypePromotionRule for elementwise operators.
 
         Args:
@@ -144,6 +170,7 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
         self.promotion_kind = promotion_kind
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Text form listing namespace, op, positions, names and kind.
         return (
             f"ElementwiseTypePromotionRule('{self.namespace}', '{self.op_name}', "
             f"{self.promote_args_positions}, {self.promote_kwargs_names}, {self.promotion_kind})"
@@ -151,6 +178,8 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
 
     # pyrefly: ignore [bad-override]
     def __eq__(self, other: object, /) -> bool:
+        # [FUNCTION DOC] HELPER: Equal if other is an elementwise rule with the same namespace, op
+        # name, arg positions, kwarg names and promotion kind.
         if not isinstance(other, ElementwiseTypePromotionRule):
             return False
         return (
@@ -162,11 +191,16 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
         )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash of the class plus namespace and op name only (coarser than
+        # equality, which is allowed).
         return f"{type(self)}:{self.namespace}.{self.op_name}".__hash__()
 
     def _consolidate_input_dtype(
         self, computed_dtype: torch.dtype, result_dtype: torch.dtype
     ) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Chooses the dtype inputs are cast to. With the compute-dtype flag
+        # off and a default or int-to-float kind, returns the result dtype (avoids extra upcasts);
+        # otherwise returns the computation dtype.
         """
         Although opmath is the right thing to do to retain on-par precision, it inserts
         upcasts everywhere in the graph. This is particularly hard for backend to optimize
@@ -183,6 +217,11 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Gathers the configured positional args (present and not None) and kwargs
+        # (present and not None), flattens them, and asks the prims helper for the compute and
+        # result dtypes under the rule's kind. Returns a snapshot mapping every gathered arg
+        # position and kwarg name to the consolidated input dtype, with the result dtype as the
+        # output dtype. Errors from the helper (e.g. no tensor inputs) propagate.
         candidate_args = {
             i: args[i]
             for i in self.promote_args_positions
@@ -211,12 +250,17 @@ class ElementwiseTypePromotionRule(TypePromotionRule):
 
 
 class DivElementwiseTypePromotionRule(ElementwiseTypePromotionRule):
+    # [CLASS DOC] Elementwise rule for the aten div op over args zero and one. The promotion kind
+    # is chosen per call from the rounding mode keyword (none: int-to-float; trunc or floor:
+    # default), so the kind attribute is overwritten during previews.
     """Reference type promotion rule from torch._refs.div.
 
     Rule depends on the value of the `rounding_mode` argument.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Builds the div rule: namespace aten, op div, positions zero and one, no
+        # kwargs, default kind (replaced per call).
         super().__init__(
             "aten",
             "div",
@@ -228,6 +272,11 @@ class DivElementwiseTypePromotionRule(ElementwiseTypePromotionRule):
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Reads the rounding mode keyword, sets the promotion kind accordingly
+        # (none: int-to-float; trunc or floor: default) and defers to the parent preview.
+        # Raises a value error for any other mode. Side effect: mutates the rule's kind.
+        # KNOWN ISSUE: mutating shared rule state per call is not thread safe and makes equality
+        # and the mutable kind depend on call history.
         rounding_mode = kwargs.get("rounding_mode")
         if rounding_mode is None:
             # true_divide
@@ -247,12 +296,16 @@ class DivElementwiseTypePromotionRule(ElementwiseTypePromotionRule):
 
 
 class ReductionTypePromotionRule(TypePromotionRule):
+    # [CLASS DOC] Rule for reduction ops. State: a reduction output kind from the prims helpers.
+    # Previewing promotes only the first argument (the input tensor) to the computation dtype and
+    # reports the result dtype, honoring an optional dtype keyword.
     def __init__(
         self,
         namespace: str,
         op_name: str,
         promotion_kind: _prims_common.REDUCTION_OUTPUT_TYPE_KIND,
     ) -> None:
+        # [FUNCTION DOC] Stores the op identity and the reduction output kind.
         """Constructs a TypePromotionRule for reduction operators.
 
         Args:
@@ -264,10 +317,16 @@ class ReductionTypePromotionRule(TypePromotionRule):
         self.promotion_kind = promotion_kind
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Text form listing namespace, op and kind.
         return f"ReductionTypePromotionRule('{self.namespace}', '{self.op_name}', {self.promotion_kind})"
 
     # pyrefly: ignore [bad-override]
     def __eq__(self, other: object, /) -> bool:
+        # [FUNCTION DOC] HELPER: Intended to compare namespace, op name and kind with another rule.
+        # KNOWN ISSUE: the type check tests for the elementwise rule class instead of the
+        # reduction class, so a reduction rule is never equal to another reduction rule (not even
+        # itself via a copy) and could only match an elementwise rule that lacks the kind attribute
+        # semantics; set membership still works only through identity.
         if not isinstance(other, ElementwiseTypePromotionRule):
             return False
         return (
@@ -277,11 +336,17 @@ class ReductionTypePromotionRule(TypePromotionRule):
         )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash of the class plus namespace and op name.
         return f"{type(self)}:{self.namespace}.{self.op_name}".__hash__()
 
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Takes the first positional arg (must be a tensor, else assertion error;
+        # also an assertion error if there are no args) and the optional dtype keyword, asks the
+        # prims helper for computation and result dtypes, and falls back to the computation dtype
+        # if no result dtype is given. Returns a snapshot casting arg zero to the computation dtype
+        # with no kwarg changes.
         if len(args) < 1:
             raise AssertionError(
                 f"Reduction op torch.ops.{self.namespace}.{self.op_name} expects at least one argument"
@@ -307,6 +372,8 @@ class ReductionTypePromotionRule(TypePromotionRule):
 
 
 class AllOrAnyReductionTypePromotionRule(ReductionTypePromotionRule):
+    # [CLASS DOC] Reduction rule for the aten all and any ops: always computes in bool and keeps
+    # uint8 results for uint8 inputs.
     """Reference type promotion rule from torch.ops.aten.all or torch.ops.aten.any.
 
     This is a special case where computation dtype is always torch.bool.
@@ -314,6 +381,7 @@ class AllOrAnyReductionTypePromotionRule(ReductionTypePromotionRule):
     """
 
     def __init__(self, op_name: str) -> None:
+        # [FUNCTION DOC] Builds an aten rule for the given op name with the always-bool kind.
         super().__init__(
             "aten",
             op_name,
@@ -323,6 +391,10 @@ class AllOrAnyReductionTypePromotionRule(ReductionTypePromotionRule):
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Requires a tensor first arg (assertion error otherwise). Casts it to bool;
+        # the result dtype is uint8 for a uint8 input, else bool.
+        # KNOWN ISSUE: the class docstring says the result depends on the dtype keyword, but the
+        # code looks only at the input tensor's dtype and ignores the keyword.
         if len(args) < 1:
             raise AssertionError(
                 f"Reduction op torch.ops.{self.namespace}.{self.op_name} expects at least one argument"
@@ -341,6 +413,8 @@ class AllOrAnyReductionTypePromotionRule(ReductionTypePromotionRule):
 
 
 class SumLikeReductionTypePromotionRule(ReductionTypePromotionRule):
+    # [CLASS DOC] Reduction rule for sum-like ops (sum, prod, cumsum, cumprod): integral and bool
+    # inputs accumulate in int64 unless a dtype keyword overrides it.
     """Reference type promotion rule from torch.ops.aten.sum.
 
     This is a special case where computation dtype is always torch.int64 for integral arg,
@@ -350,6 +424,9 @@ class SumLikeReductionTypePromotionRule(ReductionTypePromotionRule):
     def preview_type_promotion(
         self, args: tuple, kwargs: dict
     ) -> TypePromotionSnapshot:
+        # [FUNCTION DOC] Requires a tensor first arg (assertion error otherwise). If no dtype
+        # keyword is given, picks int64 for bool or integer inputs and the input dtype otherwise,
+        # then defers to the parent preview with only that dtype keyword (other kwargs dropped).
         if len(args) < 1:
             raise AssertionError(
                 f"Reduction op torch.ops.{self.namespace}.{self.op_name} expects at least one argument"
@@ -1114,6 +1191,9 @@ _EXTRA_TYPE_PROMOTION_RULE_SET = {
 
 
 class ElementwiseTypePromotionRuleSetGenerator:
+    # [CLASS DOC] HELPER: Stateless utility (class methods only) that inspects the decorated
+    # reference ops in several torch reference modules to rebuild elementwise promotion rules.
+    # Used to regenerate or validate the generated rule table, not at export time.
     """Hackily distilling info from reference ops decorated with elementwise type promotion rule.
 
     The goal is to retrieve the decorator
@@ -1131,6 +1211,8 @@ class ElementwiseTypePromotionRuleSetGenerator:
 
     @classmethod
     def generate_from_torch_refs(cls) -> set[ElementwiseTypePromotionRule]:
+        # [FUNCTION DOC] Parses the main, nn, linalg, special and nn-functional reference modules
+        # and returns the union of the valid rules found, as a set.
         """Parse type promotion rules from reference ops under torch._C._refs."""
         rule_set = set()
         rule_set.update(cls._parse_torch_refs(_refs))
@@ -1144,6 +1226,9 @@ class ElementwiseTypePromotionRuleSetGenerator:
     def _parse_torch_refs(
         cls, ref_module: ModuleType
     ) -> set[ElementwiseTypePromotionRule]:
+        # [FUNCTION DOC] HELPER: For each exported name of a reference module, parses the rule from
+        # the op and keeps it if found and valid (op exists as a packet). Logs the module name.
+        # Returns the set of kept rules.
         logger.info("Processing module: %s", ref_module.__name__)
         rule_set = set()
         for name in ref_module.__all__:
@@ -1159,6 +1244,13 @@ class ElementwiseTypePromotionRuleSetGenerator:
         cls,
         decorated_op: Callable,
     ) -> ElementwiseTypePromotionRule | None:
+        # [FUNCTION DOC] HELPER: Follows the chain of wrapped functions through closure variables
+        # until the elementwise type promotion wrapper object is found. Then maps the wrapper's
+        # promoting argument names to positions (positional parameters, by signature index) or
+        # keyword names (keyword-only parameters) and builds an aten rule using the op's name and
+        # the wrapper's kind. Returns None, logging a warning, if no wrapper is found.
+        # KNOWN ISSUE: the position counter advances for every parameter, including variadic and
+        # keyword-only ones, which only matters if they precede positional ones (not expected).
         """Retrieve and parse type promotion decorator from op under torch._refs."""
         fn = decorated_op
         type_promo_wrapper = None
@@ -1209,9 +1301,14 @@ class ElementwiseTypePromotionRuleSetGenerator:
 
 
 class TypePromotionTable:
+    # [CLASS DOC] Lookup table from the string namespace.op to a promotion rule. Built at
+    # construction from the generated and extra rule sets (extras win on conflict); more rules
+    # can be added later.
     """Type promotion table for torch.ops."""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the table and adds every generated rule, then every extra rule.
+        # Raises a value error if any rule refers to a non-existent op.
         self._rule_table = {}
         for rule in _GENERATED_ATEN_TYPE_PROMOTION_RULE_SET:
             self.add_rule(rule)
@@ -1219,6 +1316,9 @@ class TypePromotionTable:
             self.add_rule(rule)
 
     def add_rule(self, rule: TypePromotionRule) -> None:
+        # [FUNCTION DOC] Validates the rule and stores it under namespace.op, replacing any
+        # existing rule. Raises a value error if the rule's op is invalid.
+        # KNOWN ISSUE: the docstring mentions a module argument that does not exist.
         """Add a type promotion rule for a python op in a torch.ops module.
 
         Args:
@@ -1233,6 +1333,8 @@ class TypePromotionTable:
         self._rule_table[f"{rule.namespace}.{rule.op_name}"] = rule
 
     def get_rule(self, py_op: torch._ops.OpOverloadPacket) -> TypePromotionRule | None:
+        # [FUNCTION DOC] Returns the rule whose key equals the string form of the op packet
+        # (namespace.op), or None if there is none.
         """Get type promotion rule for a python op under 'torch.ops.<namespace>'."""
         return self._rule_table.get(str(py_op), None)
 
@@ -1241,6 +1343,8 @@ def get_type_promotion_rule(
     node: torch.fx.Node,
     type_promotion_table: TypePromotionTable,
 ) -> TypePromotionRule | None:
+    # [FUNCTION DOC] Returns the table's rule for a node whose target is an operator overload
+    # (looked up by its packet), or None if the target is not an overload or has no rule.
     """Get type promotion rule for a node.
 
     Args:
@@ -1263,6 +1367,10 @@ def get_type_promotion_rule(
 def find_compatible_op_overload(
     op: torch._ops.OpOverloadPacket, args: tuple, kwargs: dict
 ) -> torch._ops.OpOverload:
+    # [FUNCTION DOC] Tries each overload of the packet in order and returns the first whose
+    # schema accepts the given args and kwargs. Raises a runtime error listing every overload's
+    # failure if none matches. Raises an assertion error if an overload attribute is not an
+    # overload object. Read-only.
     """Find compatible OpOverload for an OpOverloadPacket using provided args and kwargs.
 
     Each "call_function" fx.Node in the fx.GraphModule has a target that represents a torch._ops.OpOverload.
@@ -1318,6 +1426,10 @@ def find_compatible_op_overload(
 
 
 class _TypePromotionInterpreter(torch.fx.Interpreter):
+    # [CLASS DOC] HELPER: Graph interpreter that, before running each node, applies the matching
+    # promotion rule by inserting cast nodes for inputs (and for the output when the computation
+    # dtype differs from the expected one), updating node targets and metadata in place. State:
+    # the rule table. Running it mutates the graph being interpreted.
     """Interpreter that inserts type promotion for each node."""
 
     def __init__(
@@ -1325,10 +1437,14 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         module: torch.fx.GraphModule,
         type_promotion_table: TypePromotionTable,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the interpreter on the module and keeps the table.
         super().__init__(module)
         self.type_promotion_table = type_promotion_table
 
     def _run_node_and_set_meta(self, node) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the node with the base interpreter, stores the output in the
+        # environment, copies current traced metadata keys not already on the node, and recomputes
+        # the node's value metadata from the output. Returns the output. Mutates the node.
         """Run node and set meta according to `fx_traceback.get_current_meta()`.
 
         This should be used on new nodes or nodes that have been modified.
@@ -1355,6 +1471,9 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         args: tuple,
         kwargs: dict,
     ) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Appends a node of the given op type to the graph at the current
+        # insertion point (assertion error for an unknown op type), runs it to fill metadata and
+        # the environment, and returns it.
         """Create a node and set its metadata."""
         if op_type not in (
             "call_function",
@@ -1374,6 +1493,12 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         node: torch.fx.Node,
         expected_out_dtype: torch.dtype,
     ) -> None:
+        # [FUNCTION DOC] HELPER: After a node's inputs changed, retargets it to a compatible
+        # overload and reruns it. Asserts the old value metadata exists, the target is an overload,
+        # the output kind is unchanged, and the old tensor dtype equals the expected dtype. If the
+        # new tensor dtype differs (op math), inserts a conversion node after it and redirects all
+        # users to it. Raises not-implemented for symbolic, list or tuple outputs and a runtime
+        # error for any other output type. Mutates the graph.
         """Rerun a node after type promotion and update node.meta["val"] with the output value."""
         node_val = node.meta.get("val", None)
         if node_val is None:
@@ -1441,6 +1566,12 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         fx_arg: torch.fx.node.Argument,
         dtype: torch.dtype | None,
     ) -> torch.fx.node.Argument:
+        # [FUNCTION DOC] HELPER: Returns the argument unchanged if dtype is None or it already has
+        # that dtype. Tensor-valued nodes of another dtype get a conversion node inserted before
+        # the consumer; symbolic numbers and plain Python numbers of another dtype become a scalar
+        # tensor node of the target dtype; tuples and lists are handled element-wise preserving the
+        # container type. Raises not-implemented for other argument kinds (including a node whose
+        # value is neither tensor nor symbolic). Returns the new or old argument.
         """Promote fx_arg to dtype if necessary."""
         if dtype is None:
             logger.info(
@@ -1539,6 +1670,9 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         node: torch.fx.Node,
         rule: TypePromotionRule,
     ) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Previews the rule on the node's concrete args, promotes each
+        # positional and keyword argument per the snapshot, and, if anything changed, assigns the
+        # new args and kwargs and reruns the node with the expected output dtype. Returns the node.
         """Promote node inputs and outputs according to type promotion rule."""
         args, kwargs = self.fetch_args_kwargs_from_env(node)
         type_promotion_info = rule.preview_type_promotion(args, kwargs)
@@ -1565,6 +1699,9 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
         return node
 
     def run_node(self, n: torch.fx.Node) -> Any:
+        # [FUNCTION DOC] Override of the interpreter hook: under the current-node context, looks
+        # up a rule for the node and, if any, promotes its inputs/outputs in the graph; then runs
+        # the node with the base implementation and returns its value.
         """This method is an override which inserts type promotion nodes as needed.
 
         For each `call_function` node, an initial check is conducted to determine if a type
@@ -1585,6 +1722,9 @@ class _TypePromotionInterpreter(torch.fx.Interpreter):
 
 
 class InsertTypePromotion(_pass.Transform):
+    # [CLASS DOC] Graph transform pass that makes type promotion explicit. State: an interpreter
+    # built on the module with a promotion table (default one if none given). Running it replays
+    # the graph with fake argument values under the fake mode, mutating the module in place.
     """Explicitly insert type promotion ops to the graph.
 
     Underneath, the main pass is driven by `_TypePromotionInterpreter`, which is a subclass
@@ -1601,6 +1741,8 @@ class InsertTypePromotion(_pass.Transform):
         module: torch.fx.GraphModule,
         type_promotion_table: TypePromotionTable | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the transform on the module and creates the interpreter with
+        # the given table, or a freshly built default table when none (or an empty one) is given.
         super().__init__(module)
         self.interpreter = _TypePromotionInterpreter(
             module, type_promotion_table or TypePromotionTable()
@@ -1618,6 +1760,10 @@ class InsertTypePromotion(_pass.Transform):
         | torch.SymBool
         | None
     ]:
+        # [FUNCTION DOC] HELPER: Collects the value metadata of each placeholder node in graph
+        # order. If reading metadata raises a runtime error, an unused placeholder yields None,
+        # while a used one raises a runtime error asking for pre-existing fake args. Returns the
+        # list.
         """Fetch fake args from fx graph.
 
         For each argument, try to fetch fake tensor from the matching placeholder node.
@@ -1645,6 +1791,10 @@ class InsertTypePromotion(_pass.Transform):
         return fake_args
 
     def _run(self, *args, **kwargs) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Pass entry point. Rejects any positional or keyword arguments (assertion
+        # error) since inputs come from graph metadata. Fetches fake args, requires a detectable
+        # fake mode (assertion error otherwise), and runs the interpreter under that mode, the
+        # python dispatcher and node-metadata preservation. Returns the mutated module.
         if args:
             raise AssertionError(
                 "`InsertTypePromotion` deduces symbolic fake arguments from the graph. "

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers for building and inspecting TorchScript graphs during ONNX export.
+# Defines the GraphContext dataclass (graph, block, opset, env bookkeeping plus op-creation
+# methods), functions that create nodes and attributes, and small node-kind and domain
+# predicates. Import time: compiles the attribute-name regex and the skipped-attribute set.
 """Utilities for manipulating the torch.Graph object and the torchscript."""
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ _SKIP_NODE_ATTRIBUTES = {"inplace", "aten"}
 
 @dataclasses.dataclass
 class GraphContext:
+    # [CLASS DOC] Dataclass bundling the state used while converting one graph to ONNX: the
+    # graph, current block, opset version, the node being converted, the initializer mapping,
+    # the old-to-new value mapping with a set of its values, and a growing list of new nodes.
+    # Unknown attributes are forwarded to the wrapped graph. Key methods: op, aten_op (alias at)
+    # and onnxscript_op, which append nodes to the current block.
     """Extra context for symbolic functions with all methods from torch.Graph.
 
     NOTE: This class is not meant for external consumption. Please do not depend on
@@ -50,6 +59,8 @@ class GraphContext:
     # Relay methods from _C.Graph for compatibility with symbolic functions that expect
     # a _C.Graph
     def __getattr__(self, name: str) -> Any:
+        # [FUNCTION DOC] Fallback attribute lookup: delegates any name not found on the context
+        # to the wrapped graph and returns it. Raises whatever the graph raises when missing.
         return getattr(self.graph, name)
 
     def op(
@@ -59,6 +70,11 @@ class GraphContext:
         outputs: int = 1,
         **kwargs,
     ):
+        # [FUNCTION DOC] Adds an ONNX operator node to the current block. Args: opname (a bare
+        # name gets the onnx domain, a qualified name is kept), raw_args inputs (tensors become
+        # constants), outputs count, kwargs attributes with a type-suffixed name (None skipped).
+        # Returns the single output value, or a tuple when outputs is not one. Mutates the graph
+        # and appends to the new node list. Raises on a badly named attribute.
         """Creates an ONNX operator "opname", taking "raw_args" as inputs and "kwargs" as attributes.
 
         The set of operators and the inputs/attributes they take
@@ -89,6 +105,9 @@ class GraphContext:
         return _add_op(self, opname, *raw_args, outputs=outputs, **kwargs)
 
     def aten_op(self, operator: str, *args, overload_name: str = "", **kwargs):
+        # [FUNCTION DOC] Adds a fallback ATen node: calls op with the aten ATen operator name and
+        # passes the operator name and overload name as string attributes. Returns what op
+        # returns; extra args and kwargs are forwarded as inputs and attributes.
         """Generates an ONNX ATen op node.
 
         This function is for backward compatibility with the old symbolic functions.
@@ -112,6 +131,9 @@ class GraphContext:
         outputs: int = 1,
         **kwargs,
     ):
+        # [FUNCTION DOC] Adds a node for an onnx-script function. Registers the function as a
+        # custom ONNX symbolic under its domain, name and opset version (global registry
+        # mutation), then adds a node with that qualified name. Args and return as for op.
         """Creates an ONNX operator from onnx-script function, taking "raw_args" as inputs and "kwargs" as attributes.
 
         onnx-script repository: https://github.com/microsoft/onnx-script
@@ -156,6 +178,9 @@ def add_op_with_blocks(
     n_blocks: int = 1,
     **attributes,
 ) -> tuple[Any, tuple[GraphContext, ...], _C.Node]:
+    # [FUNCTION DOC] Adds an operator via the context, then attaches n_blocks empty sub-blocks
+    # to its node. Returns the output value(s), a tuple of shallow-copied contexts (one per new
+    # block, each pointing at its block), and the node. Mutates the graph.
     """Creates an ONNX operator "opname", taking inputs and attributes.
 
     Args:
@@ -202,6 +227,10 @@ def _add_op(
     outputs: int = 1,
     **kwargs,
 ):
+    # [FUNCTION DOC] HELPER: Core node builder behind op. Converts non-value args to constant
+    # nodes (None passes through), drops None attributes, prefixes a bare opname with the onnx
+    # domain, creates the node in the context's block (shape inference per global flag), records
+    # it in the new node list, and returns the single output or a tuple of outputs.
     """Creates an ONNX operator "opname", taking "args" as inputs and attributes "kwargs".
 
     The set of operators and the inputs/attributes they take
@@ -257,6 +286,8 @@ def _add_op(
 
 
 def _const_if_tensor(graph_context: GraphContext, arg):
+    # [FUNCTION DOC] HELPER: Returns None and graph values unchanged; wraps any other argument in
+    # a new constant node (value attribute of tensor kind) and returns that node's output.
     if arg is None:
         return arg
     if isinstance(arg, _C.Value):
@@ -275,6 +306,11 @@ def _create_node(
     n_outputs: int,
     shape_inference: bool = True,
 ) -> _C.Node:
+    # [FUNCTION DOC] HELPER: Creates and inserts a node of the given kind into a graph or block
+    # with the given inputs and n_outputs (extra outputs added manually for blocks). Raises an
+    # assertion error if the output count mismatches. Sets attributes in sorted key order,
+    # skipping inplace and aten, then optionally runs node-level ONNX shape/type inference with
+    # the initializer mapping and opset. Returns the node.
     """Creates a node 'domain_op', taking inputs and attributes."""
     if isinstance(graph_or_block, _C.Graph):
         graph = graph_or_block
@@ -311,12 +347,17 @@ def _create_node(
 
 
 def _is_onnx_list(value):
+    # [FUNCTION DOC] HELPER: True if value is iterable but not a string, bytes or tensor.
     return isinstance(value, Iterable) and not isinstance(
         value, (str, bytes, torch.Tensor)
     )
 
 
 def _scalar(x: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Returns the first element of a one-element tensor. Raises an
+    # assertion error if the element count is not one.
+    # KNOWN ISSUE: indexing the first dimension returns a tensor, not a Python value as the
+    # docstring says, and fails for zero-dimensional tensors.
     """Convert a scalar tensor into a Python value."""
     if x.numel() != 1:
         raise AssertionError(f"Expected numel() == 1, got {x.numel()}")
@@ -324,6 +365,11 @@ def _scalar(x: torch.Tensor):
 
 
 def _add_attribute(node: _C.Node, key: str, value: Any, aten: bool):
+    # [FUNCTION DOC] HELPER: Sets one attribute on a node. The key must end in an underscore and
+    # a type suffix (f, i, s, t, g, z or ty); otherwise raises a value error. If the value is a
+    # list-like, the kind gets a plural suffix. Calls the node's matching setter and returns
+    # its result.
+    # KNOWN ISSUE: the aten parameter is accepted but never used.
     r"""Initializes the right attribute based on type of value."""
     m = _ATTR_PATTERN.match(key)
     if m is None:
@@ -339,10 +385,13 @@ def _add_attribute(node: _C.Node, key: str, value: Any, aten: bool):
 
 
 def _is_tensor(x: _C.Value) -> bool:
+    # [FUNCTION DOC] HELPER: True if the value's type is a subtype of the tensor type.
     return x.type().isSubtypeOf(_C.TensorType.get())
 
 
 def get_device_from_value(value: _C.Value) -> torch.device | None:
+    # [FUNCTION DOC] Returns the device recorded in a tensor-typed value's type (may itself be
+    # None if unknown), or None if the value is not a tensor.
     if not _is_tensor(value):
         return None
     tensor_type = typing.cast(_C.TensorType, value.type())
@@ -350,6 +399,8 @@ def get_device_from_value(value: _C.Value) -> torch.device | None:
 
 
 def parse_node_kind(kind: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits a node kind into (domain, op name) at the double colon. Raises a
+    # value error if the separator is missing or appears more than once.
     """Parse node kind into domain and Op name."""
     if "::" not in kind:
         raise ValueError(f"Node kind: {kind} is invalid. '::' is not in node kind.")
@@ -360,15 +411,18 @@ def parse_node_kind(kind: str) -> tuple[str, str]:
 
 
 def is_aten(domain: str) -> bool:
+    # [FUNCTION DOC] True if the domain string equals aten.
     """Check if the domain is official."""
     return domain == "aten"
 
 
 def is_prim(domain: str) -> bool:
+    # [FUNCTION DOC] True if the domain string equals prim.
     """Check if the domain is official."""
     return domain == "prim"
 
 
 def is_onnx(domain: str) -> bool:
+    # [FUNCTION DOC] True if the domain string equals onnx.
     """Check if the domain is official."""
     return domain == "onnx"

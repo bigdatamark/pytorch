@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Conversions between JIT scalar types, torch dtypes, torch type names and ONNX
+# tensor data types. Defines the ScalarName and TorchName literal aliases, the JitScalarType
+# enum (values follow the c10 ScalarType order), two name validators, and module-level lookup
+# tables (and their inverses) built at import time. No other import-time side effects.
 """Utilities for converting and operating on ONNX, JIT and torch types."""
 
 from __future__ import annotations
@@ -65,6 +69,10 @@ TorchName = Literal[
 
 
 class JitScalarType(enum.IntEnum):
+    # [CLASS DOC] Integer enum of scalar types (uint8 through undefined, 21 members) whose
+    # numeric values mirror the c10 ScalarType ordering. Stateless; conversion goes through the
+    # module-level tables. Class methods build members from names, dtypes, ONNX types or graph
+    # values; instance methods convert back to names, dtype or ONNX type.
     """Scalar types defined in torch.
 
     Use ``JitScalarType`` to convert from torch and JIT scalar types to ONNX scalar types.
@@ -108,6 +116,9 @@ class JitScalarType(enum.IntEnum):
 
     @classmethod
     def _from_name(cls, name: ScalarName | TorchName | str | None) -> JitScalarType:
+        # [FUNCTION DOC] HELPER: Maps a JIT scalar name or a torch type name to the enum member.
+        # Args: name, a string or None. Returns the member. Raises OnnxExporterError if name is
+        # None or matches neither table. Scalar names are checked before torch names.
         """Convert a JIT scalar type or torch type name to ScalarType.
 
         Note: DO NOT USE this API when `name` comes from a `torch._C.Value.type()` calls.
@@ -135,6 +146,9 @@ class JitScalarType(enum.IntEnum):
 
     @classmethod
     def from_dtype(cls, dtype: torch.dtype | None) -> JitScalarType:
+        # [FUNCTION DOC] Maps a torch dtype to the enum member via the inverse dtype table.
+        # Args: dtype, a torch dtype or None. Raises OnnxExporterError if it is not in the table
+        # (including None). No side effects.
         """Convert a torch dtype to JitScalarType.
 
         Note: DO NOT USE this API when `dtype` comes from a `torch._C.Value.type()` calls.
@@ -160,6 +174,11 @@ class JitScalarType(enum.IntEnum):
     def from_onnx_type(
         cls, onnx_type: int | _C_onnx.TensorProtoDataType | None
     ) -> JitScalarType:
+        # [FUNCTION DOC] Maps an ONNX tensor data type (enum or its integer value) to the enum
+        # member via the inverse ONNX table. Raises OnnxExporterError if not found.
+        # KNOWN ISSUE: the ONNX table is many-to-one (e.g. qint8 and int8 share INT8, complex32
+        # and undefined share UNDEFINED), so the inverse keeps only the last member per ONNX type
+        # and the result may not be the original scalar type.
         """Convert a ONNX data type to JitScalarType.
 
         Args:
@@ -180,6 +199,13 @@ class JitScalarType(enum.IntEnum):
     def from_value(
         cls, value: torch._C.Value | torch.Tensor | None, default=None
     ) -> JitScalarType:
+        # [FUNCTION DOC] Determines the scalar type of a tensor or graph value. If the value is
+        # neither (or is a None-valued node), returns default when it is a JitScalarType, else
+        # raises OnnxExporterError. Tensors use their dtype. List types use the element type's
+        # dtype, falling back to the element type's name. Optional types use the element dtype, or
+        # default if it is unknown (error if default is not a JitScalarType). Other values use the
+        # type's scalar name unless it is a None constant. Finally falls back to default, else
+        # raises SymbolicValueError.
         """Create a JitScalarType from a value's scalar type.
 
         Args:
@@ -245,18 +271,26 @@ class JitScalarType(enum.IntEnum):
         )
 
     def scalar_name(self) -> ScalarName:
+        # [FUNCTION DOC] Returns the JIT scalar name (e.g. Float) for this member via table lookup.
         """Convert a JitScalarType to a JIT scalar type name."""
         return _SCALAR_TYPE_TO_NAME[self]
 
     def torch_name(self) -> TorchName:
+        # [FUNCTION DOC] Returns the torch type name for this member via table lookup.
+        # KNOWN ISSUE: the table has no entry for UNDEFINED, so that member raises a key error.
         """Convert a JitScalarType to a torch type name."""
         return _SCALAR_TYPE_TO_TORCH_NAME[self]
 
     def dtype(self) -> torch.dtype:
+        # [FUNCTION DOC] Returns the torch dtype for this member via table lookup.
+        # KNOWN ISSUE: the table has no entry for UNDEFINED, so that member raises a key error.
         """Convert a JitScalarType to a torch dtype."""
         return _SCALAR_TYPE_TO_DTYPE[self]
 
     def onnx_type(self) -> _C_onnx.TensorProtoDataType:
+        # [FUNCTION DOC] Returns the ONNX tensor data type for this member. Raises
+        # OnnxExporterError if the member has no ONNX mapping. Quantized types map to their
+        # plain integer counterparts; complex32 maps to UNDEFINED.
         """Convert a JitScalarType to an ONNX data type."""
         if self not in _SCALAR_TYPE_TO_ONNX:
             raise errors.OnnxExporterError(
@@ -265,6 +299,8 @@ class JitScalarType(enum.IntEnum):
         return _SCALAR_TYPE_TO_ONNX[self]
 
     def onnx_compatible(self) -> bool:
+        # [FUNCTION DOC] Returns true if the member has an ONNX mapping and is neither UNDEFINED
+        # nor COMPLEX32.
         """Return whether this JitScalarType is compatible with ONNX."""
         return (
             self in _SCALAR_TYPE_TO_ONNX
@@ -274,11 +310,13 @@ class JitScalarType(enum.IntEnum):
 
 
 def valid_scalar_name(scalar_name: ScalarName | str) -> bool:
+    # [FUNCTION DOC] Returns true if the string is a key of the JIT scalar name table.
     """Return whether the given scalar name is a valid JIT scalar type name."""
     return scalar_name in _SCALAR_NAME_TO_TYPE
 
 
 def valid_torch_name(torch_name: TorchName | str) -> bool:
+    # [FUNCTION DOC] Returns true if the string is a key of the torch type name table.
     """Return whether the given torch name is a valid torch type name."""
     return torch_name in _TORCH_NAME_TO_SCALAR_TYPE
 
