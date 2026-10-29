@@ -1,4 +1,12 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests for the functorch control flow higher-order operators: cond, switch,
+#   while_loop, scan, associative_scan and map.
+# Defines shared helpers (cudagraph checks, functionalization converters, reference "fake"
+#   implementations, combine-function factories, canned while_loop test programs) and a large
+#   TestControlFlow suite checking eager, compiled, make_fx, functionalization, autograd and
+#   cudagraph behavior, many with golden graph strings.
+# Import time: builds the WHILE_LOOP_TESTS table by calling the module-level builder;
+#   otherwise only imports.
 import contextlib
 import functools
 import unittest
@@ -53,6 +61,11 @@ from torch.testing._internal.common_utils import (
 
 @contextlib.contextmanager
 def check_cudagraphs_not_skipped(test_case):
+    # [FUNCTION DOC] HELPER: context manager that asserts no inductor cudagraph skips happened
+    #   inside its body. Records the dynamo inductor cudagraph_skips counter on entry; in the
+    #   finally path restores the saved counter value and then asserts, using the given test case,
+    #   that the counter seen at exit equals the one it reads back (the restore happens before the
+    #   assert so a failure does not leak state).
     counters = torch._dynamo.utils.counters
     old_cudagraph_skips = counters["inductor"]["cudagraph_skips"]
     try:
@@ -68,6 +81,10 @@ def check_cudagraphs_not_skipped(test_case):
 
 
 def _check_compile_cudagraph_backend(test_case, fn, args):
+    # [FUNCTION DOC] HELPER: compiles fn with the cudagraphs backend and runs it three times
+    #   (eager warmup, capture plus replay, replay), each inside the no-skip context manager and
+    #   after marking a new cudagraph step. Each output tree is detached and cloned. Then runs fn
+    #   eagerly and asserts via test_case that every collected output equals the eager result.
     # test cudagraphs backend
     cudagraphs_compiled_fn = torch.compile(fn, backend="cudagraphs")
     # We run 3 times.
@@ -92,11 +109,19 @@ def _check_compile_cudagraph_backend(test_case, fn, args):
 
 
 def _check_compile_many_backends_with_cudagraph(test_case, fn, args):
+    # [FUNCTION DOC] HELPER: runs the cudagraph comparison helper for the backends
+    #   eager_no_compile, eager and aot_eager in turn, forwarding test_case, fn and args.
     for backend in ["eager_no_compile", "eager", "aot_eager"]:
         _check_compile_any_backend_with_cudagraph(test_case, fn, args, backend)
 
 
 def _check_compile_any_backend_with_cudagraph(test_case, fn, args, backend):
+    # [FUNCTION DOC] HELPER: checks that fn works under CUDA graph capture for one backend. Uses
+    #   fn itself for eager_no_compile, else torch.compile with the backend. Runs a warmup on a
+    #   side stream under the control-flow warmup dispatch mode, then captures a CUDAGraph on the
+    #   side stream under the capture dispatch mode, runs eager fn on that stream, replays the
+    #   graph, and asserts that both the warmup output and the replayed (cloned) captured output
+    #   equal the eager result.
     if backend == "eager_no_compile":
         compiled_fn = fn
     else:
@@ -130,12 +155,18 @@ def _check_compile_any_backend_with_cudagraph(test_case, fn, args, backend):
 
 # TODO: pull these helpers from AOTAutograd later
 def to_fun(t):
+    # [FUNCTION DOC] HELPER: converts a tensor into a FunctionalTensor via to_functional; any non-
+    #   tensor value is returned unchanged.
     if isinstance(t, torch.Tensor):
         return FunctionalTensor.to_functional(t)
     return t
 
 
 def from_fun(t):
+    # [FUNCTION DOC] HELPER: inverse of to_fun. Non-FunctionalTensor input is returned as is,
+    #   after raising AssertionError if it is a plain tensor that is nevertheless a
+    #   functional tensor. For a FunctionalTensor it syncs pending updates and returns the
+    #   unwrapped inner tensor.
     if not isinstance(t, FunctionalTensor):
         # quick sanity assert
         if isinstance(t, torch.Tensor):
@@ -147,6 +178,9 @@ def from_fun(t):
 
 
 def to_fun_old(t):
+    # [FUNCTION DOC] HELPER: wraps a plain tensor into a C++ functional tensor and mirrors
+    #   its autograd metadata onto the result; non-tensors and already functional tensors
+    #   are returned unchanged.
     if isinstance(t, torch.Tensor) and not torch._is_functional_tensor(t):
         out = torch._to_functional_tensor(t)
         torch._mirror_autograd_meta_to(t, out)
@@ -155,6 +189,9 @@ def to_fun_old(t):
 
 
 def from_fun_old(t):
+    # [FUNCTION DOC] HELPER: for a tensor input, raises AssertionError if it is not a C++
+    #   functional tensor, otherwise syncs and returns the underlying tensor; non-tensor input
+    #   is returned unchanged.
     # quick sanity assert
     if isinstance(t, torch.Tensor):
         if not torch._is_functional_tensor(t):
@@ -165,12 +202,18 @@ def from_fun_old(t):
 
 
 def _fake_while_loop(cond_fn, body_fn, operands):
+    # [FUNCTION DOC] HELPER: reference eager while loop; repeatedly calls body_fn on the operands
+    #   while cond_fn is truthy and returns the final operands.
     while cond_fn(*operands):
         operands = body_fn(*operands)
     return operands
 
 
 def compile_mode_helper(fct, compile_mode):
+    # [FUNCTION DOC] HELPER: wraps fct according to the compile_mode string: compile gives
+    #   fullgraph static-shape torch.compile, compile_dynamic_shape gives fullgraph dynamic-shape
+    #   compile, eager gives fullgraph compile with the eager backend, and any other value
+    #   returns fct untouched.
     if compile_mode == "compile":
         return torch.compile(fct, fullgraph=True, dynamic=False)
     elif compile_mode == "compile_dynamic_shape":
@@ -194,24 +237,41 @@ ALIAS_FN = [
 
 
 def get_scan_combine_fn(name, associative=True, parameters=None):
+    # [FUNCTION DOC] HELPER: factory returning a combine function for scan or associative_scan
+    #   tests, selected by name (add, adds, mul, div, s5_operator, different_input_size_operator,
+    #   tuple_fct, complex_pointwise, non_pointwise, RNN, fct_c1_no_grad); raises ValueError for
+    #   an unknown name. When associative is False, the chosen function is wrapped so it returns a
+    #   pair holding its result twice (carry and output form). The RNN variant reads weights from
+    #   the parameters argument.
     def add(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: returns the elementwise sum of the two tensors.
         return x + y
 
     def adds(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: returns a tuple with x doubled and y doubled (each
+        #   added to itself).
         return x + x, y + y
 
     def mul(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: returns the elementwise product.
         return x * y
 
     def div(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: returns the elementwise quotient x over y.
         return x / y
 
     def s5_operator(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: S5-style linear recurrence combine. Unpacks each input into
+        #   a pair (A, Bu) and returns the product of the A terms together with A_j times
+        #   Bu_i plus Bu_j.
         A_i, Bu_i = x
         A_j, Bu_j = y
         return A_j * A_i, A_j * Bu_i + Bu_j
 
     def different_input_size_operator(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: combine over 5-tuples (x, dA, dB, C, y). New x is the sum of the
+        #   two x entries; new y is an einsum of the new x with the second C; dA, dB and C of the
+        #   second element are passed through with zero added. Returns the 5-tuple.
         x_o, dA_o, dB_o, C_o, y_o = x
         x_n, dA_n, dB_n, C_n, y_n = y
 
@@ -221,9 +281,14 @@ def get_scan_combine_fn(name, associative=True, parameters=None):
         return x_new, dA_n + 0.0, dB_n + 0.0, C_n + 0.0, y_new
 
     def tuple_fct(x, y):
+        # [FUNCTION DOC] HELPER: combine for pair inputs; returns a pair holding the sum of the
+        #   first entries and the product of the second entries.
         return (x[0] + y[0], x[1] * y[1])
 
     def complex_pointwise(x, y):
+        # [FUNCTION DOC] HELPER: combine over nested dict structures; multiplies the "i" entries,
+        #   multiplies the first nested list element under "j" and adds the "o" entries of the
+        #   dict in the second list element, rebuilding the same structure.
         return {
             "i": x["i"] * y["i"],
             "j": (
@@ -233,15 +298,26 @@ def get_scan_combine_fn(name, associative=True, parameters=None):
         }
 
     def non_pointwise(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: builds a fixed 2x2 matrix from a range on x's device and
+        #   returns x and y each matrix-multiplied by it, summed. Not elementwise, so unsuitable
+        #   as a pointwise combine.
         W = torch.arange(4, dtype=torch.float, device=x.device).view(2, 2)
         return x @ W + y @ W
 
     def RNN(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: RNN cell combine using the enclosing parameters list (four
+        #   tensors): computes a candidate from y and the first two parameters, then tanh of that
+        #   plus x times the third parameter plus the fourth. Returns the new hidden state and a
+        #   clone of it.
         c_new = y @ parameters[0] + parameters[1]
         h_new = torch.tanh(c_new + x @ parameters[2] + parameters[3])
         return h_new, h_new.clone()
 
     def fct_c1_no_grad(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC] HELPER: combine taking a pair x and a tensor y. Returns a nested pair of
+        #   a carry pair (c1, c2) and the output h_new where h_new is tanh of the sum of both x
+        #   entries and y, c2 is the second entry of x plus y, and c1 is the first entry of x plus
+        #   y computed under no_grad so it carries no gradient history.
         h_new = torch.tanh(x[0] + x[1] + y)
         c2 = x[1] + y
         with torch.no_grad():
@@ -280,52 +356,90 @@ def get_scan_combine_fn(name, associative=True, parameters=None):
 
 
 def _while_loop_tests():
+    # [FUNCTION DOC] HELPER: builds the table of while_loop test programs. Defines several
+    #   functions and Modules (simple, simple_with_mutation, nested, Nested, SimpleWithLinear,
+    #   SimpleWithPytreeCarry, NestedWithLinear, IntCarry, PytreeIntCarry, ConstAndSymIntOutput)
+    #   and returns a dict mapping a case name to a pair of (callable or module instance, example
+    #   input tuple). Called once at import time to create WHILE_LOOP_TESTS.
     def simple(x):
+        # [FUNCTION DOC] HELPER: while_loop that adds one to x until its sum reaches 10; returns
+        #   the final carry tuple.
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: predicate: sum of x is less than 10.
             return x.sum() < 10
 
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: returns a one-element tuple with x plus one.
             return (x + 1,)
 
         return while_loop(cond_fn, body_fn, (x,))
 
     def simple_with_mutation(x):
+        # [FUNCTION DOC] HELPER: like simple but both predicate and body perform clone plus in-
+        #   place add one and add minus one on a copy, which leaves values unchanged, to exercise
+        #   mutation handling inside the loop.
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: predicate on a mutated clone of x (net zero change); true
+            #   while its sum is less than 10.
             y = x.clone().add_(1).add_(-1)
             return y.sum() < 10
 
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: mutates a clone of x (net zero change) and returns a tuple
+            #   with that plus one.
             y = x.clone().add_(1).add_(-1)
             return (y + 1,)
 
         return while_loop(cond_fn, body_fn, (x,))
 
     def nested(out_iter, it, y):
+        # [FUNCTION DOC] HELPER: nested while_loop test. Outer loop runs while the sum of out_iter
+        #   is below 2 and increments out_iter each iteration; each outer body runs an inner
+        #   while_loop that runs while the sum of it is below 10, adding y to it and incrementing
+        #   y. Returns the outer loop result tuple.
         def cond_fn(out_iter, it, y):
+            # [FUNCTION DOC] HELPER: inner predicate, sum of it below 10.
             return it.sum() < 10
 
         def body_fn(out_iter, it, y):
+            # [FUNCTION DOC] HELPER: inner body; returns a clone of out_iter, it plus y, and
+            #   y plus one.
             return (out_iter.clone(), it + y, y + 1)
 
         def outer_cond_fn(out_iter, it, y):
+            # [FUNCTION DOC] HELPER: outer predicate, sum of out_iter below 2.
             return out_iter.sum() < 2
 
         def outer_body_fn(out_iter, it, y):
+            # [FUNCTION DOC] HELPER: runs the inner while_loop on the three carries, then returns
+            #   out_iter plus one with the inner it and y.
             out_iter, it, y = while_loop(cond_fn, body_fn, (out_iter, it, y))
             return (out_iter + 1, it, y)
 
         return while_loop(outer_cond_fn, outer_body_fn, (out_iter, it, y))
 
     class Nested(torch.nn.Module):
+        # [CLASS DOC] HELPER: module with two nested while_loops over scalar counters and
+        #   two float tensors.
         def forward(self, ci, cj, a, b):
+            # [FUNCTION DOC] HELPER: runs an outer while_loop on counter ci while it is positive;
+            #   each iteration runs an inner while_loop on counter cj, which adds 3.14 to x and
+            #   subtracts 2.71 from y per step, then decrements the outer counter, doubles x and
+            #   halves y. Returns the loop result.
             def cond_fn(i1, j1, x1, y1):
+                # [FUNCTION DOC] HELPER: outer predicate, first counter greater than zero.
                 return i1 > 0
 
             def body_fn(i1, j1, x1, y1):
+                # [FUNCTION DOC] HELPER: outer body; runs the inner while_loop then returns
+                #   decremented counter, cloned inner counter, x doubled and y halved.
                 def cond_fn_nested(i2, j2, x2, y2):
+                    # [FUNCTION DOC] HELPER: inner predicate, second counter greater than zero.
                     return j2 > 0
 
                 def body_fn_nested(i2, j2, x2, y2):
+                    # [FUNCTION DOC] HELPER: inner body; clones the first counter, decrements the
+                    #   second, adds 3.14 to x and subtracts 2.71 from y.
                     return i2.clone(), j2 - 1, x2 + 3.14, y2 - 2.71
 
                 i1, j1, x1, y1 = while_loop(
@@ -336,26 +450,44 @@ def _while_loop_tests():
             return while_loop(cond_fn, body_fn, (ci, cj, a, b))
 
     class SimpleWithLinear(torch.nn.Module):
+        # [CLASS DOC] HELPER: module holding a 2x2 Linear and an integer buffer dec equal to one;
+        #   used to test while_loop bodies that use module parameters and buffers.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: creates the linear layer and the buffer dec
+            #   holding tensor one.
             super().__init__()
             self.linear = torch.nn.Linear(2, 2)
             self.dec = torch.nn.Buffer(torch.tensor(1))
 
         def forward(self, iter, x):
+            # [FUNCTION DOC] HELPER: runs while_loop on (iter, x); the loop continues while the
+            #   counter minus dec is positive, and each step decrements the counter and applies
+            #   the linear layer to x.
             def cond_fn(it, x):
+                # [FUNCTION DOC] HELPER: true while it minus the module buffer dec is
+                #   greater than zero.
                 return it - self.dec > 0
 
             def body_fn(it, x):
+                # [FUNCTION DOC] HELPER: returns the decremented counter and the linear layer
+                #   applied to x.
                 return it - 1, self.linear(x)
 
             return while_loop(cond_fn, body_fn, (iter, x))
 
     class SimpleWithPytreeCarry(torch.nn.Module):
+        # [CLASS DOC] HELPER: module whose while_loop carry includes a nested pytree of tensors.
         def forward(self, it, pytree_input):
+            # [FUNCTION DOC] HELPER: runs while_loop with a counter and a pytree input and
+            #   returns the result.
             def cond_fn(it, pytree_input):
+                # [FUNCTION DOC] HELPER: true while the counter is positive.
                 return it > 0
 
             def body_fn(it, pytree_input):
+                # [FUNCTION DOC] HELPER: rotates the pytree: new first element is the sine of the
+                #   "x" entry, new "x" is the cosine of "y", new "y" is the old first element plus
+                #   one; counter decremented. Keeps the original container structure.
                 x = pytree_input[0][0]
                 y = pytree_input[1]["x"]
                 z = pytree_input[1]["y"]
@@ -367,32 +499,51 @@ def _while_loop_tests():
             return while_loop(cond_fn, body_fn, (it, pytree_input))
 
     class NestedWithLinear(torch.nn.Module):
+        # [CLASS DOC] HELPER: module holding a SimpleWithLinear submodule, its own Linear layer
+        #   and an integer buffer dec equal to one; nests a module-using loop inside another loop.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: creates the inner module, the outer linear layer and
+            #   the dec buffer.
             super().__init__()
             self.mod = SimpleWithLinear()
             self.outer_linear = torch.nn.Linear(2, 2)
             self.dec = torch.nn.Buffer(torch.tensor(1))
 
         def forward(self, iter, x):
+            # [FUNCTION DOC] HELPER: runs while_loop on (iter, x) that continues while the counter
+            #   minus dec is positive.
             def cond_fn(it, x):
+                # [FUNCTION DOC] HELPER: true while it minus the buffer dec is greater than zero.
                 return it - self.dec > 0
 
             def body_fn(it, x):
+                # [FUNCTION DOC] HELPER: decrements the counter, runs the inner module on the
+                #   pair, takes its output tensor and applies the outer linear layer.
                 return it - 1, self.outer_linear(self.mod(it, x)[1])
 
             return while_loop(cond_fn, body_fn, (iter, x))
 
     class PytreeIntCarry(torch.nn.Module):
+        # [CLASS DOC] HELPER: module whose while_loop carries Python ints and symbolic shape sizes
+        #   inside a pytree beside a tensor.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: carries the two leading sizes of x, a dict of three int
+            #   constants and sine of x through a while_loop. Afterwards maps over the int dict to
+            #   add one, and to add the final tensor. Returns (final shapes, incremented ints,
+            #   ints plus tensor, final tensor).
             a = x.shape[0]
             b = x.shape[1]
 
             def cond_fn(shapes, const_int_dict, x):
+                # [FUNCTION DOC] HELPER: true while the product of the three int constants is
+                #   below the product of the two size entries.
                 a, b = shapes
                 c1, c2, c3 = const_int_dict["int_carry"]
                 return c1 * c2 * c3 < a * b
 
             def body_fn(shapes, const_int_dict, x):
+                # [FUNCTION DOC] HELPER: increments both sizes and all three int constants and
+                #   adds one to x; returns the same pytree structure.
                 a, b = shapes
                 c1, c2, c3 = const_int_dict["int_carry"]
                 return (
@@ -408,11 +559,23 @@ def _while_loop_tests():
             return (out_shapes, out_inc, out_add, out_x)
 
     class IntCarry(torch.nn.Module):
+        # [CLASS DOC] HELPER: module whose while_loop carry is a plain int counter plus a tensor,
+        #   invoked through the higher-order op directly.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: calls the while_loop higher-order op directly with initial
+            #   counter zero and x. The body writes the counter value added to row it of a clone
+            #   of x. Returns four values: final counter plus one, counter plus the tensor,
+            #   whether the counter is below the leading size, and a ones tensor of size twice the
+            #   counter (guarded by a check that the counter is positive).
             def cond_fn(it, x):
+                # [FUNCTION DOC] HELPER: true while the counter is less than the leading
+                #   dimension of x.
                 return it < x.shape[0]
 
             def body_fn(it, x):
+                # [FUNCTION DOC] HELPER: asserts via torch._check the counter is in range, adds
+                #   the counter to the selected row of a clone of x in place, and returns counter
+                #   plus one with the clone.
                 x_clone = x.clone()
                 # Need these checks to select from x
                 torch._check(it >= 0)
@@ -434,14 +597,24 @@ def _while_loop_tests():
             )
 
     class ConstAndSymIntOutput(torch.nn.Module):
+        # [CLASS DOC] HELPER: module testing while_loop whose carries mix symbolic ints, constant
+        #   ints and a data-dependent int.
         def forward(self, t):
+            # [FUNCTION DOC] HELPER: builds a carry of the two sizes, three int ones, size0
+            #   plus one, the integer sum of t via item, and sine of t; runs the while_loop
+            #   higher-order op directly; returns (result plus one, result plus t) mapped over
+            #   the output pytree.
             a = t.shape[0]
             b = t.shape[1]
 
             def cond_fn(a, b, c1, c2, c3, c0, u0, x):
+                # [FUNCTION DOC] HELPER: true while the product of c1, c2 and c3 is below the
+                #   product of a and b.
                 return c1 * c2 * c3 < a * b
 
             def body_fn(a, b, c1, c2, c3, c0, u0, x):
+                # [FUNCTION DOC] HELPER: rotates the carries: returns b, c1, c2, c3, a, constant
+                #   zero, u0 plus one, and x plus one.
                 return b, c1, c2, c3, a, 0, u0 + 1, x + 1
 
             carry = (a, b, 1, 1, 1, a + 1, t.sum().to(torch.int64).item(), t.sin())
@@ -502,6 +675,9 @@ WHILE_LOOP_TESTS = _while_loop_tests()
 def collect_meta_for_filtered_nodes(
     gm: torch.fx.GraphModule, node_names, meta_field_name
 ):
+    # [FUNCTION DOC] HELPER: walks every submodule of the graph module and, for each graph node
+    #   whose name is in node_names, appends the value of each requested meta field name (None
+    #   when missing). Returns the flat list.
     ret = []
     for mod in gm.modules():
         for node in mod.graph.nodes:
@@ -512,6 +688,8 @@ def collect_meta_for_filtered_nodes(
 
 
 def reduce_func(*operands):
+    # [FUNCTION DOC] HELPER: returns the sum of all positional operands, starting
+    #   from integer zero.
     acc = 0
     for operand in operands:
         acc += operand
@@ -519,26 +697,42 @@ def reduce_func(*operands):
 
 
 class ReduceObj:
+    # [CLASS DOC] HELPER: callable object wrapping reduce_func, used to
+    #   test callable-instance branches.
     def __call__(self, *operands):
+        # [FUNCTION DOC] HELPER: sums the operands via reduce_func.
         return reduce_func(*operands)
 
 
 class ReduceMod(torch.nn.Module):
+    # [CLASS DOC] HELPER: nn.Module wrapper around reduce_func, used to test modules
+    #   as branch callables.
     def _reduce(self, *operands):
+        # [FUNCTION DOC] HELPER: sums the operands via reduce_func.
         return reduce_func(*operands)
 
     def forward(self, *operands):
+        # [FUNCTION DOC] HELPER: delegates to _reduce.
         return self._reduce(*operands)
 
 
 @unittest.skipIf(IS_WINDOWS, "Windows not supported for this test")
 @skipIfNoDynamoSupport
 class TestControlFlow(TestCase):
+    # [CLASS DOC] Main test suite for cond, while_loop, scan, associative_scan, map and related
+    #   higher-order ops. Skipped on Windows and when dynamo is unsupported. Methods compare
+    #   eager, compiled and traced results, check autograd and compare golden graph text. setUp
+    #   resets dynamo; check_autograd is a shared gradient comparer.
     def setUp(self):
+        # [FUNCTION DOC] Resets torch._dynamo state, then runs the base TestCase setUp.
         torch._dynamo.reset()
         super().setUp()
 
     def check_autograd(self, result, result_exp, params):
+        # [FUNCTION DOC] HELPER: flattens params, result and result_exp as pytrees, computes
+        #   gradients of the expected and actual results with respect to params using all-
+        #   ones output gradients, and asserts the two gradient lists are equal with atol
+        #   6e-05 and rtol 6e-06.
         params_flatten = pytree.tree_leaves(params)
         result_flatten = pytree.tree_leaves(result)
         result_exp_flatten = pytree.tree_leaves(result_exp)
@@ -551,10 +745,14 @@ class TestControlFlow(TestCase):
         self.assertEqual(grads, expected_grads, atol=6e-05, rtol=6e-06)
 
     def test_cond_no_trace(self):
+        # [FUNCTION DOC] Eager cond with a Python bool False pred: checks the false branch
+        #   (cosine) result is returned.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns the sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns the cosine of x.
             return x.cos()
 
         x = torch.randn(4)
@@ -563,10 +761,14 @@ class TestControlFlow(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_cond_gpu(self):
+        # [FUNCTION DOC] CUDA-only test: cond with a CUDA boolean tensor predicate False and CUDA
+        #   operand; asserts the result equals the cosine of x.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns the sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns the cosine of x.
             return x.cos()
 
         x = torch.randn(4, device="cuda")
@@ -575,10 +777,16 @@ class TestControlFlow(TestCase):
         self.assertEqual(result, torch.cos(x))
 
     def test_cond_autograd_simple(self):
+        # [FUNCTION DOC] Eager cond for both predicate values with an input requiring grad: checks
+        #   the result and the gradient against calling the selected branch directly. Then traces
+        #   a function that runs cond and autograd.grad with make_fx and compares the golden
+        #   graph, which contains two cond ops (forward, backward) with their branch subgraphs.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns the sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns the cosine of x.
             return x.cos()
 
         for pred, fn in zip(
@@ -594,6 +802,9 @@ class TestControlFlow(TestCase):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond on the predicate and x,
+            #   then returns the gradient of the result with respect to x using an all-
+            #   ones output gradient.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -617,10 +828,15 @@ def forward(self, pred_1, x_1):
         )
 
     def test_cond_autograd_complex(self):
+        # [FUNCTION DOC] Same as the simple autograd cond test but with more involved branches
+        #   (abs of sine of x squared, and cosine of x plus 42): checks forward and gradients for
+        #   both predicates and the make_fx golden graph.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns the absolute value of the sine of x squared.
             return torch.abs((x**2).sin())
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns the cosine of x plus 42.
             return (x + 42).cos()
 
         for pred, fn in zip(
@@ -636,6 +852,8 @@ def forward(self, pred_1, x_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond then returns gradient with respect
+            #   to x using ones as the output gradient.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -659,17 +877,31 @@ def forward(self, pred_1, x_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_nested(self):
+        # [FUNCTION DOC] Skipped under dynamo (graph break). Defines a module with three levels of
+        #   nested torch.cond selected by predicates p0, p1, p2 over three tensors and checks
+        #   nested cond forward and gradient behavior.
         class Nested(torch.nn.Module):
+            # [CLASS DOC] HELPER: module nesting three levels of cond.
             def forward(self, p0, p1, p2, a, b, c):
+                # [FUNCTION DOC] HELPER: selects true_fn or false_fn by p0 and, inside, by p1 and
+                #   then p2, each leaf being a small arithmetic expression of the three inputs;
+                #   returns the cond result.
                 def true_fn(x0, y0, z0):
+                    # [FUNCTION DOC] HELPER: when p0 is true, dispatches on p1 between
+                    #   true_true_fn and true_false_fn.
                     def true_true_fn(x1, y1, z1):
+                        # [FUNCTION DOC] HELPER: returns (x1 minus y1 times z1) times 3.14.
                         return (x1 - y1 * z1) * 3.14
 
                     def true_false_fn(x1, y1, z1):
+                        # [FUNCTION DOC] HELPER: dispatches on p2 between the two
+                        #   leaf functions below.
                         def true_false_true_fn(x2, y2, z2):
+                            # [FUNCTION DOC] HELPER: returns x2 times y2 times z2 divided by 2.71.
                             return (x2 * y2 * z2) / 2.71
 
                         def true_false_false_fn(x2, y2, z2):
+                            # [FUNCTION DOC] HELPER: returns (x2 plus y2 plus z2) times 1.23.
                             return (x2 + y2 + z2) * 1.23
 
                         return torch.cond(
@@ -679,11 +911,18 @@ def forward(self, pred_1, x_1):
                     return torch.cond(p1, true_true_fn, true_false_fn, [x0, y0, z0])
 
                 def false_fn(x0, y0, z0):
+                    # [FUNCTION DOC] HELPER: when p0 is false, dispatches on p1 between
+                    #   false_true_fn and false_false_fn.
                     def false_true_fn(x1, y1, z1):
+                        # [FUNCTION DOC] HELPER: dispatches on p2 between the two
+                        #   leaf functions below.
                         def false_true_true_fn(x2, y2, z2):
+                            # [FUNCTION DOC] HELPER: returns x2 minus y2 minus z2, plus 1.23.
                             return (x2 - y2 - z2) + 1.23
 
                         def false_true_false_fn(x2, y2, z2):
+                            # [FUNCTION DOC] HELPER: returns x2 divided by y2 divided by
+                            #   z2, minus 3.14.
                             return (x2 / y2 / z2) - 3.14
 
                         return torch.cond(
@@ -691,6 +930,7 @@ def forward(self, pred_1, x_1):
                         )
 
                     def false_false_fn(x1, y1, z1):
+                        # [FUNCTION DOC] HELPER: returns (x1 minus y1 times z1) divided by 2.71.
                         return (x1 - y1 * z1) / 2.71
 
                     return torch.cond(p1, false_true_fn, false_false_fn, [x0, y0, z0])
@@ -700,11 +940,15 @@ def forward(self, pred_1, x_1):
         nn_module = Nested()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: calls the nested module with predicate tensors false, true,
+            #   false and x for all three tensor inputs.
             return nn_module(
                 torch.tensor(False), torch.tensor(True), torch.tensor(False), x, x, x
             )
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: calls the nested module with predicate tensors true, false,
+            #   true and x for all three tensor inputs.
             return nn_module(
                 torch.tensor(True), torch.tensor(False), torch.tensor(True), x, x, x
             )
@@ -724,10 +968,16 @@ def forward(self, pred_1, x_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_mixed_require_grad(self):
+        # [FUNCTION DOC] Skipped under dynamo. Runs cond with operands where only some require
+        #   grad (x requires grad, y does not) and checks result and gradient with respect to x
+        #   for both predicates. Then traces forward plus backward with make_fx and compares the
+        #   golden graph, in which the non-grad input is still passed to the branches.
         def true_fn(x, y, z):
+            # [FUNCTION DOC] HELPER: returns the product of the three inputs.
             return x * y * z
 
         def false_fn(x, y, z):
+            # [FUNCTION DOC] HELPER: returns the sum of the three inputs.
             return x + y + z
 
         x = torch.randn(4, requires_grad=True)
@@ -745,6 +995,8 @@ def forward(self, pred_1, x_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x, y, z):
+            # [FUNCTION DOC] HELPER: traced function; runs cond over the three operands and
+            #   returns the gradient of the result with respect to the first operand only.
             result = cond(pred, true_fn, false_fn, (x, y, z))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -769,12 +1021,21 @@ def forward(self, pred_1, x_1, y_1, z_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_grad_through_cond(self):
+        # [FUNCTION DOC] Skipped under dynamo. Checks gradients with respect to the weight of a
+        #   Linear module captured by the branches, for both predicate values, and traces the
+        #   backward with symbolic make_fx (non-fake inputs allowed because module parameters
+        #   are not fakified), comparing the golden graph in which parameters are passed as
+        #   extra cond operands.
         nn_module = torch.nn.Linear(4, 4)
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: applies the captured linear module to x.
             return nn_module(x)
 
         def false_fn(X):
+            # [FUNCTION DOC] HELPER: returns x times the linear module output.
+            # KNOWN ISSUE: the parameter is named X (capital) but the body uses x from the
+            #   enclosing scope, so it works only through closure capture of the outer x.
             return x * nn_module(x)
 
         x = torch.randn(4, requires_grad=True)
@@ -797,6 +1058,8 @@ def forward(self, pred_1, x_1, y_1, z_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond and returns the gradient of the
+            #   result with respect to the module weight using ones as output gradient.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (nn_module.weight,), grad_out)
@@ -831,19 +1094,29 @@ def forward(self, pred_1, x_1):
         )
 
     def test_cond_in_forloop(self):
+        # [FUNCTION DOC] Unrolls three cond calls in a Python loop (always the true branch because
+        #   the predicate is a constant true bool) and compares the result and the input gradient
+        #   with a plain loop of squaring plus one. Then traces forward plus backward in symbolic
+        #   mode and compares the golden graph, in which cond has been resolved away into
+        #   straight-line aten ops.
         def for_loop_fake(x):
+            # [FUNCTION DOC] HELPER: reference; three times replaces x by x squared plus one.
             for _ in range(3):
                 x = x * x + 1
             return x
 
         def for_loop_test(x):
+            # [FUNCTION DOC] HELPER: three iterations each applying cond with a Python bool
+            #   predicate (always true here) choosing between square-plus-one and identity.
             for i in range(3):
                 pred = i < 3
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: returns x squared plus one.
                     return x * x + 1
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: returns x unchanged.
                     return x
 
                 x = cond(pred, true_fn, false_fn, (x,))
@@ -862,6 +1135,8 @@ def forward(self, pred_1, x_1):
         self.assertEqual(expected_grads, grads)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: traced function; runs the cond loop and returns gradient of
+            #   its result with respect to x with ones as output gradient.
             x_new = for_loop_test(x)
             grad_out = torch.ones_like(x_new)
             return torch.autograd.grad(x_new, (x,), grad_out)
@@ -892,10 +1167,19 @@ def forward(self, x_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_pytree_not_all_inputs_used(self):
+        # [FUNCTION DOC] Skipped under dynamo. Operand is a nested dict/list/tuple pytree where
+        #   the true branch ignores the third tensor. For the true predicate it expects taking
+        #   gradients with respect to all three leaves to raise an exception (unused input).
+        #   Traces the gradient wrt two leaves and compares golden graphs for the outer graph plus
+        #   the true branch forward and backward subgraphs.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: adds the first list entry and the "b" entry of the second
+            #   entry (ignores the third).
             return x["t"][0] + x["t"][1]["b"]
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: first entry times (the third entry's first element
+            #   divided by "b").
             return x["t"][0] * (x["t"][2][0] / x["t"][1]["b"])
 
         a = torch.randn(4, requires_grad=True)
@@ -918,6 +1202,8 @@ def forward(self, x_1):
                     self.assertEqual(expected_grads, grads)
 
         def f(pred, a, b, c):
+            # [FUNCTION DOC] HELPER: traced function; runs cond on the pytree and returns gradient
+            #   with respect to a and b.
             result = cond(pred, true_fn, false_fn, ({"t": [a, {"b": b}, (c,)]},))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (a, b), grad_out)
@@ -966,10 +1252,16 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1):
         )
 
     def test_cond_autograd_pytree_input(self):
+        # [FUNCTION DOC] Checks cond with a pytree operand (dict containing list, dict and tuple
+        #   of tensors) for both predicates: result and gradients with respect to a and b match
+        #   direct calls. Traces gradients in symbolic mode with captured tensors and compares
+        #   the golden graph.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: first entry plus "b" times the third entry's element.
             return x["t"][0] + x["t"][1]["b"] * x["t"][2][0]
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: first entry times (third entry's element divided by "b").
             return x["t"][0] * (x["t"][2][0] / x["t"][1]["b"])
 
         a = torch.randn(4, requires_grad=True)
@@ -990,6 +1282,8 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred):
+            # [FUNCTION DOC] HELPER: traced function; closes over a, b, c; runs cond on the
+            #   predicate and returns gradients with respect to a and b.
             result = cond(pred, true_fn, false_fn, ({"t": [a, {"b": b}, (c,)]},))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (a, b), grad_out)
@@ -1022,10 +1316,17 @@ def forward(self, pred_1):
         )
 
     def test_cond_autograd_different_pytree_output(self):
+        # [FUNCTION DOC] Branches return different output pytree structures (tuple with dict and
+        #   list versus a dict of list); asserts cond raises UncapturedHigherOrderOpError
+        #   mentioning the torch.cond operator for both predicate values.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns a tuple of: first entry, a dict holding third element
+            #   divided by b, and a list with the third element.
             return x["t"][0], {"r": x["t"][2][0] / x["t"][1]["b"]}, [x["t"][2][0]]
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a dict with a list holding first times b and
+            #   the third element.
             return {"res": [x["t"][0] * x["t"][1]["b"], x["t"][2][0]]}
 
         a = torch.randn(4, requires_grad=True)
@@ -1041,10 +1342,17 @@ def forward(self, pred_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_same_pytree_output(self):
+        # [FUNCTION DOC] Skipped under dynamo. Branches return the same dict-of-list-and-tuple
+        #   structure of cloned tensors; checks values and gradients wrt c for both predicates,
+        #   then traces forward only with real tracing and compares the golden graph, which
+        #   returns the rebuilt dict.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns a dict with a list of clones of the first entry and a
+            #   tuple of a clone of the third element.
             return {"res": [x["t"][0].clone(), (x["t"][2][0].clone(),)]}
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: like true_fn but the first list entry is a clone of "b".
             return {"res": [x["t"][1]["b"].clone(), (x["t"][2][0].clone(),)]}
 
         a = torch.randn(4, requires_grad=True)
@@ -1067,6 +1375,8 @@ def forward(self, pred_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred):
+            # [FUNCTION DOC] HELPER: traced function; runs cond on the pytree of closed-over
+            #   tensors and returns the result.
             result = cond(pred, true_fn, false_fn, ({"t": [a, {"b": b}, (c,)]},))
             return result
 
@@ -1088,14 +1398,20 @@ def forward(self, pred_1):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_cond_autograd_torch_nn_module(self):
+        # [FUNCTION DOC] Skipped under dynamo. Branches use a Linear module and a GRUCell
+        #   module; checks results and input gradients for both predicates, then traces
+        #   forward and backward and compares a golden graph where all six module parameters
+        #   are passed as operands.
         nn_module_true = torch.nn.Linear(4, 4)
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: applies the Linear module to abs of sine of x squared.
             return nn_module_true(torch.abs((x**2).sin()))
 
         nn_module_false = torch.nn.GRUCell(4, 4)
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: applies the GRUCell module to cosine of x plus 42.
             return nn_module_false((x + 42).cos())
 
         for pred, fn in zip(
@@ -1111,6 +1427,7 @@ def forward(self, pred_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond and returns the gradient wrt x.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -1151,21 +1468,29 @@ def forward(self, pred_1, x_1):
         )
 
     def test_cond_autograd_user_nn_module(self):
+        # [FUNCTION DOC] Same autograd checks as the nn module test, with a user-defined squaring
+        #   module in the true branch and a ReLU module in the false branch; compares the golden
+        #   make_fx graph (no parameters, so only x and the gradient are passed).
         class User_nn_module(torch.nn.Module):
+            # [CLASS DOC] HELPER: parameterless module that squares its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: only calls the base class initializer.
                 super().__init__()
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: returns input times input.
                 return input * input
 
         nn_module_true = User_nn_module()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: applies the squaring module to abs of sine of x squared.
             return nn_module_true(torch.abs((x**2).sin()))
 
         nn_module_false = torch.nn.ReLU(inplace=False)
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: applies the ReLU module to cosine of x plus 42.
             return nn_module_false((x + 42).cos())
 
         for pred, fn in zip(
@@ -1181,6 +1506,7 @@ def forward(self, pred_1, x_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond and returns the gradient wrt x.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -1203,11 +1529,17 @@ def forward(self, pred_1, x_1):
         )
 
     def test_cond_autograd_inner_fn(self):
+        # [FUNCTION DOC] Checks that a branch containing an inner helper function behaves like one
+        #   without: forward and gradient for false then true predicate, equality of both results
+        #   and gradients, plus the golden make_fx graph.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: abs of sine of x squared.
             return torch.abs((x**2).sin())
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: same math as true_fn, computed through an inner function.
             def inner_fn(x):
+                # [FUNCTION DOC] HELPER: returns x squared.
                 return x**2
 
             return torch.abs(inner_fn(x).sin())
@@ -1236,6 +1568,7 @@ def forward(self, pred_1, x_1):
         self.assertEqual(grads_false, grads_true)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond and returns the gradient wrt x.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -1258,10 +1591,16 @@ def forward(self, pred_1, x_1):
         )
 
     def test_cond_autograd_inner_tensor(self):
+        # [FUNCTION DOC] Checks autograd through a branch that creates its own tensor (ones times
+        #   42, no grad) inside the branch; forward and gradient for both predicates plus the
+        #   golden make_fx graph.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: abs of sine of x squared.
             return torch.abs((x**2).sin())
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: builds a constant tensor of 42s and returns the cosine of
+            #   x times it.
             y = torch.ones(4, requires_grad=False) * 42
             return (x * y).cos()
 
@@ -1278,6 +1617,7 @@ def forward(self, pred_1, x_1):
             self.assertEqual(expected_grads, grads)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: traced function; runs cond and returns the gradient wrt x.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -1301,10 +1641,14 @@ def forward(self, pred_1, x_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_cond_autograd_gpu(self):
+        # [FUNCTION DOC] CUDA-only: cond with CUDA boolean predicates and a CUDA input requiring
+        #   grad; checks result and gradient against calling the branch directly.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns cosine of x.
             return x.cos()
 
         for pred, fn in zip(
@@ -1321,12 +1665,20 @@ def forward(self, pred_1, x_1):
             self.assertEqual(expected_grads, grads)
 
     def _test_cond_autograd(self, cond_fct, pred_fn, true_fn, false_fn, operands):
+        # [FUNCTION DOC] HELPER: shared checker. Runs the given cond function on the predicate
+        #   computed from operands, compares with the branch executed on grad-enabled detached
+        #   clones, then (if any operand requires grad) compares gradients (unused ones
+        #   materialized as zeros) and checks that tensor metadata of each gradient equals the
+        #   operand metadata ignoring requires_grad. Returns the cond outputs and the operands
+        #   that require grad.
         from torch.fx.passes.shape_prop import _extract_tensor_metadata, TensorMetadata
 
         # This is a helper function that extracts the metadata from the tensor and
         # sets the requires_grad flag to false. This is needed as we compare the
         # metadata of the operands and the gradients
         def _extract_tensor_metadata_except_requires_grad(arg):
+            # [FUNCTION DOC] HELPER: returns the fx tensor metadata of the argument with the
+            #   requires_grad field forced to false so operands and gradients can be compared.
             metadata = _extract_tensor_metadata(arg)
             metadata = TensorMetadata(
                 metadata.shape,
@@ -1393,6 +1745,12 @@ def forward(self, pred_1, x_1):
     def test_cond_autograd_zeros_unused_branch_complex_compile_fail(
         self, compile_mode, scalar
     ):
+        # [FUNCTION DOC] Skipped under dynamo, without SM70 or CUDA. Parametrized with compile
+        #   mode compile_dynamic_shape and scalar False. Builds CUDA operands (non-scalar
+        #   shapes in this configuration, labeled as not working), uses a dynamic-shape
+        #   compiled cond and runs the shared autograd checker with matrix-multiply branches.
+        #   It has no explicit failure assertion; the name suggests the non-scalar case is a
+        #   known failing configuration.
         device = torch.device("cuda")
         cond_fct = compile_mode_helper(torch.cond, compile_mode)
 
@@ -1416,6 +1774,8 @@ def forward(self, pred_1, x_1):
         operands = [x, w1, b1, w2, b2]
 
         def true_fn(x, w1, b1, w2, b2):
+            # [FUNCTION DOC] HELPER: for scalar mode returns a one-tuple of w1 times x plus b1,
+            #   otherwise a one-tuple with the sum of the matrix product of w1 and x plus b1.
             if scalar:
                 # This works
                 return ((w1 * x + b1),)
@@ -1424,6 +1784,7 @@ def forward(self, pred_1, x_1):
                 return ((w1 @ x + b1).sum(),)
 
         def false_fn(x, w1, b1, w2, b2):
+            # [FUNCTION DOC] HELPER: same as true_fn but using w2 and b2.
             if scalar:
                 # This works
                 return ((w2 * x + b2),)
@@ -1432,6 +1793,7 @@ def forward(self, pred_1, x_1):
                 return ((w2 @ x + b2).sum(),)
 
         def pred_fn(x, w1, b1, w2, b2):
+            # [FUNCTION DOC] HELPER: predicate; true if the mean of x is greater than zero.
             return x.mean() > 0
 
         cond_outputs, cond_inputs = self._test_cond_autograd(
@@ -1439,6 +1801,8 @@ def forward(self, pred_1, x_1):
         )
 
     def test_switch_basic(self):
+        # [FUNCTION DOC] Eager switch over three branches (zeros, ones, twos): integer and single-
+        #   element tensor indices, with out-of-range indices clamped to the first or last branch.
         x = torch.tensor([0, 1, 2])
         branches = (
             lambda inp_x: torch.zeros_like(inp_x),
@@ -1479,6 +1843,8 @@ def forward(self, pred_1, x_1):
         self.assertEqual(result, 2 * torch.ones_like(x))
 
     def test_switch_zero_args(self):
+        # [FUNCTION DOC] Switch with branches that take no operands and an empty operand list;
+        #   checks each index runs the matching branch.
         branches = (
             lambda: torch.zeros(3),
             lambda: torch.ones(3),
@@ -1489,6 +1855,8 @@ def forward(self, pred_1, x_1):
             self.assertEqual(switch(i, branches, []), branches[i]())
 
     def test_switch_multiple_args(self):
+        # [FUNCTION DOC] Switch with two operands; each index gives the same result as calling the
+        #   matching branch directly.
         x = torch.ones(3)
         y = torch.tensor([1.0, 2.0, 3.0])
         branches = (
@@ -1501,6 +1869,9 @@ def forward(self, pred_1, x_1):
             self.assertEqual(switch(i, branches, (x, y)), branches[i](x, y))
 
     def test_switch_invalid_index(self):
+        # [FUNCTION DOC] Checks switch raises RuntimeError for a list index ("Expected
+        #   index to be") and for a two-element tensor index ("Expected index to be int
+        #   or single-element tensor").
         x = torch.ones(3)
         branches = (torch.sin, torch.cos)
 
@@ -1513,6 +1884,8 @@ def forward(self, pred_1, x_1):
             switch(torch.tensor([0, 1]), branches, (x,))
 
     def test_switch_zero_branch(self):
+        # [FUNCTION DOC] Checks that an empty branch list raises RuntimeError saying branches must
+        #   be a non-empty tuple or list of callables.
         x = torch.ones(3)
 
         # Empty-branch rejection happens unconditionally at the top of
@@ -1526,10 +1899,13 @@ def forward(self, pred_1, x_1):
             switch(idx, [], (x,))
 
     def test_switch_single_branch_shortcut(self):
+        # [FUNCTION DOC] With a single branch, switch just calls it whatever the index is (ints 0
+        #   and 5, tensors 0 and 7).
         # A single-branch switch degenerates to a plain call regardless of
         # index value (matches jax.lax.switch). The index is ignored since
         # it clamps to 0.
         def only_branch(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine of the input.
             return inp_x.sin()
 
         x = torch.randn(4)
@@ -1539,6 +1915,8 @@ def forward(self, pred_1, x_1):
         self.assertEqual(switch(torch.tensor([7]), (only_branch,), (x,)), x.sin())
 
     def test_switch_different_output_shapes(self):
+        # [FUNCTION DOC] Eager switch where branches return different shapes (sine keeps shape,
+        #   sum returns a scalar); checks both index values.
         x = (torch.pi / 2) * torch.ones(2)
         branches = (torch.sin, torch.sum)
 
@@ -1550,10 +1928,13 @@ def forward(self, pred_1, x_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_switch_gpu(self):
+        # [FUNCTION DOC] CUDA-only: switch with a CUDA index tensor selecting the cosine branch.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine of the input.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine of the input.
             return inp_x.cos()
 
         x = torch.randn(4, device="cuda")
@@ -1562,11 +1943,15 @@ def forward(self, pred_1, x_1):
         self.assertEqual(result, torch.cos(x))
 
     def test_switch_no_trace(self):
+        # [FUNCTION DOC] Eager smoke test of switch with two branches using int
+        #   and tensor indices.
         # Smoke-test eager execution with 2 branches (cond is a special case of switch).
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: cosine of the input.
             return inp_x.cos()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: sine of the input.
             return inp_x.sin()
 
         x = torch.randn(4)
@@ -1577,11 +1962,15 @@ def forward(self, pred_1, x_1):
         self.assertEqual(switch(torch.tensor([1]), (branch0, branch1), (x,)), x.sin())
 
     def test_switch_cond_equivalence(self):
+        # [FUNCTION DOC] Checks switch with branches ordered false, true and index 1 for true / 0
+        #   for false gives the same result as cond with the same predicate.
         # switch(int(pred), [false_fn, true_fn], ops) must equal cond(pred, true_fn, false_fn, ops).
         def true_fn(inp_x):
+            # [FUNCTION DOC] HELPER: sine of the input.
             return inp_x.sin()
 
         def false_fn(inp_x):
+            # [FUNCTION DOC] HELPER: cosine of the input.
             return inp_x.cos()
 
         x = torch.randn(4)
@@ -1593,18 +1982,26 @@ def forward(self, pred_1, x_1):
             self.assertEqual(cond_result, switch_result)
 
     def test_switch_functionalized(self):
+        # [FUNCTION DOC] Checks torch.func.functionalize applied to a function using switch
+        #   (one branch mutates a local in place) gives the same results as eager for each
+        #   of three indices.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine of the input, then in-place adds 4 to that local,
+            #   returns its sum.
             y = inp_x.sin()
             y.add_(4)
             return y.sum()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: sum of cosine of the input.
             return inp_x.cos().sum()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: sum of abs of the input.
             return inp_x.abs().sum()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         x = torch.ones(4, 5)
@@ -1615,20 +2012,32 @@ def forward(self, pred_1, x_1):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_switch_functionalized_input_mutation(self):
+        # [FUNCTION DOC] Skipped under dynamo. Compiles with the AOT eager recording backend a
+        #   function that clones its input and switches between a branch that mutates the input
+        #   through a view and a clean branch. Checks the result equals the mutating branch run on
+        #   a clone and, unless cross-ref testing is on, compares the golden forward graph
+        #   (auto_functionalized_v2 wrapping the switch op with two subgraphs).
         def branch_mutating(inp_x):
+            # [FUNCTION DOC] HELPER: makes a view of the input, adds 1 in place, returns the sum
+            #   of its sine.
             view_x = inp_x.view(inp_x.shape)
             view_x.add_(1)
             return view_x.sin().sum()
 
         def branch_clean(inp_x):
+            # [FUNCTION DOC] HELPER: returns the sum of cosine of the input.
             return inp_x.cos().sum()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two branches without cloning (defined but not
+            #   used in this test).
             return switch(idx, (branch_mutating, branch_clean), (inp_x,))
 
         x = torch.ones(4, 5)
 
         def g(idx, inp_x):
+            # [FUNCTION DOC] HELPER: clones the input then switches between the mutating and clean
+            #   branches; this is the function compiled.
             inp_x = inp_x.clone()
             return switch(idx, (branch_mutating, branch_clean), (inp_x,))
 
@@ -1678,20 +2087,28 @@ class <lambda>(torch.nn.Module):
             )
 
     def test_switch_with_tensor_closure(self):
+        # [FUNCTION DOC] Branches add closed-over tensors a, b, c to the input. Checks eager
+        #   results, then traces with make_fx and checks the traced graph computes with a; after
+        #   mutating a in place the traced graph output follows the new value, showing closures
+        #   are lifted as inputs (not baked as constants).
         a = torch.ones(2, 3)
         b = torch.ones(2, 3) + 1
         c = torch.ones(2, 3) * 2
 
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor a.
             return inp_x + a
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor b.
             return inp_x + b
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor c.
             return inp_x + c
 
         def foo(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three closure branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         inp = torch.randn(2, 3)
@@ -1710,16 +2127,21 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(gm(torch.tensor([0]), inp), inp + a)
 
     def test_switch_branch_returns_none(self):
+        # [FUNCTION DOC] Checks switch allows None as an output leaf when all branches return None
+        #   in that position: tensor part matches and the None part is returned as None.
         # None is allowed as a branch output leaf when every branch returns
         # None in that position. cond._merge_output already handles None;
         # the dynamo-side gate was over-rejecting it, now fixed.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine and None.
             return inp_x.sin(), None
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine and None.
             return inp_x.cos(), None
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two branches.
             return switch(idx, (branch0, branch1), (inp_x,))
 
         x = torch.randn(4)
@@ -1730,16 +2152,23 @@ class <lambda>(torch.nn.Module):
             self.assertIsNone(n)
 
     def test_switch_three_branches_divergent_int_leaves(self):
+        # [FUNCTION DOC] Traces switch symbolically with branches whose second output is a
+        #   different int constant per branch (0, 1, 2) and then a version where all return 7;
+        #   checks the traced graph returns the right tensor and int for each index.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine and the int 0.
             return inp_x.sin(), 0
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine and the int 1.
             return inp_x.cos(), 1
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: returns abs and the int 2.
             return inp_x.abs(), 2
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         x = torch.randn(4)
@@ -1750,15 +2179,19 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(n, fn(x)[1])
 
         def branch0_eq(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine and the int 7.
             return inp_x.sin(), 7
 
         def branch1_eq(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine and the int 7.
             return inp_x.cos(), 7
 
         def branch2_eq(inp_x):
+            # [FUNCTION DOC] HELPER: returns abs and the int 7.
             return inp_x.abs(), 7
 
         def g(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three equal-int branches.
             return switch(idx, (branch0_eq, branch1_eq, branch2_eq), (inp_x,))
 
         graph_eq = make_fx(g, tracing_mode="symbolic")(torch.tensor([0]), x)
@@ -1768,16 +2201,22 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(n, 7)
 
     def test_switch_branch_returns_float_rejected(self):
+        # [FUNCTION DOC] Documents current behavior: when branches return a Python float next
+        #   to a tensor, switch raises UncapturedHigherOrderOpError saying outputs must
+        #   consist of tensors.
         # Python float leaves are blocked by the shared HOP output gate.
         # Captures the current behavior so a future relaxation of
         # validate_subgraph_output_types must update this test.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine and the float 3.14.
             return inp_x.sin(), 3.14
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine and the float 3.14.
             return inp_x.cos(), 3.14
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two branches.
             return switch(idx, (branch0, branch1), (inp_x,))
 
         with self.assertRaisesRegex(
@@ -1787,15 +2226,21 @@ class <lambda>(torch.nn.Module):
             f(torch.tensor([0]), torch.randn(4))
 
     def test_switch_mismatched_output_arity(self):
+        # [FUNCTION DOC] Branch outputs differ in count (one tensor versus two);
+        #   expects RuntimeError or TorchRuntimeError matching a differing-branch-
+        #   outputs or unmatched-output-spec message.
         # Branch 0 returns one tensor, branch 1 returns a tuple of two
         # tensors — different number of outputs.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns one tensor (sine).
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns two tensors (cosine, abs).
             return inp_x.cos(), inp_x.abs()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two branches.
             return switch(idx, (branch0, branch1), (inp_x,))
 
         with self.assertRaisesRegex(
@@ -1805,15 +2250,20 @@ class <lambda>(torch.nn.Module):
             f(torch.tensor([0]), torch.randn(4))
 
     def test_switch_mismatched_output_structure(self):
+        # [FUNCTION DOC] Branches return a tuple versus a dict with the same number of tensors;
+        #   expects the same output-spec mismatch error.
         # Branch 0 returns a tuple; branch 1 returns a dict. Two tensor
         # leaves each, but the tree specs disagree.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns a tuple of sine and cosine.
             return (inp_x.sin(), inp_x.cos())
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns a dict with sine under a and cosine under b.
             return {"a": inp_x.sin(), "b": inp_x.cos()}
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two branches.
             return switch(idx, (branch0, branch1), (inp_x,))
 
         with self.assertRaisesRegex(
@@ -1823,18 +2273,24 @@ class <lambda>(torch.nn.Module):
             f(torch.tensor([0]), torch.randn(4))
 
     def test_switch_mismatched_output_structure_three_branches(self):
+        # [FUNCTION DOC] Three branches where only the last returns a two-tensor tuple; expects
+        #   the output-spec mismatch error.
         # Three-branch mismatch: branches 0 and 1 agree on a single-tensor
         # return; branch 2 diverges by returning a two-tensor tuple.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: returns abs and sum.
             return inp_x.abs(), inp_x.sum()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         with self.assertRaisesRegex(
@@ -1844,17 +2300,23 @@ class <lambda>(torch.nn.Module):
             f(torch.tensor([0]), torch.randn(4))
 
     def test_switch_constant_index_specialization(self):
+        # [FUNCTION DOC] Compiled with the eager backend and full graph, a Python constant index
+        #   makes dynamo pick the branch directly: indices 0, 1, 2, a negative (clamped to the
+        #   first) and a huge one (clamped to the last) each give the matching branch result.
         # When the index is a Python constant, dynamo specializes to that
         # specific branch — the switch HOP never enters the graph.
         # backend="eager" is used because PR 1 has no inductor lowering;
         # specialization is a dynamo-level concern.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         branches = (branch0, branch1, branch2)
@@ -1864,22 +2326,27 @@ class <lambda>(torch.nn.Module):
         # scalar-argument promotion to SymInt).
         @torch.compile(backend="eager", fullgraph=True)
         def f0(inp_x):
+            # [FUNCTION DOC] HELPER: compiled; switch with literal index 0.
             return switch(0, branches, (inp_x,))
 
         @torch.compile(backend="eager", fullgraph=True)
         def f1(inp_x):
+            # [FUNCTION DOC] HELPER: compiled; switch with literal index 1.
             return switch(1, branches, (inp_x,))
 
         @torch.compile(backend="eager", fullgraph=True)
         def f2(inp_x):
+            # [FUNCTION DOC] HELPER: compiled; switch with literal index 2.
             return switch(2, branches, (inp_x,))
 
         @torch.compile(backend="eager", fullgraph=True)
         def f_neg(inp_x):
+            # [FUNCTION DOC] HELPER: compiled; switch with literal index minus 5.
             return switch(-5, branches, (inp_x,))
 
         @torch.compile(backend="eager", fullgraph=True)
         def f_huge(inp_x):
+            # [FUNCTION DOC] HELPER: compiled; switch with literal index 99.
             return switch(99, branches, (inp_x,))
 
         x = torch.randn(4)
@@ -1893,19 +2360,27 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("mark_dynamic cannot be traced under dynamo_wrapped")
     def test_switch_symint_index_clamped(self):
+        # [FUNCTION DOC] Skipped under dynamo. Compiled function derives the index from a dynamic
+        #   dimension size minus 5. Size 2 gives a negative index clamped to branch 0; after a
+        #   dynamo reset, size 8 gives an index above range clamped to the last branch.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         branches = (branch0, branch1, branch2)
 
         @torch.compile(backend="eager", fullgraph=True)
         def f(idx_carrier, inp_x):
+            # [FUNCTION DOC] HELPER: compiled; index is the leading size of idx_carrier minus 5;
+            #   switches over the three branches.
             idx = idx_carrier.shape[0] - 5
             return switch(idx, branches, (inp_x,))
 
@@ -1923,6 +2398,8 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(f(idx_carrier, x), branch2(x))
 
     def test_switch_nn_module_branches(self):
+        # [FUNCTION DOC] Switch where each branch is a different Linear module (parameters
+        #   captured as free variables); checks each index gives the matching module output.
         # Each branch is a different nn.Module whose parameters are
         # captured as free variables. Dynamo must lift the parameters of
         # all branches into the HOP's operand tuple and rewrite every
@@ -1931,6 +2408,7 @@ class <lambda>(torch.nn.Module):
         linear1 = torch.nn.Linear(4, 3)
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the two modules.
             return switch(idx, (linear0, linear1), (inp_x,))
 
         x = torch.randn(2, 4)
@@ -1938,17 +2416,23 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(f(torch.tensor([1]), x), linear1(x))
 
     def test_switch_complex_nn_module_branches(self):
+        # [FUNCTION DOC] Switch over three MLP modules with different hidden sizes but the same
+        #   output shape; checks each index matches calling the module directly.
         # Complex modules: each branch is a different multi-layer MLP with
         # different hidden dimensions. As long as the final output shape
         # matches across branches, dynamo captures and lifts all module
         # parameters correctly.
         class MLP(torch.nn.Module):
+            # [CLASS DOC] HELPER: two-layer perceptron with ReLU between linear layers.
             def __init__(self, in_dim, hidden, out_dim):
+                # [FUNCTION DOC] HELPER: stores two Linear layers mapping in_dim to hidden and
+                #   hidden to out_dim.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(in_dim, hidden)
                 self.fc2 = torch.nn.Linear(hidden, out_dim)
 
             def forward(self, inp_x):
+                # [FUNCTION DOC] HELPER: applies the first layer, ReLU, then the second layer.
                 return self.fc2(torch.relu(self.fc1(inp_x)))
 
         mlp_small = MLP(4, 8, 2)
@@ -1956,6 +2440,7 @@ class <lambda>(torch.nn.Module):
         mlp_tiny = MLP(4, 3, 2)
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three MLPs.
             return switch(idx, (mlp_small, mlp_large, mlp_tiny), (inp_x,))
 
         x = torch.randn(5, 4)
@@ -1963,6 +2448,8 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(f(torch.tensor([i]), x), mlp(x))
 
     def test_switch_heterogeneous_lifted_args(self):
+        # [FUNCTION DOC] Branches capture different free variables (one tensor, two tensors, a
+        #   Linear module); checks the results for each index equal direct calls.
         # Branches with different combinations of lifted free variables:
         # branch0 captures one tensor, branch1 captures two tensors,
         # branch2 captures an nn.Module. dynamo unions all lifted
@@ -1973,17 +2460,22 @@ class <lambda>(torch.nn.Module):
         linear = torch.nn.Linear(4, 3)
 
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: linear map with a fixed identity-like weight plus
+            #   the bias tensor.
             return torch.nn.functional.linear(inp_x, torch.eye(4, 3).t()) + bias
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: same as branch0 plus an offset tensor.
             return (
                 torch.nn.functional.linear(inp_x, torch.eye(4, 3).t()) + bias + offset
             )
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: applies the captured Linear module.
             return linear(inp_x)
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         x = torch.randn(2, 4)
@@ -1992,14 +2484,19 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(f(torch.tensor([2]), x), branch2(x))
 
     def test_switch_pytree_operands(self):
+        # [FUNCTION DOC] Switch with a nested dict/list/tuple pytree as the single operand; each
+        #   of three indices matches calling the branch directly.
         # Test that switch supports pytree operands (nested dict/list/tuple of tensors)
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: first entry plus "b" times third entry's element.
             return inp_x["t"][0] + inp_x["t"][1]["b"] * inp_x["t"][2][0]
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: first entry times (third element divided by "b").
             return inp_x["t"][0] * (inp_x["t"][2][0] / inp_x["t"][1]["b"])
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: first entry minus "b" plus third entry's element.
             return inp_x["t"][0] - inp_x["t"][1]["b"] + inp_x["t"][2][0]
 
         a = torch.randn(4)
@@ -2015,13 +2512,19 @@ class <lambda>(torch.nn.Module):
 
     @parametrize("idx", [0, 1, 2, -5, 99])
     def test_switch_autograd_basic(self, idx):
+        # [FUNCTION DOC] Parametrized over indices 0, 1, 2, -5 and 99 (the last two clamp to the
+        #   first and last branch). Checks switch result and gradient wrt x against the clamped
+        #   branch called directly.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: sine.
             return x.sin()
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: cosine of x plus 42.
             return (x + 42).cos()
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: tanh of x times 3.14, plus x.
             return (x * 3.14).tanh() + x
 
         branches = (branch0, branch1, branch2)
@@ -2037,15 +2540,22 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_make_fx_two_switches(self):
+        # [FUNCTION DOC] Traces switch plus backward with make_fx and asserts the graph has
+        #   exactly two switch higher-order op calls (forward and backward), then checks the
+        #   gradient value against the branch called directly.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: sine.
             return x.sin()
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: cosine.
             return x.cos()
 
         branches = (branch0, branch1)
 
         def f(idx, x):
+            # [FUNCTION DOC] HELPER: traced function; switch then gradient wrt x with ones
+            #   as output gradient.
             result = switch(idx, branches, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -2066,35 +2576,49 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(grads, expected_grads)
 
     def test_switch_autograd_nested(self):
+        # [FUNCTION DOC] Builds branch functions that themselves call switch with constant tensor
+        #   indices (nested switch) to check autograd through nested switch.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: nested switch with index 1 over three inner functions.
             def inner0(y):
+                # [FUNCTION DOC] HELPER: sine of y times 2.
                 return (y * 2).sin()
 
             def inner1(y):
+                # [FUNCTION DOC] HELPER: cosine of y plus 1.
                 return (y + 1).cos()
 
             def inner2(y):
+                # [FUNCTION DOC] HELPER: tanh of y.
                 return y.tanh()
 
             return switch(torch.tensor(1), (inner0, inner1, inner2), (x,))
 
         def mid_fn(x):
+            # [FUNCTION DOC] HELPER: nested switch with index 0 over two inner functions.
             def inner0(y):
+                # [FUNCTION DOC] HELPER: sine of y plus 3.
                 return (y + 3).sin()
 
             def inner1(y):
+                # [FUNCTION DOC] HELPER: cosine of y times 0.5.
                 return (y * 0.5).cos()
 
             return switch(torch.tensor(0), (inner0, inner1), (x,))
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: defines three inner functions (relu, sigmoid of y minus 1,
+            #   cosine of y squared) and switches among them with index 2.
             def inner0(y):
+                # [FUNCTION DOC] HELPER: relu of y.
                 return y.relu()
 
             def inner1(y):
+                # [FUNCTION DOC] HELPER: sigmoid of y minus 1.
                 return (y - 1).sigmoid()
 
             def inner2(y):
+                # [FUNCTION DOC] HELPER: cosine of y squared.
                 return (y**2).cos()
 
             return switch(torch.tensor(2), (inner0, inner1, inner2), (x,))
@@ -2111,13 +2635,18 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_mixed_require_grad(self):
+        # [FUNCTION DOC] Switch with three operands where only x requires grad (y does not); for
+        #   each index checks the result and the gradient wrt x equal calling the branch directly.
         def branch0(x, y, z):
+            # [FUNCTION DOC] HELPER: product of the three inputs.
             return x * y * z
 
         def branch1(x, y, z):
+            # [FUNCTION DOC] HELPER: sum of the three inputs.
             return x + y + z
 
         def branch2(x, y, z):
+            # [FUNCTION DOC] HELPER: first minus second, times third.
             return (x - y) * z
 
         x = torch.randn(4, requires_grad=True)
@@ -2134,13 +2663,18 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_pytree_input(self):
+        # [FUNCTION DOC] Switch with a nested dict/list/tuple operand of three grad-requiring
+        #   tensors; for each index checks the result and the gradients wrt all three leaves.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: first entry plus "b" times third element.
             return x["t"][0] + x["t"][1]["b"] * x["t"][2][0]
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: first entry times (third element divided by "b").
             return x["t"][0] * (x["t"][2][0] / x["t"][1]["b"])
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: first minus "b" plus third element.
             return x["t"][0] - x["t"][1]["b"] + x["t"][2][0]
 
         a = torch.randn(4, requires_grad=True)
@@ -2160,13 +2694,19 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("Skip due to graph break when run with dynamo")
     def test_switch_autograd_pytree_not_all_inputs_used(self):
+        # [FUNCTION DOC] Skipped under dynamo. Branches ignore some leaves of the pytree operand.
+        #   For each index checks the result and that gradients computed with unused allowed equal
+        #   the reference gradients with unused ones materialized as zeros.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: first entry plus "b" (ignores the third).
             return x["t"][0] + x["t"][1]["b"]
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: first times (third divided by "b").
             return x["t"][0] * (x["t"][2][0] / x["t"][1]["b"])
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: clone of the third element only.
             return x["t"][2][0].clone()
 
         a = torch.randn(4, requires_grad=True)
@@ -2191,13 +2731,19 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_pytree_output(self):
+        # [FUNCTION DOC] Branches return the same dict structure holding a list with a
+        #   tensor and a tuple; for each index checks the result and the gradient wrt x of
+        #   the flattened outputs.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: dict holding sine and a tuple of cosine.
             return {"res": [x.sin(), (x.cos(),)]}
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: dict holding cosine and a tuple of tanh.
             return {"res": [x.cos(), (x.tanh(),)]}
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: dict holding tanh and a tuple of sine.
             return {"res": [x.tanh(), (x.sin(),)]}
 
         branches = (branch0, branch1, branch2)
@@ -2215,15 +2761,21 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_grad_through_params(self):
+        # [FUNCTION DOC] Checks gradients wrt the weight of a Linear module captured by the
+        #   branches, for each of three indices, against direct branch calls (graph retained for
+        #   the two gradient calls).
         nn_module = torch.nn.Linear(4, 4)
 
         def branch0(x):
+            # [FUNCTION DOC] HELPER: the module applied to x.
             return nn_module(x)
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: x times the module applied to x.
             return x * nn_module(x)
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: relu of the module output.
             return nn_module(x).relu()
 
         branches = (branch0, branch1, branch2)
@@ -2242,14 +2794,19 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_inner_tensor(self):
+        # [FUNCTION DOC] Branches that create constant tensors internally (ones times 42, a tensor
+        #   filled with 0.5); checks results and gradients wrt x for each index.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: abs of sine of x squared.
             return torch.abs((x**2).sin())
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: cosine of x times a constant tensor of 42s.
             y = torch.ones(4, requires_grad=False) * 42
             return (x * y).cos()
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: tanh of x plus a constant tensor of 0.5s.
             z = torch.full((4,), 0.5, requires_grad=False)
             return (x + z).tanh()
 
@@ -2265,19 +2822,27 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_symint_index(self):
+        # [FUNCTION DOC] Compiles with the eager backend, full graph and dynamic shapes a function
+        #   that computes the switch index as a size taken from an arange of the integer argument;
+        #   for each index checks the result and gradient wrt x against the direct branch.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: sine.
             return x.sin()
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: cosine.
             return x.cos()
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: tanh.
             return x.tanh()
 
         branches = (branch0, branch1, branch2)
 
         @torch.compile(backend="eager", fullgraph=True, dynamic=True)
         def f(i, x):
+            # [FUNCTION DOC] HELPER: compiled; index is the size of an arange of length i;
+            #   switches over the three branches.
             index = torch.arange(i).size(0)
             return switch(index, branches, (x,))
 
@@ -2293,6 +2858,9 @@ class <lambda>(torch.nn.Module):
 
     @parametrize("aux", ["none", "int_equal", "int_divergent"])
     def test_switch_autograd_non_tensor_output_leaves(self, aux):
+        # [FUNCTION DOC] Parametrized by aux in none, int_equal, int_divergent: each branch
+        #   returns a tensor and an auxiliary leaf (None, 7 for all, or 0/1/2 per branch). Checks
+        #   tensor value, aux leaf value and the gradient wrt x for each index.
         if aux == "none":
             aux_vals = (None, None, None)
         elif aux == "int_equal":
@@ -2301,7 +2869,11 @@ class <lambda>(torch.nn.Module):
             aux_vals = (0, 1, 2)
 
         def make_branch(op, a):
+            # [FUNCTION DOC] HELPER: factory returning a branch that applies op to its input and
+            #   returns it along with the fixed auxiliary value a.
             def branch(x):
+                # [FUNCTION DOC] HELPER: returns the op applied to x and the
+                #   captured auxiliary value.
                 return op(x), a
 
             return branch
@@ -2326,13 +2898,18 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_switch_autograd_multiple_tensor_outputs(self):
+        # [FUNCTION DOC] Branches return two tensors each; for each index checks the outputs and
+        #   the gradient wrt x with ones as output gradients for both outputs.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: sine and cosine.
             return x.sin(), x.cos()
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: tanh and relu.
             return x.tanh(), x.relu()
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: sigmoid and sine of x squared.
             return x.sigmoid(), (x**2).sin()
 
         branches = (branch0, branch1, branch2)
@@ -2352,13 +2929,18 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_switch_autograd_gpu(self):
+        # [FUNCTION DOC] CUDA-only: switch with a CUDA index tensor and CUDA input requiring grad;
+        #   checks result and gradient for each index.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: sine.
             return x.sin()
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: cosine.
             return x.cos()
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: tanh.
             return x.tanh()
 
         branches = (branch0, branch1, branch2)
@@ -2374,7 +2956,10 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_map_gpu(self):
+        # [FUNCTION DOC] CUDA-only: control_flow.map of an add of a per-slice value and a
+        #   broadcast value over a CUDA stack; compares with the reference fake map.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         xs = torch.ones(3, 2, 2, device="cuda")
@@ -2385,10 +2970,14 @@ class <lambda>(torch.nn.Module):
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
     def test_while_loop_gpu(self):
+        # [FUNCTION DOC] CUDA-only: while_loop adding one until the sum reaches 10 on a CUDA
+        #   tensor; compares with the reference fake while loop.
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: true while the sum of x is below 10.
             return x.sum() < 10
 
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: returns a one-tuple with x plus one.
             return (x + 1,)
 
         x = torch.zeros(1, device="cuda")
@@ -2397,7 +2986,11 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected, res)
 
     def test_map_illegal_inputs(self):
+        # [FUNCTION DOC] Checks control_flow.map raises RuntimeError for: xs containing a non-
+        #   tensor (message about mapped xs consisting of tensors), a leading dimension of size 0,
+        #   and inconsistent leading dimensions across xs.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: adds the two entries of x and y.
             return x[0] + x[1] + y
 
         with self.assertRaisesRegex(
@@ -2423,13 +3016,19 @@ class <lambda>(torch.nn.Module):
             )
 
     def test_map_illegal_outputs(self):
+        # [FUNCTION DOC] map whose function returns a Python scalar via item raises RuntimeError
+        #   naming the map_impl higher-order op; returning a size object raises
+        #   UncapturedHigherOrderOpError with the same op name; returning None is accepted.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns the item of x (a Python number).
             return x.item()
 
         def f1(x, y):
+            # [FUNCTION DOC] HELPER: returns the size of y (non-tensor).
             return y.size()
 
         def f2(x, y):
+            # [FUNCTION DOC] HELPER: returns None.
             return None
 
         x = torch.ones([3])
@@ -2453,7 +3052,10 @@ class <lambda>(torch.nn.Module):
         control_flow.map(f2, x, y)
 
     def test_map_list_in_out(self):
+        # [FUNCTION DOC] map with list-of-list structure for both input and output; checks result
+        #   structure (one by one nested) and values against the reference fake map.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a nested list with the first nested tensor plus y.
             return [[x[0][0] + y]]
 
         xs = [[torch.ones(3, 2, 2)]]
@@ -2465,7 +3067,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected, res)
 
     def test_map_dict_in_out(self):
+        # [FUNCTION DOC] map with nested dict input and a dict output; checks the output has a
+        #   single key "c" and matches the reference.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a dict with "c" set to the inner tensor plus y.
             return {"c": x["a"]["b"] + y}
 
         xs = {"a": {"b": torch.ones(3, 2, 2)}}
@@ -2477,7 +3082,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected, res)
 
     def test_map_autograd_simple(self):
+        # [FUNCTION DOC] map with a function of both a mapped input and a broadcast input, both
+        #   requiring grad; compares results and gradients wrt both to the reference fake map.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: sine then cosine of x times cosine then sine of y.
             return x.sin().cos() * y.cos().sin()
 
         xs = torch.ones(3, 2, 2, requires_grad=True)
@@ -2491,7 +3099,10 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected_grads, grads)
 
     def test_map_autograd_simple_partial_grad(self):
+        # [FUNCTION DOC] Same as the simple map autograd test but y does not require grad;
+        #   compares gradient wrt xs only.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: sine then cosine of x times cosine then sine of y.
             return x.sin().cos() * y.cos().sin()
 
         xs = torch.ones(3, 2, 2, requires_grad=True)
@@ -2506,7 +3117,12 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected_grads, grads)
 
     def test_map_autograd_no_grad_output(self):
+        # [FUNCTION DOC] map over a list of xs where only the first requires grad and the function
+        #   returns two outputs, the second independent of xs; checks values and gradient of the
+        #   first output wrt xs first element.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns first-input sine-cosine plus y, and the sine of
+            #   cosine of y.
             return x[0].sin().cos() + y, y.cos().sin()
 
         xs = [torch.ones(3, 2, 2, requires_grad=True), torch.ones(3, 3)]
@@ -2521,14 +3137,21 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(expected_grads, grads)
 
     def test_map_autograd_nested_list(self):
+        # [FUNCTION DOC] Runs map over nested-list inputs with a forward plus backward helper and
+        #   compares outputs and gradients with the reference fake map.
         import torch.utils._pytree as pytree
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: unpacks x into nested parts and returns a nested list with
+            #   sine times cosine combinations, one involving y.
             a, b = x
             c, d = a
             return [[b.sin() * c.cos()], d.sin() * y.cos()]
 
         def fwbw(map_op, f, x, y):
+            # [FUNCTION DOC] HELPER: applies the given map operator, flattens inputs and outputs,
+            #   and returns the output with gradients of all outputs wrt all flattened inputs
+            #   using ones as output gradients.
             z = map_op(f, x, y)
             flat_x = pytree.tree_leaves(x)
             flat_z = pytree.tree_leaves(z)
@@ -2550,21 +3173,29 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(true_outs, fake_outs)
 
     def test_map_autograd_higher_order(self):
+        # [FUNCTION DOC] Compares jacobian and hessian (from torch.autograd.functional) of
+        #   map-based wrappers against the same on the fake map wrappers, for xs requiring
+        #   grad and y not.
         from torch.autograd.functional import hessian as hes, jacobian as jac
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: sine then cosine of x, plus y.
             return x.sin().cos() + y
 
         def wrapper_jac(x, y):
+            # [FUNCTION DOC] HELPER: map of f for jacobian.
             return control_flow.map(f, x, y)
 
         def wrapper_jac_fake(x, y):
+            # [FUNCTION DOC] HELPER: fake map of f for jacobian.
             return _fake_map(f, x, y)
 
         def wrapper_hes(x, y):
+            # [FUNCTION DOC] HELPER: sum of map of f, for hessian.
             return control_flow.map(f, x, y).sum()
 
         def wrapper_hes_fake(x, y):
+            # [FUNCTION DOC] HELPER: sum of fake map of f, for hessian.
             return _fake_map(f, x, y).sum()
 
         for g_fct, (wrap, wrap_fake) in [
@@ -2584,7 +3215,12 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(expected_grads, grads)
 
     def test_scan_y_less_ndim_then_dim(self):
+        # [FUNCTION DOC] Scan along dimension 2 where the per-step output is a scalar (fewer
+        #   dimensions than the scan dim) with a matrix-product carry; compares with the
+        #   reference fake scan.
         def combine_fn(carry, x):
+            # [FUNCTION DOC] HELPER: returns the matrix product of carry and x as the new carry,
+            #   and the sum of that product as the per-step output.
             return carry @ x, (carry @ x).sum()
 
         init = torch.randn(4, 3)
@@ -2602,7 +3238,15 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_compile(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Skipped under dynamo; needs CUDA; parametrized over reverse, compile mode
+        #   (none or eager), device and autograd. Compares scan with the reference fake scan for
+        #   cumulative sum and product combine functions (and against torch cumsum and cumprod
+        #   when not reversed), integer examples with known expected values, a combine function
+        #   with different carry and output math, and a non-associative division; checks gradients
+        #   when autograd is on.
         def add2(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns the product as the new carry and the sum
+            #   as the output.
             return x * y, x + y
 
         x = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
@@ -2722,6 +3366,10 @@ class <lambda>(torch.nn.Module):
         ],
     )
     def test_scan_dtype(self, reverse, compile_mode, device, dtype):
+        # [FUNCTION DOC] Skipped under dynamo; needs CUDA; parametrized over reverse, compile
+        #   mode, device and dtype (float16, float32, int32, int64, complex64). Checks that scan
+        #   outputs match the fake scan and that the device and dtype of carry and outputs are as
+        #   expected, including cases where carry dtype differs from output dtype.
         scan_fct = compile_mode_helper(scan, compile_mode)
 
         # Check all outputs and carries on the correct device and with torch.float32
@@ -2785,6 +3433,10 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_dim(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA. For five random tensor ranks (2 to 5) and random
+        #   sizes and scan dimension (no seed, so shapes vary per run), checks scan with add and
+        #   mul combine functions against the fake scan and, when not reversed, against torch
+        #   cumsum and cumprod; optionally checks gradients.
         import random
 
         scan_fct = compile_mode_helper(scan, compile_mode)
@@ -2827,6 +3479,9 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_binary_operator(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Runs scan with the S5 operator over list carry
+        #   and list inputs built from a repeated vector and random inputs, compares with fake
+        #   scan, and with autograd on, compares gradients wrt all inits and elements.
         state_dim = 20
         timesteps = 10
         scan_fct = compile_mode_helper(scan, compile_mode)
@@ -2889,6 +3544,10 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_tuple(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Scan with tuple carry and tuple inputs: first
+        #   with a combine function whose output equals the carry, then with one whose output is a
+        #   different tuple; compares with the fake scan, checks the second output matches the
+        #   first run's second output, and checks gradients when autograd is on.
         x = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         y = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         inp = (x, y)
@@ -2916,6 +3575,9 @@ class <lambda>(torch.nn.Module):
             self.check_autograd(result_same, expected_result, (init, inp))
 
         def fct_different_output_tuple(x, y):
+            # [FUNCTION DOC] HELPER: returns a pair: the new carry tuple made of the sum
+            #   of first entries and the product of second entries and the output (product
+            #   of second entries).
             return ((x[0] + y[0], x[1] * y[1]), (x[1] * y[1]))
 
         inp = (x, y)
@@ -2934,8 +3596,13 @@ class <lambda>(torch.nn.Module):
             self.check_autograd(result_diff, expected_result, (init, inp))
 
     def test_scan_wrong_pytree(self):
+        # [FUNCTION DOC] Combine function returns a carry dict with an extra key compared to init;
+        #   expects UncapturedHigherOrderOpError complaining init and carry do not have the same
+        #   number of outputs.
         # Init and input have same pytree
         def fct_wrong_pytree(x, y):
+            # [FUNCTION DOC] HELPER: returns two dicts (carry and output) built from the input
+            #   with an extra "k" key, so the carry structure differs from init.
             return (
                 {
                     "i": x["i"] * y["j"][0][0],
@@ -2970,8 +3637,11 @@ class <lambda>(torch.nn.Module):
             scan(fct_wrong_pytree, init, inp, dim=0)
 
     def test_scan_float_output(self):
+        # [FUNCTION DOC] Combine function returns a Python float as the carry; expects
+        #   UncapturedHigherOrderOpError naming the scan higher-order op.
         # Init and input have same pytree
         def fct_float_output(x, y):
+            # [FUNCTION DOC] HELPER: returns the float 0.0 as carry and x plus y as output.
             return 0.0, x + y
 
         x = torch.randn(3, 2, 2)
@@ -2992,6 +3662,9 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_complex_pytree(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Needs CUDA. Scan with a nested dict/list pytree carry and input using the
+        #   complex pointwise combine function; compares with fake scan across reverse, compile
+        #   mode, device, and checks gradients when autograd is on.
         # Init and input have same pytree
 
         scan_fct = compile_mode_helper(scan, compile_mode)
@@ -3029,6 +3702,12 @@ class <lambda>(torch.nn.Module):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_scan_associative_scan(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Scan (compiled) whose body calls associative_scan
+        #   (uncompiled, reversed, generic combine mode) over the per-step input; compares with
+        #   the fake scan.
+        # KNOWN ISSUE: the comment above says this does not work because of vmap use inside
+        #   associative_scan and that it should be marked expected fail, but no such marker is
+        #   present on the test.
         combine_mode = "generic"
         compile_mode_scan = "compile"
         compile_mode_associative_scan = "none"
@@ -3044,6 +3723,8 @@ class <lambda>(torch.nn.Module):
         inp = torch.randn(3, 10, 5, device=device)
 
         def body(x, y):
+            # [FUNCTION DOC] HELPER: runs the reversed associative scan with the add combine
+            #   function on y, and returns x plus y as carry and x plus the scan result as output.
             val = associative_scan_fct(
                 get_scan_combine_fn("add", True),
                 y,
@@ -3072,12 +3753,19 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_downstream_scan_matmul(self, compile_mode, reverse, device, autograd):
+        # [FUNCTION DOC] Skipped under dynamo; needs CUDA. Scans over dim 1 then multiplies the
+        #   selected scan result (carry or stacked output, for index 0 and 1) by a ones matrix;
+        #   compares the (optionally compiled) chain with the fake scan version and checks
+        #   gradients when autograd is on.
         inp = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
         init = torch.randn(3, 2, device=device, requires_grad=autograd)
 
         for ind in range(2):
             # Chain with matmul
             def chain_fct(inp):
+                # [FUNCTION DOC] HELPER: runs scan with the add combine function over dim 1 and
+                #   returns the selected output (index from the enclosing loop) matrix-multiplied
+                #   by a 2 by 5 ones matrix.
                 W = torch.ones(2, 5, device=device)
                 o = scan(
                     get_scan_combine_fn("add", False),
@@ -3113,6 +3801,9 @@ class <lambda>(torch.nn.Module):
     def test_scan_downstream_scan_scan_dim(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Skipped under dynamo; needs CUDA. Chains two scans, the second scanning
+        #   dim 0 over the stacked output of the first (which scanned dim 1); compares with fake
+        #   scans and checks gradients wrt both inits and the input when autograd is on.
         inp = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
         init = torch.randn(3, 2, device=device, requires_grad=autograd)
 
@@ -3120,6 +3811,8 @@ class <lambda>(torch.nn.Module):
         init2 = torch.randn(1, 10, 2, device=device, requires_grad=autograd)
 
         def chain_fct_different_dim(inp):
+            # [FUNCTION DOC] HELPER: first scan over dim 1 with init, then a second scan over dim
+            #   0 of the first scan's stacked output with init2; returns the second scan result.
             o1 = scan(
                 get_scan_combine_fn("add", False),
                 init,
@@ -3165,6 +3858,9 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_non_pointwise(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Scan with the non-pointwise combine function
+        #   (matrix multiplication by a fixed matrix) compared to the fake scan, with
+        #   optional gradient check.
         scan_fct = compile_mode_helper(scan, compile_mode)
 
         x = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
@@ -3193,6 +3889,11 @@ class <lambda>(torch.nn.Module):
     @parametrize("reverse", [False, True])
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     def test_scan_compile_cnt(self, reverse, device):
+        # [FUNCTION DOC] Needs CUDA. With automatic dynamic shapes enabled, counts dynamo
+        #   frames via a compile counter across a sequence of scan calls varying length, scan
+        #   dim and reverse flag; asserts the frame count goes 1, 2, 2, 3, 4, 4, 5, 6, 6, 6,
+        #   i.e. recompiles on first size change, dim change and reverse change but not on
+        #   further size changes.
         dim = 1
 
         from torch._dynamo.testing import CompileCounter
@@ -3321,11 +4022,15 @@ class <lambda>(torch.nn.Module):
             self.assertEqual(cnt.frame_count, 6)
 
     def test_scan_operator_call_count(self):
+        # [FUNCTION DOC] Uses generic_scan with a combine function that counts its calls: five
+        #   steps give five calls, and a single-element scan gives exactly one call.
         from torch._higher_order_ops.scan import generic_scan, wrap_combine_fn_flat
 
         counter = [0]
 
         def counting_combine(carry, x):
+            # [FUNCTION DOC] HELPER: increments the first slot of the shared counter list and
+            #   returns carry plus x and x.
             counter[0] += 1
             return carry + x, x
 
@@ -3362,16 +4067,25 @@ class <lambda>(torch.nn.Module):
     @parametrize("reverse", [False, True])
     @parametrize("compile_mode", ["none", "eager", "compile", "compile_dynamic_shape"])
     def test_scan_zero_length(self, reverse, compile_mode):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over reverse and compile modes (none,
+        #   eager, compile, compile_dynamic_shape). Scans over inputs with a zero-length scan
+        #   dimension for bodies that keep shape, change shape and dtype, or use a tuple input;
+        #   compares with the fake scan.
         def body_same(c, x):
+            # [FUNCTION DOC] HELPER: carry plus x as new carry and a clone as output.
             y = c + x
             return y, y.clone()
 
         def body_reduce(c, x):
+            # [FUNCTION DOC] HELPER: new carry is carry plus x; output is the sum over the last
+            #   dim cast to float64, so output shape and dtype differ from x.
             # y shape and dtype both differ from the xs slice.
             y = c + x
             return y, y.sum(dim=-1).to(torch.float64).clone()
 
         def body_struct(c, x):
+            # [FUNCTION DOC] HELPER: x is a pair; new carry is carry plus both parts; output is a
+            #   clone of it.
             # xs is a 2-tuple, but the body emits a single ys leaf.
             x0, x1 = x
             y = c + x0 + x1
@@ -3392,10 +4106,16 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo("don't test compile on compile")
     @parametrize("reverse", [False, True])
     def test_scan_zero_length_autograd(self, reverse):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over reverse. Scans over a zero-length
+        #   xs with init and xs requiring grad, backpropagates the sum of carry and outputs, and
+        #   checks the grad of init is all ones (no steps run, carry equals init) and that the
+        #   grad of xs has the same shape as xs.
         init = torch.randn(2, 3, requires_grad=True)
         xs = torch.randn(0, 2, 3, requires_grad=True)
 
         def body(c, x):
+            # [FUNCTION DOC] HELPER: new carry is the sine of carry plus x; the output is a
+            #   clone of it.
             y = torch.sin(c + x)
             return y, y.clone()
 
@@ -3407,7 +4127,11 @@ class <lambda>(torch.nn.Module):
         self.assertEqual(xs.grad.shape, xs.shape)
 
     def test_scan_unequal_scan_dim_size(self):
+        # [FUNCTION DOC] Scan with a two-leaf xs whose leading sizes differ (0 and 5) raises
+        #   RuntimeError saying all xs leaves must have the same scan dimension size.
         def body(c, x):
+            # [FUNCTION DOC] HELPER: xs is a pair; new carry is carry plus both parts; output is a
+            #   clone of it.
             x0, x1 = x
             y = c + x0 + x1
             return y, y.clone()
@@ -3419,6 +4143,8 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_init_non_tensor(self):
+        # [FUNCTION DOC] Skipped under dynamo. Passing a Python float as init raises RuntimeError
+        #   saying all init leaves must be tensors.
         x = torch.randn(3, 1, 2, device=torch.device("cpu"))
         dim = 1
 
@@ -3429,6 +4155,9 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_init_wrong_shape(self):
+        # [FUNCTION DOC] Skipped under dynamo. Init with a shape that does not match the carry
+        #   produced by the add combine function raises UncapturedHigherOrderOpError complaining
+        #   init and carry metadata differ.
         scan_fct = compile_mode_helper(scan, "none")
 
         # Only init and no input
@@ -3450,7 +4179,12 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_init_wrong_pytree_init_longer_carry(self):
+        # [FUNCTION DOC] Skipped under dynamo. Init has two entries but the combine function
+        #   returns a carry with different arity; expects UncapturedHigherOrderOpError about
+        #   differing numbers of init and carry outputs.
         def init_longer_carry(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns a pair of a single tensor plus one and an output of y
+            #   plus one; the carry structure does not match the two-entry init.
             return x[0] + 1.0, y + 1.0
 
         scan_fct = compile_mode_helper(scan, "none")
@@ -3473,7 +4207,12 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_init_wrong_pytree_init_shorter_carry(self):
+        # [FUNCTION DOC] Skipped under dynamo. Init is a single tensor but the combine function
+        #   returns a two-tensor carry; expects UncapturedHigherOrderOpError about differing
+        #   numbers of init and carry outputs.
         def init_shorter_carry(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns a carry tuple of two tensors (x plus 1, x plus 2) and
+            #   an output x plus 3.
             return (x + 1, x + 2), x + 3
 
         scan_fct = compile_mode_helper(scan, "none")
@@ -3496,7 +4235,12 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_init_wrong_pytree_carry_shape(self):
+        # [FUNCTION DOC] Skipped under dynamo. The combine function returns a carry that is a
+        #   view-like slice of its input with a different shape; expects
+        #   UncapturedHigherOrderOpError naming the scan higher-order op.
         def wrong_carry_shape(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns the first row slice of x as carry and x plus
+            #   3 as output.
             return x[0, :], x + 3
 
         scan_fct = compile_mode_helper(scan, "none")
@@ -3519,7 +4263,10 @@ class <lambda>(torch.nn.Module):
 
     @skipIfTorchDynamo("don't test compile on compile")
     def test_scan_one_return(self):
+        # [FUNCTION DOC] Skipped under dynamo. Combine function returns a single tensor instead of
+        #   a carry/output pair; expects UncapturedHigherOrderOpError naming the scan op.
         def no_carry(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns only x plus 3.
             return x + 3
 
         scan_fct = compile_mode_helper(scan, "none")
@@ -3547,6 +4294,12 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_init(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Skipped under dynamo; needs CUDA; parametrized over reverse, compile
+        #   mode, device, autograd. Exercises scan inits: init with no xs (result carry equals
+        #   init), scalar init with a carry that grows by one, init of unrelated shape, init
+        #   spanning two steps of the scan dim, a tiled init with sliced outputs (checking
+        #   result shapes), and the regular case compared with cumsum; checks gradients when
+        #   autograd is on.
         scan_fct = compile_mode_helper(scan, compile_mode)
 
         # Only init and no input
@@ -3576,6 +4329,7 @@ class <lambda>(torch.nn.Module):
         init = torch.ones(1, device=device, requires_grad=autograd)
 
         def add_scalar_carry(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry plus 1.0 as new carry and carry plus input as output.
             return x + 1.0, x + y
 
         result_init = scan_fct(add_scalar_carry, init, inp, dim=dim, reverse=reverse)
@@ -3592,6 +4346,8 @@ class <lambda>(torch.nn.Module):
         init = torch.randn(7, 8, device=device, requires_grad=autograd)
 
         def add_scalar_carry2(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry plus 1.0 as new carry; output is the top-left block of
+            #   the carry (sized like y) plus y.
             return x + 1.0, x[: y.shape[0], : y.shape[1]] + y
 
         result_init = scan_fct(add_scalar_carry2, init, inp, dim=dim, reverse=reverse)
@@ -3617,6 +4373,8 @@ class <lambda>(torch.nn.Module):
         init = torch.tile(init, (1, 2, 1))
 
         def add_scalar_carry_sliced_out(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry plus 1.0 as new carry; output is the first slice along
+            #   dim 1 of the carry plus y.
             return x + 1.0, x[:, :1, :] + y
 
         result_init = scan_fct(
@@ -3653,6 +4411,9 @@ class <lambda>(torch.nn.Module):
     @parametrize("reverse", [False, True])
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     def test_scan_init_wrong_pytree_complex(self, reverse, device):
+        # [FUNCTION DOC] Needs CUDA; parametrized over reverse and device. Scan with a dict init
+        #   whose structure differs from the input/carry structure expected by the complex
+        #   pointwise combine function; expects some Exception to be raised.
         x = torch.randn(3, 2, 2, device=device)
         y = torch.randn(3, 2, 2, device=device)
         z = torch.randn(3, 2, 2, device=device)
@@ -3692,7 +4453,14 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_init_pytree_complex(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Scan with dict/list/tuple pytree init and inputs,
+        #   using first the regular complex pointwise function, then combine functions whose
+        #   output pytree differs, and whose carry pytree differs, from the input; compares with
+        #   fake scan and checks gradients on leaves when autograd is on. Slicing of init and
+        #   inputs depends on the reverse flag.
         def fct_pointwise_different_output(x, y):
+            # [FUNCTION DOC] HELPER: returns a carry dict (products and sums, same structure as
+            #   init) and an output with a different structure (a tuple of scaled y and a dict).
             return (
                 {
                     "i": x["i"] * y["i"],
@@ -3714,6 +4482,8 @@ class <lambda>(torch.nn.Module):
             )
 
         def fct_pointwise_different_carry(x, y):
+            # [FUNCTION DOC] HELPER: returns a carry dict whose structure differs from the input
+            #   (includes an extra tuple member) and an output tuple of a scaled value and a dict.
             return (
                 {
                     "i": x["i"] * y["i"],
@@ -3826,13 +4596,19 @@ class <lambda>(torch.nn.Module):
     @skipIfNoDynamoSupport
     @skipIfCrossRef  # Arg order changes with crossref
     def test_scan_pytree_output(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Compiles a reversed scan with a tuple
+        #   carry using the eager recording backend and compares the golden graph: flip of xs,
+        #   scan higher-order op with a combine subgraph, and flip of the stacked output.
         x = torch.randn(3, 10, 2, device=torch.device("cpu"))
         init = torch.randn(1, 10, 2, device=torch.device("cpu"))
 
         def f(fct, init, xs):
+            # [FUNCTION DOC] HELPER: reversed scan along dim 0 of the given function.
             return scan(fct, init, xs, dim=0, reverse=True)
 
         def combine_fn(init, x):
+            # [FUNCTION DOC] HELPER: carry pair becomes (first plus x, second minus x); output is
+            #   the difference of the two new carries.
             a, b = (init[0] + x, init[1] - x)
             return (a, b), a - b
 
@@ -3875,6 +4651,10 @@ class GraphModule(torch.nn.Module):
     @parametrize("compile_mode", ["none", "eager"])
     @parametrize("autograd", [False, True])
     def test_scan_closure_RNN(self, compile_mode, autograd):
+        # [FUNCTION DOC] Skipped under dynamo; requires SM70 and CUDA. Compares scan with a
+        #   closure-based RNN cell combine function (weights passed as parameters) to
+        #   torch.nn.RNN: final state and stacked outputs; with autograd also compares gradients
+        #   wrt h, x and the weights (transposing weight gradients).
         dim = 1
         device = torch.device("cpu")
         scan_fct = compile_mode_helper(scan, compile_mode)
@@ -3955,6 +4735,11 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_RNN_partial_autograd(
         self, reverse, compile_mode, partial_grad, device
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over reverse, compile mode, partial-
+        #   grad scenario (xs, init, additional_inputs, complex, random) and device. Builds eight
+        #   tensors (two xs, two inits, four closure parameters) with various requires_grad masks
+        #   (random masks in the random scenario, unseeded), scans with a two-carry RNN, compares
+        #   with fake scan, and checks gradients only for outputs requiring grad.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
 
@@ -4007,6 +4792,8 @@ class GraphModule(torch.nn.Module):
             ]
 
             def RNN(x: torch.Tensor, y: torch.Tensor):
+                # [FUNCTION DOC] HELPER: combine using closure weights; carries (first entry of x
+                #   plus b_hh, second entry of x plus 1) and outputs a tanh/matmul combination.
                 c_new_0 = x[0] + b_hh
                 c_new_1 = x[1] + 1
                 h_new = (
@@ -4034,6 +4821,11 @@ class GraphModule(torch.nn.Module):
                 )
 
     def test_scan_break_bw_input_output_aliasing(self):
+        # [FUNCTION DOC] Unit test of the ScanAutogradImpl pass that clones backward-graph outputs
+        #   aliasing placeholders. Builds an fx graph with a computed output, a direct placeholder
+        #   output and a view of a placeholder output, runs the pass on a stub instance, and
+        #   asserts the computed output is unchanged while the direct and transitive aliases are
+        #   replaced by clone nodes of the right inputs.
         # Focused test for ScanAutogradImpl._break_bw_input_output_aliasing.
         # The partitioner naturally produces direct placeholder outputs (covered
         # by test_scan_closure_combine_fn_with_no_grad_additional_inputs_partial),
@@ -4078,6 +4870,11 @@ class GraphModule(torch.nn.Module):
     @parametrize("device", ["cpu", "cuda"])
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_multiple_layers_gradient(self, layers, device):
+        # [FUNCTION DOC] Needs CUDA, SM70, and not dynamo; parametrized over layer count (1, 2, 3)
+        #   and device; capture_scalar_outputs enabled. Defines three equivalent RNN-like models
+        #   (python loop, scan with list carry, scan with stacked tensor carry), compiles each,
+        #   and checks that layer weight gradients and loss equal those of the uncompiled copy
+        #   with identical weights.
         import torch.nn as nn
 
         torch.manual_seed(1)
@@ -4089,7 +4886,11 @@ class GraphModule(torch.nn.Module):
         DEVICE = device
 
         class RNNLoop(nn.Module):
+            # [CLASS DOC] HELPER: model with a stack of linear layers that unrolls over time in a
+            #   Python loop, updating a list of hidden states.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates a ModuleList of Linear layers from twice the
+                #   feature dim to the feature dim, and records layer count.
                 super().__init__()
                 self.layers = nn.ModuleList(
                     [nn.Linear(FEATURE_DIM * 2, FEATURE_DIM) for _ in range(LAYERS)]
@@ -4097,6 +4898,9 @@ class GraphModule(torch.nn.Module):
                 self.num_layers = LAYERS
 
             def forward(self, initial, inputs_sequence):
+                # [FUNCTION DOC] HELPER: for each time step and each layer, concatenates hidden
+                #   state and input, applies the layer, adds the update to the hidden state and
+                #   feeds it onward; stacks per-step outputs along time.
                 B, T, _ = inputs_sequence.shape
                 hs_list = initial
                 all_out = []
@@ -4113,7 +4917,10 @@ class GraphModule(torch.nn.Module):
                 return torch.stack(all_out, dim=1)
 
         class RNNScanList(nn.Module):
+            # [CLASS DOC] HELPER: same model implemented with scan over a list of hidden-state
+            #   tensors as the carry.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the Linear layer stack and records layer count.
                 super().__init__()
                 self.layers = nn.ModuleList(
                     [nn.Linear(FEATURE_DIM * 2, FEATURE_DIM) for _ in range(LAYERS)]
@@ -4121,7 +4928,12 @@ class GraphModule(torch.nn.Module):
                 self.num_layers = LAYERS
 
             def forward(self, initial, input_sequence):
+                # [FUNCTION DOC] HELPER: runs scan along dim 1 with a step function and returns
+                #   the stacked outputs (final carry discarded).
                 def step(carry, input):
+                    # [FUNCTION DOC] HELPER: updates each layer's hidden state in a copy of
+                    #   the carry list and returns cloned hidden states with a clone of the
+                    #   last layer output.
                     hs_list = carry[:]
                     for li, layer in enumerate(self.layers):
                         h_prev_li = hs_list[li]
@@ -4136,7 +4948,9 @@ class GraphModule(torch.nn.Module):
                 return all_outputs_scan
 
         class RNNScanTensor(nn.Module):
+            # [CLASS DOC] HELPER: same model with the hidden states stacked into one tensor carry.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the Linear layer stack and records layer count.
                 super().__init__()
                 self.layers = nn.ModuleList(
                     [nn.Linear(FEATURE_DIM * 2, FEATURE_DIM) for _ in range(LAYERS)]
@@ -4144,7 +4958,11 @@ class GraphModule(torch.nn.Module):
                 self.num_layers = LAYERS
 
             def forward(self, initial, input_sequence):
+                # [FUNCTION DOC] HELPER: stacks initial hidden states along dim 1, scans along dim
+                #   1 and returns the stacked outputs.
                 def step(carry_tensor, xs_input):
+                    # [FUNCTION DOC] HELPER: for each layer updates its slice of a cloned carry
+                    #   tensor and returns the cloned carry with a clone of the last layer output.
                     input = xs_input
                     hs_tensor = carry_tensor
                     for li, layer in enumerate(self.layers):
@@ -4164,6 +4982,9 @@ class GraphModule(torch.nn.Module):
                 return all_outputs_scan
 
         def run_test_and_get_grads_loss(model, initial_hs, inputs):
+            # [FUNCTION DOC] HELPER: zeroes existing parameter grads, runs the model on detached
+            #   copies of the initial states and inputs, backpropagates the sum of outputs, and
+            #   returns the list of cloned layer weight gradients and the loss.
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.zero_()
@@ -4237,6 +5058,10 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_with_no_grad_init_carries_unequal_grad(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Combine function computes one carry
+        #   under no_grad; both inits (random) may require grad. Compares with fake scan; with
+        #   autograd, checks gradients of all result leaves but the first with respect to x and
+        #   the second init.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4277,6 +5102,9 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_with_no_grad_init_carries_equal_grad(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Same as the unequal-grad test but
+        #   the first init does not require grad; compares with fake scan and checks gradients of
+        #   all result leaves except the first.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4317,6 +5145,9 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_with_no_grad_for_out(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. The per-step output is computed
+        #   under no_grad while carries are differentiable; compares with fake scan and, with
+        #   autograd, checks gradients of the carries wrt x and both inits.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4324,6 +5155,8 @@ class GraphModule(torch.nn.Module):
         h2 = torch.randn(3, 7, device=device, requires_grad=autograd)
 
         def fct_ys_no_grad(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: new carries are the first entry of x plus y and the second
+            #   entry of x plus y; the output is tanh of their sum computed under no_grad.
             c1 = x[0] + y
             c2 = x[1] + y
             with torch.no_grad():
@@ -4346,6 +5179,9 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_with_no_grad_additional_inputs_partial(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Combine function uses closure
+        #   tensors, with part of the computation (using W_hh and b_hh) under no_grad; compares
+        #   with fake scan and checks gradients of the second result wrt h, x, W_ih, b_ih.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4356,6 +5192,8 @@ class GraphModule(torch.nn.Module):
         b_hh = torch.randn(7, device=device, requires_grad=autograd)
 
         def fct_no_grad_bhh_Whh(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry from the closure weights W_ih and b_ih; output is carry
+            #   plus one plus a tanh term computed under no_grad.
             c_new = y @ W_ih + b_ih + x
 
             h_new = c_new + 1
@@ -4381,6 +5219,9 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_with_no_grad_additional_inputs_all(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. All closure-parameter terms are
+        #   computed under no_grad; compares with fake scan and checks gradients of the second
+        #   result wrt h and x only.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4391,6 +5232,8 @@ class GraphModule(torch.nn.Module):
         b_hh = torch.randn(7, device=device, requires_grad=autograd)
 
         def fct_no_grad_bih_Wih_bhh_Whh(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: computes terms from all four closure parameters under no_grad
+            #   and adds them to differentiable carry and output.
             c_new = x + y
             h_new = c_new + x
             with torch.no_grad():
@@ -4418,6 +5261,9 @@ class GraphModule(torch.nn.Module):
     def test_scan_closure_combine_fn_carries_ys_same_grad(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Carry and output share the
+        #   differentiable path plus no_grad closure terms; compares with fake scan and checks
+        #   gradients of the second result wrt h and x.
         dim = 1
         scan_fct = compile_mode_helper(scan, compile_mode)
         x = torch.randn(3, 10, 7, device=device, requires_grad=autograd)
@@ -4428,6 +5274,8 @@ class GraphModule(torch.nn.Module):
         b_hh = torch.randn(7, device=device, requires_grad=autograd)
 
         def fct_no_grad_bih_Wih_bhh_Whh(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: new carry and output built from a differentiable sum plus
+            #   no_grad closure terms.
             c_new = x + y
             h_new = c_new + 1
             with torch.no_grad():
@@ -4453,6 +5301,10 @@ class GraphModule(torch.nn.Module):
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     @parametrize("autograd", [False, True])
     def test_scan_closure_nested(self, reverse, compile_mode, device, autograd):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Scan with a closure-based cell
+        #   (checked against fake scan), then two chained scans of different closure weights
+        #   (second scanning the stacked outputs of the first), then a more complex pair reusing
+        #   weights across both; checks gradients when autograd is on.
         scan_fct = compile_mode_helper(scan, compile_mode)
 
         # Simple non-nested case
@@ -4462,6 +5314,7 @@ class GraphModule(torch.nn.Module):
         b = torch.randn(7, device=device, requires_grad=autograd)
 
         def f1(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry y matmul W plus b; output tanh of carry plus x.
             c_new = y @ W + b
             h_new = torch.tanh(c_new + x)
             return c_new, h_new
@@ -4475,6 +5328,9 @@ class GraphModule(torch.nn.Module):
 
         # Nested case
         def chain_fct(fct, f_1, f_2, xs, h_1, h_2):
+            # [FUNCTION DOC] HELPER: runs the given scan function twice along dim 1 with reverse
+            #   from the enclosing test: first f_1 on xs with h_1, then f_2 on the stacked outputs
+            #   of the first with h_2; returns the second result.
             o1 = fct(
                 f_1,
                 h_1,
@@ -4500,11 +5356,13 @@ class GraphModule(torch.nn.Module):
         b_2 = torch.randn(3, device=device, requires_grad=autograd)
 
         def f1(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry y matmul W_1 plus b_1; output tanh of carry plus x.
             c_new = y @ W_1 + b_1
             h_new = torch.tanh(c_new + x)
             return c_new, h_new
 
         def f2(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry y matmul W_2 plus b_2; output tanh of carry plus x.
             c_new = y @ W_2 + b_2
             h_new = torch.tanh(c_new + x)
             return c_new, h_new
@@ -4526,11 +5384,14 @@ class GraphModule(torch.nn.Module):
         b_2 = torch.randn(3, device=device, requires_grad=autograd)
 
         def f1(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry y matmul W_1 plus b_1; output tanh of carry plus x.
             c_new = y @ W_1 + b_1
             h_new = torch.tanh(c_new + x)
             return c_new, h_new
 
         def f2(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: carry mixes W_2, b_2 times b_1 and y matmul W_1; output tanh
+            #   of carry plus x.
             c_new = y @ W_2 + b_2 * b_1 + y @ W_1
             h_new = torch.tanh(c_new + x)
             return c_new, h_new
@@ -4546,13 +5407,18 @@ class GraphModule(torch.nn.Module):
 
     @skipIfNoDynamoSupport
     def test_scan_simple_graph_wrong_dtype(self):
+        # [FUNCTION DOC] Combine function returns a carry of int64 dtype while init is
+        #   float; expects UncapturedHigherOrderOpError complaining about differing init
+        #   and carry metadata.
         def add_wrong_dtype(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns an int64 ones-like carry and the sum as output.
             return torch.ones_like(x + y, dtype=torch.int64), x + y
 
         x = torch.randn(3, 10, 2, device=torch.device("cpu"))
         init = torch.randn(1, 10, 2, device=torch.device("cpu"))
 
         def f(fct, init, xs):
+            # [FUNCTION DOC] HELPER: reversed scan along dim 0.
             return scan(fct, init, xs, dim=0, reverse=True)
 
         # Wrong dtype
@@ -4565,10 +5431,14 @@ class GraphModule(torch.nn.Module):
     @skipIfNoDynamoSupport
     @skipIfCrossRef  # Arg order changes with crossref
     def test_scan_simple_graph(self):
+        # [FUNCTION DOC] Skipped for cross-ref. Traces a reversed scan with symbolic make_fx and
+        #   compares the golden graph (flip, scan op with size arguments, flip of the output),
+        #   then compiles with the eager recording backend and compares the dynamo graph code.
         x = torch.randn(3, 10, 2, device=torch.device("cpu"))
         init = torch.randn(1, 10, 2, device=torch.device("cpu"))
 
         def f(fct, init, xs):
+            # [FUNCTION DOC] HELPER: reversed scan along dim 0.
             return scan(fct, init, xs, dim=0, reverse=True)
 
         # Correct case
@@ -4614,9 +5484,12 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @requires_cuda
     def test_scan_input_mutation(self):
+        # [FUNCTION DOC] CUDA-only. Combine function mutates its carry argument in place; scan is
+        #   expected to raise UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
 
         def fct_input_mutation(x, y):
+            # [FUNCTION DOC] HELPER: adds one to x in place then returns two sums.
             x.add_(1)
             return x + y, x + y + 2
 
@@ -4634,10 +5507,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @requires_cuda
     def test_scan_additional_input_mutation(self):
+        # [FUNCTION DOC] CUDA-only. Combine function mutates a closed-over buffer in place; scan
+        #   is expected to raise UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
         buf = torch.randn(2, 2, device=device)
 
         def fct_additional_input_mutation(x, y):
+            # [FUNCTION DOC] HELPER: adds one to the closure buffer in place and returns two sums.
             buf.add_(1)
             return x + y, x + y + 2
 
@@ -4652,9 +5528,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @requires_cuda
     def test_scan_input_carry_alias(self):
+        # [FUNCTION DOC] CUDA-only. Combine function returns an input leaf directly as a carry;
+        #   expects UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
 
         def fct_input_output_alias(x, y):
+            # [FUNCTION DOC] HELPER: returns the first carry entry unchanged as the new carry
+            #   (aliasing the input) plus other sums.
             return (x[0], x[1] + y[1]), (x[1] + y[1] + 1, x[1] + y[1] + 2)
 
         x = torch.randn(3, 2, 2, device=device)
@@ -4673,9 +5553,12 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @requires_cuda
     def test_scan_input_output_alias(self):
+        # [FUNCTION DOC] CUDA-only. Combine function returns a carry input directly as an output;
+        #   expects UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
 
         def fct_input_output_alias(x, y):
+            # [FUNCTION DOC] HELPER: returns an input leaf as one of its outputs.
             return (x[0] + 1, x[1] + y[1]), (x[1], x[1] + y[1] + 2)
 
         x = torch.randn(3, 2, 2, device=device)
@@ -4695,9 +5578,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_scan_carry_carry_alias(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Combine function returns the same tensor for both
+        #   carry slots; expects UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
 
         def fct_carry_carry_alias(x, y):
+            # [FUNCTION DOC] HELPER: returns the same computed tensor twice as the carry
+            #   pair, plus outputs.
             c = x[0] + y[1]
             return (c, c), (x[0] + y[1], x[0] + y[1] + 1)
 
@@ -4718,9 +5605,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_scan_carry_output_alias(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Combine function returns the same tensor as both
+        #   a carry and an output; expects UncapturedHigherOrderOpError naming the scan op.
         device = torch.device("cuda")
 
         def fct_carry_output_alias(x, y):
+            # [FUNCTION DOC] HELPER: computes a tensor c and returns it both inside the carry pair
+            #   and as the first output.
             c = x[0] + y[1]
             return (x[0] + y[1], c), (c, x[0] + y[1] + 1)
 
@@ -4739,7 +5630,11 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
             scan(fct_carry_output_alias, init, inp, dim=0)
 
     def test_scan_length_validation_pass(self):
+        # [FUNCTION DOC] Scan with an explicit length equal to the xs size gives the same result
+        #   as the fake scan.
         def add(c, x):
+            # [FUNCTION DOC] HELPER: carry plus x as the new carry and a clone of the sum
+            #   as the output.
             return c + x, (c + x).clone()
 
         init = torch.tensor(0.0)
@@ -4749,7 +5644,11 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
         self.assertEqual(result, expected)
 
     def test_scan_length_validation_mismatch(self):
+        # [FUNCTION DOC] Scan with length 3 on xs of size 4 raises RuntimeError whose message says
+        #   the length does not match the xs size.
         def add(c, x):
+            # [FUNCTION DOC] HELPER: carry plus x as the new carry and a clone of the
+            #   sum as output.
             return c + x, (c + x).clone()
 
         init = torch.tensor(0.0)
@@ -4760,7 +5659,10 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
             scan(add, init, xs, length=3)
 
     def test_scan_length_negative_raises(self):
+        # [FUNCTION DOC] Scan with xs None and length minus one raises RuntimeError saying length
+        #   must be a non-negative integer.
         def body(c, x):
+            # [FUNCTION DOC] HELPER: increments carry by 1.0 and returns a clone as output.
             return c + 1.0, (c + 1.0).clone()
 
         init = torch.tensor(0.0)
@@ -4770,8 +5672,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
             scan(body, init, None, length=-1)
 
     def test_scan_xs_empty_tuple_length_eager(self):
+        # [FUNCTION DOC] An empty tuple for xs with an explicit length behaves like xs None: the
+        #   body receives None for x, four steps run, the carry is 4.0 and the stacked output is
+        #   1 to 4.
         # Empty pytree xs (()) is treated the same as xs=None when length is given.
         def body(c, x):
+            # [FUNCTION DOC] HELPER: raises RuntimeError if x is not None; otherwise increments
+            #   the carry by 1.0 and returns a clone as output.
             if x is not None:
                 raise RuntimeError(f"expected x to be None, got {x}")
             return c + 1.0, (c + 1.0).clone()
@@ -4783,8 +5690,12 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @parametrize("length", [4, 0])
     def test_scan_xs_none_length_body_uses_x_raises(self, length):
+        # [FUNCTION DOC] Parametrized over length 4 and 0. A body that adds None x to the carry
+        #   makes scan raise RuntimeError or TypeError about an unsupported operand type with
+        #   NoneType, whatever the length.
         # combine_fn that dereferences x must raise regardless of length.
         def bad_body(c, x):
+            # [FUNCTION DOC] HELPER: adds x (None) to the carry, which fails.
             return c + x, (c + x).clone()
 
         init = torch.tensor(0.0)
@@ -4798,13 +5709,20 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
     @parametrize("output", ["tensor", "none"])
     @parametrize("autograd", [False, True])
     def test_scan_xs_none_length(self, compile_mode, output, autograd):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over compile mode, output kind (tensor
+        #   or none) and autograd. Scans with xs None and length 3 and compares with the fake
+        #   scan; with a None output and autograd on, asserts that a RuntimeError is raised (a
+        #   pinned limitation) and returns early; otherwise checks gradients when autograd is on.
         if output == "tensor":
 
             def body(c, x):
+                # [FUNCTION DOC] HELPER: carry becomes the sine of the carry; output is a
+                #   clone of it.
                 return torch.sin(c), torch.sin(c).clone()
         else:
 
             def body(c, x):  # noqa: E306
+                # [FUNCTION DOC] HELPER: carry becomes the sine of the carry; output is None.
                 return torch.sin(c), None
 
         init = torch.tensor(0.5, requires_grad=autograd)
@@ -4827,7 +5745,10 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @skipIfNoDynamoSupport
     def test_scan_xs_none_length_make_fx_none_output(self):
+        # [FUNCTION DOC] Traces scan with xs None, length 3 and a None output through make_fx and
+        #   checks the traced graph gives the same result as the fake scan.
         def body(c, x):
+            # [FUNCTION DOC] HELPER: carry becomes sine of carry; output None.
             return torch.sin(c), None
 
         init = torch.tensor(0.5)
@@ -4838,9 +5759,13 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
     @parametrize("output", ["tensor", "none"])
     def test_scan_xs_none_length_zero(self, output):
+        # [FUNCTION DOC] Parametrized over output kind. Scan with xs None and length 0 returns the
+        #   init as carry; the tensor-output case gives an output of shape zero by three with the
+        #   init dtype, the none case gives None; both match the fake scan.
         if output == "tensor":
 
             def body(c, x):
+                # [FUNCTION DOC] HELPER: returns the carry unchanged and a clone of carry times 2.
                 return c, (c * 2).clone()
 
             init = torch.tensor([1.0, 2.0, 3.0])
@@ -4851,6 +5776,7 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
         else:
 
             def body(c, x):  # noqa: E306
+                # [FUNCTION DOC] HELPER: carry plus 1.0 and a None output.
                 return c + 1.0, None
 
             init = torch.tensor(0.0)
@@ -4863,21 +5789,27 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
     @skipIfNoDynamoSupport
     @parametrize("output", ["tensor", "none"])
     def test_scan_xs_none_length_zero_compile(self, output):
+        # [FUNCTION DOC] Parametrized over output kind. Under torch.compile with full
+        #   graph, scan with xs None and length 0 raises RuntimeError saying it is not
+        #   supported under torch.compile.
         if output == "tensor":
 
             def body(c, x):
+                # [FUNCTION DOC] HELPER: returns the carry unchanged and a clone of carry times 2.
                 return c, (c * 2).clone()
 
             init = torch.tensor([1.0, 2.0, 3.0])
         else:
 
             def body(c, x):  # noqa: E306
+                # [FUNCTION DOC] HELPER: carry plus 1.0 and a None output.
                 return c + 1.0, None
 
             init = torch.tensor(0.0)
 
         @torch.compile(fullgraph=True)
         def f(i):
+            # [FUNCTION DOC] HELPER: compiled; scan with xs None and length 0.
             return scan(body, i, None, length=0)
 
         with self.assertRaisesRegex(
@@ -4887,7 +5819,11 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
             f(init)
 
     def test_scan_xs_none_length_vmap(self):
+        # [FUNCTION DOC] Applies torch.vmap over a batch of three initial carries to a scan with
+        #   xs None and length 4; checks the batched carry is init plus 4 and the stacked output
+        #   holds init plus 1 through 4 along dim 1.
         def body(c, x):
+            # [FUNCTION DOC] HELPER: carry plus 1.0 and a clone of it as output.
             return c + 1.0, (c + 1.0).clone()
 
         batch_init = torch.arange(3, dtype=torch.float32)
@@ -4901,7 +5837,11 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
     @skipIfTorchDynamo("don't test compile on compile")
     @skipIfNoDynamoSupport
     def test_scan_xs_none_length_dynamic_compile(self):
+        # [FUNCTION DOC] Skipped under dynamo. Compiles a scan with xs None and a dynamic length
+        #   using a compile counter backend; length 4 and 6 give the expected results and a repeat
+        #   of length 4 does not recompile (frame count 1).
         def body(c, x):
+            # [FUNCTION DOC] HELPER: carry plus 1.0 and a clone of it as output.
             return c + 1.0, (c + 1.0).clone()
 
         init = torch.tensor(0.0)
@@ -4911,6 +5851,7 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
         @torch.compile(backend=cc, fullgraph=True, dynamic=True)
         def f(i, length):
+            # [FUNCTION DOC] HELPER: compiled; scan with xs None and the given length.
             return scan(body, i, None, length=length)
 
         r4 = f(init, 4)
@@ -4924,13 +5865,21 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor):
 
 
 class AssociativeScanModels:
+    # [CLASS DOC] HELPER: namespace class with module wrappers used by the associative scan tests:
+    #   a factory for scan functions and the modules CombineFn, Simple, ChainFn and NestedFn.
     @staticmethod
     def get_scan_fct(compile_mode, combine_mode):
+        # [FUNCTION DOC] HELPER: static factory. For any compile mode except fake, compiles
+        #   associative_scan per the mode and returns a function taking combine function,
+        #   xs, dim and reverse that fixes the combine mode; for fake returns the reference
+        #   fake associative scan.
         # Compile the associative_scan according to the provided compile_mode
         if compile_mode != "fake":
             assoc_scan_comp = compile_mode_helper(associative_scan, compile_mode)
 
             def scan_fct(combine_fn, xs, dim, reverse):
+                # [FUNCTION DOC] HELPER: calls the compiled associative scan with the given
+                #   combine function, xs, dim and reverse and the captured combine mode.
                 return assoc_scan_comp(combine_fn, xs, dim, reverse, combine_mode)
 
         else:
@@ -4938,7 +5887,11 @@ class AssociativeScanModels:
         return scan_fct
 
     class CombineFn(torch.nn.Module):
+        # [CLASS DOC] HELPER: module that applies one associative scan with a given combine
+        #   function, dim, reverse and modes.
         def __init__(self, combine_fn, dim, reverse, combine_mode, compile_mode):
+            # [FUNCTION DOC] HELPER: stores the scan function (from get_scan_fct for the compile
+            #   and combine modes), the combine function, dim and reverse.
             super().__init__()
 
             self.scan_fct = AssociativeScanModels.get_scan_fct(
@@ -4949,11 +5902,16 @@ class AssociativeScanModels:
             self.reverse = reverse
 
         def forward(self, inputs):
+            # [FUNCTION DOC] HELPER: runs the scan function on the inputs and returns the result.
             results = self.scan_fct(self.combine_fn, inputs, self.dim, self.reverse)
             return results
 
     class Simple(torch.nn.Module):
+        # [CLASS DOC] HELPER: module that runs two associative scans (add and mul) over
+        #   the same inputs.
         def __init__(self, dim, reverse, combine_mode, compile_mode):
+            # [FUNCTION DOC] HELPER: builds a list of two CombineFn modules (add and mul combine
+            #   functions) sharing the given dim, reverse, combine mode and compile mode.
             super().__init__()
 
             kwargs = {
@@ -4972,13 +5930,21 @@ class AssociativeScanModels:
             ]
 
         def forward(self, inputs):
+            # [FUNCTION DOC] HELPER: applies each CombineFn to the inputs and returns the
+            #   list of results.
             results = []
             for combine_fn in self.combine_fns:
                 results.append(combine_fn(inputs))
             return results
 
     class ChainFn(torch.nn.Module):
+        # [CLASS DOC] HELPER: module that chains several scan stages; per-stage options may be
+        #   lists of the chain length, otherwise the single value is shared.
         def __init__(self, combine_fn, dim, reverse, combine_mode, compile_mode):
+            # [FUNCTION DOC] HELPER: for each stage builds an options mapping (taking list entries
+            #   by position when a value is a list of chain length), creates the scan function for
+            #   that stage's combine mode, and stores a tuple of stage function, scan function and
+            #   remaining options (dim, reverse).
             super().__init__()
 
             chain_len = len(combine_fn)
@@ -5011,13 +5977,20 @@ class AssociativeScanModels:
                 self.nested_tuple.append((combine_fn, scan_fct, kwargs_el))
 
         def forward(self, inputs):
+            # [FUNCTION DOC] HELPER: threads the inputs through each stage, calling the stage
+            #   function with the scan function and the stage options.
             results = inputs
             for combine_fn, scan_fct, kwargs in self.nested_tuple:
                 results = combine_fn(scan_fct, results, **kwargs)
             return results
 
     class NestedFn(torch.nn.Module):
+        # [CLASS DOC] HELPER: module that runs a scan function with the combine function taken
+        #   from the keyword arguments.
         def forward(self, scan_fct, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: takes the combine function out of the keyword
+            #   arguments (removing it from the mapping) and calls the scan function with
+            #   it and the remaining keywords.
             combine_fn = kwargs["combine_fn"]
 
             # Remove combine_fn from kwargs
@@ -5031,11 +6004,20 @@ class AssociativeScanModels:
 @unittest.skipIf(IS_WINDOWS, "Windows not supported for this test")
 @skipIfNoDynamoSupport
 class AssociativeScanTests(TestCase):
+    # [CLASS DOC] Test suite for associative_scan against the reference fake implementation
+    #   over compile modes, combine modes (pointwise or generic), directions, devices and
+    #   autograd. Skipped on Windows and without dynamo support. Helper methods compare
+    #   results and gradients.
     def setUp(self):
+        # [FUNCTION DOC] Resets dynamo state then calls the base class setUp.
         torch._dynamo.reset()
         super().setUp()
 
     def _check_autograd(self, result, result_exp, autograd_param):
+        # [FUNCTION DOC] HELPER: keeps only parameters requiring grad and result tensors requiring
+        #   grad; raises AssertionError if the number of differentiable results differs between
+        #   result and expected; computes gradients of both with ones as output gradients and
+        #   asserts equality with atol 6e-05 and rtol 6e-06.
         grad_param = [p for p in autograd_param if p.requires_grad]
 
         result_flatten, _ = pytree.tree_flatten(result)
@@ -5059,6 +6041,9 @@ class AssociativeScanTests(TestCase):
         self.assertEqual(grads, expected_grads, atol=6e-05, rtol=6e-06)
 
     def _run_test(self, model, model_fake, inputs, autograd_param=None):
+        # [FUNCTION DOC] HELPER: runs model and fake model on the inputs and asserts equal
+        #   results; if any given autograd parameter requires grad, compares gradients for the
+        #   results that require grad; returns the model result.
         result = model(inputs)
         result_exp = model_fake(inputs)
         self.assertEqual(result, result_exp)
@@ -5080,6 +6065,8 @@ class AssociativeScanTests(TestCase):
         return result
 
     def _prepare_fake_kwargs(self, original_kwargs):
+        # [FUNCTION DOC] HELPER: returns a copy of the keyword mapping with compile_mode
+        #   set to fake.
         kwargs_fake = original_kwargs.copy()
         kwargs_fake["compile_mode"] = "fake"
         return kwargs_fake
@@ -5106,6 +6093,10 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_zero_length(
         self, combine_mode, reverse, compile_mode, device, autograd, dim
     ):
+        # [FUNCTION DOC] Requires SM70. Parametrized over combine mode, reverse, compile mode,
+        #   device, autograd and dim; pointwise on cpu or with dynamic-shape compile is skipped.
+        #   Runs the add and mul scan model on an input whose chosen dim has size zero and
+        #   compares to the fake model (including gradients).
         shape = [2, 4, 3]
         shape[dim] = 0
         x = torch.randn(*shape, device=device, requires_grad=autograd)
@@ -5147,6 +6138,10 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_compile(
         self, combine_mode, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). Compares the Simple model with the fake one and, when not reversed,
+        #   with cumsum and cumprod; then checks a small float example against known sums for
+        #   forward and reversed scans.
         x = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
         kwargs = {
             "dim": 0,
@@ -5218,6 +6213,12 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_dim(
         self, combine_mode, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). With a fixed random seed generates four random shapes and scan dims,
+        #   resets dynamo each time, compares with the fake model, and when not reversed compares
+        #   with cumsum and cumprod.
+        # KNOWN ISSUE: the torch reference cumsum/cumprod always use dim 0 instead of the randomly
+        #   chosen scan dim, so the comparison is only meaningful when the chosen dim is 0.
         import random
 
         random.seed(1234)
@@ -5254,6 +6255,12 @@ class AssociativeScanTests(TestCase):
     @requires_cuda
     @unittest.expectedFailure
     def test_associative_scan_dim_shape_failure(self, compile_mode, combine_mode):
+        # [FUNCTION DOC] Requires SM70 and CUDA; marked as expected failure. Intended to run
+        #   a reversed compiled generic scan on a 9 by 9 input along dim 0 and compare with
+        #   the fake model.
+        # KNOWN ISSUE: the method declares compile_mode and combine_mode parameters but is not
+        #   parametrized, so it fails on a missing-argument error before running; the expected-
+        #   failure marker hides this.
         num_dims = [2]
         for num_dim in num_dims:
             shapes = [9 for _ in range(num_dim)]
@@ -5274,11 +6281,17 @@ class AssociativeScanTests(TestCase):
             )
 
     def test_associative_scan_pointwise_cpu_lowering_error(self):
+        # [FUNCTION DOC] Compiling a module that calls associative_scan in pointwise mode on a CPU
+        #   tensor raises InductorError saying it is not supported on cpu.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a pointwise associative scan along dim 0.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: returns associative_scan of the module-level add function
+                #   over xs along dim 0 in pointwise mode.
                 return associative_scan(combine_fn, xs, dim=0, combine_mode="pointwise")
 
         from torch._inductor.exc import InductorError
@@ -5290,11 +6303,19 @@ class AssociativeScanTests(TestCase):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_associative_scan_pointwise_mixed_device_lowering_error(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Compiling a pointwise associative scan over a
+        #   tuple with one CUDA and one CPU tensor raises InductorError saying it is not
+        #   supported on cpu.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: element-wise sum of the two tuples, returning a tuple.
             return (x[0] + y[0], x[1] + y[1])
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a pointwise associative scan over a
+            #   pair of tensors.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: runs associative_scan over the pair (a, b) along dim 0
+                #   in pointwise mode.
                 return associative_scan(
                     combine_fn, (a, b), dim=0, combine_mode="pointwise"
                 )
@@ -5330,6 +6351,9 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_tuple(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). Associative scan over a tuple input with the tuple combine function,
+        #   compared with the fake model including gradients for both tensors.
         x = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         y = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         inp = (x, y)
@@ -5358,9 +6382,13 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_expand_in_combine_fn(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Generic-mode scan whose combine
+        #   function expands a reduced tensor back to x's shape; compared with the fake model.
         x = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
 
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: multiplies x by the sum of y over the last dim expanded
+            #   to x's shape.
             return x * torch.sum(y, -1).expand(x.shape)
 
         kwargs = {
@@ -5387,6 +6415,9 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_non_contiguous_tensor(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Builds a transposed (non-
+        #   contiguous) input, raises AssertionError if it is contiguous, and compares the add
+        #   scan with the fake model.
         x = (
             torch.arange(30, device=device, dtype=torch.float32, requires_grad=autograd)
             .view(10, 3)
@@ -5434,6 +6465,9 @@ class AssociativeScanTests(TestCase):
     def test_associative_scan_complex_pytree(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). Scan over a dict/list/tuple pytree input using the complex pointwise
+        #   combine function, compared with the fake model including gradients for x, y, z.
         x = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         y = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
         z = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
@@ -5458,6 +6492,10 @@ class AssociativeScanTests(TestCase):
     @skipIfNoDynamoSupport
     @skipIfCrossRef  # Arg order changes with crossref
     def test_associative_scan_pytree_output(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Compiles a reversed generic
+        #   associative scan over a nested pytree of three tensors with the eager recording
+        #   backend and compares the golden graph (movedim, flip, vmap-batched combine, interleave
+        #   via pad and stack, flip back).
         x = (
             (
                 torch.randn(3, 10, 2, device=torch.device("cpu")),
@@ -5467,11 +6505,16 @@ class AssociativeScanTests(TestCase):
         )
 
         def f(fct, xs):
+            # [FUNCTION DOC] HELPER: reversed generic associative scan along dim 0.
             return associative_scan(
                 fct, xs, dim=0, reverse=True, combine_mode="generic"
             )
 
         def combine_fn(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: combine over nested pytree values; returns a nested carry
+            #   made of a and a one-tuple holding b, and an output a minus b, where a is the
+            #   sum of x's first leaf and y's second and b is the difference of x's inner leaf
+            #   and y's second.
             a, b = (x[0][0] + y[1], x[0][1][0] - y[1])
             return (a, (b,)), a - b
 
@@ -5608,11 +6651,18 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_downstream_scan_matmul(
         self, combine_mode, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). Chains an add associative scan along dim 1 with a matrix
+        #   multiplication by a ones matrix and compares with the fake chain.
         def first_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: applies the scan function with the add combine function to
+            #   the input and returns the result.
             o = scan_fct(get_scan_combine_fn("add", True), inp, **kwargs)
             return o
 
         def second_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: ignores the scan function and returns the input matrix-
+            #   multiplied by a 2 by 5 ones matrix.
             W = torch.ones(2, 5, device=device)
             return inp @ W
 
@@ -5656,11 +6706,15 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_downstream_scan_scan(
         self, combine_mode, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-shape
+        #   compile skipped). Chains two add scans along dim 1 and compares with the fake chain.
         def first_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: applies the add scan to the input.
             o1 = scan_fct(get_scan_combine_fn("add", True), inp, **kwargs)
             return o1
 
         def second_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: applies the add scan to the input.
             o2 = scan_fct(get_scan_combine_fn("add", True), inp, **kwargs)
             return o2
 
@@ -5718,13 +6772,19 @@ class GraphModule(torch.nn.Module):
         device,
         autograd,
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over combine mode, compile mode,
+        #   first direction, same_direction and autograd (pointwise on cpu, dynamic-shape compile,
+        #   or pointwise with autograd skipped). Chains two add scans over dim 1 then dim 0, the
+        #   second direction equal to the first or its opposite, and compares with the fake chain.
         reverse_second = reverse_first if same_direction else not reverse_first
 
         def first_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: applies the add scan to the input.
             o1 = scan_fct(get_scan_combine_fn("add", True), inp, **kwargs)
             return o1
 
         def second_chain_fct(scan_fct, inp, **kwargs):
+            # [FUNCTION DOC] HELPER: applies the add scan to the input.
             o2 = scan_fct(get_scan_combine_fn("add", True), inp, **kwargs)
             return o2
 
@@ -5751,6 +6811,9 @@ class GraphModule(torch.nn.Module):
     @requires_cuda
     @unittest.expectedFailure
     def test_associative_scan_nested(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA; expected failure (comment says vmap inside
+        #   associative_scan prevents nested use). Runs a pointwise scan whose combine function
+        #   itself calls another scan, compared to a fake nested version.
         combine_mode = "pointwise"
         compile_mode = "eager"
         reverse_first = False
@@ -5760,6 +6823,8 @@ class GraphModule(torch.nn.Module):
         reverse_second = reverse_first if same_direction else not reverse_first
 
         def first_nested_fct(x, y):
+            # [FUNCTION DOC] HELPER: runs an inner associative scan with the multiply combine
+            #   function over y, and returns x plus that.
             y_new = associative_scan(
                 second_nested_fct,
                 y,
@@ -5770,12 +6835,14 @@ class GraphModule(torch.nn.Module):
             return x + y_new
 
         def first_nested_fct_fake(x, y):
+            # [FUNCTION DOC] HELPER: same as first_nested_fct using the fake associative scan.
             y_new = _fake_associative_scan(
                 second_nested_fct, y, 0, reverse=reverse_second
             )
             return x + y_new
 
         def second_nested_fct(x, y):
+            # [FUNCTION DOC] HELPER: returns x times y.
             return x * y
 
         inp = torch.randn(3, 10, 2, device=device)
@@ -5805,14 +6872,24 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_loop_in_combine_fn(
         self, compile_mode, loop_type, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over compile mode, loop type (only
+        #   the Python for loop is enabled), reverse, device and autograd. Generic scan whose
+        #   combine function loops; compared with the fake model including gradients.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: accumulates the absolute values of the ten rows of y into a
+            #   zero tensor with a loop (a while_loop variant exists for the while loop type), and
+            #   returns x times the accumulated value.
             cnt = torch.zeros_like(y[0, :])
             if loop_type == "while":
 
                 def cond_fn(ind, loop_val):
+                    # [FUNCTION DOC] HELPER: while-loop predicate, whether the first entry of
+                    #   loop_val is below 5.
                     return (loop_val < 5)[0]
 
                 def body_fn(ind, loop_val):
+                    # [FUNCTION DOC] HELPER: returns the index plus one and loop_val plus abs
+                    #   of the index.
                     return ind + 1, loop_val + torch.abs(ind)
 
                 new_ind, cnt = torch.while_loop(
@@ -5851,19 +6928,30 @@ class GraphModule(torch.nn.Module):
     @requires_cuda
     @unittest.expectedFailure
     def test_associative_scan_loop_in_combine_fn_failure(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA; expected failure. Generic scan whose combine
+        #   function only defines while-loop helpers and returns nothing.
+        # KNOWN ISSUE: combine_fn has no return statement, so it returns None, and the loop
+        #   helpers are never called; the test passes only because it is expected to fail.
         compile_mode = "none"
         loop_type = "while"
         reverse = False
         device = torch.device("cuda")
 
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: creates a zero tensor and defines the while-loop helpers
+            #   but returns nothing.
+            # KNOWN ISSUE: unfinished body, always returns None.
             _cnt = torch.zeros_like(y[0, :])
             if loop_type == "while":
 
                 def cond_fn(ind, loop_val):
+                    # [FUNCTION DOC] HELPER: predicate, whether the first entry of loop_val is
+                    #   below 5 (never used).
                     return (loop_val < 5)[0]
 
                 def body_fn(ind, loop_val):
+                    # [FUNCTION DOC] HELPER: returns index plus one and loop_val plus abs of the
+                    #   index (never used).
                     return ind + 1, loop_val + torch.abs(ind)
 
         inp = torch.randn(3, 10, 1, device=device) * 2
@@ -5900,7 +6988,12 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_cond_in_combine_fn(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over compile mode, reverse, device
+        #   and autograd (cpu and dynamic-shape compile skipped). Generic scan whose combine
+        #   function uses cond on the sign of the sum of y; compared with the fake model.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: val is y cloned if sum of y is positive, else one minus y,
+            #   chosen by cond; returns x times val.
             val = cond(torch.sum(y) > 0.0, lambda y: y.clone(), lambda y: 1.0 - y, (y,))
             return x * val
 
@@ -5927,12 +7020,17 @@ class GraphModule(torch.nn.Module):
     @requires_cuda
     @unittest.expectedFailure
     def test_associative_scan_map_in_combine_fn(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA; expected failure (comment attributes it to vmap
+        #   use in associative_scan). Generic scan whose combine function calls control_flow.map.
         compile_mode = "none"
         reverse = False
         device = torch.device("cuda")
 
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: maps a body adding the first row of y to each row of y, and
+            #   returns x times the mapped result.
             def body(x, y):
+                # [FUNCTION DOC] HELPER: returns x plus y.
                 return x + y
 
             y_init = y[0]
@@ -5964,8 +7062,13 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_vmap_in_combine_fn(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized. Generic scan whose combine function
+        #   uses torch.vmap; compared with the fake model including gradients.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: squares y through a vmapped function over dim 0 and returns
+            #   x plus that.
             def body(x):
+                # [FUNCTION DOC] HELPER: returns x squared.
                 return x**2
 
             mapped_body = torch.vmap(body, 0, 0)
@@ -6004,6 +7107,9 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_non_pointwise_generic(
         self, reverse, compile_mode, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over reverse, compile mode, device
+        #   (cpu skipped) and autograd. Generic-mode scan with the non-pointwise (matrix
+        #   multiplication) combine function, compared with the fake model including gradients.
         x = torch.randn(3, 10, 2, device=device, requires_grad=autograd)
 
         kwargs = {
@@ -6045,6 +7151,10 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_binary_operator(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise on cpu or dynamic-
+        #   shape compile skipped). Scan with the S5 operator over a tuple of a repeated
+        #   vector and random projected inputs; compared with the fake model including
+        #   gradients of both elements.
         state_dim = 20
         timesteps = 10
         projected_inputs = torch.randn(
@@ -6074,6 +7184,10 @@ class GraphModule(torch.nn.Module):
     @parametrize("reverse", [False, True])
     @parametrize("device", [torch.device("cpu"), torch.device("cuda")])
     def test_associative_scan_different_input_size(self, compile_mode, reverse, device):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over compile mode, reverse and
+        #   device. Generic-mode scan along dim 2 over a 5-tuple of tensors with different
+        #   trailing shapes using the different-input-size operator; compared with the fake model
+        #   (no autograd parameters passed).
         batch = 5
         hidden_dim = 3
         length = 10
@@ -6109,6 +7223,9 @@ class GraphModule(torch.nn.Module):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_associative_scan_different_input_size_wrong_dim(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. In pointwise mode with scan dim 3, one input
+        #   tensor lacks that many dimensions; expects ValueError saying all xs leaves must have
+        #   at least dim plus 1 dimensions.
         batch = 5
         hidden_dim = 3
         length = 10
@@ -6157,18 +7274,25 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_simple(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise mode skipped because
+        #   lowering does not support lifted arguments). Runs scans whose combine functions use
+        #   closed-over tensors (one tensor used twice, or two different tensors); compared with
+        #   the fake model including gradients wrt input and closure tensors.
         H = torch.rand(2, device=device, requires_grad=autograd)
 
         def fct_freevars1(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: x times closure H plus y times 2.
             return x * H + y * 2
 
         def fct_freevars2(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: x times closure H plus y times closure H.
             return x * H + y * H
 
         H1 = torch.rand(1, device=device, requires_grad=autograd)
         H2 = torch.rand(1, device=device, requires_grad=autograd)
 
         def fct_freevars3(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: x times closure H1 plus y times closure H2.
             return x * H1 + y * H2
 
         inp = torch.randn(3, 2, 2, device=device, requires_grad=autograd)
@@ -6210,18 +7334,28 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_nested(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped). Combine
+        #   functions that use closures and an inner helper function, either with the closed-over
+        #   tensor outside the combine function or a constant created inside it; compared with
+        #   matching fake combine functions including gradients.
         H1 = torch.rand(4, 5, device=device, requires_grad=autograd)
         H2 = torch.rand(4, 1, device=device, requires_grad=autograd)
 
         def fct_nested_outside(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: applies an inner function multiplying y by closure H2, then
+            #   returns x plus that times closure H1.
             def inner(xi):
+                # [FUNCTION DOC] HELPER: returns xi times H2.
                 return xi * H2
 
             ret = inner(y)
             return x + ret * H1
 
         def fct_nested_outside_fake(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: same computation as fct_nested_outside, used with
+            #   the fake scan.
             def inner(xi):
+                # [FUNCTION DOC] HELPER: returns xi times H2.
                 return xi * H2
 
             ret = inner(y)
@@ -6231,18 +7365,24 @@ class GraphModule(torch.nn.Module):
         # RuntimeError: vmap: called random operation while in randomness error mode.
         # Please either use the 'same' or 'different' randomness flags on vmap or perform the randomness operation out of vmap
         def fct_nested_inside(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: creates a constant tensor of 42s inside the function (random
+            #   tensors would trigger the vmap randomness error), applies an inner function
+            #   multiplying y by it, and returns x plus that times closure H1.
             H2_i = torch.ones(4, 1, device=device) * 42
 
             def inner(xi):
+                # [FUNCTION DOC] HELPER: returns xi times the constant H2_i.
                 return xi * H2_i
 
             ret = inner(y)
             return x + ret * H1
 
         def fct_nested_inside_fake(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: same as fct_nested_inside, for the fake scan.
             H2_i = torch.ones(4, 1, device=device) * 42
 
             def inner(xi):
+                # [FUNCTION DOC] HELPER: returns xi times the constant H2_i.
                 return xi * H2_i
 
             ret = inner(y)
@@ -6287,10 +7427,15 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_fct(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped). Combine
+        #   function that calls a helper function defined outside it; compared with the fake
+        #   model including gradients.
         def additional_fct_no_add_inp(x, y):
+            # [FUNCTION DOC] HELPER: returns x times y.
             return x * y
 
         def fct_nested_outside(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns x plus the helper applied to y and y.
             ret = additional_fct_no_add_inp(y, y)
             return x + ret
 
@@ -6320,16 +7465,23 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_fct_generic(
         self, compile_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized over compile mode, reverse, device
+        #   and autograd. Combine function that itself calls a generic-mode associative_scan along
+        #   dim 1; compared with a fake version using the fake scan.
         def additional_fct_no_add_inp(x, y):
+            # [FUNCTION DOC] HELPER: returns x times y.
             return x * y
 
         def fct_nested_outside(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: runs a generic associative scan of the multiply function over
+            #   y along dim 1 and returns x plus the result.
             ret = associative_scan(
                 additional_fct_no_add_inp, y, 1, combine_mode="generic"
             )
             return x + ret
 
         def fct_nested_outside_fake(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: same using the fake associative scan.
             ret = _fake_associative_scan(additional_fct_no_add_inp, y, 1)
             return x + ret
 
@@ -6368,9 +7520,13 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_shape_check(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped). Combine
+        #   function multiplies a carry by a closed-over identity matrix (requires grad) and adds
+        #   the next element; scan along dim 2; compared with the fake model.
         H = torch.eye(2, device=device, requires_grad=True)
 
         def fct_freevars(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: x matrix-multiplied by closure H, plus y.
             return x @ H + y
 
         inp = torch.randn(2, 2, 3, device=device, requires_grad=True)
@@ -6407,12 +7563,17 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_freevars_pytree(
         self, compile_mode, combine_mode, reverse, device, autograd
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped). Combine
+        #   function over dict/list/tuple pytrees that adds closed-over pytree leaves; compared
+        #   with the fake model with gradients wrt all input leaves.
         xf = torch.randn(2, 2, device=device, requires_grad=autograd)
         yf = torch.randn(2, 2, device=device, requires_grad=autograd)
         zf = torch.randn(2, 2, device=device, requires_grad=autograd)
         inpf = {"i": xf, "j": ([yf], [{"o": zf}])}
 
         def fct_pointwise(x, y):
+            # [FUNCTION DOC] HELPER: pointwise combine over the pytree (products of the first two
+            #   leaves, sum of the third) with the matching closed-over leaf added to each result.
             return {
                 "i": (x["i"] * y["i"]) + inpf["i"],
                 "j": (
@@ -6470,6 +7631,10 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_partial_grad(
         self, combine_mode, compile_mode, reverse, device
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped on cpu, dynamic-
+        #   shape compile and HIP). Scans over a tuple of six tensors with eight requires-grad
+        #   masks (all, none, one, five unseeded random masks); compared with the fake model
+        #   including gradients of the tensors that require grad.
         import random
 
         n_params = 6
@@ -6481,6 +7646,7 @@ class GraphModule(torch.nn.Module):
             autograds.append([bool(random.randint(0, 1)) for _ in range(n_params)])
 
         def mul2(x, y):
+            # [FUNCTION DOC] HELPER: returns a tuple of element-wise products of the two tuples.
             return (*[xv * yv for xv, yv in zip(x, y)],)
 
         for a_grads in autograds:
@@ -6530,7 +7696,12 @@ class GraphModule(torch.nn.Module):
     def test_associative_scan_partial_grad_no_grad(
         self, combine_mode, compile_mode, reverse, device
     ):
+        # [FUNCTION DOC] Requires SM70 and CUDA; parametrized (pointwise skipped on cpu, dynamic-
+        #   shape compile and HIP). Combine function computes the second output under no_grad;
+        #   compared with the fake model with gradients only for the first input.
         def mul_single_nograd(x, y):
+            # [FUNCTION DOC] HELPER: returns the product of first entries and the product of
+            #   second entries computed under no_grad.
             xy1 = x[0] * y[0]
             with torch.no_grad():
                 xy2 = x[1] * y[1]
@@ -6557,6 +7728,8 @@ class GraphModule(torch.nn.Module):
 
     @unittest.skipIf(not SM70OrLater, "triton")
     def test_associative_scan_sparse_tensor(self):
+        # [FUNCTION DOC] Requires SM70. A sparse tensor as xs raises ValueError saying xs leaves
+        #   must be dense tensors.
         x = torch.tensor(
             [[[0.0, 0], [1.0, 2.0]], [[0.0, 0], [3.0, 4.0]], [[0.0, 0], [5.0, 6.0]]]
         ).to_sparse()
@@ -6572,19 +7745,27 @@ class GraphModule(torch.nn.Module):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_associative_scan_combine_fn_wrong_meta_in_combine_fn(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Combine functions that change dtype,
+        #   device or memory format of the result each make associative_scan raise
+        #   UncapturedHigherOrderOpError complaining initial_xs and combine_fn_output
+        #   have different metadata.
         device = torch.device("cuda")
         B, N, C, H, W = 3, 3, 2, 3, 3
         x = torch.randn(B, N, C, H, W, device=device)
 
         def fct_wrong_dtype(x, y):
+            # [FUNCTION DOC] HELPER: returns the sum cast to int64.
             return (x + y).to(torch.int64)
 
         def fct_wrong_device(x, y):
+            # [FUNCTION DOC] HELPER: returns the sum moved to the other device type (cpu when the
+            #   test device is cuda).
             return (x + y).to(
                 torch.device("cpu") if device.type == "cuda" else torch.device("cuda")
             )
 
         def fct_wrong_stride(x, y):
+            # [FUNCTION DOC] HELPER: returns the sum converted to channels_last memory format.
             return (x + y).to(memory_format=torch.channels_last)
 
         for fct in [fct_wrong_dtype, fct_wrong_device, fct_wrong_stride]:
@@ -6596,7 +7777,12 @@ class GraphModule(torch.nn.Module):
 
     @unittest.skipIf(not SM70OrLater, "triton")
     def test_associative_scan_wrong_pytree(self):
+        # [FUNCTION DOC] Requires SM70. A combine function that expects different pytree arguments
+        #   makes generic associative_scan raise AssertionError saying combine_fn received the
+        #   wrong number of arguments.
         def fct_wrong_pytree(x, y):
+            # [FUNCTION DOC] HELPER: returns a dict with an extra "k" key built from the nested
+            #   inputs, mismatching the input structure.
             return {
                 "i": x["i"] * y["j"][0][0],
                 "k": torch.tensor(0.0),
@@ -6617,6 +7803,8 @@ class GraphModule(torch.nn.Module):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_associative_scan_non_pointwise(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Pointwise combine mode with a non-pointwise
+        #   combine function raises RuntimeError saying combine_fn needs to be pointwise.
         device = torch.device("cuda")
         x = torch.randn(3, 10, 2, device=device)
         with self.assertRaisesRegex(
@@ -6633,9 +7821,12 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_associative_scan_input_mutation(self):
+        # [FUNCTION DOC] CUDA-only. Combine function mutates its first argument in place; expects
+        #   UncapturedHigherOrderOpError naming the associative_scan higher-order op.
         device = torch.device("cuda")
 
         def fct_input_mutation(x, y):
+            # [FUNCTION DOC] HELPER: adds one to x in place and returns x plus y.
             x.add_(1)
             return x + y
 
@@ -6652,9 +7843,13 @@ class GraphModule(torch.nn.Module):
 
     @requires_cuda
     def test_associative_scan_input_output_alias(self):
+        # [FUNCTION DOC] CUDA-only. Combine function returns an input leaf directly; expects
+        #   UncapturedHigherOrderOpError naming the associative_scan op.
         device = torch.device("cuda")
 
         def fct_input_output_alias(x, y):
+            # [FUNCTION DOC] HELPER: returns the first input leaf unchanged and the sum of
+            #   the second leaves.
             return x[0], x[1] + y[1]
 
         x = torch.randn(3, 2, 2, device=device)
@@ -6673,9 +7868,12 @@ class GraphModule(torch.nn.Module):
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     def test_associative_scan_output_output_alias(self):
+        # [FUNCTION DOC] Requires SM70 and CUDA. Combine function returns the same tensor for two
+        #   outputs; expects UncapturedHigherOrderOpError naming the associative_scan op.
         device = torch.device("cuda")
 
         def fct_output_output_alias(x, y):
+            # [FUNCTION DOC] HELPER: computes a tensor and returns it twice.
             c = x[0] + y[1]
             return c, c
 
@@ -6696,11 +7894,18 @@ class GraphModule(torch.nn.Module):
 @unittest.skipIf(IS_WINDOWS, "Windows not supported for this test")
 @skipIfNoDynamoSupport
 class TestControlFlowTraced(TestCase):
+    # [CLASS DOC] Tests that control flow higher-order ops can be traced (make_fx in several
+    #   modes), compiled, exported and run under CUDA graphs. Skipped on Windows and without
+    #   dynamo support. Provides tracing, compile and export check helpers.
     def setUp(self):
+        # [FUNCTION DOC] Resets dynamo state then calls the base class setUp.
         torch._dynamo.reset()
         super().setUp()
 
     def _check_tracing(self, fn, args, allow_non_fake_inputs=False):
+        # [FUNCTION DOC] HELPER: computes the eager result, then for each of symbolic, real and
+        #   fake tracing modes traces with make_fx, asserts the traced graph returns the eager
+        #   result for the same args, and returns a mapping from mode to traced graph.
         graphs = {}
         eager_res = fn(*args)
         for tracing_mode in ["symbolic", "real", "fake"]:
@@ -6714,11 +7919,16 @@ class TestControlFlowTraced(TestCase):
         return graphs
 
     def _check_compile(self, fn, args, *, dynamic=False, backend="eager"):
+        # [FUNCTION DOC] HELPER: compiles fn with the given backend and dynamic flag and asserts
+        #   it matches the eager result.
         eager_res = fn(*args)
         compiled_fn = torch.compile(fn, backend=backend, dynamic=dynamic)
         self.assertEqual(compiled_fn(*args), eager_res)
 
     def _check_export(self, fn, args, *, strict=False, dynamic_shapes=None):
+        # [FUNCTION DOC] HELPER: exports fn with the new experimental tracer enabled (given
+        #   strictness and dynamic shapes), asserts the exported module output matches eager, and
+        #   returns the exported program.
         eg_out = fn(*args)
         with torch._export.config.patch(use_new_tracer_experimental=True):
             ep = torch.export.export(
@@ -6729,13 +7939,19 @@ class TestControlFlowTraced(TestCase):
         return ep
 
     def test_cond_traced_not_nested(self):
+        # [FUNCTION DOC] Traces cond with make_fx (the predicate is a runtime tensor input) and
+        #   checks the graph selects sine or cosine for true or false predicates and gives
+        #   different results; also checks the symbolic-mode trace matches eager.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches and operand list holding x.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -6750,15 +7966,20 @@ class TestControlFlowTraced(TestCase):
         self.assertEqual(graph(x, torch.tensor(True)), f(x, torch.tensor(True)))
 
     def test_switch_traced_mismatched_output_structure(self):
+        # [FUNCTION DOC] Tracing switch_op with branches returning a tuple versus a dict raises
+        #   RuntimeError saying the output spec from the branches is unmatched.
         from torch._higher_order_ops.switch import switch_op
 
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: returns a tuple of sine and cosine.
             return (inp_x.sin(), inp_x.cos())
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: returns a dict with sine and cosine.
             return {"a": inp_x.sin(), "b": inp_x.cos()}
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: calls switch_op over the two branches.
             return switch_op(idx, (branch0, branch1), (inp_x,))
 
         x = torch.randn(4)
@@ -6768,16 +7989,23 @@ class TestControlFlowTraced(TestCase):
             make_fx(f)(torch.tensor([0]), x)
 
     def test_switch_traced_not_nested(self):
+        # [FUNCTION DOC] Traces switch with three branches using make_fx and checks the traced
+        #   graph picks the right branch for indices 0, 1, 2 and clamped indices -1 and 99;
+        #   repeats under symbolic tracing.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         x = torch.randn(4)
@@ -6797,16 +8025,22 @@ class TestControlFlowTraced(TestCase):
             self.assertEqual(graph(torch.tensor([i]), x), fn(x))
 
     def test_switch_tracing_all_modes(self):
+        # [FUNCTION DOC] Uses the tracing helper to trace switch under symbolic, real and fake
+        #   modes and compare with eager.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         # Exercise the helper, which round-trips through symbolic / real /
@@ -6816,7 +8050,13 @@ class TestControlFlowTraced(TestCase):
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_simple_capture_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Compiles switch with three lambda
+        #   branches using the eager recording backend, asserts one graph, and compares golden
+        #   code of the outer graph (clamp of the index, switch op with three branch submodules)
+        #   and each branch submodule.
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: defines three lambda branches (sine, cosine, abs) and
+            #   switches among them.
             branches = (
                 lambda inp_x: inp_x.sin(),
                 lambda inp_x: inp_x.cos(),
@@ -6876,6 +8116,9 @@ def forward(self, l_inp_x_):
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_lifted_args_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Branches close over different
+        #   tensors; checks via golden code that the outer graph lifts all closure tensors as
+        #   operands and every branch submodule has the same union signature.
         # When different branches close over different tensors, dynamo must
         # union the free variables across branches so every branch graph
         # shares the same placeholder signature and the HOP receives the
@@ -6885,15 +8128,19 @@ def forward(self, l_inp_x_):
         c = torch.ones(2, 3) * 2
 
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor a.
             return inp_x + a
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor b.
             return inp_x + b
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor c.
             return inp_x + c
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         backend = EagerAndRecordGraphs()
@@ -6951,6 +8198,10 @@ def forward(self, l_inp_x_, l_branch0_closure_0_cell_contents_branch0, l_branch1
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_lifted_args_dedup_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Branches share some closure tensors;
+        #   checks via golden code that each closure tensor appears once in the operand tuple and
+        #   every branch submodule has the same deduplicated signature (suffixes show which branch
+        #   first lifted a tensor).
         a = torch.ones(2, 3)
         b = torch.ones(2, 3) + 1
         c = torch.ones(2, 3) * 2
@@ -6959,15 +8210,19 @@ def forward(self, l_inp_x_, l_branch0_closure_0_cell_contents_branch0, l_branch1
         # No leaf is in *all* three -> shared block is empty; `a` is lifted by
         # branches 0+1, `b` by branches 0+1, `c` by branches 1+2.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensors a and b.
             return inp_x + a + b
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: input plus a, b and c.
             return inp_x + a + b + c
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: input plus closure tensor c.
             return inp_x + c
 
         def f(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches.
             return switch(idx, (branch0, branch1, branch2), (inp_x,))
 
         backend = EagerAndRecordGraphs()
@@ -7030,16 +8285,22 @@ def forward(self, l_inp_x_, l_branch0_closure_0_cell_contents_branch0, l_branch0
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_constant_index_specialization_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. With a Python constant index 1,
+        #   the captured graph contains only the cosine op (no switch higher-order op) and has
+        #   no child submodules.
         # When the index is a Python constant, dynamo specializes into the
         # selected branch and the switch HOP is not emitted at all. The
         # captured graph contains only the ops of branches[idx].
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         branches = (branch0, branch1, branch2)
@@ -7068,21 +8329,29 @@ def forward(self, L_inp_x_ : torch.Tensor):
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_index_type_specialization_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Shows how the index type
+        #   affects capture: a Python int specializes (no switch op, no submodules), while a
+        #   symbolic int from a dynamic shape and a tensor each emit the switch op with
+        #   three branch submodules.
         # Pin down dynamo's specialization behavior by index type.
         # Python int -> specialize: HOP is not emitted, only branches[idx]'s ops survive.
         # SymInt or Tensor -> no specialize: HOP is emitted with all branches as submodules.
         def branch0(inp_x):
+            # [FUNCTION DOC] HELPER: sine.
             return inp_x.sin()
 
         def branch1(inp_x):
+            # [FUNCTION DOC] HELPER: cosine.
             return inp_x.cos()
 
         def branch2(inp_x):
+            # [FUNCTION DOC] HELPER: abs.
             return inp_x.abs()
 
         branches = (branch0, branch1, branch2)
 
         def fn(idx, inp_x):
+            # [FUNCTION DOC] HELPER: switch over the three branches using the given index.
             return switch(idx, branches, (inp_x,))
 
         x = torch.randn(4)
@@ -7100,6 +8369,8 @@ def forward(self, L_inp_x_ : torch.Tensor):
         # `.shape` so it is genuinely symbolic at trace time. No specialization;
         # HOP captures all branches.
         def fn_symint(idx_carrier, inp_x):
+            # [FUNCTION DOC] HELPER: derives the index as the leading size of idx_carrier minus
+            #   one and switches over the branches.
             idx = idx_carrier.shape[0] - 1
             return switch(idx, branches, (inp_x,))
 
@@ -7132,6 +8403,10 @@ def forward(self, L_inp_x_ : torch.Tensor):
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_switch_nn_module_lifted_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Switch over two Linear modules
+        #   compiled with the eager recording backend; golden code shows weights and biases
+        #   of both modules lifted as operands, and each branch submodule only reading its
+        #   own module's parameters.
         # nn.Module branches: every parameter of every branch's module is
         # lifted into the HOP operand tuple, and each branch's submodule
         # signature accepts the full union. Reads of foreign parameters
@@ -7191,15 +8466,23 @@ def forward(self, l_inp_x_, l_linear0_parameters_bias__branch0, l_linear0_parame
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with crossref
     def test_cond_simple_with_linear_compile_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref; with trace_autograd_ops
+        #   enabled. Compiles a function doing cond and autograd.grad and checks a single
+        #   graph is captured, containing the cond op with true and false submodules and the
+        #   autograd grad call.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         x = torch.randn(4, requires_grad=True)
 
         def f(pred, x):
+            # [FUNCTION DOC] HELPER: runs cond then returns the gradient of the result wrt x with
+            #   ones as output gradient.
             result = cond(pred, true_fn, false_fn, (x,))
             grad_out = torch.ones_like(result)
             return torch.autograd.grad(result, (x,), grad_out)
@@ -7228,12 +8511,22 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         )
 
     def test_while_loop_op_mismatch_in_meta(self):
+        # [FUNCTION DOC] Tracing (fake mode) a module whose while_loop body changes tensor shapes
+        #   (via nonzero) raises UncapturedHigherOrderOpError saying carried inputs and body
+        #   output have different metadata.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the while_loop higher-order op directly with a
+            #   body that returns nonzero results.
             def forward(self, c, a, b):
+                # [FUNCTION DOC] HELPER: runs the while_loop higher-order op with condition on the
+                #   counter being positive and no additional inputs.
                 def cond_fn(c, a, b):
+                    # [FUNCTION DOC] HELPER: true while c is greater than zero.
                     return c > 0
 
                 def body_fn(c, a, b):
+                    # [FUNCTION DOC] HELPER: decrements c and returns the nonzero index tensors of
+                    #   a and b, whose shapes differ from the carries.
                     return c - 1, a.nonzero(), b.nonzero()
 
                 return torch.ops.higher_order.while_loop(
@@ -7260,13 +8553,19 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_cond_traced_not_nested_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Runs cond with true
+        #   and false CUDA predicates through the cudagraphs backend helper and the many-backends
+        #   capture/replay helper and compares with eager.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y selecting sine or cosine of x.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4).cuda()
@@ -7291,6 +8590,10 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_cond_pin_memory_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Checks pinned host
+        #   memory allocated during stream capture inside conditional nodes goes to the private
+        #   pool, by running branches that use split_with_sizes_copy (an op using pinned memory
+        #   internally) through the cudagraph helpers for true and false predicates.
         # Make sure that pinned host memory allocations get assigned
         # to a private pool correctly during stream capture, even
         # inside of conditional nodes.
@@ -7302,12 +8605,15 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         sizes = [3, 4, 3]
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: splits x into pieces of sizes 3, 4, 3 with copy.
             return torch.split_with_sizes_copy(x, sizes)
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: splits twice x into pieces of the same sizes with copy.
             return torch.split_with_sizes_copy(2 * x, sizes)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y between the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(10).cuda()
@@ -7332,25 +8638,35 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_cond_traced_triply_nested_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Builds three
+        #   levels of nested cond functions and runs two predicate combinations through
+        #   the cudagraph helpers.
         def level3_true(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def level3_false(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def level2_true(x, p2):
+            # [FUNCTION DOC] HELPER: cond on p2 between the level 3 functions.
             return cond(p2, level3_true, level3_false, [x])
 
         def level2_false(x, p2):
+            # [FUNCTION DOC] HELPER: cond on p2 between x plus 1 and x minus 1 lambdas.
             return cond(p2, lambda x: x + 1, lambda x: x - 1, [x])
 
         def level1_true(x, p1, p2):
+            # [FUNCTION DOC] HELPER: cond on p1 between level2_true and level2_false.
             return cond(p1, level2_true, level2_false, [x, p2])
 
         def level1_false(x, p1, p2):
+            # [FUNCTION DOC] HELPER: cond on p1 between level2_false and level2_true.
             return cond(p1, level2_false, level2_true, [x, p2])
 
         def f(x, p0, p1, p2):
+            # [FUNCTION DOC] HELPER: cond on p0 between the level 1 functions.
             return cond(p0, level1_true, level1_false, [x, p1, p2])
 
         x = torch.randn(4).cuda()
@@ -7379,13 +8695,20 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_while_loop_traced_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Runs a while_loop
+        #   (adding 2 per step until the iteration reaches a tensor limit of 3) through the
+        #   cudagraph helpers and compares with eager.
         def f(x, limit):
+            # [FUNCTION DOC] HELPER: runs while_loop on a counter starting at zero and x, looping
+            #   while the counter is below the limit.
             init_iter = torch.zeros((), dtype=torch.int64, device=x.device)
 
             def cond_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: true while iteration is less than the closed-over limit.
                 return iteration < limit
 
             def body_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: returns acc plus 2 and iteration plus 1.
                 return acc + 2, iteration + 1
 
             return while_loop(cond_fn, body_fn, (x, init_iter))
@@ -7401,13 +8724,23 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_while_loop_cuda_graph_replay_uses_runtime_condition(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Warms up and
+        #   captures a CUDA graph of the while_loop higher-order op (limit passed as an additional
+        #   input), then replays it with limits 3, 0 and 5 after resetting the inputs, checking
+        #   the output tensor equals one plus twice the limit, the counter output equals the
+        #   limit, and the captured input buffers are left unchanged. Shows the loop condition is
+        #   evaluated at replay time.
         def cond_fn(acc, iteration, limit):
+            # [FUNCTION DOC] HELPER: true while iteration is less than limit.
             return iteration < limit
 
         def body_fn(acc, iteration, limit):
+            # [FUNCTION DOC] HELPER: returns acc plus 2 and iteration plus 1.
             return acc + 2, iteration + 1
 
         def f(x, iteration, limit):
+            # [FUNCTION DOC] HELPER: invokes the while_loop higher-order op on (x, iteration) with
+            #   limit as additional input.
             return torch.ops.higher_order.while_loop(
                 cond_fn, body_fn, (x, iteration), (limit,)
             )
@@ -7448,10 +8781,16 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_while_loop_cudagraph_kwargs_error(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. For both the capture
+        #   dispatch mode and the warmup dispatch mode, calling their dispatch hook for the
+        #   while_loop op with an unexpected keyword argument raises RuntimeError saying kwargs
+        #   are not supported (each mode checked in its own subtest).
         def cond_fn(iteration):
+            # [FUNCTION DOC] HELPER: true while iteration is below 1.
             return iteration < 1
 
         def body_fn(iteration):
+            # [FUNCTION DOC] HELPER: returns a one-tuple with iteration plus one.
             return (iteration + 1,)
 
         iteration = torch.zeros((), dtype=torch.int64, device="cuda")
@@ -7478,10 +8817,16 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_while_loop_cudagraph_body_pytree_mismatch_error(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. During CUDA graph
+        #   capture with the capture dispatch mode, a while_loop whose body returns a dict instead
+        #   of the carry structure raises RuntimeError saying body_fn should return the same
+        #   pytree structure as carried_inputs.
         def cond_fn(iteration):
+            # [FUNCTION DOC] HELPER: true while iteration is below 1.
             return iteration < 1
 
         def body_fn(iteration):
+            # [FUNCTION DOC] HELPER: returns a dict holding iteration plus one (wrong structure).
             return {"iteration": iteration + 1}
 
         iteration = torch.zeros((), dtype=torch.int64, device="cuda")
@@ -7502,13 +8847,21 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_cond_inside_while_loop_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. A while_loop whose
+        #   body uses cond on iteration parity (add 3 on even, subtract 1 on odd) is run through
+        #   the cudagraph helpers.
         def f(x, limit):
+            # [FUNCTION DOC] HELPER: runs while_loop with a zero counter until the
+            #   counter reaches limit.
             init_iter = torch.zeros((), dtype=torch.int64, device=x.device)
 
             def cond_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: true while iteration is less than the closed-over limit.
                 return iteration < limit
 
             def body_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: applies cond on whether iteration is even to add 3 or
+                #   subtract 1 from acc, and increments iteration.
                 pred = iteration % 2 == 0
                 acc = torch.cond(
                     pred,
@@ -7531,31 +8884,44 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_while_loop_inside_cond_cudagraphs(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. A cond whose
+        #   branches are while_loops (add 2 per step versus subtract 1 per step, for limit
+        #   iterations) is run through the cudagraph helpers for true and false predicates.
         def add_loop(x, limit):
+            # [FUNCTION DOC] HELPER: while_loop adding 2 to x for limit iterations; returns
+            #   the accumulated tensor.
             init_iter = torch.zeros((), dtype=torch.int64, device=x.device)
 
             def cond_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: true while iteration is less than limit.
                 return iteration < limit
 
             def body_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: returns acc plus 2 and iteration plus 1.
                 return acc + 2, iteration + 1
 
             acc, _ = torch.while_loop(cond_fn, body_fn, (x, init_iter))
             return acc
 
         def sub_loop(x, limit):
+            # [FUNCTION DOC] HELPER: while_loop subtracting 1 from x for limit iterations;
+            #   returns the tensor.
             init_iter = torch.zeros((), dtype=torch.int64, device=x.device)
 
             def cond_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: true while iteration is less than limit.
                 return iteration < limit
 
             def body_fn(acc, iteration):
+                # [FUNCTION DOC] HELPER: returns acc minus 1 and iteration plus 1.
                 return acc - 1, iteration + 1
 
             acc, _ = torch.while_loop(cond_fn, body_fn, (x, init_iter))
             return acc
 
         def f(x, pred, limit):
+            # [FUNCTION DOC] HELPER: cond on pred between add_loop and sub_loop with operands
+            #   x and limit.
             return torch.cond(pred, add_loop, sub_loop, [x, limit])
 
         x = torch.randn(4).cuda()
@@ -7570,6 +8936,11 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
         "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
     )
     def test_cond_traced_record_stream_reuse(self):
+        # [FUNCTION DOC] Skipped without CUDA graph conditional-node support. Enables the
+        #   allocator setting graph_capture_record_stream_reuse, then expects capturing a cond
+        #   (zero-argument branches that allocate tensors) under the capture dispatch mode to
+        #   raise RuntimeError mentioning that setting; the finally clause resets the allocator
+        #   setting to false.
         torch.cuda.memory._set_allocator_settings(
             "graph_capture_record_stream_reuse:True"
         )
@@ -7577,9 +8948,11 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
             predicate = torch.tensor(True, device="cuda")
 
             def true_fn():
+                # [FUNCTION DOC] HELPER: returns two new zero tensors of size 8 on CUDA.
                 return torch.zeros(8, device="cuda"), torch.zeros(8, device="cuda")
 
             def false_fn():
+                # [FUNCTION DOC] HELPER: returns two new zero tensors of size 8 on CUDA.
                 return torch.zeros(8, device="cuda"), torch.zeros(8, device="cuda")
 
             g = torch.cuda.CUDAGraph()
@@ -7595,6 +8968,9 @@ def forward(self, L_pred_ : torch.Tensor, L_x_ : torch.Tensor):
             )
 
     def test_while_loop_nested_traced(self):
+        # [FUNCTION DOC] Traces the nested while_loop test program and compares symbolic-mode
+        #   golden graphs: the outer graph with the while_loop op, the condition subgraph (sum
+        #   less than 2), and the body subgraph (inner while_loop followed by adding one).
         fn, inp = WHILE_LOOP_TESTS["nested"]
         graphs = self._check_tracing(fn, inp)
         self.assertExpectedInline(
@@ -7635,6 +9011,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         )
 
     def test_while_loop_pytree_carry(self):
+        # [FUNCTION DOC] Compiles the pytree-carry while_loop program with the eager recording
+        #   backend and checks the result matches eager; unless run under dynamo, also checks one
+        #   graph was captured and compares golden code of the graph (while_loop op with
+        #   flattened pytree carries).
         fn, inp = WHILE_LOOP_TESTS["simple_with_pytree_carry"]
         backend = EagerAndRecordGraphs()
         expected_res = fn(*inp)
@@ -7663,6 +9043,10 @@ def forward(self, L_it_ : torch.Tensor, L_pytree_input_0_0_ : torch.Tensor, L_py
             )
 
     def _wrap_with_functionalize(self, fn, func_type):
+        # [FUNCTION DOC] HELPER: wraps fn according to func_type: cpp uses the C++ functionalize
+        #   API, python uses the Python API and also returns a FunctionalTensorMode, functorch
+        #   uses torch.func.functionalize, no leaves fn as is, and any other value raises
+        #   AssertionError. Returns the wrapped function and the mode (None when not needed).
         mode = None
         if func_type == "cpp":
             fn = CppFunctionalizeAPI().functionalize(fn)
@@ -7680,6 +9064,11 @@ def forward(self, L_it_ : torch.Tensor, L_pytree_input_0_0_ : torch.Tensor, L_py
 
     @parametrize("func_type", ["no", "cpp", "python", "functorch"])
     def test_while_loop_simple_functionalize_check_graph(self, func_type):
+        # [FUNCTION DOC] Parametrized over functionalization type (no, cpp, python, functorch).
+        #   Traces the simple-with-mutation program in all tracing modes under the chosen
+        #   functionalization (entering the mode if given), and compares golden graphs of the
+        #   symbolic trace; with no functionalization the cond and body keep in-place adds,
+        #   otherwise they are functionalized to out-of-place adds.
         fn, inp = WHILE_LOOP_TESTS["simple_with_mutation"]
         fn, mode = self._wrap_with_functionalize(fn, func_type)
         mode = mode if mode is not None else contextlib.nullcontext()
@@ -7811,6 +9200,10 @@ def forward(self, arg0_1):
         },
     )
     def test_while_loop_functionalize(self, func_type, while_loop_test):
+        # [FUNCTION DOC] Parametrized over functionalization type and over the while_loop test
+        #   programs excluding those with module parameters or unbacked int carries. Traces each
+        #   program under the chosen functionalization with the tracing helper (comparing with
+        #   eager in all modes).
         fn, inp = WHILE_LOOP_TESTS[while_loop_test]
         fn, mode = self._wrap_with_functionalize(fn, func_type)
         mode = mode if mode is not None else contextlib.nullcontext()
@@ -7827,6 +9220,9 @@ def forward(self, arg0_1):
         - {"int_carry", "pytree_int_carry", "const_and_symint_output"},
     )
     def test_while_loop_tracing(self, while_loop_test):
+        # [FUNCTION DOC] Parametrized over the while_loop test programs except the int-carry ones.
+        #   Traces each program with make_fx in all modes, allowing non-fake inputs only for the
+        #   programs that use module parameters.
         fn, inp = WHILE_LOOP_TESTS[while_loop_test]
         allow_non_fake_inputs = while_loop_test in (
             "simple_with_linear",
@@ -7837,12 +9233,18 @@ def forward(self, arg0_1):
     @parametrize("backend", ["eager", "aot_eager"])
     @parametrize("while_loop_test", list(WHILE_LOOP_TESTS.keys()))
     def test_while_loop_compile(self, backend, while_loop_test):
+        # [FUNCTION DOC] Parametrized over eager and aot_eager backends and every while_loop test
+        #   program. Compiles each and compares with eager.
         fn, inp = WHILE_LOOP_TESTS[while_loop_test]
         self._check_compile(fn, inp, backend=backend)
 
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     @skipIfCrossRef  # Arg order changes with cross ref
     def test_while_loop_simple_with_linear_compile_check_graph(self):
+        # [FUNCTION DOC] Skipped under dynamo and cross-ref. Compiles the simple-with-linear
+        #   program with the eager recording backend and compares the golden graph, in which the
+        #   buffer, weight and bias are passed to the while_loop as additional inputs to the cond
+        #   and body subgraphs.
         fn, inp = WHILE_LOOP_TESTS["simple_with_linear"]
         backend = EagerAndRecordGraphs()
         torch.compile(fn, backend=backend)(*inp)
@@ -7881,6 +9283,10 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_while_loop_nested2_traced(self):
+        # [FUNCTION DOC] Traces the nested module program in all modes and compares golden code of
+        #   the symbolic graph, the outer body, the inner body and the inner condition.
+        # KNOWN ISSUE: the golden check for the outer body is written twice with identical
+        #   content; the repeated check adds no coverage.
         fn, inp = WHILE_LOOP_TESTS["nested2"]
         graphs = self._check_tracing(fn, inp)
         gm = graphs["symbolic"]
@@ -7962,20 +9368,31 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1, arg7_1
         )
 
     def test_cond_nested_traced(self):
+        # [FUNCTION DOC] Traces a nested cond with make_fx and checks the traced graph's results
+        #   for all four predicate combinations against expected formulas (square plus x, double
+        #   plus x, or cosine), then checks the symbolic trace matches eager and, if CUDA graph
+        #   conditional nodes are supported, runs the cudagraph helpers.
         def true_nested(y):
+            # [FUNCTION DOC] HELPER: returns y times y.
             return y * y
 
         def false_nested(y):
+            # [FUNCTION DOC] HELPER: returns y plus y.
             return y + y
 
         def true_fn(x, pred2):
+            # [FUNCTION DOC] HELPER: applies a nested cond on pred2 between the nested functions
+            #   and returns x plus the result.
             z = cond(pred2, true_nested, false_nested, [x])
             return x + z
 
         def false_fn(x, _):
+            # [FUNCTION DOC] HELPER: returns the cosine of x, ignoring the second argument.
             return x.cos()
 
         def f(x, pred, pred2):
+            # [FUNCTION DOC] HELPER: cond on pred between true_fn and false_fn with operands
+            #   x and pred2.
             return cond(pred, true_fn, false_fn, [x, pred2])
 
         x = torch.randn(4)
@@ -8028,19 +9445,28 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1, arg7_1
             )
 
     def test_cond_functionalized(self):
+        # [FUNCTION DOC] Checks cond under torch.func.functionalize gives the same result as
+        #   eager, that the symbolic make_fx trace of the functionalized function matches eager
+        #   and that none of the ops in the true branch subgraph are mutable; if CUDA graph
+        #   conditional nodes are supported, also runs the cudagraph helpers.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x, mutated in place (add 4) in a local; returns max
+            #   of sine of x plus sum of the mutated local.
             y = x.sin()
             y.add_(4)
             return x.sin().max() + y.sum()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: min of cosine of x.
             return x.cos().min()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
 
         def f_(x, y):
+            # [FUNCTION DOC] HELPER: cond on a predicate tensor argument.
             return cond(y, true_fn, false_fn, [x])
 
         example_inputs = (torch.ones(4, 5),)
@@ -8069,10 +9495,15 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1, arg6_1, arg7_1
             )
 
     def test_cond_accepts_torch_function_as_inputs(self):
+        # [FUNCTION DOC] Uses torch.add and torch.mul directly as cond branches with a data-
+        #   dependent predicate; traces with all modes and compares golden code of the symbolic
+        #   graph and the two branch subgraphs.
         a = torch.randn(3, 4)
         b = torch.randn(3, 4)
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of a is positive, with branches
+            #   torch.add and torch.mul and operands a and b.
             return cond(a.sum() > 0, torch.add, torch.mul, (a, b))
 
         gm = self._check_tracing(f, (a, b))["symbolic"]
@@ -8108,13 +9539,19 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
         )
 
     def test_cond_retrace_functionalized(self):
+        # [FUNCTION DOC] Traces cond with make_fx, then retraces the functionalized traced
+        #   module and checks the retraced graph gives the same result as the original function
+        #   on a zero input.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether all elements of x are nonzero.
             return cond(x.all(), true_fn, false_fn, (x,))
 
         inp = torch.ones(1, 2)
@@ -8125,13 +9562,22 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
         self.assertEqual(gm_functional(torch.zeros(1, 2)), f(torch.zeros(1, 2)))
 
     def test_cond_subgraph_same_shape_env_as_parent(self):
+        # [FUNCTION DOC] Traces cond with symbolic tracing and checks the nodes of the
+        #   outer graph and of the true and false subgraphs all share the shape environment
+        #   of the outer graph.
+        # KNOWN ISSUE: the helper iterating nodes ignores its argument and always walks the outer
+        #   graph, so the subgraph loops re-check the outer graph and do not verify the subgraphs.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x plus 10.
             return x.sin() + 10
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x minus 20.
             return x.cos() - 20
 
         def f(x, pred):
+            # [FUNCTION DOC] HELPER: cond on pred and then doubles the result by adding
+            #   it to itself.
             y = cond(pred, true_fn, false_fn, [x])
             z = torch.add(y, y)
             return z
@@ -8142,6 +9588,11 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
         graph_shape_env = symbolic_traced_graph.shape_env
 
         def _node_shape_env_iter(gm):
+            # [FUNCTION DOC] HELPER: generator yielding the shape environment associated with the
+            #   value metadata of each call_function node of the outer symbolic graph (handling
+            #   tuples, symbolic ints and tensors).
+            # KNOWN ISSUE: the gm parameter is never used; the loop reads
+            #   the enclosing symbolic_traced_graph.
             for node in symbolic_traced_graph.graph.nodes:
                 if node.op == "call_function":
                     val = node.meta.get("val")
@@ -8163,22 +9614,32 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
             self.assertTrue(shape_env is graph_shape_env)
 
     def test_cond_functionalized_nested(self):
+        # [FUNCTION DOC] Checks nested cond under functionalize matches eager, traces
+        #   symbolically, and checks that the innermost true branch subgraph contains
+        #   no mutable ops.
         def true_true_fn(x):
+            # [FUNCTION DOC] HELPER: mutates a cosine local in place and returns max of sine of x
+            #   plus max of sine of the local.
             y = x.cos()
             y.add_(4)
             return x.sin().max() + y.sin().max()
 
         def true_false_fn(x):
+            # [FUNCTION DOC] HELPER: min of cosine of x.
             return x.cos().min()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: nested cond on whether the leading size is 1 between the
+            #   two functions above.
             pred = x.shape[0] == 1
             return cond(pred, true_true_fn, true_false_fn, [x])
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sum of x.
             return x.sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: outer cond on whether the leading size is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8203,13 +9664,18 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
         self.assertFalse(any(op._schema.is_mutable for op in all_ops))
 
     def test_cond_functionalized_data_dependent_pred(self):
+        # [FUNCTION DOC] Checks cond under functionalize with a data-dependent predicate (count of
+        #   nonzero elements) matches eager both eagerly and in a make_fx trace.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sum of sine of x.
             return x.sin().sum()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sum of cosine of x.
             return x.cos().sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the number of nonzero entries of x is 1.
             pred = x.nonzero().shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8221,15 +9687,22 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
         self.assertEqual(graph_module(*example_inputs), f(*example_inputs))
 
     def test_cond_functionalized_input_mutation_on_true_branch(self):
+        # [FUNCTION DOC] With a constant predicate, make_fx of the functionalized function inlines
+        #   the true branch (golden graph with view, add, copy back to the input). With a symbolic
+        #   trace, expects TorchRuntimeError saying cond_true might be modifying the input.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: mutates a view of x in place (add one) and returns the sum
+            #   of its sine.
             view_x = x.view(x.shape)
             view_x.add_(1)
             return view_x.sin().sum()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sum of cosine of x.
             return x.cos().sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 4.
             pred = x.shape[0] == 4
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8262,15 +9735,22 @@ def forward(self, x_1):
             )
 
     def test_cond_functionalized_input_mutation_on_false_branch(self):
+        # [FUNCTION DOC] With a constant predicate (5 by 5 input, predicate false) the false
+        #   branch is inlined (golden graph). With a symbolic trace expects TorchRuntimeError
+        #   saying cond_false might be modifying the input.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sum of sine of x.
             return x.sin().sum()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: mutates a view of x in place (add one) and returns the sum
+            #   of its cosine.
             view_x = x.view(x.shape)
             view_x.add_(1)
             return view_x.cos().sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 4.
             pred = x.shape[0] == 4
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8303,14 +9783,21 @@ def forward(self, x_1):
             )
 
     def test_cond_functionalized_output_alias_input(self):
+        # [FUNCTION DOC] With a constant predicate the false branch (which returns a view
+        #   of the input) is inlined (golden graph). With a symbolic trace expects
+        #   UncapturedHigherOrderOpError naming torch.cond because a branch output
+        #   aliases its input.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: clone of x.
             return x.clone()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a view of x with the same shape.
             view_x = x.view(x.shape)
             return view_x
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 4.
             pred = x.shape[0] == 4
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8340,21 +9827,29 @@ def forward(self, x_1):
             )
 
     def test_cond_functionalized_nested_input_mutation(self):
+        # [FUNCTION DOC] Nested cond where the innermost true branch mutates its input in place;
+        #   symbolic make_fx of the functionalized function raises TorchRuntimeError saying
+        #   cond_true might be modifying the input.
         def true_true_fn(x):
+            # [FUNCTION DOC] HELPER: adds 4 to x in place and returns the max of sine of x.
             x.add_(4)
             return x.sin().max()
 
         def true_false_fn(x):
+            # [FUNCTION DOC] HELPER: min of cosine of x.
             return x.cos().min()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: nested cond on whether the leading size is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_true_fn, true_false_fn, [x])
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sum of x.
             return x.sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: outer cond on whether the leading size is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8368,21 +9863,31 @@ def forward(self, x_1):
             )
 
     def test_cond_functionalized_nested_input_mutation_with_aot_func(self):
+        # [FUNCTION DOC] Uses manual functionalization of the input (old-style functional tensor
+        #   with functionalization enabled; the finally clause disables it). Running nested cond
+        #   with an input-mutating branch under symbolic make_fx must raise
+        #   UncapturedHigherOrderOpError naming torch.cond, both when called directly on the
+        #   functional input and through a wrapper that enables functionalization around the call.
         def true_true_fn(x):
+            # [FUNCTION DOC] HELPER: adds 4 to x in place and returns max of sine of x.
             x.add_(4)
             return x.sin().max()
 
         def true_false_fn(x):
+            # [FUNCTION DOC] HELPER: min of cosine of x.
             return x.cos().min()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: nested cond on whether the leading size is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_true_fn, true_false_fn, [x])
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sum of x.
             return x.sum()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: outer cond on whether the leading size is 1.
             pred = x.shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8404,8 +9909,13 @@ def forward(self, x_1):
             torch._disable_functionalization()
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory; the wrapped function enables
+            #   functionalization (without view reapplying) around the call and always
+            #   disables it afterwards.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: enables functionalization, calls the wrapped function
+                #   with the same arguments, and disables functionalization in a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     return func(*args, **kwargs)
@@ -8424,14 +9934,22 @@ def forward(self, x_1):
             make_fx(f_wrapper(f), tracing_mode="symbolic")(example_input_func)
 
     def test_cond_functionalized_input_aliasing_with_aot_func(self):
+        # [FUNCTION DOC] Branches return the input itself or a view of it; with manual
+        #   functionalization enabled, calling cond (directly on a functional input, or
+        #   via a wrapper converting tensor args to functional tensors) must raise
+        #   UncapturedHigherOrderOpError naming torch.cond (the wrapped call is made
+        #   under symbolic make_fx).
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: returns x itself.
             return x
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a view of x with the same shape.
             view_x = x.view(x.shape)
             return view_x
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of x is positive.
             pred = x.sum() > 0
             return cond(pred, true_fn, false_fn, [x])
 
@@ -8451,8 +9969,14 @@ def forward(self, x_1):
             torch._disable_functionalization()
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory; the wrapped function enables
+            #   functionalization, converts all tensor positional and keyword arguments to
+            #   functional tensors, calls the function, and disables functionalization afterwards.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: enables functionalization, maps tensor arguments to
+                #   functional tensors, calls the function, and disables functionalization in
+                #   a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     func_args = pytree.tree_map(
@@ -8483,23 +10007,36 @@ def forward(self, x_1):
             make_fx(f_wrapper(f), tracing_mode="symbolic")(example_input)
 
     def test_cond_functionalized_aot_func_check_functional(self):
+        # [FUNCTION DOC] Traces cond with a wrapper that functionalizes arguments (old-style),
+        #   runs the function and converts the outputs back; checks no call_function node in the
+        #   true and false subgraphs has a mutable schema, and that the traced module gives the
+        #   same result as the original function.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x, mutated in place (add 5) in a local, returned.
             y = x.sin()
             y.add_(5)
             return y
 
         def f(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 4.
             pred = x.shape[0] == 4
             return cond(pred, true_fn, false_fn, [x])
 
         example_input = torch.ones(5, 5)
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory; the wrapped function enables
+            #   functionalization, maps tensor args and kwargs to functional tensors, runs
+            #   the function, converts the outputs back, and disables functionalization in
+            #   a finally clause.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: does the functionalize, call and convert-back sequence
+                #   described for f_wrapper with cleanup in a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     func_args = pytree.tree_map(
@@ -8530,20 +10067,29 @@ def forward(self, x_1):
         self.assertEqual(result_gm(torch.ones(5, 5)), f(torch.ones(5, 5)))
 
     def test_cond_nested_traced_other_inputs(self):
+        # [FUNCTION DOC] Traces nested cond where the true branch adds a constant tensor to the
+        #   nested result; checks the traced graph on two different inputs for the true-true case.
         def true_nested(y):
+            # [FUNCTION DOC] HELPER: y times y.
             return y * y
 
         def false_nested(y):
+            # [FUNCTION DOC] HELPER: y plus y.
             return y + y
 
         def true_fn(k, pred2):
+            # [FUNCTION DOC] HELPER: nested cond on pred2 between the nested functions, plus a
+            #   constant tensor of 0.25s.
             z = cond(pred2, true_nested, false_nested, [k])
             return torch.add(torch.tensor([0.25, 0.25]), z)
 
         def false_fn(k, _):
+            # [FUNCTION DOC] HELPER: cosine of k.
             return k.cos()
 
         def f(k, pred, pred2):
+            # [FUNCTION DOC] HELPER: outer cond on pred between true_fn and false_fn with operands
+            #   k and pred2.
             return cond(pred, true_fn, false_fn, [k, pred2])
 
         x = torch.tensor([0.5, 0.5])
@@ -8558,19 +10104,28 @@ def forward(self, x_1):
         self.assertEqual(result_true_true, (b * b) + torch.tensor([0.25, 0.25]))
 
     def test_cond_nested_traced_multi(self):
+        # [FUNCTION DOC] Traces two sequential conds (square versus double on one predicate,
+        #   add versus multiply on another) and compares the golden outer graph and the
+        #   first true subgraph; if CUDA graph conditional nodes are supported, also runs
+        #   the cudagraph helpers.
         def true_a(y):
+            # [FUNCTION DOC] HELPER: y times y.
             return y * y
 
         def false_a(y):
+            # [FUNCTION DOC] HELPER: y plus y.
             return y + y
 
         def true_b(y, z):
+            # [FUNCTION DOC] HELPER: y plus z.
             return y + z
 
         def false_b(y, z):
+            # [FUNCTION DOC] HELPER: y times z.
             return y * z
 
         def f(x, pred, pred2):
+            # [FUNCTION DOC] HELPER: adds the results of two conds with different predicates.
             a_out = cond(pred, true_a, false_a, [x])
             b_out = cond(pred2, true_b, false_b, [x, x])
             return a_out + b_out
@@ -8614,13 +10169,18 @@ def forward(self, arg0_1):
             )
 
     def test_raise_error_on_mismatch_type_size(self):
+        # [FUNCTION DOC] Branches returning a single tensor versus a tuple make tracing cond raise
+        #   UncapturedHigherOrderOpError naming torch.cond.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a tuple of x twice.
             return (x, x)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -8634,13 +10194,18 @@ def forward(self, arg0_1):
             make_fx(f)(x, torch.tensor(False))
 
     def test_raise_error_on_mismatch_tensor_size(self):
+        # [FUNCTION DOC] Branches returning tensors of different shapes raise TorchRuntimeError
+        #   mentioning merging two branches' output in torch.cond.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a new 10 by 10 zero tensor.
             return torch.zeros([10, 10])
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -8651,13 +10216,18 @@ def forward(self, arg0_1):
             make_fx(f)(x, torch.tensor(False))
 
     def test_cond_traced_not_nested_fake_tensor(self):
+        # [FUNCTION DOC] Same as the not-nested traced cond test but with fake tracing mode: the
+        #   traced graph selects sine for a true predicate and cosine for a false one.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -8669,20 +10239,27 @@ def forward(self, arg0_1):
         self.assertEqual(result_false, torch.cos(x))
 
     def test_cond_nested_traced_fake_tensor(self):
+        # [FUNCTION DOC] Fake-mode version of the nested cond tracing test; checks all four
+        #   predicate combinations against expected values.
         def true_nested(y):
+            # [FUNCTION DOC] HELPER: y times y.
             return y * y
 
         def false_nested(y):
+            # [FUNCTION DOC] HELPER: y plus y.
             return y + y
 
         def true_fn(x, pred2):
+            # [FUNCTION DOC] HELPER: nested cond on pred2 and returns x plus the result.
             z = cond(pred2, true_nested, false_nested, [x])
             return x + z
 
         def false_fn(x, _):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def f(x, pred, pred2):
+            # [FUNCTION DOC] HELPER: outer cond on pred.
             return cond(pred, true_fn, false_fn, [x, pred2])
 
         x = torch.randn(4)
@@ -8714,20 +10291,27 @@ def forward(self, arg0_1):
         self.assertEqual(result_false_true, torch.cos(x))
 
     def test_cond_nested_traced_other_inputs_fake_tensor(self):
+        # [FUNCTION DOC] Fake-mode version of the nested cond test with a constant tensor added in
+        #   the true branch; checks results for two inputs.
         def true_nested(y):
+            # [FUNCTION DOC] HELPER: y times y.
             return y * y
 
         def false_nested(y):
+            # [FUNCTION DOC] HELPER: y plus y.
             return y + y
 
         def true_fn(k, pred2):
+            # [FUNCTION DOC] HELPER: nested cond on pred2, plus a constant tensor of 0.25s.
             z = cond(pred2, true_nested, false_nested, [k])
             return torch.add(torch.tensor([0.25, 0.25]), z)
 
         def false_fn(k, _):
+            # [FUNCTION DOC] HELPER: cosine of k.
             return k.cos()
 
         def f(k, pred, pred2):
+            # [FUNCTION DOC] HELPER: outer cond on pred.
             return cond(pred, true_fn, false_fn, [k, pred2])
 
         x = torch.tensor([0.5, 0.5])
@@ -8744,19 +10328,26 @@ def forward(self, arg0_1):
         self.assertEqual(result_true_true, (b * b) + torch.tensor([0.25, 0.25]))
 
     def test_cond_nested_traced_multi_fake_tensor(self):
+        # [FUNCTION DOC] Fake-mode version of the sequential conds test; compares golden outer
+        #   graph and first true subgraph.
         def true_a(y):
+            # [FUNCTION DOC] HELPER: y times y.
             return y * y
 
         def false_a(y):
+            # [FUNCTION DOC] HELPER: y plus y.
             return y + y
 
         def true_b(y, z):
+            # [FUNCTION DOC] HELPER: y plus z.
             return y + z
 
         def false_b(y, z):
+            # [FUNCTION DOC] HELPER: y times z.
             return y * z
 
         def f(x, pred, pred2):
+            # [FUNCTION DOC] HELPER: adds the results of two conds with different predicates.
             a_out = cond(pred, true_a, false_a, [x])
             b_out = cond(pred2, true_b, false_b, [x, x])
             return a_out + b_out
@@ -8790,13 +10381,19 @@ def forward(self, arg0_1):
         )
 
     def test_raise_error_on_mismatch_type_size_fake_tensor(self):
+        # [FUNCTION DOC] Fake-mode version of the type/size mismatch test; branches
+        #   returning a tensor versus a tuple make tracing raise
+        #   UncapturedHigherOrderOpError naming torch.cond.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a tuple of x twice.
             return (x, x)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -8810,13 +10407,19 @@ def forward(self, arg0_1):
             make_fx(f, tracing_mode="fake")(x, torch.tensor(False))
 
     def test_raise_error_on_mismatch_tensor_size_fake_tensor(self):
+        # [FUNCTION DOC] Fake-mode version of the tensor size mismatch test; branches returning
+        #   tensors of different shapes raise TorchRuntimeError mentioning merging two branches'
+        #   output in torch.cond.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: returns a new 10 by 10 zero tensor.
             return torch.zeros([10, 10])
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on y with the two branches.
             return cond(y, true_fn, false_fn, [x])
 
         x = torch.randn(4)
@@ -8827,6 +10430,9 @@ def forward(self, arg0_1):
             make_fx(f, tracing_mode="fake")(x, torch.tensor(False))
 
     def check_map_count(self, gm, op_count):
+        # [FUNCTION DOC] HELPER: counts call_function nodes targeting the map_impl higher-
+        #   order op across the graph module and all of its submodules and asserts the
+        #   count equals op_count.
         i = 0
         for m in gm.modules():
             for node in m.graph.nodes:
@@ -8838,10 +10444,14 @@ def forward(self, arg0_1):
         self.assertEqual(i, op_count)
 
     def test_tracing_map_real(self):
+        # [FUNCTION DOC] Traces a map call with make_fx in real mode, checks the traced graph
+        #   result equals eager on new inputs and that the graph holds exactly one map op.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         def g(xs, y):
+            # [FUNCTION DOC] HELPER: maps f over xs with y as extra argument.
             return control_flow.map(f, xs, y)
 
         gm = make_fx(g, tracing_mode="real")(torch.ones(3, 2, 2), torch.ones(2))
@@ -8852,10 +10462,14 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 1)
 
     def test_tracing_map_symbolic_simple(self):
+        # [FUNCTION DOC] Traces map in symbolic mode and runs the graph on inputs of different
+        #   shape; checks it matches eager and has one map op.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         def g(xs, y):
+            # [FUNCTION DOC] HELPER: maps f over xs with y.
             return control_flow.map(f, xs, y)
 
         gm = make_fx(g, tracing_mode="symbolic")(torch.ones(3, 2, 4), torch.ones(4))
@@ -8866,10 +10480,16 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 1)
 
     def test_tracing_map_symbolic_list(self):
+        # [FUNCTION DOC] Symbolic tracing of map over a nested list of tensors with a list output,
+        #   followed by element-wise ops; checks the graph on different-shaped inputs matches
+        #   eager and has one map op.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a list with the nested first input plus y and the
+            #   second input times y.
             return [x[0][0] + y, x[1] * y]
 
         def g(xs, y, z):
+            # [FUNCTION DOC] HELPER: maps f then multiplies or adds z to the two outputs.
             out = control_flow.map(f, xs, y)
             return out[0] + z, out[1] * z
 
@@ -8885,10 +10505,16 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 1)
 
     def test_tracing_map_symbolic_dict(self):
+        # [FUNCTION DOC] Symbolic tracing of map over a dict input with dict output; checks the
+        #   graph on different-shaped inputs matches eager and has one map op.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a dict with the nested "a" entry plus y and the "c"
+            #   entry times y.
             return {"d": x["b"]["a"] + y, "e": x["c"] * y}
 
         def g(xs, y, z):
+            # [FUNCTION DOC] HELPER: maps f then adds and multiplies z to the outputs,
+            #   returning a dict.
             out = control_flow.map(f, xs, y)
             return {"f": out["d"] + z, "g": out["e"] * z}
 
@@ -8904,10 +10530,15 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 1)
 
     def test_tracing_map_autograd_symbolic_simple(self):
+        # [FUNCTION DOC] Traces map plus autograd.grad in symbolic mode; checks the graph matches
+        #   eager gradients and that two map ops exist (forward and backward).
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         def g(xs, y):
+            # [FUNCTION DOC] HELPER: maps f and returns the gradients of the output wrt xs and y
+            #   with ones as output gradient.
             out = control_flow.map(f, xs, y)
             return torch.autograd.grad(out, (xs, y), torch.ones_like(out))
 
@@ -8921,12 +10552,19 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 2)
 
     def test_tracing_map_autograd_symbolic_list(self):
+        # [FUNCTION DOC] Symbolic trace of map with list input/output and some inputs not
+        #   requiring grad; gradients are taken only wrt inputs that require grad; checks the
+        #   graph matches eager and has two map ops.
         import torch.utils._pytree as pytree
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a list with cosine of the first input plus sine of y
+            #   and sine of the second input times cosine of y.
             return [x[0].cos() + y.sin(), x[1].sin() * y.cos()]
 
         def g(xs, y):
+            # [FUNCTION DOC] HELPER: maps f, flattens outputs and inputs, and returns gradients
+            #   wrt the inputs requiring grad.
             out = control_flow.map(f, xs, y)
             flat_out = pytree.tree_leaves(out)
             flat_inp = pytree.tree_leaves((xs, y))
@@ -8946,10 +10584,15 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 2)
 
     def test_tracing_map_autograd_symbolic_dict(self):
+        # [FUNCTION DOC] Same as the list variant but with a dict input; checks the graph matches
+        #   eager and has two map ops.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns a list holding a plus y and b times y.
             return [x["a"] + y, x["b"] * y]
 
         def g(xs, y):
+            # [FUNCTION DOC] HELPER: maps f, flattens outputs and inputs, returns gradients wrt
+            #   the inputs requiring grad.
             out = control_flow.map(f, xs, y)
             flat_out = pytree.tree_leaves(out)
             flat_inp = pytree.tree_leaves((xs, y))
@@ -8975,19 +10618,31 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 2)
 
     def test_tracing_map_autograd_aot_functionalized(self):
+        # [FUNCTION DOC] Traces map plus gradients with and without a functionalizing wrapper;
+        #   checks the plain trace matches eager and counts mutable ops (including inside map
+        #   bodies): none for the functionalized trace and two for the plain one (forward and
+        #   recomputation in backward).
         def inner(x, y):
+            # [FUNCTION DOC] HELPER: computes x minus 1, mutates it in place (add 1), and returns
+            #   it times y.
             z = x - 1
             z.add_(1)
             return z * y
 
         def f(xs, y):
+            # [FUNCTION DOC] HELPER: maps inner and returns gradients of the result wrt xs and y.
             res = control_flow.map(inner, xs, y)
             grads = torch.autograd.grad(res, (xs, y), torch.ones_like(res))
             return grads
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory enabling functionalization around the
+            #   wrapped call and converting outputs back.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: enables functionalization, runs the function, maps
+                #   outputs back from functional tensors, and disables functionalization in
+                #   a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     return pytree.tree_map(from_fun_old, func(*args, **kwargs))
@@ -9008,6 +10663,8 @@ def forward(self, arg0_1):
         self.assertEqual(gm(xs, y), f(xs, y))
 
         def count_mutable(gm):
+            # [FUNCTION DOC] HELPER: recursively counts call_function nodes in the graph whose
+            #   schema is mutable, descending into map_impl body submodules.
             c = 0
             for node in gm.graph.nodes:
                 if node.op == "call_function":
@@ -9022,12 +10679,18 @@ def forward(self, arg0_1):
         self.assertEqual(count_mutable(gm), 2)
 
     def test_map_functionalized(self):
+        # [FUNCTION DOC] Checks map under torch.func.functionalize matches eager (including
+        #   make_fx real and symbolic traces); verifies no op in the traced body graph is mutable
+        #   and that there is one map op.
         def map_fn(x, y):
+            # [FUNCTION DOC] HELPER: adds x and y then mutates the result in place (add 4)
+            #   and returns it.
             z = x + y
             z.add_(4)
             return z
 
         def f(xs, y):
+            # [FUNCTION DOC] HELPER: maps map_fn over xs with y.
             return control_flow.map(map_fn, xs, y)
 
         example_inputs = (torch.ones(3, 2, 4), torch.ones(4))
@@ -9048,17 +10711,26 @@ def forward(self, arg0_1):
         self.check_map_count(gm, 1)
 
     def test_map_functionalized_aot_func(self):
+        # [FUNCTION DOC] Traces map with a wrapper that enables functionalization; checks the body
+        #   graph has no mutable ops and the result matches eager.
         def map_fn(x, y):
+            # [FUNCTION DOC] HELPER: adds x and y then mutates the sum in place (add 4)
+            #   and returns it.
             z = x + y
             z.add_(4)
             return z
 
         def f(xs, y):
+            # [FUNCTION DOC] HELPER: maps map_fn over xs with y.
             return control_flow.map(map_fn, xs, y)
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory enabling functionalization around the call.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: enables functionalization, runs the function,
+                #   converts outputs back from functional tensors, disables functionalization
+                #   in a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     return pytree.tree_map(from_fun_old, func(*args, **kwargs))
@@ -9078,11 +10750,15 @@ def forward(self, arg0_1):
         self.assertEqual(gm(*example_inputs), f(*example_inputs))
 
     def test_map_functionalized_arg_mutation(self):
+        # [FUNCTION DOC] A map function that mutates its extra argument in place under
+        #   functionalize raises TorchRuntimeError saying map might be modifying the input.
         def map_fn(x, y):
+            # [FUNCTION DOC] HELPER: adds 4 to y in place and returns x plus y.
             y.add_(4)
             return x + y
 
         def f(xs, y):
+            # [FUNCTION DOC] HELPER: maps map_fn over xs with y.
             return control_flow.map(map_fn, xs, y)
 
         example_inputs = (torch.ones(3, 2, 4), torch.ones(4))
@@ -9094,11 +10770,15 @@ def forward(self, arg0_1):
             functional_f(*example_inputs)
 
     def test_map_functionalized_elem_mutation(self):
+        # [FUNCTION DOC] A map function that mutates its mapped element in place under
+        #   functionalize raises TorchRuntimeError saying map might be modifying the input.
         def map_fn(x, y):
+            # [FUNCTION DOC] HELPER: adds 4 to x in place and returns x plus y.
             x.add_(4)
             return x + y
 
         def f(xs, y):
+            # [FUNCTION DOC] HELPER: maps map_fn over xs with y.
             return control_flow.map(map_fn, xs, y)
 
         example_inputs = (torch.ones(3, 2, 4), torch.ones(4))
@@ -9109,13 +10789,20 @@ def forward(self, arg0_1):
             functional_f(*example_inputs)
 
     def test_cond_autograd_backward(self):
+        # [FUNCTION DOC] Runs cond with a size-based predicate and backward through it; checks no
+        #   error is raised when running backward, forward without backward, or compiled, and that
+        #   the compiled result equals eager.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: cosine of x.
             return x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: sine of x.
             return x.sin()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x exceeds 4,
+            #   applied to y.
             return control_flow.cond(x.shape[0] > 4, true_fn, false_fn, [y])
 
         example_inputs = (
@@ -9133,14 +10820,21 @@ def forward(self, arg0_1):
 
     @skipIfTorchDynamo("Skip because we're testing export")
     def test_cond_autograd_backward_inp_out_aliasing(self):
+        # [FUNCTION DOC] Skipped under dynamo. Runs cond whose branches return the sum of inputs,
+        #   with backward, eager and compiled with the AOT recording backend; unless cross-ref,
+        #   compares the golden backward graph where the gradient outputs are cloned so they do
+        #   not alias the tangent input; also checks compiled equals eager.
         from torch._dynamo.testing import AotEagerAndRecordGraphs
 
         backend = AotEagerAndRecordGraphs()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of x exceeds 4 with the same function
+            #   in both branches.
             return control_flow.cond(x.sum() > 4, fn, fn, (x, y))
 
         example_inputs = (
@@ -9181,14 +10875,20 @@ class GraphModule(torch.nn.Module):
 
     @skipIfTorchDynamo("Skip because we're testing export")
     def test_cond_autograd_backward_out_out_aliasing(self):
+        # [FUNCTION DOC] Skipped under dynamo. Like the input-output aliasing test but branches
+        #   compute sine of the sum, so the two gradient outputs would alias each other; golden
+        #   backward graph shows a clone separating them; also checks compiled equals eager.
         from torch._dynamo.testing import AotEagerAndRecordGraphs
 
         backend = AotEagerAndRecordGraphs()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: returns sine of x plus y.
             return (x + y).sin()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of x exceeds 4 with the same function
+            #   in both branches.
             return control_flow.cond(x.sum() > 4, fn, fn, (x, y))
 
         example_inputs = (
@@ -9232,11 +10932,15 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(res, res_compiled)
 
     def test_map_functionalized_elem_alias(self):
+        # [FUNCTION DOC] A map function returning its input element itself (aliasing) under
+        #   functionalize raises UncapturedHigherOrderOpError naming the map_impl op.
         def map_fn(x):
+            # [FUNCTION DOC] HELPER: creates an unused view of x and returns x itself.
             x.view(x.shape)
             return x
 
         def f(xs):
+            # [FUNCTION DOC] HELPER: maps map_fn over xs.
             return control_flow.map(map_fn, xs)
 
         example_inputs = (torch.ones(3, 2, 4),)
@@ -9251,16 +10955,23 @@ class GraphModule(torch.nn.Module):
             functional_f(*example_inputs)
 
     def test_nested_map_cond_real(self):
+        # [FUNCTION DOC] Traces a map whose function applies cond (multiply or add) in real
+        #   tracing mode; checks the graph result against eager and one map op.
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: x times y.
             return x * y
 
         def false_fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         def f(x, pred, y):
+            # [FUNCTION DOC] HELPER: cond on pred between true_fn and false_fn with operands
+            #   x and y.
             return cond(pred, true_fn, false_fn, [x, y])
 
         def g(pred, xs, y):
+            # [FUNCTION DOC] HELPER: maps f over xs with pred and y as extra arguments.
             return control_flow.map(f, xs, pred, y)
 
         gm = make_fx(g, tracing_mode="real")(
@@ -9274,16 +10985,23 @@ class GraphModule(torch.nn.Module):
         self.check_map_count(gm, 1)
 
     def test_nested_map_cond_symbolic(self):
+        # [FUNCTION DOC] Same as the real nested map/cond test but with symbolic tracing and
+        #   differently shaped runtime inputs.
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: x times y.
             return x * y
 
         def false_fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         def f(x, pred, y):
+            # [FUNCTION DOC] HELPER: cond on pred between true_fn and false_fn with operands
+            #   x and y.
             return cond(pred, true_fn, false_fn, [x, y])
 
         def g(pred, xs, y):
+            # [FUNCTION DOC] HELPER: maps f over xs with pred and y.
             return control_flow.map(f, xs, pred, y)
 
         gm = make_fx(g, tracing_mode="symbolic")(
@@ -9297,25 +11015,35 @@ class GraphModule(torch.nn.Module):
         self.check_map_count(gm, 1)
 
     def test_nested_cond_map_cond_symbolic(self):
+        # [FUNCTION DOC] Symbolic tracing of a cond whose branches contain a map whose function
+        #   contains a cond; checks the traced graph against eager and that two map ops exist (one
+        #   per outer branch).
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: x times y.
             return x * y
 
         def false_fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         def f(x, pred, y):
+            # [FUNCTION DOC] HELPER: innermost cond on pred.
             return cond(pred, true_fn, false_fn, [x, y])
 
         def g(pred, xs, y):
+            # [FUNCTION DOC] HELPER: maps f over xs.
             return control_flow.map(f, xs, pred, y)
 
         def main_true_fn(pred, xs, y):
+            # [FUNCTION DOC] HELPER: the mapped result times 2.
             return g(pred, xs, y) * 2
 
         def main_false_fn(pred, xs, y):
+            # [FUNCTION DOC] HELPER: the mapped result plus 1.
             return g(pred, xs, y) + 1
 
         def main(p, pred, xs, y):
+            # [FUNCTION DOC] HELPER: outer cond on p between main_true_fn and main_false_fn.
             return cond(p, main_true_fn, main_false_fn, [pred, xs, y])
 
         gm = make_fx(main, tracing_mode="symbolic")(
@@ -9330,13 +11058,20 @@ class GraphModule(torch.nn.Module):
         self.check_map_count(gm, 2)
 
     def test_cond_with_sym_pred(self):
+        # [FUNCTION DOC] Traces cond with a predicate depending on a symbolic size using
+        #   symbolic make_fx; asserts the shape env has no guards (nothing specialized),
+        #   compares the golden graph, and checks the traced graph and eager run correctly on an
+        #   input of different size.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus x.
             return x + x
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x times x.
             return x * x
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size of x is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
         gm = make_fx(foo, tracing_mode="symbolic")(torch.ones(3, 2, 1))
@@ -9363,11 +11098,17 @@ def forward(self, x_1):
         self.assertEqual(foo(x), true_fn(x))
 
     def test_cond_with_unbacked_sym_pred(self):
+        # [FUNCTION DOC] Traces cond whose predicate depends on the size of a nonzero result (an
+        #   unbacked symbolic value) and compares the golden graph.
         def foo(x):
+            # [FUNCTION DOC] HELPER: defines the branches, computes nonzero indices of x, and runs
+            #   cond on whether their count exceeds 3.
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: x plus x.
                 return x + x
 
             def false_fn(x):
+                # [FUNCTION DOC] HELPER: x times x.
                 return x * x
 
             az = x.nonzero()
@@ -9390,6 +11131,9 @@ def forward(self, x_1):
         )
 
     def _check_closure_correctly_lifted(self, f, *, args, exp_res, exp_arg_num):
+        # [FUNCTION DOC] HELPER: raises AssertionError unless args is a tuple or list; checks f
+        #   gives exp_res eagerly and through a make_fx trace, and that every child submodule of
+        #   the traced graph has exactly exp_arg_num placeholder nodes.
         if not isinstance(args, (tuple, list)):
             raise AssertionError(f"Expected args to be tuple or list, got {type(args)}")
         self.assertEqual(f(*args), exp_res)
@@ -9397,6 +11141,7 @@ def forward(self, x_1):
         self.assertEqual(gm(*args), exp_res)
 
         def cnt_placeholder(gm):
+            # [FUNCTION DOC] HELPER: returns the number of placeholder nodes in the graph module.
             return len([node for node in gm.graph.nodes if node.op == "placeholder"])
 
         placeholder_cnts = [cnt_placeholder(mod) for mod in gm.children()]
@@ -9405,6 +11150,11 @@ def forward(self, x_1):
     def _check_closure_correctly_lifted_with_mutation(
         self, f, closures_to_be_mutated, *, args, exp_arg_num
     ):
+        # [FUNCTION DOC] HELPER: checks closure lifting for the current results, then
+        #   calls add with minus one on each closure tensor and checks again with the
+        #   recomputed expected value.
+        # KNOWN ISSUE: add is out-of-place and its result is discarded, so the closures are never
+        #   actually mutated; the second check repeats the first.
         exp_res = f(*args)
         self._check_closure_correctly_lifted(
             f, args=args, exp_res=exp_res, exp_arg_num=exp_arg_num
@@ -9419,16 +11169,21 @@ def forward(self, x_1):
         )
 
     def test_cond_with_tensor_closure(self):
+        # [FUNCTION DOC] Cond branches close over tensors a and b; checks branches are lifted to
+        #   take three arguments (x, a, b) via the closure helper.
         a = torch.ones(2, 3)
         b = torch.ones(2, 3) + 1
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure a.
             return x + a
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure b.
             return x + b
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
         # expected branches takes [x, a, b] as input
@@ -9438,16 +11193,22 @@ def forward(self, x_1):
         )
 
     def test_cond_with_tensor_closure_graph_module(self):
+        # [FUNCTION DOC] Traces cond with tensor closures using symbolic make_fx allowing non-fake
+        #   inputs; compares the golden outer graph (closure tensors as constants passed as
+        #   operands) and the true subgraph.
         a = torch.ones(2, 3)
         b = torch.ones(2, 3) + 1
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure a.
             return x + a
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure b.
             return x + b
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
         # expected branches takes [x, a, b] as input
@@ -9479,8 +11240,12 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
     def test_cond_with_module_param_closure(self):
+        # [FUNCTION DOC] Cond branches reading a parameter and a buffer from a module object;
+        #   checks both branches take (x, param, buffer) via the closure helper.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a non-grad parameter of ones and a buffer of twos.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: registers the parameter and the buffer.
                 super().__init__()
                 self.register_parameter(
                     "param", torch.nn.Parameter(torch.ones(2, 3), requires_grad=False)
@@ -9490,12 +11255,15 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         my_mode = Mod()
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus the module parameter.
             return x + my_mode.param
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus the module buffer.
             return x + my_mode.buffer
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
         inp = torch.ones(2, 3)
@@ -9505,14 +11273,20 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
     def test_cond_with_module_python_scalar_closure(self):
+        # [FUNCTION DOC] Branches close over a tensor and a Python int; checks that only the
+        #   tensor is lifted (both branches take two arguments) and the result is input plus one.
         def foo(x):
+            # [FUNCTION DOC] HELPER: builds a tensor a and an int b, defines branches using them,
+            #   and runs cond on whether the leading size is 4.
             a = torch.ones(1, 1)
             b = 1
 
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: x plus tensor a.
                 return x + a
 
             def false_fn(x):
+                # [FUNCTION DOC] HELPER: x plus integer b.
                 return x + b
 
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
@@ -9525,20 +11299,28 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
     def test_cond_nested_with_closure(self):
+        # [FUNCTION DOC] Nested cond whose inner branches close over tensors a and b; checks that
+        #   the closure arguments are deduplicated so all branches take three arguments.
         a = torch.ones(1, 1)
         b = torch.ones(1, 1) + 1
 
         def inner_true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure a.
             return x + a
 
         def inner_false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure b.
             return x + b
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: outer cond on whether the leading size is 4 between two
+            #   functions that run inner conds.
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: inner cond on whether the leading size is 2.
                 return cond(x.shape[0] == 2, inner_true_fn, inner_false_fn, [x])
 
             def false_fn(x):
+                # [FUNCTION DOC] HELPER: inner cond on whether the leading size exceeds 4.
                 return cond(x.shape[0] > 4, inner_true_fn, inner_false_fn, [x])
 
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
@@ -9553,34 +11335,55 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         )
 
     def test_cond_nested_with_closure_graph_module(self):
+        # [FUNCTION DOC] Defines nested cond functions with closures but never calls them
+        #   or asserts anything.
+        # KNOWN ISSUE: the test has no assertions and does not execute foo, so it tests nothing.
         a = torch.ones(1, 1)
         b = torch.ones(1, 1) + 1
 
         def inner_true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure a.
             return x + a
 
         def inner_false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus closure b.
             return x + b
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: outer cond (never executed) over two functions that
+            #   run inner conds.
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: inner cond on whether the leading size is 2.
                 return cond(x.shape[0] == 2, inner_true_fn, inner_false_fn, [x])
 
             def false_fn(x):
+                # [FUNCTION DOC] HELPER: inner cond on whether the leading size exceeds 4.
                 return cond(x.shape[0] > 4, inner_true_fn, inner_false_fn, [x])
 
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
     def test_map_unfunc_boolean_tensor_for_nested_map_cond(self):
+        # [FUNCTION DOC] Traces a map whose function runs cond on a boolean tensor, using a
+        #   wrapper that functionalizes arguments (old style); compares the golden outer graph
+        #   (map_impl with mapped and extra inputs) and the map body graph (cond).
         def map_fn(pred, x):
+            # [FUNCTION DOC] HELPER: maps a function that applies cond (double or halve) over x
+            #   using pred as extra argument.
             def fn(x, pred):
+                # [FUNCTION DOC] HELPER: cond on pred between multiplying x by 2 and dividing
+                #   it by 2.
                 return control_flow.cond(pred, lambda x: x * 2, lambda x: x / 2, (x,))
 
             return control_flow.map(fn, x, pred)
 
         def f_wrapper(func):
+            # [FUNCTION DOC] HELPER: decorator factory that functionalizes tensor arguments, runs
+            #   the function and converts outputs back with functionalization enabled.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: enables functionalization, maps tensors to functional
+                #   tensors in args and kwargs, calls the function, converts outputs back, and
+                #   disables functionalization in a finally clause.
                 torch._enable_functionalization(reapply_views=False)
                 try:
                     func_args = pytree.tree_map(
@@ -9625,19 +11428,28 @@ def forward(self, arg0_1, arg1_1):
 
     @skipIfCrossRef  # Arg order changes with crossref
     def test_cond_make_fx_preserve_stack_trace_for_nodes_in_subgraph(self):
+        # [FUNCTION DOC] Skipped for cross-ref. Exports a cond function, runs the exported module
+        #   under an interpreter with node metadata preserved while tracing with make_fx, and
+        #   checks that source_fn_stack and stack_trace metadata of the add, mul, sin and cos
+        #   nodes match between the exported and retraced modules.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x plus cosine of x.
             return x + x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x times sine of x.
             return x * x.sin()
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, (x,))
 
         inp = torch.randn([4, 3])
         gm, _ = torch._dynamo.export(foo)(inp)
 
         def run_with_interpreter(*args):
+            # [FUNCTION DOC] HELPER: runs the exported graph module with an fx Interpreter inside
+            #   a context preserving node meta.
             with torch.fx.traceback.preserve_node_meta():
                 return torch.fx.Interpreter(gm).run(*args)
 
@@ -9656,11 +11468,17 @@ def forward(self, arg0_1, arg1_1):
         "triggers cache limit for foo and changes unique_graphs count.",
     )
     def test_cond_no_dynamo_cache_limit(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo. Calls a compiled cond function repeatedly with
+        #   fresh branch closures (recompile limit plus one times) and checks results stay
+        #   correct; asserts the dynamo statistics: captured calls equal twice the iteration count
+        #   and unique graphs equal the iteration count.
         torch._dynamo.reset()
         counters = torch._dynamo.utils.counters
         counters.clear()
 
         def foo(x, true_fn, false_fn):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of x is negative, with the
+            #   given branch functions.
             return cond(x.sum() < 0, true_fn, false_fn, (x,))
 
         inp = torch.ones(3, 4)
@@ -9669,10 +11487,14 @@ def forward(self, arg0_1, arg1_1):
 
         # Need functions that cause recompilations
         def get_dummy_fns(str):
+            # [FUNCTION DOC] HELPER: returns a cosine-like and a sine-like function whose closures
+            #   depend on the given string, so each call fails dynamo guards.
             def dummy_cos(x):
+                # [FUNCTION DOC] HELPER: cosine of x with a no-op length adjustment.
                 return x.cos() + len(str) - len(str)
 
             def dummy_sin(x):
+                # [FUNCTION DOC] HELPER: sine of x with a no-op length adjustment.
                 return x.sin() + len(str) - len(str)
 
             return dummy_cos, dummy_sin
@@ -9686,13 +11508,19 @@ def forward(self, arg0_1, arg1_1):
         self.assertEqual(counters["stats"]["unique_graphs"], iter_n)
 
     def test_cond_with_consecutive_make_fx_symbolic(self):
+        # [FUNCTION DOC] Traces cond symbolically on four inputs of different shapes and
+        #   compares golden graphs for the outer graph and each branch every time (the generated
+        #   graph is identical).
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: x minus cosine of x.
             return x - x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: x plus sine of x.
             return x + x.sin()
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: cond on whether the leading size is 4.
             return cond(x.shape[0] == 4, true_fn, false_fn, [x])
 
         inps = (torch.ones(3, 4), torch.ones(3, 5), torch.ones(5, 4), torch.ones(5, 3))
@@ -9733,24 +11561,39 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     def _create_test_fns_for_cond(
         self, pred, inner_most_fn, operands, closure_list, nested_level
     ):
+        # [FUNCTION DOC] HELPER: recursive factory returning operands and a function that runs
+        #   cond. At nesting level 0 the branches add or subtract the inner function applied to
+        #   the operands and, when closure tensors exist, to the closure list (or just apply it);
+        #   the function returns a zeros tensor when there are no operands or closures. At higher
+        #   levels, branches add or subtract the next lower level function applied to its own
+        #   operands, with the predicate flipped at each level using a comparison, and the empty
+        #   case returns ones.
         if nested_level == 0:
             if len(closure_list) > 0:
 
                 def true_fn(*operands):
+                    # [FUNCTION DOC] HELPER: inner function of operands plus inner function
+                    #   of closure tensors.
                     return inner_most_fn(*operands) + inner_most_fn(*closure_list)
 
                 def false_fn(*operands):
+                    # [FUNCTION DOC] HELPER: inner function of operands minus inner function
+                    #   of closure tensors.
                     return inner_most_fn(*operands) - inner_most_fn(*closure_list)
 
             else:
 
                 def true_fn(*operands):
+                    # [FUNCTION DOC] HELPER: inner function of operands.
                     return inner_most_fn(*operands)
 
                 def false_fn(*operands):
+                    # [FUNCTION DOC] HELPER: inner function of operands.
                     return inner_most_fn(*operands)
 
             def fn(*operands):
+                # [FUNCTION DOC] HELPER: returns a tensor of zeros if there are no operands and no
+                #   closures, else cond on pred between the two branches.
                 if len(operands) == 0 and len(closure_list) == 0:
                     return torch.zeros(1)
                 return cond(pred, true_fn, false_fn, operands)
@@ -9762,12 +11605,18 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
             def true_fn(*operands):
+                # [FUNCTION DOC] HELPER: inner function of operands plus the nested level function
+                #   on its arguments.
                 return inner_most_fn(*operands) + inner_fn(*args)
 
             def false_fn(*operands):
+                # [FUNCTION DOC] HELPER: inner function of operands minus the nested level
+                #   function on its arguments.
                 return inner_most_fn(*operands) - inner_fn(*args)
 
             def fn(*operands):
+                # [FUNCTION DOC] HELPER: returns a tensor of ones if there are no operands and no
+                #   closures, else cond on pred between the branches.
                 if len(operands) == 0 and len(closure_list) == 0:
                     return torch.ones(1)
                 return cond(pred, true_fn, false_fn, operands)
@@ -9775,6 +11624,8 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             return operands, fn
 
     def _init_predicate(self, pred_type):
+        # [FUNCTION DOC] HELPER: returns a predicate by type name: Python True, integer tensor 1,
+        #   float tensor 1.0 or boolean tensor False; raises NotImplementedError for other names.
         if pred_type == "bool":
             return True
         elif pred_type == "intTensor":
@@ -9787,6 +11638,9 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             raise NotImplementedError
 
     def _init_fn(self, inner_fn_type):
+        # [FUNCTION DOC] HELPER: returns the reduce function, a ReduceMod instance
+        #   or a ReduceObj instance for the names function, module and object;
+        #   raises NotImplementedError otherwise.
         if inner_fn_type == "function":
             return reduce_func
         elif inner_fn_type == "module":
@@ -9804,6 +11658,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     def test_cond_tracing_with_valid_inputs(
         self, predType, innerFnType, nOperands, nClosure, nesting
     ):
+        # [FUNCTION DOC] Parametrized over predicate type, inner function type, operand count,
+        #   closure count and nesting depth. Builds the cond test function and checks that make_fx
+        #   traces in symbolic, fake and real modes (non-fake inputs allowed) reproduce the eager
+        #   result, in per-mode subtests.
         pred = self._init_predicate(predType)
         inner_fn = self._init_fn(innerFnType)
         operands = [torch.ones(2, 3) + i for i in range(nOperands)]
@@ -9826,6 +11684,9 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     @parametrize("nClosure", [0, 1])
     @parametrize("nesting", [0])
     def test_cond_vmap(self, predType, innerFnType, nOperands, nClosure, nesting):
+        # [FUNCTION DOC] Parametrized over boolean-tensor predicates, inner function types,
+        #   operand counts, closure counts and nesting 0. Checks that vmap of the cond function
+        #   over operands matches eager (comparing each output element when closures exist).
         pred = self._init_predicate(predType)
         inner_fn = self._init_fn(innerFnType)
         operands = [torch.ones(2, 3) + i for i in range(nOperands)]
@@ -9842,7 +11703,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             self.assertEqual(eager_res, out[1])
 
     def test_cond_vmap_simple(self):
+        # [FUNCTION DOC] vmap over a cond whose branches are add 100 or clone and whose predicate
+        #   is true; the result has the input shape and equals input plus 100.
         def fn(x):
+            # [FUNCTION DOC] HELPER: cond with constant true predicate tensor, adding
+            #   100 or cloning.
             return torch.cond(
                 pred=torch.tensor([True]),
                 true_fn=lambda x: x + 100,
@@ -9856,7 +11721,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(res, a + 100)
 
     def test_cond_vmap_multiple_inputs(self):
+        # [FUNCTION DOC] vmap of cond with a data-dependent predicate over two batched inputs;
+        #   checks per-batch selection of x plus 100 or a clone of y against the expected matrix.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: cond on whether sum of x is less than sum of y; true gives x
+            #   plus 100, false gives clone of y.
             return torch.cond(
                 pred=x.sum() < y.sum(),
                 true_fn=lambda x, y: x + 100,
@@ -9874,10 +11743,15 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(expected, res)
 
     def test_cond_vmap_single_input_with_closure(self):
+        # [FUNCTION DOC] vmap of cond with a closure tensor; run once and then again with
+        #   error_on_recompile set to check no recompilation; result equals the input
+        #   plus the closure.
         a = torch.ones((3, 5)) + 3
         c = torch.arange(5)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: cond with true predicate tensor adding or subtracting
+            #   the closure c.
             return torch.cond(
                 pred=torch.tensor([True]),
                 true_fn=lambda x: x + c,
@@ -9895,11 +11769,15 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(a + c, res)
 
     def test_cond_vmap_multiple_args_with_closure(self):
+        # [FUNCTION DOC] vmap of cond over two batched inputs with a false predicate and closure;
+        #   result equals b minus the closure.
         a = torch.ones((3, 5), dtype=torch.int64) + 3
         b = torch.arange(15).reshape(3, 5)
         c = torch.arange(5)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: cond with false predicate tensor; true branch x plus c, false
+            #   branch y minus c.
             return torch.cond(
                 pred=torch.tensor([False]),
                 true_fn=lambda x, y: x + c,
@@ -9912,10 +11790,14 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     @parametrize("nClosure", [0, 1])
     def test_cond_vmap_multiple_outputs(self, nClosure):
+        # [FUNCTION DOC] Parametrized over closure usage. vmap of cond whose branches return two
+        #   tensors; checks two results equal (a plus c, a minus c) or (a plus 1, a minus 1).
         if nClosure:
             c = torch.ones(5, dtype=torch.int64) + 5
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: cond with true predicate; true branch returns x plus c
+                #   and x minus c; false branch two clones.
                 return torch.cond(
                     pred=torch.tensor([True]),
                     true_fn=lambda x: (x + c, x - c),
@@ -9926,6 +11808,8 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         else:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: cond with true predicate; true branch returns x plus 1
+                #   and x minus 1; false branch two clones.
                 return torch.cond(
                     pred=torch.tensor([True]),
                     true_fn=lambda x: (x + 1, x - 1),
@@ -9945,7 +11829,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     @parametrize("boolcond", [True, False])
     def test_vmap_vmap(self, boolcond):
+        # [FUNCTION DOC] Parametrized over whether the predicate is a Python bool or a tensor.
+        #   Nested vmap over a cond function; result equals the input plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: cond with true predicate (Python bool or tensor as selected),
+            #   adding or subtracting 1.
             return torch.cond(
                 pred=torch.tensor([True]) if not boolcond else True,
                 true_fn=lambda x: x + 1,
@@ -9954,6 +11842,7 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
         def wrapper(x):
+            # [FUNCTION DOC] HELPER: vmap of fn over x.
             return torch.vmap(fn)(x)
 
         a = torch.ones((3, 4, 5))
@@ -9961,7 +11850,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(res, a + 1)
 
     def test_cond_trace_set__and_mutate_input(self):
+        # [FUNCTION DOC] Cond branches that call set_ on an input and mutate through a view raise
+        #   UncapturedHigherOrderOpError naming torch.cond.
         def f(a, tmp):
+            # [FUNCTION DOC] HELPER: takes a view of a, replaces a's storage with tmp under
+            #   no_grad, multiplies the view by 2 in place, and returns a plus tmp.
             a_view = a.view(-1)
             with torch.no_grad():
                 a.set_(tmp)
@@ -9980,7 +11873,13 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     @skipIfCrossRef  # Arg order changes with crossref
     def test_cond_trace_set__and_mutate_intermediate(self):
+        # [FUNCTION DOC] Skipped for cross-ref. Cond branches using set_ on a cloned intermediate:
+        #   compiling with the aot_eager and inductor backends raises RuntimeError about mutating
+        #   tensors with frozen storage; with the eager recording backend, compares the golden
+        #   true-branch graph and checks the output equals the eager function.
         def f(a, tmp):
+            # [FUNCTION DOC] HELPER: clones a and tmp, replaces a's storage with tmp under
+            #   no_grad, mutates through a view, and returns a plus tmp.
             a = a.clone()
             a_view = a.view(-1)
             tmp = tmp.clone()
@@ -9993,7 +11892,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         tmp = torch.ones(3, 3, requires_grad=True)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling cond with f in both branches.
             def forward(self, inp: torch.Tensor, tmp: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: cond on whether the sum of inp is positive using f
+                #   for both branches.
                 return torch.cond(inp.sum() > 0, f, f, (inp, tmp))
 
         with self.assertRaisesRegex(
@@ -10030,14 +11932,22 @@ def forward(self, l_inp_, l_tmp_):
     @skipIfCrossRef  # Args get renamed to r in crossref mode
     @parametrize("requires_grad", [True, False])
     def test_cond_symint_operands(self, requires_grad):
+        # [FUNCTION DOC] Skipped for cross-ref; parametrized over requires_grad. Compiles a module
+        #   whose cond branches use a Python int attribute with dynamic shapes and the eager
+        #   recording backend; checks result equality, one graph, and golden graph code in which
+        #   the symbolic size is passed as an operand.
         backend = EagerAndRecordGraphs()
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding an int attribute used by the cond branches.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: sets the attribute num to 3.
                 super().__init__()
                 self.num = 3
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: cond with true predicate tensor; true branch a plus b
+                #   plus num, false branch a minus b minus num.
                 return torch.cond(
                     pred=torch.tensor([True]),
                     true_fn=lambda a, b: a + b + self.num,
@@ -10065,12 +11975,18 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
         )
 
     def test_two_hops_not_sharing_code_obj(self):
+        # [FUNCTION DOC] With automatic dynamic shapes, uses a compile counter to show that
+        #   compiled cond does not recompile on a new tensor of the same shape, that while_loop
+        #   causes a recompile (a separate code object), a repeat does not, and a cond with a new
+        #   shape triggers a third frame.
         pred, args = torch.tensor(True), (torch.ones(3, 3),)
 
         def fn1(x):
+            # [FUNCTION DOC] HELPER: x plus 1.
             return x + 1
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: x minus 1.
             return x - 1
 
         from torch._dynamo.testing import CompileCounter
@@ -10087,6 +12003,7 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
             self.assertEqual(cnt.frame_count, 1)
 
             def cond_fn(x):
+                # [FUNCTION DOC] HELPER: true if the sum of x is positive.
                 return x.sum() > 0
 
             args = (torch.randn(4, 4),)
@@ -10104,14 +12021,20 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
             self.assertEqual(cnt.frame_count, 3)
 
     def test_hop_raises_if_not_overriding_call(self):
+        # [FUNCTION DOC] Instantiating a HigherOrderOperator subclass that does not override its
+        #   call hook raises TypeError mentioning the class name.
         class WrongHop(torch._ops.HigherOrderOperator):
+            # [CLASS DOC] HELPER: empty HigherOrderOperator subclass.
             pass
 
         with self.assertRaisesRegex(TypeError, "WrongHop"):
             WrongHop("wrong_hop")
 
     def test_scan_functionalized(self):
+        # [FUNCTION DOC] Checks scan along dim 1 with the add combine function under
+        #   torch.func.functionalize equals the eager result.
         def f(init, xs):
+            # [FUNCTION DOC] HELPER: scan with the add combine function along dim 1.
             return scan(get_scan_combine_fn("add", False), init, xs, dim=1)
 
         example_inputs = torch.ones(5, 7, 4)
@@ -10122,11 +12045,16 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
         )
 
     def test_scan_functionalized_elem_mutation(self):
+        # [FUNCTION DOC] Combine functions that mutate an element in place (first mutating
+        #   the carry then the input) under functionalize make the call raise some
+        #   exception (message unchecked).
         def add1(x, y):
+            # [FUNCTION DOC] HELPER: adds 4 to x in place and returns two sums.
             x.add_(4)
             return x + y, x + y
 
         def f(init, xs):
+            # [FUNCTION DOC] HELPER: scan of add1 along dim 1.
             return scan(add1, init, xs, dim=1)
 
         example_inputs = torch.ones(5, 7, 4)
@@ -10146,10 +12074,12 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
             functional_f(example_init, example_inputs)
 
         def add2(x, y):
+            # [FUNCTION DOC] HELPER: adds 4 to y in place and returns two sums.
             y.add_(4)
             return x + y, x + y
 
         def f(init, xs):
+            # [FUNCTION DOC] HELPER: scan of add2 along dim 1.
             return scan(add2, init, xs, dim=1)
 
         functional_f = torch.func.functionalize(f)
@@ -10168,10 +12098,14 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
             functional_f(example_init, example_inputs)
 
     def test_scan_functionalized_elem_alias(self):
+        # [FUNCTION DOC] A combine function returning its carry as both outputs (aliasing) under
+        #   functionalize makes scan raise some exception (message unchecked).
         def add(x, y):
+            # [FUNCTION DOC] HELPER: returns x twice.
             return x, x
 
         def f(init, xs):
+            # [FUNCTION DOC] HELPER: scan of add along dim 1.
             return scan(add, init, xs, dim=1)
 
         example_inputs = torch.ones(5, 7, 4)
@@ -10193,13 +12127,21 @@ def forward(self, s97 : torch.SymInt, L_a_ : torch.Tensor, L_b_ : torch.Tensor):
 
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     def test_scan_pytree_closure(self):
+        # [FUNCTION DOC] Skipped under dynamo. Scan whose combine function closes over a pytree
+        #   holding a parameter dict and a buffer tuple; compiles with the eager recording
+        #   backend, asserts one graph and compares golden code (closure leaves passed to the scan
+        #   op as additional inputs; the cross-ref branch has identical expected text), then
+        #   checks eager and compiled outputs equal the fake scan result.
         param_buffer = ({"param": torch.randn(3, 3)}, (torch.randn(3),))
 
         def add(carry, x):
+            # [FUNCTION DOC] HELPER: carry matrix-multiplied by the closure parameter and by x
+            #   plus the closure buffer; returns the result as carry and its sum as output.
             ret = (carry @ param_buffer[0]["param"]) @ x + param_buffer[1][0]
             return ret, ret.sum()
 
         def f(init, xs):
+            # [FUNCTION DOC] HELPER: scan of add over xs.
             return scan(add, init, xs)
 
         init = torch.randn(4, 3)
@@ -10246,15 +12188,24 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_in_vmap_simple(self):
+        # [FUNCTION DOC] With scalar output capture enabled, vmap over a function that reshapes
+        #   the batched input and runs scan with a clone-carry combine function using a closure
+        #   matrix; checks eager scan, compiled, and fake-scan results agree.
         x = torch.randn(3, 4, 4)
         y = torch.randn(4, 2)
         zeros = torch.zeros(2, 3)
 
         def combine_fn(init, xs):
+            # [FUNCTION DOC] HELPER: returns a clone of the carry and the product of xs
+            #   with closure y.
             return init.clone(), xs @ y
 
         def fn(scan_op, x, y):
+            # [FUNCTION DOC] HELPER: vmap with batch dims (1, 0, none) of a function that scans
+            #   over a reshaped slice.
             def inner_fn(zeros, x, y):
+                # [FUNCTION DOC] HELPER: reshapes x to 2 by 2 by 4 and runs the scan op with
+                #   combine_fn over it from zeros init.
                 x = x.view(2, 2, 4)
 
                 return scan_op(
@@ -10273,12 +12224,18 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_in_vmap_complex_ops(self):
+        # [FUNCTION DOC] With scalar output capture enabled, vmap over both init and xs of a scan
+        #   with a combine function using relu, transpose, matrix multiplication and reductions;
+        #   checks eager, compiled and fake scan agree.
         # Test with various operations requiring shape reasoning
         x = torch.randn(4, 5, 3, 2)
         init = torch.randn(4, 3, 2)
         weight = torch.randn(3, 3)
 
         def combine_fn(carry, xs):
+            # [FUNCTION DOC] HELPER: new carry is relu of carry plus the transposed product of
+            #   transposed xs and the closure weight; output is sum of sine of carry plus mean of
+            #   cosine of xs.
             # carry: (3, 2), xs: (3, 2)
             intermediate = torch.nn.functional.relu(carry)
             xs_t = xs.transpose(0, 1)  # (2, 3)
@@ -10288,7 +12245,9 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
             return new_carry, output
 
         def fn(scan_op, x, init):
+            # [FUNCTION DOC] HELPER: vmap over dim 0 of both arguments of a function that scans.
             def inner_fn(x, init):
+                # [FUNCTION DOC] HELPER: runs the scan op with combine_fn on init and x.
                 return scan_op(combine_fn, init, x)
 
             return torch.vmap(inner_fn, in_dims=(0, 0))(x, init)
@@ -10302,12 +12261,16 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_in_vmap_unbatched_x(self):
+        # [FUNCTION DOC] Same as the complex-ops vmap test but xs is not batched (in-dim none)
+        #   while init is; checks eager, compiled and fake scan agree.
         # Test with various operations requiring shape reasoning
         x = torch.randn(5, 3, 2)
         init = torch.randn(4, 3, 2)
         weight = torch.randn(3, 3)
 
         def combine_fn(carry, xs):
+            # [FUNCTION DOC] HELPER: same relu / transpose / matmul combine function as the
+            #   complex ops test.
             # carry: (3, 2), xs: (3, 2)
             intermediate = torch.nn.functional.relu(carry)
             xs_t = xs.transpose(0, 1)  # (2, 3)
@@ -10317,7 +12280,9 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
             return new_carry, output
 
         def fn(scan_op, x, init):
+            # [FUNCTION DOC] HELPER: vmap with xs unbatched and init batched over dim 0.
             def inner_fn(x, init):
+                # [FUNCTION DOC] HELPER: runs the scan op with combine_fn on init and x.
                 return scan_op(combine_fn, init, x)
 
             return torch.vmap(inner_fn, in_dims=(None, 0))(x, init)
@@ -10331,12 +12296,16 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @skipIfTorchDynamo("not a dynamo test")
     def test_scan_in_vmap_unbatched_init_error(self):
+        # [FUNCTION DOC] Skipped under dynamo. vmap with xs batched but init unbatched makes scan
+        #   fail with RuntimeError about a size mismatch at a non-singleton dimension.
         # Test with various operations requiring shape reasoning
         x = torch.randn(4, 5, 3, 2)
         init = torch.randn(4, 3, 2)
         weight = torch.randn(3, 3)
 
         def combine_fn(carry, xs):
+            # [FUNCTION DOC] HELPER: same relu / transpose / matmul combine function as the
+            #   complex ops test.
             # carry: (3, 2), xs: (3, 2)
             intermediate = torch.nn.functional.relu(carry)
             xs_t = xs.transpose(0, 1)  # (2, 3)
@@ -10346,7 +12315,9 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
             return new_carry, output
 
         def vmap_fn(x, init):
+            # [FUNCTION DOC] HELPER: vmap with xs batched and init not batched, scanning inside.
             def fn(x, init):
+                # [FUNCTION DOC] HELPER: scans with combine_fn over init and x.
                 return scan(combine_fn, init, x)
 
             return torch.vmap(fn, in_dims=(0, None))(x, init)
@@ -10359,18 +12330,27 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @skipIfTorchDynamo("a vmap test, not a dynamo test")
     def test_vmap_closure_weight_error(self):
+        # [FUNCTION DOC] Skipped under dynamo. Shows that a combine function reading a closed-over
+        #   batched weight (instead of a vmapped argument) sees the unbatched full weight, so the
+        #   vmapped fake scan raises RuntimeError about a shape mismatch.
         init_batched = torch.randn(7, 2, 3)
         xs_batched = torch.randn(7, 5, 4)
         weight = torch.randn(7, 4, 3)
 
         def combine_fn(carry, xs):
+            # [FUNCTION DOC] HELPER: carry plus xs matrix-multiplied by the closure weight; output
+            #   is the sum of carry.
             # carry: (2, 3), xs: (4,), weight: (4, 3)
             new_carry = carry + xs @ weight
             output = carry.sum()
             return new_carry, output
 
         def expected_fn(init, xs, weight):
+            # [FUNCTION DOC] HELPER: vmap over dim 0 of init, xs and weight, calling
+            #   an inner function.
             def fn(init, xs, weight):
+                # [FUNCTION DOC] HELPER: fake scan of combine_fn on init and xs
+                #   (weight argument unused).
                 return _fake_scan(combine_fn, init, xs)
 
             return torch.vmap(fn, in_dims=(0, 0, 0))(init, xs, weight)
@@ -10386,11 +12366,16 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_in_vmap_mixed_batch_dims(self):
+        # [FUNCTION DOC] With scalar output capture enabled, vmap with init batched on dim 2
+        #   and xs on dim 1; combine function uses a scalar closure; checks eager, compiled and
+        #   fake scan agree.
         init = torch.randn(8, 5, 6)
         xs_batched = torch.randn(3, 6, 5, 8)
         scale = torch.randn([])
 
         def combine_fn(carry, xs):
+            # [FUNCTION DOC] HELPER: new carry is carry plus the scaled sum of xs; output is xs
+            #   matrix-multiplied by carry.
             # carry: 8, 5
             # xs: 5, 8
             # new_carry: 8, 5
@@ -10399,7 +12384,9 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
             return new_carry, output
 
         def fn(scan_op, init, xs):
+            # [FUNCTION DOC] HELPER: vmap with in dims 2 and 1 of a function that scans.
             def inner_fn(init, xs):
+                # [FUNCTION DOC] HELPER: runs the scan op with combine_fn.
                 return scan_op(combine_fn, init, xs)
 
             return torch.vmap(inner_fn, in_dims=(2, 1))(init, xs)
@@ -10413,22 +12400,34 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_vmap_scan_vmap_scan_nested(self):
+        # [FUNCTION DOC] With scalar output capture enabled, nests vmap, scan, vmap, scan
+        #   with batch sizes 3 and 4 and scan lengths 5 and 6; checks eager, compiled and
+        #   fake scan agree.
         # Outer batch: 3, inner batch: 4, outer scan: 5, inner scan: 6
         init = torch.randn(3, 4, 2, 8)
         xs_outer = torch.randn(3, 5, 4, 6, 2)
 
         def fn(scan_op, init, xs):
+            # [FUNCTION DOC] HELPER: builds inner and outer combine functions and applies vmap
+            #   over a function that runs the outer scan.
             def inner_combine(carry, xs):
+                # [FUNCTION DOC] HELPER: new carry adds xs as a column to the carry; output is the
+                #   sum of carry over dim 0.
                 # carry: (2, 8), xs: (2,)
                 new_carry = carry + xs.unsqueeze(-1)
                 output = carry.sum(dim=0)  # (8,)
                 return new_carry, output
 
             def outer_combine(init, xs):
+                # [FUNCTION DOC] HELPER: uses vmap over an inner function that runs the inner
+                #   scan, then returns the carry updated by the mean of results (expanded to carry
+                #   size) and the sum of the results.
                 # carry: (4, 2, 8,), xs: (4, 6, 2)
                 # xs has batch dimension 4 from outer vmap
 
                 def inner_fn(init, xs):
+                    # [FUNCTION DOC] HELPER: runs the inner scan and reduces its final carry and
+                    #   outputs to a vector.
                     # init: (2, 8)
                     # xs: (6, 2)
                     # final_carry: (2, 8)
@@ -10444,6 +12443,7 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
                 return new_carry.expand(*init.size()), output
 
             def vmap_inner_fn(init, xs):
+                # [FUNCTION DOC] HELPER: runs the outer scan with outer_combine.
                 # init: (4, 2, 8)
                 # xs: (5, 4, 6, 2)
                 return scan_op(outer_combine, init, xs)
@@ -10459,11 +12459,17 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_scan_vmap_scan_nested(self):
+        # [FUNCTION DOC] With scalar output capture enabled, a scan whose combine function uses
+        #   vmap over an inner fake scan; checks eager, compiled and fake scan agree.
         xs_outer = torch.randn(5, 3, 4, 2)
         init_outer = torch.randn(3, 8)
 
         def fn(scan_op, init, xs):
+            # [FUNCTION DOC] HELPER: defines the inner and outer combine functions and runs the
+            #   given scan op with the outer one.
             def inner_combine_fake(carry, xs):
+                # [FUNCTION DOC] HELPER: new carry is carry plus the sum of xs; output is
+                #   carry times 2.
                 # carry: 8
                 # xs: 2
                 new_carry = carry + xs.sum()
@@ -10471,9 +12477,14 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
                 return new_carry, output
 
             def outer_combine_fake(carry, xs):
+                # [FUNCTION DOC] HELPER: vmaps an inner function (over carry and xs rows) that
+                #   runs a fake scan; returns the next carry (stacked final carries) and the sum
+                #   over the batch of summed outputs.
                 # carry: 3, 8
                 # xs: 3, 4, 2
                 def inner_fn(carry_elem, xs_elem):
+                    # [FUNCTION DOC] HELPER: runs the fake scan with inner_combine_fake and
+                    #   returns the summed outputs and the final carry.
                     # carry_elem: 8
                     # xs: 4, 2
                     # final_carry: 8
@@ -10502,6 +12513,10 @@ def forward(self, L_init_ : torch.Tensor, L_xs_ : torch.Tensor, L_add_closure_0_
     @parametrize("strict", [True, False])
     @parametrize("dynamic", [True, False])
     def test_while_loop_op_int_carry_export(self, strict, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over strict and dynamic. Exports the
+        #   int-carry while_loop module (with a dynamic leading dim when dynamic) with the export
+        #   check helper; for non-strict dynamic export compares the golden exported graph
+        #   (while_loop with int counter and unbacked symbolic outputs).
         m, args = WHILE_LOOP_TESTS["int_carry"]
         dynamic_shapes = {"x": {0: torch.export.Dim("dim_x")}} if dynamic else None
         ep = self._check_export(m, args, strict=strict, dynamic_shapes=dynamic_shapes)
@@ -10560,6 +12575,10 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @parametrize("backend", ["eager", "aot_eager"])
     def test_while_loop_op_int_carry_compile(self, dynamic, backend):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic and backend (eager or
+        #   aot_eager). Compiles the int-carry module with the check helper; for the dynamic eager
+        #   case without cross-ref checks one graph and compares golden readable code (while_loop
+        #   with symbolic additional inputs, runtime asserts and subgraphs).
         m, args = WHILE_LOOP_TESTS["int_carry"]
         if backend == "eager":
             backend = EagerAndRecordGraphs()
@@ -10642,6 +12661,10 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_while_loop_op_constant_and_symint_output_export(self, strict, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over strict and dynamic; scalar output
+        #   capture enabled. Exports the const-and-symint-output module; for non-strict, non-
+        #   dynamic export compares the golden exported graph (item call, while_loop with eight
+        #   carries and subgraphs).
         m, args = WHILE_LOOP_TESTS["const_and_symint_output"]
         dynamic_shapes = {"t": {0: torch.export.Dim("dim_t")}} if dynamic else None
         ep = self._check_export(m, args, strict=strict, dynamic_shapes=dynamic_shapes)
@@ -10715,6 +12738,9 @@ class GraphModule(torch.nn.Module):
     @parametrize("backend", ["eager", "aot_eager"])
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_while_loop_op_constant_and_symint_output_compile(self, dynamic, backend):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic and backend; scalar
+        #   output capture enabled. Compiles the const-and-symint-output module; for the static
+        #   eager case without cross-ref checks one graph and compares the golden readable code.
         m, args = WHILE_LOOP_TESTS["const_and_symint_output"]
         if backend == "eager":
             backend = EagerAndRecordGraphs()
@@ -10789,6 +12815,9 @@ class GraphModule(torch.nn.Module):
     @parametrize("strict", [True, False])
     @parametrize("dynamic", [True, False])
     def test_while_loop_op_pytree_int_carry_export(self, strict, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over strict and dynamic. Exports the
+        #   pytree-int-carry module; for strict dynamic export without cross-ref compares the
+        #   golden exported graph.
         m, args = WHILE_LOOP_TESTS["pytree_int_carry"]
         dynamic_shapes = {"x": {0: torch.export.Dim("dim_x")}} if dynamic else None
         ep = self._check_export(m, args, strict=strict, dynamic_shapes=dynamic_shapes)
@@ -10851,6 +12880,9 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @parametrize("backend", ["eager", "aot_eager"])
     def test_while_loop_op_pytree_int_carry_compile(self, dynamic, backend):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic and backend. Compiles the
+        #   pytree-int-carry module; for the dynamic eager case without cross-ref checks one graph
+        #   and compares golden readable code.
         m, args = WHILE_LOOP_TESTS["pytree_int_carry"]
         if backend == "eager":
             backend = EagerAndRecordGraphs()
@@ -10920,18 +12952,31 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @parametrize("backend", ["eager", "aot_eager"])
     def test_compile_while_loop_stack_output(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic and backend. Compiles a module that calls the
+        #   while_loop_stack_output higher-order op with a linear body and a counter; checks it
+        #   returns two tensors stacked over three iterations and matches the eager module.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a 3 by 3 linear layer, used with the stack-
+            #   output while loop.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs the while_loop_stack_output op with a counter below
+                #   the leading size and a body applying the linear layer; returns the stacked
+                #   counter and stacked tensor outputs.
                 c = torch.tensor(0, dtype=torch.int64)
 
                 def cond_fn(c, x):
+                    # [FUNCTION DOC] HELPER: true while the counter is less than the leading
+                    #   size of x.
                     return c < x.size(0)
 
                 def body_fn(c, x):
+                    # [FUNCTION DOC] HELPER: returns counter plus one and the linear layer
+                    #   applied to x.
                     return c + 1, self.linear(x)
 
                 stacked_c, stacked_x = torch.ops.higher_order.while_loop_stack_output(
@@ -10949,28 +12994,46 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_while_loop_autograd_simple(self):
+        # [FUNCTION DOC] With scalar output capture enabled, compiles with the AOT recording
+        #   backend a module doing a while_loop (while the sum is below 2, update x using a square
+        #   and a linear layer), runs backward, compares output, parameters and gradients with an
+        #   eager Python-loop module with copied weights; checks the forward graph has one stack-
+        #   output while_loop node and the backward graph one while_loop node, and (without cross-
+        #   ref) compares golden forward and backward graphs.
         backend = torch._dynamo.testing.AotEagerAndRecordGraphs()
 
         class ModEager(torch.nn.Module):
+            # [CLASS DOC] HELPER: eager reference module using a Python while loop with the same
+            #   update and a linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: while the sum of x is below 2, replaces x by x squared
+                #   plus one plus linear of x; returns x.
                 while x.sum() < 2:
                     x = x * x + 1 + self.linear(x)
                 return x
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module doing the same computation with the
+            #   while_loop higher-order op.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: defines the condition and body and runs the while_loop
+                #   op on x.
                 def cond_fn(x):
+                    # [FUNCTION DOC] HELPER: true while the sum of x is below 2.
                     return x.sum() < 2
 
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: returns x squared plus one plus linear of x.
                     return x * x + 1 + self.linear(x)
 
                 return torch._higher_order_ops.while_loop(cond_fn, body_fn, (x,))
@@ -11096,7 +13159,12 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_input_output_alias(self):
+        # [FUNCTION DOC] For each aliasing function in the shared list, compiling a cond
+        #   whose branches return an alias of the input raises
+        #   UncapturedHigherOrderOpError naming torch.cond.
         def fn(f, *args):
+            # [FUNCTION DOC] HELPER: cond on whether the sum of the first argument is positive,
+            #   using the given function in both branches.
             return torch.cond(args[0].sum() > 0, f, f, args)
 
         x = torch.randn(2, 2)
@@ -11111,8 +13179,15 @@ class GraphModule(torch.nn.Module):
                 torch.compile(fn)(f, x)
 
     def test_input_input_alias(self):
+        # [FUNCTION DOC] Passes an operand and a view of it to cond (skipping the identity
+        #   function, which cond dedupes); compiling raises UncapturedHigherOrderOpError naming
+        #   torch.cond for each view function.
         def fn(view_f, arg):
+            # [FUNCTION DOC] HELPER: cond on the sign of the sum of arg with operands arg and a
+            #   view of arg.
             def f(arg1, arg2):
+                # [FUNCTION DOC] HELPER: returns cosine of the first and sine of
+                #   the second argument.
                 return arg1.cos(), arg2.sin()
 
             return torch.cond(arg.sum() > 0, f, f, (arg, view_f(arg)))
@@ -11132,8 +13207,16 @@ class GraphModule(torch.nn.Module):
 
     @parametrize("inference_mode", [True, False])
     def test_input_mutation(self, inference_mode):
+        # [FUNCTION DOC] Parametrized over inference_mode. For each aliasing function, a cond
+        #   branch that mutates a view of its input in place raises UncapturedHigherOrderOpError
+        #   naming torch.cond when compiled; under inference mode compilation succeeds, otherwise
+        #   it raises the same error.
         def fn(view_f, *args):
+            # [FUNCTION DOC] HELPER: cond on the sign of the sum with the same mutating branch
+            #   in both sides.
             def mutate_f(x):
+                # [FUNCTION DOC] HELPER: applies the view function to x, adds 1 in place and
+                #   returns the sine of it.
                 v = view_f(x)
                 v.add_(1)
                 return v.sin()
@@ -11167,11 +13250,16 @@ class GraphModule(torch.nn.Module):
     @requires_cuda
     @parametrize("device", ["cuda", "cpu"])
     def test_cond_input_mutation(self, device):
+        # [FUNCTION DOC] Needs CUDA; parametrized over cuda and cpu. Under no_grad, compiled cond
+        #   whose false branch mutates its input in place: with false predicate the output equals
+        #   sine plus 2 and is not the input object; with true predicate output is input plus 1.
         predicate_true = torch.tensor(True, device=device)
         predicate_false = torch.tensor(False, device=device)
         org_data = torch.ones(2, 2, device=device)
 
         def fn(predicate, data):
+            # [FUNCTION DOC] HELPER: cond with branches x plus 1 and an in-place sine then add
+            #   2 on x.
             return torch.cond(
                 predicate, lambda x: x + 1, lambda x: x.sin_().add_(2), [data]
             )
@@ -11189,6 +13277,9 @@ class GraphModule(torch.nn.Module):
 
     @skipIfTorchDynamo("Graph is not captured correctly when test with dynamo")
     def test_while_loop_unbacked_bindings(self):
+        # [FUNCTION DOC] Skipped under dynamo. Compiles the pytree-int-carry module
+        #   dynamically and asserts one graph with a single while_loop node whose metadata
+        #   records five unbacked bindings.
         m, args = WHILE_LOOP_TESTS["pytree_int_carry"]
         backend = EagerAndRecordGraphs()
         self._check_compile(m, args, dynamic=True, backend=backend)
@@ -11201,6 +13292,9 @@ class GraphModule(torch.nn.Module):
 
     # Return the .module() graph str result of non-strict export
     def _check_export_ret_graph_str(self, fn, args, dynamic_shapes=None) -> str:
+        # [FUNCTION DOC] HELPER: exports fn strictly and non-strictly with the given dynamic
+        #   shapes, asserts both exported modules give the eager result on the args, and returns
+        #   the normalized readable graph of the non-strict export.
         strict_ep = torch.export.export(
             fn, args, dynamic_shapes=dynamic_shapes, strict=True
         )
@@ -11214,12 +13308,21 @@ class GraphModule(torch.nn.Module):
 
     @skipIfTorchDynamo("Skip because dynamo cannot trace torch.export.")
     def test_cond_eager_run_with_item(self):
+        # [FUNCTION DOC] Skipped under dynamo. Exports a module whose cond branches call item on
+        #   tensors, then compares the golden non-strict graph with the cond op and branch
+        #   subgraphs that call item.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a cond whose branches multiply by item of one
+            #   of two tensors.
             def forward(self, a, b1, b2, c):
+                # [FUNCTION DOC] HELPER: cond on a, selecting c times item of b1 or
+                #   b2; result doubled.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: x times the item of b1.
                     return x * b1.item()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: x times the item of b2.
                     return x * b2.item()
 
                 r = torch.cond(a, true_fn, false_fn, (c,))
@@ -11270,15 +13373,24 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_cond_merge_graph_preserves_ph_meta(self):
+        # [FUNCTION DOC] Compiles a module whose cond branches close over sizes and a
+        #   tensor; asserts one graph and that every placeholder of the branch subgraph
+        #   has example_value metadata.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward conditions on the sum of x with closures
+            #   over sizes of y and z.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: records leading sizes a and b of y and z and runs cond on
+                #   whether the sum of x exceeds 5.
                 a = y.shape[0]
                 b = z.shape[0]
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus size a.
                     return x + a
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus size b times tensor z.
                     return x + b * z
 
                 return torch.cond(x.sum() > 5, true_fn, false_fn, (x,))
@@ -11296,17 +13408,27 @@ class GraphModule(torch.nn.Module):
 
     @skipIfTorchDynamo("Skip because dynamo cannot trace torch.export.")
     def test_cond_symint_closure(self):
+        # [FUNCTION DOC] Skipped under dynamo. Exports a module whose cond branches close over
+        #   symbolic sizes of y and z, with dynamic dimensions for x, y and z, using the non-
+        #   strict/strict export graph helper, and compares the golden non-strict graph where the
+        #   symbolic sizes and z are passed as cond operands.
         from torch.export import Dim
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose cond branches close over sizes of y and z and over
+            #   the tensor z.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: records sizes of y and z and runs cond on whether the
+                #   leading size of x exceeds 5.
                 a = y.shape[0]
                 b = z.shape[0]
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus size a.
                     return x + a
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus size b times tensor z.
                     return x + b * z
 
                 # When exporting with non-strict: a and b are symints,
@@ -11357,19 +13479,29 @@ class GraphModule(torch.nn.Module):
     # which causes a graph break
     @unittest.expectedFailure
     def test_cond_unbacked_symint_closure(self):
+        # [FUNCTION DOC] Expected failure (per comment, unbacked symbolic ints created during
+        #   non-strict export cause a graph break). Exports a module whose cond branches close
+        #   over an item-derived unbacked int plus sizes, with dynamic dimensions, through the
+        #   export graph helper.
         from torch.export import Dim
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose cond branches close over sizes, a tensor and an
+            #   unbacked int taken from the sum of y.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: computes sizes a and b of y and z and an int c from the
+                #   sum of y, then runs cond on whether the leading size of x exceeds 5.
                 a = y.shape[0]
                 b = z.shape[0]
                 # c is an unbacked symint in non-strict export
                 c = y.sum().item()
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus a plus c.
                     return x + a + c
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: x plus b times z times c.
                     return x + b * z * c
 
                 # When exporting with non-strict: a and b are symints,
@@ -11385,6 +13517,11 @@ class GraphModule(torch.nn.Module):
         "Skip because _merge_output is not intended for dynamo to compile"
     )
     def test_merge_output(self):
+        # [FUNCTION DOC] Skipped under dynamo. Tests the cond output-merging helper on pairs of
+        #   fake tensors built with given sizes and strides: for valid cases, the merged
+        #   tensor's size and stride strings (with unbacked symbols) must equal the expected
+        #   strings; for invalid cases (non-contiguous or differing layouts) the helper must
+        #   raise an exception.
         from torch._higher_order_ops.cond import _merge_output
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -11424,6 +13561,9 @@ class GraphModule(torch.nn.Module):
         ]
 
         def _inner(case):
+            # [FUNCTION DOC] HELPER: builds a fake mode with a shape env, creates two empty
+            #   strided tensors from the case sizes and strides, merges them with the helper and
+            #   asserts the string forms of the merged size and stride equal the expected ones.
             fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
             (size1, stride1), (size2, stride2), (merged_size, merged_stride) = case
@@ -11475,16 +13615,26 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @parametrize("backend", ["eager", "aot_eager"])
     def test_cond_mismatched_branch_output(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic and backend (eager, aot_eager). Cond branches
+        #   return tensors of different sizes (slices cloned to share storage offset); compiled
+        #   full graph result must equal eager. For the dynamic eager case (without cross-ref) it
+        #   also compares the golden graph, in which the output has an unbacked leading size with
+        #   a runtime non-negativity assert.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose cond branches return slices of different lengths.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: runs cond on the sign of the sum of x with the two
+                #   slicing branches and returns the sum of y minus the cond result.
                 a = y.shape[0]
                 b = z.shape[0]
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: clone of x plus size a, taken from index 2 on.
                     # clone the outputs so branches have the same storage_offset
                     return (x + a)[2:].clone()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: clone of the first two rows of x plus b times z.
                     # clone the outputs so branches have the same storage_offset
                     return (x + b * z)[:2].clone()
 
@@ -11555,9 +13705,17 @@ class GraphModule(torch.nn.Module):
     @parametrize("dynamic", [True, False])
     @parametrize("backend", ["eager", "aot_eager"])
     def test_cond_mismatched_branch_strided_output(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic and backend. Branches return tensors with
+        #   different shapes and strides (swapped-axis views expanded differently, plus empty
+        #   strided tensors); the compiled full-graph result must equal eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose cond branches return differently strided tuples.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: cond on the sign of the sum of x, returns the sum of y
+                #   plus the first output.
                 def true_fn(x, y):
+                    # [FUNCTION DOC] HELPER: returns the swapped-axes x plus one, unsqueezed and
+                    #   expanded to five along a new axis, and an empty strided 3 by 3 tensor.
                     return (
                         (x.swapaxes(-1, 0) + 1)
                         .unsqueeze(1)
@@ -11566,6 +13724,8 @@ class GraphModule(torch.nn.Module):
                     )
 
                 def false_fn(x, y):
+                    # [FUNCTION DOC] HELPER: same pattern using y with expansion of four and an
+                    #   empty strided 4 by 5 tensor.
                     return (
                         (y.swapaxes(-1, 0) + 1)
                         .unsqueeze(1)
@@ -11586,13 +13746,21 @@ class GraphModule(torch.nn.Module):
 
     @parametrize("backend", ["eager", "aot_eager"])
     def test_cond_branch_closure_over_int_args(self, backend):
+        # [FUNCTION DOC] Parametrized over eager and aot_eager. Compiles (dynamic, full graph)
+        #   functions whose zero-argument cond branches create tensors from closed-over int
+        #   arguments; first with identical shapes, then (second case, eager backends only because
+        #   inductor fails) with branches of different widths; results must equal eager.
         def f(rows: int, cols: int):
+            # [FUNCTION DOC] HELPER: builds a true predicate tensor and cond branches returning
+            #   ones or zeros of rows by cols; returns the cond result.
             pred = torch.tensor(True)
 
             def true_fn():
+                # [FUNCTION DOC] HELPER: returns ones of size rows by cols.
                 return torch.ones(rows, cols)
 
             def false_fn():
+                # [FUNCTION DOC] HELPER: returns zeros of size rows by cols.
                 return torch.zeros(rows, cols)
 
             return torch.cond(pred, true_fn, false_fn)
@@ -11602,12 +13770,16 @@ class GraphModule(torch.nn.Module):
 
         # differing sizes still fail on inductor (#189528), hence eager/aot_eager only
         def g(rows: int, cols: int):
+            # [FUNCTION DOC] HELPER: like f but the false branch returns zeros with
+            #   one extra column.
             pred = torch.tensor(True)
 
             def true_fn():
+                # [FUNCTION DOC] HELPER: returns ones of size rows by cols.
                 return torch.ones(rows, cols)
 
             def false_fn():
+                # [FUNCTION DOC] HELPER: returns zeros of size rows by cols plus one.
                 return torch.zeros(rows, cols + 1)
 
             return torch.cond(pred, true_fn, false_fn)
@@ -11617,15 +13789,28 @@ class GraphModule(torch.nn.Module):
 
 
 class TestAutoFunctionalizeControlFlow(TestCase):
+    # [CLASS DOC] Tests auto-functionalization of control-flow higher-order ops that mutate
+    #   inputs, buffers or captured tensors: runs eager, AOT eager recording and inductor and
+    #   compares golden forward graphs (auto_functionalized_v2 wrapping cond, switch, while_loop
+    #   or scan). Provides check helpers.
     def check(self, gen_fn, args, device, dynamic) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] HELPER: moves args to the device; runs a fresh module from the generator
+        #   three times (eager under no_grad, AOT eager recording backend, inductor), each on its
+        #   own cloned args with dynamo reset between compiles; asserts outputs, mutated args and
+        #   all buffers match the eager run for both compiled variants; returns the first
+        #   recorded forward graph.
         args = pytree.tree_map(lambda t: t.to(device=device), args)
 
         def _clone(args):
+            # [FUNCTION DOC] HELPER: returns a list with clones of tensor arguments and
+            #   other arguments unchanged.
             return [
                 arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args
             ]
 
         def _new_fn():
+            # [FUNCTION DOC] HELPER: calls the generator and, if the result is a module, moves it
+            #   to the device; returns it.
             mod_or_fn = gen_fn()
             if isinstance(mod_or_fn, torch.nn.Module):
                 mod_or_fn.to(device)
@@ -11666,9 +13851,19 @@ class TestAutoFunctionalizeControlFlow(TestCase):
     @parametrize("device", ["cuda", "cpu"])
     @parametrize("dynamic", [True, False])
     def test_cond_auto_functionalize_input_mutation(self, device, dynamic):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. Cond
+        #   whose both branches mutate their cloned input in place; verifies results with
+        #   the check helper, and for static CUDA without cross-ref compares the golden
+        #   forward graph (auto_functionalized_v2 of the cond op with two subgraphs that
+        #   copy the mutation back).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that clones x, runs a mutating cond and adds y
+            #   to the result.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: clones x, conditions on the sign of its sum with the same
+                #   mutating function on both branches, and returns y plus the result.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and returns sine of x.
                     x.add_(1)
                     return x.sin()
 
@@ -11721,15 +13916,26 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", ["cuda", "cpu"])
     @parametrize("dynamic", [True, False])
     def test_cond_auto_functionalize_buffer_mutation(self, device, dynamic):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. Cond branches
+        #   mutate both their input and a module buffer; verified with the check helper and, for
+        #   static CUDA without cross-ref, a golden graph in which the buffer is passed as an
+        #   additional base and copied back afterwards.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a buffer of ones whose cond branch
+            #   mutates the buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer of eight ones on the device.
                 super().__init__()
                 self.register_buffer(
                     "buf", torch.ones(8, requires_grad=False, device=device)
                 )
 
             def forward(self, p, x):
+                # [FUNCTION DOC] HELPER: clones x, runs a mutating cond on predicate p and returns
+                #   x plus buffer plus the cond result.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and to the buffer in place;
+                    #   returns x plus the buffer.
                     x.add_(1)
                     self.buf.add_(1)
                     return x + self.buf
@@ -11788,17 +13994,30 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", ["cuda", "cpu"])
     @parametrize("dynamic", [True, False])
     def test_cond_auto_functionalize_union_input_mutation(self, device, dynamic):
+        # [FUNCTION DOC] Skipped on ROCm; needs CUDA and SM70; parametrized over device and
+        #   dynamic. True branch mutates its input while the false branch mutates a buffer;
+        #   verified via the check helper and, for static CUDA without cross-ref, a golden graph
+        #   where the union of mutated inputs is handled.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a 4 by 3 buffer of ones whose branches
+            #   mutate different state.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer.
                 super().__init__()
                 self.register_buffer("buf", torch.ones(4, 3, requires_grad=False))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: clones x, runs cond on the sign of its sum, and returns y
+                #   plus result plus the sums of x and the buffer.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and returns sine of x matrix-
+                    #   multiplied by the buffer.
                     x.add_(1)
                     return x.sin() @ self.buf
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: adds one to the buffer in place and returns sine of x
+                    #   matrix-multiplied by the buffer.
                     self.buf.add_(1)
                     return x.sin() @ self.buf
 
@@ -11859,11 +14078,20 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_switch_auto_functionalize_input_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. Switch whose two
+        #   identical branches mutate their input; verified on eager and AOT eager only (no
+        #   inductor) with a golden forward graph for the static case without cross-ref
+        #   (auto_functionalized_v2 of switch with a clamped index).
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module running switch over two mutating branches.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: clones x, computes an index from the sign of its
+                #   sum, runs switch with the same mutating function twice, and returns y
+                #   plus the result.
                 def branch_mut(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and returns sine of x.
                     x.add_(1)
                     return x.sin()
 
@@ -11918,15 +14146,24 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_switch_auto_functionalize_buffer_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. Switch whose branches
+        #   mutate both their input and a buffer, verified on eager and AOT eager with a golden
+        #   graph for the static case without cross-ref.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a buffer of eight ones mutated in switch branches.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer.
                 super().__init__()
                 self.register_buffer("buf", torch.ones(8, requires_grad=False))
 
             def forward(self, p, x):
+                # [FUNCTION DOC] HELPER: clones x, uses the predicate cast to an integer as the
+                #   switch index, and returns x plus buffer plus the switch result.
                 def branch_mut(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and to the buffer in place;
+                    #   returns x plus the buffer.
                     x.add_(1)
                     self.buf.add_(1)
                     return x + self.buf
@@ -11986,19 +14223,32 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_switch_auto_functionalize_union_input_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. Switch where one branch
+        #   mutates its input and the other mutates a buffer; verified on eager and AOT eager with
+        #   a golden graph for the static case without cross-ref.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a 4 by 3 buffer, switch branches
+            #   mutate different state.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer.
                 super().__init__()
                 self.register_buffer("buf", torch.ones(4, 3, requires_grad=False))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: clones x, computes the index from the sign of its
+                #   sum, runs switch over two branches and returns the sum with y, x sum
+                #   and buffer sum.
                 def branch0(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and returns sine of x matrix-
+                    #   multiplied by the buffer.
                     x.add_(1)
                     return x.sin() @ self.buf
 
                 def branch1(x):
+                    # [FUNCTION DOC] HELPER: adds one to the buffer in place and returns sine of x
+                    #   matrix-multiplied by the buffer.
                     self.buf.add_(1)
                     return x.sin() @ self.buf
 
@@ -12065,18 +14315,30 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", ["cuda", "cpu"])
     @parametrize("dynamic", [True, False])
     def test_while_loop_auto_functionalize_buffer_mutation(self, device, dynamic):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. A while_loop
+        #   body mutates a buffer; verified with the check helper and, for static CUDA without
+        #   cross-ref, a golden graph (auto_functionalized_v2 of while_loop with the buffer as an
+        #   additional input and a copy back).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a buffer of eight ones whose while_loop
+            #   body mutates it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer on the device.
                 super().__init__()
                 self.register_buffer(
                     "buf", torch.ones(8, requires_grad=False, device=device)
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: clones x, runs the while_loop and returns x plus the sum
+                #   of the buffer plus the loop result.
                 def cond_fn(x):
+                    # [FUNCTION DOC] HELPER: true while the sum of x is positive.
                     return x.sum() > 0
 
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: subtracts one from x, subtracts one from the buffer
+                    #   in place, and returns a tuple with the new x plus the buffer sum.
                     x_new = x.add(-1)
                     self.buf.add_(-1)
                     return (x_new + self.buf.sum(),)
@@ -12133,17 +14395,27 @@ class <lambda>(torch.nn.Module):
     def test_while_loop_auto_functionalize_multiple_buffer_mutation(
         self, device, dynamic
     ):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. A while_loop
+        #   body mutates two buffers, one depending on the other; verified with the check helper
+        #   and a golden graph for static CUDA without cross-ref.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two buffers (ones and zeros) updated in
+            #   the loop body.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the two buffers on the device.
                 super().__init__()
                 self.register_buffer("buf1", torch.ones(4, device=device))
                 self.register_buffer("buf2", torch.zeros(4, device=device))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs the while_loop on x.
                 def cond_fn(x):
+                    # [FUNCTION DOC] HELPER: true while the sum of x is positive.
                     return x.sum() > 0
 
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: adds x into the first buffer in place, adds the first
+                    #   buffer into the second, and returns x minus one.
                     self.buf1.add_(x)
                     self.buf2.add_(self.buf1)
                     return (x - 1,)
@@ -12191,17 +14463,27 @@ class <lambda>(torch.nn.Module):
     @parametrize("device", ["cuda", "cpu"])
     @parametrize("dynamic", [True, False])
     def test_while_loop_auto_functionalize_buffer_in_cond(self, device, dynamic):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. The while_loop
+        #   condition function itself mutates a counter buffer; verified with the check helper and
+        #   a golden graph for static CUDA without cross-ref.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an integer counter buffer incremented in
+            #   the loop condition.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the counter buffer as zero.
                 super().__init__()
                 self.register_buffer("counter", torch.tensor(0, device=device))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs the while_loop on x.
                 def cond_fn(x):
+                    # [FUNCTION DOC] HELPER: increments the counter buffer in place and returns
+                    #   whether it is below 3.
                     self.counter.add_(1)
                     return self.counter < 3
 
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: returns a tuple with x plus one.
                     return (x + 1,)
 
                 return while_loop(cond_fn, body_fn, (x,))
@@ -12244,12 +14526,24 @@ class <lambda>(torch.nn.Module):
     def test_while_loop_auto_functionalize_captured_tensor_mutation(
         self, device, dynamic
     ):
+        # [FUNCTION DOC] Needs CUDA and SM70; parametrized over device and dynamic. The while_loop
+        #   body mutates a tensor passed to forward (captured in the body); verified with the
+        #   check helper; for static CUDA without cross-ref it also prints the graph and compares
+        #   the golden graph.
+        # KNOWN ISSUE: the test contains a leftover print statement of the graph
+        #   before the assertion.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose while_loop body mutates the argument y.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: runs the while_loop on x with a body mutating y, then
+                #   returns the result plus the sum of y.
                 def cond_fn(x):
+                    # [FUNCTION DOC] HELPER: true while the sum of x is positive.
                     return x.sum() > 0
 
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: subtracts one from y in place and returns a tuple
+                    #   with x plus the sum of y.
                     y.add_(-1)
                     return (x + y.sum(),)
 
@@ -12297,6 +14591,10 @@ class <lambda>(torch.nn.Module):
             )
 
     def _check_eager_and_aot_eager_only(self, gen_fn, args, device, dynamic):
+        # [FUNCTION DOC] HELPER: simplified version of the check helper that runs only the eager
+        #   reference and the AOT eager recording backend (no inductor), for HOPs whose inductor
+        #   mutation support is not finished; asserts equal outputs, args and buffers; returns the
+        #   recorded forward graph.
         """Stripped-down version of self.check that runs eager + aot_eager
         but NOT inductor.
 
@@ -12310,11 +14608,14 @@ class <lambda>(torch.nn.Module):
         args = pytree.tree_map(lambda t: t.to(device=device), args)
 
         def _clone(args):
+            # [FUNCTION DOC] HELPER: returns a list with clones of tensor arguments and
+            #   other arguments unchanged.
             return [
                 arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args
             ]
 
         def _new_fn():
+            # [FUNCTION DOC] HELPER: calls the generator and moves a module result to the device.
             mod_or_fn = gen_fn()
             if isinstance(mod_or_fn, torch.nn.Module):
                 mod_or_fn.to(device)
@@ -12342,17 +14643,26 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_scan_auto_functionalize_buffer_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. A scan combine function
+        #   mutates a buffer; verified on eager and AOT eager, and the printed graph must mention
+        #   auto_functionalized_v2 and the scan op.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a buffer of four ones updated by the
+            #   scan combine function.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the buffer.
                 super().__init__()
                 self.register_buffer(
                     "buf", torch.ones(4, requires_grad=False, device=device)
                 )
 
             def forward(self, init, xs):
+                # [FUNCTION DOC] HELPER: scans the combine function over xs along dim 0.
                 def combine_fn(carry, x):
+                    # [FUNCTION DOC] HELPER: adds x into the buffer in place and returns carry
+                    #   plus x and carry times x plus the buffer sum.
                     self.buf.add_(x)
                     return carry + x, carry * x + self.buf.sum()
 
@@ -12368,16 +14678,23 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_scan_auto_functionalize_multiple_buffer_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. Scan combine function
+        #   mutates two buffers; the printed graph must mention auto_functionalized_v2.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two buffers updated by the scan combine function.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers the two buffers.
                 super().__init__()
                 self.register_buffer("buf1", torch.ones(4, device=device))
                 self.register_buffer("buf2", torch.zeros(4, device=device))
 
             def forward(self, init, xs):
+                # [FUNCTION DOC] HELPER: scans the combine function over xs along dim 0.
                 def combine_fn(carry, x):
+                    # [FUNCTION DOC] HELPER: adds x into the first buffer, adds the first buffer
+                    #   into the second, and returns carry plus x and carry times x.
                     self.buf1.add_(x)
                     self.buf2.add_(self.buf1)
                     return carry + x, carry * x
@@ -12393,11 +14710,20 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_scan_auto_functionalize_captured_tensor_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. Scan
+        #   combine function mutates a captured argument tensor; the printed graph
+        #   must mention auto_functionalized_v2.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose scan combine function mutates the
+            #   tensor argument y.
             def forward(self, init, xs, y):
+                # [FUNCTION DOC] HELPER: scans, then returns the first scan result plus the sum of
+                #   y and the second result.
                 def combine_fn(carry, x):
+                    # [FUNCTION DOC] HELPER: subtracts one from y in place and returns carry plus
+                    #   x and carry times x plus the sum of y.
                     y.add_(-1)
                     return carry + x, carry * x + y.sum()
 
@@ -12412,7 +14738,12 @@ class <lambda>(torch.nn.Module):
         self.assertIn("auto_functionalized_v2", graph_str)
 
     def test_scan_init_mutation_graph_breaks(self):
+        # [FUNCTION DOC] A scan combine function that mutates its carry (init) in place is
+        #   disallowed: compiling the scan with the eager backend and full graph under no_grad
+        #   raises UncapturedHigherOrderOpError naming the scan higher-order op.
         def combine_fn(carry, x):
+            # [FUNCTION DOC] HELPER: adds one to carry in place and returns carry plus x and
+            #   carry times x.
             carry.add_(1)  # mutating init is disallowed
             return carry + x, carry * x
 
@@ -12420,6 +14751,7 @@ class <lambda>(torch.nn.Module):
         xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
         def fn(init, xs):
+            # [FUNCTION DOC] HELPER: scan of combine_fn over xs along dim 0.
             return scan(combine_fn, init, xs, dim=0)
 
         torch._dynamo.reset()
@@ -12431,7 +14763,12 @@ class <lambda>(torch.nn.Module):
                 torch.compile(fn, backend="eager", fullgraph=True)(init, xs)
 
     def test_scan_xs_mutation_graph_breaks(self):
+        # [FUNCTION DOC] A scan combine function that mutates its per-step xs element in place is
+        #   disallowed: compiling with the eager backend and full graph under no_grad raises
+        #   UncapturedHigherOrderOpError naming the scan op.
         def combine_fn(carry, x):
+            # [FUNCTION DOC] HELPER: adds one to x in place and returns carry plus x and
+            #   carry times x.
             x.add_(1)  # mutating xs[t] is disallowed
             return carry + x, carry * x
 
@@ -12439,6 +14776,7 @@ class <lambda>(torch.nn.Module):
         xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
         def fn(init, xs):
+            # [FUNCTION DOC] HELPER: scan of combine_fn over xs along dim 0.
             return scan(combine_fn, init, xs, dim=0)
 
         torch._dynamo.reset()
@@ -12452,17 +14790,27 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_scan_auto_functionalize_partial_buffer_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. A scan combine
+        #   function mutates two of three buffers (leaving the middle one only read) so the
+        #   mutated set is non-contiguous; verified on eager and AOT eager and the printed graph
+        #   must mention auto_functionalized_v2.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with three zero buffers, of which the first and third are
+            #   mutated by the scan combine function.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: registers three buffers of four zeros.
                 super().__init__()
                 self.register_buffer("buf0", torch.zeros(4, device=device))
                 self.register_buffer("buf1", torch.zeros(4, device=device))
                 self.register_buffer("buf2", torch.zeros(4, device=device))
 
             def forward(self, init, xs):
+                # [FUNCTION DOC] HELPER: scans the combine function over xs along dim 0.
                 def combine_fn(carry, x):
+                    # [FUNCTION DOC] HELPER: adds x into buffers buf0 and buf2 in place; returns
+                    #   carry plus x and carry times x plus the sum of buf1.
                     # Skip buf1 to make non-contiguous mutation set.
                     self.buf0.add_(x)
                     self.buf2.add_(x)
@@ -12477,7 +14825,11 @@ class <lambda>(torch.nn.Module):
         self.assertIn("auto_functionalized_v2", graph_str)
 
     def test_scan_eager_init_mutation_raises(self):
+        # [FUNCTION DOC] Calling scan eagerly with a combine function that mutates its carry in
+        #   place raises UncapturedHigherOrderOpError naming the scan op.
         def combine_fn(carry, x):
+            # [FUNCTION DOC] HELPER: adds one to carry in place and returns carry plus x and
+            #   carry times x.
             carry.add_(1)
             return carry + x, carry * x
 
@@ -12493,11 +14845,18 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_map_auto_functionalize_xs_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. A map body mutating its
+        #   mapped element in place is auto-functionalized; verified on eager and AOT eager and
+        #   the printed graph must mention auto_functionalized_v2 and the map_impl op.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that maps a body mutating its element.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: maps body_fn over xs.
                 def body_fn(x):
+                    # [FUNCTION DOC] HELPER: adds one to x in place and returns x times 2 plus the
+                    #   sum of x.
                     x.add_(1)
                     return x * 2 + x.sum()
 
@@ -12512,11 +14871,18 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_map_auto_functionalize_multiple_xs_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. A map over a tuple of
+        #   two inputs whose body mutates both elements; verified on eager and AOT eager and the
+        #   printed graph must mention auto_functionalized_v2.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that maps a body mutating two mapped elements.
             def forward(self, xs1, xs2):
+                # [FUNCTION DOC] HELPER: maps body_fn over the pair of inputs.
                 def body_fn(xs):
+                    # [FUNCTION DOC] HELPER: unpacks the pair, adds one to the first in place and
+                    #   subtracts one from the second in place, and returns their sum and product.
                     x1, x2 = xs
                     x1.add_(1)
                     x2.sub_(1)
@@ -12531,7 +14897,11 @@ class <lambda>(torch.nn.Module):
         self.assertIn("auto_functionalized_v2", graph_str)
 
     def test_map_pos_args_mutation_graph_breaks(self):
+        # [FUNCTION DOC] A map body that mutates an additional positional argument is disallowed:
+        #   compiling with the eager backend and full graph raises UncapturedHigherOrderOpError
+        #   naming the map_impl op.
         def body_fn(x, buf):
+            # [FUNCTION DOC] HELPER: adds x into buf in place and returns x times 2.
             buf.add_(x)  # mutating pos_args is disallowed
             return x * 2
 
@@ -12539,6 +14909,7 @@ class <lambda>(torch.nn.Module):
         buf = torch.zeros(4)
 
         def fn(xs, buf):
+            # [FUNCTION DOC] HELPER: maps body_fn over xs with buf as extra argument.
             return control_flow.map(body_fn, xs, buf)
 
         torch._dynamo.reset()
@@ -12550,15 +14921,20 @@ class <lambda>(torch.nn.Module):
                 torch.compile(fn, backend="eager", fullgraph=True)(xs, buf)
 
     def test_map_captured_tensor_mutation_graph_breaks(self):
+        # [FUNCTION DOC] A map body that mutates a captured loop-invariant tensor is disallowed:
+        #   compiling raises UncapturedHigherOrderOpError naming the map_impl op.
         y = torch.ones(4)
 
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: subtracts one from the captured y in place and returns x
+            #   times 2 plus the sum of y.
             y.add_(-1)  # mutating a captured (loop-invariant) tensor is disallowed
             return x * 2 + y.sum()
 
         xs = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
         def fn(xs):
+            # [FUNCTION DOC] HELPER: maps body_fn over xs.
             return control_flow.map(body_fn, xs)
 
         torch._dynamo.reset()
@@ -12572,11 +14948,19 @@ class <lambda>(torch.nn.Module):
     @skipIfTorchDynamo()
     @parametrize("dynamic", [True, False])
     def test_map_auto_functionalize_partial_xs_mutation(self, dynamic):
+        # [FUNCTION DOC] Skipped under dynamo; parametrized over dynamic. A map body mutates the
+        #   first and third of three mapped inputs, leaving the middle one read-only; verified on
+        #   eager and AOT eager and the printed graph must mention auto_functionalized_v2.
         device = "cpu"
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module mapping a body over three inputs.
             def forward(self, xs0, xs1, xs2):
+                # [FUNCTION DOC] HELPER: maps body_fn over the triple of inputs.
                 def body_fn(xs):
+                    # [FUNCTION DOC] HELPER: unpacks three elements, adds one in place to the
+                    #   first and third, and returns the first times 2 plus the sums of the
+                    #   second and third.
                     x0, x1, x2 = xs
                     # Skip x1 to make a non-contiguous mutation set.
                     x0.add_(1)
@@ -12595,7 +14979,10 @@ class <lambda>(torch.nn.Module):
         self.assertIn("auto_functionalized_v2", graph_str)
 
     def test_map_eager_pos_args_mutation_raises(self):
+        # [FUNCTION DOC] Calling map eagerly with a body that mutates its additional positional
+        #   argument raises UncapturedHigherOrderOpError naming the map_impl op.
         def body_fn(x, buf):
+            # [FUNCTION DOC] HELPER: adds x into buf in place and returns x times 2.
             buf.add_(x)
             return x * 2
 
@@ -12625,11 +15012,23 @@ _hop_schema_test_schema_types = [
 @skipIfTorchDynamo("We don't expect users to torch.compile hop schema generation.")
 @unittest.skipIf(IS_WINDOWS, "Windows not supported for this test")
 class TestHopSchema(TestCase):
+    # [CLASS DOC] Tests schema generation for higher-order ops: type, list and function
+    #   schema generators over example values of several types, the schema tree spec checks,
+    #   and the gen_schema methods of cond, switch, while_loop, scan, associative_scan and
+    #   map_impl with golden schema strings (including mutation annotations). Skipped under
+    #   dynamo and on Windows.
     def _get_example_val(self, ty: str):
+        # [FUNCTION DOC] HELPER: returns an example value for a schema type name: True, 1, 1.0,
+        #   "foo", a scalar tensor, a symbolic int or bool created from a fresh shape env, a
+        #   traced graph module of a sine function, or a TorchBind object (after initializing the
+        #   TorchBind test implementations); raises NotImplementedError for other names.
         from torch.fx.experimental.sym_node import SymNode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def create_symtype(cls, pytype, shape_env, val):
+            # [FUNCTION DOC] HELPER: creates a symbol in the shape env with a testing constant
+            #   source named by the current count of backed variables and wraps it in a SymNode of
+            #   the given Python type and hint, then in the given symbolic class.
             from torch._dynamo.source import ConstantSource
 
             symbol = shape_env.create_symbol(
@@ -12659,6 +15058,7 @@ class TestHopSchema(TestCase):
         elif ty == "GraphModule":
 
             def f(x):
+                # [FUNCTION DOC] HELPER: returns the sine of x.
                 return x.sin()
 
             return make_fx(f)(torch.ones(1))
@@ -12675,6 +15075,8 @@ class TestHopSchema(TestCase):
 
     @parametrize("schema_type", _hop_schema_test_schema_types)
     def test_type_gen(self, schema_type):
+        # [FUNCTION DOC] Parametrized over the schema type names. Generates a schema type from an
+        #   example value and checks that parsing its string form gives back the same type.
         from torchgen.gen_schema_utils import TypeGen
 
         example_val = self._get_example_val(schema_type)
@@ -12684,6 +15086,9 @@ class TestHopSchema(TestCase):
 
     @parametrize("schema_type", _hop_schema_test_schema_types)
     def test_list_gen(self, schema_type):
+        # [FUNCTION DOC] Parametrized over the schema type names. Generates a schema type from a
+        #   one-element list of an example value (twice) and checks each string form parses back
+        #   to the same type.
         from torchgen.gen_schema_utils import TypeGen
 
         example_val = self._get_example_val(schema_type)
@@ -12694,6 +15099,9 @@ class TestHopSchema(TestCase):
         self.assertEqual(ty2.parse(str(ty2)), ty2)
 
     def test_function_schema_gen(self):
+        # [FUNCTION DOC] Generates function schemas from named example inputs of all types and one
+        #   tensor, a list of one tensor and a list of two tensors as outputs; compares the golden
+        #   schema strings and checks each parses back to an equal schema.
         from torchgen.gen_schema_utils import FunctionSchemaGen
 
         inps = [
@@ -12728,6 +15136,9 @@ class TestHopSchema(TestCase):
         self.assertEqual(schema3.parse(str(schema3)), schema3)
 
     def test_schema_tree_spec(self):
+        # [FUNCTION DOC] Adding a tuple as one argument to the cond schema generator raises
+        #   RuntimeError asking for flattened inputs; adding the flattened tensors and a tree spec
+        #   yields a schema with two tensor arguments and no return.
         schema_gen = HopSchemaGenerator(torch.ops.higher_order.cond)
         args = (torch.randn(3, 4), torch.randn(2, 3))
         with self.assertRaisesRegex(
@@ -12744,6 +15155,8 @@ class TestHopSchema(TestCase):
         )
 
     def test_cond_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the cond schema string for a tensor predicate, two lambda branches
+        #   and one tensor operand.
         schema = torch.ops.higher_order.cond.gen_schema(
             torch.tensor(True),
             lambda x: x.sin(),
@@ -12756,6 +15169,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_cond_gen_schema_symbool_inputs(self):
+        # [FUNCTION DOC] Checks the cond schema string uses the symbolic bool type when
+        #   the predicate is a symbolic bool derived from the size of a nonzero result
+        #   under a fake mode.
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -12775,6 +15191,8 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the switch schema string for a tensor index, three branches
+        #   and one operand.
         schema = torch.ops.higher_order.switch.gen_schema(
             torch.tensor(0),
             (lambda x: x.sin(), lambda x: x.cos(), lambda x: x.tan()),
@@ -12786,6 +15204,8 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_symint_inputs(self):
+        # [FUNCTION DOC] Checks the switch schema string uses the symbolic int type for an index
+        #   derived from a nonzero size under a fake mode.
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -12804,6 +15224,8 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_multiple_operands(self):
+        # [FUNCTION DOC] Checks the switch schema for two operands and branches
+        #   returning two tensors.
         schema = torch.ops.higher_order.switch.gen_schema(
             torch.tensor(1),
             (lambda x, y: (x + y, x * y), lambda x, y: (x - y, x / y)),
@@ -12815,11 +15237,15 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_with_input_mutation(self):
+        # [FUNCTION DOC] Checks the switch schema marks the operand mutated by one branch as
+        #   mutable (alias annotation with a write mark).
         def branch0(x, y):
+            # [FUNCTION DOC] HELPER: adds one to x in place and returns x plus y.
             x.add_(1)
             return x + y
 
         def branch1(x, y):
+            # [FUNCTION DOC] HELPER: returns x minus y.
             return x - y
 
         schema = torch.ops.higher_order.switch.gen_schema(
@@ -12833,11 +15259,15 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_with_disjoint_branch_mutation(self):
+        # [FUNCTION DOC] Checks that when different branches mutate different operands, the schema
+        #   marks both operands as mutable.
         def branch0(x, y):
+            # [FUNCTION DOC] HELPER: adds one to x in place and returns x plus y.
             x.add_(1)
             return x + y
 
         def branch1(x, y):
+            # [FUNCTION DOC] HELPER: subtracts one from y in place and returns x minus y.
             y.sub_(1)
             return x - y
 
@@ -12852,6 +15282,7 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_int_index(self):
+        # [FUNCTION DOC] Checks the switch schema string uses the int type for a Python int index.
         schema = torch.ops.higher_order.switch.gen_schema(
             0,
             (lambda x: x.sin(), lambda x: x.cos()),
@@ -12863,13 +15294,18 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_differing_int_symint_outputs(self):
+        # [FUNCTION DOC] Checks the switch schema when branches return a tensor and different
+        #   ints: the second return is typed as int.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: returns sine and the int 5.
             return x.sin(), 5
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: returns cosine and the int 7.
             return x.cos(), 7
 
         def branch2(x):
+            # [FUNCTION DOC] HELPER: returns tan and the int 9.
             return x.tan(), 9
 
         schema = torch.ops.higher_order.switch.gen_schema(
@@ -12883,10 +15319,14 @@ class TestHopSchema(TestCase):
         )
 
     def test_switch_gen_schema_matching_int_int_outputs(self):
+        # [FUNCTION DOC] Checks the switch schema when branches return a tensor and the same int:
+        #   the second return is typed as int.
         def branch0(x):
+            # [FUNCTION DOC] HELPER: returns sine and the int 5.
             return x.sin(), 5
 
         def branch1(x):
+            # [FUNCTION DOC] HELPER: returns cosine and the int 5.
             return x.cos(), 5
 
         schema = torch.ops.higher_order.switch.gen_schema(
@@ -12900,10 +15340,14 @@ class TestHopSchema(TestCase):
         )
 
     def test_while_loop_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the while_loop schema string for two tensor carries and
+        #   no additional inputs.
         def cond_fn(x, y):
+            # [FUNCTION DOC] HELPER: true while the sum of x is below 10.
             return x.sum() < 10
 
         def body_fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus one and sine of y.
             return x + 1, y.sin()
 
         schema = torch.ops.higher_order.while_loop.gen_schema(
@@ -12918,10 +15362,14 @@ class TestHopSchema(TestCase):
         )
 
     def test_while_loop_gen_schema_with_additional_inputs(self):
+        # [FUNCTION DOC] Checks the while_loop schema string for two tensor carries and one
+        #   tensor additional input.
         def cond_fn(x, y, z):
+            # [FUNCTION DOC] HELPER: true while the sum of x is below z.
             return x.sum() < z
 
         def body_fn(x, y, z):
+            # [FUNCTION DOC] HELPER: returns x plus one and sine of y.
             return x + 1, y.sin()
 
         schema = torch.ops.higher_order.while_loop.gen_schema(
@@ -12936,7 +15384,10 @@ class TestHopSchema(TestCase):
         )
 
     def test_scan_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the scan schema string for one init, one xs and no additional
+        #   inputs; two tensor returns.
         def combine_fn(carry, x):
+            # [FUNCTION DOC] HELPER: returns carry plus x and carry times x.
             return carry + x, carry * x
 
         schema = torch.ops.higher_order.scan.gen_schema(
@@ -12951,7 +15402,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_scan_gen_schema_with_additional_inputs(self):
+        # [FUNCTION DOC] Checks the scan schema string with one additional tensor input.
         def combine_fn(carry, x, scale):
+            # [FUNCTION DOC] HELPER: returns carry plus x times scale and carry times x.
             return carry + x * scale, carry * x
 
         schema = torch.ops.higher_order.scan.gen_schema(
@@ -12966,7 +15419,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_scan_gen_schema_multiple_inputs(self):
+        # [FUNCTION DOC] Checks the scan schema string for two inits and two xs with four returns.
         def combine_fn(carry1, carry2, x1, x2):
+            # [FUNCTION DOC] HELPER: returns four values built from the two carries and two xs.
             return carry1 + x1, carry2 * x2, carry1 - x1, carry2 + x2
 
         schema = torch.ops.higher_order.scan.gen_schema(
@@ -12981,7 +15436,10 @@ class TestHopSchema(TestCase):
         )
 
     def test_scan_gen_schema_with_mutated_arg_indices_kwarg(self):
+        # [FUNCTION DOC] Checks that passing mutated argument indices as a string (index 3) marks
+        #   the second additional input as mutable in the scan schema.
         def combine_fn(carry, x, buf0, buf1):
+            # [FUNCTION DOC] HELPER: returns carry plus x and carry times x, ignoring the buffers.
             return carry + x, carry * x
 
         schema = torch.ops.higher_order.scan.gen_schema(
@@ -12997,7 +15455,11 @@ class TestHopSchema(TestCase):
         )
 
     def test_scan_gen_schema_multiple_additional_mutation_via_kwarg(self):
+        # [FUNCTION DOC] Checks that mutated indices 3 and 4 mark the second and third additional
+        #   inputs as mutable in the scan schema.
         def combine_fn(carry, x, b0, b1, b2):
+            # [FUNCTION DOC] HELPER: adds x in place to b1 and b2 and returns carry plus x and
+            #   carry times x.
             b1.add_(x)
             b2.add_(x)
             return carry + x, carry * x
@@ -13015,7 +15477,10 @@ class TestHopSchema(TestCase):
         )
 
     def test_associative_scan_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the associative_scan schema string for one xs tensor and
+        #   no additional inputs.
         def combine_fn(x, y):
+            # [FUNCTION DOC] HELPER: returns x plus y.
             return x + y
 
         schema = torch.ops.higher_order.associative_scan.gen_schema(
@@ -13029,7 +15494,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_associative_scan_gen_schema_with_additional_inputs(self):
+        # [FUNCTION DOC] Checks the associative_scan schema string with one additional tensor.
         def combine_fn(x, y, scale):
+            # [FUNCTION DOC] HELPER: returns x times y times scale.
             return x * y * scale
 
         schema = torch.ops.higher_order.associative_scan.gen_schema(
@@ -13043,7 +15510,11 @@ class TestHopSchema(TestCase):
         )
 
     def test_associative_scan_gen_schema_multiple_inputs(self):
+        # [FUNCTION DOC] Checks the associative_scan schema string for two xs tensors
+        #   with two returns.
         def combine_fn(x1, x2, y1, y2):
+            # [FUNCTION DOC] HELPER: returns the sum of the first pair and the product of
+            #   the second pair.
             return x1 + y1, x2 * y2
 
         schema = torch.ops.higher_order.associative_scan.gen_schema(
@@ -13057,10 +15528,14 @@ class TestHopSchema(TestCase):
         )
 
     def test_while_loop_gen_schema_with_int_carries(self):
+        # [FUNCTION DOC] Checks the while_loop schema string with two int carries, one tensor
+        #   carry and one tensor additional input; the returns include the ints.
         def cond_fn(x, y, z, c):
+            # [FUNCTION DOC] HELPER: true while x is less than y.
             return x < y
 
         def body_fn(x, y, z, c):
+            # [FUNCTION DOC] HELPER: returns x plus one, y minus one, sine of z and c plus x.
             return x + 1, y - 1, z.sin(), c + x
 
         schema = torch.ops.higher_order.while_loop.gen_schema(
@@ -13075,10 +15550,14 @@ class TestHopSchema(TestCase):
         )
 
     def test_while_loop_gen_schema_with_input_mutation(self):
+        # [FUNCTION DOC] Checks that mutated indices 0 to 3 mark all three carries and the
+        #   additional input as mutable in the while_loop schema.
         def cond_fn(x, y, z, c):
+            # [FUNCTION DOC] HELPER: true while x is less than y.
             return x < y
 
         def body_fn(x, y, z, c):
+            # [FUNCTION DOC] HELPER: mutates x, y, z and c in place and returns x, y, z.
             x.add_(1)
             y.sub_(1)
             z.sin_()
@@ -13100,7 +15579,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_tensor_inputs(self):
+        # [FUNCTION DOC] Checks the map_impl schema string for one xs tensor.
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: returns sine of x.
             return x.sin()
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
@@ -13114,7 +15595,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_with_additional_inputs(self):
+        # [FUNCTION DOC] Checks the map_impl schema string with one additional tensor.
         def body_fn(x, scale):
+            # [FUNCTION DOC] HELPER: returns x times scale.
             return x * scale
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
@@ -13128,7 +15611,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_multiple_inputs(self):
+        # [FUNCTION DOC] Checks the map_impl schema string for two xs tensors with two returns.
         def body_fn(x1, x2):
+            # [FUNCTION DOC] HELPER: returns x1 plus x2 and x1 times x2.
             return x1 + x2, x1 * x2
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
@@ -13142,7 +15627,9 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_with_mutated_arg_indices_kwarg(self):
+        # [FUNCTION DOC] Checks that mutated index 0 marks xs0 as mutable in the map_impl schema.
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: returns x times 2.
             return x * 2
 
         schema = torch.ops.higher_order.map_impl.gen_schema(
@@ -13157,7 +15644,11 @@ class TestHopSchema(TestCase):
         )
 
     def test_map_gen_schema_multiple_xs_mutation_via_kwarg(self):
+        # [FUNCTION DOC] Checks that mutated indices 0 and 2 mark xs0 and xs2 as mutable in
+        #   the map_impl schema.
         def body_fn(x0, x1, x2):
+            # [FUNCTION DOC] HELPER: adds one in place to x0 and x2 and returns the sum
+            #   of the three.
             x0.add_(1)
             x2.add_(1)
             return x0 + x1 + x2
@@ -13175,7 +15666,13 @@ class TestHopSchema(TestCase):
 
 
 class DynamicCondModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: small network with a cond whose branches use different linear layers
+    #   (one layer versus two layers) followed by ReLU and an output layer; the branch is chosen
+    #   by the sign of the sum of the input.
     def __init__(self, input_size=16, hidden_size=64, output_size=10):
+        # [FUNCTION DOC] HELPER: creates linear layers fc1_0 (input to hidden), fc1_1 (input to
+        #   32), fc1_2 (32 to hidden), a ReLU and the output layer fc2 (hidden to output);
+        #   defaults are 16, 64 and 10.
         super().__init__()
         self.fc1_0 = torch.nn.Linear(input_size, hidden_size)
         self.fc1_1 = torch.nn.Linear(input_size, 32)
@@ -13184,10 +15681,14 @@ class DynamicCondModel(torch.nn.Module):
         self.fc2 = torch.nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: runs cond on the sign of the sum of x between the two branches,
+        #   then ReLU and the output layer; returns the output.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: applies the first linear layer.
             return self.fc1_0(x)
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: applies the second then the third linear layer.
             x = self.fc1_1(x)
             return self.fc1_2(x)
 
@@ -13205,10 +15706,17 @@ class DynamicCondModel(torch.nn.Module):
     "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
 )
 class TestControlFlowNN(TestCase):
+    # [CLASS DOC] Tests a neural network containing cond with CUDA graph conditional nodes;
+    #   skipped without support.
     def test_cond_in_NN(self):
+        # [FUNCTION DOC] Runs forward and backward of the dynamic cond model on a CUDA input
+        #   through a function returning output, loss and parameter gradients, using the many-
+        #   backends capture helper and the cudagraph backend helper.
         model = DynamicCondModel().cuda()
 
         def autograd_test(x):
+            # [FUNCTION DOC] HELPER: clears parameter grads, runs the model, backpropagates the
+            #   sum of the output, and returns the output, loss and list of parameter gradients.
             model.zero_grad(set_to_none=True)
             output = model(x)
             loss = output.sum()
@@ -13227,8 +15735,15 @@ class TestControlFlowNN(TestCase):
     "CUDA 12.4 or greater is required for CUDA Graphs with conditional nodes",
 )
 class TestControlFlowAndRNG(TestCase):
+    # [CLASS DOC] Tests random number generation interacting with CUDA graph conditional nodes;
+    #   skipped without support.
     @parametrize("rng_func", ["custom_generator", "default_generator"])
     def test_rng_with_conditional_nodes_errors(self, rng_func):
+        # [FUNCTION DOC] Parametrized over custom_generator and default_generator. Compiling with
+        #   the cudagraphs backend a cond whose true branch uses random numbers raises
+        #   RuntimeError saying RNG within data-dependent conditional nodes is not supported.
+        # KNOWN ISSUE: the custom generator case calls skipTest immediately, so its remaining
+        #   setup code never runs.
         pred = torch.tensor(True, device="cuda")
         x = torch.ones(10, dtype=torch.float32, device="cuda")
 
@@ -13239,6 +15754,8 @@ class TestControlFlowAndRNG(TestCase):
             generator = torch.Generator("cuda")
 
             def custom_generator(x):
+                # [FUNCTION DOC] HELPER: adds random normal noise drawn from the custom generator
+                #   to x (unreachable because the test is skipped first).
                 return x + torch.randn(
                     *x.shape, generator=generator, dtype=x.dtype, device=x.device
                 )
@@ -13247,11 +15764,13 @@ class TestControlFlowAndRNG(TestCase):
         elif rng_func == "default_generator":
 
             def default_generator(x):
+                # [FUNCTION DOC] HELPER: adds random normal noise from the default generator to x.
                 return x + torch.randn(*x.shape, dtype=x.dtype, device=x.device)
 
             rng_func = default_generator
 
         def func(pred, x):
+            # [FUNCTION DOC] HELPER: cond on pred between the random function and doubling x.
             return torch.cond(pred, rng_func, lambda x: 2 * x, [x])
 
         compiled_func = torch.compile(func, backend="cudagraphs")
@@ -13262,10 +15781,15 @@ class TestControlFlowAndRNG(TestCase):
             compiled_func(pred, x)
 
     def test_rng_outside_conditional_nodes_does_not_error(self):
+        # [FUNCTION DOC] Cond branches are deterministic and random noise is added outside the
+        #   cond; compiled with the cudagraphs backend three times without errors and with output
+        #   shape equal to the input.
         pred = torch.tensor(True, device="cuda")
         x = torch.ones(10, dtype=torch.float32, device="cuda")
 
         def func(pred, x):
+            # [FUNCTION DOC] HELPER: cond multiplying by 2 or 3, then adds random normal noise
+            #   outside the cond.
             y = torch.cond(pred, lambda t: 2 * t, lambda t: 3 * t, [x])
             return y + torch.randn(*y.shape, dtype=y.dtype, device=y.device)
 
