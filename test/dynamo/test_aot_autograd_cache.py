@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for AOTAutogradCache, the on-disk cache of AOT autograd compilation
+# results used by torch.compile with the inductor backend. Contains custom-pass and
+# fake-process-group helpers, a mixin that checks the standalone autograd_cache_key matches the
+# key made during compile_fx, and the AOTAutogradCacheTests suite (hit/miss counters, hot
+# loading of artifacts, bypass rules, guards, custom autograd functions, triton ops, saved
+# tensor hooks, regional inductor, cache key sensitivity to config and passes). Importing
+# registers module level custom graph pass instances and computes device_type; running the file
+# uses the standard PyTorch test runner.
 
 import contextlib
 import copy
@@ -83,11 +91,19 @@ device_type = (
 
 
 class CustomPreGradPassRemoveIdentMuls(CustomGraphPass):
+    # [CLASS DOC] HELPER: Test custom pre-grad graph pass that rewrites an FX graph in place,
+    # replacing multiplications whose left operand is the constant 1 by the right operand.
+    # Reports a stable uuid so the cache key can include it.
     """
     Pre-grad pass that removes redundant identity multiplications (1 * x).
     """
 
     def __call__(self, g: torch.fx.Graph) -> None:
+        # [FUNCTION DOC] HELPER: Walks the nodes of graph g; for each call_function node whose
+        # target is operator.mul and whose first argument equals 1, redirects all users of
+        # that node to the second argument and erases the node. Mutates g in place and returns
+        # None. A multiplication with 1 as the right operand is not touched (only the left
+        # operand is checked).
         for n in g.nodes:
             if n.op == "call_function" and n.target is operator.mul:
                 lhs, rhs = n.args
@@ -96,11 +112,17 @@ class CustomPreGradPassRemoveIdentMuls(CustomGraphPass):
                     g.erase_node(n)
 
     def uuid(self):
+        # [FUNCTION DOC] HELPER: Returns the fixed string identifying this pass version, which
+        # inductor mixes into the cache key.
         return "custom_pre_grad_pass_remove_ident_muls_v1"
 
 
 class CustomPreGradPassRemoveIdentMulsNoUUID(CustomPreGradPassRemoveIdentMuls):
+    # [CLASS DOC] HELPER: Variant of the identity-mul pass that reports no uuid, so the pass
+    # cannot be hashed and the cache is expected to be bypassed.
     def uuid(self):
+        # [FUNCTION DOC] HELPER: Returns None instead of a uuid, marking the pass
+        # as not cacheable.
         return None
 
 
@@ -112,6 +134,9 @@ custom_pre_grad_pass_remove_ident_muls_wo_uuid = (
 
 @contextlib.contextmanager
 def _fake_process_group(rank=0, world_size=2):
+    # [FUNCTION DOC] HELPER: Context manager creating a "fake" c10d process group with a
+    # FakeStore for the given rank and world_size (no real communication). Yields once the group
+    # is initialized; always destroys the process group on exit, including when the body raises.
     """Context manager for setting up and tearing down a fake process group."""
     import torch.distributed as c10d
     from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -125,6 +150,9 @@ def _fake_process_group(rank=0, world_size=2):
 
 
 def aot_eager_regional_inductor():
+    # [FUNCTION DOC] HELPER: Builds a dynamo backend (via aot_autograd) that uses the
+    # regional_inductor pass as both the forward and the backward compiler. Returns the backend
+    # callable; nothing is compiled until it is invoked.
     """
     Regional inductor backend for AOT autograd.
     Uses regional_inductor as both forward and backward compiler.
@@ -146,6 +174,13 @@ def saved_tensors_hooks_to_gm(
     symbolic_tracing=True,
     inp_fn=None,
 ):
+    # [FUNCTION DOC] HELPER: Converts a pair of saved-tensor pack/unpack hook functions into a
+    # pair of GraphModules (pack_gm, unpack_gm) and returns them. With symbolic_tracing, uses
+    # torch.fx.symbolic_trace on each function. Otherwise runs pack_fn on an example input (from
+    # inp_fn, or a random 2x3 tensor with both dims marked dynamic) and traces both with
+    # make_fx, feeding the unpack function the pack output. If pack_cache_hash /
+    # unpack_cache_hash are given, every node marked is_wrapped in the corresponding graph gets
+    # that value as its user_cache_hash metadata.
     if symbolic_tracing:
         pack_gm = torch.fx.symbolic_trace(pack_fn)
         unpack_gm = torch.fx.symbolic_trace(unpack_fn)
@@ -163,6 +198,8 @@ def saved_tensors_hooks_to_gm(
         unpack_gm = make_fx(unpack_fn)(pack_out)
 
     def set_manual_hash(g, manual_hash):
+        # [FUNCTION DOC] HELPER: Sets the user_cache_hash metadata to manual_hash on every node
+        # of graph g whose meta has a true is_wrapped entry.
         for node in g.nodes:
             if node.meta and node.meta.get("is_wrapped", False):
                 node.meta["user_cache_hash"] = manual_hash
@@ -179,6 +216,9 @@ def amax_to_scale(
     float8_dtype: torch.dtype,
     round_scales_to_power_of_2: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Computes an fp8 scaling factor: the max finite value of
+    # float8_dtype divided by amax (clamped below at 1e-12), computed in float64 and returned as
+    # a float32 tensor. round_scales_to_power_of_2 is accepted but ignored.
     amax = amax.to(torch.float64)
     res = torch.finfo(float8_dtype).max / torch.clamp(amax, min=1e-12)
     res = res.to(torch.float32)
@@ -188,6 +228,9 @@ def amax_to_scale(
 # Must be at module level to use fx.wrap
 @torch.fx.wrap
 def _pack_fp8_with_scale_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped (opaque leaf in symbolic tracing) pack hook. For
+    # non-floating tensors returns x unchanged. Otherwise returns a tuple of the original dtype,
+    # a float32 scale from the tensor's abs max, and the tensor scaled and cast to float8_e5m2.
     if not x.dtype.is_floating_point:
         return x
 
@@ -200,6 +243,9 @@ def _pack_fp8_with_scale_wrap(x):
 
 @torch.fx.wrap
 def _unpack_fp8_with_scale_wrap(x):
+    # [FUNCTION DOC] HELPER: fx-wrapped unpack hook inverse of the pack hook. A plain tensor is
+    # returned unchanged; a (dtype, scale, fp8 tensor) tuple is divided by the scale in float32
+    # and cast back to the original dtype.
     if isinstance(x, torch.Tensor):
         return x
 
@@ -209,19 +255,35 @@ def _unpack_fp8_with_scale_wrap(x):
 
 
 class CacheKeyEquivalenceMixin:
+    # [CLASS DOC] HELPER: Test mixin placed before the test case in the MRO. Its setUp patches
+    # torch._inductor.compile_fx.compile_fx with a wrapper that, for every compiled graph, also
+    # computes the standalone cache key and checks it equals the key computed in the real
+    # pipeline. State: _compile_fx_patcher, started in setUp and stopped in tearDown.
     """Mixin that verifies the standalone autograd_cache_key API produces the
     same key as the internal compilation pipeline for every torch.compile
     invocation in the test."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp, then creates and starts the compile_fx
+        # patcher so the rest of the test runs with key-equivalence checks.
         super().setUp()
         self._compile_fx_patcher = self._install_compile_fx_patcher()
         self._compile_fx_patcher.start()
 
     def _install_compile_fx_patcher(self):
+        # [FUNCTION DOC] HELPER: Returns an unstarted mock patch object replacing
+        # compile_fx.compile_fx with a capturing wrapper that delegates to the real function
+        # (saved before patching).
         real_compile_fx = torch._inductor.compile_fx.compile_fx
 
         def capturing_compile_fx(mod, example_inputs_, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper around the real compile_fx. Computes the
+            # standalone key first (treating BypassAOTAutogradCache or NotImplementedError as
+            # "bypassed") and asserts the module code was not mutated. Then runs the real
+            # compile_fx with autograd_cache_key and run_pre_grad_passes patched to record the
+            # real key and whether pre-grad passes changed the code. Unless bypassed or
+            # pre-grad passes changed the graph, asserts the two keys are equal. Returns the
+            # real compile_fx result.
             mod.recompile()
             mod_code = mod.code
 
@@ -248,6 +310,9 @@ class CacheKeyEquivalenceMixin:
             def capturing_cache_key(
                 mod, ei, config, compiler_config_extra=None, act_input_paths=()
             ):
+                # [FUNCTION DOC] HELPER: Calls the real autograd_cache_key with the same
+                # arguments, stores its key and debug lines in the enclosing captured_gt_*
+                # variables, and returns the result unchanged.
                 nonlocal captured_gt_key, captured_gt_debug_lines
                 result = real_cache_key(
                     mod, ei, config, compiler_config_extra, act_input_paths
@@ -262,6 +327,9 @@ class CacheKeyEquivalenceMixin:
             def capturing_run_pre_grad_passes(
                 mod_inner: GraphModule, example_inputs_: Sequence[InputType]
             ) -> torch.fx.GraphModule:
+                # [FUNCTION DOC] HELPER: Runs the real pre-grad passes on mod_inner and records
+                # (in the enclosing captured_pre_grad_change) whether the generated code of the
+                # module differs before and after. Returns the pass result.
                 nonlocal captured_pre_grad_change
                 mod_inner.recompile()
                 mod_inner_code = mod_inner.code
@@ -299,13 +367,21 @@ class CacheKeyEquivalenceMixin:
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Stops the compile_fx patcher, then runs the parent tearDown.
         self._compile_fx_patcher.stop()
         super().tearDown()
 
 
 @instantiate_parametrized_tests
 class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
+    # [CLASS DOC] Test suite for AOTAutogradCache. Each test enables the autograd cache via
+    # functorch config, compiles small functions with torch.compile, and checks
+    # counters["aot_autograd"] values for autograd_cache_miss / hit / saved (and related
+    # inductor counters) across recompiles after clearing dynamo state. Inherits the
+    # key-equivalence check from CacheKeyEquivalenceMixin.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp, clears the global counters, and clears
+        # all caches so each test starts cold.
         """
         Reset all counters and caches before each unit test
         """
@@ -314,6 +390,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self._clear_all_caches()
 
     def _clear_all_caches(self):
+        # [FUNCTION DOC] HELPER: Clears the FX graph cache, the AOTAutogradCache, and
+        # the CacheArtifactManager, then resets dynamo and the PyCodeCache (the last
+        # step via _clear_dynamo_and_codecache).
         """
         Clear every cache, including AOTAutogradCache and FXCache
         """
@@ -323,6 +402,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self._clear_dynamo_and_codecache()
 
     def _clear_dynamo_and_codecache(self):
+        # [FUNCTION DOC] HELPER: Resets dynamo (dropping in-memory compiled code and guards) and
+        # purges the inductor PyCodeCache, leaving on-disk caches intact. This forces the next
+        # call to consult the persistent caches.
         """
         Clear unrelated caches, like dynamo and PyCodeCache
         """
@@ -338,11 +420,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         }
     )
     def test_local_cache_stats(self):
+        # [FUNCTION DOC] Test that the local AOT autograd cache reports stats in cache_stats
+        # under "LocalAOTAutogradCache": after the first compile one miss and one put and no
+        # hits; after clearing dynamo and recompiling, one hit. Clears the stats mapping
+        # before and after.
         from torch._inductor.remote_cache import cache_stats
 
         cache_stats._stats.clear()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Simple model function returning x * 2 + y.
             return x * 2 + y
 
         compiled_fn = torch.compile(fn)  # noqa: UNSPECIFIED_BACKEND
@@ -375,6 +462,12 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @parametrize("dtype", (torch.float32, torch.bfloat16))
     @parametrize("dynamic", (False, True))
     def test_cache_hot_load(self, device, dtype, dynamic):
+        # [FUNCTION DOC] Test hot loading of cache artifacts, parametrized over device (GPU and
+        # cpu), dtype and dynamic shapes. Compiles forward+backward, saves the artifacts with
+        # torch.compiler.save_cache_artifacts and checks per-kind artifact counts, clears all
+        # caches (and triton dir) and shows a recompile misses again, then loads the saved bytes
+        # and shows the recompile hits the AOT autograd cache. Expected inductor counters differ
+        # when bundled_autograd_cache is on. Skips if the GPU or SM80 (bfloat16) is missing.
         """
         Verify that we can populate and hot load functions from the cache.
         """
@@ -384,6 +477,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             raise unittest.SkipTest("requires SM80 or later")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function: matmul of sin(x) with y.
             return x.sin() @ y
 
         a = torch.rand(100, 100, dtype=dtype, device=device, requires_grad=True)
@@ -490,11 +584,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_basic(self):
+        # [FUNCTION DOC] Test the basic interaction of FXGraphCache and AOTAutogradCache: the
+        # first call misses and saves one entry; after clearing dynamo and codecache, a second
+        # call hits without another miss or save.
         """
         Verify the interactions between FXGraphCache and AOTAutogradCache.
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x * 2, y @ y).
             return (x * 2, y @ y)
 
         a = torch.rand(25)
@@ -522,10 +620,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
     def test_act_input_paths_cache_hit(self):
+        # [FUNCTION DOC] Test that a cache hit still performs the tensor wait for an
+        # AsyncCollectiveTensor input (activation input path): compiles an add of 1, checks
+        # the wrapper is marked completed after a miss run, then after clearing dynamo
+        # checks a hit occurs and wait_tensor was called at least once. Skipped if
+        # torch.distributed is unavailable.
         import torch.distributed._functional_collectives as funcol
         from torch.distributed._functional_collectives import AsyncCollectiveTensor
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function returning x + 1.
             return x + 1
 
         compiled_fn = torch.compile(fn, backend="inductor", fullgraph=True)
@@ -533,6 +637,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         orig_wait_tensor = funcol.wait_tensor
 
         def counting_wait_tensor(t):
+            # [FUNCTION DOC] HELPER: Replacement for funcol.wait_tensor that records each call
+            # in wait_calls and delegates to the original.
             wait_calls.append(1)
             return orig_wait_tensor(t)
 
@@ -563,7 +669,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_numpy_round_cache_hit(self):
+        # [FUNCTION DOC] Test that a function using numpy round on an ndarray input can be
+        # cached under strict_autograd_cache: one miss and save, then a hit after clearing
+        # dynamo, with results equal to eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function returning np.round(x).
             return np.round(x)
 
         inp = np.array([[1.2, 2.7], [-3.5, 4.5]], dtype=np.float32)
@@ -585,11 +695,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_vmap(self):
+        # [FUNCTION DOC] Test torch.vmap inside a compiled function is cached: forward and
+        # gradients match eager on a miss and again on a hit after clearing dynamo.
+        # KNOWN ISSUE: the existing docstring is just the unfinished word "make".
         """
         make
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Applies vmap of (x * y + 1).sum(dim=0) over the inputs and
+            # returns the sum of the result.
             f = lambda x, y: (x * y + 1).sum(dim=0)  # noqa: E731
             vmapped = torch.vmap(f)(x, y)
             return vmapped.sum(dim=0)
@@ -635,11 +750,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_multi_graph_specialization(self):
+        # [FUNCTION DOC] Test that multi-graph specializations (specialize_on for sizes 8 and 16
+        # of a dynamic dim) are each cached: three misses and saves at first, then three hits
+        # after clearing dynamo.
         """
         Verify multi graph specializations all cache hit
         """
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function returning x * 5.
             return x * 5
 
         a = torch.randn(5)
@@ -678,11 +797,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_symbol_specialization(self):
+        # [FUNCTION DOC] Test that symbol specializations do not cause cache misses: the first
+        # call (two inputs maybe-marked dynamic) is one miss and one save. Then a different set
+        # of dims is maybe-marked dynamic (also b), dynamo is cleared and the call must hit:
+        # still one miss, one hit, one save.
         """
         Verify the symbol specializations don't cause cache miss.
         """
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Returns a tuple of random-noise-plus-inputs and a scaled
+            # random value; uses random numbers so output is not deterministic.
             return (torch.randn(5) + x + y, z * torch.randn(1))
 
         a = torch.rand(5)
@@ -716,8 +841,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_aot_runtime_trace_joint(self):
+        # [FUNCTION DOC] Test that compiling a function over a TwoTensor subclass input
+        # with symbolic expand works with the autograd cache: runs forward and backward,
+        # clears dynamo, then runs again (cache path). Only checks that nothing raises; no
+        # counters are asserted.
         @torch.compile(backend="inductor")
         def f(x):
+            # [FUNCTION DOC] HELPER: Model function: sin of x, then expand to a square of the
+            # leading size (a symbolic size under dynamic shapes).
             tmp = x.sin()
             s0 = tmp.shape[0]
             return tmp.expand(s0, s0)
@@ -738,11 +869,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         msg="Known issue: Window can't delete loaded modules, so we can't clear module cache."
     )
     def test_clear_fx_graph_cache(self):
+        # [FUNCTION DOC] Test the interaction of FxGraphCache clearing with the autograd cache.
+        # After a first miss, clears the FX graph cache and dynamo. With bundled_autograd_cache
+        # the second call still hits (one miss, one hit, one save); otherwise the entry is
+        # invalid, giving two misses, no hit, two saves. Skipped on Windows.
         """
         Verify the interactions between FXGraphCache and AOTAutogradCache.
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x * 2, y @ y).
             return (x * 2, y @ y)
 
         a = torch.rand(25)
@@ -780,10 +916,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @unittest.skipIf(not (TEST_CUDA or TEST_XPU), "GPU is unavailable")
     @requires_triton()
     def test_non_bundled_to_bundled_config_change(self):
+        # [FUNCTION DOC] Test that switching bundled_autograd_cache from off to on gives a new
+        # cache entry (config is part of the key): first compile misses and saves, then with
+        # bundled mode on and dynamo reset, the recompile is another miss and save with no hit.
+        # Skipped if bundled mode is already on; needs a GPU and triton.
         if functorch_config.bundled_autograd_cache:
             raise unittest.SkipTest("BundledAutogradCache is already enabled")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x * 2, y @ y).
             return (x * 2, y @ y)
 
         a = torch.rand(25, device=GPU_TYPE)
@@ -809,7 +950,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         {"enable_autograd_cache": True, "view_replay_for_aliased_outputs": True}
     )
     def test_view_replay(self):
+        # [FUNCTION DOC] Test caching with view_replay_for_aliased_outputs: a function that
+        # mutates its input in place and returns it with a detached alias. Compiled once
+        # under original-view tracking, then run three times (dynamo cleared each time)
+        # checking outputs equal eager and cache counters: miss 1/hit 0, then hit 1, then hit
+        # 2, with no bypass.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function: takes a detached alias of a, multiplies a
+            # by 2 in place, returns a and the alias.
             tmp = a.detach()
             a.mul_(2)
             return a, tmp
@@ -818,6 +966,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             compiled_fn = torch.compile(fn)  # noqa: UNSPECIFIED_BACKEND
 
         def run_and_check(miss, hit, bypass):
+            # [FUNCTION DOC] HELPER: Clears dynamo, runs eager fn and compiled_fn on fresh equal
+            # random inputs under original view tracking, asserts equal outputs and asserts the
+            # miss, hit and bypass counters equal the given values.
             self._clear_dynamo_and_codecache()
 
             inp = torch.rand(2, 3)
@@ -842,14 +993,20 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_invoke_subgraph(self):
+        # [FUNCTION DOC] Test that a function using two calls of a mark_compile_region function
+        # (invoke_subgraph) compiles with strict_autograd_cache on, meaning no bypass error is
+        # raised. There are no assertions beyond not raising.
         from torch._higher_order_ops.invoke_subgraph import mark_compile_region
 
         @mark_compile_region
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Region function returning x + y.
             return x + y
 
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function calling the region function twice and
+            # adding the results.
             return gn(x, y) + gn(x, y)
 
         a = torch.randn(25)
@@ -863,15 +1020,26 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_unsafe_mark_cacheable(self):
+        # [FUNCTION DOC] Test that an allow_in_graph autograd Function (with a graph break in
+        # forward) makes AOT autograd bypass the cache: compiling raises BackendCompilerFailed
+        # mentioning BypassAOTAutogradCache and an unsupported call_function target, with
+        # counters miss 0, hit 0, bypass 1. The test then clears caches and unconditionally
+        # raises SkipTest (TODO: allow_in_graph produces an unserializable artifact).
+        # KNOWN ISSUE: the trailing SkipTest means a cache-hit check is never run.
         @torch._dynamo.allow_in_graph
         class AllowInGraphFunc(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function whose forward breaks the graph and returns
+            # sin(x); no backward is defined.
             @staticmethod
             def forward(_, x):
+                # [FUNCTION DOC] HELPER: Forward: calls graph_break then returns x.sin().
                 torch._dynamo.graph_break()
                 return x.sin()
 
         @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Model function applying the allow_in_graph Function to x; y
+            # and z are unused.
             return AllowInGraphFunc.apply(x)
 
         x = torch.randn(4, 4)
@@ -900,11 +1068,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_fx_graph_cache_off(self):
+        # [FUNCTION DOC] Test that with fx_graph_cache disabled the autograd cache is bypassed
+        # on every compile: bypass counter goes 1 then 2 and there are no hits or saves.
         """
         Should not use cache if FXGraphCache is not enabled
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x * 2, y @ y).
             return (x * 2, y @ y)
 
         a = torch.rand(25)
@@ -933,8 +1104,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     )
     @dynamo_config.patch("compiled_autograd", True)
     def test_compiled_autograd_bypass(self):
+        # [FUNCTION DOC] Test that with compiled_autograd enabled, a function calling
+        # autograd.grad inside the compiled region fails with BackendCompilerFailed whose
+        # message says BypassAOTAutogradCache for the unsupported call_function target
+        # compiled_autograd.ops.validate_outputs (strict mode turns the bypass into an error).
         # Need to make the compiled autograd graph serializable
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Computes a.cos() + b, sums it and calls autograd.grad
+            # w.r.t. a and b; returns nothing (None).
             out = a.cos() + b
             loss = out.sum()
             ga, gb = torch.autograd.grad(loss, inputs=[a, b])
@@ -953,7 +1130,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @dynamo_config.patch("compiled_autograd", True)
     def test_inference_graph_cache_hit_with_compiled_autograd_enabled(self):
+        # [FUNCTION DOC] Test that a forward-only (inference) graph is still cached when
+        # compiled_autograd is enabled: one miss and save the first time; after clearing
+        # counters and dynamo, one hit with no miss or save.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Model function returning the sum of cos(a) + b.
             out = a.cos() + b
             return out.sum()
 
@@ -978,9 +1159,18 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"autograd_cache_allow_custom_autograd_functions": True})
     def test_custom_autograd_function_miss(self):
+        # [FUNCTION DOC] Test that changing the body of a custom autograd function (with
+        # autograd_cache_allow_custom_autograd_functions on) invalidates the cache. First
+        # compile: one miss, one save. The function class is then redefined with cos and sin
+        # swapped; after clearing dynamo the recompile gives one miss, no hit, one save. Needs a
+        # GPU and triton.
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function: forward returns sin(x), saves it for
+            # backward and stores cos(x) on the context; backward combines both.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Computes y = sin(x), saves y with save_for_backward,
+                # stores cos(x) as attribute foo on ctx and returns y.
                 y = x.sin()
                 ctx.save_for_backward(y)
                 ctx.foo = x.cos()
@@ -988,10 +1178,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns grad_output times saved y plus ctx.foo times
+                # grad_output (not the mathematically exact gradient; only used for caching).
                 result = ctx.saved_tensors[0]
                 return grad_output * result + ctx.foo * grad_output
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function applying the custom autograd Function.
             return MyAutogradFunction.apply(a)
 
         a = torch.randn(5, device=device_type, requires_grad=True)
@@ -1005,9 +1198,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 1)
 
         class MyAutogradFunction(torch.autograd.Function):  # noqa: F811
+            # [CLASS DOC] HELPER: Redefinition of the custom Function with forward computing
+            # cos(x) and keeping sin(x) as foo; it rebinds the name captured by fn so the next
+            # compile sees different source.
             # Change the function slightly
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Computes y = cos(x), saves y, stores sin(x) on ctx.foo
+                # and returns y.
                 y = x.cos()
                 ctx.save_for_backward(y)
                 ctx.foo = x.sin()
@@ -1015,6 +1213,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Same backward as the original: saved y times grad plus
+                # ctx.foo times grad.
                 result = ctx.saved_tensors[0]
                 return grad_output * result + ctx.foo * grad_output
 
@@ -1034,9 +1234,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"autograd_cache_allow_custom_autograd_functions": True})
     def test_custom_autograd_function(self):
+        # [FUNCTION DOC] Test that a custom autograd Function is cacheable when
+        # autograd_cache_allow_custom_autograd_functions is on: first compile one miss and save;
+        # after clearing counters and dynamo the second is one hit with no miss or save. Results
+        # match eager. Needs a GPU and triton.
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function (sin forward, cos kept on ctx).
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Computes y = sin(x), saves y, stores cos(x) on
+                # ctx.foo, returns y.
                 y = x.sin()
                 ctx.save_for_backward(y)
                 ctx.foo = x.cos()
@@ -1044,10 +1251,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns grad_output times saved y plus
+                # ctx.foo times grad_output.
                 result = ctx.saved_tensors[0]
                 return grad_output * result + ctx.foo * grad_output
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function applying the custom autograd Function.
             return MyAutogradFunction.apply(a)
 
         a = torch.randn(5, device=device_type, requires_grad=True)
@@ -1076,6 +1286,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"autograd_cache_allow_custom_autograd_functions": True})
     def test_custom_autograd_function_with_custom_triton_kernel(self):
+        # [FUNCTION DOC] Test caching of a custom autograd Function whose forward calls a user
+        # triton_op wrapping a triton kernel: first compile is one miss and save, second (after
+        # clearing dynamo) is one hit. Needs a GPU and triton.
+        # [FUNCTION DOC] HELPER: Triton kernel loading one value through pointer x and storing
+        # that value plus 1 back in place.
         @triton.jit
         def my_jit(x):
             arg_0 = tl.load(x)
@@ -1083,13 +1298,19 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::my_triton_op": clones x into a tensor
+            # requiring grad, launches my_jit on it through capture_triton with a grid of one,
+            # and returns that tensor.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             return y
 
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function whose forward calls the triton op.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Calls the triton op on x, saves the result, stores
+                # cos(x) on ctx.foo and returns the result.
                 y = torch.ops.test.my_triton_op(x)
                 ctx.save_for_backward(y)
                 ctx.foo = x.cos()
@@ -1097,10 +1318,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns grad_output times saved result plus
+                # ctx.foo times grad_output.
                 result = ctx.saved_tensors[0]
                 return grad_output * result + ctx.foo * grad_output
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function applying the custom autograd Function.
             return MyAutogradFunction.apply(a)
 
         a = torch.randn(5, device=GPU_TYPE, requires_grad=True)
@@ -1131,6 +1355,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     def test_custom_autograd_function_with_custom_triton_kernel_cache_invalidation(
         self,
     ):
+        # [FUNCTION DOC] Test that changing the source of a triton kernel used by a triton_op
+        # inside a custom autograd Function invalidates the cache. Compiles (miss, save), clears
+        # dynamo and hits, then redefines the kernel (adds 2 instead of 1) and the op,
+        # recompiles after clearing dynamo and expects the miss counter to be 1 after counters
+        # were cleared. Needs a GPU and triton.
+        # [FUNCTION DOC] HELPER: Triton kernel that loads one value through pointer x and stores
+        # it plus 1 back in place.
         @triton.jit
         def my_jit(x):
             arg_0 = tl.load(x)
@@ -1138,13 +1369,18 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::my_triton_op": clones x into a tensor
+            # requiring grad, runs my_jit via capture_triton with a grid of one, returns it.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             return y
 
         class MyAutogradFunction(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function whose forward calls the triton op.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Calls the triton op, saves the result, stores cos(x) on
+                # ctx.foo and returns the result.
                 y = torch.ops.test.my_triton_op(x)
                 ctx.save_for_backward(y)
                 ctx.foo = x.cos()
@@ -1152,10 +1388,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns grad_output times saved result plus
+                # ctx.foo times grad_output.
                 result = ctx.saved_tensors[0]
                 return grad_output * result + ctx.foo * grad_output
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function applying the custom autograd Function.
             return MyAutogradFunction.apply(a)
 
         a = torch.randn(5, device=GPU_TYPE, requires_grad=True)
@@ -1180,6 +1419,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 0)
 
         # Now modify the source code of my_jit by redefining it
+        # [FUNCTION DOC] HELPER: Redefined triton kernel: loads one value through pointer x and
+        # stores it plus 2 back in place (source differs from before).
         @triton.jit
         def my_jit(x):  # noqa: F811
             arg_0 = tl.load(x)
@@ -1187,6 +1428,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Redefinition of "test::my_triton_op" that clones x and runs
+            # the new my_jit on it, returning the tensor.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             return y
@@ -1206,8 +1449,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_cache_invalidation(self):
+        # [FUNCTION DOC] Test cache invalidation when a triton_op's kernel changes: the first
+        # compile of an op calling a triton kernel is one miss and save; after clearing dynamo
+        # the kernel and op are redefined (adds 2 instead of 1) and the recompile must miss
+        # again (two misses, no hit, two saves). Needs a GPU and triton.
         from torch._library import capture_triton
 
+        # [FUNCTION DOC] HELPER: Triton kernel loading one value through pointer x and storing
+        # it plus 1 back in place.
         @triton.jit
         def my_jit(x):
             arg_0 = tl.load(x)
@@ -1215,11 +1464,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::my_triton_op": clones x, runs my_jit via
+            # capture_triton with a grid of one, returns the tensor.
             y = x.clone().detach_().requires_grad_(True)
             capture_triton(my_jit)[1,](y)
             return y
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function calling the registered triton op.
             return torch.ops.test.my_triton_op(a)
 
         a = torch.randn(5, device=GPU_TYPE)
@@ -1236,6 +1488,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         # Redefine the triton op
 
+        # [FUNCTION DOC] HELPER: Redefined triton kernel that stores the loaded value plus 2.
         @triton.jit
         def my_jit(x):  # noqa: F811
             arg_0 = tl.load(x)
@@ -1243,6 +1496,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Redefinition of "test::my_triton_op" using the new kernel.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             return y
@@ -1262,6 +1516,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_local_variable_kernel_detection(self):
+        # [FUNCTION DOC] Test that a triton kernel reached through a local variable and an
+        # identity wrapper function is recorded for the triton_op in the triton_ops_to_kernels
+        # mapping (name inner_kernel), then that running the op adds 42 to every element. Needs
+        # a GPU and triton.
         """
         Test that triton kernels passed via local variables are properly detected.
 
@@ -1276,6 +1534,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._library import capture_triton
         from torch._library.triton import triton_ops_to_kernels
 
+        # [FUNCTION DOC] HELPER: Masked in-place triton kernel: each program handles BLOCK_SIZE
+        # elements of x_ptr (bounded by n_elements) and adds 42 to them.
         @triton.jit
         def inner_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -1285,12 +1545,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             tl.store(x_ptr + offsets, x + 42, mask=mask)
 
         def identity_wrapper(kernel):
+            # [FUNCTION DOC] HELPER: Returns the kernel argument unchanged (stands in for a
+            # wrapper like unroll_varargs).
             # simulate a wrapper function (like unroll_varargs in GDPA)
             # that takes a kernel as argument and returns it
             return kernel
 
         @torch._library.triton_op("test::local_var_triton_op", mutates_args=())
         def local_var_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::local_var_triton_op": clones x, takes the
+            # kernel through a local variable and wrapper, and launches it on the clone with
+            # BLOCK_SIZE 256 and a grid of ceil(n_elements / BLOCK_SIZE). Returns it.
             y = x.clone()
             n_elements = y.numel()
             # this is the GDPA pattern:
@@ -1327,12 +1592,18 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_local_variable_cache_invalidation(self):
+        # [FUNCTION DOC] Test that changing a kernel referenced via a local variable in a
+        # triton_op invalidates the cache: first compile one miss and save; after the kernel and
+        # op are redefined (adds 2 instead of 1) and dynamo cleared, the recompile is a second
+        # miss and second save with no hit. Needs a GPU, triton.
         """
         Test that cache properly invalidates when a kernel passed via local
         variable changes.
         """
         from torch._library import capture_triton
 
+        # [FUNCTION DOC] HELPER: Triton kernel loading a value through pointer x and storing it
+        # plus 1 back in place.
         @triton.jit
         def versioned_kernel(x):
             arg_0 = tl.load(x)
@@ -1340,12 +1611,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::local_var_cache_test", mutates_args=())
         def local_var_cache_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::local_var_cache_test": clones x, runs the
+            # kernel (taken from a local variable) on it with a grid of one, returns it.
             y = x.clone().detach_().requires_grad_(True)
             kernel = versioned_kernel  # local assignment
             capture_triton(kernel)[1,](y)
             return y
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function calling the registered triton op.
             return torch.ops.test.local_var_cache_test(a)
 
         a = torch.randn(5, device=GPU_TYPE)
@@ -1360,6 +1634,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         self._clear_dynamo_and_codecache()
 
         # redef the kernel with different behavior
+        # [FUNCTION DOC] HELPER: Redefined kernel storing the loaded value plus 2.
         @triton.jit
         def versioned_kernel(x):  # noqa: F811
             arg_0 = tl.load(x)
@@ -1367,6 +1642,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::local_var_cache_test", mutates_args=())
         def local_var_cache_op(x: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Redefinition of "test::local_var_cache_test" using the new
+            # kernel via a local variable.
             y = x.clone().detach_().requires_grad_(True)
             kernel = versioned_kernel  # local assignment
             capture_triton(kernel)[1,](y)
@@ -1387,6 +1664,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_recursive_function_kernel_detection(self):
+        # [FUNCTION DOC] Test that a kernel called inside a helper function (not directly in the
+        # triton_op) is found by the recursive analysis: the mapping triton_ops_to_kernels for
+        # the op must contain nested_kernel, and running the op adds 100 to every element. Needs
+        # a GPU and triton.
         """
         Test that triton kernels hidden behind helper function calls are detected.
 
@@ -1404,6 +1685,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._library import capture_triton
         from torch._library.triton import triton_ops_to_kernels
 
+        # [FUNCTION DOC] HELPER: Masked in-place triton kernel adding 100 to BLOCK_SIZE sized
+        # chunks of x_ptr, bounded by n_elements.
         @triton.jit
         def nested_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -1413,12 +1696,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             tl.store(x_ptr + offsets, x + 100, mask=mask)
 
         def helper_that_calls_kernel(y, n_elements):
+            # [FUNCTION DOC] HELPER: Launches nested_kernel on y through capture_triton with
+            # BLOCK_SIZE 256 and a grid of ceil(n_elements / BLOCK_SIZE).
             """Helper function that contains the triton kernel call."""
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)  # noqa: E731
             capture_triton(nested_kernel)[grid](y, n_elements, BLOCK_SIZE=256)
 
         @torch._library.triton_op("test::recursive_func_triton_op", mutates_args=())
         def recursive_func_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::recursive_func_triton_op": clones x and
+            # calls the helper to run the kernel on the clone, then returns it.
             y = x.clone()
             n_elements = y.numel()
             # The kernel is hidden inside helper_that_calls_kernel
@@ -1449,6 +1736,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_kernel_factory_function(self):
+        # [FUNCTION DOC] Test that a kernel returned by a factory function is recorded for the
+        # triton_op (name factory_kernel) in triton_ops_to_kernels, and that running the op adds
+        # 42 to every element. Needs a GPU and triton.
         """
         Test that triton kernels returned from factory functions are properly detected.
 
@@ -1459,6 +1749,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._library import capture_triton
         from torch._library.triton import triton_ops_to_kernels
 
+        # [FUNCTION DOC] HELPER: Masked in-place triton kernel adding 42 to BLOCK_SIZE sized
+        # chunks of x_ptr, bounded by n_elements.
         @triton.jit
         def factory_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -1468,11 +1760,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             tl.store(x_ptr + offsets, x + 42, mask=mask)
 
         def get_kernel():
+            # [FUNCTION DOC] HELPER: Factory returning the factory_kernel kernel.
             """Factory function that returns a triton kernel."""
             return factory_kernel
 
         @torch._library.triton_op("test::factory_triton_op", mutates_args=())
         def factory_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::factory_triton_op": clones x, obtains the
+            # kernel from the factory and launches it on the clone, returns the clone.
             y = x.clone()
             n_elements = y.numel()
             kernel = get_kernel()
@@ -1505,6 +1800,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_lru_cache_factory_function(self):
+        # [FUNCTION DOC] Test that a kernel returned through an lru_cache-decorated factory is
+        # recorded for the triton_op (name cached_kernel) in triton_ops_to_kernels, and that
+        # running the op adds 99 to every element. Needs a GPU and triton.
         """
         Test that triton kernels returned from @lru_cache decorated factory
         functions are properly detected.
@@ -1522,6 +1820,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._library import capture_triton
         from torch._library.triton import triton_ops_to_kernels
 
+        # [FUNCTION DOC] HELPER: Masked in-place triton kernel adding 99 to BLOCK_SIZE sized
+        # chunks of x_ptr, bounded by n_elements.
         @triton.jit
         def cached_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -1531,16 +1831,20 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             tl.store(x_ptr + offsets, x + 99, mask=mask)
 
         def get_kernel():
+            # [FUNCTION DOC] HELPER: Plain factory returning cached_kernel.
             """Factory function."""
             return cached_kernel
 
         @lru_cache
         def get_cached_kernel():
+            # [FUNCTION DOC] HELPER: lru_cache-wrapped factory that calls get_kernel.
             """Calls factory function decorated with @lru_cache."""
             return get_kernel()
 
         @torch._library.triton_op("test::lru_cache_triton_op", mutates_args=())
         def lru_cache_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::lru_cache_triton_op": clones x, gets the
+            # kernel via the cached factory and launches it on the clone, returns it.
             y = x.clone()
             n_elements = y.numel()
             kernel = get_cached_kernel()
@@ -1573,11 +1877,18 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_triton_op_cache_multiple_ops_invalidation(self):
+        # [FUNCTION DOC] Test cache invalidation with nested triton_ops: op2 calls op1, which
+        # runs two kernels. After the first compile (one miss, one save) and a dynamo clear,
+        # only my_jit and the ops are redefined (my_jit adds 2); the recompile must miss again
+        # (two misses, no hit, two saves). Needs GPU, triton.
+        # [FUNCTION DOC] HELPER: Triton kernel loading a value through x and storing it plus 1
+        # back in place.
         @triton.jit
         def my_jit(x):
             arg_0 = tl.load(x)
             tl.store(x, arg_0 + 1)
 
+        # [FUNCTION DOC] HELPER: Second triton kernel, same body as my_jit (plus 1).
         @triton.jit
         def my_jit2(x):
             arg_0 = tl.load(x)
@@ -1585,6 +1896,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::my_triton_op": clones x and runs both
+            # kernels on the clone via capture_triton, returns the clone.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             torch._library.capture_triton(my_jit2)[1,](y)
@@ -1592,11 +1905,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op2", mutates_args=())
         def my_triton_op2(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: triton_op "test::my_triton_op2": clones x, calls the
+            # registered op my_triton_op on it and returns the clone.
             y = x.clone().detach_().requires_grad_(True)
             torch.ops.test.my_triton_op(y)
             return y
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Model function calling the registered op my_triton_op2.
             return torch.ops.test.my_triton_op2(a)
 
         a = torch.randn(5, device=GPU_TYPE)
@@ -1613,6 +1929,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         # Redefine the triton op
 
+        # [FUNCTION DOC] HELPER: Redefined kernel storing the loaded value plus 2.
         @triton.jit
         def my_jit(x):  # noqa: F811
             arg_0 = tl.load(x)
@@ -1620,6 +1937,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op", mutates_args=())
         def my_triton_op(x: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Redefinition of "test::my_triton_op": clones x and runs the
+            # new my_jit and the old my_jit2 on the clone, returning it.
             y = x.clone().detach_().requires_grad_(True)
             torch._library.capture_triton(my_jit)[1,](y)
             torch._library.capture_triton(my_jit2)[1,](y)
@@ -1627,6 +1946,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch._library.triton_op("test::my_triton_op2", mutates_args=())
         def my_triton_op2(x: torch.Tensor) -> torch.Tensor:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Redefinition of "test::my_triton_op2": clones x, calls the
+            # registered op my_triton_op on it and returns the clone.
             y = x.clone().detach_().requires_grad_(True)
             torch.ops.test.my_triton_op(y)
             return y
@@ -1646,11 +1967,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"strict_autograd_cache": True})
     def test_autograd_lazy_backward(self):
+        # [FUNCTION DOC] Test that backward is compiled lazily and only then is the entry saved
+        # (strict mode). Forward only: one miss, saved 0. After clearing dynamo and a second
+        # forward: another miss, saved 0. After running backward saved becomes 1 and grads match
+        # eager. After a clear and fresh inputs the forward hits (2 misses, 1 hit, 1 save) and
+        # backward still matches eager.
         """
         Lazily compile the backward, and lazily save to cache
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Model function returning a.cos() + b.
             return a.cos() + b
 
         a = torch.randn(25, requires_grad=True)
@@ -1697,6 +2024,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"strict_autograd_cache": True})
     def test_autograd_no_dynamo_trace_backward(self):
+        # [FUNCTION DOC] Test that dynamo does not trace into the compiled backward even on a
+        # cache hit. The compiled function runs autograd.grad of x.sum() inside it; first call
+        # is a miss with one save, the traced frame infos are recorded, then dynamo is reset and
+        # the call repeated: one hit, same result, and the thread-local traced_frame_infos must
+        # equal the earlier ones.
         """
         Test that dynamo does not trace into the backward compiled function,
         even on cache hit.
@@ -1705,6 +2037,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the gradient of x.sum() with respect to x, computed
+            # with autograd.grad during the forward execution.
             # Calls x.sum().backward() during forward execution of fn
             (x_grad,) = torch.autograd.grad(x.sum(), x)
             return x_grad
@@ -1734,11 +2068,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_autograd_function(self):
+        # [FUNCTION DOC] Test that a function with autograd (forward and backward) hits the
+        # cache on the second compile: one miss and save first, then after clearing dynamo one
+        # hit with no new miss or save. Outputs and grads match eager.
         """
         Tests autograd cache hits
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Model function returning a.sin() + b.
             return a.sin() + b
 
         a = torch.randn(25, requires_grad=True)
@@ -1785,6 +2123,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_autograd_guard_single_entry(self, device, dtype):
+        # [FUNCTION DOC] Test the single-entry behavior of the cache when inductor guards on
+        # 32-bit index math change. With dynamic shapes: first call is a miss, the same shapes
+        # hit, a very large b shape yields a guard miss (which counts as a miss), then slightly
+        # different small a shape with large b hits, and the original shapes hit again.
+        # Parametrized by dtype; requires a large GPU (64GB).
         """
         Test caching the same graph, but under conditions that introduce guards
         for tensor sizes < int32. See test_codecache::TestFxGraphCache::test_cache_load_with_guards_int32_bounds.
@@ -1798,9 +2141,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             raise unittest.SkipTest("requires CUDA SM80 or later")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x + x, y + y).
             return (x + x, y + y)
 
         def expect_miss(compiled_fn, a, b):
+            # [FUNCTION DOC] HELPER: Clears dynamo/codecache and counters, calls
+            # compiled_fn on (a, b) and asserts one cache miss, zero guard misses and zero
+            # hits. Returns the result.
             self._clear_dynamo_and_codecache()
             counters.clear()
             res = compiled_fn(a, b)
@@ -1813,6 +2160,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             return res
 
         def expect_hit(compiled_fn, a, b):
+            # [FUNCTION DOC] HELPER: Clears dynamo/codecache and counters, calls compiled_fn on
+            # (a, b) and asserts zero misses, zero guard misses and one hit. Returns the result.
             self._clear_dynamo_and_codecache()
             counters.clear()
             res = compiled_fn(a, b)
@@ -1828,6 +2177,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             return res
 
         def expect_guard_miss(compiled_fn, a, b):
+            # [FUNCTION DOC] HELPER: Clears dynamo/codecache and counters, calls compiled_fn on
+            # (a, b) and asserts one miss, one guard miss and no hit. Returns the result.
             self._clear_dynamo_and_codecache()
             counters.clear()
             res = compiled_fn(a, b)
@@ -1894,6 +2245,12 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_autograd_inductor_guards(self, device, dtype, requires_grad):
+        # [FUNCTION DOC] Test the cache with inductor guards across three input shape pairs
+        # (small, one large, other large) for a dynamic compile, parametrized by dtype and
+        # requires_grad. Each shape is run without resetting dynamo so a recompile happens:
+        # expects one more miss and save each time (no extra save at backward). Then dynamo is
+        # cleared and a rerun must hit. Guard miss count increments after each iteration.
+        # Requires a large GPU (64GB).
         """
         Test caching the same graph, but under conditions that introduce guards
         for tensor sizes < int32.
@@ -1905,6 +2262,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             raise unittest.SkipTest("requires CUDA SM80 or later")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x + x, y + y).
             return (x + x, y + y)
 
         compiled_fn = torch.compile(fn, dynamic=True)  # noqa: UNSPECIFIED_BACKEND
@@ -1993,14 +2351,24 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_nn_module_with_params_global_constant(self):
+        # [FUNCTION DOC] Test that a tensor class attribute used by an nn.Module forward is
+        # lifted as a graph input: first compile miss+save, second after clearing dynamo hits
+        # with the same result; after replacing the class constant with 3s a third run still
+        # hits (two hits) but equals the first result plus one.
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 2x2 class level tensor CONSTANT (of 2s) and a
+            # random 2x2 parameter; forward returns sin(x) + param + CONSTANT.
             CONSTANT = torch.tensor([[2, 2], [2, 2]])
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the module and registers the random
+                # 2x2 parameter param.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.randn([2, 2]))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x.sin() plus the parameter plus the current
+                # value of the class attribute CONSTANT.
                 return x.sin() + self.param + MyMod.CONSTANT
 
         with torch.no_grad():
@@ -2041,10 +2409,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         }
     )
     def test_tensor_constant(self):
+        # [FUNCTION DOC] Test that, with bundled autograd cache, strict mode, and
+        # always_keep_tensor_constants, a graph containing a tensor constant serializes and is
+        # saved: one miss and one save. Skipped without a GPU.
         """Bundled AOT cache serialization with strict_autograd_cache should
         succeed when the compiled graph contains tensor constants."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds an empty int64 index tensor on the device of x and
+            # returns x indexed by it (an empty tensor).
             idx = torch.tensor([], dtype=torch.long, device=x.device)
             return x[idx]
 
@@ -2059,6 +2432,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_remote_cache", False)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_multiple_compile_triton_kernels(self):
+        # [FUNCTION DOC] Test that CompiledTritonKernels._cache is empty after both a cache miss
+        # compile and a cache hit: runs a compiled function under no_grad, clears dynamo and
+        # runs again (one miss, then one hit). Needs a GPU and triton.
         """
         When we cache hit on AOTAutogradCache, we need to still clear
         CompiledTritonKernels after compiling the kernel.
@@ -2067,6 +2443,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch.compile  # noqa: UNSPECIFIED_BACKEND
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning x.sin() + y.
             return x.sin() + y
 
         x = torch.randn(10, device=device_type)
@@ -2090,9 +2467,13 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"strict_autograd_cache": True})
     def test_dynamic_shapes_different_sizes(self):
+        # [FUNCTION DOC] Test (strict mode) that a dynamic-shape function whose forward and
+        # backward take different symint inputs but the same symbols can be cached: first
+        # compile one miss and save, then after clearing dynamo one hit.
         # The forward and backward function have different symint inputs,
         # but the same underlying symbols
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns (concatenation of x with x, x * y).
             z = x * y
             return (torch.cat((x, x), dim=0), z)
 
@@ -2124,25 +2505,36 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"activation_memory_budget_runtime_estimator": "testing"})
     @functorch_config.patch({"saved_tensors_hooks_filtering_mode": "all"})
     def test_saved_tensors_hooks_autograd_cache(self):
+        # [FUNCTION DOC] Test that saved-tensors hooks are part of the autograd cache key.
+        # Baseline compile is a miss and save. With CPU-offload pack/unpack hooks (traced
+        # non-symbolically, user cache hash "cpu_offload") it is a second miss and save. With
+        # different hook functions but the same hash string it hits. With multiply-by-2 hooks
+        # without a hash it is a third miss and save. Skipped without CUDA/XPU and SM80.
         ctx = torch.autograd.graph.saved_tensors_hooks
         device = torch.device(f"{device_type}:0")
 
         def pack_cpu(x):
+            # [FUNCTION DOC] HELPER: Pack hook moving the saved tensor to CPU.
             return x.to(device="cpu")
 
         def unpack_cpu(x):
+            # [FUNCTION DOC] HELPER: Unpack hook moving the tensor back to the test device.
             return x.to(device=device)
 
         def pack_cpu2(x):
+            # [FUNCTION DOC] HELPER: Second pack hook, same behavior (moves tensor to CPU).
             return x.to(device="cpu")
 
         def unpack_cpu2(x):
+            # [FUNCTION DOC] HELPER: Second unpack hook, same behavior (back to device).
             return x.to(device=device)
 
         def pack_mul2(x):
+            # [FUNCTION DOC] HELPER: Pack hook returning the tensor multiplied by 2.
             return x * 2
 
         def unpack_mul2(x):
+            # [FUNCTION DOC] HELPER: Unpack hook returning the tensor divided by 2.
             return x / 2
 
         # Can not use custom AutogradFunction here,
@@ -2151,6 +2543,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         # For non-symbolic tracing all dtypes and devices and burned in the graph.
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function: x + 1, sin, cos, relu, exp, then
+            # multiplied by 2.
             x = x + 1
             x = x.sin().cos()
             x = x.relu()
@@ -2161,6 +2555,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         backend = "inductor"
 
         def inp_fn():
+            # [FUNCTION DOC] HELPER: Returns a 2x3 ones tensor on the test device with
+            # requires_grad set and both dims marked dynamic.
             x = torch.ones(2, 3, device=device, requires_grad=True)
             torch._dynamo.mark_dynamic(x, 0)
             torch._dynamo.mark_dynamic(x, 1)
@@ -2223,15 +2619,22 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_saved_tensors_hooks_autograd_cache_symbolic(self):
+        # [FUNCTION DOC] Test saved-tensor hooks traced symbolically with fx-wrapped fp8
+        # pack/unpack functions. Baseline: one miss and save. With the fp8 hooks and a cache
+        # hash: second miss and save. Same hooks and same hash again: one hit without new miss.
+        # Changed hash string ("..._MISS"): a third miss. Needs CUDA/XPU and SM80.
         def pack_fp8_with_scale(x):
+            # [FUNCTION DOC] HELPER: Pack hook delegating to the fx-wrapped fp8 packer.
             return _pack_fp8_with_scale_wrap(x)
 
         def unpack_fp8_with_scale(packed):
+            # [FUNCTION DOC] HELPER: Unpack hook delegating to the fx-wrapped fp8 unpacker.
             return _unpack_fp8_with_scale_wrap(packed)
 
         ctx = torch.autograd.graph.saved_tensors_hooks
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function: x + 1 then two relus.
             x = x + 1
             # Relu saves bitmask in AutogradContext
             x = x.relu()
@@ -2242,6 +2645,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         backend = "inductor"
 
         def inp_fn():
+            # [FUNCTION DOC] HELPER: Returns a 2x3 ones tensor on the test device with
+            # requires_grad set and both dims marked dynamic.
             x = torch.ones(2, 3, device=device, requires_grad=True)
             torch._dynamo.mark_dynamic(x, 0)
             torch._dynamo.mark_dynamic(x, 1)
@@ -2306,6 +2711,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         }
     )
     def test_cache_lazy_backward_for_compiled_autograd(self):
+        # [FUNCTION DOC] Test hot loading cache artifacts for a lazily compiled backward used
+        # by compiled autograd (fixed cpu, float32, dynamic). Records artifacts inside
+        # fresh_cache (one miss, one save, one compiled autograd capture), saves them, clears
+        # all caches, loads them, and runs three times: the first iteration hits the AOT
+        # autograd cache (inductor hits only when not bundled); later iterations must record no
+        # counters at all (no recompiles).
+        # KNOWN ISSUE: the string literal after the assignments is a stray expression, not a
+        # docstring, so the function has no docstring; skip checks on GPU_TYPE are dead code
+        # because device is fixed to cpu.
         device = "cpu"
         dtype = torch.float32
         dynamic = True
@@ -2318,6 +2732,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             raise unittest.SkipTest("requires SM80 or later")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function: matmul of sin(x) with y.
             return x.sin() @ y
 
         a = torch.rand(100, 100, dtype=dtype, device=device, requires_grad=True)
@@ -2429,6 +2844,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"bundled_autograd_cache": True})
     def test_regional_inductor_basic(self):
+        # [FUNCTION DOC] Test the regional inductor backend with bundled autograd cache: the
+        # first compile of a function with an annotated region is a miss and save; after
+        # clearing dynamo it hits, and both results are equal.
         """
         Basic test for regional inductor with bundled autograd cache.
         Tests that regional inductor compilation results can be cached and hit.
@@ -2436,6 +2854,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         import torch.fx.traceback as fx_traceback
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function: sin(x), then within an annotation region
+            # for inductor computes sin(x)*y + 1, then returns sin of that.
             sin = torch.sin(x)
             # Mark this region to be compiled with inductor
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -2472,6 +2892,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"bundled_autograd_cache": True})
     def test_regional_inductor_with_backward(self):
+        # [FUNCTION DOC] Test regional inductor with a backward pass and bundled cache. Runs
+        # forward and backward once, records the miss and save counts (several AOT compiles
+        # happen: outer graph plus each region, both must be positive), clears dynamo, reruns
+        # with cloned inputs and checks hits are positive, miss and save counts are unchanged,
+        # and that outputs and input grads equal the first run.
         """
         Test regional inductor with backward pass and bundled autograd cache.
         Note: Regional inductor triggers multiple AOT autograd compilations:
@@ -2481,6 +2906,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         import torch.fx.traceback as fx_traceback
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function: sin(x), then within an annotation region
+            # for inductor computes sin(x)*y + 1, then returns sin of that.
             sin = torch.sin(x)
             # Mark this region to be compiled with inductor
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -2536,6 +2963,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"bundled_autograd_cache": True})
     def test_regional_inductor_cache_miss_on_change(self):
+        # [FUNCTION DOC] Test that two functions differing only in a constant (+1 vs +2 inside
+        # the marked region) do not share a cache entry under regional inductor: the second
+        # compile increases miss and save counts, has no hits, and the results differ.
         """
         Test that changing the function causes a cache miss with regional inductor.
         Regional inductor creates multiple AOT compilations, so we track
@@ -2544,6 +2974,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         import torch.fx.traceback as fx_traceback
 
         def fn1(x, y):
+            # [FUNCTION DOC] HELPER: Model function with a region computing sin(x)*y + 1, then
+            # sin of the result.
             sin = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 mul = sin * y
@@ -2551,6 +2983,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             return torch.sin(add)
 
         def fn2(x, y):
+            # [FUNCTION DOC] HELPER: Same as fn1 but the region adds 2 instead of 1.
             sin = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 mul = sin * y
@@ -2594,16 +3027,25 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"activation_memory_budget": 0.5})
     def test_custom_runtime_estimator_cache_hit(self):
+        # [FUNCTION DOC] Test that a CustomRuntimeEstimator returning a valid uuid as the
+        # activation memory budget runtime estimator is cacheable: first compile one miss and
+        # save with no bypass; after clearing dynamo one hit with no new miss or save and no
+        # bypass. Uses fresh_cache and a 0.5 memory budget.
         """Test that CustomRuntimeEstimator with valid uuid() results in cache hit."""
 
         class MyCustomEstimator(CustomRuntimeEstimator):
+            # [CLASS DOC] HELPER: Estimator returning a constant cost of 1.0 for every node and
+            # a fixed uuid string, so it can be part of the cache key.
             def __call__(self, node) -> float:
+                # [FUNCTION DOC] HELPER: Returns the constant runtime estimate 1.0 for any node.
                 return 1.0
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns the fixed identifier "my_custom_estimator_v1".
                 return "my_custom_estimator_v1"
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning matmul(x, y) + 1.
             return torch.mm(x, y) + 1
 
         with fresh_cache():
@@ -2639,13 +3081,20 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"activation_memory_budget": 0.5})
     def test_custom_estimator_bypasses_cache(self):
+        # [FUNCTION DOC] Test that a runtime estimator without a usable uuid makes the autograd
+        # cache bypass: first with a plain function (no uuid method), then with a
+        # CustomRuntimeEstimator whose uuid returns None. In both cases miss, hit and saved stay
+        # at 0 and the bypass counter is positive.
         """Test that cache is bypassed when custom estimator lacks proper uuid."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning matmul(x, y) + 1.
             return torch.mm(x, y) + 1
 
         # Test 1: Raw callable without uuid() method bypasses cache
         def raw_estimator(node) -> float:
+            # [FUNCTION DOC] HELPER: Plain-function estimator returning 1.0 for any node; has
+            # no uuid method.
             return 1.0
 
         with fresh_cache():
@@ -2668,10 +3117,14 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         # Test 2: CustomRuntimeEstimator with uuid() returning None bypasses cache
         class EstimatorWithNullUuid(CustomRuntimeEstimator):
+            # [CLASS DOC] HELPER: Estimator returning 1.0 for every node whose uuid is None,
+            # which makes it uncacheable.
             def __call__(self, node) -> float:
+                # [FUNCTION DOC] HELPER: Returns the constant runtime estimate 1.0.
                 return 1.0
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns None, signalling no identifier is available.
                 return None
 
         with fresh_cache():
@@ -2692,6 +3145,11 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch("enable_autograd_cache", True)
     def test_pre_grad_passes_inplace_cpu(self):
+        # [FUNCTION DOC] Regression test that pre_grad_passes mutates the given GraphModule in
+        # place for CPU inference (the identity removal pass used to return a new module).
+        # Traces a linear+identity+relu model, runs pre_grad_passes with pattern_matcher and
+        # freezing enabled under no_grad, and asserts the returned object is the same object
+        # as the input.
         """
         `remove_identity` was an out-place operation previously, and it is called
         for CPU inference inside `pre_grad_passes`. So, it broke the in-place semantics
@@ -2702,12 +3160,16 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._inductor.fx_passes.pre_grad import pre_grad_passes
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small module: a 4x4 Linear followed by an Identity
+            # layer, then relu.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear 4x4 layer and an identity layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.identity = torch.nn.Identity()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear, identity, then relu and returns it.
                 x = self.linear(x)
                 x = self.identity(x)
                 return torch.relu(x)
@@ -2729,23 +3191,33 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"activation_memory_budget": 0.5})
     def test_different_custom_estimator_uuids_cause_cache_miss(self):
+        # [FUNCTION DOC] Test that two estimators with different uuid strings give different
+        # cache keys: compiling with the first is one miss and save; after clearing dynamo,
+        # compiling with the second is a second miss and save, with no hits and no bypass.
         """Test that different uuid values cause cache miss."""
 
         class EstimatorV1(CustomRuntimeEstimator):
+            # [CLASS DOC] HELPER: Estimator with constant cost 1.0 and uuid "estimator_v1".
             def __call__(self, node) -> float:
+                # [FUNCTION DOC] HELPER: Returns the constant runtime estimate 1.0.
                 return 1.0
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns the identifier "estimator_v1".
                 return "estimator_v1"
 
         class EstimatorV2(CustomRuntimeEstimator):
+            # [CLASS DOC] HELPER: Estimator with constant cost 1.0 and uuid "estimator_v2".
             def __call__(self, node) -> float:
+                # [FUNCTION DOC] HELPER: Returns the constant runtime estimate 1.0.
                 return 1.0
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns the identifier "estimator_v2".
                 return "estimator_v2"
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning matmul(x, y) + 1.
             return torch.mm(x, y) + 1
 
         with fresh_cache():
@@ -2784,12 +3256,21 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch({"enable_autograd_cache": True})
     @functorch_config.patch({"strict_autograd_cache": True})
     def test_output_views_input_dynamic(self):
+        # [FUNCTION DOC] Test (strict mode) that a dynamic-shape module returning an output that
+        # is a view of its input is cached and still correct: first call one miss and save;
+        # after clearing dynamo, a call with different dynamic sizes hits. Output equals eager
+        # and the view shares storage with the input.
         class OutputViewsInput(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 64x64 Linear whose forward returns the relu of
+            # the linear output and a flattened (batch*seq, hidden) view of x.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 64-to-64 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(64, 64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Reads batch, seq, hidden from x.shape, applies linear
+                # then relu, and returns that and a view of x of shape (batch*seq, hidden).
                 batch, seq, hidden = x.shape
                 y = self.linear(x)
                 y = torch.relu(y)
@@ -2838,6 +3319,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_cache_hit_logs_aot_graphs(self):
+        # [FUNCTION DOC] Test that the aot_graphs log prints on a cache hit as well as on a miss
+        # (issue 149060). Captures logs of the graph_capture logger on the first call (expects
+        # "Forward graph") and, after clearing dynamo, logs of the aot_autograd_result logger on
+        # a hit (expects "Forward graph (from cache)").
         """
         Verify that TORCH_LOGS=aot_graphs prints graphs on cache hit, not just cache miss.
         See https://github.com/pytorch/pytorch/issues/149060
@@ -2845,6 +3330,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch.testing._internal.logging_utils import logs_to_string
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning (x * 2, y @ y).
             return (x * 2, y @ y)
 
         a = torch.rand(25)
@@ -2917,17 +3403,30 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         expect_pre_grad_call_count: tuple[int, int],
         use_module: bool,
     ):
+        # [FUNCTION DOC] Parametrized test of how the custom pre-grad pass interacts with the
+        # cache, for each timing (early, late, default), pass with or without uuid, and
+        # function vs module target. Wraps run_pre_grad_passes to count calls and record graph
+        # text, and compile_fx_forward to record what inductor receives. Runs under no_grad.
+        # First compile: one miss, expected first call count, the pre-grad graph still has the
+        # multiplication by 1 and the graph given to inductor does not. After resetting
+        # dynamo: one hit, expected second call count (how often pre-grad passes ran on the
+        # hit) and equal results.
         from torch._inductor.compile_fx import compile_fx_forward, run_pre_grad_passes
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning 1 * x + y.
             return 1 * x + y
 
         class LinearModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10x10 Linear whose forward multiplies the linear
+            # output by 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 10-to-10 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns 1 times the output of the linear layer.
                 return 1 * self.linear(x)
 
         pre_grad_call_count = 0
@@ -2937,6 +3436,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         def wrap_run_pre_grad_passes(
             model: GraphModule, example_inputs: Sequence[InputType]
         ) -> GraphModule:
+            # [FUNCTION DOC] HELPER: Counts the call, records the printed graph text of the
+            # model, runs the real pre-grad passes on it and returns the model.
             nonlocal pre_grad_call_count
             pre_grad_call_count += 1
             pre_grad_input_graphs.append(model.print_readable(print_output=False))
@@ -2945,6 +3446,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
         @torch.utils._typing_utils.copy_func_params(compile_fx_forward)
         def wrap_compile_fx_forward(gm, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Records the printed graph text of gm reaching inductor and
+            # delegates to the real compile_fx_forward.
             inductor_input_graphs.append(gm.print_readable(print_output=False))
             return compile_fx_forward(gm, *args, **kwargs)
 
@@ -3010,19 +3513,26 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @functorch_config.patch("enable_autograd_cache", True)
     @inductor_config.patch("pre_grad_pass_timing", "late")
     def test_pre_grad_pass_late_timing_without_uuid_raises(self):
+        # [FUNCTION DOC] Test that with pre_grad_pass_timing late, a pre-grad custom pass whose
+        # uuid is None makes compilation raise a RuntimeError matching "pre_grad_custom_pass ...
+        # NoUuidPass must implement uuid".
         """
         Explicitly setting late timing with a pass that has no UUID should
         raise a RuntimeError.
         """
 
         class NoUuidPass(CustomGraphPass):
+            # [CLASS DOC] HELPER: No-op graph pass that has no uuid (returns None).
             def __call__(self, g: torch.fx.Graph) -> None:
+                # [FUNCTION DOC] HELPER: Does nothing to the graph.
                 pass
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns None (no identifier).
                 return None
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning x + y.
             return x + y
 
         x = torch.randn(10)
@@ -3039,6 +3549,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch("enable_autograd_cache", True)
     def test_pre_grad_pass_default_timing_without_uuid_warns(self):
+        # [FUNCTION DOC] Test that with default timing, a pass without uuid logs a warning
+        # ("NoUuidPass does not implement uuid()") on logger torch._inductor.codecache, exactly
+        # once for the first compile, and none on a second compile of the same pass class.
+        # Clears the module level warned set first.
         """
         Default timing with a pass that has no UUID should log a warning about
         the pre-grad pass cache being bypassed, only once per pass class.
@@ -3046,13 +3560,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch._inductor.codecache import _warned_pre_grad_pass_missing_uuid
 
         class NoUuidPass(CustomGraphPass):
+            # [CLASS DOC] HELPER: No-op graph pass that has no uuid (returns None).
             def __call__(self, g: torch.fx.Graph) -> None:
+                # [FUNCTION DOC] HELPER: Does nothing to the graph.
                 pass
 
             def uuid(self):
+                # [FUNCTION DOC] HELPER: Returns None (no identifier).
                 return None
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Model function returning x + y.
             return x + y
 
         x = torch.randn(10)
@@ -3096,6 +3614,12 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     def test_cache_hit_across_processes_pre_grad_custom_pass(
         self, pre_grad_pass_timing, has_uuid, expect_miss_on_different_uuid
     ):
+        # [FUNCTION DOC] Parametrized test of cross-process cache behavior with a custom
+        # pre-grad pass. Runs a generated script in a subprocess three times sharing one
+        # temporary TORCHINDUCTOR_CACHE_DIR; the script compiles a function using a pass that
+        # removes 1 * x and prints the aot_autograd counters as JSON. Run one is a miss, run two
+        # (same uuid) is a hit, run three (different uuid) is a miss only when
+        # expect_miss_on_different_uuid, else a hit.
         """
         Verify cache behavior across processes for different pre-grad pass
         timing and UUID configurations.
@@ -3157,6 +3681,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             env = {**os.environ, "TORCHINDUCTOR_CACHE_DIR": cache_dir}
 
             def run_script(pass_uuid):
+                # [FUNCTION DOC] HELPER: Formats the script template with the timing and the
+                # repr of pass_uuid, runs it with the current Python interpreter and the cache
+                # dir env, asserts exit code 0, and returns the counters parsed from the last
+                # line of stdout.
                 script = script_template.format(
                     pre_grad_pass_timing=pre_grad_pass_timing,
                     pass_uuid=repr(pass_uuid),
@@ -3204,6 +3732,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_dtensor_cache_hit(self):
+        # [FUNCTION DOC] Test that a DTensor input on a fake 2-rank CPU mesh gives an autograd
+        # cache miss then a hit after clearing dynamo.
+        # KNOWN ISSUE: the skip condition includes IS_LINUX, so the test is skipped on Linux
+        # (see issue 179689 in the skip reason), the platform it targets.
         """
         Test that DTensor produces cache hits on second compile.
 
@@ -3217,6 +3749,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
             mesh = init_device_mesh("cpu", (2,))
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Model function returning x.sin().
                 return x.sin()
 
             compiled_fn = torch.compile(fn, backend="inductor")
@@ -3242,6 +3775,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_non_tuple_return_cache_key(self):
+        # [FUNCTION DOC] Test that the standalone compile_fx.autograd_cache_key rejects a graph
+        # whose output is not a tuple: traces a function returning a single tensor with fake
+        # tensors, asserts graph_returns_tuple is false, expects NotImplementedError ("don't
+        # return a tuple") and then checks compile_fx on the same graph still completes.
         """autograd_cache_key does not support graphs that don't return a tuple,
         since compile_fx mutates them via make_graph_return_tuple."""
         from torch._subclasses import FakeTensorMode
@@ -3249,6 +3786,7 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Model function returning x.sin().
             return x.sin()
 
         inp = torch.randn(10)
@@ -3264,6 +3802,9 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_flatten_graph_inputs_cache_key(self):
+        # [FUNCTION DOC] Test that the standalone autograd_cache_key rejects nested container
+        # (list) inputs with NotImplementedError ("nested container inputs"), while compile_fx
+        # itself accepts the graph taking a list of two fake tensors.
         """autograd_cache_key does not support nested container inputs, since
         compile_fx wraps them via flatten_graph_inputs."""
         from torch._subclasses import FakeTensorMode
@@ -3271,6 +3812,8 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def fn(xs):
+            # [FUNCTION DOC] HELPER: Takes a list of two tensors and returns a one element tuple
+            # holding their sum.
             return (xs[0] + xs[1],)
 
         inp = torch.randn(10)
@@ -3289,18 +3832,25 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @inductor_config.patch("fx_graph_remote_cache", False)
     def test_autocast_cache_distinguishes_dtype(self):
+        # [FUNCTION DOC] Test that the autocast dtype is part of the cache key: a small
+        # two-linear model compiled under bfloat16 autocast misses, under float16 autocast
+        # misses again, then bfloat16 and float16 again each hit. Checks output dtypes.
+        # Needs an accelerator.
         """
         Ensure AOTAutograd cache key includes autocast dtype so that
         graphs compiled under different autocast dtypes are not reused.
         """
 
         class TwoLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two 64x64 linear layers with a gelu in between.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two 64-to-64 linear layers fc1 and fc2.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(64, 64)
                 self.fc2 = torch.nn.Linear(64, 64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, gelu, then fc2.
                 return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
 
         with fresh_cache():
@@ -3351,6 +3901,10 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @inductor_config.patch("fx_graph_remote_cache", False)
     def test_autocast_in_graph_is_cacheable(self):
+        # [FUNCTION DOC] Test that an autocast context entered inside the compiled function is
+        # cacheable and its dtype is part of the key: bfloat16 run misses with no bypass,
+        # float16 run misses again (no reuse), then bfloat16 and float16 each hit, with output
+        # dtypes and values equal to the first runs. Needs an accelerator.
         """
         An autocast context manager inside the compiled region is traced into
         _enter_autocast/_exit_autocast nodes. Those are cacheable, and the dtype
@@ -3359,10 +3913,15 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
         """
 
         def fn(x, w, dtype):
+            # [FUNCTION DOC] HELPER: Model function computing gelu(x @ w) under an autocast
+            # context of the given dtype on the GPU device type.
             with torch.amp.autocast(GPU_TYPE, dtype=dtype):
                 return torch.nn.functional.gelu(x @ w)
 
         def run(dtype):
+            # [FUNCTION DOC] HELPER: Resets dynamo and counters, compiles fn, runs it under
+            # no_grad with the enclosing x and w and the given dtype, and returns the output and
+            # a tuple (miss, hit, bypass) of the autograd cache counters.
             torch._dynamo.reset()
             counters.clear()
             compiled = torch.compile(fn, backend="inductor")
@@ -3406,11 +3965,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_region_activation_memory_budget_causes_cache_miss(self):
+        # [FUNCTION DOC] Test that changing the budget given to region_activation_memory_budget
+        # changes the cache key: budget 0.3 is a miss, budget 0.8 is a second miss, and 0.3
+        # again hits (two misses, one hit).
         """Changing the budget set via torch.autograd.graph.region_activation_memory_budget
         invalidates the AOTAutograd cache."""
 
         def make_fn(budget):
+            # [FUNCTION DOC] HELPER: Returns a model function that computes relu(mm(x, y) + 1)
+            # inside a region_activation_memory_budget context set to budget.
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Runs the matmul-add-relu inside the budget context.
                 with torch.autograd.graph.region_activation_memory_budget(budget):
                     return (torch.mm(x, y) + 1).relu()
 
@@ -3450,11 +4015,17 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch({"enable_autograd_cache": True})
     def test_region_activation_memory_budget_graph_break_cache(self):
+        # [FUNCTION DOC] Test that with a graph break between two budget regions, only the graph
+        # whose budget changed misses. Budgets (0.3, 0.5): two misses; then (0.3, 0.8): one hit
+        # and one new miss; then (0.7, 0.8): another hit and miss.
         """With graph breaks, changing one graph's budget causes a miss for
         that graph but a hit for the unchanged graph."""
 
         def make_fn(budget_a, budget_b):
+            # [FUNCTION DOC] HELPER: Returns a function that applies relu(x + 1) under budget
+            # budget_a, forces a graph break, then returns relu(x * 2) under budget_b.
             def fn(x):
+                # [FUNCTION DOC] HELPER: The two-region function with a graph break between.
                 with torch.autograd.graph.region_activation_memory_budget(budget_a):
                     x = (x + 1).relu()
                 torch._dynamo.graph_break()
@@ -3495,27 +4066,41 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
 @functorch_config.patch({"bundled_autograd_cache": True})
 class AOTAutogradCacheBundledTests(AOTAutogradCacheTests):
+    # [CLASS DOC] Runs every test of AOTAutogradCacheTests again with bundled_autograd_cache
+    # turned on (class level config patch); adds no tests.
     pass
 
 
 @dataclasses.dataclass
 class _MockEntryForPickleTest:
+    # [CLASS DOC] HELPER: Dataclass standing in for a cache entry in pickle tests, with a
+    # picklable string field and an arbitrary field the tests set to something unpicklable.
+    # Defined at module level so pickling errors come from the field values, not from the class.
     """Module-level mock entry for pickle tests, so pickle errors come from fields not the class."""
 
     picklable_field: str
     unpicklable_field: object
 
     def pre_save(self):
+        # [FUNCTION DOC] HELPER: No-op stand-in for the pre-save hook of a real entry.
         pass
 
 
 @inductor_config.patch("fx_graph_cache", True)
 class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for cache key generation (AOTAutogradCachePickler and
+    # autograd_cache_key), cacheability checks, and pickling of entries. Helpers compile a
+    # function with a capturing backend to obtain an FX graph and example inputs, then compute
+    # keys under a fake tracing context. Runs with fx_graph_cache on.
     @property
     def device_type(self) -> str:
+        # [FUNCTION DOC] HELPER: Property returning the module level device_type string.
         return device_type
 
     def default_config(self):
+        # [FUNCTION DOC] HELPER: Returns a fresh AOTConfig with no compilers, empty
+        # decompositions, dynamic_shapes true, no tangents or export, zero aot_id and no
+        # precompile backend id, for building cache keys.
         return AOTConfig(
             fw_compiler=None,
             bw_compiler=None,
@@ -3534,12 +4119,18 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def _get_dynamo_output(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Resets dynamo, compiles fn with fullgraph and a backend
+        # that captures the graph module and example inputs and returns the graph unchanged,
+        # calls it with args and kwargs, and returns the tuple (result, captured graph,
+        # captured example inputs).
         # Reset dynamo between runs
         torch._dynamo.reset()
         fx_graph = None
         example_inputs = None
 
         def compiler(gm, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Backend that stores gm and inputs in the enclosing
+            # variables and returns gm.
             nonlocal fx_graph
             nonlocal example_inputs
             fx_graph = gm
@@ -3551,6 +4142,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         return (result, fx_graph, example_inputs)
 
     def gen_cache_key(self, f, config, inputs=None, act_input_paths=()):
+        # [FUNCTION DOC] HELPER: Computes the cache key of function f under config. Captures the
+        # FX graph by compiling f on inputs (default one ones(3) tensor), then, inside a tracing
+        # context with a fake mode and a fresh ShapeEnv and with the graph sanitized, calls
+        # autograd_cache_key with act_input_paths and returns its result (key and debug
+        # information). May raise BypassAOTAutogradCache.
         if inputs is None:
             inputs = [torch.ones(3)]
         _, fx_g, example_inputs = self._get_dynamo_output(f, *inputs)
@@ -3569,7 +4165,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
                 )
 
     def test_basic_hash_key(self):
+        # [FUNCTION DOC] Test that the cache key for the same function and config is stable
+        # across two computations.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         config = self.default_config()
@@ -3579,7 +4178,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(c1, c2)
 
     def test_runtime_only_configs_do_not_change_key(self):
+        # [FUNCTION DOC] Test that runtime-only AOTConfig fields (aot_id, fw_compiler) do not
+        # change the cache key.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         config = self.default_config()
@@ -3595,6 +4197,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(c1, c3)
 
     def test_to_cacheable_strips_runtime_only_fields(self):
+        # [FUNCTION DOC] Test that AOTConfig.to_cacheable returns a CacheableAOTConfig that
+        # keeps static_input_indices and precompile_backend_id but has no fw_compiler attribute
+        # (runtime-only compilers and partition function removed).
         config = self.default_config()
         config = dataclasses.replace(
             config,
@@ -3615,7 +4220,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(hasattr(cacheable, "fw_compiler"))
 
     def test_different_cacheable_configs(self):
+        # [FUNCTION DOC] Test that setting static_input_indices or precompile_backend_id on the
+        # config each gives a different cache key than the base config.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         base_config = self.default_config()
@@ -3634,7 +4242,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(base, self.gen_cache_key(fn, config_with_backend))
 
     def test_different_act_input_paths(self):
+        # [FUNCTION DOC] Test that act_input_paths change the key: no paths, a top level path
+        # for input 0, and a nested path through _local_tensor all differ (base vs top level,
+        # and top level vs nested).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         config = self.default_config()
@@ -3648,10 +4260,14 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(top_level_act, nested_act)
 
     def test_different_graphs(self):
+        # [FUNCTION DOC] Test that two functions with different graphs (cos then sin vs sin then
+        # cos) have different cache keys.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.cos().sin().
             return x.cos().sin()
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         config = self.default_config()
@@ -3660,7 +4276,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(c1, c2)
 
     def test_different_configs(self):
+        # [FUNCTION DOC] Test that turning off dynamic_shapes in the AOTConfig changes
+        # the cache key.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.cos().sin().
             return x.cos().sin()
 
         config = self.default_config()
@@ -3671,7 +4290,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(c1, c2)
 
     def test_different_inputs(self):
+        # [FUNCTION DOC] Test that inputs of different shape (3 vs 2 elements) give
+        # different cache keys.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.cos().sin().
             return x.cos().sin()
 
         config = self.default_config()
@@ -3680,7 +4302,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(c1, c2)
 
     def test_different_global_configs(self):
+        # [FUNCTION DOC] Test that global state is part of the key: unchanged state gives equal
+        # keys, while flipping functorch debug_assert, flipping inductor debug, or running under
+        # no_grad each gives a different key.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.cos().sin().
             return x.cos().sin()
 
         config = self.default_config()
@@ -3713,14 +4339,20 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(c1, c2)
 
     def test_incompatible_function(self):
+        # [FUNCTION DOC] Test that key generation raises BypassAOTAutogradCache for an
+        # allow_in_graph autograd Function (which contains a graph break).
         @torch._dynamo.allow_in_graph
         class AllowInGraphFunc(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd Function whose forward breaks the graph
+            # and returns x.sin().
             @staticmethod
             def forward(_, x):
+                # [FUNCTION DOC] HELPER: Forward: graph break, then x.sin().
                 torch._dynamo.graph_break()
                 return x.sin()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the allow_in_graph Function to x.
             return AllowInGraphFunc.apply(x)
 
         config = self.default_config()
@@ -3729,16 +4361,21 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_private_namespace(self):
+        # [FUNCTION DOC] Test that a private function (monkeypatched into the torch
+        # namespace with a leading underscore name and allow_in_graph) makes key
+        # generation raise BypassAOTAutogradCache.
         # TODO: anyone who monkeypatches a **public** function into torch namespace with @allow_in_graph
         # could still break our sanity check and cache something bad. But that's an edge case we'll take the risk on.
         # Monkeypatch some random private function into torch, see that it fails
         @torch._dynamo.allow_in_graph
         def my_private_fun(x):
+            # [FUNCTION DOC] HELPER: Allowed-in-graph function returning x.sin().
             return x.sin()
 
         with patch("torch._my_priv", new=my_private_fun, create=True):
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Calls the patched private torch function on x.
                 return torch._my_priv(x)
 
             config = self.default_config()
@@ -3748,7 +4385,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
     @torch._inductor.config.patch({"freezing": True})
     def test_freezing(self):
+        # [FUNCTION DOC] Test that with inductor freezing enabled key
+        # generation raises BypassAOTAutogradCache.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.cos().sin().
             return x.cos().sin()
 
         config = self.default_config()
@@ -3757,10 +4397,13 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_private_builtin(self):
+        # [FUNCTION DOC] Test that a private builtin (torch._foreach_add) is still cacheable and
+        # that keys differ when its scalar argument differs (1 vs 2).
         # _foreach_add is a private torch function, but
         # it's also a builtin_function_or_method, so it should be allowed to be cached
         # since dynamo allows it in the graph
         def fn(x, b):
+            # [FUNCTION DOC] HELPER: Returns _foreach_add of the pair (x, x) with b.
             y = (x, x)
             return torch._foreach_add(y, b)
 
@@ -3770,12 +4413,17 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertNotEqual(r1, r2)
 
     def test_nn_module_with_params(self):
+        # [FUNCTION DOC] Test that two separate instances of a module with a 3x3 parameter, fed
+        # same-sized inputs, give equal cache keys.
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a 3x3 ones parameter; forward adds it to x.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the 3x3 parameter seq.
                 super().__init__()
                 self.seq = torch.nn.Parameter(torch.ones((3, 3)))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the parameter plus x.
                 return self.seq + x
 
         config = self.default_config()
@@ -3785,8 +4433,12 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(c1, c2)
 
     def test_normal_torch_function(self):
+        # [FUNCTION DOC] Test that a plain torch function (allowed in graph) can have a cache
+        # key generated without raising; no value is asserted.
         @torch._dynamo.allow_in_graph
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes sin(x) + cos(x) (also calls abs, ignoring the
+            # result) and returns the sum.
             y = torch.sin(x)
             z = torch.cos(x)
             w = y + z
@@ -3797,7 +4449,12 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.gen_cache_key(fn, config)
 
     def test_safe_torchfunction(self):
+        # [FUNCTION DOC] Test that a function using safe symbolic torch functions (size
+        # comparison, sym_int, sym_float, sym_sqrt, sym_sum) can have a cache key
+        # generated without raising.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compares x.size() to a Size, builds symbolic numbers from 9
+            # and returns (comparison result, sym_sum of them).
             a = x.size()
             b = torch.Size([3, 3])
             c = a == b
@@ -3811,7 +4468,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         self.gen_cache_key(fn, config, inputs=[torch.ones((3, 3))])
 
     def test_numpy_wrapper_requires_torch_numpy_target(self):
+        # [FUNCTION DOC] Test that a numpy-to-tensor wrapper around a function that is not
+        # from torch._numpy fails check_cacheable with BypassAOTAutogradCache
+        # ("Unsupported call_function target").
         def not_torch_numpy(x):
+            # [FUNCTION DOC] HELPER: Plain function returning x.sin().
             return x.sin()
 
         wrapper = torch._dynamo.utils.numpy_to_tensor_wrapper(not_torch_numpy)
@@ -3827,9 +4488,13 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             check_cacheable(gm)
 
     def test_numpy_wrapper_cache_key_does_not_cache_unknown_callable_ids(self):
+        # [FUNCTION DOC] Test that the torch._numpy cache key lookup returns None for an unknown
+        # callable and does not add an entry to its by-id LRU cache (cache size stays 0). Clears
+        # the cache first.
         torch._dynamo.utils._torch_numpy_callable_cache_key_by_id.cache_clear()
 
         def not_torch_numpy(x):
+            # [FUNCTION DOC] HELPER: Plain function returning x.
             return x
 
         self.assertIsNone(
@@ -3844,6 +4509,8 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_numpy_wrapper_accepts_torch_numpy_alias_target(self):
+        # [FUNCTION DOC] Test that numpy wrappers over torch._numpy abs and absolute pass
+        # check_cacheable and have a non-None numpy wrapper cache key.
         import torch._numpy as tnp
 
         for target in (tnp.abs, tnp.absolute):
@@ -3858,7 +4525,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             self.assertIsNotNone(torch._dynamo.utils.numpy_wrapper_cache_key(wrapper))
 
     def test_numpy_wrapper_rejects_spoofed_torch_numpy_target(self):
+        # [FUNCTION DOC] Test that a function faking torch._numpy module and name (spoofed
+        # round) is rejected by check_cacheable with BypassAOTAutogradCache.
         def spoofed_round(x):
+            # [FUNCTION DOC] HELPER: Plain function returning x.sin() with spoofed metadata.
             return x.sin()
 
         spoofed_round.__module__ = "torch._numpy._funcs_impl"
@@ -3878,10 +4548,14 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             check_cacheable(gm)
 
     def test_numpy_wrapper_rejects_subclass(self):
+        # [FUNCTION DOC] Test that a subclass of the numpy wrapper class is rejected by
+        # check_cacheable with BypassAOTAutogradCache, even around tnp.round.
         import torch._numpy as tnp
 
         class CustomWrapper(torch._dynamo.utils.numpy_to_tensor_wrapper):
+            # [CLASS DOC] HELPER: Subclass of numpy_to_tensor_wrapper with an overridden call.
             def __call__(self, x):
+                # [FUNCTION DOC] HELPER: Returns x unchanged.
                 return x
 
         wrapper = CustomWrapper(tnp.round)
@@ -3897,9 +4571,13 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             check_cacheable(gm)
 
     def test_numpy_wrapper_hash_distinguishes_safe_wrappers(self):
+        # [FUNCTION DOC] Test that graphs with numpy wrappers over tnp.round and tnp.sin are
+        # both cacheable and hash to different values with AOTAutogradCachePickler.
         import torch._numpy as tnp
 
         def make_gm(target):
+            # [FUNCTION DOC] HELPER: Builds a GraphModule with one input, calling a numpy
+            # wrapper of target on it, outputting the call result.
             wrapper = torch._dynamo.utils.numpy_to_tensor_wrapper(target)
             graph = torch.fx.Graph()
             x = graph.placeholder("x")
@@ -3919,7 +4597,12 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_graph_module_hash_preserves_kernel_idx_strings(self):
+        # [FUNCTION DOC] Test that the graph module hash keeps string arguments such as
+        # "kernel_idx = 1" vs "kernel_idx = 2" distinct: two graphs calling _assert with those
+        # messages are cacheable and hash differently.
         def make_gm(message):
+            # [FUNCTION DOC] HELPER: Builds a GraphModule with an input and a call to
+            # torch._assert(True, message); the input is the output.
             graph = torch.fx.Graph()
             x = graph.placeholder("x")
             graph.call_function(torch._assert, (True, message))
@@ -3938,7 +4621,12 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_sanitize_gm_for_cache(self):
+        # [FUNCTION DOC] Test that graph metadata and compile_subgraph_reason do not affect the
+        # key: the keys computed with different meta values and reason are all equal, with and
+        # without the sanitize_gm_for_cache context.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes sin(x) + cos(x) (calls abs on the sum and drops
+            # it) and returns the sum.
             y = torch.sin(x)
             z = torch.cos(x)
             w = y + z
@@ -3970,6 +4658,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(c1, c4)
 
     def test_dill_serialization_with_inner_functions(self):
+        # [FUNCTION DOC] Test that, when dill is available, a graph with an inner function
+        # stored in node metadata round trips through GraphPickler (dumps then loads with a fake
+        # mode) and the function still works (returns 10 for input 5). Skips if dill is missing.
         """
         Test that with dill, we can now serialize graphs that contain inner functions
         in node metadata. Standard pickle would fail on these because inner functions
@@ -3984,11 +4675,13 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             self.skipTest("dill not available")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().cos().
             return x.sin().cos()
 
         _, fx_g, example_inputs = self._get_dynamo_output(fn, torch.ones(3))
 
         def inner_helper(x):
+            # [FUNCTION DOC] HELPER: Inner (non-module-level) function returning x * 2.
             return x * 2
 
         for node in fx_g.graph.nodes:
@@ -4005,6 +4698,8 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(node.meta["inner_fn"](5), 10)
 
     def test_pickle_entry_with_unpicklable_field(self):
+        # [FUNCTION DOC] Test that _pickle_entry returns None and logs exactly one warning
+        # (naming the WeakValueDictionary remove callback) when an entry field is unpicklable.
         from weakref import WeakValueDictionary
 
         # WeakValueDictionary's internal 'remove' callback is unpicklable
@@ -4027,6 +4722,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_pickle_entry_with_lambda(self):
+        # [FUNCTION DOC] Test that _pickle_entry on an entry with a lambda field returns None,
+        # logs one warning naming the lambda, and emits one structured trace artifact named
+        # aotautograd_cache_pickle_failure with json encoding.
         entry = _MockEntryForPickleTest(
             picklable_field="test",
             unpicklable_field=lambda x: x,  # lambdas are unpicklable
@@ -4055,6 +4753,8 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
     @functorch_config.patch("strict_autograd_cache", True)
     def test_pickle_entry_strict_mode_raises(self):
+        # [FUNCTION DOC] Test that with strict_autograd_cache on, _pickle_entry re-raises the
+        # pickling error (AttributeError or PicklingError) naming the local lambda.
         entry = _MockEntryForPickleTest(
             picklable_field="test",
             unpicklable_field=lambda x: x,
@@ -4071,6 +4771,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
     @skipIfXpu(msg="https://github.com/intel/torch-xpu-ops/issues/4091")
     @requires_gpu_and_triton
     def test_prepare_for_pickle_clears_benchmark_failure_reasons(self):
+        # [FUNCTION DOC] Test that CachingAutotuner.prepare_for_pickle clears
+        # benchmark_failure_reasons: runs a small triton add kernel through an autotuner,
+        # injects a launcher key into benchmark_failure_reasons, checks that pickling then
+        # fails, and that after prepare_for_pickle the dict is empty and pickling succeeds.
+        # Needs a GPU and triton; skipped on XPU.
         """prepare_for_pickle clears benchmark_failure_reasons which can hold
         exec'd launcher keys that aren't picklable.
         """
@@ -4095,6 +4800,8 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         if triton_version_uses_attrs_dict():
             meta["signature"]["XBLOCK"] = "constexpr"
 
+        # [FUNCTION DOC] HELPER: Triton kernel adding 1.0 to xnumel elements of in_ptr0 in
+        # blocks of XBLOCK, writing to out_ptr0 with a mask.
         @triton.jit
         def _add_kernel(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr):
             pid = tl.program_id(0)
@@ -4138,6 +4845,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         pickle.dumps(autotuner)
 
     def test_nested_tensor_subclass_cache_key(self):
+        # [FUNCTION DOC] Test that the cache key of a nested tensor subclass is the same in two
+        # separate spawned processes: each runs the module level subprocess function and returns
+        # its key via a queue. Skips if a subprocess fails.
         ctx = multiprocessing.get_context("spawn")
         results = []
         for _ in range(2):
@@ -4163,6 +4873,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
     def test_dtensor_different_process_cache_key(self):
+        # [FUNCTION DOC] Test that a DTensor's cache key is identical across two separate
+        # spawned processes (needed for warm start hits), using the module level subprocess
+        # function. Skips if a subprocess fails or distributed is unavailable.
         """
         Test that DTensor cache keys are consistent across different processes.
 
@@ -4195,6 +4908,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
     def test_dtensor_fake_script_object_mesh_cache_key(self):
+        # [FUNCTION DOC] Test that a DTensor whose mesh is a FakeScriptObject wrapping a
+        # DeviceMesh hashes the same under AOTAutogradCachePickler as one with the real mesh.
+        # Uses a fake process group.
         from torch._library.fake_class_registry import FakeScriptObject
         from torch.distributed.device_mesh import DeviceMesh
         from torch.distributed.tensor import DTensor, Replicate
@@ -4240,6 +4956,9 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not torch.distributed.is_available(), "requires distributed")
     def test_dtensor_different_placements_different_cache_key(self):
+        # [FUNCTION DOC] Test that DTensors with the same local data but different placements
+        # (Replicate vs Shard on dim 0) on a fake 2-rank CPU mesh hash differently with
+        # AOTAutogradCachePickler built from a captured graph.
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import DTensor, Replicate, Shard
 
@@ -4251,6 +4970,7 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             dtensor_shard = DTensor.from_local(local_tensor, mesh, [Shard(0)])
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Returns x.sin().
                 return x.sin()
 
             # Get dynamo output for replicate
@@ -4258,6 +4978,8 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             fx_graph = None
 
             def compiler(gm, inputs, **kwargs):
+                # [FUNCTION DOC] HELPER: Backend that stores gm in the enclosing fx_graph and
+                # returns it unchanged.
                 nonlocal fx_graph
                 fx_graph = gm
                 return gm
@@ -4277,6 +4999,10 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_reducer_override_fallthrough_for_unpicklable_types(self):
+        # [FUNCTION DOC] Test that AOTAutogradCachePickler falls back to the parent
+        # reducer_override for objects that are not tensor subclasses and cannot be pickled
+        # normally: pickling does not raise, equal values give equal bytes and different values
+        # give different bytes.
         """
         Test that AOTAutogradCachePickler falls through to the parent class
         reducer_override for types that are not tensor subclasses but are
@@ -4284,12 +5010,17 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
         """
 
         class FakeReduceOp:
+            # [CLASS DOC] HELPER: Object holding a name whose pickling protocol raises
+            # TypeError, imitating a pybind11 enum.
             """Simulates a pybind11 enum that cannot be pickled."""
 
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: Stores the name.
                 self.name = name
 
             def __reduce_ex__(self, protocol):
+                # [FUNCTION DOC] HELPER: Always raises TypeError saying the object cannot be
+                # pickled; the pickler must handle this itself.
                 raise TypeError("cannot pickle 'FakeReduceOp' object")
 
         gm = torch.fx.GraphModule({}, torch.fx.Graph())
@@ -4311,6 +5042,11 @@ class AOTAutogradCachePicklerTests(torch._dynamo.test_case.TestCase):
 
 
 def _subprocess_gen_dtensor_cache_key(queue):
+    # [FUNCTION DOC] HELPER: Runs in a spawned process. Creates a fake 2-rank process group and
+    # mesh, builds a Replicate DTensor of zeros, captures the FX graph of a sin function
+    # compiled with a capturing backend, computes the AOTAutogradCachePickler hash of the
+    # DTensor and puts it in queue. Always destroys the process group. Module level so
+    # multiprocessing can import it.
     """
     Subprocess helper to generate a DTensor cache key.
     Must be at module level for multiprocessing to work.
@@ -4333,6 +5069,7 @@ def _subprocess_gen_dtensor_cache_key(queue):
         dtensor = DTensor.from_local(local_tensor, mesh, [Replicate()])
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x.sin().
             return x.sin()
 
         # Get dynamo output
@@ -4340,6 +5077,8 @@ def _subprocess_gen_dtensor_cache_key(queue):
         fx_graph = None
 
         def compiler(gm, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Backend that stores gm in the enclosing fx_graph and
+            # returns it unchanged.
             nonlocal fx_graph
             fx_graph = gm
             return gm
@@ -4356,6 +5095,9 @@ def _subprocess_gen_dtensor_cache_key(queue):
 
 
 def _subprocess_gen_nested_subclass_cache_key(queue):
+    # [FUNCTION DOC] HELPER: Runs in a spawned process. Builds a TwoTensor of two TwoTensors of
+    # zeros, captures the FX graph of a sin function with a capturing backend, computes the
+    # AOTAutogradCachePickler hash of the nested subclass and puts it in queue.
     import torch
     import torch._dynamo
     from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCachePickler
@@ -4366,6 +5108,7 @@ def _subprocess_gen_nested_subclass_cache_key(queue):
     nested_two_tensor = TwoTensor(inner1, inner2)
 
     def fn(x):
+        # [FUNCTION DOC] HELPER: Returns x.sin().
         return x.sin()
 
     # Get dynamo output
@@ -4373,6 +5116,8 @@ def _subprocess_gen_nested_subclass_cache_key(queue):
     fx_graph = None
 
     def compiler(gm, inputs, **kwargs):
+        # [FUNCTION DOC] HELPER: Backend that stores gm in the enclosing fx_graph and
+        # returns it unchanged.
         nonlocal fx_graph
         fx_graph = gm
         return gm
@@ -4387,24 +5132,33 @@ def _subprocess_gen_nested_subclass_cache_key(queue):
 
 
 def _policy_save_mm(ctx, op, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Selective checkpoint policy returning MUST_SAVE for the aten mm op
+    # and MUST_RECOMPUTE for every other op.
     if op == torch.ops.aten.mm.default:
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.MUST_RECOMPUTE
 
 
 def _policy_save_add(ctx, op, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Selective checkpoint policy returning MUST_SAVE for the aten
+    # add.Tensor op and MUST_RECOMPUTE for every other op.
     if op == torch.ops.aten.add.Tensor:
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.MUST_RECOMPUTE
 
 
 def _policy_no_hash(ctx, op, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Same behavior as the save-mm policy (saves mm, recomputes the
+    # rest); used with a context function that has no cache_hash.
     if op == torch.ops.aten.mm.default:
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.MUST_RECOMPUTE
 
 
 def _create_sac_ctx_fn(policy, cache_hash=None):
+    # [FUNCTION DOC] HELPER: Returns a partial of create_selective_checkpoint_contexts bound to
+    # policy; if cache_hash is not None it is stored as the cache_hash attribute of the partial
+    # (which the cache uses as the policy's identity).
     """
     Helper to create a SAC context_fn with cache_hash set on the partial.
     """
@@ -4415,12 +5169,18 @@ def _create_sac_ctx_fn(policy, cache_hash=None):
 
 
 class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests of how higher-order-op regions (activation
+    # checkpointing with selective checkpoint policies, RNG in checkpoint) interact
+    # with the autograd cache. Includes the key-equivalence mixin check. Counters
+    # are cleared and dynamo reset before and after each test.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs parent setUp, clears counters, resets dynamo.
         super().setUp()
         counters.clear()
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs parent tearDown, clears counters, resets dynamo.
         super().tearDown()
         counters.clear()
         torch._dynamo.reset()
@@ -4431,7 +5191,12 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_different_sac_policies_cause_cache_miss(self):
+        # [FUNCTION DOC] Test (strict mode) that two selective checkpoint policies with
+        # different cache_hash values give different cache entries: compiling with the save-mm
+        # policy is one miss; after a dynamo reset, compiling with the save-add policy is a
+        # second miss with no hits.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Computes mm(x, y), then adds x to it, and returns that.
             a = torch.mm(x, y)
             b = torch.add(a, x)
             return b
@@ -4442,6 +5207,8 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
 
         @torch.compile(backend="inductor")
         def fn_with_checkpoint(x, y, ctx_fn):
+            # [FUNCTION DOC] HELPER: Compiled function running gn under non-reentrant checkpoint
+            # with the given context function.
             return checkpoint(gn, x, y, use_reentrant=False, context_fn=ctx_fn)
 
         x = torch.randn(4, 4)
@@ -4468,7 +5235,11 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_same_sac_policy_causes_cache_hit(self):
+        # [FUNCTION DOC] Test (strict mode) that the same selective checkpoint policy and hash
+        # cause a cache hit: first run one miss; after a dynamo reset the second run has one hit
+        # and still one miss.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Computes mm(x, y), then adds x to it, and returns that.
             a = torch.mm(x, y)
             b = torch.add(a, x)
             return b
@@ -4477,6 +5248,8 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
 
         @torch.compile(backend="inductor")
         def fn_with_checkpoint(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function running gn under non-reentrant checkpoint
+            # with the shared context function.
             return checkpoint(gn, x, y, use_reentrant=False, context_fn=ctx_fn)
 
         x = torch.randn(4, 4)
@@ -4503,11 +5276,17 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_checkpoint_with_dropout_caches_correctly(self):
+        # [FUNCTION DOC] Test (strict mode) that a checkpointed region with dropout (random ops)
+        # is cacheable: forward and backward of the first run is one miss; after a dynamo reset
+        # the second run is a hit with the miss count unchanged.
         def gn(x):
+            # [FUNCTION DOC] HELPER: Applies dropout with p of 0.5 in training mode.
             return torch.dropout(x, p=0.5, train=True)
 
         @torch.compile(backend="inductor")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function running gn
+            # under non-reentrant checkpoint.
             return checkpoint(gn, x, use_reentrant=False)
 
         x = torch.randn(4, 4, requires_grad=True)
@@ -4533,7 +5312,10 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
     @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch("enable_autograd_cache", True)
     def test_sac_without_cache_hash_bypasses_cache(self):
+        # [FUNCTION DOC] Test that a selective checkpoint context function without a cache_hash
+        # makes the autograd cache bypass: no miss, no hit, and a positive bypass counter.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Computes mm(x, y), then adds x to it, and returns that.
             a = torch.mm(x, y)
             b = torch.add(a, x)
             return b
@@ -4542,6 +5324,8 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
 
         @torch.compile(backend="inductor")
         def fn_with_checkpoint(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function running gn under non-reentrant checkpoint
+            # with the context function that has no hash.
             return checkpoint(gn, x, y, use_reentrant=False, context_fn=ctx_fn)
 
         x = torch.randn(4, 4)
@@ -4560,7 +5344,11 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_changing_cache_hash_invalidates_cache(self):
+        # [FUNCTION DOC] Test (strict mode) that using a different policy and different
+        # cache_hash invalidates the cache: the save-mm function is one miss; after a dynamo
+        # reset the save-add function is a second miss with no hits.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: Computes mm(x, y), then adds x to it, and returns that.
             a = torch.mm(x, y)
             b = torch.add(a, x)
             return b
@@ -4571,10 +5359,14 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
 
         @torch.compile(backend="inductor")
         def fn_mm(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function checkpointing gn with the
+            # save-mm context function.
             return checkpoint(gn, x, y, use_reentrant=False, context_fn=ctx_fn_mm)
 
         @torch.compile(backend="inductor")
         def fn_add(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function checkpointing gn with the
+            # save-add context function.
             return checkpoint(gn, x, y, use_reentrant=False, context_fn=ctx_fn_add)
 
         x = torch.randn(4, 4)
@@ -4596,22 +5388,32 @@ class HOPCacheTests(CacheKeyEquivalenceMixin, torch._dynamo.test_case.TestCase):
 
 @instantiate_parametrized_tests
 class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests that the public autograd_cache_key functions (the one in aot_autograd
+    # and the one in compile_fx) return the same key as the key computed during a real
+    # torch.compile run, and that keys vary with input dtype and graph. Counters are cleared and
+    # dynamo reset around each test.
     """
     Verify that the exposed autograd_cache_key API function produces the same
     cache key that the internal compilation pipeline would.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs parent setUp, clears counters, resets dynamo.
         super().setUp()
         counters.clear()
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs parent tearDown, clears counters, resets dynamo.
         super().tearDown()
         counters.clear()
         torch._dynamo.reset()
 
     def _compile_and_capture(self, fn, *args):
+        # [FUNCTION DOC] HELPER: Compiles fn (fullgraph, default backend) in a fresh cache while
+        # patching compile_fx and autograd_cache_key with wrappers that capture the graph
+        # module, example inputs and the key (first element of the real result). Asserts a key
+        # was captured and returns (key, graph module, example inputs list).
         """Run torch.compile with the inductor backend and capture the
         ground-truth cache key, graph module, and example inputs produced
         during compilation."""
@@ -4622,6 +5424,8 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         captured_example_inputs = None
 
         def capturing_compile_fx(model_, example_inputs_, **kwargs):
+            # [FUNCTION DOC] HELPER: Records model_ and a list of the example inputs, then
+            # delegates to the real compile_fx and returns its result.
             nonlocal captured_gm, captured_example_inputs
             captured_gm = model_
             captured_example_inputs = list(example_inputs_)
@@ -4632,6 +5436,8 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         def capturing_cache_key(
             mod, ei, config, compiler_config_extra=None, act_input_paths=()
         ):
+            # [FUNCTION DOC] HELPER: Calls the real autograd_cache_key, stores the key (first
+            # element of its result) in the enclosing captured_key and returns the result.
             nonlocal captured_key
             result = real_cache_key(
                 mod, ei, config, compiler_config_extra, act_input_paths
@@ -4656,12 +5462,19 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         return captured_key, captured_gm, captured_example_inputs
 
     def _tracing_context(self):
+        # [FUNCTION DOC] HELPER: Returns a tracing context manager holding a TracingContext with
+        # a fake mode and a fresh ShapeEnv.
         """Create a TracingContext with a ShapeEnv, as required by
         _check_can_cache inside the cache key computation."""
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
         return torch._guards.tracing(TracingContext(fake_mode))
 
     def _aot_autograd_cache_key(self, fx_graph, example_inputs):
+        # [FUNCTION DOC] HELPER: Calls aot_autograd.autograd_cache_key on the graph with the
+        # settings compile_fx would use: compiler config extra from the graph, the inductor
+        # decomposition table, ignore_shape_env, keep_inference_input_mutations, and functorch
+        # patches for unlift_effect_tokens and selective_decompose. Runs inside a tracing
+        # context and returns the (key, debug info) result.
         """Call aot_autograd.autograd_cache_key with the same config and
         tracing context that compile_fx would use."""
         from torch._inductor.compile_fx import create_compiler_config_extra
@@ -4689,6 +5502,9 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
             )
 
     def _compile_fx_cache_key(self, fx_graph, example_inputs):
+        # [FUNCTION DOC] HELPER: Calls compile_fx.autograd_cache_key (which handles
+        # decompositions and config patching itself) with ignore_shape_env inside a tracing
+        # context and returns the (key, debug info) result.
         """Call compile_fx.autograd_cache_key, the higher-level API that
         handles decompositions and config patching internally."""
         with self._tracing_context():
@@ -4705,9 +5521,12 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_matches_torch_compile(self):
+        # [FUNCTION DOC] Test that the keys from aot_autograd.autograd_cache_key and
+        # compile_fx.autograd_cache_key equal the key captured from a real compile.
         """autograd_cache_key matches the real compile_fx pipeline."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sin(x) + cos(x).
             return x.sin() + x.cos()
 
         x = torch.randn(4, 4)
@@ -4725,9 +5544,12 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_stable_across_calls(self):
+        # [FUNCTION DOC] Test that cache keys are deterministic: repeated calls of each API
+        # agree with each other and with the key from the real compile.
         """Cache keys should be deterministic."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sin(x) + cos(x).
             return x.sin() + x.cos()
 
         x = torch.randn(4, 4)
@@ -4748,9 +5570,12 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_varies_with_different_inputs(self):
+        # [FUNCTION DOC] Test that float32 and float64 inputs give different keys, each matching
+        # the key from the corresponding real compile via both APIs.
         """Different input dtypes should produce different cache keys."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sin(x) + cos(x).
             return x.sin() + x.cos()
 
         x_float = torch.randn(4, 4)
@@ -4775,12 +5600,16 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_varies_with_different_graphs(self):
+        # [FUNCTION DOC] Test that two different functions give different keys, each matching
+        # the real compile key via both APIs.
         """Different model functions should produce different cache keys."""
 
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Returns sin(x) + cos(x).
             return x.sin() + x.cos()
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Returns exp(x) * log(x).
             return x.exp() * x.log()
 
         x = torch.randn(4, 4)
@@ -4804,14 +5633,19 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_for_module(self):
+        # [FUNCTION DOC] Test that the key APIs match the real compile key for an nn.Module
+        # (linear layer followed by relu).
         """autograd_cache_key matches compilation for nn.Modules."""
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 4x4 linear layer; forward returns relu of it.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the 4-to-4 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns relu of the linear layer applied to x.
                 return self.linear(x).relu()
 
         mod = MyModule()
@@ -4830,9 +5664,12 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
     def test_cache_key_for_multiple_outputs(self):
+        # [FUNCTION DOC] Test that the key APIs match the real compile key for a function
+        # returning two outputs.
         """autograd_cache_key matches compilation for multiple outputs."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the tuple (sin(x), cos(x)).
             return x.sin(), x.cos()
 
         x = torch.randn(4, 4)
@@ -4857,6 +5694,12 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
     def test_standalone_compile_cache_key_matches_standalone_compile(
         self, dynamic_shapes, aot
     ):
+        # [FUNCTION DOC] Parametrized test (dynamic_shapes mode and aot flag) that the
+        # standalone_compile autograd_cache_key equals the key really used by
+        # standalone_compile. Builds an FX graph by hand for sin(x) + cos(x) with fake example
+        # values, runs standalone_compile while capturing the key (with a tracing context or
+        # fake mode as the mode requires), then computes the key from the standalone API and
+        # asserts they are equal.
         """standalone_compile.autograd_cache_key matches the real key
         produced when running standalone_compile end-to-end."""
         from contextlib import nullcontext
@@ -4898,6 +5741,8 @@ class CacheKeyAPITests(torch._dynamo.test_case.TestCase):
         def capturing_cache_key(
             mod, ei, config, compiler_config_extra=None, act_input_paths=()
         ):
+            # [FUNCTION DOC] HELPER: Calls the real autograd_cache_key, stores its key in the
+            # enclosing captured_key and returns the same (key, debug info) pair.
             nonlocal captured_key
             captured_key, _ = real_cache_key_fn(
                 mod, ei, config, compiler_config_extra, act_input_paths
