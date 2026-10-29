@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Model averaging strategies for local-SGD style training. Defines the abstract
+# ModelAverager base class and PeriodicModelAverager, which all-reduces (averages)
+# parameters every fixed number of steps after a warm-up period.
+# Exports ModelAverager and PeriodicModelAverager. No import-time side effects.
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -13,6 +18,9 @@ __all__ = ["ModelAverager", "PeriodicModelAverager"]
 
 
 class ModelAverager(ABC):
+    # [CLASS DOC] Abstract base for model averagers. Holds the process group used for
+    # all-reduce (defaults to the world group) and an integer step counter starting at 0.
+    # Subclasses must implement average_parameters and are responsible for advancing step.
     r"""Base class for all model averagers.
 
     Args:
@@ -23,6 +31,8 @@ class ModelAverager(ABC):
     """
 
     def __init__(self, process_group: dist.ProcessGroup | None = None):
+        # [FUNCTION DOC] Stores the given process group (or the default world group when
+        # None; asserts the world group exists via not_none) and sets the step counter to 0.
         self.process_group = (
             process_group if process_group is not None else _not_none(dist.group.WORLD)
         )
@@ -30,10 +40,15 @@ class ModelAverager(ABC):
 
     @abstractmethod
     def average_parameters(self, params):
+        # [FUNCTION DOC] Abstract hook: average the given parameters across the process
+        # group. Base implementation always raises NotImplementedError.
         raise NotImplementedError
 
 
 class PeriodicModelAverager(ModelAverager):
+    # [CLASS DOC] Averager that skips the first warmup_steps steps, then averages
+    # parameters over the process group once every period steps. State: period,
+    # warmup_steps, and the inherited step counter and process group.
     r"""
     Averages parameters periodically after the warm-up stage.
 
@@ -89,6 +104,9 @@ class PeriodicModelAverager(ModelAverager):
     def __init__(
         self, period, warmup_steps=0, process_group: dist.ProcessGroup | None = None
     ):
+        # [FUNCTION DOC] Validates and stores period and warmup_steps.
+        # Raises ValueError if warmup_steps is negative or period is below 1; emits a
+        # warning when period equals 1 (plain DDP would be cheaper).
         super().__init__(process_group)
         if warmup_steps < 0:
             raise ValueError("Arg ``warmup_steps`` must be a non-negative number.")
@@ -109,6 +127,10 @@ class PeriodicModelAverager(ModelAverager):
         self,
         params: Iterable[torch.nn.Parameter] | Iterable[dict[str, torch.nn.Parameter]],
     ):
+        # [FUNCTION DOC] Averages the given parameters (or optimizer param groups) across the
+        # process group when the step counter is at or past warmup_steps and the distance
+        # from warmup_steps is a multiple of period. Always increments step by one.
+        # Side effects: collective all-reduce communication; parameters updated in place.
         """
         Averages parameters or parameter groups of an optimizer if ``step`` is no less than ``warmup_steps``.
 

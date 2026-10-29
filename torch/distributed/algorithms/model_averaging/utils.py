@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Helper functions for model averaging: filter parameters that have gradients, flatten
+# and all-reduce-average them over a process group, and write results back.
+# Exports average_parameters, get_params_to_average, average_parameters_or_parameter_groups.
 import itertools
 from collections.abc import Iterable, Iterator
 
@@ -21,6 +25,11 @@ __all__ = [
 def average_parameters(
     params: Iterator[torch.nn.Parameter], process_group: ProcessGroup
 ):
+    # [FUNCTION DOC] Averages the parameters across the process group (the world group if
+    # None). Returns immediately if this rank is not in the group. Otherwise concatenates all
+    # flattened parameter data, divides by group size, synchronizes the accelerator if one is
+    # available, all-reduces (sum) in place, then copies slices back into each parameter's data,
+    # restoring original shapes and dtypes. Needs extra memory equal to the parameters' size.
     """
     Averages all the given parameters.
 
@@ -52,6 +61,9 @@ def average_parameters(
 def get_params_to_average(
     params: Iterable[torch.nn.Parameter] | Iterable[dict[str, torch.nn.Parameter]],
 ):
+    # [FUNCTION DOC] Returns a list of parameters having a non-empty gradient. Input items may
+    # be parameters (model parameters) or mappings with a params entry (optimizer param groups).
+    # Raises NotImplementedError for any other item type.
     """
     Return a list of parameters that need to average.
 
@@ -82,5 +94,6 @@ def average_parameters_or_parameter_groups(
     params: Iterable[torch.nn.Parameter] | Iterable[dict[str, torch.nn.Parameter]],
     process_group: ProcessGroup,
 ):
+    # [FUNCTION DOC] Filters to parameters with gradients, then averages them over the group.
     """Averages parameters of a model or parameter groups of an optimizer."""
     average_parameters(iter(get_params_to_average(params)), process_group)

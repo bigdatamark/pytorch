@@ -6,11 +6,17 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC]
+# Custom argparse actions that let command-line options default from PET_<DEST> environment
+# variables: env (value options) and check_env (boolean flags). No import-time side effects.
 import os
 from argparse import Action
 
 
 class env(Action):
+    # [CLASS DOC] argparse Action whose default is taken from the environment variable
+    # PET_ plus the upper-cased dest, falling back to the given default. An explicit
+    # command-line value always wins. Stores the parsed value on the namespace.
     """
     Get argument values from ``PET_{dest}`` before defaulting to the given ``default`` value.
 
@@ -42,6 +48,9 @@ class env(Action):
     """
 
     def __init__(self, dest, default=None, required=False, **kwargs) -> None:
+        # [FUNCTION DOC] Looks up the PET_ environment variable for dest; its value (if set)
+        # replaces default. If the resulting default is truthy, required is forced to False.
+        # Delegates to the base Action constructor.
         env_name = f"PET_{dest.upper()}"
         default = os.environ.get(env_name, default)
 
@@ -55,10 +64,14 @@ class env(Action):
         super().__init__(dest=dest, default=default, required=required, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
+        # [FUNCTION DOC] Stores the command-line value on the namespace under dest.
         setattr(namespace, self.dest, values)
 
 
 class check_env(Action):
+    # [CLASS DOC] argparse Action for boolean flags (takes no value, like store_true) whose
+    # default comes from the PET_ environment variable for dest, read as an integer
+    # (non-zero means True). Presence of the flag on the command line always yields True.
     """
     Check whether the env var ``PET_{dest}`` exists before defaulting to the given ``default`` value.
 
@@ -96,9 +109,13 @@ class check_env(Action):
     """
 
     def __init__(self, dest, default=False, **kwargs) -> None:
+        # [FUNCTION DOC] Computes the default from the PET_ environment variable (parsed as an
+        # integer, so a non-integer value raises ValueError), falling back to the given default.
+        # Registers the action with a constant True and zero arguments.
         env_name = f"PET_{dest.upper()}"
         default = bool(int(os.environ.get(env_name, "1" if default else "0")))
         super().__init__(dest=dest, const=True, default=default, nargs=0, **kwargs)
 
     def __call__(self, parser, namespace, values, option_string=None):
+        # [FUNCTION DOC] Sets the namespace attribute dest to True (the constant) when the flag is given.
         setattr(namespace, self.dest, self.const)

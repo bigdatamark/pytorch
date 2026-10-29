@@ -1,5 +1,9 @@
 # pyre-strict
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Thread based async checkpoint executor: runs the synchronous save in a single worker
+# thread. Contains the worker function save_wrapper and the executor class. No import-time
+# side effects.
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -20,6 +24,10 @@ def save_wrapper(
     no_dist: bool = False,
     use_collectives: bool = True,
 ) -> Future:
+    # [FUNCTION DOC] HELPER: worker run in the executor thread. If given a future, waits for
+    # its result (the staged state dict), then calls the synchronous save with all other
+    # arguments passed through and returns its result. Exceptions from the future or save propagate.
+    # KNOWN ISSUE: the return annotation says Future but save returns checkpoint metadata.
     from torch.distributed.checkpoint.state_dict_saver import save
 
     staged_dict = (
@@ -39,7 +47,11 @@ def save_wrapper(
 
 
 class _ThreadBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
+    # [CLASS DOC] HELPER: executor that submits saves to a private single-worker thread pool.
+    # The pool is shut down (without waiting) once a submitted save completes, so each instance
+    # is effectively usable for one save.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: creates the one-thread pool with a name prefix for its thread.
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="AsyncCheckpointExecutor"
         )
@@ -55,6 +67,9 @@ class _ThreadBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Future:
+        # [FUNCTION DOC] HELPER: submits the save wrapper to the thread pool with the given
+        # arguments, registers a callback that shuts the pool down when the future finishes,
+        # and returns the future (resolving to the save result).
         f: Future = self._executor.submit(
             save_wrapper,
             staging_future_or_state_dict=staging_future_or_state_dict,

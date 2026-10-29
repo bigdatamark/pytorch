@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Python front end for distributed autograd. When the C++ extension is built with
+# distributed support, re-exports the native context helpers and backward, get_gradients,
+# DistAutogradContext. Defines the context manager class (creates and releases a distributed
+# autograd context id) and is_available. Import-time side effect: initializes the native
+# module and raises RuntimeError if that initialization fails. Public __all__: context, is_available.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -10,6 +16,7 @@ if TYPE_CHECKING:
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if the torch C extension was built with distributed autograd support.
     return hasattr(torch._C, "_dist_autograd_init")
 
 
@@ -35,6 +42,9 @@ __all__ = ["context", "is_available"]
 
 
 class context:
+    # [CLASS DOC] Context manager wrapping a distributed autograd pass. Entering creates a
+    # new native context (kept in autograd_context) and yields its integer id; exiting
+    # releases that context. Used with rpc calls and the distributed backward function.
     """
     Context object to wrap forward and backward passes when using
     distributed autograd. The ``context_id`` generated in the ``with``
@@ -54,6 +64,7 @@ class context:
     """
 
     def __enter__(self) -> int:
+        # [FUNCTION DOC] Creates a new distributed autograd context, stores it, returns its integer id.
         self.autograd_context = _new_context()
         return self.autograd_context._context_id()
 
@@ -63,4 +74,5 @@ class context:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Releases the context created on entry; exception info is ignored (not suppressed).
         _release_context(self.autograd_context._context_id())

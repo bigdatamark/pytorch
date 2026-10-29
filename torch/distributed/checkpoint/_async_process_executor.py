@@ -1,5 +1,12 @@
 # pyre-strict
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Process based async checkpoint executor. A long-lived daemon subprocess (spawned per rank, with
+# its own gloo process group) performs checkpoint saves; the trainer talks to it over a pipe
+# using request/response objects. Contains the control enum, request and init-info dataclasses,
+# the subprocess manager class, a module-level singleton (_CHECKPOINT_PROCESS) and the executor class.
+# Environment switches read at runtime: DCP_USE_PREFIX_STORE, DCP_DISABLE_AUTOMATIC_GC,
+# DCP_DISABLE_MANUAL_GC. Import-time side effect: none beyond creating the root-level logger reference.
 import gc
 import logging
 import os
@@ -26,22 +33,29 @@ logger = logging.getLogger()
 
 
 class _CheckpointSaveProcessControlOpts(Enum):
+    # [CLASS DOC] HELPER: control messages exchanged with the background process: INIT_COMPLETE
+    # (child to parent, initialization done) and TERMINATE (parent to child, shut down).
     INIT_COMPLETE = "init_complete"
     TERMINATE = "terminate"
 
 
 @dataclass(init=False, unsafe_hash=True)
 class _CheckpointRequestIdentifier:
+    # [CLASS DOC] HELPER: identifies one save request: the checkpoint id plus a random unique
+    # string. Hashable (unsafe hash) so it can key request tracking.
     checkpoint_id: str | os.PathLike | None
     uuid: str
 
     def __init__(self, checkpoint_id: str | os.PathLike | None):
+        # [FUNCTION DOC] HELPER: stores the checkpoint id and generates a fresh random unique string.
         self.checkpoint_id = checkpoint_id
         self.uuid = str(uuid4())
 
 
 @dataclass
 class _AsyncCheckpointRequest:
+    # [CLASS DOC] HELPER: message sent to the background process: the staged state dict, request
+    # identifier, optional storage writer and planner, and the no_dist and use_collectives flags.
     staged_state_dict: STATE_DICT_TYPE
     checkpoint_request_id: _CheckpointRequestIdentifier
     storage_writer: StorageWriter | None = None
@@ -52,6 +66,9 @@ class _AsyncCheckpointRequest:
 
 @dataclass(init=False)
 class _ProcessGroupInitInfo:
+    # [CLASS DOC] HELPER: picklable bundle of what the background process needs to create its own
+    # process group: node-local rank, global rank, world size, rendezvous address and port, and
+    # flags for prefix store use and for disabling automatic or manual garbage collection.
     local_rank: int
     global_rank: int
     world_size: int
@@ -62,6 +79,11 @@ class _ProcessGroupInitInfo:
     disable_manual_gc: bool
 
     def __init__(self, process_group: dist.ProcessGroup | None = None):
+        # [FUNCTION DOC] HELPER: collective call (all ranks of the group must call it). Reads ranks
+        # and world size from the given group and the three DCP environment switches (set to 1 to
+        # enable). The coordinator (rank 0) chooses the rendezvous address and port, which are
+        # broadcast to all ranks and saved. Raises AssertionError if the prefix store mode lacks
+        # MASTER_ADDR or MASTER_PORT.
         self.local_rank = dist.get_node_local_rank(fallback_rank=0)
         self.global_rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
@@ -82,6 +104,9 @@ class _ProcessGroupInitInfo:
         )
 
         def get_master_addr_and_port() -> tuple[str, int]:
+            # [FUNCTION DOC] HELPER: runs only on the coordinator. In prefix store mode returns the
+            # MASTER_ADDR and MASTER_PORT environment values (error if missing). Otherwise returns
+            # MASTER_ADDR or the fully qualified hostname, and a newly found free port.
             if self.use_prefix_store:
                 master_addr = os.environ.get("MASTER_ADDR")
                 master_port = os.environ.get("MASTER_PORT")
@@ -105,10 +130,18 @@ class _ProcessGroupInitInfo:
 
 
 class _AsyncCheckpointProcess:
+    # [CLASS DOC] HELPER: parent-side handle for the daemon checkpoint subprocess. Owns the spawn
+    # context, the pipe end used to talk to the child, and the process. Sends save requests and
+    # waits for metadata or exceptions; terminates the child on garbage collection. The child runs
+    # the static method _checkpointing_subprocess (init phase, then a serving loop).
     def __init__(
         self,
         pg_init_info: _ProcessGroupInitInfo,
     ):
+        # [FUNCTION DOC] HELPER: spawns the daemon subprocess with the init info and a pipe end,
+        # closes the parent's copy of the child end, then blocks up to 1800 seconds for the init
+        # complete message. Raises RuntimeError on timeout or child death, AssertionError if the
+        # response is not the init complete message, or re-raises an exception sent by the child.
         self.ctx = mp.get_context("spawn")
         self._process_pipe, child_end = self.ctx.Pipe()
 
@@ -134,6 +167,8 @@ class _AsyncCheckpointProcess:
             raise AssertionError(f"Expected INIT_COMPLETE response, got {response}")
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] HELPER: if the child is alive, sends a terminate message and waits up to
+        # 5 seconds; if still alive, logs a warning and terminates it forcibly.
         if self._save_process.is_alive():
             try:
                 logger.info("Terminating the checkpoint background process.")
@@ -147,9 +182,14 @@ class _AsyncCheckpointProcess:
                     self._save_process.terminate()
 
     def _send(self, data: Any) -> None:
+        # [FUNCTION DOC] HELPER: sends a picklable object to the child over the pipe.
         self._process_pipe.send(data)
 
     def _wait_for_response(self, timeout: float | None = None) -> Any:
+        # [FUNCTION DOC] HELPER: receives the next object from the child. Raises RuntimeError if the
+        # child is dead (before or during receipt, including closed pipe) or if a timeout is given
+        # and nothing arrives in time; with no timeout it blocks. If the received object is an
+        # exception it is raised in the parent; otherwise it is returned.
         if not self._save_process.is_alive():
             logger.info("Checkpoint background process is dead calling join()...")
             self._save_process.join()
@@ -184,6 +224,9 @@ class _AsyncCheckpointProcess:
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Metadata:
+        # [FUNCTION DOC] HELPER: wraps the arguments into a request with a fresh identifier, sends
+        # it to the child and blocks (no timeout) until the reply. Returns the checkpoint metadata.
+        # Raises AssertionError if the reply is not metadata; child exceptions are re-raised.
         # Create a unique identifier to locate requests/responses
         # from the checkpoint daemon process.
         checkpoint_request_id = _CheckpointRequestIdentifier(checkpoint_id)
@@ -211,6 +254,8 @@ class _AsyncCheckpointProcess:
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Metadata:
+        # [FUNCTION DOC] HELPER: runs in the child. Performs the synchronous save with the request's
+        # checkpoint id, writer, planner and flags, and returns the metadata.
         from torch.distributed.checkpoint.state_dict_saver import save
 
         metadata = save(
@@ -228,6 +273,15 @@ class _AsyncCheckpointProcess:
         pg_init_info: _ProcessGroupInitInfo,
         parent_conn,
     ) -> None:
+        # [FUNCTION DOC] HELPER: child process entry point. Phase 1: sets up logging and rank/rendezvous
+        # environment variables, initializes a gloo-only process group (optionally on a prefixed TCP
+        # store), barriers, tells the parent init is complete, and optionally disables automatic
+        # garbage collection. Any init failure is sent to the parent as an exception and the function
+        # returns. Phase 2: loops receiving messages; a terminate message ends the loop; a request
+        # triggers a save whose metadata (or exception, without exiting) is sent back; with automatic
+        # gc disabled and manual gc allowed, collects after each save and freezes gc after the first.
+        # A non-request, non-terminate message raises AssertionError (ends the loop). Always destroys
+        # the process group and closes the pipe on exit.
         # Phase 1: Process Group Initialization
         # Only needs to execute once during the lifetime of the checkpoint background process.
         try:
@@ -353,7 +407,11 @@ _CHECKPOINT_PROCESS: _AsyncCheckpointProcess | None = None
 
 
 class _ProcessBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
+    # [CLASS DOC] HELPER: executor that runs saves through the shared daemon process (module-level
+    # singleton, created lazily on first use and reused by later saves). A one-thread pool in the
+    # trainer waits for the child so the caller gets a future.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: creates a one-thread pool used to wait on the child process.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     @staticmethod
@@ -368,6 +426,11 @@ class _ProcessBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Metadata:
+        # [FUNCTION DOC] HELPER: runs in the pool thread. Creates the singleton daemon process if
+        # absent (needs pg_init_info, else AssertionError; creation is logged under the writer's
+        # checkpoint id when present). Resolves a staging future to a state dict, sends it to the
+        # daemon and returns the metadata. Sets the module global _CHECKPOINT_PROCESS.
+        # KNOWN ISSUE: the process_group argument is only used for logging; it is not forwarded to the save.
         global _CHECKPOINT_PROCESS
         if _CHECKPOINT_PROCESS is None:
             if pg_init_info is None:
@@ -381,6 +444,7 @@ class _ProcessBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
 
             @_dcp_method_logger(**ckpt_kwargs)
             def create_checkpoint_daemon_process() -> None:
+                # [FUNCTION DOC] HELPER: constructs the daemon process handle and stores it in the module global.
                 global _CHECKPOINT_PROCESS
                 # pyrefly: ignore [bad-argument-type]
                 _CHECKPOINT_PROCESS = _AsyncCheckpointProcess(pg_init_info=pg_init_info)
@@ -416,6 +480,11 @@ class _ProcessBasedAsyncCheckpointExecutor(_AsyncCheckpointExecutor):
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Future:
+        # [FUNCTION DOC] HELPER: if the daemon does not exist yet, collectively builds the process
+        # group init info on the calling thread (all ranks must call). Submits the save implementation
+        # to the pool and returns a future resolving to the metadata; the pool shuts down (no wait)
+        # when that future completes, so an executor instance serves one save. The first call is
+        # slow because it spawns the daemon.
         """
         NOTE:
 

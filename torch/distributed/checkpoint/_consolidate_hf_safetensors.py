@@ -1,4 +1,12 @@
 # pyre-strict
+# [MODULE DOC]
+# Consolidation of sharded safetensors files (saved by distributed checkpoint with custom
+# sharding metadata) into full-tensor safetensors output files plus a HuggingFace style index
+# file. Pipeline: read input headers, compute full tensor shapes per output file, write output
+# headers, copy shard bytes into place (optionally with a thread pool, one output file per task),
+# and write the overall weight map. Public entry points: consolidate_safetensors_files and
+# consolidate_safetensors_files_on_every_rank (splits output files across ranks). Other names are
+# helpers. Import-time side effect: creates the module logger only.
 
 import concurrent.futures
 import glob
@@ -32,6 +40,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 @dataclass
 class _FqnData:
+    # [CLASS DOC] HELPER: per-tensor layout info in an output file: byte offset of its data,
+    # full shape, element size in bytes and dtype name string. Defaults are zero or empty and
+    # are filled in by the parse and write-metadata steps.
     """
     Dataclass to store information about a tensor (identified by its fully qualified name).
 
@@ -50,6 +61,8 @@ class _FqnData:
 
 @dataclass
 class _OutputFileData:
+    # [CLASS DOC] HELPER: description of one output file: size in bytes of its header section
+    # (set when metadata is written) and a mapping from tensor name to its layout info.
     """
     Dataclass to store information about an output safetensors file.
 
@@ -64,6 +77,8 @@ class _OutputFileData:
 
 @dataclass
 class _InputFileData:
+    # [CLASS DOC] HELPER: description of one input shard file: header section size in bytes and
+    # its parsed header mapping.
     """
     Dataclass to store information about an input safetensors file.
 
@@ -80,6 +95,12 @@ def _parse_input_metadata(
     input_files_data: dict[str, _InputFileData],
     output_files_data: dict[str, _OutputFileData],
 ) -> None:
+    # [FUNCTION DOC] HELPER: for every tensor in every input header, computes its full size as the
+    # per-dimension maximum over shards of (shard shape plus shard offset), remembering its dtype.
+    # Then, for each tensor already registered in an output file, replaces its layout entry with a
+    # new one holding the full shape, dtype name and element size in bytes (from the dtype's bit width
+    # via the safetensors dtype lookup; floating point types only). Mutates output_files_data.
+    # Raises ValueError if an input file lacks the checkpoint's custom sharding metadata.
     """
     Parse metadata from input safetensors files to determine the full tensor shapes and types.
 
@@ -143,6 +164,10 @@ def _parse_input_metadata(
 def _write_metadata(
     output_files_data: dict[str, _OutputFileData],
 ) -> None:
+    # [FUNCTION DOC] HELPER: for each output file, creates or truncates the file and writes the
+    # header: an 8-byte little-endian length followed by a JSON mapping from tensor name to shape,
+    # dtype and start/end data offsets (tensors packed back to back in mapping order). Records each
+    # tensor's start offset and the total header size on the layout objects. Writes files.
     """
     Write metadata to the beginning of each output safetensors file.
 
@@ -204,6 +229,7 @@ def _read_tensor_data(
     end_offset: int,
     metadata_size: int,
 ) -> bytes:
+    # [FUNCTION DOC] HELPER: seeks the open file to header size plus start offset and reads the bytes up to the end offset.
     """
     Read a specific byte range of tensor data from an open safetensors file.
 
@@ -228,6 +254,11 @@ def _process_output_file(
     output_data: _OutputFileData,
     input_files_data: dict[str, _InputFileData],
 ) -> None:
+    # [FUNCTION DOC] HELPER: fills one output file with tensor data. Opens all input files, then for
+    # each tensor in order of its offset allocates a zeroed buffer of the full size, copies every
+    # input shard containing that tensor into its position in the buffer, and appends the buffer to
+    # the output (opened for update, positioned at end, so the header must already exist). Closes the
+    # input files in all cases. Reads and writes files; safe to run in parallel on different outputs.
     """
     Process a single output file by writing tensor data from input files using direct reads.
 
@@ -315,6 +346,11 @@ def _write_data(
     output_files_data: dict[str, _OutputFileData],
     num_threads: int = 1,
 ) -> None:
+    # [FUNCTION DOC] HELPER: processes every output file, sequentially if num_threads is at most one
+    # or there is a single output; otherwise uses a thread pool (workers up to the smaller of
+    # num_threads and file count), one task per output file. A failed task prints the error and
+    # re-raises it.
+    # KNOWN ISSUE: the docstring says memory mapping is used, but the code uses plain file reads.
     """
     Write tensor data from input files to the output files using memory mapping.
 
@@ -365,6 +401,11 @@ def _write_sub_tensor_to_file_optimized(
     sub_tensor_offsets: list[int],
     sub_tensor_shape: list[int],
 ) -> None:
+    # [FUNCTION DOC] HELPER: copies a shard (raw bytes in row-major order) into a full-tensor byte
+    # buffer at the shard's offsets. Returns immediately if either shape is empty. Otherwise loops over
+    # the shard in linear order: converts the linear position to per-dimension indices, asks how many
+    # elements can be copied contiguously, and copies that chunk from the source position to the
+    # destination position (both in bytes). Mutates full_tensor_mv.
     """
     Optimized version that writes the maximum number of contiguous bytes possible.
 
@@ -443,6 +484,13 @@ def _calculate_max_contiguous_elements(
     sub_tensor_shape: list[int],
     tensor_shape: list[int],
 ) -> int:
+    # [FUNCTION DOC] HELPER: returns how many elements, starting at the given multi-index of the
+    # shard, can be copied as one contiguous run in both shard and full tensor. Default is the rest of
+    # the last dimension; if at the start of a row and the shard spans the full last dimension, it is
+    # all remaining rows; if additionally at the start of a plane and it spans the full last two
+    # dimensions, it is all remaining planes. Raises ValueError for empty lists, mismatched lengths,
+    # an index outside the shard, or a shard dimension larger than the tensor's.
+    # Note: the docstring omits the return value.
     """
     Calculate the maximum number of contiguous elements that can be written from current position.
 
@@ -519,6 +567,9 @@ def _write_overall_metadata_file(
     output_dir: str,
     output_files_data: dict[str, _OutputFileData],
 ) -> None:
+    # [FUNCTION DOC] HELPER: writes the index JSON file (name from the shared metadata file name
+    # constant) into output_dir, holding the total byte size of all tensors and a mapping from tensor
+    # name to the base name of the file containing it. Overwrites an existing file.
     """
     Write the overall metadata file that maps tensor names to their file locations.
 
@@ -551,6 +602,10 @@ def _consolidate_safetensors_files(
     fqn_to_file_mapping: dict[str, str],
     num_threads: int,
 ) -> dict[str, _OutputFileData]:
+    # [FUNCTION DOC] HELPER: core pipeline. Builds output file descriptions from the tensor-to-file
+    # mapping (files placed in output_dir), finds all safetensors files in input_dir and reads their
+    # headers, then runs: parse shapes, write output headers, write tensor data (using num_threads).
+    # Returns the output file descriptions. Reads and writes files.
     output_files_data: dict[str, _OutputFileData] = {}
     # Create multiple output files based on the provided mapping
     for fqn, filename in fqn_to_file_mapping.items():
@@ -589,6 +644,12 @@ def consolidate_safetensors_files(
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
 ) -> None:
+    # [FUNCTION DOC] Single-process consolidation. Converts the tensor-to-index mapping into file names
+    # (via the shared name generator and the maximum index), consolidates all inputs from input_dir
+    # into output files in output_dir, then writes the overall index file. Logs timing.
+    # Raises ValueError if the mapping is empty (maximum of nothing) or inputs lack sharding metadata.
+    # KNOWN ISSUE: the docstring says the mapping is optional with a single-file default, but None
+    # fails; the index file name in the docstring differs from the actual constant.
     """
     Main function to consolidate sharded safetensors files into one or more output files.
 
@@ -637,6 +698,13 @@ def consolidate_safetensors_files_on_every_rank(
     num_threads: int = 1,
     process_group: dist.ProcessGroup | None = None,
 ) -> None:
+    # [FUNCTION DOC] Distributed consolidation. Rank and world size come from the given group when
+    # distributed is initialized, else single process mode. Each output file index is assigned to the
+    # rank equal to index modulo world size; each rank consolidates only its tensors. Then, if
+    # distributed, rank 0 gathers all ranks' output descriptions, writes the overall index file, and
+    # all ranks barrier. Collective when distributed (all ranks must call). Reads and writes files.
+    # KNOWN ISSUE: the gather destination is rank 0 of the default numbering while rank comes from the
+    # given group, which may differ when a subgroup is used.
     """
     Consolidate sharded safetensors files across multiple ranks, with each rank handling a subset of output files.
 

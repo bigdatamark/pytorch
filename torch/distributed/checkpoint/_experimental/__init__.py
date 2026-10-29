@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental checkpointing framework: composable checkpointer, writer, reader, stager and
+# barrier building blocks, plus factory functions for synchronous and asynchronous checkpointers.
+# Re-exports everything listed in __all__ from its submodules (barriers, builder, checkpoint
+# reader and writer, checkpointer, config, staging, types, utils).
 """
 Checkpoint functionality for machine learning models.
 

@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Benchmark script combining DistributedDataParallel (dense part) and RPC with remote
+# EmbeddingBag tables on parameter servers (sparse part). Rank layout: trainers first,
+# then parameter servers, then one master (last rank) that drives training and prints
+# per-trainer and overall percentile timings. Run as a script: prints GPU topology via
+# nvidia-smi, parses command-line options, sets MASTER_ADDR/MASTER_PORT environment
+# variables, overrides the module-level config globals, and spawns one process per rank.
+# Module-level config: NUM_TRAINERS, NUM_PS, NUM_EMBEDDINGS, EMBEDDING_DIM, WARMUP_CYCLES.
 
 # pyre-unsafe
 import argparse
@@ -35,6 +43,11 @@ WARMUP_CYCLES = 5
 
 
 class HybridModel(torch.nn.Module):
+    # [CLASS DOC] Model with a sparse part (remote embedding bag tables referenced by the
+    # list emb_rref_list, one per parameter server) and a dense part (a stack of linear
+    # layers wrapped in DistributedDataParallel on the given device). State: emb_rref_list,
+    # ddp, device. Forward queries every embedding table remotely and feeds the result
+    # through the DDP-wrapped dense stack.
     r"""
     The model consists of a sparse part and a dense part.
 
@@ -47,6 +60,9 @@ class HybridModel(torch.nn.Module):
     """
 
     def __init__(self, emb_rref_list, device):
+        # [FUNCTION DOC] Stores the remote embedding references, builds a six-stage dense
+        # sequential model (input width 512, output width 8), moves it to the device and wraps
+        # it in DDP (requires an initialized process group among trainers). Saves the device.
         super().__init__()
         self.emb_rref_list = emb_rref_list
         fc1 = torch.nn.Linear(512, 256)
@@ -60,6 +76,14 @@ class HybridModel(torch.nn.Module):
         self.device = device
 
     def forward(self, indices, offsets):
+        # [FUNCTION DOC] Performs a blocking remote forward on each embedding table with the
+        # indices and offsets, concatenates the outputs along the feature dimension, reshapes
+        # to rows of width 512 (batch scaled by the ratio of total embedding width to 512) and
+        # returns the DDP dense model output. Raises AssertionError if total embedding width
+        # (NUM_PS times EMBEDDING_DIM) is smaller than 512.
+        # KNOWN ISSUE: the concatenation sits inside the loop over tables, so it is recomputed
+        # each iteration and is undefined if the list of references is empty. Also the integer
+        # division truncates if the width is not a multiple of 512.
         emb_lookups = []
 
         for emb_rref in self.emb_rref_list:
@@ -83,10 +107,15 @@ class HybridModel(torch.nn.Module):
 
 
 def _retrieve_embedding_parameters(emb_rref):
+    # [FUNCTION DOC] HELPER: runs on a parameter server; returns a list of remote references
+    # to each parameter of the locally held embedding module behind the given reference.
     return [RRef(p) for p in emb_rref.local_value().parameters()]
 
 
 def _print_header():
+    # [FUNCTION DOC] HELPER: prints the column header line (four repeated pairs of
+    # seconds-per-epoch and epochs-per-second labels, one per percentile) to stdout.
+    # KNOWN ISSUE: the loop variable (the percentile values) is unused, so labels carry no percentile.
     _print_cont("\n")
     _print_cont(" " * 10)
     for _ in [50, 75, 90, 95]:
@@ -95,6 +124,11 @@ def _print_header():
 
 
 def _print_benchmark(prefix, nelem, measurements):
+    # [FUNCTION DOC] HELPER: prints, for the 50th, 75th, 90th and 95th percentiles of the
+    # time measurements, the duration and the throughput (nelem divided by duration), labelled
+    # with prefix. Writes to stdout.
+    # KNOWN ISSUE: throughput is a float but is formatted with an integer format code, which
+    # raises ValueError at runtime.
     measurements = sorted(measurements)
     _print_cont(f"{prefix:8s}:")
     for p in [50, 75, 90, 95]:
@@ -104,10 +138,14 @@ def _print_benchmark(prefix, nelem, measurements):
 
 
 def _print_cont(msg):
+    # [FUNCTION DOC] HELPER: prints the message to stdout with no trailing newline and flushes.
     print(msg, end="", flush=True)
 
 
 def _run_printable(cmd):
+    # [FUNCTION DOC] HELPER: runs the shell-style command string as a subprocess capturing
+    # output, raises AssertionError on a non-zero exit code, and returns a one-element list
+    # holding the decoded stdout text (round-tripped through torch save and load in memory).
     proc = subprocess.run(shlex.split(cmd), capture_output=True, check=False)  # type: ignore[call-overload]
     if proc.returncode != 0:
         raise AssertionError
@@ -123,6 +161,13 @@ def _run_printable(cmd):
 
 
 def _run_trainer(emb_rref_list, rank):
+    # [FUNCTION DOC] Runs on a trainer via RPC. Builds the HybridModel on the GPU with index
+    # rank, gathers remote references to all embedding parameters (from each server) plus local
+    # model parameters, and creates a distributed SGD optimizer (learning rate 0.05) and
+    # cross-entropy loss. Then runs 100 plus WARMUP_CYCLES epochs of 10 random batches each;
+    # per batch: opens a distributed autograd context, forward, loss, distributed backward,
+    # optimizer step. Records wall time per epoch, drops the warm-up epochs.
+    # Returns a tuple of rank, list of epoch times, and the batch size count of the last epoch.
     r"""
     Each trainer runs a forward pass which involves an embedding lookup on the 8 parameter servers,
     and running nn.Linear locally.
@@ -153,6 +198,9 @@ def _run_trainer(emb_rref_list, rank):
     criterion = torch.nn.CrossEntropyLoss()
 
     def get_next_batch(rank):
+        # [FUNCTION DOC] HELPER: generator yielding 10 random batches. Each has random indices
+        # (20 to 50 entries drawn from the embedding table size), offsets splitting them into
+        # bags of random length 1 to 10, and random class targets (0-7) moved to GPU index rank.
         for _ in range(10):
             num_indices = random.randint(20, 50)
             indices = torch.LongTensor(num_indices).random_(0, NUM_EMBEDDINGS)
@@ -204,6 +252,14 @@ def _run_trainer(emb_rref_list, rank):
 
 
 def run_worker(rank, world_size):
+    # [FUNCTION DOC] Per-process entry point started by multiprocessing spawn. Role depends on
+    # rank: the last rank is the master (creates one remote EmbeddingBag per parameter server,
+    # launches training on every trainer asynchronously, waits for results and prints
+    # per-trainer and aggregate benchmarks); low ranks are trainers (initialize a gloo process
+    # group for DDP plus RPC, then wait for work); middle ranks are parameter servers
+    # (initialize RPC only). All roles end with RPC shutdown, which blocks until all finish.
+    # KNOWN ISSUE: the trainer branch compares against NUM_PS rather than NUM_TRAINERS, and the
+    # master does not pass the backend options; correct only when the counts are equal.
     r"""
     Initialize RPC, calls the function, and shuts down RPC.
     """

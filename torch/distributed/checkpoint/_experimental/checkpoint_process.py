@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Out-of-process checkpoint writing. CheckpointProcess spawns a daemon subprocess that builds a
+# checkpoint writer and serves requests (ping, write checkpoint, terminate) sent over a pipe as
+# pickled request objects; the parent uses a single-thread pool to create the process and issue
+# writes asynchronously. Also defines the config dataclass, request type enum and request/response
+# dataclasses. Setting the MKL_SERVICE_FORCE_INTEL environment variable happens when a process is created.
 import logging
 import os
 import traceback
@@ -20,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CheckpointProcessConfig:
+    # [CLASS DOC] Settings for the checkpoint subprocess: seconds to wait for it to initialize
+    # (default 30) and seconds to wait for graceful shutdown before killing it (default 60).
     """
     Configuration options for the CheckpointProcess.
 
@@ -36,6 +44,8 @@ class CheckpointProcessConfig:
 
 
 class RequestType(Enum):
+    # [CLASS DOC] Kinds of messages understood by the worker: ping (liveness and init handshake),
+    # write checkpoint, and terminate process.
     PING = "ping"
     WRITE_CHECKPOINT = "write_checkpoint"
     TERMINATE_PROCESS = "exit"
@@ -43,6 +53,8 @@ class RequestType(Enum):
 
 @dataclass
 class WorkerRequest:
+    # [CLASS DOC] Message from parent to worker: a request type and a payload mapping. Sent via
+    # pickling over the pipe.
     """
     A dataclass for storing the command to be sent to the worker process.
     Note: This relies on pickling to send the command to the worker process. Handle
@@ -55,6 +67,8 @@ class WorkerRequest:
 
 @dataclass
 class WorkerResponse:
+    # [CLASS DOC] Message from worker to parent: echoes the request type, a success flag, an
+    # optional error text (traceback) and an optional payload mapping.
     request_type: RequestType
     success: bool
     error_msg: str | None = None
@@ -62,6 +76,11 @@ class WorkerResponse:
 
 
 class CheckpointProcess:
+    # [CLASS DOC] Parent-side proxy that writes checkpoints in a spawned subprocess. State: a
+    # single-thread executor, rank info, config, subprocess and writer init callbacks with their
+    # arguments, the spawned process context, the parent pipe end, and process_creation_future
+    # (completes when the subprocess answers its init ping). write returns a future; close shuts
+    # down the executor and terminates the subprocess.
     """
     A checkpoint writer that writes checkpoints to a remote process.
     """
@@ -75,6 +94,9 @@ class CheckpointProcess:
         checkpoint_writer_init_fn: Callable[..., CheckpointWriter],
         checkpoint_writer_init_args: dict[str, Any],
     ):
+        # [FUNCTION DOC] Stores all arguments, creates the one-thread executor, and immediately
+        # submits subprocess creation to it (non-blocking); the resulting future is kept as
+        # process_creation_future.
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._rank_info = rank_info
         self._config = config
@@ -95,6 +117,10 @@ class CheckpointProcess:
         self,
         config: CheckpointProcessConfig,
     ) -> None:
+        # [FUNCTION DOC] HELPER: runs in the executor thread. Creates a pipe, sets an MKL workaround
+        # environment variable, spawns one daemon subprocess without joining, closes the parent's copy
+        # of the child pipe end, sends a ping and waits up to the configured init timeout for a reply.
+        # Raises TimeoutError if none arrives, RuntimeError if the reply reports failure or the child died.
         logger.info(
             "Creating checkpoint subprocess for rank %d", self._rank_info.global_rank
         )
@@ -155,6 +181,13 @@ class CheckpointProcess:
         checkpoint_writer_init_fn: Callable[..., CheckpointWriter],
         checkpoint_writer_init_args: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: subprocess entry point (the spawn index must be 0, else AssertionError).
+        # Runs the init callback with its arguments, builds the writer by calling the writer factory
+        # with its arguments (adding rank info if absent), then loops receiving requests: ping gets a
+        # success response; write checkpoint writes the state dict to the path with extra keyword
+        # arguments and replies success; terminate replies and exits the loop; an unknown type raises
+        # ValueError. Any exception is reported to the parent as a failed response with the traceback,
+        # the pipe is closed, and the function returns.
         logger.debug(
             "Checkpoint subprocess started for rank %d/%d (PID: %d)",
             rank_info.global_rank,
@@ -227,6 +260,8 @@ class CheckpointProcess:
             logger.exception("Subprocess terminated due to exception")
 
     def _send(self, request_type: RequestType, payload: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: wraps type and payload in a request and sends it on the parent pipe.
+        # Raises AssertionError if the pipe is not set up, RuntimeError if the OS reports a broken pipe.
         try:
             if self._parent_end is None:
                 raise AssertionError("Parent end of pipe should be initialized")
@@ -244,6 +279,9 @@ class CheckpointProcess:
             raise RuntimeError(error_msg) from e
 
     def _recv(self) -> dict[str, Any] | None:
+        # [FUNCTION DOC] HELPER: blocks for one response on the parent pipe and returns its payload
+        # (possibly None). Raises RuntimeError if the response reports failure or the pipe is closed
+        # or reset; AssertionError if the pipe is not set up.
         try:
             if self._parent_end is None:
                 raise AssertionError("Parent end of pipe should be initialized")
@@ -266,6 +304,10 @@ class CheckpointProcess:
         path: str,
         **kwargs: Any,
     ) -> Future[None] | None:
+        # [FUNCTION DOC] Blocks until the subprocess is initialized (re-raising its creation errors),
+        # then queues a write on the executor and returns the future. The state dict may itself be a
+        # future (from staging) which the queued task resolves first. Extra keyword arguments are
+        # forwarded to the worker's writer.
         logger.debug("Waiting for subprocess initialization to complete")
 
         # wait until the process is started
@@ -284,6 +326,9 @@ class CheckpointProcess:
         path: str,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] HELPER: runs in the executor thread. Resolves the state dict if it is a
+        # future, sends a write request (state dict, path, keyword arguments) to the worker and blocks
+        # for its reply. Raises RuntimeError on worker failure or death.
         logger.debug("Starting checkpoint write to %s", path)
 
         # wait for staging state_dict to be available
@@ -313,6 +358,10 @@ class CheckpointProcess:
         logger.debug("Checkpoint write to %s completed successfully", path)
 
     def close(self) -> None:
+        # [FUNCTION DOC] Shuts down the executor (waits for running work, cancels queued work). If the
+        # subprocess is alive, sends a terminate request (a broken pipe is logged and tolerated), then
+        # joins with the shutdown timeout and kills the process if it is still running. Re-raises
+        # ProcessExitedException if the child exited abnormally.
         logger.debug(
             "Closing CheckpointProcess for rank %d", self._rank_info.global_rank
         )

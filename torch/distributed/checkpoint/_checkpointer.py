@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Experimental high level checkpointer wrapper. Defines _Checkpointer, which binds a storage
+# writer, reader and optional planners and delegates to the state dict saver and loader
+# functions. Exports nothing publicly (empty __all__). No import-time side effects.
 from concurrent.futures import Future
 from typing import Any
 
@@ -17,6 +21,10 @@ __all__: list[str] = []
 
 
 class _Checkpointer:
+    # [CLASS DOC] HELPER: convenience object remembering storage_writer, storage_reader,
+    # process_group, coordinator_rank, no_dist, load_planner and save_planner, and exposing
+    # save, async_save and load that call the module-level functions with those settings.
+    # Experimental.
     """This base class specifies a high level API for saving and loading
     distributed `state_dict` 's. It provides an abstraction over the low-level APIs
     provided by :py:mod:`torch.distributed.checkpoint.storage`, essentially calling
@@ -40,6 +48,7 @@ class _Checkpointer:
         load_planner: LoadPlanner | None = None,
         save_planner: SavePlanner | None = None,
     ):
+        # [FUNCTION DOC] HELPER: stores the given writer, reader and options as attributes. No validation or I/O.
         """Initializes the Checkpointer instance.
 
         Args:
@@ -63,6 +72,9 @@ class _Checkpointer:
         self,
         state_dict: STATE_DICT_TYPE,
     ) -> Metadata:
+        # [FUNCTION DOC] HELPER: synchronously saves the state dict through the saver using the
+        # stored writer, process group, coordinator rank, no_dist flag and save planner.
+        # Returns the checkpoint metadata. Writes to storage; collective across ranks.
         """Calls :py:meth: `torch.distributed.state_dict_saver.save`. Utilizing values passed during initialization."""
         return saver.save(
             state_dict,
@@ -77,6 +89,10 @@ class _Checkpointer:
         self,
         state_dict: STATE_DICT_TYPE,
     ) -> Future:
+        # [FUNCTION DOC] HELPER: starts an asynchronous save via the saver using the stored writer,
+        # process group and save planner, and returns the resulting future. Raises AssertionError if
+        # the saver does not return a future.
+        # KNOWN ISSUE: coordinator rank and no_dist settings are not forwarded to the async saver.
         """
         Calls :py:meth: `torch.distributed.state_dict_saver._async_save`. Utilizing values passed during initialization.
 
@@ -94,6 +110,9 @@ class _Checkpointer:
         return response
 
     def load(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: loads checkpoint data in place into the given state dict using the
+        # stored reader, process group and load planner. Returns nothing; collective across ranks.
+        # KNOWN ISSUE: coordinator rank and no_dist settings are not forwarded to the loader.
         """Calls :py:meth: `torch.distributed.state_dict_loader.load`. Utilizing values passed during initialization."""
         loader.load(
             state_dict,

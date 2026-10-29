@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Factory functions that assemble synchronous and asynchronous checkpointers from a config:
+# make_sync_checkpointer and make_async_checkpointer, plus default init callbacks and a helper that
+# detects rank info from the distributed environment. No import-time side effects.
 """
 Factory functions for creating checkpointer instances with sensible defaults.
 
@@ -22,6 +26,8 @@ from .types import RankInfo
 
 
 def _get_default_rank_info() -> RankInfo:
+    # [FUNCTION DOC] HELPER: returns rank info (world size and rank) from the default process group
+    # when distributed is initialized, otherwise a single-rank value (world size 1, rank 0).
     """
     Get default rank information from the current distributed environment.
 
@@ -40,10 +46,12 @@ def _get_default_rank_info() -> RankInfo:
 
 
 def default_subprocess_init_fn(*_: Any) -> None:
+    # [FUNCTION DOC] Default subprocess init callback: ignores all arguments and does nothing.
     """Default subprocess initialization function (no-op)."""
 
 
 def default_writer_init_fn(rank_info: RankInfo) -> CheckpointWriter:
+    # [FUNCTION DOC] Default writer factory: returns a checkpoint writer with default writer config for the given rank info.
     """Default checkpoint writer initialization function."""
     return CheckpointWriter(
         config=CheckpointWriterConfig(),
@@ -56,6 +64,11 @@ def make_sync_checkpointer(
     rank_info: RankInfo | None = None,
     commit_hook: WriterHook | None = None,
 ) -> SyncCheckpointer:
+    # [FUNCTION DOC] Builds a synchronous checkpointer. Rank info defaults to the detected one.
+    # Creates a reader, builds a barrier from config.barrier_config (may be none), builds a writer
+    # from config.writer_config with the barrier and optional commit hook, and returns a
+    # SyncCheckpointer wrapping the writer and reader. May create a TCP store via the barrier.
+    # KNOWN ISSUE: the default config argument is one shared instance created at definition time.
     """
     Factory function to create a SyncCheckpointer instance with sensible defaults.
 
@@ -118,6 +131,12 @@ def make_async_checkpointer(
     checkpoint_writer_init_fn: Callable[..., CheckpointWriter] = default_writer_init_fn,
     checkpoint_writer_init_args: dict[str, Any] | None = None,
 ) -> AsyncCheckpointer:
+    # [FUNCTION DOC] Builds an asynchronous checkpointer. Rank info defaults to the detected one.
+    # Creates a reader, a default stager from config.staging_config, and a checkpoint process
+    # (spawns a subprocess in the background) from config.process_config with the given subprocess
+    # init callback and arguments and writer factory and arguments (None becomes an empty mapping).
+    # Returns an AsyncCheckpointer combining stager, process and reader.
+    # KNOWN ISSUE: barrier_config in the config is ignored here, unlike in the sync factory.
     """
     Factory function to create an AsyncCheckpointer instance with sensible defaults.
 

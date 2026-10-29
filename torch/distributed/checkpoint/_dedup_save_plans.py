@@ -1,4 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# Deduplication of save plans across ranks: removes write items replicated on several
+# plans so each item is written once. Exports dedup_save_plans. No import-time side effects.
 import dataclasses
 from collections import defaultdict
 from typing import TYPE_CHECKING
@@ -16,6 +19,12 @@ def dedup_save_plans(
     all_plans: list[SavePlan],
     save_to_lowest_rank: bool = False,
 ) -> list[SavePlan]:
+    # [FUNCTION DOC] Given one save plan per rank, returns new plans (originals unchanged) in which
+    # each write item identified by its index appears in exactly one plan. For a duplicated item,
+    # the owner is the lowest-numbered plan when save_to_lowest_rank is set; otherwise the plan with
+    # the least accumulated storage so far (items processed in first-seen order; non-tensor items or
+    # zero-size items count as size one). Raises AssertionError on an internal length mismatch.
+    # KNOWN ISSUE: the docstring is truncated mid-sentence ("rather than returns").
     """
     Removes duplicate entries from appearing on multiple SavePlans. For each duplicate across
     a set of SavePlans, only the smallest SavePlan in terms of planned storage keeps the entry.

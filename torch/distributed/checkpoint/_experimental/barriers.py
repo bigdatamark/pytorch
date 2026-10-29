@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Barrier abstractions for synchronizing ranks around checkpoint operations: abstract Barrier,
+# DistBarrier (process group barrier), TCPStoreBarrier (key-value store based), a registry keyed
+# by barrier type string, a register decorator, a config dataclass and a factory from config.
+# Import-time side effects: creates the registry and registers the two barrier classes in it.
 """
 Barrier implementations for synchronizing distributed checkpoint operations.
 
@@ -25,6 +30,8 @@ BARRIER_REGISTRY: dict[str, type] = {}
 
 
 def register_barrier(barrier_class: type) -> type:
+    # [FUNCTION DOC] Class decorator: if the class has a barrier_type attribute, records it in the
+    # global registry under that name (overwriting any existing entry). Returns the class unchanged.
     """Register a barrier class in the global registry."""
     if hasattr(barrier_class, "barrier_type"):
         BARRIER_REGISTRY[barrier_class.barrier_type] = barrier_class
@@ -33,6 +40,8 @@ def register_barrier(barrier_class: type) -> type:
 
 @dataclass
 class BarrierConfig:
+    # [CLASS DOC] Dataclass holding a barrier type name (None means no barrier) and a mapping of
+    # constructor keyword arguments used by the factory to build that barrier.
     """
     Configuration for barrier construction.
 
@@ -70,6 +79,10 @@ class BarrierConfig:
 def create_barrier_from_config(
     barrier_config: BarrierConfig,
 ) -> Optional["Barrier"]:
+    # [FUNCTION DOC] Returns None if no barrier type is configured; otherwise looks up the registered
+    # class and constructs it with the config's argument mapping as keyword arguments.
+    # Raises ValueError for an unregistered type name.
+    # KNOWN ISSUE: the BarrierConfig docstring says rank_info is injected automatically, but nothing here injects it.
     """
     Create a barrier instance from BarrierConfig.
 
@@ -96,6 +109,8 @@ def create_barrier_from_config(
 
 
 class Barrier(abc.ABC):
+    # [CLASS DOC] Abstract barrier interface: construction takes implementation-specific keyword
+    # arguments, and execute_barrier blocks until every rank has arrived.
     """
     Abstract base class for synchronization barriers.
 
@@ -106,6 +121,7 @@ class Barrier(abc.ABC):
 
     @abc.abstractmethod
     def __init__(self, **kwargs: dict[str, Any]):
+        # [FUNCTION DOC] Abstract constructor; the base body does nothing.
         """
         Initialize a barrier.
 
@@ -118,6 +134,7 @@ class Barrier(abc.ABC):
 
     @abc.abstractmethod
     def execute_barrier(self) -> None:
+        # [FUNCTION DOC] Abstract: block until all participating ranks reach this point.
         """
         Execute a synchronization barrier.
 
@@ -128,6 +145,8 @@ class Barrier(abc.ABC):
 
 @register_barrier
 class DistBarrier(Barrier):
+    # [CLASS DOC] Registered as "dist_barrier". Barrier that calls the default process group's
+    # barrier; needs an initialized distributed environment. Stateless.
     """
     A barrier implementation using PyTorch's distributed barrier for synchronization.
 
@@ -141,6 +160,7 @@ class DistBarrier(Barrier):
     def __init__(
         self,
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError if the distributed package is not initialized.
         """
         Initialize a DistBarrier.
 
@@ -154,6 +174,8 @@ class DistBarrier(Barrier):
             raise AssertionError("DistBarrier requires an initialized process group.")
 
     def execute_barrier(self) -> None:
+        # [FUNCTION DOC] Blocks on the default process group barrier (no explicit timeout, no prefix used).
+        # KNOWN ISSUE: the docstring mentions a prefix from initialization, but this class has none.
         """
         Execute a synchronization barrier using the prefix provided during initialization.
         """
@@ -164,6 +186,9 @@ class DistBarrier(Barrier):
 
 @register_barrier
 class TCPStoreBarrier(Barrier):
+    # [CLASS DOC] Registered as "tcp_store". Barrier built on a TCP key-value store shared by all
+    # ranks (rank 0 hosts it). Keeps a per-prefix sequence counter so repeated barriers use distinct
+    # key prefixes, plus rank, world size, prefix and timeout settings.
     """
     A barrier implementation using PyTorch's TCPStore for synchronization.
 
@@ -186,6 +211,10 @@ class TCPStoreBarrier(Barrier):
         master_address: str,
         timeout_secs: int,
     ):
+        # [FUNCTION DOC] Logs the settings, stores rank, world size, prefix and wait timeout, and
+        # creates the TCP store client (rank 0 acts as the server) with the init timeout. May block
+        # or raise if the store cannot be reached.
+        # KNOWN ISSUE: use_checkpoint_barrier_tcpstore_libuv is accepted and logged but never used.
         """
         Initialize a TCPStoreBarrier.
 
@@ -232,6 +261,10 @@ class TCPStoreBarrier(Barrier):
         )
 
     def execute_barrier(self) -> None:
+        # [FUNCTION DOC] Records this rank's current sequence number in the store, waits through the
+        # store barrier helper until all ranks have joined that sequence (key prefix is the barrier
+        # prefix plus sequence), then increments the sequence. Blocks; store errors or timeouts propagate.
+        # KNOWN ISSUE: the configured timeout_secs is only logged and not passed to the wait.
         """
         Execute a synchronization barrier using the prefix provided during initialization.
 
@@ -248,6 +281,7 @@ class TCPStoreBarrier(Barrier):
         )
 
         def _rank_key(rank: int) -> str:
+            # [FUNCTION DOC] HELPER: returns the store key name for a rank.
             return f"rank{rank}"
 
         # Track which barrier sequence this rank is joining.

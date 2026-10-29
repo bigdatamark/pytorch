@@ -1,5 +1,8 @@
 # pyre-strict
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the abstract interface for asynchronous checkpoint save executors (thread based
+# or process based implementations live in sibling modules). No import-time side effects.
 import abc
 import os
 from concurrent.futures import Future
@@ -11,6 +14,8 @@ from torch.distributed.checkpoint.storage import StorageWriter
 
 
 class _AsyncCheckpointExecutor(abc.ABC):
+    # [CLASS DOC] HELPER: abstract interface for running a checkpoint save in the background.
+    # Subclasses implement execute_save and decide whether work runs in a thread or process.
     @abc.abstractmethod
     def execute_save(
         self,
@@ -23,6 +28,10 @@ class _AsyncCheckpointExecutor(abc.ABC):
         no_dist: bool = False,
         use_collectives: bool = True,
     ) -> Future:
+        # [FUNCTION DOC] HELPER: abstract. Starts a save of a state dict (or of a future that
+        # resolves to one, from staging) using the given checkpoint id, storage writer, planner,
+        # process group, and the no_dist and use_collectives switches. Returns a future that
+        # completes when the save finishes. The base body has no implementation (returns None).
         """
         Execute the checkpoint save request asynchronously.
 

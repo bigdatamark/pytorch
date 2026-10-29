@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 # Copyright 2022 Cruise LLC
+# [MODULE DOC]
+# Hierarchical SGD model averaging. Defines HierarchicalModelAverager, which averages
+# parameters over process groups of different sizes at different periods after a warm-up.
+# Import-time side effect: creates a module logger only.
 import logging
 import warnings
 from collections import OrderedDict
@@ -15,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class HierarchicalModelAverager(averagers.ModelAverager):
+    # [CLASS DOC] ModelAverager with a multi-level hierarchy. State: _periods (list of
+    # periods in mapping order), period_process_group_dict (ordered mapping from period
+    # to the process group, or subgroups, used at that level), warmup_steps, and the
+    # inherited step counter. At each step at most one group averages: the one for the
+    # largest period dividing the step. The last level must span the whole process group.
     r"""
     Runs hierarchical model averaging (`hierarchical SGD <https://arxiv.org/pdf/2010.12998.pdf>`_).
 
@@ -99,6 +108,13 @@ class HierarchicalModelAverager(averagers.ModelAverager):
     """
 
     def __init__(self, period_group_size_dict=None, warmup_steps=0, process_group=None):
+        # [FUNCTION DOC] Validates arguments and builds one process group per period.
+        # For each (period, group size) entry, a group size different from the overall size
+        # creates subgroups via new_subgroups (collective call, all ranks must participate);
+        # otherwise the overall group is reused. Logs the hierarchy.
+        # Raises ValueError if the mapping is empty, the first period is not positive,
+        # the last group size differs from the process group size, or warmup_steps is negative.
+        # Warns if the last period is 1.
         super().__init__(process_group)
         if not period_group_size_dict:
             raise ValueError("Arg ``period_group_size_dict`` must not be empty.")
@@ -144,6 +160,8 @@ class HierarchicalModelAverager(averagers.ModelAverager):
         self.warmup_steps = warmup_steps
 
     def _find_process_group(self):
+        # [FUNCTION DOC] HELPER: scans periods from largest to smallest and returns the
+        # group of the first period dividing the current step, or None if none divides it.
         """
         Return a process group as the value of a ``period_process_group_dict`` entry.
 
@@ -161,6 +179,9 @@ class HierarchicalModelAverager(averagers.ModelAverager):
         self,
         params: Iterable[torch.nn.Parameter] | Iterable[dict[str, torch.nn.Parameter]],
     ):
+        # [FUNCTION DOC] If step is at or past warmup_steps and some period divides it,
+        # averages the given parameters over that level's process group (all-reduce, in-place
+        # parameter update). Always increments step by one.
         """
         Averages parameters or parameter groups of an optimizer.
 

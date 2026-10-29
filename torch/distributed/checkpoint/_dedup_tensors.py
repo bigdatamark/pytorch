@@ -1,4 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# Simple deduplication of replicated write items across save plans, keeping the first
+# occurrence. Exports dedup_tensors. Import-time side effect: creates the module logger with a
+# console handler at INFO level and no propagation.
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
@@ -13,6 +17,8 @@ __all__ = ["dedup_tensors"]
 
 
 def init_logger() -> logging.Logger:
+    # [FUNCTION DOC] HELPER: configures and returns this module's logger: INFO level, a console
+    # stream handler with a detailed formatter, no propagation to parent loggers. Mutates logging state.
     logger = logging.getLogger(__name__)
     level = logging.INFO
     logger.setLevel(level)
@@ -32,6 +38,9 @@ logger = init_logger()
 
 # TODO add docstring for dedup_tensors
 def dedup_tensors(all_plans: list[SavePlan]) -> list[SavePlan]:
+    # [FUNCTION DOC] Finds write items (by index) present in more than one plan and removes them
+    # from every plan except the first (lowest position) that has them. Logs the removed keys at
+    # info level. Returns a new list; modified plans are copies, originals are not mutated.
     all_plans = list(all_plans)
     key_to_plan: dict[MetadataIndex, list[int]] = {}
     for plan_idx, plan in enumerate(all_plans):
