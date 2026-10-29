@@ -4,6 +4,16 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Dynamo-patched copy of CPython 3.13.5 Lib/test/test_math.py, run through
+# CPythonTestCase so the standard-library math module is exercised under
+# torch.compile/Dynamo. Main contents: a meta-path finder that redirects 'test.*' imports to
+# top-level modules, pure Python reference helpers (ulp conversion, factorial, tolerance
+# checks, data-file parsers), small fixture classes, and three test classes: MathTests
+# (functions and edge cases of math), IsCloseTests (math.isclose) and FMATests (math.fma).
+# Import-time side effects: installs RedirectImportFinder at the front of sys.meta_path,
+# computes the double-rounding flag, and derives paths of the mathdata test-case files next
+# to this file. Running the file as a script calls run_tests.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_math.py
 
@@ -35,7 +45,18 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook that maps the names in redirect_imports (for example
+    # test.test_math and test.test_iter) onto the same-named top-level module, so the copied
+    # CPython tests can import their siblings from this directory. Stateless; installed once
+    # at import time.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: Meta-path hook. If the full module name is in redirect_imports,
+        # strips the leading 'test.' prefix, imports the bare module, registers it in
+        # sys.modules under the original dotted name and returns the bare module's spec. Returns
+        # None (let other finders run) when the name is not redirected or the bare import raises
+        # ImportError. Mutates sys.modules.
+        # KNOWN ISSUE: uses importlib.util without importing it explicitly; it only works
+        # because another import already loaded importlib.util.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -96,6 +117,11 @@ test_file = os.path.join(test_dir, 'mathdata', 'cmath_testcases.txt')
 
 
 def to_ulps(x):
+    # [FUNCTION DOC] HELPER: Maps a non-NaN float to an integer so that adjacent doubles map
+    # to adjacent integers: packs the value as little-endian binary64, reads it back as a
+    # signed 64-bit int and, for negative results, flips it to a negative ordering. Positive
+    # and negative zero map to 0 and -1. Only meaningful for IEEE 754 binary64 doubles.
+    # Returns an int.
     """Convert a non-NaN float x to an integer, in such a way that
     adjacent floats are converted to adjacent integers.  Then
     abs(ulps(x) - ulps(y)) gives the difference in ulps between two
@@ -134,10 +160,16 @@ def to_ulps(x):
 # this set is range((n >> i+1) + 1 | 1, (n >> i) + 1 | 1, 2).
 
 def count_set_bits(n):
+    # [FUNCTION DOC] HELPER: Recursively counts the 1 bits of a nonnegative integer by
+    # clearing the lowest set bit each step. Returns an int; used by py_factorial for
+    # the power-of-two exponent.
     """Number of '1' bits in binary expansion of a nonnnegative integer."""
     return 1 + count_set_bits(n & n - 1) if n else 0
 
 def partial_product(start, stop):
+    # [FUNCTION DOC] HELPER: Product of the odd integers from start up to (excluding) stop,
+    # computed by recursive halving. Both bounds are expected odd with start <= stop; an empty
+    # range gives 1, a single factor gives start. Returns an int.
     """Product of integers in range(start, stop, 2), computed recursively.
     start and stop should both be odd, with start <= stop.
 
@@ -152,6 +184,10 @@ def partial_product(start, stop):
         return partial_product(start, mid) * partial_product(mid, stop)
 
 def py_factorial(n):
+    # [FUNCTION DOC] HELPER: Pure Python reference factorial using the binary split formula:
+    # iterates the bit positions of n from high to low, accumulating partial products of odd
+    # numbers, and shifts the result left by n minus its popcount. Expects a nonnegative int;
+    # returns the factorial as an int. Used to cross-check math.factorial.
     """Factorial of nonnegative integer n, via "Binary Split Factorial Formula"
     described at http://www.luschny.de/math/factorial/binarysplitfact.html
 
@@ -163,6 +199,10 @@ def py_factorial(n):
     return outer << (n - count_set_bits(n))
 
 def ulp_abs_check(expected, got, ulp_tol, abs_tol):
+    # [FUNCTION DOC] HELPER: Compares two finite floats. Succeeds when their distance
+    # in ulps (via to_ulps) is within ulp_tol OR their absolute difference is within
+    # abs_tol. Returns None on success, otherwise a formatted message with the observed
+    # error and permitted tolerances.
     """Given finite floats `expected` and `got`, check that they're
     approximately equal to within the given number of ulps or the
     given absolute tolerance, whichever is bigger.
@@ -181,6 +221,12 @@ def ulp_abs_check(expected, got, ulp_tol, abs_tol):
         return fmt.format(abs_error, ulp_error, abs_tol, ulp_tol)
 
 def parse_mtestfile(fname):
+    # [FUNCTION DOC] HELPER: Generator that parses the math_testcases data file. Strips
+    # text after a double dash comment marker, skips blank lines, and splits each line on
+    # the arrow into the left side (id, function name, argument) and right side (expected
+    # value followed by optional flags). Yields tuples of id, function name, float
+    # argument, float expected value and flag list. Opens the file as UTF-8; raises on
+    # malformed lines or non-numeric fields.
     """Parse a file with test values
 
     -- starts a comment
@@ -207,6 +253,10 @@ def parse_mtestfile(fname):
 
 
 def parse_testfile(fname):
+    # [FUNCTION DOC] HELPER: Generator that parses the cmath_testcases data file. Skips lines
+    # starting with a double dash and blank lines, splits on the arrow and yields id, function
+    # name, real and imaginary argument parts, real and imaginary expected parts (all floats)
+    # and a flag list. Opens the file as UTF-8; raises on malformed lines.
     """Parse a file with test values
 
     Empty lines or lines starting with -- are ignored
@@ -231,6 +281,12 @@ def parse_testfile(fname):
 
 
 def result_check(expected, got, ulp_tol=5, abs_tol=0.0):
+    # [FUNCTION DOC] HELPER: Compares an expected and a received value for the table-driven
+    # tests. Equal values pass, except that two zeros with different sign bits fail. Mixed
+    # int/float pairs are converted to float; two NaNs count as equal; any infinity mismatch
+    # fails; two finite floats are compared through ulp_abs_check with the given tolerances.
+    # Non-numeric values (such as exception-name strings) must be exactly equal. Returns None on
+    # success or a message string of the form expected/got plus the reason.
     # Common logic of MathTests.(ftest, test_testcases, test_mtestcases)
     """Compare arguments expected and got, as floats, if either
     is a float, using a tolerance expressed in multiples of
@@ -279,30 +335,58 @@ def result_check(expected, got, ulp_tol=5, abs_tol=0.0):
         return None
 
 class FloatLike:
+    # [CLASS DOC] HELPER: Fixture whose instances are convertible to float only through the
+    # float conversion protocol. Stores the given value and returns it unchanged from the
+    # conversion method; it is not an int or float subclass, so it exercises code paths that
+    # call the protocol.
     def __init__(self, value):
+        # [FUNCTION DOC] HELPER: Stores the value to be returned by the float conversion.
         self.value = value
 
     def __float__(self):
+        # [FUNCTION DOC] HELPER: Float conversion protocol; returns the stored value as is (no
+        # coercion, so it must already be a float for the caller to accept it).
         return self.value
 
 class IntSubclass(int):
+    # [CLASS DOC] HELPER: Plain int subclass used to check that math.perm and math.comb accept
+    # and return exact ints for int subclasses.
     pass
 
 # Class providing an __index__ method.
 class MyIndexable(object):
+    # [CLASS DOC] HELPER: Fixture exposing only the integer index protocol (not an int
+    # subclass); wraps an int and returns it from the index method. Used for gcd, lcm,
+    # perm and comb.
     def __init__(self, value):
+        # [FUNCTION DOC] HELPER: Stores the integer to be returned by the index protocol.
         self.value = value
 
     def __index__(self):
+        # [FUNCTION DOC] HELPER: Index protocol; returns the stored value.
         return self.value
 
 class BadDescr:
+    # [CLASS DOC] HELPER: Descriptor whose get method always raises ValueError. Assigned to
+    # special method names (ceil, floor, trunc, float conversion) to check that math functions
+    # propagate errors raised while looking up those methods.
     def __get__(self, obj, objtype=None):
+        # [FUNCTION DOC] HELPER: Descriptor get; unconditionally raises ValueError
+        # regardless of arguments.
         raise ValueError
 
 class MathTests(__TestCase):
+    # [CLASS DOC] Main test case (CPythonTestCase subclass) covering the functions and
+    # constants of the math module: trig/hyperbolic, rounding, logs, exponentials, gcd/lcm,
+    # comb/perm, fsum, hypot, dist, sumprod, prod, nextafter, ulp, remainder and special-
+    # value (inf, nan, signed zero) behavior, plus table-driven tests from the mathdata
+    # files. Has no instance state; ftest and the custom assertions are shared helpers. Some
+    # tests are skipped under Dynamo.
 
     def ftest(self, name, got, expected, ulp_tol=5, abs_tol=0.0):
+        # [FUNCTION DOC] HELPER: Assertion helper. Calls result_check with the expected and got
+        # values and the ulp/absolute tolerances (defaults 5 ulps, 0.0); fails the test with the
+        # given name and the message when they differ. Returns nothing.
         """Compare arguments expected and got, as floats, if either
         is a float, using a tolerance expressed in multiples of
         ulp(expected) or absolutely, whichever is greater.
@@ -316,12 +400,16 @@ class MathTests(__TestCase):
             self.fail("{}: {}".format(name, failure))
 
     def testConstants(self):
+        # [FUNCTION DOC] Checks math.pi and math.e against high-precision literals with ftest
+        # and that math.tau equals twice pi exactly.
         # Ref: Abramowitz & Stegun (Dover, 1965)
         self.ftest('pi', math.pi, 3.141592653589793238462643)
         self.ftest('e', math.e, 2.718281828459045235360287)
         self.assertEqual(math.tau, 2*math.pi)
 
     def testAcos(self):
+        # [FUNCTION DOC] Tests math.acos: wrong arity raises TypeError; values at -1, 0 and 1;
+        # inputs outside [-1, 1] (including infinities) raise ValueError; NaN input gives NaN.
         self.assertRaises(TypeError, math.acos)
         self.ftest('acos(-1)', math.acos(-1), math.pi)
         self.ftest('acos(0)', math.acos(0), math.pi/2)
@@ -333,6 +421,9 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.acos(NAN)))
 
     def testAcosh(self):
+        # [FUNCTION DOC] Tests math.acosh: TypeError on missing argument, known values at 1 and
+        # 2, ValueError for inputs below 1 and negative infinity, positive infinity maps to
+        # itself, NaN propagates.
         self.assertRaises(TypeError, math.acosh)
         self.ftest('acosh(1)', math.acosh(1), 0)
         self.ftest('acosh(2)', math.acosh(2), 1.3169578969248168)
@@ -343,6 +434,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.acosh(NAN)))
 
     def testAsin(self):
+        # [FUNCTION DOC] Tests math.asin: TypeError on missing argument, values at -1, 0, 1,
+        # ValueError for arguments outside [-1, 1] or infinite, NaN propagates.
         self.assertRaises(TypeError, math.asin)
         self.ftest('asin(-1)', math.asin(-1), -math.pi/2)
         self.ftest('asin(0)', math.asin(0), 0)
@@ -354,6 +447,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.asin(NAN)))
 
     def testAsinh(self):
+        # [FUNCTION DOC] Tests math.asinh: TypeError on missing argument, odd symmetry at plus
+        # and minus 1, zero, infinities map to themselves, NaN propagates.
         self.assertRaises(TypeError, math.asinh)
         self.ftest('asinh(0)', math.asinh(0), 0)
         self.ftest('asinh(1)', math.asinh(1), 0.88137358701954305)
@@ -363,6 +458,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.asinh(NAN)))
 
     def testAtan(self):
+        # [FUNCTION DOC] Tests math.atan: TypeError on missing argument, values at -1, 0, 1,
+        # limits of plus and minus infinity (pi/2), NaN propagates.
         self.assertRaises(TypeError, math.atan)
         self.ftest('atan(-1)', math.atan(-1), -math.pi/4)
         self.ftest('atan(0)', math.atan(0), 0)
@@ -372,6 +469,10 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.atan(NAN)))
 
     def testAtanh(self):
+        # [FUNCTION DOC] Tests math.atanh: known values at 0 and plus/minus 0.5; ValueError at
+        # plus/minus 1 and infinities; NaN propagates.
+        # KNOWN ISSUE: the arity check calls math.atan instead of math.atanh (copied upstream
+        # typo), so atanh's own TypeError behavior is not tested.
         self.assertRaises(TypeError, math.atan)
         self.ftest('atanh(0)', math.atanh(0), 0)
         self.ftest('atanh(0.5)', math.atanh(0.5), 0.54930614433405489)
@@ -383,6 +484,10 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.atanh(NAN)))
 
     def testAtan2(self):
+        # [FUNCTION DOC] Tests math.atan2 over the full IEEE 754 special-value table: argument
+        # arity errors, quadrant values for simple inputs, and each combination of y in (+0, -0,
+        # +inf, -inf, positive finite, negative finite, NaN) with x in (-inf, finite, +/-0,
+        # +inf, NaN), including the sign of zero results and NaN propagation.
         self.assertRaises(TypeError, math.atan2)
         self.ftest('atan2(-1, 0)', math.atan2(-1, 0), -math.pi/2)
         self.ftest('atan2(-1, 1)', math.atan2(-1, 1), -math.pi/4)
@@ -445,6 +550,9 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.atan2(NAN, NAN)))
 
     def testCbrt(self):
+        # [FUNCTION DOC] Tests math.cbrt: TypeError on missing argument, exact cube roots, sign
+        # preservation including negative zero, non-trivial values, infinities map to
+        # themselves, NaN propagates.
         self.assertRaises(TypeError, math.cbrt)
         self.ftest('cbrt(0)', math.cbrt(0), 0)
         self.ftest('cbrt(1)', math.cbrt(1), 1)
@@ -461,6 +569,12 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.cbrt(NAN)))
 
     def testCeil(self):
+        # [FUNCTION DOC] Tests math.ceil: the result type is int and values round toward
+        # positive infinity (negative values toward zero). Also checks the __ceil__ protocol
+        # with local fixtures: a class defining it, a float subclass defining it, an object
+        # only convertible to float (uses real ceiling), a class without it (TypeError), a
+        # class whose lookup raises ValueError (propagated), and that an instance attribute
+        # is not used (TypeError).
         self.assertRaises(TypeError, math.ceil)
         self.assertEqual(int, type(math.ceil(0.5)))
         self.assertEqual(math.ceil(0.5), 1)
@@ -476,14 +590,23 @@ class MathTests(__TestCase):
         #self.assertTrue(math.isnan(math.ceil(NAN)))
 
         class TestCeil:
+            # [CLASS DOC] HELPER: Local fixture defining the ceil special method, returning 42.
             def __ceil__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 42.
                 return 42
         class FloatCeil(float):
+            # [CLASS DOC] HELPER: Local float subclass whose ceil special method returns 42 (the
+            # override must win).
             def __ceil__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 42.
                 return 42
         class TestNoCeil:
+            # [CLASS DOC] HELPER: Local fixture with no ceil support; math.ceil
+            # must raise TypeError.
             pass
         class TestBadCeil:
+            # [CLASS DOC] HELPER: Local fixture whose ceil attribute is a descriptor
+            # that raises ValueError.
             __ceil__ = BadDescr()
         self.assertEqual(math.ceil(TestCeil()), 42)
         self.assertEqual(math.ceil(FloatCeil()), 42)
@@ -501,6 +624,10 @@ class MathTests(__TestCase):
 
     @requires_IEEE_754
     def testCopysign(self):
+        # [FUNCTION DOC] Tests math.copysign (IEEE 754 only): values with various signs, the
+        # ability to distinguish signed zeros and infinities, NaN as first argument stays
+        # NaN, and NaN as the sign source (only the magnitude is asserted since the NaN sign
+        # bit is platform dependent).
         self.assertEqual(math.copysign(1, 42), 1.0)
         self.assertEqual(math.copysign(0., 42), 0.0)
         self.assertEqual(math.copysign(1., -42), -1.0)
@@ -534,6 +661,9 @@ class MathTests(__TestCase):
         self.assertEqual(abs(math.copysign(2., NAN)), 2.)
 
     def testCos(self):
+        # [FUNCTION DOC] Tests math.cos: known values with an absolute tolerance of one
+        # ulp near zero. Infinite input must give NaN or raise ValueError (either
+        # accepted); NaN propagates.
         self.assertRaises(TypeError, math.cos)
         self.ftest('cos(-pi/2)', math.cos(-math.pi/2), 0, abs_tol=math.ulp(1))
         self.ftest('cos(0)', math.cos(0), 1)
@@ -550,6 +680,9 @@ class MathTests(__TestCase):
     @unittest.skipIf(sys.platform == 'win32' and platform.machine() in ('ARM', 'ARM64'),
                     "Windows UCRT is off by 2 ULP this test requires accuracy within 1 ULP")
     def testCosh(self):
+        # [FUNCTION DOC] Tests math.cosh: values at 0 and a Lambert identity check, both
+        # infinities give positive infinity, NaN propagates. Skipped on Windows ARM where the C
+        # runtime is off by two ulps.
         self.assertRaises(TypeError, math.cosh)
         self.ftest('cosh(0)', math.cosh(0), 1)
         self.ftest('cosh(2)-2*cosh(1)**2', math.cosh(2)-2*math.cosh(1)**2, -1) # Thanks to Lambert
@@ -558,6 +691,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.cosh(NAN)))
 
     def testDegrees(self):
+        # [FUNCTION DOC] Tests math.degrees at pi, pi/2, -pi/4 and 0, and TypeError
+        # without an argument.
         self.assertRaises(TypeError, math.degrees)
         self.ftest('degrees(pi)', math.degrees(math.pi), 180.0)
         self.ftest('degrees(pi/2)', math.degrees(math.pi/2), 90.0)
@@ -565,6 +700,8 @@ class MathTests(__TestCase):
         self.ftest('degrees(0)', math.degrees(0), 0)
 
     def testExp(self):
+        # [FUNCTION DOC] Tests math.exp: known values, +inf gives inf, -inf gives 0, NaN
+        # propagates, and a huge finite argument raises OverflowError.
         self.assertRaises(TypeError, math.exp)
         self.ftest('exp(-1)', math.exp(-1), 1/math.e)
         self.ftest('exp(0)', math.exp(0), 1)
@@ -575,6 +712,8 @@ class MathTests(__TestCase):
         self.assertRaises(OverflowError, math.exp, 1000000)
 
     def testExp2(self):
+        # [FUNCTION DOC] Tests math.exp2 analogously to exp: known values, infinities, NaN and
+        # OverflowError for a huge argument.
         self.assertRaises(TypeError, math.exp2)
         self.ftest('exp2(-1)', math.exp2(-1), 0.5)
         self.ftest('exp2(0)', math.exp2(0), 1)
@@ -586,6 +725,8 @@ class MathTests(__TestCase):
         self.assertRaises(OverflowError, math.exp2, 1000000)
 
     def testFabs(self):
+        # [FUNCTION DOC] Tests math.fabs for negative, zero and positive ints and
+        # TypeError without arguments.
         self.assertRaises(TypeError, math.fabs)
         self.ftest('fabs(-1)', math.fabs(-1), 1)
         self.ftest('fabs(0)', math.fabs(0), 0)
@@ -593,6 +734,9 @@ class MathTests(__TestCase):
 
     @skipIfTorchDynamo("infinite loop")
     def testFactorial(self):
+        # [FUNCTION DOC] Tests math.factorial for 0 and for 1..999, comparing against a running
+        # product and the pure Python py_factorial; negative inputs raise ValueError. Skipped
+        # under Dynamo due to an infinite loop.
         self.assertEqual(math.factorial(0), 1)
         total = 1
         for i in range(1, 1000):
@@ -603,6 +747,8 @@ class MathTests(__TestCase):
         self.assertRaises(ValueError, math.factorial, -10**100)
 
     def testFactorialNonIntegers(self):
+        # [FUNCTION DOC] Tests that math.factorial raises TypeError for floats (integral or
+        # not), Decimal and strings.
         self.assertRaises(TypeError, math.factorial, 5.0)
         self.assertRaises(TypeError, math.factorial, 5.2)
         self.assertRaises(TypeError, math.factorial, -1.0)
@@ -614,12 +760,19 @@ class MathTests(__TestCase):
     # Other implementations may place different upper bounds.
     @support.cpython_only
     def testFactorialHugeInputs(self):
+        # [FUNCTION DOC] CPython-only test: factorial of an int too large for a C long raises
+        # OverflowError, and a huge float still raises TypeError.
         # Currently raises OverflowError for inputs that are too large
         # to fit into a C long.
         self.assertRaises(OverflowError, math.factorial, 10**100)
         self.assertRaises(TypeError, math.factorial, 1e100)
 
     def testFloor(self):
+        # [FUNCTION DOC] Tests math.floor: result type is int, rounding toward negative
+        # infinity. Also checks the floor special-method protocol with local fixtures exactly
+        # as testCeil does for ceil (custom method used, float-convertible object uses real
+        # floor, missing method gives TypeError, raising descriptor propagates ValueError,
+        # instance attribute ignored).
         self.assertRaises(TypeError, math.floor)
         self.assertEqual(int, type(math.floor(0.5)))
         self.assertEqual(math.floor(0.5), 0)
@@ -633,14 +786,22 @@ class MathTests(__TestCase):
         #self.assertTrue(math.isnan(math.floor(NAN)))
 
         class TestFloor:
+            # [CLASS DOC] HELPER: Local fixture defining the floor special method, returning 42.
             def __floor__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 42.
                 return 42
         class FloatFloor(float):
+            # [CLASS DOC] HELPER: Local float subclass whose floor special method returns 42.
             def __floor__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 42.
                 return 42
         class TestNoFloor:
+            # [CLASS DOC] HELPER: Local fixture with no floor support; math.floor
+            # must raise TypeError.
             pass
         class TestBadFloor:
+            # [CLASS DOC] HELPER: Local fixture whose floor attribute is a descriptor
+            # that raises ValueError.
             __floor__ = BadDescr()
         self.assertEqual(math.floor(TestFloor()), 42)
         self.assertEqual(math.floor(FloatFloor()), 42)
@@ -657,6 +818,9 @@ class MathTests(__TestCase):
         self.assertEqual(math.floor(FloatLike(-1.0)), -1.0)
 
     def testFmod(self):
+        # [FUNCTION DOC] Tests math.fmod: sign follows the dividend (including negative zero
+        # results), NaN operands propagate, ValueError for zero divisor or infinite dividend,
+        # and a finite dividend with an infinite divisor is returned unchanged.
         self.assertRaises(TypeError, math.fmod)
         self.ftest('fmod(10, 1)', math.fmod(10, 1), 0.0)
         self.ftest('fmod(10, 0.5)', math.fmod(10, 0.5), 0.0)
@@ -680,9 +844,15 @@ class MathTests(__TestCase):
         self.assertRaises(ValueError, math.fmod, INF, INF)
 
     def testFrexp(self):
+        # [FUNCTION DOC] Tests math.frexp: TypeError without argument; mantissa/exponent pairs
+        # for -1, 0, 1, 2 within a small tolerance via a local checker; infinities keep the
+        # mantissa, NaN stays NaN.
         self.assertRaises(TypeError, math.frexp)
 
         def testfrexp(name, result, expected):
+            # [FUNCTION DOC] HELPER: Unpacks the returned and expected (mantissa, exponent)
+            # pairs and fails the test with a message naming the case if the mantissas differ by
+            # more than eps or exponents differ.
             (mant, exp), (emant, eexp) = result, expected
             if abs(mant-emant) > eps or exp != eexp:
                 self.fail('%s returned %r, expected %r'%\
@@ -701,6 +871,12 @@ class MathTests(__TestCase):
     @unittest.skipIf(HAVE_DOUBLE_ROUNDING,
                          "fsum is not exact on machines with double rounding")
     def testFsum(self):
+        # [FUNCTION DOC] Tests math.fsum against exactly known sums (catastrophic cancellation,
+        # tie rounding, long series, partial array resizing, a telescoping sum) and 1000
+        # shuffled random vectors compared with the pure Python full-precision msum. Also checks
+        # infinity/NaN results, FloatLike inputs, OverflowError for overflowing sums or huge
+        # ints, ValueError for inf plus -inf, TypeError for bad types, and that iterator errors
+        # propagate. Skipped without IEEE 754 or on machines with double rounding.
         # math.fsum relies on exact rounding for correct operation.
         # There's a known problem with IA32 floating-point that causes
         # inexact rounding in some situations, and will cause the
@@ -717,6 +893,10 @@ class MathTests(__TestCase):
         etiny = float_info.min_exp - mant_dig
 
         def msum(iterable):
+            # [FUNCTION DOC] HELPER: Full-precision summation reference. Splits each value with
+            # frexp into a scaled integer mantissa and exponent, accumulates in one big integer
+            # at the lowest exponent seen, then rounds the exact total to a float using round-
+            # half-even on the tail bits. Returns a float.
             """Full precision summation.  Compute sum(iterable) without any
             intermediate accumulation of error.  Based on the 'lsum' function
             at https://code.activestate.com/recipes/393090-binary-floating-point-summation-accurate-to-full-p/
@@ -806,12 +986,17 @@ class MathTests(__TestCase):
         self.assertRaises(OverflowError, math.fsum, [10**1000])
 
         def bad_iter():
+            # [FUNCTION DOC] HELPER: Generator yielding 1.0 then raising ZeroDivisionError, to
+            # check fsum propagates iterator exceptions.
             yield 1.0
             raise ZeroDivisionError
 
         self.assertRaises(ZeroDivisionError, math.fsum, bad_iter())
 
     def testGcd(self):
+        # [FUNCTION DOC] Tests math.gcd: zero and sign handling, small and huge values
+        # (including combinations of negated arguments with a known common factor), zero to many
+        # arguments, TypeError for floats, and acceptance of objects with the index protocol.
         gcd = math.gcd
         self.assertEqual(gcd(0, 0), 0)
         self.assertEqual(gcd(1, 0), 1)
@@ -854,6 +1039,12 @@ class MathTests(__TestCase):
         self.assertEqual(gcd(MyIndexable(120), MyIndexable(84)), 12)
 
     def testHypot(self):
+        # [FUNCTION DOC] Tests math.hypot: agreement with a plain square-root-of-sum-of-
+        # squares for zero to five arguments, accepted types (int, float, Decimal, Fraction,
+        # bool, float-convertible), corner cases (zero, negative zero, order independence),
+        # TypeError for keyword arguments or non-numbers, errors for ints too large for
+        # float, infinity beating NaN, NaN otherwise propagating, and scaling at extremely
+        # large and small magnitudes.
         from decimal import Decimal
         from fractions import Fraction
 
@@ -938,6 +1129,10 @@ class MathTests(__TestCase):
     @unittest.skipIf(HAVE_DOUBLE_ROUNDING,
                      "hypot() loses accuracy on machines with double rounding")
     def testHypotAccuracy(self):
+        # [FUNCTION DOC] Tests math.hypot accuracy: for a list of hex-encoded float pairs that
+        # once produced 1-2 ulp errors, requires the result to equal the correctly rounded value
+        # computed with a 500-digit decimal context. Each pair runs in its own subTest. Skipped
+        # without IEEE 754 or with double rounding.
         # Verify improved accuracy in cases that were known to be inaccurate.
         #
         # The new algorithm's accuracy depends on IEEE 754 arithmetic
@@ -998,6 +1193,13 @@ class MathTests(__TestCase):
                 self.assertEqual(hypot(x, y), z)
 
     def testDist(self):
+        # [FUNCTION DOC] Tests math.dist: simple exact cases, random vectors up to nine
+        # dimensions against a naive formula, non-tuple iterables, accepted element types,
+        # corner cases (zero distance, empty vectors, positive zero result, order independence),
+        # tuple subclasses, many error cases (keyword arguments, wrong arity, scalars, dimension
+        # mismatch, bad element types, overflowing ints, raising float conversion), equivalence
+        # to abs in one dimension, a cartesian grid of special values (infinite difference gives
+        # inf, else NaN) and scaling for extremely large and small values.
         from decimal import Decimal as D
         from fractions import Fraction as F
 
@@ -1055,6 +1257,8 @@ class MathTests(__TestCase):
 
         # Verify tuple subclasses are allowed
         class T(tuple):
+            # [CLASS DOC] HELPER: Local tuple subclass checking that dist
+            # accepts tuple subclasses.
             pass
         self.assertEqual(dist(T((1, 2, 3)), ((4, 2, -1))), 5.0)
 
@@ -1088,6 +1292,8 @@ class MathTests(__TestCase):
             dist([1], 2)
 
         class BadFloat:
+            # [CLASS DOC] HELPER: Local fixture whose float conversion attribute is a raising
+            # descriptor (ValueError); dist must propagate it.
             __float__ = BadDescr()
 
         with self.assertRaises(ValueError):
@@ -1127,12 +1333,18 @@ class MathTests(__TestCase):
             self.assertEqual(math.dist(q, p), 5*scale)
 
     def test_math_dist_leak(self):
+        # [FUNCTION DOC] Regression test for gh-98897: math.dist with vectors of different
+        # lengths must raise ValueError (error handling must not leak memory).
         # gh-98897: Check for error handling does not leak memory
         with self.assertRaises(ValueError):
             math.dist([1, 2], [3, 4, 5])
 
     @slowTest
     def testIsqrt(self):
+        # [FUNCTION DOC] Tests math.isqrt: for about thousands of small and huge values, result
+        # is an exact int floor square root (s*s <= value < (s+1)*(s+1)); negative input raises
+        # ValueError; booleans and index-protocol objects are accepted (negative ones raise
+        # ValueError); floats, strings, Decimal and complex raise TypeError. Marked slow.
         # Test a variety of inputs, large and small.
         test_values = (
             list(range(1000))
@@ -1162,10 +1374,14 @@ class MathTests(__TestCase):
         self.assertEqual(s, 0)
 
         class IntegerLike(object):
+            # [CLASS DOC] HELPER: Local fixture exposing only the index protocol
+            # for isqrt checks.
             def __init__(self, value):
+                # [FUNCTION DOC] HELPER: Stores the integer value.
                 self.value = value
 
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Index protocol; returns the stored value.
                 return self.value
 
         s = math.isqrt(IntegerLike(1729))
@@ -1186,6 +1402,9 @@ class MathTests(__TestCase):
                     math.isqrt(value)
 
     def test_lcm(self):
+        # [FUNCTION DOC] Tests math.lcm: zero handling, sign handling, small and huge values
+        # (with combinations of negated arguments against a computed product), zero to many
+        # arguments, TypeError for floats and acceptance of index-protocol objects.
         lcm = math.lcm
         self.assertEqual(lcm(0, 0), 0)
         self.assertEqual(lcm(1, 0), 0)
@@ -1230,6 +1449,10 @@ class MathTests(__TestCase):
         self.assertEqual(lcm(MyIndexable(120), MyIndexable(84)), 840)
 
     def testLdexp(self):
+        # [FUNCTION DOC] Tests math.ldexp: TypeError for missing or non-int exponent,
+        # simple scalings, OverflowError on overflow, underflow to signed zero, infinities
+        # and NaN passing through, and exponents of enormous magnitude (up to 10**40)
+        # giving the same limiting results.
         self.assertRaises(TypeError, math.ldexp)
         self.assertRaises(TypeError, math.ldexp, 2.0, 1.1)
         self.ftest('ldexp(0,1)', math.ldexp(0,1), 0)
@@ -1263,6 +1486,9 @@ class MathTests(__TestCase):
             self.assertTrue(math.isnan(math.ldexp(NAN, n)))
 
     def testLog(self):
+        # [FUNCTION DOC] Tests math.log: TypeError for wrong arity, natural log and explicit
+        # bases, huge ints, ValueError for negative arguments or negative base, log of -inf
+        # raises, +inf gives inf, NaN propagates.
         self.assertRaises(TypeError, math.log)
         self.assertRaises(TypeError, math.log, 1, 2, 3)
         self.ftest('log(1/e)', math.log(1/math.e), -1)
@@ -1281,6 +1507,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.log(NAN)))
 
     def testLog1p(self):
+        # [FUNCTION DOC] Tests math.log1p: TypeError without argument, big ints agree with float
+        # conversion, ValueError at -1, +inf maps to inf.
         self.assertRaises(TypeError, math.log1p)
         for n in [2, 2**90, 2**300]:
             self.assertAlmostEqual(math.log1p(n), math.log1p(float(n)))
@@ -1290,6 +1518,9 @@ class MathTests(__TestCase):
     @skipIfTorchDynamo("Infinite loop")
     @requires_IEEE_754
     def testLog2(self):
+        # [FUNCTION DOC] Tests math.log2: arity error, exact results for 1, 2, 4 and huge powers
+        # of two as ints, ValueError for negative or -inf input, NaN propagates. Skipped under
+        # Dynamo (infinite loop) and when IEEE 754 is not available.
         self.assertRaises(TypeError, math.log2)
 
         # Check some integer values
@@ -1311,12 +1542,18 @@ class MathTests(__TestCase):
     # log2() is not accurate enough on Mac OS X Tiger (10.4)
     @support.requires_mac_ver(10, 5)
     def testLog2Exact(self):
+        # [FUNCTION DOC] Tests that math.log2 of every power of two from 2**-1074 to 2**1023 is
+        # exactly the exponent. Skipped under Dynamo and on very old macOS.
         # Check that we get exact equality for log2 of powers of 2.
         actual = [math.log2(math.ldexp(1.0, n)) for n in range(-1074, 1024)]
         expected = [float(n) for n in range(-1074, 1024)]
         self.assertEqual(actual, expected)
 
     def testLog10(self):
+        # [FUNCTION DOC] Tests math.log10: known values, huge int, ValueError for negative or
+        # -inf input, NaN propagates.
+        # KNOWN ISSUE: the infinity check calls math.log instead of math.log10 (copied upstream
+        # typo), so log10 of infinity is not actually tested.
         self.assertRaises(TypeError, math.log10)
         self.ftest('log10(0.1)', math.log10(0.1), -1)
         self.ftest('log10(1)', math.log10(1), 0)
@@ -1329,6 +1566,12 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.log10(NAN)))
 
     def testSumProd(self):
+        # [FUNCTION DOC] Tests math.sumprod: core results, result type matching the
+        # equivalent plain sum of products for ints, floats, Fraction and Decimal mixes,
+        # TypeError for wrong arity or non-iterables or bad elements, ValueError for unequal
+        # lengths, large values and OverflowError for ints too large for float, errors from
+        # iterators or from multiplication or addition propagating, inf/NaN behavior, and a
+        # regression case from development.
         sumprod = math.sumprod
         Decimal = decimal.Decimal
         Fraction = fractions.Fraction
@@ -1380,6 +1623,7 @@ class MathTests(__TestCase):
 
         # Error in iterator
         def raise_after(n):
+            # [FUNCTION DOC] HELPER: Generator yielding 0..n-1 and then raising RuntimeError.
             for i in range(n):
                 yield i
             raise RuntimeError
@@ -1395,9 +1639,13 @@ class MathTests(__TestCase):
 
         # Error in multiplication
         class BadMultiply:
+            # [CLASS DOC] HELPER: Local fixture whose multiplication (both
+            # directions) raises RuntimeError.
             def __mul__(self, other):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError
             def __rmul__(self, other):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError
         with self.assertRaises(RuntimeError):
             sumprod([10, BadMultiply(), 30], [1, 2, 3])
@@ -1430,6 +1678,9 @@ class MathTests(__TestCase):
                          "sumprod() accuracy not guaranteed on machines with double rounding")
     @support.cpython_only    # Other implementations may choose a different algorithm
     def test_sumprod_accuracy(self):
+        # [FUNCTION DOC] Tests math.sumprod accuracy: results must be correctly rounded for sums
+        # such as ten times 0.1 and a cancelling pair of large values. CPython only, IEEE 754
+        # only, skipped with double rounding.
         sumprod = math.sumprod
         self.assertEqual(sumprod([0.1] * 10, [1]*10), 1.0)
         self.assertEqual(sumprod([0.1] * 20, [True, False] * 10), 1.0)
@@ -1438,32 +1689,51 @@ class MathTests(__TestCase):
 
     @support.requires_resource('cpu')
     def test_sumprod_stress(self):
+        # [FUNCTION DOC] Stress test (needs the cpu resource): builds pools of mixed numeric
+        # values (ints, floats, huge magnitudes, inf/NaN, complex, Decimal, Fraction,
+        # int/float subclasses) and, for every pair of sequences of length 0 to 3 from each
+        # pool, requires sumprod to give the same outcome (exception type, result type and
+        # repr) as a naive loop.
         sumprod = math.sumprod
         product = itertools.product
         Decimal = decimal.Decimal
         Fraction = fractions.Fraction
 
         class Int(int):
+            # [CLASS DOC] HELPER: Local int subclass whose add and multiply return Int and
+            # whose repr shows the value, so sumprod's handling of subclasses can be compared
+            # with the baseline.
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: Adds as plain ints and wraps the result in Int.
                 return Int(int(self) + int(other))
             def __mul__(self, other):
+                # [FUNCTION DOC] HELPER: Multiplies as plain ints and wraps the result in Int.
                 return Int(int(self) * int(other))
             __radd__ = __add__
             __rmul__ = __mul__
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: Returns a repr of the form Int(value).
                 return f'Int({int(self)})'
 
         class Flt(float):
+            # [CLASS DOC] HELPER: Local float subclass whose add and multiply truncate to int
+            # and return Int.
             def __add__(self, other):
+                # [FUNCTION DOC] HELPER: Converts both operands to int, adds, returns Int.
                 return Int(int(self) + int(other))
             def __mul__(self, other):
+                # [FUNCTION DOC] HELPER: Converts both operands to int, multiplies, returns Int.
                 return Int(int(self) * int(other))
             __radd__ = __add__
             __rmul__ = __mul__
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: Returns a repr of the form Flt(truncated int value).
                 return f'Flt({int(self)})'
 
         def baseline_sumprod(p, q):
+            # [FUNCTION DOC] HELPER: Reference implementation: sums products of strictly zipped
+            # elements starting from int zero. Raises ValueError for unequal lengths. Defines
+            # the target behavior.
             """This defines the target behavior including exceptions and special values.
             However, it is subject to rounding errors, so float inputs should be exactly
             representable with only a few bits.
@@ -1474,6 +1744,9 @@ class MathTests(__TestCase):
             return total
 
         def run(func, *args):
+            # [FUNCTION DOC] HELPER: Calls func with args and returns a triple of (exception
+            # type or None, result type or None, repr of result or the string None).
+            # AssertionError and NameError are re-raised so test bugs are not hidden.
             "Make comparing functions easier. Returns error status, type, and result."
             try:
                 result = func(*args)
@@ -1517,6 +1790,11 @@ class MathTests(__TestCase):
     @support.cpython_only    # Other implementations may choose a different algorithm
     @support.requires_resource('cpu')
     def test_sumprod_extended_precision_accuracy(self):
+        # [FUNCTION DOC] Tests extended-precision accuracy of math.sumprod: generates ill-
+        # conditioned dot products (condition number 1e30) with the GenDot algorithm,
+        # computes the exact value with Fractions, and requires the median relative error
+        # over 1000 trials to be below 1e-16. Failure suggests an inaccurate C fma. CPython,
+        # IEEE 754 and cpu-resource only.
         import operator
         from fractions import Fraction
         from itertools import starmap
@@ -1528,18 +1806,28 @@ class MathTests(__TestCase):
         DotExample = namedtuple('DotExample', ('x', 'y', 'target_sumprod', 'condition'))
 
         def DotExact(x, y):
+            # [FUNCTION DOC] HELPER: Exact dot product of two sequences
+            # using Fraction arithmetic.
             vec1 = map(Fraction, x)
             vec2 = map(Fraction, y)
             return sum(starmap(operator.mul, zip(vec1, vec2, strict=True)))
 
         def Condition(x, y):
+            # [FUNCTION DOC] HELPER: Condition number of the dot product: twice the exact dot of
+            # absolute values divided by the absolute exact dot.
             return 2.0 * DotExact(map(abs, x), map(abs, y)) / abs(DotExact(x, y))
 
         def linspace(lo, hi, n):
+            # [FUNCTION DOC] HELPER: Returns n evenly spaced floats from lo to hi inclusive.
             width = (hi - lo) / (n - 1)
             return [lo + width * i for i in range(n)]
 
         def GenDot(n, c):
+            # [FUNCTION DOC] HELPER: Generates two random vectors x and y of length n (at
+            # least 6, asserted) whose dot product has roughly condition number c: first half
+            # random with large exponents, second half built to cancel, then pairs shuffled.
+            # Returns a DotExample with x, y, exact dot and achieved condition number. Uses
+            # the random module (non-deterministic).
             """ Algorithm 6.1 (GenDot) works as follows. The condition number (5.7) of
             the dot product xT y is proportional to the degree of cancellation. In
             order to achieve a prescribed cancellation, we generate the first half of
@@ -1578,11 +1866,16 @@ class MathTests(__TestCase):
             return DotExample(x, y, DotExact(x, y), Condition(x, y))
 
         def RelativeError(res, ex):
+            # [FUNCTION DOC] HELPER: Relative error of a computed dot product res, measured by
+            # the exact dot of the inputs extended with minus res, divided by the exact target.
+            # Returns a float.
             x, y, target_sumprod, condition = ex
             n = DotExact(list(x) + [-res], list(y) + [1])
             return fabs(n / target_sumprod)
 
         def Trial(dotfunc, c, n):
+            # [FUNCTION DOC] HELPER: One trial: generates a length-10 example with condition c,
+            # applies dotfunc and returns the relative error. The n parameter is unused.
             ex = GenDot(10, c)
             res = dotfunc(ex.x, ex.y)
             return RelativeError(res, ex)
@@ -1600,9 +1893,14 @@ class MathTests(__TestCase):
         self.assertLess(relative_err, 1e-16)
 
     def testModf(self):
+        # [FUNCTION DOC] Tests math.modf: TypeError without argument, fractional and integral
+        # parts for positive and negative values via a local checker, infinities give signed
+        # zero fraction, NaN gives NaN for both parts.
         self.assertRaises(TypeError, math.modf)
 
         def testmodf(name, result, expected):
+            # [FUNCTION DOC] HELPER: Compares returned and expected (fraction, integer) pairs,
+            # failing with a message if they differ by more than eps.
             (v1, v2), (e1, e2) = result, expected
             if abs(v1-e1) > eps or abs(v2-e2):
                 self.fail('%s returned %r, expected %r'%\
@@ -1619,6 +1917,11 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(modf_nan[1]))
 
     def testPow(self):
+        # [FUNCTION DOC] Tests math.pow against the C99 special-value table: simple values,
+        # OverflowError, results for bases 0, -0, +/-inf, -1 and 1 against many exponents,
+        # exponent zero always giving 1, ValueError for negative base with non-integer exponent
+        # or zero base with negative exponent, limits for base magnitude relative to 1 with
+        # infinite exponents, and negative bases with integer exponents.
         self.assertRaises(TypeError, math.pow)
         self.ftest('pow(0,1)', math.pow(0,1), 0)
         self.ftest('pow(1,0)', math.pow(1,0), 1)
@@ -1769,6 +2072,8 @@ class MathTests(__TestCase):
         #self.assertEqual(1.**0, 1)
 
     def testRadians(self):
+        # [FUNCTION DOC] Tests math.radians at 180, 90, -45 and 0 and TypeError
+        # without an argument.
         self.assertRaises(TypeError, math.radians)
         self.ftest('radians(180)', math.radians(180), math.pi)
         self.ftest('radians(90)', math.radians(90), math.pi/2)
@@ -1778,9 +2083,18 @@ class MathTests(__TestCase):
     @slowTest
     @requires_IEEE_754
     def testRemainder(self):
+        # [FUNCTION DOC] Tests math.remainder (IEEE 754 only, slow): validates a table of
+        # hex/decimal triples against the spec (|r| <= |y|/2, x - r a multiple of y, ties to
+        # even) and bit-exact results via hex strings; checks a tiny subnormal modulus over
+        # many multiples; NaN propagation; infinite modulus returns x; ValueError for zero
+        # modulus or infinite dividend.
         from fractions import Fraction
 
         def validate_spec(x, y, r):
+            # [FUNCTION DOC] HELPER: Checks with exact Fractions that r is a valid IEEE
+            # remainder of x by y: |r| is at most half of |y|, (x - r)/y is an integer, and that
+            # integer is even when |r| is exactly half of |y|. Assumes finite values and nonzero
+            # y; failures via test assertions.
             """
             Check that r matches remainder(x, y) according to the IEEE 754
             specification. Assumes that x, y and r are finite and y is nonzero.
@@ -1906,6 +2220,8 @@ class MathTests(__TestCase):
                 math.remainder(value, -0.0)
 
     def testSin(self):
+        # [FUNCTION DOC] Tests math.sin: values at 0 and plus/minus pi/2, infinite input gives
+        # NaN or ValueError, NaN propagates, TypeError without argument.
         self.assertRaises(TypeError, math.sin)
         self.ftest('sin(0)', math.sin(0), 0)
         self.ftest('sin(pi/2)', math.sin(math.pi/2), 1)
@@ -1919,6 +2235,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.sin(NAN)))
 
     def testSinh(self):
+        # [FUNCTION DOC] Tests math.sinh: value at 0, identity with cosh, odd symmetry,
+        # infinities map to themselves, NaN propagates.
         self.assertRaises(TypeError, math.sinh)
         self.ftest('sinh(0)', math.sinh(0), 0)
         self.ftest('sinh(1)**2-cosh(1)**2', math.sinh(1)**2-math.cosh(1)**2, -1)
@@ -1928,6 +2246,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.sinh(NAN)))
 
     def testSqrt(self):
+        # [FUNCTION DOC] Tests math.sqrt: known values for ints and floats, +inf maps to itself,
+        # ValueError for negative input or -inf, NaN propagates.
         self.assertRaises(TypeError, math.sqrt)
         self.ftest('sqrt(0)', math.sqrt(0), 0)
         self.ftest('sqrt(0)', math.sqrt(0.0), 0.0)
@@ -1942,6 +2262,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.sqrt(NAN)))
 
     def testTan(self):
+        # [FUNCTION DOC] Tests math.tan: values at 0 and plus/minus pi/4, infinite input gives
+        # NaN or ValueError, NaN propagates.
         self.assertRaises(TypeError, math.tan)
         self.ftest('tan(0)', math.tan(0), 0)
         self.ftest('tan(pi/4)', math.tan(math.pi/4), 1)
@@ -1955,6 +2277,8 @@ class MathTests(__TestCase):
         self.assertTrue(math.isnan(math.tan(NAN)))
 
     def testTanh(self):
+        # [FUNCTION DOC] Tests math.tanh: value at 0, odd symmetry within one ulp, limits at
+        # plus and minus infinity are plus and minus 1, NaN propagates.
         self.assertRaises(TypeError, math.tanh)
         self.ftest('tanh(0)', math.tanh(0), 0)
         self.ftest('tanh(1)+tanh(-1)', math.tanh(1)+math.tanh(-1), 0,
@@ -1965,12 +2289,19 @@ class MathTests(__TestCase):
 
     @requires_IEEE_754
     def testTanhSign(self):
+        # [FUNCTION DOC] Tests that math.tanh of negative zero is negative zero, with the sign
+        # verified through copysign (IEEE 754 only).
         # check that tanh(-0.) == -0. on IEEE 754 systems
         self.assertEqual(math.tanh(-0.), -0.)
         self.assertEqual(math.copysign(1., math.tanh(-0.)),
                          math.copysign(1., -0.))
 
     def test_trunc(self):
+        # [FUNCTION DOC] Tests math.trunc: int results truncating toward zero for ints and
+        # floats. Checks the trunc special method protocol with local fixtures: custom method
+        # used (23), float subclass override used, float-convertible object without the method
+        # raises TypeError, missing method TypeError, raising descriptor propagates ValueError,
+        # wrong arity TypeError.
         self.assertEqual(math.trunc(1), 1)
         self.assertEqual(math.trunc(-1), -1)
         self.assertEqual(type(math.trunc(1)), int)
@@ -1983,14 +2314,22 @@ class MathTests(__TestCase):
         self.assertEqual(math.trunc(-100.999), -100)
 
         class TestTrunc:
+            # [CLASS DOC] HELPER: Local fixture defining the trunc special method, returning 23.
             def __trunc__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 23.
                 return 23
         class FloatTrunc(float):
+            # [CLASS DOC] HELPER: Local float subclass whose trunc special method returns 23.
             def __trunc__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 23.
                 return 23
         class TestNoTrunc:
+            # [CLASS DOC] HELPER: Local fixture with no trunc support; math.trunc
+            # must raise TypeError.
             pass
         class TestBadTrunc:
+            # [CLASS DOC] HELPER: Local fixture whose trunc attribute is a descriptor
+            # that raises ValueError.
             __trunc__ = BadDescr()
 
         self.assertEqual(math.trunc(TestTrunc()), 23)
@@ -2003,6 +2342,8 @@ class MathTests(__TestCase):
         self.assertRaises(ValueError, math.trunc, TestBadTrunc())
 
     def testIsfinite(self):
+        # [FUNCTION DOC] Tests math.isfinite: true for plus and minus zero and finite values,
+        # false for NaN and both infinities.
         self.assertTrue(math.isfinite(0.0))
         self.assertTrue(math.isfinite(-0.0))
         self.assertTrue(math.isfinite(1.0))
@@ -2012,6 +2353,8 @@ class MathTests(__TestCase):
         self.assertFalse(math.isfinite(float("-inf")))
 
     def testIsnan(self):
+        # [FUNCTION DOC] Tests math.isnan: true for NaN (either sign) and for infinity times
+        # zero, false for infinity and finite values.
         self.assertTrue(math.isnan(float("nan")))
         self.assertTrue(math.isnan(float("-nan")))
         self.assertTrue(math.isnan(float("inf") * 0.))
@@ -2020,6 +2363,8 @@ class MathTests(__TestCase):
         self.assertFalse(math.isnan(1.))
 
     def testIsinf(self):
+        # [FUNCTION DOC] Tests math.isinf: true for both infinities and for overflowing
+        # literals, false for NaN and finite values.
         self.assertTrue(math.isinf(float("inf")))
         self.assertTrue(math.isinf(float("-inf")))
         self.assertTrue(math.isinf(1E400))
@@ -2029,11 +2374,15 @@ class MathTests(__TestCase):
         self.assertFalse(math.isinf(1.))
 
     def test_nan_constant(self):
+        # [FUNCTION DOC] Tests that math.nan is a NaN with positive sign bit
+        # (checked via copysign).
         # `math.nan` must be a quiet NaN with positive sign bit
         self.assertTrue(math.isnan(math.nan))
         self.assertEqual(math.copysign(1., math.nan), 1.)
 
     def test_inf_constant(self):
+        # [FUNCTION DOC] Tests that math.inf is infinite, positive, and equal to float inf; its
+        # negation equals float -inf.
         self.assertTrue(math.isinf(math.inf))
         self.assertGreater(math.inf, 0.0)
         self.assertEqual(math.inf, float("inf"))
@@ -2046,6 +2395,10 @@ class MathTests(__TestCase):
     # tested.
     @unittest.skipUnless(verbose, 'requires verbose mode')
     def test_exceptions(self):
+        # [FUNCTION DOC] Runs only in verbose mode (known to fail on some platforms):
+        # an underflowing exp must return 0 without raising, an overflowing exp must
+        # raise OverflowError, and sqrt of -1.0 must raise ValueError. Fails the test
+        # with a message otherwise.
         try:
             x = math.exp(-1000000000)
         except:
@@ -2078,6 +2431,12 @@ class MathTests(__TestCase):
 
     @requires_IEEE_754
     def test_testfile(self):
+        # [FUNCTION DOC] Table-driven test (IEEE 754 only) using the cmath_testcases file: for
+        # each case whose inputs and outputs are purely real, skips rect and polar, optionally
+        # skips one case on very old macOS, looks up the function on math, maps invalid/divide-
+        # by-zero flags to expected ValueError and overflow to OverflowError, fixes the zero
+        # sign for a few sqrt cases, and compares with 5 ulp tolerance using result_check.
+        # Collects every failure and fails once with the full list.
         # Some tests need to be skipped on ancient OS X versions.
         # See issue #27953.
         SKIP_ON_TIGER = {'tan0064'}
@@ -2142,6 +2501,11 @@ class MathTests(__TestCase):
 
     @requires_IEEE_754
     def test_mtestfile(self):
+        # [FUNCTION DOC] Table-driven test (IEEE 754 only) using the math_testcases file: calls
+        # each named math function on the argument, maps raised ValueError/OverflowError to the
+        # expected names via flags, uses default tolerance of 5 ulps with wider tolerances for
+        # gamma (20 ulps), lgamma (absolute 1e-15) and erfc for non-negative arguments
+        # (10/100/1000 ulps by range), and fails once with all collected mismatches.
         fail_fmt = "{}: {}({!r}): {}"
 
         failures = []
@@ -2208,6 +2572,12 @@ class MathTests(__TestCase):
                       '\n  '.join(failures))
 
     def test_prod(self):
+        # [FUNCTION DOC] Tests math.prod: empty and start values, mixed numeric types,
+        # integers/floats/Fractions, propagation of multiplication errors, fast-path
+        # overflow, TypeError for non-iterables or non-multiplicable elements, odd uses with
+        # string/list start, start being keyword-only, zero handling, big ints and floats
+        # against a naive loop, NaN and infinity combinations, and result type preservation
+        # (int, float, Decimal).
         from fractions import Fraction as F
 
         prod = math.prod
@@ -2225,7 +2595,10 @@ class MathTests(__TestCase):
 
         # Error in multiplication
         class BadMultiply:
+            # [CLASS DOC] HELPER: Local fixture whose reflected
+            # multiplication raises RuntimeError.
             def __rmul__(self, other):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError
         with self.assertRaises(RuntimeError):
             prod([10., BadMultiply()])
@@ -2260,6 +2633,8 @@ class MathTests(__TestCase):
         self.assertEqual(prod([1, 2, 3, 0]), 0)
 
         def _naive_prod(iterable, start=1):
+            # [FUNCTION DOC] HELPER: Reference product: multiplies start by each element in
+            # order and returns it.
             for elem in iterable:
                 start *= elem
             return start
@@ -2311,6 +2686,11 @@ class MathTests(__TestCase):
 
     @skipIfTorchDynamo("Infinite loop")
     def testPerm(self):
+        # [FUNCTION DOC] Tests math.perm: matches the factorial definition for many (n, k),
+        # Pascal-like identity, corner cases, one-argument form, TypeError for non-integers or
+        # wrong arity, ValueError for negative arguments, zero when k exceeds n, huge n,
+        # OverflowError for enormous results on CPython, and int results for bool, int subclass
+        # and index-protocol arguments. Skipped under Dynamo (infinite loop).
         perm = math.perm
         factorial = math.factorial
         # Test if factorial definition is satisfied
@@ -2376,6 +2756,11 @@ class MathTests(__TestCase):
 
     @skipIfTorchDynamo("infinite loop")
     def testComb(self):
+        # [FUNCTION DOC] Tests math.comb analogously to testPerm: factorial definition,
+        # Pascal's identity, corner cases, symmetry, TypeError for non-integers or wrong
+        # arity, ValueError for negatives, zero when k exceeds n, huge n, OverflowError on
+        # CPython, and int result types for bool, int subclass and index-protocol arguments.
+        # Skipped under Dynamo.
         comb = math.comb
         factorial = math.factorial
         # Test if factorial definition is satisfied
@@ -2447,6 +2832,10 @@ class MathTests(__TestCase):
 
     @requires_IEEE_754
     def test_nextafter(self):
+        # [FUNCTION DOC] Tests math.nextafter (IEEE 754 only): neighbors around large powers of
+        # two, around 1.0 with the steps argument, equal arguments return the target with its
+        # sign, around zero (subnormals and signed zero), around infinity, NaN propagation,
+        # steps zero returns the start and negative steps raise ValueError.
         # around 2^52 and 2^63
         self.assertEqual(math.nextafter(4503599627370496.0, -INF),
                          4503599627370495.5)
@@ -2508,6 +2897,10 @@ class MathTests(__TestCase):
     @unittest.skip("flaky test under torch dynamo")  # works on pytest and crashes on unittest
     @requires_IEEE_754
     def test_ulp(self):
+        # [FUNCTION DOC] Tests math.ulp: ulp of 1.0 is epsilon, powers of two, smallest and
+        # largest floats, infinity gives infinity, NaN gives NaN, and the value is symmetric
+        # under negation. Currently skipped unconditionally because it is flaky under Dynamo
+        # (crashes with unittest).
         self.assertEqual(math.ulp(1.0), sys.float_info.epsilon)
         # use int ** int rather than float ** int to not rely on pow() accuracy
         self.assertEqual(math.ulp(2 ** 52), 1.0)
@@ -2530,10 +2923,18 @@ class MathTests(__TestCase):
                 self.assertEqual(math.ulp(-x), math.ulp(x))
 
     def test_issue39871(self):
+        # [FUNCTION DOC] Regression test for issue 39871: atan2, copysign and remainder
+        # must raise TypeError (not SystemError) when the first argument is not
+        # convertible, and must not try to convert the second argument afterwards
+        # (verified via a flag on the fixture).
         # A SystemError should not be raised if the first arg to atan2(),
         # copysign(), or remainder() cannot be converted to a float.
         class F:
+            # [CLASS DOC] HELPER: Local fixture whose float conversion records that it was
+            # called and then raises ZeroDivisionError.
             def __float__(self):
+                # [FUNCTION DOC] HELPER: Sets the converted flag on the instance and divides by
+                # zero, raising ZeroDivisionError.
                 self.converted = True
                 1/0
         for func in math.atan2, math.copysign, math.remainder:
@@ -2546,6 +2947,8 @@ class MathTests(__TestCase):
             self.assertFalse(getattr(y, "converted", False))
 
     def test_input_exceptions(self):
+        # [FUNCTION DOC] Tests that math.exp, erf and atan2 raise TypeError for non-numeric
+        # arguments and atan2 raises TypeError for the wrong number of arguments.
         self.assertRaises(TypeError, math.exp, "spam")
         self.assertRaises(TypeError, math.erf, "spam")
         self.assertRaises(TypeError, math.atan2, "spam", 1.0)
@@ -2556,10 +2959,14 @@ class MathTests(__TestCase):
     # Custom assertions.
 
     def assertIsNaN(self, value):
+        # [FUNCTION DOC] HELPER: Custom assertion; fails the test with a message if the value
+        # is not NaN.
         if not math.isnan(value):
             self.fail("Expected a NaN, got {!r}.".format(value))
 
     def assertEqualSign(self, x, y):
+        # [FUNCTION DOC] HELPER: Custom assertion; asserts x equals y and that their sign bits
+        # (via copysign) match, to compare signed zeros.
         """Similar to assertEqual(), but compare also the sign with copysign().
 
         Function useful to compare signed zeros.
@@ -2569,25 +2976,36 @@ class MathTests(__TestCase):
 
 
 class IsCloseTests(__TestCase):
+    # [CLASS DOC] Tests for math.isclose (PEP 485). The class attribute isclose selects the
+    # function under test so subclasses can reuse the tests with another implementation.
+    # Provides assertion helpers that report both values on failure.
     isclose = math.isclose  # subclasses should override this
 
     def assertIsClose(self, a, b, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Asserts isclose(a, b, ...) is true; message names both values.
         self.assertTrue(self.isclose(a, b, *args, **kwargs),
                         msg="%s and %s should be close!" % (a, b))
 
     def assertIsNotClose(self, a, b, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Asserts isclose(a, b, ...) is false; message names both values.
         self.assertFalse(self.isclose(a, b, *args, **kwargs),
                          msg="%s and %s should not be close!" % (a, b))
 
     def assertAllClose(self, examples, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Asserts every pair in examples is close under the
+        # given tolerance arguments.
         for a, b in examples:
             self.assertIsClose(a, b, *args, **kwargs)
 
     def assertAllNotClose(self, examples, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Asserts no pair in examples is close under the
+        # given tolerance arguments.
         for a, b in examples:
             self.assertIsNotClose(a, b, *args, **kwargs)
 
     def test_negative_tolerances(self):
+        # [FUNCTION DOC] Checks that isclose raises ValueError when rel_tol or
+        # abs_tol is negative.
         # ValueError should be raised if either tolerance is less than zero
         with self.assertRaises(ValueError):
             self.assertIsClose(1, 1, rel_tol=-1e-100)
@@ -2595,6 +3013,8 @@ class IsCloseTests(__TestCase):
             self.assertIsClose(1, 1, rel_tol=1e-100, abs_tol=-1e10)
 
     def test_identical(self):
+        # [FUNCTION DOC] Checks that identical values (including 0.0 and -0.0, int vs float) are
+        # close even with both tolerances zero.
         # identical values must test as close
         identical_examples = [(2.0, 2.0),
                               (0.1e200, 0.1e200),
@@ -2605,6 +3025,8 @@ class IsCloseTests(__TestCase):
         self.assertAllClose(identical_examples, rel_tol=0.0, abs_tol=0.0)
 
     def test_eight_decimal_places(self):
+        # [FUNCTION DOC] Checks examples within 1e-8 relative tolerance are close and not
+        # close at 1e-9.
         # examples that are close to 1e-8, but not 1e-9
         eight_decimal_places_examples = [(1e8, 1e8 + 1),
                                          (-1e-8, -1.000000009e-8),
@@ -2613,6 +3035,8 @@ class IsCloseTests(__TestCase):
         self.assertAllNotClose(eight_decimal_places_examples, rel_tol=1e-9)
 
     def test_near_zero(self):
+        # [FUNCTION DOC] Checks values near zero are never close by relative tolerance but are
+        # close with an absolute tolerance of 1e-8.
         # values close to zero
         near_zero_examples = [(1e-9, 0.0),
                               (-1e-9, 0.0),
@@ -2623,6 +3047,7 @@ class IsCloseTests(__TestCase):
         self.assertAllClose(near_zero_examples, abs_tol=1e-8)
 
     def test_identical_infinite(self):
+        # [FUNCTION DOC] Checks equal infinities (same sign) are close regardless of tolerance.
         # these are close regardless of tolerance -- i.e. they are equal
         self.assertIsClose(INF, INF)
         self.assertIsClose(INF, INF, abs_tol=0.0)
@@ -2630,6 +3055,8 @@ class IsCloseTests(__TestCase):
         self.assertIsClose(NINF, NINF, abs_tol=0.0)
 
     def test_inf_ninf_nan(self):
+        # [FUNCTION DOC] Checks NaN, mixed infinities, and infinity against finite numbers are
+        # never close, even with a very large absolute tolerance.
         # these should never be close (following IEEE 754 rules for equality)
         not_close_examples = [(NAN, NAN),
                               (NAN, 1e-100),
@@ -2645,6 +3072,8 @@ class IsCloseTests(__TestCase):
         self.assertAllNotClose(not_close_examples, abs_tol=0.999999999999999)
 
     def test_zero_tolerance(self):
+        # [FUNCTION DOC] Checks that with zero relative tolerance equal values are close and
+        # slightly different values are not.
         # test with zero tolerance
         zero_tolerance_close_examples = [(1.0, 1.0),
                                          (-3.4, -3.4),
@@ -2657,10 +3086,14 @@ class IsCloseTests(__TestCase):
         self.assertAllNotClose(zero_tolerance_not_close_examples, rel_tol=0.0)
 
     def test_asymmetry(self):
+        # [FUNCTION DOC] Checks the PEP 485 symmetry example: 9 and 10 are close with rel_tol
+        # 0.1 in both argument orders.
         # test the asymmetry example from PEP 485
         self.assertAllClose([(9, 10), (10, 9)], rel_tol=0.1)
 
     def test_integers(self):
+        # [FUNCTION DOC] Checks isclose with int arguments at 1e-8 versus
+        # 1e-9 relative tolerance.
         # test with integer values
         integer_examples = [(100000001, 100000000),
                             (123456789, 123456788)]
@@ -2669,6 +3102,8 @@ class IsCloseTests(__TestCase):
         self.assertAllNotClose(integer_examples, rel_tol=1e-9)
 
     def test_decimals(self):
+        # [FUNCTION DOC] Checks isclose with Decimal arguments at several magnitudes at
+        # 1e-8 versus 1e-9.
         # test with Decimal values
         from decimal import Decimal
 
@@ -2680,6 +3115,8 @@ class IsCloseTests(__TestCase):
         self.assertAllNotClose(decimal_examples, rel_tol=1e-9)
 
     def test_fractions(self):
+        # [FUNCTION DOC] Checks isclose with Fraction arguments at 1e-8 versus
+        # 1e-9 relative tolerance.
         # test with Fraction values
         from fractions import Fraction
 
@@ -2692,9 +3129,14 @@ class IsCloseTests(__TestCase):
 
 
 class FMATests(__TestCase):
+    # [CLASS DOC] Tests for math.fma (fused multiply-add): NaN, infinity, signed-zero, overflow
+    # and single-rounding behavior, plus random inputs where a naive multiply then add differs.
+    # Defines custom assertions for NaN and signed zeros. No instance state.
     """ Tests for math.fma. """
 
     def test_fma_nan_results(self):
+        # [FUNCTION DOC] Checks that fma returns NaN whenever any of the three arguments is NaN,
+        # for a set of representative values in the other two positions.
         # Selected representative values.
         values = [
             -math.inf, -1e300, -2.3, -1e-300, -0.0,
@@ -2709,6 +3151,9 @@ class FMATests(__TestCase):
                 self.assertIsNaN(math.fma(a, b, math.nan))
 
     def test_fma_infinities(self):
+        # [FUNCTION DOC] Checks fma with infinities: ValueError for infinity times zero or when
+        # product and addend are infinities of opposite sign; infinite results when same sign or
+        # when only one of product and addend is infinite and the other finite.
         # Cases involving infinite inputs or results.
         positives = [1e-300, 2.3, 1e300, math.inf]
         finites = [-1e300, -2.3, -1e-300, -0.0, 0.0, 1e-300, 2.3, 1e300]
@@ -2782,6 +3227,10 @@ class FMATests(__TestCase):
         or (sys.platform == "android" and platform.machine() == "x86_64"),
         f"this platform doesn't implement IEE 754-2008 properly")
     def test_fma_zero_result(self):
+        # [FUNCTION DOC] Checks the sign of zero results of fma: exact zero inputs, exact
+        # cancellation (always positive zero), underflow to signed zero, and a case where
+        # rounding the product first would give the wrong sign. Skipped on platforms whose libc
+        # fma has wrong zero signs.
         nonnegative_finites = [0.0, 1e-300, 2.3, 1e300]
 
         # Zero results from exact zero inputs.
@@ -2833,6 +3282,9 @@ class FMATests(__TestCase):
         self.assertIsPositiveZero(math.fma(x-y, -(x+y), z))
 
     def test_fma_overflow(self):
+        # [FUNCTION DOC] Checks fma overflow behavior: OverflowError when the product or sum
+        # overflows, but a finite result when a large product is offset by the addend, including
+        # boundary cases where the exact result is just representable.
         a = b = float.fromhex('0x1p512')
         c = float.fromhex('0x1p1023')
         # Overflow from multiplication.
@@ -2866,10 +3318,15 @@ class FMATests(__TestCase):
         self.assertEqual(math.fma(a, b, -c), c)
 
     def test_fma_single_round(self):
+        # [FUNCTION DOC] Checks fma rounds once: fma of (a-1) and (a+1) plus 1 equals a squared
+        # for a tiny a.
         a = float.fromhex('0x1p-50')
         self.assertEqual(math.fma(a - 1.0, a + 1.0, 1.0), a*a)
 
     def test_random(self):
+        # [FUNCTION DOC] Checks fma on hand-picked random hex triples where a singly
+        # rounded result differs from a double-rounded one; verifies both argument orders
+        # of the multiplicands.
         # A collection of randomly generated inputs for which the naive FMA
         # (with two rounds) gives a different result from a singly-rounded FMA.
 
@@ -2920,18 +3377,23 @@ class FMATests(__TestCase):
 
     # Custom assertions.
     def assertIsNaN(self, value):
+        # [FUNCTION DOC] HELPER: Custom assertion; fails if the value is not a NaN.
         self.assertTrue(
             math.isnan(value),
             msg="Expected a NaN, got {!r}".format(value)
         )
 
     def assertIsPositiveZero(self, value):
+        # [FUNCTION DOC] HELPER: Custom assertion; fails unless the value is zero with
+        # positive sign bit.
         self.assertTrue(
             value == 0 and math.copysign(1, value) > 0,
             msg="Expected a positive zero, got {!r}".format(value)
         )
 
     def assertIsNegativeZero(self, value):
+        # [FUNCTION DOC] HELPER: Custom assertion; fails unless the value is zero with
+        # negative sign bit.
         self.assertTrue(
             value == 0 and math.copysign(1, value) < 0,
             msg="Expected a negative zero, got {!r}".format(value)
