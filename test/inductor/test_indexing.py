@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor index-expression handling: simplification of ModularIndexing
+# and FloorDiv expressions by SizeVarAllocator, lane-contiguity analysis, hint computation for
+# precomputed and unbacked symbols, expression printers for Python, C++ and Triton, int32
+# overflow detection on kernel indices, and a Triton codegen scoping regression. Defines several
+# TestCase classes and module constants LONG_SUFFIX (platform-dependent integer literal suffix)
+# and DO_PERF_TEST (from the environment variable of the same name). Running the file as a
+# script invokes the test runner when a CPU or GPU is available.
 import os
 import sys
 import types
@@ -56,7 +63,15 @@ DO_PERF_TEST = os.environ.get("DO_PERF_TEST") == "1"
 
 
 class TestIndexingSimplification(InductorTestCase):
+    # [CLASS DOC] Tests of SizeVarAllocator index simplification: vector-range simplification,
+    # lane contiguity analysis, modular-indexing and floor-division rewrites, zero-term removal,
+    # and a few GPU compile tests that check the generated Triton load indexing. Most tests are
+    # pure symbolic checks needing no device.
     def test_simplify_index_in_vec_range(self):
+        # [FUNCTION DOC] Checks that simplify_index_in_vec_range rewrites a modular index with
+        # modulus 16 over vector width 8 into the variable plus a fresh mod symbol, leaves
+        # modulus 10 unchanged, and that stride_at_vec_range returns 1 for the modular index and
+        # 0 for a floor division by 8.
         i = sympy.Symbol("i", integer=True, nonnegative=True)
 
         self.assertEqual(
@@ -71,6 +86,9 @@ class TestIndexingSimplification(InductorTestCase):
         )
 
     def test_simplify_index_in_vec_range_with_relational(self):
+        # [FUNCTION DOC] Regression test for relational sub-expressions (a Piecewise built from
+        # a comparison with a symbolic bound): simplify_index_in_vec_range and
+        # stride_at_vec_range must return a result instead of crashing inside sympy.
         """Regression test for https://github.com/pytorch/pytorch/issues/181115
 
         sympy.simplify crashes with 'StrictLessThan has no attribute diff'
@@ -86,6 +104,10 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertIsNotNone(result2)
 
     def test_analyze_lane_contiguity(self):
+        # [FUNCTION DOC] Exercises analyze_lane_contiguity on many index forms and checks the
+        # returned contiguous_width, stride, uniform, uniform_width and unknown fields: linear
+        # offsets, scaled variables, products, modular indexing with and without an offset,
+        # plain Mod, floor division (uniform lanes), and mixes that must be reported as unknown.
         sizevars = SizeVarAllocator()
         i = sympy.Symbol("i", integer=True, nonnegative=True)
         j = sympy.Symbol("j", integer=True, nonnegative=True)
@@ -148,6 +170,11 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertTrue(result.unknown)
 
     def test_indexing_simplification(self):
+        # [FUNCTION DOC] Checks simplify_with_ranges on modular indexing and floor division with
+        # given variable ranges: dropping moduli larger than the variable range, keeping terms
+        # with negative parts, removing multiples of the modulus, folding constant divisors,
+        # simplifying nested modular indexing, and a large expression with a reduction variable.
+        # Also checks symbolic divisor cancellation directly.
         sizevars = SizeVarAllocator()
         i0 = sympy.Symbol("i0", integer=True, nonnegative=True)
         i1 = sympy.Symbol("i1", integer=True, nonnegative=True)
@@ -268,6 +295,9 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertEqual(sizevars.simplify_with_ranges(expr, var_ranges), expected)
 
     def test_floordiv_modularindexing_simplification(self):
+        # [FUNCTION DOC] Checks that a floor division of a modular indexing merges into one
+        # modular indexing when the divisor divides the modulus, is left alone when it does not,
+        # and becomes zero when the base is known to be smaller than the divisor.
         sizevars = SizeVarAllocator()
         i0 = sympy.Symbol("i0", integer=True, nonneg=True)
 
@@ -294,6 +324,9 @@ class TestIndexingSimplification(InductorTestCase):
         )
 
     def test_simplify_with_ranges_forwards_local_ranges_to_shape_env(self):
+        # [FUNCTION DOC] Checks that simplify_with_ranges applies the local variable ranges it
+        # is given so a nested min/max base under a modular indexing simplifies away, while the
+        # variable is not left registered in the shape environment range table afterwards.
         sizevars = SizeVarAllocator()
         q3 = sympy.Symbol("q3", integer=True, nonnegative=True)
         base = Min(
@@ -306,6 +339,9 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertEqual(sizevars.simplify_with_ranges(expr, {q3: 28}), base)
 
     def test_remove_zero_terms_generalized(self):
+        # [FUNCTION DOC] Checks the generalized zero-term removal in floor division: a term
+        # smaller than the gcd of the other terms with the divisor is dropped, equal-boundary
+        # cases still drop, and a range exceeding the gcd leaves the expression unchanged.
         sizevars = SizeVarAllocator()
         i0 = sympy.Symbol("i0", integer=True, nonneg=True)
         i1 = sympy.Symbol("i1", integer=True, nonneg=True)
@@ -330,6 +366,11 @@ class TestIndexingSimplification(InductorTestCase):
         )
 
     def test_indexing_join(self):
+        # [FUNCTION DOC] Checks joining of modular indexing terms: two adjacent pieces merge
+        # into one larger modulus (with scaling, non-unit divisor, symbolic modulus, and an
+        # offset), a wrong modulus is not merged, and a floor division plus modular indexing
+        # pair collapses to the variable or a smaller floor division. Merged results are also
+        # compared numerically.
         sizevars = SizeVarAllocator()
         i0 = sympy.Symbol("i0", integer=True)
         i1 = sympy.Symbol("i1", integer=True)
@@ -390,6 +431,8 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertEqual(expr6.subs({i0: 39485}), simplified.subs({i0: 39485}))
 
     def test_modular_indexing_pairs_merged(self):
+        # [FUNCTION DOC] Checks combine_modular_indexing_pairs merges a nested modular indexing
+        # when the inner modulus is a multiple of the outer one (1024 and 32).
         sizevars = SizeVarAllocator()
         x = sympy.Symbol("x", integer=True, positive=True)
         a = 1024
@@ -403,6 +446,8 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertNotEqual(expr2, actual)
 
     def test_modular_indexing_pairs_not_merged(self):
+        # [FUNCTION DOC] Checks combine_modular_indexing_pairs leaves a nested modular indexing
+        # unchanged when the moduli are not compatible (1024 and 3).
         sizevars = SizeVarAllocator()
         x = sympy.Symbol("x", integer=True, positive=True)
         a = 1024
@@ -415,6 +460,8 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertNotEqual(ModularIndexing(x, 1, b), actual)
 
     def test_modular_indexing_positive(self):
+        # [FUNCTION DOC] Checks that taking the absolute value of a modular indexing minus one
+        # does not get simplified away, i.e. the result differs from the input expression.
         x = sympy.Symbol("x", integer=True, positive=True)
         expr = ModularIndexing(x, 1, 1024) - 1
         expr2 = abs(expr)
@@ -422,6 +469,8 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertNotEqual(expr2, expr)
 
     def test_expand_floor_div_skipped(self):
+        # [FUNCTION DOC] Checks expand_floor_div returns a false value when the expression has
+        # more than one floor division and so cannot be expanded.
         sizevars = SizeVarAllocator()
         x = sympy.Symbol("x", integer=True, positive=True)
         y = sympy.Symbol("y", integer=True, positive=True)
@@ -432,6 +481,9 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertFalse(sizevars.expand_floor_div(expr))
 
     def test_expand_floor_div_applied(self):
+        # [FUNCTION DOC] Checks expand_floor_div on an integer-scaled term plus one
+        # floor division returns a numerator and denominator whose ratio equals the
+        # combined floor division.
         sizevars = SizeVarAllocator()
         x = sympy.Symbol("x", integer=True, positive=True)
         y = sympy.Symbol("y", integer=True, positive=True)
@@ -443,6 +495,9 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertEqual(expected, FloorDiv(actual, denominator))
 
     def test_expand_floor_div_applied_symbolic_factor(self):
+        # [FUNCTION DOC] Checks expand_floor_div when the multiplier is a symbol and the
+        # variables are given explicitly: the numerator is scaled by the denominator so the
+        # ratio is correct.
         sizevars = SizeVarAllocator()
         s = sympy.Symbol("s", integer=True, positive=True)
         x = sympy.Symbol("x", integer=True, positive=True)
@@ -455,6 +510,8 @@ class TestIndexingSimplification(InductorTestCase):
         self.assertEqual(expected, FloorDiv(actual, denominator))
 
     def test_expand_floor_div_skipped_cross_tree_symbolic_factor(self):
+        # [FUNCTION DOC] Checks expand_floor_div returns a false value when the symbolic factor
+        # multiplies a variable outside the listed variable set.
         sizevars = SizeVarAllocator()
         s = sympy.Symbol("s", integer=True, positive=True)
         x = sympy.Symbol("x", integer=True, positive=True)
@@ -465,8 +522,15 @@ class TestIndexingSimplification(InductorTestCase):
 
     @unittest.skipUnless(HAS_GPU, "Need GPU for this test")
     def test_int8_unpack(self):
+        # [FUNCTION DOC] GPU test: compiles an int8 unpacking function that splits each byte
+        # into two nibbles, stacks and flattens them, and checks the generated Triton code loads
+        # the input with the simplified half index exactly twice. Optionally benchmarks when
+        # DO_PERF_TEST is set.
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Splits each byte into its high and low nibbles, stacks
+            # them on a new last dimension, merges that into the previous dimension and
+            # doubles the values.
             first_elements = x >> 4
             second_elements = x & 15
             unpacked = torch.stack([first_elements, second_elements], dim=-1).view(
@@ -486,8 +550,13 @@ class TestIndexingSimplification(InductorTestCase):
 
     @unittest.skipUnless(HAS_GPU, "Need GPU for this test")
     def test_int8_unpack_dynamic_shape(self):
+        # [FUNCTION DOC] GPU test: same nibble unpacking as the static version but compiled with
+        # dynamic shapes; checks the generated Triton code still has exactly two loads with the
+        # simplified half index.
         @torch.compile(dynamic=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Splits each byte into high and low nibbles, interleaves
+            # them and doubles the values.
             first_elements = x >> 4
             second_elements = x & 15
             unpacked = torch.stack([first_elements, second_elements], dim=-1).view(
@@ -504,7 +573,14 @@ class TestIndexingSimplification(InductorTestCase):
 
     @unittest.skipUnless(HAS_GPU, "Need GPU for this test")
     def test_floordiv_div_sympy_is_integer_bug(self):
+        # [FUNCTION DOC] GPU regression test: compiles with full graph and dynamic shapes a
+        # function combining a variance reduction, embedding lookup, padding, batched matmul
+        # and concatenation on bfloat16 inputs, and runs backward. It passes if no exception
+        # is raised.
         def foo(arg0, arg1, arg2, arg3, arg4, sentinel):
+            # [FUNCTION DOC] HELPER: Builds a variance of a reshaped input, a clamped embedding
+            # lookup, a padded batched matmul with a summed tensor, concatenates them on
+            # dimension 0 and adds a sentinel scalar.
             t0 = arg0
             t1 = t0.reshape((28, 24, 3, 127))
             t2 = t1.var(dim=2)
@@ -544,7 +620,13 @@ class TestIndexingSimplification(InductorTestCase):
 
     @unittest.skipUnless(HAS_CPU, "requires CPU")
     def test_bool_minimum_maximum_index_propagation(self):
+        # [FUNCTION DOC] CPU test: compiles a function that takes a minimum and a maximum of
+        # boolean tensors (from an equality of a thresholded input) and checks both outputs have
+        # boolean dtype and the input shape.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Thresholds the input, compares it with the input for
+            # equality, creates an uninitialised boolean tensor like the result, and returns its
+            # elementwise minimum and maximum with itself.
             thresh = torch.nn.functional.threshold(x, 6.08522335982976, -0.05932757)
             eq = torch.eq(thresh, x)
             empty = torch.empty_like(eq)
@@ -561,7 +643,14 @@ class TestIndexingSimplification(InductorTestCase):
 
 
 class ExprPrinterTests(InductorTestCase):
+    # [CLASS DOC] Tests of the expression printers for Python (pexpr), Triton
+    # (texpr) and C++ (cexpr): power, floor, ceiling, round, NaN, infinities,
+    # integer limits, modulo variants, floor division, and min/max. Parametrized
+    # tests are expanded by instantiate_parametrized_tests.
     def test_print_pow(self):
+        # [FUNCTION DOC] Checks printing of a power: the zero exponent prints as one, a square
+        # prints as an explicit product for Python and Triton and with an int64 cast for C++;
+        # the integer suffix depends on the platform.
         s1 = sympy.Symbol("foo", integer=True)
         s2 = sympy.Symbol("bar", integer=True)
 
@@ -595,6 +684,9 @@ class ExprPrinterTests(InductorTestCase):
             )  # 1.0 for FP div
 
     def test_print_floor(self):
+        # [FUNCTION DOC] Checks printing of a floor of half a symbol for integer and non-integer
+        # symbols in Python, Triton and C++ forms (math floor, libdevice floor, std floor with
+        # or without an int64 cast).
         for integer in [True, False]:
             s1 = sympy.Symbol("s1", integer=integer)
             expr = sympy.floor(s1 / 2)
@@ -612,6 +704,8 @@ class ExprPrinterTests(InductorTestCase):
                 self.assertExpectedInline(cexpr(expr), """std::floor((1.0/2.0)*s1)""")
 
     def test_print_ceil(self):
+        # [FUNCTION DOC] Checks printing of a ceiling of half a symbol for integer and
+        # non-integer symbols in Python and C++ forms.
         for integer in [True, False]:
             s1 = sympy.Symbol("s1", integer=integer)
             expr = sympy.ceiling(s1 / 2)
@@ -625,6 +719,8 @@ class ExprPrinterTests(InductorTestCase):
                 self.assertExpectedInline(cexpr(expr), """std::ceil((1.0/2.0)*s1)""")
 
     def test_print_round(self):
+        # [FUNCTION DOC] Checks printing of a round-to-int expression in Python, C++ (lrint) and
+        # Triton (llrint cast to int64).
         expr = RoundToInt(sympy.Symbol("x", integer=True) / 2)
         self.assertExpectedInline(pexpr(expr), """round((1/2)*x)""")
         self.assertExpectedInline(cexpr(expr), """std::lrint((1.0/2.0)*x)""")
@@ -633,6 +729,7 @@ class ExprPrinterTests(InductorTestCase):
         )
 
     def test_print_nan(self):
+        # [FUNCTION DOC] Checks printing of NaN in Python and C++.
         expr = sympy.nan
         self.assertExpectedInline(pexpr(expr), """math.nan""")
         self.assertExpectedInline(
@@ -640,6 +737,7 @@ class ExprPrinterTests(InductorTestCase):
         )
 
     def test_print_infinity(self):
+        # [FUNCTION DOC] Checks printing of positive infinity in Python and C++.
         expr = sympy.oo
         self.assertExpectedInline(pexpr(expr), """math.inf""")
         self.assertExpectedInline(
@@ -648,6 +746,7 @@ class ExprPrinterTests(InductorTestCase):
         )
 
     def test_print_negative_infinity(self):
+        # [FUNCTION DOC] Checks printing of negative infinity in Python and C++.
         expr = -sympy.oo
         self.assertExpectedInline(pexpr(expr), """-math.inf""")
         self.assertExpectedInline(
@@ -656,6 +755,8 @@ class ExprPrinterTests(InductorTestCase):
         )
 
     def test_print_integer(self):
+        # [FUNCTION DOC] Checks C++ printing of the minimum int64 value, and that integers just
+        # below the minimum or above the maximum int64 raise OverflowError.
         expr = sympy.S((-1) << 63)
         self.assertExpectedInline(cexpr(expr), f"""(-1{LONG_SUFFIX} << 63)""")
 
@@ -668,6 +769,9 @@ class ExprPrinterTests(InductorTestCase):
             cexpr(expr)
 
     def test_print_mod(self):
+        # [FUNCTION DOC] Checks Python, C++ and Triton printing of the Mod function applied to
+        # an expression with a negative offset, and of the Python remainder operator with a
+        # symbolic divisor.
         x = sympy.Symbol("x", integer=True)
         expr = Mod(x - 1, 2)
         self.assertExpectedInline(pexpr(expr), """((-1) + x) % 2""")
@@ -682,6 +786,8 @@ class ExprPrinterTests(InductorTestCase):
         self.assertExpectedInline(texpr(expr), """(-10) % x""")
 
     def test_print_mod_index(self):
+        # [FUNCTION DOC] Checks Python, C++ and Triton printing of a modular indexing with a
+        # symbolic divisor and modulus and a negative offset.
         x = sympy.Symbol("x", integer=True)
         ks = sympy.Symbol("ks", integer=True)
         expr = ModularIndexing(x - 10, ks, ks)
@@ -694,6 +800,8 @@ class ExprPrinterTests(InductorTestCase):
         self.assertExpectedInline(texpr(expr), """((((-10) + x) // ks) % ks)""")
 
     def test_print_python_mod(self):
+        # [FUNCTION DOC] Checks printing of PythonMod: Python remainder, C++ div_mod helper, and
+        # the Triton helper remainder_integer.
         x = sympy.Symbol("x", integer=True)
         expr = PythonMod(x - 10, x)
         self.assertExpectedInline(pexpr(expr), """((-10) + x) % x""")
@@ -706,6 +814,9 @@ class ExprPrinterTests(InductorTestCase):
 
     @parametrize("ndigits", [-1, 0, 1])
     def test_print_round_decimal(self, ndigits):
+        # [FUNCTION DOC] Parametrized over ndigits of -1, 0 and 1: checks printing of round with
+        # a number of digits in Python, C++ (nearbyint with scaling) and Triton (libdevice
+        # nearbyint with scaling).
         expr = RoundDecimal(sympy.Symbol("x", integer=True) / 2, ndigits)
         self.assertEqual(pexpr(expr), f"round((1/2)*x, {ndigits})")
         self.assertEqual(
@@ -718,6 +829,9 @@ class ExprPrinterTests(InductorTestCase):
         )
 
     def test_print_floor_div(self):
+        # [FUNCTION DOC] Checks printing of floor division: symbolic divisor in Python and C++,
+        # division by minus one printing as negation (platform-specific suffix), and division by
+        # 2 printing and the string form of the expression.
         s1 = sympy.Symbol("s1", integer=True)
         s2 = sympy.Symbol("s2", integer=True)
         expr = FloorDiv(s1, s2)
@@ -749,6 +863,10 @@ class ExprPrinterTests(InductorTestCase):
         self.assertEqual(str(expr), "((s0 + 1)//2)")
 
     def test_print_Min_Max(self):
+        # [FUNCTION DOC] Checks Triton and C++ printing of two-argument and three-argument Min
+        # and Max for both sympy classes: Triton prints a select-style expression and C++ prints
+        # std min or max with int64 casts or an initializer list, with the platform-specific
+        # literal suffix.
         cases = (
             (sympy.Min, "min", "<"),
             (sympy.Max, "max", ">"),
@@ -783,11 +901,17 @@ instantiate_parametrized_tests(ExprPrinterTests)
 
 
 class TestIndexConstOverflowInt32(InductorTestCase):
+    # [CLASS DOC] Tests for the constant-offset overflow check of the int32 index analysis. A
+    # helper builds a SIMDKernelFeatures object without running its constructor and feeds it
+    # memory dependencies built from the given index expressions.
     """Tests for the constant-offset check in
     ``SIMDKernelFeatures.any_index_expr_overflows_int32`` (index evaluated at
     the origin)."""
 
     def make_feats(self, indices):
+        # [FUNCTION DOC] HELPER: Builds a bare SIMDKernelFeatures (skipping the constructor,
+        # which needs a graph) whose scheduler_nodes returns a single fake node with a read
+        # dependency for each given index expression and no writes. Returns that object.
         # Bypass __init__ (needs V.graph) and shadow scheduler_nodes().
         deps = [MemoryDep(f"buf{i}", idx, (), ()) for i, idx in enumerate(indices)]
         node = types.SimpleNamespace(
@@ -798,34 +922,46 @@ class TestIndexConstOverflowInt32(InductorTestCase):
         return feats
 
     def check(self, indices):
+        # [FUNCTION DOC] HELPER: Runs any_index_expr_overflows_int32 on a features object built
+        # from the index expressions and returns its boolean result.
         return self.make_feats(indices).any_index_expr_overflows_int32()
 
     def test_production_constant_detected(self):
+        # [FUNCTION DOC] A large negative constant offset (about -2.78 billion) plus variable
+        # terms is detected as overflowing int32.
         x0, x1 = sympy.symbols("x0 x1", integer=True)
         expr = sympy.Integer(-2_779_057_358) + x0 + 310 * x1
         self.assertTrue(self.check([expr]))
 
     def test_small_constant_not_flagged(self):
+        # [FUNCTION DOC] A constant offset of minus one million is not flagged.
         x0, x1 = sympy.symbols("x0 x1", integer=True)
         expr = sympy.Integer(-1_000_000) + x0 + 310 * x1
         self.assertFalse(self.check([expr]))
 
     def test_boundary_at_int32_limits(self):
+        # [FUNCTION DOC] Offsets exactly at the int32 limits (2**31 - 1 and -2**31) are
+        # not flagged.
         # int32 range is asymmetric: [-2**31, 2**31 - 1].
         x0 = sympy.Symbol("x0", integer=True)
         self.assertFalse(self.check([sympy.Integer(2**31 - 1) + x0]))
         self.assertFalse(self.check([sympy.Integer(-(2**31)) + x0]))
 
     def test_boundary_just_outside_int32_limits(self):
+        # [FUNCTION DOC] Offsets one past the int32 limits on either side are flagged.
         x0 = sympy.Symbol("x0", integer=True)
         self.assertTrue(self.check([sympy.Integer(2**31) + x0]))
         self.assertTrue(self.check([sympy.Integer(-(2**31) - 1) + x0]))
 
     def test_pure_constant_expression(self):
+        # [FUNCTION DOC] A constant-only expression below the int32 minimum is flagged and zero
+        # is not.
         self.assertTrue(self.check([sympy.Integer(-(2**31) - 10)]))
         self.assertFalse(self.check([sympy.Integer(0)]))
 
     def test_any_offender_triggers_detection(self):
+        # [FUNCTION DOC] With one acceptable and one overflowing index, the check
+        # reports overflow.
         x0 = sympy.Symbol("x0", integer=True)
         good = sympy.Integer(42) + x0
         bad = sympy.Integer(-(2**31) - 1) + x0
@@ -833,12 +969,18 @@ class TestIndexConstOverflowInt32(InductorTestCase):
 
 
 class TestIndexExprUpperBounds(InductorTestCase):
+    # [CLASS DOC] Tests for the variable-scaled bound check of the int32 index analysis, where
+    # the index is bounded over each loop variable's range. Helpers build fake features and
+    # memory dependencies with explicit variable names and sizes.
     """Tests for the variable-scaled bound check in
     ``SIMDKernelFeatures.any_index_expr_overflows_int32``, which bounds the
     addressing expression over each loop variable's iteration range (catching
     fused `V * x0` terms while letting a stride on a size-1 dim drop out)."""
 
     def make_feats(self, deps):
+        # [FUNCTION DOC] HELPER: Builds a bare SIMDKernelFeatures (skipping its constructor)
+        # whose scheduler_nodes returns one fake node reading the given dependencies, with
+        # no writes.
         node = types.SimpleNamespace(
             read_writes=types.SimpleNamespace(reads=deps, writes=[])
         )
@@ -847,12 +989,18 @@ class TestIndexExprUpperBounds(InductorTestCase):
         return feats
 
     def dep(self, index, var_names, sizes):
+        # [FUNCTION DOC] HELPER: Builds a MemoryDep for a buffer named buf from an index
+        # expression, a sequence of variable names and a sequence of sizes.
         return MemoryDep("buf", index, tuple(var_names), tuple(sizes))
 
     def check(self, deps):
+        # [FUNCTION DOC] HELPER: Returns the result of the int32 overflow check for the
+        # given deps.
         return self.make_feats(deps).any_index_expr_overflows_int32()
 
     def test_chunked_cross_buffer_overflow_caught(self):
+        # [FUNCTION DOC] A large per-chunk stride times a long variable range is flagged as
+        # overflowing even though no single buffer is that large.
         # `V * x0 + i`: per-chunk stride V over the fused numel overflows int32
         # even though no single buffer's storage does.
         x0, i = sympy.symbols("x0 i", integer=True)
@@ -860,12 +1008,16 @@ class TestIndexExprUpperBounds(InductorTestCase):
         self.assertTrue(self.check([dep]))
 
     def test_in_range_index_not_flagged(self):
+        # [FUNCTION DOC] A stride of 16 over four million elements stays within int32 and is
+        # not flagged.
         # stride 16 over numel 4M stays within int32.
         x0 = sympy.Symbol("x0", integer=True)
         dep = self.dep(16 * x0, [x0], [4_000_000])
         self.assertFalse(self.check([dep]))
 
     def test_stride_on_size_one_dim_drops_out(self):
+        # [FUNCTION DOC] A huge stride on a size-one dimension contributes nothing and must not
+        # be flagged.
         # Layout shape=(1, 1M), stride=(1M, 1): the large stride multiplies a
         # size-1 dim and must not force int64 (the Option A false positive).
         d0, d1 = sympy.symbols("d0 d1", integer=True)
@@ -873,6 +1025,8 @@ class TestIndexExprUpperBounds(InductorTestCase):
         self.assertFalse(self.check([dep]))
 
     def test_symbolic_size_skipped(self):
+        # [FUNCTION DOC] A dependency with a symbolic size is skipped by the precise bound check
+        # and so is not flagged and does not raise.
         # Dynamic dims are covered by the storage-size check; the precise bound
         # skips them rather than flagging or crashing on a symbolic size.
         s0 = sympy.Symbol("s0", integer=True, positive=True)
@@ -882,7 +1036,12 @@ class TestIndexExprUpperBounds(InductorTestCase):
 
 
 class TestEvaluateMinMax(InductorTestCase):
+    # [CLASS DOC] Tests of SizeVarAllocator evaluate_min, evaluate_max and guard_or_false on
+    # unbacked symbols and concrete values, documenting where the gcd-based answers are unsound.
     def test_evaluate_min_multiple(self):
+        # [FUNCTION DOC] With an unbacked symbol u0, evaluate_min of u0 and ten times u0
+        # resolves to u0 in either argument order and evaluate_max resolves to ten times u0. The
+        # docstring notes this is unsound for negative u0.
         """min(u0, k*u0) resolves via GCD: gcd(u0, k*u0)=u0.
         UNSOUND: if u0 < 0 (e.g. u0=-1) true min is 10*u0=-10, not -1."""
         sizevars = SizeVarAllocator()
@@ -892,12 +1051,17 @@ class TestEvaluateMinMax(InductorTestCase):
         self.assertEqual(sizevars.evaluate_max(u0, 10 * u0), 10 * u0)
 
     def test_evaluate_max_concrete(self):
+        # [FUNCTION DOC] evaluate_max and evaluate_min on concrete integers (including a
+        # negative) return the expected values.
         """works with concrete values even when negative.  Sound."""
         sizevars = SizeVarAllocator()
         self.assertEqual(sizevars.evaluate_max(-5, 3), 3)
         self.assertEqual(sizevars.evaluate_min(-5, 3), -5)
 
     def test_evaluate_min_product_gcd(self):
+        # [FUNCTION DOC] evaluate_min of u0 and the product of two unbacked symbols resolves to
+        # u0 through the gcd fallback; documented as unsound when the second symbol is zero or
+        # u0 is negative.
         """evaluate_min(u0, u0*u1) resolves via GCD fallback: gcd(u0, u0*u1)=u0.
         UNSOUND: when u1=0 the true min is 0, not u0; when u0<0 ordering inverts."""
         sizevars = SizeVarAllocator()
@@ -906,6 +1070,8 @@ class TestEvaluateMinMax(InductorTestCase):
         self.assertEqual(sizevars.evaluate_min(u0, u0 * u1), u0)
 
     def test_evaluate_min_product_with_both_gt_gcd(self):
+        # [FUNCTION DOC] After recording that both unbacked symbols are positive, evaluate_min
+        # of u0 and their product resolves to u0 soundly.
         """evaluate_min(u0, u0*u1) with u0>0, u1>0 resolves via GCD.
         Sound: u1>=1 guarantees u0*u1 >= u0."""
         sizevars = SizeVarAllocator()
@@ -916,6 +1082,9 @@ class TestEvaluateMinMax(InductorTestCase):
         self.assertEqual(sizevars.evaluate_min(u0, u0 * u1), u0)
 
     def test_guard_or_false_le_unbacked_symint_with_check(self):
+        # [FUNCTION DOC] After recording u0 is nonnegative, guard_or_false proves u0 <= 10*u0 is
+        # true, and returns false for the reverse comparison and for the strict comparison,
+        # which are not provable (u0 could be zero).
         """guard_or_false(Le(u0, k*u0)) resolves after constraining u0 >= 0."""
         sizevars = SizeVarAllocator()
         u0 = sizevars.shape_env.create_unbacked_symint().node.expr
@@ -929,9 +1098,14 @@ class TestEvaluateMinMax(InductorTestCase):
 
 
 class TestPrecomputedSizeHinting(InductorTestCase):
+    # [CLASS DOC] Tests that hint computation resolves precomputed-size symbols back to the
+    # original expressions via the inverse replacement table.
     """Tests for optimization_hint and guarding_hint_or_throw with PRECOMPUTED_SIZE symbols."""
 
     def test_optimization_hint_with_precomputed_size(self):
+        # [FUNCTION DOC] Registers a backed symbol with hint 168, precomputes a size for eight
+        # times it, checks both replacement tables record it, and that optimization_hint of the
+        # precomputed symbol equals the concrete product 1344.
         """Test that optimization_hint correctly resolves PRECOMPUTED_SIZE symbols.
 
         When a complex expression is replaced with a precomputed size symbol (ps0, ps1, etc.),
@@ -961,6 +1135,8 @@ class TestPrecomputedSizeHinting(InductorTestCase):
         self.assertEqual(hint, expected)
 
     def test_guarding_hint_or_throw_with_precomputed_size(self):
+        # [FUNCTION DOC] Same setup with hint 42 and a doubled expression:
+        # guarding_hint_or_throw of the precomputed symbol must return 84.
         """Test that guarding_hint_or_throw correctly resolves PRECOMPUTED_SIZE symbols."""
         sizevars = SizeVarAllocator()
 
@@ -981,6 +1157,8 @@ class TestPrecomputedSizeHinting(InductorTestCase):
         self.assertEqual(hint, expected)
 
     def test_optimization_hint_with_expression_containing_precomputed_size(self):
+        # [FUNCTION DOC] An expression that adds 3 to a precomputed symbol standing for five
+        # times a symbol with hint 10 must give an optimization hint of 53.
         """Test optimization_hint with an expression that contains a PRECOMPUTED_SIZE symbol."""
         sizevars = SizeVarAllocator()
 
@@ -1001,9 +1179,13 @@ class TestPrecomputedSizeHinting(InductorTestCase):
 
 
 class TestHintDisproves(InductorTestCase):
+    # [CLASS DOC] Tests of the hint-based fast path in statically_known_true, where a hint that
+    # disproves a claim lets it return false early.
     """Tests for hint-disproves fast-path in statically_known_true."""
 
     def test_hint_disproves_false_claim(self):
+        # [FUNCTION DOC] With hint 10 for a symbol, a claim that it is less than 5 is statically
+        # known not to hold (returns false).
         """If the hint says the expression is False, statically_known_true
         should return False without expensive sympy reasoning."""
         sizevars = SizeVarAllocator()
@@ -1014,6 +1196,8 @@ class TestHintDisproves(InductorTestCase):
         self.assertFalse(sizevars.statically_known_true(s0 < 5))
 
     def test_hint_does_not_prove_true_claim(self):
+        # [FUNCTION DOC] A claim that holds for the hint is not short-circuited; the test only
+        # verifies the call completes without raising and checks no result.
         """If the hint says True, statically_known_true should not
         short-circuit — it must fall through to full reasoning."""
         sizevars = SizeVarAllocator()
@@ -1026,6 +1210,8 @@ class TestHintDisproves(InductorTestCase):
         sizevars.statically_known_true(s0 > 5)
 
     def test_hint_disproves_with_complex_expr(self):
+        # [FUNCTION DOC] With hints 160 and 200 for two symbols, a claim that their sum is below
+        # 100 is rejected (returns false).
         """Hint fast-path works on multi-symbol expressions."""
         sizevars = SizeVarAllocator()
         s0 = sizevars.shape_env.create_symbol(160, source=ConstantSource("s0"))
@@ -1038,10 +1224,14 @@ class TestHintDisproves(InductorTestCase):
 
 
 class TestWideExpressionThresholds(InductorTestCase):
+    # [CLASS DOC] Tests that the wide-expression thresholds (safe gcd, multiple-of
+    # rules, modular indexing) only affect very wide sums, while small expressions are
+    # still fully simplified.
     """Verify that safe_gcd / free-symbols thresholds only affect WIDE
     expressions.  Small expressions must still get full simplification."""
 
     def test_safe_gcd_small_expressions(self):
+        # [FUNCTION DOC] For small expressions safe_gcd equals the plain sympy gcd.
         from torch.utils._sympy.functions import safe_gcd
 
         a, b, c = sympy.symbols("a b c", integer=True, positive=True)
@@ -1049,6 +1239,8 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertEqual(safe_gcd(a * b, a), sympy.gcd(a * b, a))
 
     def test_safe_gcd_wide_expressions_use_fallback(self):
+        # [FUNCTION DOC] For a sum of thirty symbols safe_gcd equals the simple floordiv
+        # gcd fallback.
         from torch.utils._sympy.functions import safe_gcd, simple_floordiv_gcd
 
         syms = sympy.symbols(" ".join(f"s{i}" for i in range(30)), integer=True)
@@ -1056,6 +1248,9 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertEqual(safe_gcd(wide, 160), simple_floordiv_gcd(wide, 160))
 
     def test_is_multiple_of_structural_rules_on_wide(self):
+        # [FUNCTION DOC] On a thirty-symbol sum, checks the structural multiple-of rules:
+        # products with a constant, nested sums times a constant, products of several constants,
+        # floor division, and symbolic self-division through statically_known_multiple_of.
         sizevars = SizeVarAllocator()
         syms = sympy.symbols(" ".join(f"s{i}" for i in range(30)), integer=True)
         wide = sum(syms)
@@ -1076,6 +1271,8 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertTrue(sizevars.statically_known_multiple_of(wide * 4, wide * 4))
 
     def test_remove_zero_terms_still_works_small(self):
+        # [FUNCTION DOC] Small-expression regression: zero-term removal in a floor division
+        # still drops the small term with a given range.
         sizevars = SizeVarAllocator()
         i0 = sympy.Symbol("i0", integer=True, nonneg=True)
         i1 = sympy.Symbol("i1", integer=True, nonneg=True)
@@ -1083,6 +1280,8 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertEqual(result, FloorDiv(128 * i1, 8192))
 
     def test_modular_indexing_simplification_small(self):
+        # [FUNCTION DOC] Small-expression regression: a multiple of the modulus added to the
+        # base of a modular indexing is still removed.
         i0 = sympy.Symbol("i0", integer=True, nonnegative=True)
         i1 = sympy.Symbol("i1", integer=True, nonnegative=True)
         self.assertEqual(
@@ -1091,12 +1290,16 @@ class TestWideExpressionThresholds(InductorTestCase):
         )
 
     def test_statically_known_multiple_of_equality(self):
+        # [FUNCTION DOC] statically_known_multiple_of returns true for a thirty-symbol sum
+        # and itself.
         sizevars = SizeVarAllocator()
         syms = sympy.symbols(" ".join(f"s{i}" for i in range(30)), integer=True)
         wide = sum(syms)
         self.assertTrue(sizevars.statically_known_multiple_of(wide, wide))
 
     def test_statically_known_multiple_of_factorable_add_floordiv(self):
+        # [FUNCTION DOC] statically_known_multiple_of recognizes a numerator that is 128 times a
+        # denominator built from a symbol and a floor division of two symbols.
         sizevars = SizeVarAllocator()
         s52, s97 = sympy.symbols("s52 s97", integer=True, positive=True)
         k = FloorDiv(s97, s52)
@@ -1106,6 +1309,8 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertTrue(sizevars.statically_known_multiple_of(numerator, denominator))
 
     def test_wide_modular_indexing_not_decomposed(self):
+        # [FUNCTION DOC] A modular indexing whose base is a sum of forty symbols plus a constant
+        # stays a modular indexing with the base unchanged.
         """ModularIndexing with a wide base should not enter the per-term
         simplification loop (its result would feed into sympy.expand which
         has combinatorial cost on wide Add expressions)."""
@@ -1117,6 +1322,8 @@ class TestWideExpressionThresholds(InductorTestCase):
         self.assertEqual(result.args[0], wide)
 
     def test_wide_simplify_with_ranges(self):
+        # [FUNCTION DOC] simplify_with_ranges on an expression containing a wide base returns a
+        # valid sympy expression without hanging or raising.
         """simplify_with_ranges on expressions containing wide shapes
         should still return a valid expression (not hang or error)."""
         sizevars = SizeVarAllocator()
@@ -1129,9 +1336,13 @@ class TestWideExpressionThresholds(InductorTestCase):
 
 
 class TestOptimizationHintZeroDivision(InductorTestCase):
+    # [CLASS DOC] Tests that optimization_hint tolerates division by zero produced when unbacked
+    # symbols are replaced by the fallback value.
     """Test that optimization_hint handles ZeroDivisionError from ModularIndexing with zero-valued unbacked symbols."""
 
     def test_modular_indexing_with_zero_divisor(self):
+        # [FUNCTION DOC] With fallback 0 the modular indexing with an unbacked divisor divides
+        # by zero internally; optimization_hint must return the fallback 0.
         sizevars = SizeVarAllocator()
         u0 = sizevars.shape_env.create_unbacked_symint().node.expr
         u1 = sizevars.shape_env.create_unbacked_symint().node.expr
@@ -1144,6 +1355,8 @@ class TestOptimizationHintZeroDivision(InductorTestCase):
         self.assertEqual(hint, 0)
 
     def test_floor_div_with_zero_divisor(self):
+        # [FUNCTION DOC] Same zero-divisor case for a floor division with an unbacked divisor:
+        # the hint is the fallback 0 rather than an exception.
         """optimization_hint should not crash when FloorDiv has an unbacked
         symbol as divisor that gets substituted with 0."""
         sizevars = SizeVarAllocator()
@@ -1157,6 +1370,8 @@ class TestOptimizationHintZeroDivision(InductorTestCase):
         self.assertEqual(hint, 0)
 
     def test_modular_indexing_zero_divisor_nonzero_fallback(self):
+        # [FUNCTION DOC] With fallback 8192, the modular indexing hint is computed normally and
+        # equals 1.
         """When fallback is nonzero, the hint should still not crash."""
         sizevars = SizeVarAllocator()
         u0 = sizevars.shape_env.create_unbacked_symint().node.expr
@@ -1170,9 +1385,13 @@ class TestOptimizationHintZeroDivision(InductorTestCase):
 
 
 class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
+    # [CLASS DOC] Tests of how optimization_hint canonicalizes unbacked symbols using deferred
+    # runtime asserts, including a bound on work for wide expressions.
     """Tests for bounded unbacked replacement canonicalization in optimization_hint."""
 
     def test_expression_replacements_still_apply_for_small_expr(self):
+        # [FUNCTION DOC] With a recorded equality relating two unbacked symbols, a small
+        # expression is rewritten using it and the hint with fallback 0 equals 1.
         sizevars = SizeVarAllocator()
         shape_env = sizevars.shape_env
         u0 = shape_env.create_unbacked_symint().node.expr
@@ -1184,6 +1403,8 @@ class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
         self.assertEqual(sizevars.optimization_hint(u0 + 2, fallback=0), 1)
 
     def test_expression_replacements_precede_symbol_replacements(self):
+        # [FUNCTION DOC] With two recorded runtime equalities, an expression-form replacement is
+        # applied before symbol replacement so equivalent expressions get equal hints.
         sizevars = SizeVarAllocator()
         shape_env = sizevars.shape_env
         u0 = shape_env.create_unbacked_symint().node.expr
@@ -1198,6 +1419,11 @@ class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
         )
 
     def test_wide_expression_skips_expensive_expr_subs(self):
+        # [FUNCTION DOC] With 128 unbacked symbols each tied by a recorded equality, builds a
+        # wide weighted sum. Patches the sympy substitution method to raise an AssertionError if
+        # called, and expects optimization_hint with fallback 0 to return 0 without calling it.
+        # Relies on the unittest.mock submodule being importable although only unittest is
+        # imported explicitly.
         sizevars = SizeVarAllocator()
         shape_env = sizevars.shape_env
         unbacked = [shape_env.create_unbacked_symint().node.expr for _ in range(128)]
@@ -1209,12 +1435,18 @@ class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
         expr = sum((i + 1) * sym for i, sym in enumerate(unbacked))
 
         def fail_subs(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the sympy substitution method;
+            # accepts any arguments and always raises AssertionError saying wide hints
+            # should avoid substitution.
             raise AssertionError("wide optimization_hint should avoid sympy subs")
 
         with unittest.mock.patch.object(sympy.Basic, "subs", fail_subs):
             self.assertEqual(sizevars.optimization_hint(expr, fallback=0), 0)
 
     def test_hint_respects_symbolic_upper_bound_assert(self):
+        # [FUNCTION DOC] Records an unbacked symbol u0 bounded above by a dynamic symbol of hint
+        # 16 through a deferred runtime assert. Checks the hint of u0 is at most 16 and the hint
+        # of s0 minus u0 is nonnegative, instead of using the generic fallback of 1024.
         # A reducing slice x[u0:] is sized s0 - u0. The invariant u0 <= s0 lives
         # only in deferred_runtime_asserts, not var_to_range (which keeps the loose
         # [0, fallback]). optimization_hint must honor it so u0 is capped at s0's
@@ -1240,9 +1472,15 @@ class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
 
 
 class TestOptimizationHintIdentityExpansion(InductorTestCase):
+    # [CLASS DOC] Tests that optimization_hint expands Identity wrappers after substituting
+    # unbacked expressions.
     """Test that optimization_hint expands Identity wrappers after _sub_unbacked_exprs."""
 
     def test_identity_wrapped_expr_resolves_to_int(self):
+        # [FUNCTION DOC] Builds an expression of an unbacked symbol times a difference
+        # of Identity-wrapped constants (equal to the symbol after simplification) and
+        # checks optimization_hint with fallback 42 returns 42 instead of failing to
+        # realize an integer.
         """An expression containing Identity-wrapped constants and an unbacked
         symbol should resolve to a concrete int after substitution."""
         sizevars = SizeVarAllocator()
@@ -1259,6 +1497,8 @@ class TestOptimizationHintIdentityExpansion(InductorTestCase):
 
 
 class TestLoopLocalLoadCSELifetime(InductorTestCase):
+    # [CLASS DOC] Triton codegen test about the lifetime of common-subexpression-cached loads
+    # inside reduction loops.
     @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
     @config.patch(
         {
@@ -1267,7 +1507,15 @@ class TestLoopLocalLoadCSELifetime(InductorTestCase):
         }
     )
     def test_loop_epilogue_indirect_load_scope(self):
+        # [FUNCTION DOC] Needs CUDA and Triton; caches disabled and persistent reductions
+        # off. Compiles a function mixing gather, mean and scatter with dynamic shapes,
+        # checks the result equals eager, finds exactly one reduction kernel and verifies by
+        # pattern match that inside its reduction loop an indirect load occurs before a
+        # store and again after it.
         def fn(x, source, index):
+            # [FUNCTION DOC] HELPER: Gathers rows of source at the index, adds the mean of x
+            # over the last dimension, and returns x divided by that sum together with source
+            # scatter-updated at the index with the sum.
             index = index.unsqueeze(-1)
             selected = torch.gather(source, -2, index)
             updated = selected + x.mean(dim=-1, keepdim=True)
