@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# torch.fx package: toolkit for capturing and transforming nn.Module programs. Re-exports
+# the symbolic tracer (symbolic_trace, Tracer, wrap), the IR (Graph, GraphModule, Node,
+# Proxy), execution helpers (Interpreter, Transformer), replace_pattern, has_side_effect
+# and map_arg. Importing it also imports the submodules these names come from.
 r'''
 FX is a toolkit for developers to use to transform ``nn.Module``
 instances. FX consists of three main components: a **symbolic tracer,**

@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 # pylint: disable=useless-parent-delegation
+# [MODULE DOC]
+# Public Python wrapper for asynchronous futures. Defines the Future class (a
+# subclass of the C++-backed torch._C.Future) plus helpers collect_all and wait_all.
+# Import time: defines two type variables; no other side effects.
 from __future__ import annotations
 
 from typing import cast, Generic, TYPE_CHECKING, TypeVar
@@ -19,6 +23,10 @@ S = TypeVar("S")
 
 
 class Future(torch._C.Future, Generic[T]):
+    # [CLASS DOC] Generic container for the eventual result (or exception) of an asynchronous computation.
+    # State lives in the C++ base class; this class only adds typing and thin delegating methods.
+    # Key methods: wait, value, then, add_done_callback, set_result, set_exception, done.
+    # Optionally records the devices on which contained tensors may reside.
     r"""
     Wrapper around a ``torch._C.Future`` which encapsulates an asynchronous
     execution of a callable, e.g. :meth:`~torch.distributed.rpc.rpc_async`. It
@@ -28,6 +36,9 @@ class Future(torch._C.Future, Generic[T]):
     """
 
     def __init__(self, *, devices: list[int | str | torch.device] | None = None):
+        # [FUNCTION DOC] Create an unset future. devices is an optional list of device specs (ints,
+        # strings or torch.device) that bounds where result tensors live; None means no devices.
+        # Each entry is converted to a torch.device and passed to the base constructor.
         r"""
         Create an empty unset ``Future``. If the future is intended to hold
         values containing CUDA tensors, (a superset of) their CUDA devices must
@@ -46,6 +57,8 @@ class Future(torch._C.Future, Generic[T]):
         super().__init__([torch.device(d) for d in devices])
 
     def done(self) -> bool:
+        # [FUNCTION DOC] Return True if a result or exception has been set. Does not wait for any
+        # GPU kernels producing the result to finish.
         r"""
         Return ``True`` if this ``Future`` is done. A ``Future`` is done if it
         has a result or an exception.
@@ -59,6 +72,9 @@ class Future(torch._C.Future, Generic[T]):
         return super().done()
 
     def wait(self) -> T:
+        # [FUNCTION DOC] Block until the future completes and return its value, re-raising the stored
+        # exception if one was set. Synchronizes the current CUDA streams with the result's
+        # device work. Delegates to the base class.
         r"""
         Block until the value of this ``Future`` is ready.
 
@@ -80,6 +96,8 @@ class Future(torch._C.Future, Generic[T]):
         return super().wait()
 
     def value(self) -> T:
+        # [FUNCTION DOC] Return the completed value without blocking; raises an error if the future is
+        # not yet complete, and re-raises a stored exception. Does not synchronize streams.
         r"""
         Obtain the value of an already-completed future.
 
@@ -101,6 +119,9 @@ class Future(torch._C.Future, Generic[T]):
         return super().value()
 
     def then(self, callback: Callable[[Future[T]], S]) -> Future[S]:
+        # [FUNCTION DOC] Register callback to run once this future completes; it receives this future.
+        # Returns a new future that holds the callback's return value (or its exception).
+        # The child future inherits this future's devices. Delegates to the base class.
         r"""
         Append the given callback function to this ``Future``, which will be run
         when the ``Future`` is completed.  Multiple callbacks can be added to
@@ -166,6 +187,8 @@ class Future(torch._C.Future, Generic[T]):
         return cast(Future[S], super().then(callback))
 
     def add_done_callback(self, callback: Callable[[Future[T]], None]) -> None:
+        # [FUNCTION DOC] Register callback to run with this future when it completes (immediately if
+        # already complete). Returns nothing; unlike then, no new future is created.
         r"""
         Append the given callback function to this ``Future``, which will be run
         when the ``Future`` is completed.  Multiple callbacks can be added to
@@ -211,6 +234,8 @@ class Future(torch._C.Future, Generic[T]):
         super().add_done_callback(callback)
 
     def set_result(self, result: T) -> None:
+        # [FUNCTION DOC] Mark the future complete with result and run attached callbacks. Raises an
+        # error if the future was already completed. Mutates the future state.
         r"""
         Set the result for this ``Future``, which will mark this ``Future`` as
         completed and trigger all attached callbacks. Note that a ``Future``
@@ -251,6 +276,11 @@ class Future(torch._C.Future, Generic[T]):
         super().set_result(result)
 
     def set_exception(self, result: T) -> None:
+        # [FUNCTION DOC] Complete the future with an error so wait/value raise it, and run callbacks.
+        # Raises an AssertionError if the argument is not an Exception instance. Installs an
+        # unwrap function that raises the stored object, then stores it via set_result.
+        # KNOWN ISSUE: the parameter is named result and annotated with the value type T, but
+        # it must be an exception instance.
         r"""
         Set an exception for this ``Future``, which will mark this ``Future`` as
         completed with an error and trigger all attached callbacks. Note that
@@ -276,6 +306,7 @@ class Future(torch._C.Future, Generic[T]):
             )
 
         def raise_error(fut_result):
+            # [FUNCTION DOC] HELPER: unwrap hook; raises the stored exception object instead of returning it.
             raise fut_result
 
         super()._set_unwrap_func(raise_error)
@@ -283,6 +314,8 @@ class Future(torch._C.Future, Generic[T]):
 
 
 def collect_all(futures: list[Future]) -> Future[list[Future]]:
+    # [FUNCTION DOC] Return a single future, completed when all input futures are complete, whose
+    # value is the list of those same futures. Delegates to the C++ collect-all helper.
     r"""
     Collects the provided :class:`~torch.futures.Future` objects into a single
     combined :class:`~torch.futures.Future` that is completed when all of the
@@ -315,6 +348,8 @@ def collect_all(futures: list[Future]) -> Future[list[Future]]:
 
 
 def wait_all(futures: list[Future]) -> list:
+    # [FUNCTION DOC] Wait for all futures and return the list of their values. Exits early and
+    # raises if any future holds an error, without waiting for the others.
     r"""
     Waits for all provided futures to be complete, and returns
     the list of completed values. If any of the futures encounters an error,

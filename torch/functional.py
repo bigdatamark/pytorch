@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Python-level tensor functions exported as torch.* and torch.functional.*: broadcasting
+# (broadcast_tensors, broadcast_shapes), split, einsum, meshgrid, stft/istft, unique and
+# unique_consecutive, tensordot, cartesian_prod, block_diag, cdist, atleast_1d/2d/3d, norm,
+# unravel_index, chain_matmul and lu, plus re-exports of pca_lowrank and svd_lowrank.
+# Most functions are thin wrappers that first check for __torch_function__ overrides and then
+# call the C++ _VF bindings. unique, unique_consecutive and lu are built at import time with
+# boolean_dispatch so TorchScript can resolve return types from boolean arguments; istft is
+# created by attaching a docstring to torch.istft. Import-time side effects: those assignments
+# and setting __doc__ on unique, unique_consecutive and lu.
 import itertools
 import operator
 from collections.abc import Sequence
@@ -45,6 +55,8 @@ __all__ = [
 
 
 def broadcast_tensors(*tensors):
+    # [FUNCTION DOC] Broadcast all tensors to a common shape and return them as a list of tensors (views, possibly
+    # sharing memory). Dispatches to __torch_function__ overrides first. No mutation.
     r"""broadcast_tensors(*tensors) -> List of Tensors
 
     Broadcasts the given tensors according to :ref:`broadcasting-semantics`.
@@ -77,6 +89,10 @@ def broadcast_tensors(*tensors):
 
 
 def broadcast_shapes(*shapes):
+    # [FUNCTION DOC] Compute the broadcast shape of the given shapes (ints or sequences of ints) and return a Size.
+    # Outside tracing it uses the reference implementation (an empty Size if it returns nothing);
+    # when tracing it expands zero-size scalars under no-grad and broadcasts them so the trace stays
+    # dynamic. Raises an error if the shapes are not broadcastable.
     r"""broadcast_shapes(*shapes) -> Size
 
     Similar to :func:`broadcast_tensors` but for shapes.
@@ -122,6 +138,9 @@ def split(
     split_size_or_sections: int | list[int],
     dim: int = 0,
 ) -> tuple[Tensor, ...]:
+    # [FUNCTION DOC] Split tensor along dim into chunks that are views: either equal pieces of the given size
+    # or a list of explicit section sizes. Returns a tuple of tensors. Dispatches to
+    # __torch_function__ overrides, otherwise delegates to the Tensor method.
     r"""Splits the tensor into chunks. Each chunk is a view of the original tensor.
 
     If :attr:`split_size_or_sections` is an integer type, then :attr:`tensor` will
@@ -173,6 +192,11 @@ def split(
 
 
 def einsum(*args: Any) -> Tensor:
+    # [FUNCTION DOC] Evaluate an Einstein summation. Accepts either an equation string followed by operands, or
+    # the interleaved operand/subscript-list form (converted to an equation string; subscripts 0-51
+    # map to letters, Ellipsis maps to an ellipsis). Also accepts operands given as one list.
+    # Raises ValueError for too few arguments or out-of-range subscripts. For more than two operands
+    # with opt_einsum enabled and installed, computes a contraction path and passes it to C++.
     r"""einsum(equation, *operands) -> Tensor
 
     Sums the product of the elements of the input :attr:`operands` along dimensions specified using a notation
@@ -333,6 +357,8 @@ def einsum(*args: Any) -> Tensor:
         # to the equation string format by creating the equation string from the subscripts list and grouping the
         # input operands into a tensorlist (List[Tensor]).
         def parse_subscript(n: int) -> str:
+            # [FUNCTION DOC] HELPER: map one subscript entry to a letter: Ellipsis to an ellipsis, 0-25 to upper case,
+            # 26-51 to lower case; raises ValueError outside that range.
             if n == Ellipsis:
                 return "..."
             if n >= 0 and n < 26:
@@ -388,11 +414,15 @@ if TYPE_CHECKING:
     def meshgrid(
         *tensors: Tensor | list[Tensor], indexing: str | None = None
     ) -> tuple[Tensor, ...]:
+        # [FUNCTION DOC] Type-checking-only stub; forwards to the private implementation.
         return _meshgrid(*tensors, indexing=indexing)
 
 else:
 
     def meshgrid(*tensors, indexing: str | None = None) -> tuple[Tensor, ...]:
+        # [FUNCTION DOC] Build coordinate grids from 1D tensors (given variadically or as one list). indexing selects
+        # ij or xy layout (None keeps the legacy default). Returns a tuple of tensors. Forwards to the
+        # private implementation.
         r"""Creates grids of coordinates specified by the 1D inputs in `attr`:tensors.
 
         This is helpful when you want to visualize data over some
@@ -490,6 +520,8 @@ else:
 
 
 def _meshgrid(*tensors, indexing: str | None):
+    # [FUNCTION DOC] HELPER: implementation of meshgrid: handles __torch_function__ dispatch, unwraps a single
+    # list argument, and only passes the indexing keyword to C++ when it is not None.
     if has_torch_function(tensors):
         return handle_torch_function(meshgrid, tensors, *tensors, indexing=indexing)
     if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
@@ -517,6 +549,10 @@ def stft(
     return_complex: bool | None = None,
     align_to_window: bool | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Compute the short-time Fourier transform of a 1D or 2D input. Dispatches to
+    # __torch_function__ overrides. Raises RuntimeError if align_to_window is set while center is
+    # true. If center is true, first reflect/pad the signal by half of n_fft on both sides using
+    # pad_mode, then calls the C++ stft. Returns a tensor (complex when requested).
     r"""Short-time Fourier transform (STFT).
 
     .. warning::
@@ -789,6 +825,7 @@ def _unique_torch_function(
     return_counts: bool = False,
     dim: int | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: forward a unique call to the __torch_function__ handler with all arguments.
     return handle_torch_function(
         unique,
         (input,),
@@ -807,6 +844,10 @@ def _unique_impl(
     return_counts: bool = False,
     dim: int | None = None,
 ) -> _unique_impl_out:
+    # [FUNCTION DOC] Implementation of unique: return the unique elements of input (optionally sorted, or along a
+    # dimension), always as an (output, inverse_indices, counts) triple; the optional parts are
+    # empty when not requested. Uses the dim variant when dim is given, else the flattened variant.
+    # Public unique is built from this via boolean_dispatch and shares its docstring.
     r"""unique(input, sorted=True, return_inverse=False, return_counts=False, dim=None) -> tuple[Tensor, Tensor, Tensor]
 
     Returns the unique elements of the input tensor.
@@ -985,6 +1026,7 @@ def _unique_consecutive_torch_function(
     return_counts: bool = False,
     dim: int | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: forward a unique_consecutive call to the __torch_function__ handler.
     return handle_torch_function(
         unique_consecutive,
         (input,),
@@ -1001,6 +1043,9 @@ def _unique_consecutive_impl(
     return_counts: bool = False,
     dim: int | None = None,
 ) -> _unique_impl_out:
+    # [FUNCTION DOC] Implementation of unique_consecutive: collapse runs of equal consecutive elements (optionally
+    # along dim) and return an (output, inverse_indices, counts) triple; unrequested parts are empty.
+    # Public unique_consecutive is built from this and shares its docstring.
     r"""Eliminates all but the first element from every consecutive group of equivalent elements.
 
     .. note:: This function is different from :func:`torch.unique` in the sense that this function
@@ -1064,6 +1109,8 @@ def _return_inverse_and_counts(
     dim=None,
 ):
     # type: (Tensor, bool, bool, bool, Optional[int]) -> tuple[Tensor, Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns the full triple.
 
     if has_torch_function_unary(input):
         return _unique_torch_function(input, sorted, return_inverse, return_counts, dim)
@@ -1079,6 +1126,8 @@ def _return_counts(
     dim=None,
 ):
     # type: (Tensor, bool, bool, bool, Optional[int]) -> tuple[Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns output and counts.
 
     if has_torch_function_unary(input):
         return _unique_torch_function(input, sorted, return_inverse, return_counts, dim)
@@ -1095,6 +1144,8 @@ def _return_output(
     dim=None,
 ):
     # type: (Tensor, bool, bool, bool, Optional[int]) -> Tensor
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns only the output.
 
     if has_torch_function_unary(input):
         return _unique_torch_function(input, sorted, return_inverse, return_counts, dim)
@@ -1111,6 +1162,8 @@ def _return_inverse(
     dim=None,
 ):
     # type: (Tensor, bool, bool, bool, Optional[int]) -> tuple[Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns output and inverse indices.
 
     if has_torch_function_unary(input):
         return _unique_torch_function(input, sorted, return_inverse, return_counts, dim)
@@ -1163,6 +1216,8 @@ def _consecutive_return_inverse_and_counts(
     dim=None,
 ):
     # type: (Tensor, bool, bool, Optional[int]) -> tuple[Tensor, Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique_consecutive: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns the full triple.
     if has_torch_function_unary(input):
         return _unique_consecutive_torch_function(
             input, return_inverse, return_counts, dim
@@ -1178,6 +1233,8 @@ def _consecutive_return_counts(
     dim=None,
 ):
     # type: (Tensor, bool, bool, Optional[int]) -> tuple[Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique_consecutive: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns output and counts.
 
     if has_torch_function_unary(input):
         return _unique_consecutive_torch_function(
@@ -1197,6 +1254,8 @@ def _consecutive_return_output(
     dim=None,
 ):
     # type: (Tensor, bool, bool, Optional[int]) -> Tensor
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique_consecutive: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns only the output.
 
     if has_torch_function_unary(input):
         return _unique_consecutive_torch_function(
@@ -1214,6 +1273,8 @@ def _consecutive_return_inverse(
     dim=None,
 ):
     # type: (Tensor, bool, bool, Optional[int]) -> tuple[Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: boolean_dispatch branch of unique_consecutive: forwards to the __torch_function__ handler if overridden,
+    # otherwise runs the implementation and returns output and inverse indices.
 
     if has_torch_function_unary(input):
         return _unique_consecutive_torch_function(
@@ -1273,6 +1334,7 @@ else:
         dims: int = 2,
         out: torch.Tensor | None = None,
     ):
+        # [FUNCTION DOC] HELPER: typing overload stub for tensordot; never executed.
         pass
 
     @overload
@@ -1282,6 +1344,7 @@ else:
         dims: tuple[list[int], list[int]],
         out: torch.Tensor | None = None,
     ):
+        # [FUNCTION DOC] HELPER: typing overload stub for tensordot; never executed.
         pass
 
     @overload
@@ -1291,6 +1354,7 @@ else:
         dims: list[list[int]],
         out: torch.Tensor | None = None,
     ):
+        # [FUNCTION DOC] HELPER: typing overload stub for tensordot; never executed.
         pass
 
     @overload
@@ -1300,6 +1364,7 @@ else:
         dims: torch.Tensor,
         out: torch.Tensor | None = None,
     ):
+        # [FUNCTION DOC] HELPER: typing overload stub for tensordot; never executed.
         pass
 
 
@@ -1309,6 +1374,10 @@ def tensordot(
     dims=2,
     out: torch.Tensor | None = None,
 ):
+    # [FUNCTION DOC] Contract a and b over multiple dimensions. dims is an int (last N dims of a with first N of b),
+    # a pair of dimension lists, or a tensor encoding either. Validates dims, raising RuntimeError for
+    # a bad type, a negative value, or a value larger than either tensor's rank (AssertionError for a
+    # malformed tensor dims). Calls the C++ op, writing to out if provided. Returns the result tensor.
     r"""Returns a contraction of a and b over multiple dimensions.
 
     :attr:`tensordot` implements a generalized matrix product.
@@ -1410,6 +1479,8 @@ def tensordot(
 
 
 def cartesian_prod(*tensors: Tensor) -> Tensor:
+    # [FUNCTION DOC] Return the cartesian product of the 1D input tensors as a 2D tensor (one row per combination).
+    # Dispatches to __torch_function__ overrides, otherwise calls the C++ op.
     """Do cartesian product of the given sequence of tensors. The behavior is similar to
     python's `itertools.product`.
 
@@ -1445,6 +1516,8 @@ def cartesian_prod(*tensors: Tensor) -> Tensor:
 
 
 def block_diag(*tensors):
+    # [FUNCTION DOC] Build a block diagonal matrix from the given tensors (scalars, 1D, or 2D) placed along the
+    # diagonal. Dispatches to __torch_function__ overrides, otherwise calls the C++ op.
     """Create a block diagonal matrix from provided tensors.
 
     Args:
@@ -1482,6 +1555,9 @@ def block_diag(*tensors):
 
 def cdist(x1, x2, p=2.0, compute_mode="use_mm_for_euclid_dist_if_necessary"):
     # type: (Tensor, Tensor, float, str) -> (Tensor)
+    # [FUNCTION DOC] Compute pairwise p-norm distances between row vectors of x1 and x2 (batched). compute_mode picks
+    # whether matrix multiplication is used for Euclidean distances (default heuristic, always, never).
+    # Raises ValueError for an unknown compute_mode. Dispatches to __torch_function__ overrides.
     r"""Computes the batched p-norm distance between each pair of the two collections of row vectors.
 
     Args:
@@ -1542,6 +1618,9 @@ def cdist(x1, x2, p=2.0, compute_mode="use_mm_for_euclid_dist_if_necessary"):
 
 
 def atleast_1d(*tensors):
+    # [FUNCTION DOC] Return the input(s) viewed with at least 1 dimension(s). A single tensor gives a tensor,
+    # several give a tuple/list. Dispatches to __torch_function__ overrides; inputs are not copied
+    # when they already have enough dimensions.
     r"""
     Returns a 1-dimensional view of each input tensor with zero dimensions.
     Input tensors with one or more dimensions are returned as-is.
@@ -1580,6 +1659,9 @@ def atleast_1d(*tensors):
 
 
 def atleast_2d(*tensors):
+    # [FUNCTION DOC] Return the input(s) viewed with at least 2 dimension(s). A single tensor gives a tensor,
+    # several give a tuple/list. Dispatches to __torch_function__ overrides; inputs are not copied
+    # when they already have enough dimensions.
     r"""
     Returns a 2-dimensional view of each input tensor with zero dimensions.
     Input tensors with two or more dimensions are returned as-is.
@@ -1620,6 +1702,9 @@ def atleast_2d(*tensors):
 
 
 def atleast_3d(*tensors):
+    # [FUNCTION DOC] Return the input(s) viewed with at least 3 dimension(s). A single tensor gives a tensor,
+    # several give a tuple/list. Dispatches to __torch_function__ overrides; inputs are not copied
+    # when they already have enough dimensions.
     r"""
     Returns a 3-dimensional view of each input tensor with zero dimensions.
     Input tensors with three or more dimensions are returned as-is.
@@ -1692,6 +1777,7 @@ else:
         dtype=None,
     ):
         # type: (Tensor, str, Optional[List[int]], bool, Optional[Tensor], Optional[int]) -> Tensor
+        # [FUNCTION DOC] HELPER: typing overload stub for norm used by TorchScript; never executed.
         pass
 
     @overload
@@ -1704,6 +1790,7 @@ else:
         dtype=None,
     ):
         # type: (Tensor, Optional[number], Optional[List[int]], bool, Optional[Tensor], Optional[int]) -> Tensor
+        # [FUNCTION DOC] HELPER: typing overload stub for norm used by TorchScript; never executed.
         pass
 
     @overload
@@ -1716,6 +1803,7 @@ else:
         dtype=None,
     ):
         # type: (Tensor, Optional[number], Optional[int], bool, Optional[Tensor], Optional[int]) -> Tensor
+        # [FUNCTION DOC] HELPER: typing overload stub for norm used by TorchScript; never executed.
         pass
 
     @overload
@@ -1728,6 +1816,7 @@ else:
         dtype=None,
     ):
         # type: (Tensor, str, Optional[int], bool, Optional[Tensor], Optional[int]) -> Tensor
+        # [FUNCTION DOC] HELPER: typing overload stub for norm used by TorchScript; never executed.
         pass
 
 
@@ -1739,6 +1828,12 @@ def norm(
     out=None,
     dtype=None,
 ):
+    # [FUNCTION DOC] Return the vector or matrix norm of input. p is a number, "fro", "nuc" or None (treated as 2);
+    # dim selects dimensions (int, list, or None for all); keepdim, out and dtype behave as usual.
+    # Dispatches to __torch_function__ overrides. For strided tensors on cpu, cuda, xpu, meta or the
+    # private-use backend it delegates to the linalg vector/matrix norm functions; otherwise it uses
+    # the legacy C++ frobenius, nuclear and p-norm ops. Raises ValueError when dtype is combined with
+    # "fro"/"nuc" in the legacy path, and RuntimeError for other string values of p.
     r"""Returns the matrix norm or vector norm of a given tensor.
 
     .. warning::
@@ -1958,6 +2053,9 @@ def unravel_index(
     indices: Tensor,
     shape: int | Sequence[int] | torch.Size,
 ) -> tuple[Tensor, ...]:
+    # [FUNCTION DOC] Convert flat indices into a tuple of coordinate tensors for a tensor of the given shape (row
+    # major order). Dispatches to __torch_function__ overrides; validation is in the private helper.
+    # Returns a tuple with one tensor per dimension, each shaped like indices.
     r"""Converts a tensor of flat indices into a tuple of coordinate tensors that
     index into an arbitrary tensor of the specified shape.
 
@@ -2013,6 +2111,10 @@ def unravel_index(
 
 
 def _unravel_index(indices: Tensor, shape: int | Sequence[int]) -> Tensor:
+    # [FUNCTION DOC] HELPER: validate inputs (integer non-bool indices; shape an int or sequence of ints, non-negative, with
+    # no zero entries when indices is non-empty; raising type or value errors) and compute coordinates
+    # by dividing by the row-major strides and taking the remainder modulo each dimension size.
+    # Returns one tensor with an extra trailing dimension of coordinates.
     torch._check_type(
         not indices.is_complex()
         and not indices.is_floating_point()
@@ -2060,6 +2162,9 @@ def _unravel_index(indices: Tensor, shape: int | Sequence[int]) -> Tensor:
 
 
 def chain_matmul(*matrices, out=None):
+    # [FUNCTION DOC] Multiply the 2D input tensors in an order chosen to minimize cost. Dispatches to
+    # __torch_function__ overrides, otherwise calls the C++ op, writing into out if given.
+    # KNOWN ISSUE: the override dispatch does not forward the out argument.
     r"""Returns the matrix product of the :math:`N` 2-D tensors. This product is efficiently computed
     using the matrix chain order algorithm which selects the order in which incurs the lowest cost in terms
     of arithmetic operations (`[CLRS]`_). Note that since this is a function to compute the product, :math:`N`
@@ -2108,6 +2213,9 @@ def chain_matmul(*matrices, out=None):
 
 def _lu_impl(A, pivot=True, get_infos=False, out=None):
     # type: (Tensor, bool, bool, Any) -> tuple[Tensor, Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: compute the LU factorization of A via the internal lu-with-info op, returning the packed LU
+    # tensor, pivots and infos. Error checking is enabled only when get_infos is false.
+    # KNOWN ISSUE: the out argument is accepted but ignored here; callers copy results into out.
     r"""Computes the LU factorization of a matrix or batches of matrices
     :attr:`A`. Returns a tuple containing the LU factorization and
     pivots of :attr:`A`.  Pivoting is done if :attr:`pivot` is set to
@@ -2215,6 +2323,8 @@ else:
 
 
 def _check_list_size(out_len: int, get_infos: bool, out: _ListOrSeq) -> None:
+    # [FUNCTION DOC] HELPER: validate the out argument for lu: its length must be 2 (3 with get_infos) and it must be a tuple
+    # or list; raises TypeError otherwise.
     get_infos_int = 1 if get_infos else 0
     if out_len - get_infos_int != 2:
         raise TypeError(
@@ -2228,6 +2338,9 @@ def _check_list_size(out_len: int, get_infos: bool, out: _ListOrSeq) -> None:
 
 def _lu_with_infos(A, pivot=True, get_infos=False, out=None):
     # type: (Tensor, bool, bool, Optional[tuple[Tensor, Tensor, Tensor]]) -> tuple[Tensor, Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: lu branch with infos: dispatch to __torch_function__ overrides, compute the factorization, and
+    # if out is given validate it and copy each result into it (resizing), returning out; else return
+    # the (LU, pivots, infos) triple.
     if has_torch_function_unary(A):
         return handle_torch_function(
             lu, (A,), A, pivot=pivot, get_infos=get_infos, out=out
@@ -2244,6 +2357,8 @@ def _lu_with_infos(A, pivot=True, get_infos=False, out=None):
 
 def _lu_no_infos(A, pivot=True, get_infos=False, out=None):
     # type: (Tensor, bool, bool, Optional[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]
+    # [FUNCTION DOC] HELPER: lu branch without infos: same as the with-infos branch but returns only (LU, pivots) when out
+    # is not given.
     # need to check for torch_function here so that we exit if
     if has_torch_function_unary(A):
         return handle_torch_function(
