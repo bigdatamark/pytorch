@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Shared infrastructure for PyTorch distributed tests. Provides test-skip exit codes
+# and decorators (GPU count, world size, backend availability, ROCm, Windows), multi-process test
+# base classes (MultiProcessTestCase, DistributedTestBase, MultiProcContinuousTest,
+# C10dTorchCommsTestBase), a multi-threaded test runner using the threaded process group, subtest
+# and TCP-store helpers, sparse reduce test generators and dynamo distributed harnesses.
+# Import-time side effects: creates a module logger at INFO level, probes torchcomms for built
+# backends and sets the TORCHCOMM_HAS_* globals when torchcomms is available, and computes default
+# timeouts and world size (touching the CUDA device count on ROCm).
+
 import faulthandler
 import functools
 import inspect
@@ -87,6 +96,12 @@ def setup_torchcomms_pg(
     store_path: str,
     group_name: str,
 ) -> c10d.ProcessGroup:
+    # [FUNCTION DOC] Builds a ProcessGroup whose NCCL backend is a torchcomms communicator
+    # of the given backend name. Creates a FileStore at store_path, sets the TORCHCOMM_RANK
+    # and TORCHCOMM_SIZE environment variables, creates the torchcomms comm with prefixed
+    # stores, registers it on a new ProcessGroup, sets it as default backend and registers
+    # the group by name in the c10d world. Returns the group. Raises on duplicate group
+    # names or store problems.
     """Build a bare ProcessGroup whose backend is a torchcomms _BackendWrapper.
 
     Creates a torchcomms comm of the requested ``backend`` (e.g. ``nccl``,
@@ -154,6 +169,9 @@ HAS_ACCELERATOR = TEST_CUDA or TEST_HPU or TEST_XPU
 
 
 class TestSkip(NamedTuple):
+    # [CLASS DOC] Named tuple pairing a process exit code with the human-readable skip message.
+    # Instances are the values of TEST_SKIPS and let subprocess exit codes be mapped back to
+    # skip reasons.
     exit_code: int
     message: str
 
@@ -186,6 +204,10 @@ TEST_SKIPS = {
 
 @dataclass
 class DistTestCases:
+    # [CLASS DOC] Holder of class-level tables describing backend capabilities for distributed
+    # tests: skip_collective (collective name to set of backends lacking it) and backend_feature
+    # (feature name to set of backends supporting it, with hpu/xpu entries added when those
+    # devices exist). No instances state; used by reading the class attributes.
     # Backends that do not support a specific collective
     skip_collective = {}
     skip_collective["allgather_coalesced"] = {"nccl", "mpi", "ucc", "xccl"}
@@ -207,15 +229,25 @@ class DistTestCases:
 
 
 def requires_ddp_rank(device):
+    # [FUNCTION DOC] Returns True when the device string is one of the device types (cuda, xpu)
+    # that require a per-rank device index in DDP tests. Pure.
     return device in DDP_RANK_DEVICES
 
 
 def skip_if_no_gpu(func):
+    # [FUNCTION DOC] Decorator for multi-process tests: exits the process with the no_cuda skip
+    # code when no CUDA, HPU or XPU device exists, and with the multi-gpu skip code for the world
+    # size (from the WORLD_SIZE environment variable) when any available accelerator has fewer
+    # devices than ranks. Otherwise calls the test.
     """Skips if the world size exceeds the number of GPUs, ensuring that if the
     test is run, each rank has its own GPU via ``torch.cuda.device(rank)``."""
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped test body implementing the skip checks above; exits via
+        # sys.exit with a skip exit code or returns the result of the test.
+        # KNOWN ISSUE: the multi-gpu skip key only exists for world sizes 1 through 8, so larger
+        # world sizes raise a KeyError.
         if not (TEST_CUDA or TEST_HPU or TEST_XPU):
             sys.exit(TEST_SKIPS["no_cuda"].exit_code)
         world_size = int(os.environ["WORLD_SIZE"])
@@ -238,8 +270,14 @@ def skip_if_no_gpu(func):
 # to keep CI green. But this is just a temporary solution. We should clean up
 # those tests somehow.
 def skip_if_small_worldsize(func):
+    # [FUNCTION DOC] Decorator that exits the process with the small_worldsize skip code when the
+    # BACKEND environment variable is not mpi and WORLD_SIZE is below 8; otherwise runs the test.
+    # The comment above notes it effectively skips most tests and may be outdated.
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped test body: reads BACKEND and WORLD_SIZE from the
+        # environment, exits with a skip code or runs the test. Raises KeyError if the variables
+        # are unset.
         if (os.environ["BACKEND"] != "mpi") and int(os.environ["WORLD_SIZE"]) < 8:
             sys.exit(TEST_SKIPS["small_worldsize"].exit_code)
 
@@ -249,8 +287,13 @@ def skip_if_small_worldsize(func):
 
 
 def skip_if_odd_worldsize(func):
+    # [FUNCTION DOC] Decorator that exits the process with the odd_worldsize skip code when the
+    # BACKEND environment variable is not mpi and WORLD_SIZE is odd; otherwise runs the test.
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped test body: reads BACKEND and WORLD_SIZE from the
+        # environment, exits with a skip code or runs the test. Raises KeyError if the variables
+        # are unset.
         if (os.environ["BACKEND"] != "mpi") and int(os.environ["WORLD_SIZE"]) % 2 == 1:
             sys.exit(TEST_SKIPS["odd_worldsize"].exit_code)
 
@@ -260,9 +303,16 @@ def skip_if_odd_worldsize(func):
 
 
 def require_n_gpus_for_nccl_backend(n, backend):
+    # [FUNCTION DOC] Decorator factory: for the nccl backend, skips (exits with the multi-gpu-n
+    # skip code) when fewer than n CUDA devices exist; for other backends never skips. Args: n
+    # minimum GPU count, backend name.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Applies the GPU-count skip logic to a test function and returns
+        # the wrapper.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapped test body: exits with the skip code or returns the
+            # test result.
             if backend == "nccl" and torch.cuda.device_count() < n:
                 sys.exit(TEST_SKIPS[f"multi-gpu-{n}"].exit_code)
             else:
@@ -274,9 +324,15 @@ def require_n_gpus_for_nccl_backend(n, backend):
 
 
 def import_transformers_or_skip():
+    # [FUNCTION DOC] Decorator factory that skips a test (exit with the importerror skip code)
+    # when the transformers package cannot be imported. The test runs inside the try block, so an
+    # ImportError raised by the test itself also causes a skip.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wraps a test function with the import-or-skip behavior.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapped test body: tries to import transformers classes, then
+            # runs the test; exits with a skip code on ImportError.
             try:
                 from transformers import AutoModelForMaskedLM, BertConfig  # noqa: F401
 
@@ -290,6 +346,8 @@ def import_transformers_or_skip():
 
 
 def at_least_x_gpu(x):
+    # [FUNCTION DOC] Returns True if any of CUDA, HPU or XPU is present with at least x devices,
+    # else False. Arg x is the required device count.
     if TEST_CUDA and torch.cuda.device_count() >= x:
         return True
     if TEST_HPU and torch.hpu.device_count() >= x:
@@ -300,6 +358,11 @@ def at_least_x_gpu(x):
 
 
 def _maybe_handle_skip_if_lt_x_gpu(args, msg) -> bool:
+    # [FUNCTION DOC] HELPER: Calls the test instance's _handle_test_skip hook with the message if
+    # args has a first element providing one, and returns True; returns False when there is no
+    # such hook.
+    # KNOWN ISSUE: the first element of args is read before the length check, so an empty args
+    # raises an IndexError instead of returning False.
     _handle_test_skip = getattr(args[0], "_handle_test_skip", None)
     if len(args) == 0 or _handle_test_skip is None:
         return False
@@ -308,6 +371,10 @@ def _maybe_handle_skip_if_lt_x_gpu(args, msg) -> bool:
 
 
 def skip_if_lt_x_gpu(x, *, allow_cpu=False):
+    # [FUNCTION DOC] Decorator factory that skips a test when fewer than x accelerators (CUDA, HPU
+    # or XPU) are available, unless allow_cpu is set and no accelerator exists. A skip is reported
+    # through the test's _handle_test_skip hook when present, else by exiting with the multi-gpu-x
+    # skip code. Otherwise the test runs and its result is returned (a skipped test returns None).
     """Skip if fewer than x accelerators available.
 
     Args:
@@ -316,8 +383,12 @@ def skip_if_lt_x_gpu(x, *, allow_cpu=False):
     """
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Applies the accelerator-count skip logic to a test function and
+        # returns the wrapper.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapped test body: runs the test if enough devices exist,
+            # else skips.
             if torch.cuda.is_available() and torch.cuda.device_count() >= x:
                 return func(*args, **kwargs)
             if TEST_HPU and torch.hpu.device_count() >= x:
@@ -336,6 +407,11 @@ def skip_if_lt_x_gpu(x, *, allow_cpu=False):
 
 
 def requires_world_size(n: int):
+    # [FUNCTION DOC] Decorator factory that records the requested world size on the test function
+    # (an attribute read by get_required_world_size) and skips the test via unittest.skipUnless
+    # when fewer than n CUDA devices are available. Arg n is the number of ranks.
+    # KNOWN ISSUE: the docstring usage example names a decorator spelled differently from
+    # this function.
     """
     Decorator to request a specific world size for a test. The test harness can
     read this attribute to set the number of ranks to spawn. If there are fewer
@@ -348,6 +424,8 @@ def requires_world_size(n: int):
     """
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Annotates the test function with the required world size, counts
+        # CUDA devices at decoration time and returns the function wrapped with a skip condition.
         func._required_world_size = n
         available = torch.cuda.device_count()
         return unittest.skipUnless(
@@ -358,6 +436,10 @@ def requires_world_size(n: int):
 
 
 def get_required_world_size(obj: Any, default: int) -> int:
+    # [FUNCTION DOC] Returns the world size requested for the currently running test method of obj
+    # through requires_world_size, using the current test name helper when present or the unittest
+    # method name. Returns default if the attribute is missing or anything fails (all exceptions
+    # are swallowed).
     """
     Returns the requested world size for the currently running unittest method on `obj`
     if annotated via `@require_world_size(n)`, else returns `default`.
@@ -378,9 +460,15 @@ def get_required_world_size(obj: Any, default: int) -> int:
 
 # This decorator helps avoiding initializing cuda while testing other backends
 def nccl_skip_if_lt_x_gpu(backend, x):
+    # [FUNCTION DOC] Decorator factory that only for the nccl backend skips (exit with the
+    # multi-gpu-x skip code or the test instance hook) when fewer than x CUDA devices exist,
+    # avoiding CUDA initialization for other backends. Other backends always run the test.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Applies the nccl-only GPU-count check to a test function and
+        # returns the wrapper.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapped test body: runs the test or skips as described above.
             if backend != "nccl":
                 return func(*args, **kwargs)
             if torch.cuda.is_available() and torch.cuda.device_count() >= x:
@@ -395,6 +483,10 @@ def nccl_skip_if_lt_x_gpu(backend, x):
 
 
 def verify_ddp_error_logged(model_DDP, err_substr):
+    # [FUNCTION DOC] Asserts that a DDP model logged the expected error: reads the DDP logging
+    # data and requires the iteration, has_error and error keys, then requires the error substring
+    # (with any C++ stack trace suffix removed) to appear in the logged error. Raises
+    # AssertionError on failure.
     # Verify error was logged in ddp_logging_data.
     ddp_logging_data = model_DDP._get_ddp_logging_data()
     if "iteration" not in ddp_logging_data:
@@ -417,6 +509,10 @@ def verify_ddp_error_logged(model_DDP, err_substr):
 
 
 def with_nccl_blocking_wait(func):
+    # [FUNCTION DOC] Decorator that runs the test with TORCH_NCCL_BLOCKING_WAIT set to 1 and
+    # TORCH_NCCL_ASYNC_ERROR_HANDLING unset, restoring both environment variables to their
+    # previous values afterwards (even on failure). Mutates the process environment during
+    # the test.
     """
     Convenience decorator to set/unset TORCH_NCCL_BLOCKING_WAIT flag. Note that use of
     this decorator will override the setting of TORCH_NCCL_ASYNC_ERROR_HANDLING for
@@ -426,6 +522,8 @@ def with_nccl_blocking_wait(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapped test body: saves and modifies the two environment
+        # variables, runs the test and restores them in a finally block; returns the test result.
         # Save and unset TORCH_NCCL_ASYNC_ERROR_HANDLING
         try:
             cached_nccl_async_error_handling: str | None = os.environ[
@@ -463,13 +561,21 @@ def with_nccl_blocking_wait(func):
 
 
 def with_dist_debug_levels(levels):
+    # [FUNCTION DOC] Decorator factory that runs the test once for each TORCH_DISTRIBUTED_DEBUG
+    # level in levels. For each level it sets the environment variable, reloads the c10d debug
+    # level, runs the test and calls a barrier. Returns the result of the last run.
+    # KNOWN ISSUE: the original level is restored only if it was set and the restore happens
+    # inside the loop; an empty levels list raises UnboundLocalError.
     """
     Runs a test for each distributed debug level specified in levels.
     """
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wraps the test function with the per-level loop.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapped test body implementing the loop over debug levels;
+            # mutates the environment and calls a collective barrier.
             old_level = os.environ.get("TORCH_DISTRIBUTED_DEBUG", None)
             for level in levels:
                 os.environ["TORCH_DISTRIBUTED_DEBUG"] = level
@@ -489,6 +595,9 @@ def with_dist_debug_levels(levels):
 
 
 def requires_gloo():
+    # [FUNCTION DOC] Returns a skip decorator (via the sandcastle-aware skip helper) that skips
+    # the test when c10d was built without the Gloo backend. Evaluated at decoration time; no
+    # other side effects.
     return skip_but_pass_in_sandcastle_if(
         not c10d.is_gloo_available(),
         "c10d was not compiled with the Gloo backend",
@@ -496,6 +605,10 @@ def requires_gloo():
 
 
 def requires_nccl_version(version, msg):
+    # [FUNCTION DOC] Returns a skip decorator for tests needing a minimum NCCL version. When CUDA
+    # is not available, returns an identity decorator. If NCCL is not compiled in, returns a skip
+    # decorator; otherwise skips when the installed NCCL version tuple is below version, with msg
+    # included in the reason. Args: version tuple, msg reason text.
     if not TEST_CUDA:
         return lambda f: f
     if not c10d.is_nccl_available():
@@ -510,6 +623,8 @@ def requires_nccl_version(version, msg):
 
 
 def requires_nccl_shrink():
+    # [FUNCTION DOC] Returns a skip decorator requiring NCCL 2.27 or newer, as needed for group
+    # shrink support. Delegates to requires_nccl_version.
     """
     Require NCCL shrink support (NCCL available and version >= 2.27).
     """
@@ -517,6 +632,9 @@ def requires_nccl_shrink():
 
 
 def requires_nccl():
+    # [FUNCTION DOC] Returns a skip decorator (via the sandcastle-aware skip helper) that skips
+    # the test when c10d was built without the NCCL backend. Evaluated at decoration time; no
+    # other side effects.
     return skip_but_pass_in_sandcastle_if(
         not c10d.is_nccl_available(),
         "c10d was not compiled with the NCCL backend",
@@ -524,6 +642,9 @@ def requires_nccl():
 
 
 def requires_xccl():
+    # [FUNCTION DOC] Returns a skip decorator (via the sandcastle-aware skip helper) that skips
+    # the test when c10d was built without the XCCL backend. Evaluated at decoration time; no
+    # other side effects.
     return skip_but_pass_in_sandcastle_if(
         not c10d.is_xccl_available(),
         "c10d was not compiled with the XCCL backend",
@@ -531,6 +652,9 @@ def requires_xccl():
 
 
 def requires_ucc():
+    # [FUNCTION DOC] Returns a skip decorator (via the sandcastle-aware skip helper) that skips
+    # the test when c10d was built without the UCC backend. Evaluated at decoration time; no other
+    # side effects.
     return skip_but_pass_in_sandcastle_if(
         not c10d.is_ucc_available(),
         "c10d was not compiled with the UCC backend",
@@ -538,6 +662,9 @@ def requires_ucc():
 
 
 def requires_mpi():
+    # [FUNCTION DOC] Returns a skip decorator (via the sandcastle-aware skip helper) that skips
+    # the test when c10d was built without the MPI backend. Evaluated at decoration time; no other
+    # side effects.
     return skip_but_pass_in_sandcastle_if(
         not c10d.is_mpi_available(),
         "c10d was not compiled with the MPI backend",
@@ -545,6 +672,9 @@ def requires_mpi():
 
 
 def requires_accelerator_dist_backend(backends=None):
+    # [FUNCTION DOC] Returns a skip decorator that skips unless at least one of the given
+    # accelerator backends (default all of nccl, xccl, hccl) is available; hccl counts as
+    # available when HPU testing is enabled. Unknown backend names count as unavailable.
     """
     Decorator to skip tests if no accelerator communication backend (NCCL, XCCL, HCCL) is available.
 
@@ -574,6 +704,8 @@ def requires_accelerator_dist_backend(backends=None):
 
 
 def requires_multicast_support():
+    # [FUNCTION DOC] Returns a skip decorator that skips the test unless CUDA is available and
+    # device 0 reports multicast support in symmetric memory.
     has_multicast_support = (
         torch.cuda.is_available()
         and _SymmetricMemory.has_multicast_support(DeviceType.CUDA, 0)
@@ -585,6 +717,9 @@ def requires_multicast_support():
 
 
 def evaluate_platform_supports_symm_mem():
+    # [FUNCTION DOC] Returns True when the platform can run symmetric memory tests: CUDA must be
+    # present, and on ROCm the first device's architecture name must contain gfx942 or gfx950.
+    # Returns False otherwise.
     if TEST_CUDA:
         if TEST_WITH_ROCM:
             arch_list = ["gfx942", "gfx950"]
@@ -604,14 +739,21 @@ PLATFORM_SUPPORTS_SYMM_MEM: bool = LazyVal(
 
 
 def skip_if_rocm_multiprocess(func):
+    # [FUNCTION DOC] Decorator that skips the test with the ROCm skip message when running on
+    # ROCm. Returns the wrapped function.
     """Skips a test for ROCm multiprocess UTs"""
     return unittest.skipIf(TEST_WITH_ROCM, TEST_SKIPS["skipIfRocm"].message)(func)
 
 
 def skip_if_rocm_arch_multiprocess(arch: tuple[str, ...]):
+    # [FUNCTION DOC] Decorator factory that skips the test when running on ROCm and the first
+    # device's architecture (name before any colon) is in the given tuple arch. Reads device
+    # properties at decoration time.
     """Skips a test for given ROCm archs - multiprocess UTs"""
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Computes the skip reason at decoration time and returns the
+        # function wrapped with a skip-if condition.
         reason = None
         if TEST_WITH_ROCM:
             prop = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
@@ -624,9 +766,16 @@ def skip_if_rocm_arch_multiprocess(arch: tuple[str, ...]):
 
 
 def skip_if_rocm_ver_lessthan_multiprocess(version=None):
+    # [FUNCTION DOC] Decorator factory that skips the test on ROCm when the ROCm version (parsed
+    # from the HIP version string, ignoring a git suffix) is lower than version, or when version
+    # is None. Never skips off ROCm.
+    # KNOWN ISSUE: the check that the parsed version tuple is None can never be true, and a None
+    # version always skips.
     """Skips a test for ROCm based on ROCm ver - multiprocess UTs"""
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Computes the skip reason at decoration time and returns the
+        # function wrapped with a skip-if condition.
         reason = None
         if TEST_WITH_ROCM:
             rocm_version = str(torch.version.hip)
@@ -645,9 +794,14 @@ def skip_if_rocm_ver_lessthan_multiprocess(version=None):
 
 
 def skip_if_rocm_ver_atleast_multiprocess(version=None):
+    # [FUNCTION DOC] Decorator factory that skips the test on ROCm when the ROCm version is at
+    # least the given version tuple (known failure on newer releases). Never skips off ROCm or
+    # when version is None.
     """Skips a test for ROCm if the version is at least the given tuple - multiprocess UTs"""
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Computes the skip reason at decoration time and returns the
+        # function wrapped with a skip-if condition.
         reason = None
         if TEST_WITH_ROCM:
             rocm_version = str(torch.version.hip)
@@ -662,6 +816,7 @@ def skip_if_rocm_ver_atleast_multiprocess(version=None):
 
 
 def skip_if_win32():
+    # [FUNCTION DOC] Returns a skip decorator that skips the test on Windows (win32).
     return skip_but_pass_in_sandcastle_if(
         sys.platform == "win32",
         "This unit test case is not supported on Windows platform",
@@ -669,6 +824,11 @@ def skip_if_win32():
 
 
 def sm_is_or_higher_than(device: torch.device, major: int, minor: int) -> bool:
+    # [FUNCTION DOC] Returns whether the device's compute capability is at least (major, minor).
+    # Non-CUDA devices return True and ROCm builds return False; otherwise compares the CUDA
+    # capability tuple.
+    # KNOWN ISSUE: the docstring says it errors out for non-CUDA devices, but the code
+    # returns True.
     """
     Returns True if the device's compute capability is (major, minor) or higher.
     Error out if the device is not a CUDA device.
@@ -695,6 +855,10 @@ def create_tcp_store(
     jit_class=False,
     use_libuv=True,
 ):
+    # [FUNCTION DOC] Creates a TCP store on a free port; wrapped with a retry-on-connect-failure
+    # decorator so a port collision is retried. Args: address, world size, is_master, timeout,
+    # wait_for_workers, jit_class (use the TorchScript class with the timeout converted to
+    # milliseconds), use_libuv. Returns the store object.
     """
     Creates a TCP store. Retries if the chosen port is already in use.
     """
@@ -732,6 +896,9 @@ if TEST_WITH_ROCM:
 
 
 def create_device(interface=None, lazy_init: bool = False):
+    # [FUNCTION DOC] Creates a Gloo device. Uses the loopback hostname 127.0.0.1 on Windows or
+    # when no interface is given, otherwise the named network interface; lazy_init is passed
+    # through. Returns the device.
     if sys.platform == "win32" or interface is None:
         return c10d.ProcessGroupGloo.create_device(
             hostname="127.0.0.1", lazy_init=lazy_init
@@ -743,11 +910,16 @@ def create_device(interface=None, lazy_init: bool = False):
 
 
 def get_timeout(test_id) -> int:
+    # [FUNCTION DOC] Returns the timeout in seconds for a test id: an override from
+    # TIMEOUT_OVERRIDE keyed by the last dotted component, else TIMEOUT_DEFAULT.
     return TIMEOUT_OVERRIDE.get(test_id.split(".")[-1], TIMEOUT_DEFAULT)
 
 
 @contextmanager
 def captured_output():
+    # [FUNCTION DOC] Context manager that temporarily replaces stdout and stderr with in-memory
+    # buffers, yields the two buffers, and restores the original streams afterward even on error.
+    # Mutates process-global stream state.
     new_out, new_err = StringIO(), StringIO()
     old_out, old_err = sys.stdout, sys.stderr
     try:
@@ -758,6 +930,10 @@ def captured_output():
 
 
 def simple_sparse_reduce_tests(rank: int, world_size: int, num_inputs: int = 1):
+    # [FUNCTION DOC] Generates basic sparse reduction test cases (sum only). For each of six
+    # generator variants (sparse dimensions 1 to 3, dense dimensions 1 to 3) returns a pair: the
+    # list of per-input sparse tensors for this rank and the list of expected summed tensors
+    # across all ranks. Args: rank, world size, number of inputs.
     """
     Generate a number of basic test cases for sparse reduction.
     These cover tensors with a varying number of sparse dimensions and a varying
@@ -765,6 +941,9 @@ def simple_sparse_reduce_tests(rank: int, world_size: int, num_inputs: int = 1):
     """
 
     def generate(rank: int, world_size: int, sparse_dims: int = 1, dense_dims: int = 0):
+        # [FUNCTION DOC] HELPER: Builds one sparse COO tensor for a rank: first sparse dimension
+        # has indices 0 through rank, other sparse dimensions are zero so all ranks overlap,
+        # values are ones.
         # First sparse dimension is [0..rank].
         # Subsequent dimensions are always 0, so we know there is
         # a non-empty intersection between any two sparse tensors.
@@ -777,6 +956,8 @@ def simple_sparse_reduce_tests(rank: int, world_size: int, num_inputs: int = 1):
         return torch.sparse_coo_tensor(indices, values, shape)
 
     def compute_sum(fn, world_size: int):
+        # [FUNCTION DOC] HELPER: Sums the tensors produced by the generator function for every
+        # rank of the world and returns the total.
         return reduce(
             operator.add, [fn(rank, world_size) for rank in range(world_size)]
         )
@@ -802,6 +983,10 @@ def simple_sparse_reduce_tests(rank: int, world_size: int, num_inputs: int = 1):
 
 # HELPER FOR MULTIGPU TESTS
 def init_multigpu_helper(world_size: int, backend: str):
+    # [FUNCTION DOC] Maps each rank to a list of GPU indices for multi-GPU tests, using CUDA, HPU
+    # or XPU device counts.
+    # KNOWN ISSUE: when world_size exceeds the GPU count the per-process count becomes zero
+    # (integer division), producing empty lists.
     """Multigpu tests are designed to simulate the multi nodes with multi
     GPUs on each node. Nccl backend requires equal #GPUs in each process.
     On a single node, all visible GPUs are evenly
@@ -830,6 +1015,10 @@ tmp_dir: tempfile.TemporaryDirectory | None = None
 
 
 def initialize_temp_directories(init_method: str | None = None) -> None:
+    # [FUNCTION DOC] Creates a temporary directory tree (barrier, test_dir, init_dir) stored in
+    # the module global tmp_dir and exports TEMP_DIR and INIT_METHOD environment variables.
+    # INIT_METHOD is init_method if given, else a file URL to a shared init file in the temp dir.
+    # Mutates globals and the environment.
     global tmp_dir
     tmp_dir = tempfile.TemporaryDirectory()
     os.environ["TEMP_DIR"] = tmp_dir.name
@@ -847,6 +1036,8 @@ def initialize_temp_directories(init_method: str | None = None) -> None:
 
 
 def cleanup_temp_dir() -> None:
+    # [FUNCTION DOC] Cleans up the module global temporary directory if one was created;
+    # no-op otherwise.
     if tmp_dir is not None:
         tmp_dir.cleanup()
 
@@ -856,6 +1047,10 @@ def retrieve_result_from_completion_queue(
     completion_queue: torch.multiprocessing.Queue,
     timeout: int | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Waits for a result on the completion queue of a worker process. Polls with a
+    # bounded queue timeout, returning a RuntimeError instance (not raised) if the process died
+    # without a result or the overall timeout elapsed; returns the queued result otherwise. Args:
+    # process, queue, optional total timeout in seconds.
     """Get result from the completion_queue associated with process.
 
     When the process finished without putting a result or the timeout expired an exception instance will be returned"""
@@ -896,6 +1091,13 @@ else:
 
 
 class MultiProcessTestCase(TestCase):
+    # [CLASS DOC] Base class for tests that run in subprocesses. The main process (rank equal to
+    # MAIN_PROCESS_RANK) spawns world_size processes, each of which re-creates the test case and
+    # runs the same test method with its rank, then the main process joins them and checks exit
+    # codes. State: rank, file_name (rendezvous file), processes, pid_to_pipe,
+    # special_return_code_checks and skip_return_code_checks. Key methods: _spawn_processes, _run,
+    # run_test, _join_processes, _check_return_codes. TEST_ERROR_EXIT_CODE marks a process that
+    # failed with an exception.
     MAIN_PROCESS_RANK = -1
     # This exit code is used to indicate that the test code had an error and
     # exited abnormally. There are certain tests that might use sys.exit() to
@@ -905,6 +1107,7 @@ class MultiProcessTestCase(TestCase):
 
     # do not early terminate for distributed tests.
     def _should_stop_test_suite(self) -> bool:
+        # [FUNCTION DOC] HELPER: Returns False so distributed tests never stop the suite early.
         return False
 
     # Many test cases init a process group but do not destroy it.  This property
@@ -914,15 +1117,24 @@ class MultiProcessTestCase(TestCase):
     # for each test).
     @property
     def destroy_pg_upon_exit(self) -> bool:
+        # [FUNCTION DOC] Property: whether the base class destroys the default process group after
+        # the test body in each subprocess. Defaults to True; subclasses may override.
         return True
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of ranks to spawn, defaulting to DEFAULT_WORLD_SIZE.
+        # Subclasses may override.
         return DEFAULT_WORLD_SIZE
 
     def join_or_run(self, fn):
+        # [FUNCTION DOC] Returns a bound replacement for a test method: in the main process it
+        # joins the spawned subprocesses, in a worker it runs the original method. Args: the
+        # original test function.
         @wraps(fn)
         def wrapper(self):
+            # [FUNCTION DOC] HELPER: Dispatches on whether this is the main process or a
+            # worker rank.
             if self.rank == self.MAIN_PROCESS_RANK:
                 self._join_processes(fn)
             else:
@@ -937,6 +1149,10 @@ class MultiProcessTestCase(TestCase):
     def __init__(
         self, method_name: str = "runTest", methodName: str = "runTest"
     ) -> None:
+        # [FUNCTION DOC] Constructs the test case and replaces the named test method with a
+        # version that joins subprocesses in the main process or runs the real body in workers.
+        # Accepts both method_name and methodName for BC with testslide. Raises ValueError if an
+        # explicitly named method does not exist.
         # methodName is the correct naming in unittest and testslide uses keyword arguments.
         # So we need to use both to 1) not break BC and, 2) support testslide.
         if methodName != "runTest":
@@ -954,6 +1170,9 @@ class MultiProcessTestCase(TestCase):
                 ) from e
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Per-test setup: initializes bookkeeping (return-code check overrides,
+        # process list, rank set to the main process rank), creates a temporary rendezvous file
+        # name and an empty pid-to-pipe map. Mutates instance state and creates a file.
         super().setUp()
 
         # Used for tests that are expected to return a non-0 exit code, such as
@@ -972,6 +1191,8 @@ class MultiProcessTestCase(TestCase):
         self.pid_to_pipe = {}  # type: ignore[var-annotated]
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Per-test teardown: terminates any spawned processes and clears the
+        # process list to avoid leaking file descriptors.
         super().tearDown()
         for p in self.processes:
             p.terminate()
@@ -982,10 +1203,16 @@ class MultiProcessTestCase(TestCase):
         self.processes = []
 
     def _current_test_name(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the last dotted component of the test id, i.e. the test
+        # method name.
         # self.id() == e.g. '__main__.TestDistributed.TestAdditive.test_get_rank'
         return self.id().split(".")[-1]
 
     def _start_processes(self, proc) -> None:
+        # [FUNCTION DOC] HELPER: Starts world_size processes using the given process factory,
+        # each running _run with its rank, the test name, the rendezvous file and a pipe end,
+        # plus a fake_pg keyword. Records processes and parent pipes. Side effects: starts
+        # processes and logs.
         self.processes = []
         for rank in range(int(self.world_size)):
             parent_conn, child_conn = torch.multiprocessing.Pipe()
@@ -1008,6 +1235,8 @@ class MultiProcessTestCase(TestCase):
             self.processes.append(process)
 
     def _spawn_processes(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the multiprocessing start method to spawn (ignoring if
+        # already set) and starts the test processes with a spawn context.
         try:
             torch.multiprocessing.set_start_method("spawn")
         except RuntimeError:
@@ -1017,10 +1246,16 @@ class MultiProcessTestCase(TestCase):
         self._start_processes(proc)
 
     class Event(Enum):
+        # [CLASS DOC] HELPER: Enumeration of events the main process can send to workers;
+        # currently only a request for a traceback dump.
         GET_TRACEBACK = 1
 
     @staticmethod
     def _event_listener(parent_pipe, signal_pipe, rank: int):
+        # [FUNCTION DOC] HELPER: Body of the background thread in each worker: waits on the parent
+        # pipe and a signal pipe; on a traceback request dumps all thread tracebacks to a
+        # temporary file and sends the text back; exits when the parent pipe is closed or the
+        # signal pipe fires. Args: parent pipe, signal pipe, rank.
         logger.debug("Starting event listener thread for rank %s", rank)
         while True:
             ready_pipes = multiprocessing.connection.wait([parent_pipe, signal_pipe])
@@ -1054,12 +1289,21 @@ class MultiProcessTestCase(TestCase):
     def _run(
         cls, rank: int, test_name: str, file_name: str, parent_pipe, **kwargs
     ) -> None:
+        # [FUNCTION DOC] HELPER: Entry point of each worker: builds a test instance for the
+        # test name, sets rank and rendezvous file, then runs the test. Extra keyword arguments
+        # are ignored.
         self = cls(test_name)
         self.rank = rank
         self.file_name = file_name
         self.run_test(test_name, parent_pipe)
 
     def run_test(self, test_name: str, parent_pipe) -> None:
+        # [FUNCTION DOC] Runs the test body in a worker process. Starts the event listener thread,
+        # enables C++ stack trace printing on fatal signals (non-Windows, non-macOS), sets
+        # TORCH_SHOW_CPP_STACKTRACES and the RNG seed, then calls the test method. A SkipTest
+        # exits with the generic skip code; other exceptions are logged, sent to the parent over
+        # the pipe and exit with TEST_ERROR_EXIT_CODE. Always stops the listener and closes the
+        # pipe; finally destroys the default process group if destroy_pg_upon_exit.
         # Start event listener thread.
         signal_recv_pipe, signal_send_pipe = torch.multiprocessing.Pipe(duplex=False)
         event_listener_thread = threading.Thread(
@@ -1117,6 +1361,11 @@ class MultiProcessTestCase(TestCase):
                 pass
 
     def _get_timedout_process_traceback(self) -> None:
+        # [FUNCTION DOC] HELPER: Asks each still-running process for its traceback through its
+        # pipe, waits up to five seconds for each reply, and logs the tracebacks or failure to
+        # retrieve them. Handles connection errors.
+        # KNOWN ISSUE: a local variable named traceback shadows the imported traceback module
+        # inside this function.
         pipes = []
         for i, process in enumerate(self.processes):
             if process.exitcode is None:
@@ -1157,6 +1406,10 @@ class MultiProcessTestCase(TestCase):
                 )
 
     def _join_processes(self, fn) -> None:
+        # [FUNCTION DOC] HELPER: Main-process loop that polls the spawned processes until all
+        # exit, one exits with the error code (then others are terminated) or the test timeout
+        # passes (tracebacks are requested and processes terminated). Then checks return codes and
+        # finally closes all pipes. Args: the test function, used for return-code overrides.
         timeout = get_timeout(self.id())
         start_time = time.time()
         subprocess_error = False
@@ -1201,6 +1454,12 @@ class MultiProcessTestCase(TestCase):
                 pipe.close()
 
     def _check_return_codes(self, fn, elapsed_time) -> None:
+        # [FUNCTION DOC] Verifies exit codes of the spawned processes. Returns if none were
+        # spawned. Raises RuntimeError with the child tracebacks if any exited with the error
+        # code, or if any process did not finish. Skips for functions in skip_return_code_checks.
+        # Maps a skip exit code of the first process to SkipTest (or just logs on sandcastle).
+        # Otherwise asserts the first process exit code equals the expected code (0 or the value
+        # in special_return_code_checks).
         """
         Checks that the return codes of all spawned processes match, and skips
         tests if they returned a return code indicating a skipping condition.
@@ -1278,6 +1537,7 @@ class MultiProcessTestCase(TestCase):
 
     @property
     def is_master(self) -> bool:
+        # [FUNCTION DOC] Property: True if this instance is rank 0.
         return self.rank == 0
 
 
@@ -1287,12 +1547,22 @@ class MultiProcessTestCase(TestCase):
 # common_device_type.instantiate_device_type_tests
 # other backends can add entry in backend() function
 class DistributedTestBase(MultiProcessTestCase):
+    # [CLASS DOC] Base class for device-generic distributed tests built on MultiProcessTestCase.
+    # Spawns the processes in setUp, picks the backend from the device type (nccl for cuda, hccl
+    # for hpu, xccl for xpu, gloo otherwise), and offers helpers to create the process group and
+    # map ranks to devices.
     def setUp(self):
+        # [FUNCTION DOC] Sets the WORLD_SIZE environment variable and spawns the test processes
+        # after the base setup. Mutates the environment.
         super().setUp()
         os.environ["WORLD_SIZE"] = str(self.world_size)
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the default process group (ignoring assertion errors) and
+        # removes the rendezvous file (ignoring OS errors).
+        # KNOWN ISSUE: the base class teardown is not called, so spawned processes are not
+        # terminated here.
         try:
             torch.distributed.destroy_process_group()
         except AssertionError:
@@ -1303,6 +1573,8 @@ class DistributedTestBase(MultiProcessTestCase):
             pass
 
     def backend(self, device) -> str:
+        # [FUNCTION DOC] Returns the backend name for the device string: nccl for cuda, hccl for
+        # hpu, xccl for xpu, else gloo.
         if "cuda" in device:
             return "nccl"
         elif "hpu" in device:  # intel gaudi
@@ -1313,6 +1585,12 @@ class DistributedTestBase(MultiProcessTestCase):
             return "gloo"
 
     def create_pg(self, device, world_size=None):
+        # [FUNCTION DOC] Initializes the default process group for the device using a FileStore at
+        # the rendezvous file and the backend for the device. For nccl and xccl, sets the current
+        # accelerator device and default device to the rank's device, raising RuntimeError if no
+        # accelerator is found. Returns the default group. Args: device string, optional world
+        # size (default self.world_size).
+        # KNOWN ISSUE: the store is sized by the visible device count rather than the world size.
         if world_size is None:
             world_size = self.world_size
         num_visible_devices = torch.get_device_module(device).device_count()
@@ -1338,6 +1616,8 @@ class DistributedTestBase(MultiProcessTestCase):
         return torch.distributed.distributed_c10d._get_default_group()
 
     def rank_to_device(self, device):
+        # [FUNCTION DOC] Returns a mapping from each rank to a one-element list holding its device
+        # index, wrapping around the number of visible devices of that device type.
         num_visible_devices = torch.get_device_module(device).device_count()
         return {i: [i % num_visible_devices] for i in range(self.world_size)}
 
@@ -1349,6 +1629,10 @@ def run_subtests(
     *test_args,
     **test_kwargs: Any,
 ):
+    # [FUNCTION DOC] Runs test_fn as a subtest for every combination of the values in
+    # subtest_config (mapping of keyword name to list of values), passing the chosen values as
+    # keyword arguments. Resets dynamo before and after each combination and runs a barrier after
+    # each. Args: test case instance, config, test function, extra args.
     """
     Runs a test function given by ``test_fn`` as a subtest according to the
     configurations specified by ``subtest_config``. This amortizes the
@@ -1378,6 +1662,8 @@ def run_subtests(
 
 @functools.cache
 def has_efa() -> bool:
+    # [FUNCTION DOC] Cached check whether the machine has EFA by running the fi_info command;
+    # returns True when it exits with code 0 and False if it fails or is not installed.
     """
     If shell command `fi_info -p efa -t FI_EP_RDM` returns exit code 0 then we assume that the machine has
     Libfabric EFA interfaces and EFA software components installed,
@@ -1397,6 +1683,8 @@ def has_efa() -> bool:
 
 
 def tp_transports():
+    # [FUNCTION DOC] Returns the tensorpipe transports to use, shm and uv when EFA is present (to
+    # avoid InfiniBand), else None.
     """
     If the machine has Libfabric EFA interfaces and EFA software components installed it may cause
     'RuntimeError: In operator() at tensorpipe/common/ibv.h:172 "": Operation not supported' if tensorpipe
@@ -1409,6 +1697,12 @@ def tp_transports():
 def spawn_threads_and_init_comms(
     func=None, timeout=TIMEOUT_DEFAULT, world_size=DEFAULT_WORLD_SIZE
 ):
+    # [FUNCTION DOC] Decorator for test methods that run the method in world_size threads, each
+    # with its own rank using the threaded process group. When called without a function, returns
+    # a partial decorator with the given timeout and world size. Enables thread isolation mode
+    # during the run and joins the threads, raising errors collected from the ranks. Args:
+    # function, timeout, world size.
+    # KNOWN ISSUE: the timeout argument is never used.
     """
     Wrapper to use with a test method
     """
@@ -1418,13 +1712,21 @@ def spawn_threads_and_init_comms(
         )
 
     def _run_test_method_with_multi_threads(world_size, callback):
+        # [FUNCTION DOC] HELPER: Installs the threaded world, creates a shared hash store and
+        # starts one thread per rank running worker with the callback. Returns the thread list.
         world = _install_threaded_pg()
         global_store = c10d.HashStore()
 
         def world_is_valid():
+            # [FUNCTION DOC] HELPER: Returns True if the threaded world installed by this run is
+            # still the active one.
             return world == c10d.distributed_c10d._world
 
         def worker(rank, world_pg, store):
+            # [FUNCTION DOC] HELPER: Per-rank thread body: initializes the threaded process
+            # group, runs the callback, records any exception in the shared queue and signals
+            # other threads to terminate, and finally destroys the process group if the world is
+            # still valid.
             c10d.init_process_group(
                 backend="threaded", rank=rank, world_size=world_size, store=store
             )
@@ -1450,6 +1752,8 @@ def spawn_threads_and_init_comms(
 
     @wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement test method: turns thread isolation mode on, starts
+        # the per-rank threads and joins them, always turning isolation off afterwards.
         # TODO: get test name from kwargs
         torch._C._distributed_c10d._set_thread_isolation_mode(True)
         try:
@@ -1465,6 +1769,11 @@ def spawn_threads_and_init_comms(
 
 
 class MultiThreadedTestCase(TestCase):
+    # [CLASS DOC] Test runner that executes each test in world_size threads using the in-process
+    # threaded process group. Subclasses must call _spawn_threads from setUp, and use
+    # perThreadSetUp and perThreadTearDown for per-thread fixtures. State: rank (main thread rank
+    # is MAIN_THREAD_RANK), threads, class-level exception_queue and global_store. The main thread
+    # joins the threads and reports failures.
     """
     Test runner that runs all tests with the in-proc process group using
     multiple threads with the threaded process group.
@@ -1484,8 +1793,12 @@ class MultiThreadedTestCase(TestCase):
     MAIN_THREAD_RANK = -1
 
     def join_or_run(self, fn):
+        # [FUNCTION DOC] Returns a bound replacement for a test method: the main thread joins the
+        # spawned threads while worker threads run the original test body.
         @wraps(fn)
         def wrapper(self):
+            # [FUNCTION DOC] HELPER: Dispatches on whether this is the main thread or a
+            # worker rank.
             if self.rank == self.MAIN_THREAD_RANK:
                 self._join_threads(self.threads, fn)
             else:
@@ -1496,6 +1809,9 @@ class MultiThreadedTestCase(TestCase):
     def __init__(
         self, method_name: str = "runTest", methodName: str = "runTest"
     ) -> None:
+        # [FUNCTION DOC] Constructs the test case and replaces the named test method with a
+        # version that joins threads or runs the real body. Accepts both method_name and
+        # methodName. Raises ValueError if an explicitly named method does not exist.
         # methodName is the correct naming in unittest and testslide uses keyword arguments.
         # So we need to use both to 1) not break BC and, 2) support testslide.
         if methodName != "runTest":
@@ -1513,13 +1829,17 @@ class MultiThreadedTestCase(TestCase):
                 ) from e
 
     def perThreadSetUp(self):
+        # [FUNCTION DOC] Hook run in each worker thread before the test; does nothing by default.
         # super().setUp()  # TestCase.setUp() calls torch.manual_seed()
         pass
 
     def perThreadTearDown(self):
+        # [FUNCTION DOC] Hook run in each worker thread after the test; does nothing by default.
         pass
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Main-thread setup: base setup, sets rank to the main thread rank, clears
+        # the thread list and enables C++ stack trace printing via the environment.
         """
         setUp only set up things in the main thread, if you want to configure things
         in the spawned threads, use perThreadSetUp
@@ -1531,6 +1851,7 @@ class MultiThreadedTestCase(TestCase):
         os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
 
     def tearDown(self):
+        # [FUNCTION DOC] Main-thread teardown: base teardown and clears the thread list.
         """
         tearDown only set up things in the main thread, if you want to configure things
         in the spawned threads, use perThreadTearDown
@@ -1539,6 +1860,9 @@ class MultiThreadedTestCase(TestCase):
         self.threads = []
 
     def _spawn_threads(self):
+        # [FUNCTION DOC] Enables thread isolation mode, installs the threaded world, creates a
+        # class-level hash store and starts world_size threads each running _run. Raises
+        # RuntimeError if the world is invalid. Intended to be called from setUp.
         """
         class method to spawn threads and run test, use this method in the SetUp of your TestCase
         """
@@ -1549,6 +1873,8 @@ class MultiThreadedTestCase(TestCase):
         self.__class__.global_store = c10d.HashStore()
 
         def world_is_valid():
+            # [FUNCTION DOC] HELPER: Returns True if the threaded world installed here is still
+            # the active one.
             return world == c10d.distributed_c10d._world
 
         if not world_is_valid():
@@ -1563,6 +1889,9 @@ class MultiThreadedTestCase(TestCase):
 
     @classmethod
     def _run(cls, test_name, rank, world_size, **kwargs):
+        # [FUNCTION DOC] HELPER: Thread entry point: builds a test instance, sets its rank, copies
+        # the precision and tolerance settings into the thread-local state, then runs the test
+        # with the threaded group.
         self = cls(test_name)
         self.rank = rank
 
@@ -1578,6 +1907,9 @@ class MultiThreadedTestCase(TestCase):
         self.run_test_with_threaded_pg(test_name, rank, world_size)
 
     def run_test_with_threaded_pg(self, test_name, rank, world_size):
+        # [FUNCTION DOC] Initializes the threaded process group for this rank, runs the per-thread
+        # setup, then the test method. Any exception is queued with its rank and other threads are
+        # signaled to terminate. Always destroys the process group and runs per-thread teardown.
         """
         Run the current test associated with `test_name` using the threaded process group.
         """
@@ -1602,6 +1934,12 @@ class MultiThreadedTestCase(TestCase):
 
     @classmethod
     def _join_threads(cls, threads, fn):
+        # [FUNCTION DOC] HELPER: Joins all rank threads, queuing a TimeoutError for any still
+        # alive after the default timeout, resets the process-local group, collects failures from
+        # the exception queue and always uninstalls the threaded world and turns isolation mode
+        # off. Then checks results.
+        # KNOWN ISSUE: if joining raises before failed_ranks is assigned, the final check hits an
+        # unbound variable.
         timeout = TIMEOUT_DEFAULT
         try:
             for idx, thread in enumerate(threads):
@@ -1632,6 +1970,9 @@ class MultiThreadedTestCase(TestCase):
 
     @classmethod
     def _check_return_codes(cls, failed_ranks, timeout, fn):
+        # [FUNCTION DOC] HELPER: Examines failures from the threads: logs skips, raises
+        # RuntimeError on timeouts or exceptions with the tracebacks, and for a skip exit code
+        # raises SkipTest (or logs on sandcastle). Returns None on no failures.
         # Print based on exceptions raised from threads
         #   SkipTest: print info for each thread
         #   TimeoutError: raise RuntimeError for any timed out thread
@@ -1682,14 +2023,19 @@ class MultiThreadedTestCase(TestCase):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of threads (ranks), defaulting to DEFAULT_WORLD_SIZE.
         return DEFAULT_WORLD_SIZE
 
     @property
     def _current_test_name(self) -> str:
+        # [FUNCTION DOC] HELPER: Property: the last dotted component of the test id, i.e. the test
+        # method name.
         # self.id() == e.g. '__main__.TestDistributed.TestAdditive.test_get_rank'
         return self.id().split(".")[-1]
 
     def assertEqualOnRank(self, x, y, msg=None, *, rank=0):
+        # [FUNCTION DOC] Asserts equality of x and y only on the given rank (default 0), since
+        # threads share one CPU random number generator and results are only reliable there.
         """
         The reason why we have this util function instead of
         self.assertEqual is all threads are sharing one CPU RNG
@@ -1699,38 +2045,55 @@ class MultiThreadedTestCase(TestCase):
             self.assertEqual(x, y, msg)
 
     def assertNotEqualOnRank(self, x, y, msg=None, *, rank=0):
+        # [FUNCTION DOC] Asserts inequality of x and y only on the given rank (default 0).
+        # KNOWN ISSUE: the msg argument is accepted but not passed on.
         if self.rank == rank:
             self.assertNotEqual(x, y)
 
 
 class SaveForwardInputsModule(nn.Module):
+    # [CLASS DOC] HELPER: Small test module wrapping a linear layer that records its input in a
+    # shared mapping keyed by the module, optionally casting the input to the weight dtype. State:
+    # l, forward_inputs, cast_forward_inputs.
     def __init__(
         self,
         forward_inputs: dict[nn.Module, torch.Tensor],
         cast_forward_inputs: bool,
     ) -> None:
+        # [FUNCTION DOC] Stores the shared forward_inputs mapping and cast flag, and creates a 100
+        # by 100 linear layer.
         super().__init__()
         self.l = nn.Linear(100, 100)
         self.forward_inputs = forward_inputs
         self.cast_forward_inputs = cast_forward_inputs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Records the input under this module in the shared mapping, then applies
+        # the linear layer, casting the input to the weight dtype if the cast flag is set. Returns
+        # the output tensor.
         self.forward_inputs[self] = x
         return self.l(x.to(self.l.weight.dtype) if self.cast_forward_inputs else x)
 
 
 class SaveForwardInputsModel(nn.Module):
+    # [CLASS DOC] HELPER: Test model with two SaveForwardInputsModule children applied in
+    # sequence that records its own input and those of the children in one shared mapping. State:
+    # c1, c2, forward_inputs.
     def __init__(
         self,
         forward_inputs: dict[nn.Module, torch.Tensor],
         cast_forward_inputs: bool,
     ) -> None:
+        # [FUNCTION DOC] Creates two child modules sharing the same forward_inputs mapping and
+        # stores the mapping.
         super().__init__()
         self.c1 = SaveForwardInputsModule(forward_inputs, cast_forward_inputs)
         self.c2 = SaveForwardInputsModule(forward_inputs, cast_forward_inputs)
         self.forward_inputs = forward_inputs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Records the input under this model in the shared mapping and returns the
+        # output of the second child applied to the first child's output.
         self.forward_inputs[self] = x
         return self.c2(self.c1(x))
 
@@ -1739,6 +2102,12 @@ class SaveForwardInputsModel(nn.Module):
 def _dynamo_dist_per_rank_init(
     rank, world_size, backend=None, init_pg=True, fake_pg=False
 ):
+    # [FUNCTION DOC] HELPER: Context manager for per-rank dynamo distributed setup. Sets the
+    # accelerator device to the rank (unless fake_pg), sets MASTER_ADDR and MASTER_PORT
+    # environment variables, initializes a process group (a fake one with a fake store when
+    # fake_pg, else the given or default backend for the device type) when init_pg is true, and
+    # resets dynamo and its counters. On exit resets dynamo and counters again and destroys the
+    # process group if it was initialized. Mutates the environment.
     # To avoid multiple inheritance from _dynamo.test_case.TestCase and MultiProcessTestCase,
     # Just manually implement the most important part of the dynamo behavior to reset/clear.
     if not fake_pg:
@@ -1775,6 +2144,9 @@ def _dynamo_dist_per_rank_init(
 
 
 class DynamoDistributedSingleProcTestCase(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Single-process dynamo test base class that initializes a world-size-1 process
+    # group once for the whole class, with MASTER_ADDR and MASTER_PORT patched in the environment.
+    # Class state: rank, device, device_ids.
     """
     Test harness for single-process dynamo distributed tests,
     initializes dist process group.
@@ -1784,6 +2156,11 @@ class DynamoDistributedSingleProcTestCase(torch._dynamo.test_case.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture: patches environment variables, sets rank 0, derives the
+        # device string from the current accelerator, and initializes a process group with the
+        # default backend for that device and world size 1.
+        # KNOWN ISSUE: the test for device ids checks whether the device type is contained in the
+        # device string, which is always true, so device_ids is always None.
         super().setUpClass()
         # _exit_stack is set up in TestCase
         cls._exit_stack.enter_context(
@@ -1805,11 +2182,15 @@ class DynamoDistributedSingleProcTestCase(torch._dynamo.test_case.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class fixture: destroys the process group and runs the base teardown.
         c10d.destroy_process_group()
         super().tearDownClass()
 
 
 class DynamoDistributedMultiProcTestCase(DistributedTestBase):
+    # [CLASS DOC] Dynamo distributed test base class for tests that need multiple accelerators;
+    # spawns one process per accelerator through DistributedTestBase. Slow, so tests should be few
+    # and decorated with a GPU count skip.
     """
     Use this for tests that actually run on multiple GPUs.
 
@@ -1822,12 +2203,16 @@ class DynamoDistributedMultiProcTestCase(DistributedTestBase):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Property: number of ranks equal to the accelerator device count.
         return torch.accelerator.device_count()
 
     @classmethod
     def _run(
         cls, rank: int, test_name: str, file_name: str, parent_pipe, **kwargs
     ) -> None:
+        # [FUNCTION DOC] HELPER: Worker entry point: adds a null handler to the trace log, then
+        # builds a test instance, sets rank and rendezvous file, and runs the test (same as the
+        # base implementation).
         trace_log.addHandler(logging.NullHandler())
 
         # The rest is copypasta from MultiProcessTestCase._run
@@ -1838,6 +2223,13 @@ class DynamoDistributedMultiProcTestCase(DistributedTestBase):
 
 
 class MultiProcContinuousTest(TestCase):
+    # [CLASS DOC] Test base class that spawns world_size worker processes once per class and keeps
+    # them alive across tests. For each test the main process sends the test id to every worker
+    # over a task queue, workers run it and report back on a completion queue, and the main
+    # process re-raises failures or skips. Class state: world_size, rank, rdvz_file, timeout,
+    # poison_pill (set after a failure so later tests skip), processes, task_queues and
+    # completion_queues, and a lazy spawn flag. Subclasses may override backend_str, device_type
+    # and opts.
     # Class variables:
     MAIN_PROCESS_RANK = -1
     # number of test processes
@@ -1855,6 +2247,8 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] Class method returning the backend name for the process group; None by
+        # default so it is decided from tensors. Override in subclasses.
         """
         ProcessGroup backend str.
         To be customized by sub test classes, e.g. "nccl".
@@ -1865,6 +2259,8 @@ class MultiProcContinuousTest(TestCase):
     # Please override if you intend to test on specific device type
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Class method returning the device type string: the current accelerator
+        # type, else cpu. Override to test a specific device.
         curr_device = torch.accelerator.current_accelerator()
         if curr_device is None:
             return "cpu"
@@ -1872,6 +2268,8 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def opts(cls, high_priority_stream=False):
+        # [FUNCTION DOC] Class method returning process group options; None by default. Override
+        # to supply backend options.
         """
         ProcessGroup init options.
         To be customized by sub test classes, e.g. ProcessGroupNCCLOpTest
@@ -1881,6 +2279,10 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Worker-side initialization of the default process group: requires
+        # an rendezvous file (raises AssertionError otherwise), sets LOCAL_RANK, creates a
+        # FileStore, initializes the process group with the backend, options and timeout of the
+        # class and saves the default group on the class.
         if rdvz_file is None:
             raise AssertionError("Expected rdvz_file to not be None")
         # rank should be local_rank for tests running on <= 8 gpus which is how all these tests are designed
@@ -1901,6 +2303,9 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _run_test_given_id(cls, test_id: str, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Worker-side execution of one test by id: creates an instance from
+        # the test name, sets its rank and world size, seeds the random number generators and
+        # calls the test method with the keyword arguments.
         # self.id() == e.g. '__main__.TestDistributed.TestAdditive.test_get_rank'
         test_name = test_id.rsplit(".", maxsplit=1)[-1]
         # Get the test function from the test class
@@ -1917,6 +2322,12 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _worker_loop(cls, rank, world_size, rdvz_file, task_queue, completion_queue):
+        # [FUNCTION DOC] HELPER: Main loop of a worker process: validates rank, stores rank and
+        # world size on the class, initializes the process group (an initialization exit with a
+        # skip code is remembered and makes every test a skip), then repeatedly reads test ids
+        # from the task queue until a stop sentinel. Reports each result, a skip exception or a
+        # wrapped error with traceback on the completion queue. Destroys the process group at the
+        # end only if no test raised.
         raised_exception = False
         # Sub tests are going to access these values, check first
         if not (0 <= rank < world_size):
@@ -2002,6 +2413,9 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _spawn_processes(cls, world_size) -> None:
+        # [FUNCTION DOC] HELPER: Class method: creates the rendezvous file, sets the
+        # multiprocessing start method to spawn, and starts one daemon worker process per rank
+        # with its own task queue and completion queue. Stores them on the class.
         cls.processes = []
         cls.task_queues = []
         cls.completion_queues = []
@@ -2034,6 +2448,10 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _get_world_size(cls, device_type: str) -> int:
+        # [FUNCTION DOC] HELPER: Class method returning the world size, evaluating a property
+        # defined on the class using a temporary instance created without running the constructor.
+        # If the world size is unset, uses the device count of the device type and raises SkipTest
+        # if there are none.
         """
         Get world_size, handling both class variable and property definitions.
         Properties are instance-level and need special handling in class methods.
@@ -2058,6 +2476,8 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture that only runs the base setup; process spawning is deferred
+        # to the first test to support device-type test instantiation.
         """
         Class-scope test fixture. Run once for entire test class, before any test starts.
         Note: Process spawning is deferred to setUp to support instantiate_device_type_tests,
@@ -2067,6 +2487,10 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def _ensure_processes_spawned(cls):
+        # [FUNCTION DOC] HELPER: Class method: spawns the worker processes lazily once per class
+        # (checking the class own dict so subclasses do not reuse a finished base class). Resolves
+        # the device type, sets the world size, raises SkipTest if the requested backend is
+        # unavailable, spawns the workers and marks them spawned.
         """
         Lazily spawn worker processes on first test run.
         This supports instantiate_device_type_tests which calls setUpClass during
@@ -2119,6 +2543,9 @@ class MultiProcContinuousTest(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class fixture: if workers were spawned, sends a stop sentinel to each
+        # worker, joins them and removes the rendezvous file, then runs the base teardown. Does
+        # nothing special if no workers were spawned.
         """
         Class-scope test fixture. Run once for entire test class, after all tests finish.
         Tear down the process group if spawned.
@@ -2149,6 +2576,9 @@ class MultiProcContinuousTest(TestCase):
         super().tearDownClass()
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Per-test setup: ensures workers are spawned, sets this instance as the
+        # dispatcher, raises SkipTest if a previous test poisoned the class, and sends the test id
+        # to all workers.
         """
         Test fixture. Run before each test.
         """
@@ -2170,8 +2600,14 @@ class MultiProcContinuousTest(TestCase):
             task_queue.put(self.id())
 
     def _worker_run_main_wait(self, fn):
+        # [FUNCTION DOC] HELPER: Returns a bound replacement for a test method. In the dispatcher
+        # it waits for each worker result, draining all queues before raising the first deferred
+        # skip or error (an error also sets poison_pill) and checks the result equals the test id;
+        # in a worker it just runs the test.
         @wraps(fn)
         def wrapper(self):
+            # [FUNCTION DOC] HELPER: Dispatches on whether this instance is the main dispatcher or
+            # a worker rank.
             if self.rank == self.MAIN_PROCESS_RANK:
                 logger.debug(f"Waiting for workers to finish {self.id()}")  # noqa: G004
                 # Drain all completion queues before raising any exception,
@@ -2222,6 +2658,9 @@ class MultiProcContinuousTest(TestCase):
     def __init__(
         self, method_name: str = "runTest", methodName: str = "runTest"
     ) -> None:
+        # [FUNCTION DOC] Constructs the test case and replaces the named test method with the
+        # dispatcher or worker wrapper. Accepts method_name and methodName. Raises ValueError if
+        # an explicitly named method does not exist.
         # methodName is the correct naming in unittest and testslide uses keyword arguments.
         # So we need to use both to 1) not break BC and, 2) support testslide.
         if methodName != "runTest":
@@ -2240,10 +2679,15 @@ class MultiProcContinuousTest(TestCase):
 
 
 class C10dTorchCommsTestBase(MultiProcContinuousTest):
+    # [CLASS DOC] Base class for continuous multi-process tests using torchcomms; picks the
+    # backend by device type, skips when the torchcomms backend is not built, and configures
+    # torchcomms environment variables on each worker. Class state: world_size.
     world_size: int = DEFAULT_WORLD_SIZE
 
     @staticmethod
     def backend(device) -> str:
+        # [FUNCTION DOC] Static method returning the backend name for a device string: nccl for
+        # cuda, hccl for hpu, xccl for xpu, else gloo.
         if "cuda" in device:
             return "nccl"
         elif "hpu" in device:
@@ -2255,12 +2699,16 @@ class C10dTorchCommsTestBase(MultiProcContinuousTest):
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Class method returning the backend name for the class device type, which
+        # may be a string or a callable.
         device_type = cls.device_type
         if callable(device_type):
             device_type = device_type()
         return cls.backend(device_type)
 
     def _skip_if_backend_unavailable(self, device: str) -> None:
+        # [FUNCTION DOC] HELPER: Skips the test (self.skipTest) if the torchcomms backend for the
+        # device was not built, using the TORCHCOMM_HAS_* globals.
         backend_flags = {
             "gloo": TORCHCOMM_HAS_GLOO,
             "xccl": TORCHCOMM_HAS_XCCL,
@@ -2275,6 +2723,11 @@ class C10dTorchCommsTestBase(MultiProcContinuousTest):
 
     @classmethod
     def _init_pg(cls, rank, world_size, rdvz_file):
+        # [FUNCTION DOC] HELPER: Worker-side initialization: enables the torchcomms config
+        # flag, sets MASTER_ADDR, MASTER_PORT, TORCHCOMM_RANK, TORCHCOMM_SIZE and
+        # TORCHCOMM_STORE_PATH environment variables, calls the base initialization, and for
+        # nccl or xccl sets the default accelerator device to the rank, raising RuntimeError if
+        # no accelerator is present.
         torch.distributed.config.use_torchcomms = True
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(find_free_port())
@@ -2296,6 +2749,8 @@ class C10dTorchCommsTestBase(MultiProcContinuousTest):
                 )
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Per-test setup: resolves the device type, skips if the torchcomms backend
+        # is unavailable, then runs the base setup.
         device_type = self.__class__.device_type
         logger.debug("Setting up test: %s on device type: %s", self.id(), device_type)
         if callable(device_type):
@@ -2304,5 +2759,7 @@ class C10dTorchCommsTestBase(MultiProcContinuousTest):
         super().setUp()
 
     def rank_to_device(self, device):
+        # [FUNCTION DOC] Returns a mapping from each rank to a one-element list of its device
+        # index, wrapping around the visible device count.
         num_visible_devices = torch.get_device_module(device).device_count()
         return {i: [i % num_visible_devices] for i in range(self.world_size)}
