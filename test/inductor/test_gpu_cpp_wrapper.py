@@ -1,4 +1,13 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] GPU cpp_wrapper tests for inductor. Defines a template class (GpuWrapperTemplate)
+# that is filled at import time (when a GPU runs) with wrapper-mode copies of selected tests from
+# the torchinductor, foreach, combo kernel, pattern matcher and select algorithm suites, each run
+# with the cpp_wrapper config on and checked to emit C++ wrapper code. Then copies the template
+# onto TestGpuWrapper and a dynamic-shapes variant onto DynamicShapesGpuWrapperGpuTests. Also
+# holds hand-written tests (compile timing metric, debug sync, custom op fallbacks, TMA scratch
+# scaling, lazy compile, subprocess regression scripts). Import time: imports the sibling test
+# modules, exiting cleanly if they skip when run as a script. Run as a script it uses the inductor
+# run_tests requiring filelock, only when a GPU is available.
 import itertools
 import os
 import subprocess
@@ -65,11 +74,21 @@ except unittest.SkipTest:
 
 
 class GpuWrapperTemplate:
+    # [CLASS DOC] Empty holder class. make_test_case attaches generated wrapper-mode test methods
+    # to it as attributes, and copy_tests later copies them into the real test classes.
     pass
 
 
 def _register_fbcode_cpp_wrapper_arg_helper_op(m, device):
+    # [FUNCTION DOC] HELPER: Registers a custom operator named arg_helpers on the given library
+    # fragment. The operator takes a list of tensors, a dtype, a device, a layout and a memory
+    # format and returns a tensor. Registers an implementation for the uppercased GPU backend key
+    # and a Meta implementation. The device argument is the expected device type string.
     def impl(xs, dtype, device_arg, layout, memory_format):
+        # [FUNCTION DOC] HELPER: Real implementation. Raises AssertionError unless dtype is
+        # float32, the device argument has the expected device type, layout is strided and memory
+        # format is contiguous. Returns the first tensor moved to the device, cast and made
+        # contiguous.
         if dtype != torch.float32:
             raise AssertionError(f"Unexpected dtype: {dtype}")
         if torch.device(device_arg).type != device:
@@ -85,6 +104,9 @@ def _register_fbcode_cpp_wrapper_arg_helper_op(m, device):
         )
 
     def meta(xs, dtype, _device_arg, layout, memory_format):
+        # [FUNCTION DOC] HELPER: Meta implementation: returns an empty tensor shaped like the
+        # first input with the requested dtype, layout and memory format; the device argument is
+        # ignored.
         return torch.empty_like(
             xs[0],
             dtype=dtype,
@@ -103,9 +125,17 @@ def _register_fbcode_cpp_wrapper_arg_helper_op(m, device):
 
 
 class TestGpuWrapper(InductorTestCase):
+    # [CLASS DOC] Test case run on the GPU device type. Holds hand-written cpp_wrapper tests and,
+    # after import, also receives the wrapper-mode copies of shared tests with a gpu_wrapper name
+    # suffix.
     device = GPU_TYPE
 
     def test_cpp_wrapper_compile_timing_recorded(self):
+        # [FUNCTION DOC] Skips without a GPU. Compiles a matmul plus relu function with the
+        # cpp_wrapper option inside a fresh inductor cache, after removing any existing
+        # cpp_wrapper_compile entry from the dynamo compilation time metrics. Asserts the result
+        # matches eager, the metric key now exists, and at least one recorded duration is
+        # positive.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
@@ -113,6 +143,7 @@ class TestGpuWrapper(InductorTestCase):
         from torch._inductor.utils import fresh_cache
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Matrix multiplication of the two inputs followed by relu.
             return (x @ y).relu()
 
         x = torch.randn(64, 64, device=self.device)
@@ -127,11 +158,17 @@ class TestGpuWrapper(InductorTestCase):
         self.assertTrue(any(t > 0 for t in durations))
 
     def test_aoti_debug_printer_works_on_constants(self):
+        # [FUNCTION DOC] Compiles a function with cpp_wrapper, separate build and the intermediate
+        # value printer debug option set to "2". The function creates random input and weight
+        # tensors on the device (so they become constants), multiplies them and applies a layer
+        # norm. Passes if the compiled function runs without raising; no output is checked.
         batch_size = 32
         seq_length = 50
         hidden_size = 768
 
         def test_fn():
+            # [FUNCTION DOC] HELPER: Builds a random activation and weight, matmuls them, applies
+            # a freshly created layer norm and returns True.
             inp = torch.randn(batch_size, seq_length, hidden_size, device=self.device)
             weight = torch.randn(hidden_size, hidden_size, device=self.device)
             matmul_output = inp @ weight
@@ -148,6 +185,13 @@ class TestGpuWrapper(InductorTestCase):
         comp()
 
     def test_cpp_wrapper_gpu_debug_sync_codegen(self):
+        # [FUNCTION DOC] Builds a GPU C++ wrapper object without running its constructor and sets
+        # its device to cuda. Checks that the generated debug sync code uses the HIP error check
+        # and device synchronize on ROCm, or the CUDA driver check and context synchronize
+        # otherwise, and never a Python synchronize call. Repeats the check on the entry function
+        # prologue with the debug_sync_graph config patched on (using a fake graph handler that is
+        # not in dual wrapper mode). Finally sets the device to xpu and asserts that generating
+        # debug sync raises NotImplementedError.
         wrapper = CppWrapperGpu.__new__(CppWrapperGpu)
         wrapper.device = "cuda"
 
@@ -186,12 +230,16 @@ class TestGpuWrapper(InductorTestCase):
             wrapper.generate_debug_sync(IndentedBuffer())
 
     def test_debug_sync_graph(self):
+        # [FUNCTION DOC] Skips without a GPU or when the GPU type is not cuda. Compiles a
+        # multiply-by-two function with cpp_wrapper and the debug_sync_graph option inside a
+        # device context and asserts the output equals the eager result.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if GPU_TYPE != "cuda":
             self.skipTest("CUDA/ROCm-only cpp_wrapper debug sync")
 
         def test_fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
             return x * 2
 
         compiled = torch.compile(
@@ -203,12 +251,16 @@ class TestGpuWrapper(InductorTestCase):
         self.assertEqual(result, x * 2)
 
     def test_debug_sync_kernel(self):
+        # [FUNCTION DOC] Same as the graph debug sync test but with the debug_sync_kernel option:
+        # skips without CUDA, compiles a multiply-by-two function with cpp_wrapper, runs it in a
+        # device context and compares to eager.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if GPU_TYPE != "cuda":
             self.skipTest("CUDA/ROCm-only cpp_wrapper debug sync")
 
         def test_fn(x):
+            # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
             return x * 2
 
         compiled = torch.compile(
@@ -220,10 +272,14 @@ class TestGpuWrapper(InductorTestCase):
         self.assertEqual(result, x * 2)
 
     def test_non_tensor_args_wrapped_on_cpu(self):
+        # [FUNCTION DOC] Skips without a GPU. Compiles a function taking a tensor and a Python
+        # integer with cpp_wrapper, runs it through the cpp code capture helper in a device
+        # context, and asserts the generated code wraps the non-tensor argument in a CPU tensor.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def test_fn(x, s):
+            # [FUNCTION DOC] HELPER: Adds the scalar to the tensor and returns the sum reduction.
             return (x + s).sum()
 
         compiled = torch.compile(options={"cpp_wrapper": True})(test_fn)
@@ -234,6 +290,11 @@ class TestGpuWrapper(InductorTestCase):
 
     @config.patch(implicit_fallbacks=True)
     def test_fbcode_custom_op_fallback_python_arg_helpers(self):
+        # [FUNCTION DOC] Only runs in fbcode builds with a GPU (otherwise skipped); implicit
+        # fallbacks are enabled by the config decorator. Registers the arg_helpers custom op in a
+        # scoped library fragment, compiles with fullgraph and cpp_wrapper a function that passes
+        # a sin result with dtype, device, layout and memory format arguments through the op and
+        # applies cos, and asserts it matches eager.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if not config.is_fbcode():
@@ -246,6 +307,8 @@ class TestGpuWrapper(InductorTestCase):
             _register_fbcode_cpp_wrapper_arg_helper_op(m, device)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Applies sin, calls the arg_helpers op with float32, the
+                # device, strided layout and contiguous format, then applies cos.
                 y = x.sin()
                 return torch.ops.fbcode_cpp_wrapper_arg_helpers.arg_helpers(
                     [y],
@@ -262,6 +325,11 @@ class TestGpuWrapper(InductorTestCase):
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fallback_symint_dispatch(self):
+        # [FUNCTION DOC] Skips without a GPU; implicit fallbacks enabled. Defines a scoped library
+        # op taking a tensor and a SymInt, checks the C++ wrapper reports it not compatible with
+        # the StableIValue path but compatible with boxed dispatch, then compiles a function using
+        # the first dimension (marked dynamic) as the integer argument. Asserts the result equals
+        # eager and the generated code does not call the dispatcher API directly for that op.
         # A custom op with a SymInt argument (e.g.
         # fbgemm::permute_2D_sparse_data_input1D) must not be routed to the
         # StableIValue path.  SymInt is reported as IntType by JitType.type, so
@@ -282,6 +350,8 @@ class TestGpuWrapper(InductorTestCase):
             self.assertTrue(CppWrapperCpu._compatible_with_cpp_boxed_dispatch(op))
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Calls the custom add_symint op with the input and the
+                # size of its first dimension.
                 # x.shape[0] is symbolic once dim 0 is dynamic, so n is a SymInt.
                 return torch.ops.mylib_symint.add_symint(x, x.shape[0])
 
@@ -297,6 +367,12 @@ class TestGpuWrapper(InductorTestCase):
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fallback_boxes_none_as_undefined_tensor(self):
+        # [FUNCTION DOC] Skips without a GPU; implicit fallbacks enabled. Loads the aoti custom
+        # ops shared library (from the fbcode path, or located on disk; skipped on macOS or when
+        # not built). Compiles with fullgraph and cpp_wrapper a call to the maybe_weighted op with
+        # a None weight and a dynamic first dimension size, asserts equality with eager, and
+        # asserts the code references the inner forward_maybe_weighted op and boxes the missing
+        # weight as an undefined tensor.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if IS_FBCODE or IS_SANDCASTLE:
@@ -314,6 +390,8 @@ class TestGpuWrapper(InductorTestCase):
         device = self.device
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the maybe_weighted custom op with the input, no weight
+            # and the first dimension size.
             return torch.ops.aoti_custom_ops.maybe_weighted(x, None, x.shape[0])
 
         x = torch.randn(8, 4, device=device)
@@ -329,6 +407,10 @@ class TestGpuWrapper(InductorTestCase):
 
     @skipIfXpu(msg="tests CUDA/ROCm CUDADeviceOpOverrides codegen")
     def test_cpp_scratch_scales_with_grid_size_for_tma(self):
+        # [FUNCTION DOC] Skipped on XPU. Asks the CUDA device op overrides for C++ scratch code
+        # with index zero, a 256 byte scratch workspace and prefix global_scratch. Asserts the
+        # returned variable name is global_scratch_scratch_0 and the first definition line
+        # multiplies the size by the three grid dimensions.
         scratch_def, scratch_var = CUDADeviceOpOverrides().cpp_scratch(
             0,
             TritonScratchWorkspace(
@@ -343,10 +425,18 @@ class TestGpuWrapper(InductorTestCase):
 
     @skipIfXpu(msg="tests CUDA/ROCm CUDADeviceOpOverrides codegen")
     def test_triton_wrapper_scales_scratch_with_num_ctas(self):
+        # [FUNCTION DOC] Skipped on XPU. Uses a fake wrapper that records the scratch_spaces
+        # argument given to its argument declaration generator, and drives the deferred Triton
+        # call wrapper to generate a kernel launch with a kernel config of 8 CTAs and a global
+        # scratch of 256. Asserts the recorded scratch space is 256 times 8, i.e. scaled by the
+        # CTA count.
         class FakeWrapper:
+            # [CLASS DOC] HELPER: Minimal stand-in for the C++ GPU wrapper with device cuda that
+            # records the scratch spaces passed to its argument declaration generator.
             device = "cuda"
 
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the recorded scratch spaces to none.
                 self.scratch_spaces = None
 
             def generate_args_decl(
@@ -358,6 +448,8 @@ class TestGpuWrapper(InductorTestCase):
                 is_triton_kernel=True,
                 scratch_spaces=None,
             ):
+                # [FUNCTION DOC] HELPER: Stores the scratch_spaces argument on the instance and
+                # returns an empty string; all other arguments are ignored.
                 self.scratch_spaces = scratch_spaces
 
                 return ""
@@ -385,6 +477,12 @@ class TestGpuWrapper(InductorTestCase):
 
     @parametrize("per_subkernel_blocks", [False, True])
     def test_lazy_compile_combo_kernel_default_config(self, per_subkernel_blocks):
+        # [FUNCTION DOC] Parametrized by whether combo kernels use per-subkernel block sizes.
+        # Skips without a GPU. Wraps the lazy compile autotune runner in a mock that records the
+        # xblocks result for kernels whose name contains the fused foreach marker, compiles a
+        # foreach add with cpp_wrapper, lazy (no compile-time) autotune and combo kernels, and
+        # runs it. Asserts at least one combo kernel was captured; when per-subkernel blocks is
+        # off, asserts each captured xblocks equals the single default combo block size.
         """Lazy compile should use default_config from combo_grid_meta for XBLOCK."""
         if not RUN_GPU:
             self.skipTest("GPU not available")
@@ -400,6 +498,9 @@ class TestGpuWrapper(InductorTestCase):
         original = tlc.run_triton_kernel_with_autotune
 
         def capture(pending_kernels, kernel_name, stream, args):
+            # [FUNCTION DOC] HELPER: Calls the original lazy autotune runner and, for kernels
+            # whose name contains the fused foreach marker, stores its xblocks in the captured
+            # mapping keyed by kernel name. Returns the original result.
             result = original(pending_kernels, kernel_name, stream, args)
             if "triton_for_fused" in kernel_name:
                 captured[kernel_name] = result.xblocks
@@ -418,6 +519,8 @@ class TestGpuWrapper(InductorTestCase):
                 }
             )
             def fn(params, grads):
+                # [FUNCTION DOC] HELPER: Compiled body that performs an in-place foreach add of
+                # the gradients scaled by minus 0.1 into the parameters.
                 torch._foreach_add_(params, grads, alpha=-0.1)
 
             fn(params, grads)
@@ -438,10 +541,14 @@ class TestGpuWrapper(InductorTestCase):
                 )
 
     def test_cudagraph_no_partition(self):
+        # [FUNCTION DOC] Skips without a GPU. Compiles a tensor-plus-integer sum function with
+        # cpp_wrapper, triton cudagraphs on and graph partition off, calls it three times and
+        # asserts each result equals the eager result.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def test_fn(x, s):
+            # [FUNCTION DOC] HELPER: Adds the scalar to the tensor and returns the sum reduction.
             return (x + s).sum()
 
         x = torch.randn(4, device=self.device)
@@ -460,6 +567,11 @@ class TestGpuWrapper(InductorTestCase):
             self.assertEqual(res, expected)
 
     def test_many_args_fold_expression_nesting(self):
+        # [FUNCTION DOC] Skips without a GPU, and on XPU because the compiler crashes with many
+        # kernel args. Creates 130 random parameters and gradients, compiles with cpp_wrapper and
+        # combo kernels (max args raised to 1000) an in-place foreach add with alpha minus 0.1,
+        # runs it and asserts every parameter equals the expected clone plus minus 0.1 times the
+        # gradient.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if GPU_TYPE == "xpu":
@@ -478,6 +590,8 @@ class TestGpuWrapper(InductorTestCase):
             }
         )
         def fn(params, grads):
+            # [FUNCTION DOC] HELPER: Compiled body doing an in-place foreach add of the gradients
+            # with alpha minus 0.1.
             torch._foreach_add_(params, grads, alpha=-0.1)
 
         fn(params, grads)
@@ -486,6 +600,10 @@ class TestGpuWrapper(InductorTestCase):
             self.assertEqual(p, e)
 
     def test_cpp_wrapper_backward_lazy_compile(self):
+        # [FUNCTION DOC] Regression test: skips without a GPU. Compiles with cpp_wrapper a
+        # function that builds a layer norm, applies it and runs backward with a given gradient,
+        # then asserts the output shape equals the input shape. Verifies backward graphs compiled
+        # lazily still get the cpp_wrapper Triton config.
         """Test that options={"cpp_wrapper": True} works with backward pass.
 
         Backward graphs may be compiled lazily (after compile_fx returns).
@@ -496,6 +614,9 @@ class TestGpuWrapper(InductorTestCase):
             self.skipTest("GPU not available")
 
         def fn(x, output_grad):
+            # [FUNCTION DOC] HELPER: Creates a layer norm on the device, applies it to x, back-
+            # propagates the supplied gradient through the output (side effect on layer norm
+            # parameter grads) and returns the output.
             layer_norm = torch.nn.LayerNorm(normalized_shape=4).to(self.device)
             output = layer_norm(x)
             output.backward(output_grad)
@@ -509,10 +630,14 @@ class TestGpuWrapper(InductorTestCase):
         self.assertEqual(result.shape, x.shape)
 
     def test_cuda_cpp_wrapper_skips_vec_isa_for_device_only_code(self):
+        # [FUNCTION DOC] Skips without a GPU. Compiles a sin, add one, cos function with
+        # cpp_wrapper, captures the generated C++ code, asserts results match eager and the code
+        # states that no vector instruction set is needed.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns cos of (sin of the input plus one).
             return (x.sin() + 1).cos()
 
         x = torch.randn(128, device=self.device)
@@ -526,10 +651,17 @@ class TestGpuWrapper(InductorTestCase):
     # The vec-ISA probe child cannot resolve ROCm SDK libraries in CI.
     @skipIfRocmVersionAtLeast([7, 14])
     def test_cuda_cpp_wrapper_keeps_vec_isa_for_host_vectorized_code(self):
+        # [FUNCTION DOC] Skipped on ROCm 7.14 and later, and without a GPU. Compiles with
+        # cpp_wrapper a function that does CPU arithmetic, moves to the device, does more
+        # arithmetic, moves back to the CPU and does more CPU arithmetic, on a CPU input. Asserts
+        # results match eager, the code contains vectorized CPU code, and the code states the
+        # vector instruction set is needed.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds 1 and 2, moves to the device, adds 3 and 4, moves back
+            # to CPU, adds 5 and 6, and returns the result.
             x = x + 1
             x = x + 2
             x = x.to(device=self.device)
@@ -550,10 +682,16 @@ class TestGpuWrapper(InductorTestCase):
         self.assertIn("needs_vec_isa=True", code)
 
     def test_cuda_cpp_wrapper_build_separate_splits_vec_isa_requirements(self):
+        # [FUNCTION DOC] Skips without a GPU. Same mixed CPU/device function as the previous test,
+        # compiled with cpp_wrapper under the build-separate config. Asserts results match eager
+        # and the generated code has a kernel source section, a wrapper that does not need the
+        # vector ISA, and a kernel that does.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds 1 and 2, moves to the device, adds 3 and 4, moves back
+            # to CPU, adds 5 and 6, and returns the result.
             x = x + 1
             x = x + 2
             x = x.to(device=self.device)
@@ -576,13 +714,19 @@ class TestGpuWrapper(InductorTestCase):
         self.assertIn("kernel_needs_vec_isa=True", code)
 
     def test_map_fullgraph_cpp_wrapper(self):
+        # [FUNCTION DOC] Skips without a GPU. Compiles with fullgraph and cpp_wrapper a function
+        # that maps a gelu body over the leading dimension of a random tensor and sums the result,
+        # and asserts equality with eager.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
         def body_fn(x):
+            # [FUNCTION DOC] HELPER: Applies gelu to its input.
             return torch.nn.functional.gelu(x)
 
         def fn(xs):
+            # [FUNCTION DOC] HELPER: Applies the map higher-order op with the gelu body over the
+            # first dimension and returns the sum.
             return torch._higher_order_ops.map(body_fn, xs).sum()
 
         xs = torch.randn(8, 64, device=self.device)
@@ -591,6 +735,10 @@ class TestGpuWrapper(InductorTestCase):
         self.assertEqual(opt_fn(xs), expected)
 
     def test_any_fallback_cpp_wrapper(self):
+        # [FUNCTION DOC] Skips without a GPU. In a scoped library registers an op taking a tensor
+        # and an Any argument (GPU and Meta implementations that just clone), compiles a calling
+        # function with fullgraph and cpp_wrapper, then calls it with a tensor argument and then
+        # with a string argument. Passes if neither call raises.
         if not RUN_GPU:
             self.skipTest("GPU not available")
 
@@ -598,6 +746,8 @@ class TestGpuWrapper(InductorTestCase):
             m.define("any_fallback(Tensor x, Any y) -> Tensor")
 
             def any_fallback(x: torch.Tensor, y: Any) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Op implementation: checks the Any argument is not None
+                # (via a torch check, which raises on failure) and returns a clone of x.
                 torch._check(y is not None)
                 return x.clone()
 
@@ -606,6 +756,8 @@ class TestGpuWrapper(InductorTestCase):
 
             @torch.compile(fullgraph=True, options={"cpp_wrapper": True})
             def test_fn(x: torch.Tensor, y: Any) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Compiled wrapper that calls the any_fallback custom op
+                # with the two arguments.
                 return torch.ops.mylib_fallback.any_fallback(x, y)
 
             test_fn(
@@ -653,9 +805,16 @@ for i, (a, r) in enumerate(zip(args, ref_args)):
 
 
 class TestLazyCompileKernelCollision(InductorTestCase):
+    # [CLASS DOC] Test case holding a subprocess-based regression test for kernel name collisions
+    # between lazily compiled modules loaded from warm caches.
     device = GPU_TYPE
 
     def test_lazy_compile_kernel_name_collision_across_modules(self):
+        # [FUNCTION DOC] Skips without a GPU. In a temporary cache directory, runs the module-
+        # level collision script twice in fresh Python subprocesses with the inductor cache
+        # directory set there (cold run, then warm run that loads cached modules) and fresh-cache
+        # disabled. Asserts both processes exit with return code zero, showing stderr tail on
+        # failure.
         """The collision manifests when a fresh process loads .so modules from
         warm on-disk caches: AOTAutograd cache hits cause both forward and
         backward .so to be loaded (static initializers register kernels in
@@ -725,10 +884,16 @@ compiled(x)
 
 
 class TestCppWrapperStaticInitDeadlock(InductorTestCase):
+    # [CLASS DOC] Test case holding a subprocess regression test that the C++ wrapper library load
+    # does not deadlock.
     device = GPU_TYPE
 
     @skipIfXpu(msg="https://github.com/pytorch/pytorch/issues/184496")
     def test_static_init_dlopen_does_not_deadlock(self):
+        # [FUNCTION DOC] Skipped on XPU, and without a GPU. In a temporary cache dir, runs the
+        # module-level deadlock script in a subprocess with a 60 second timeout. Fails the test on
+        # timeout, and asserts the return code is zero otherwise (reporting stderr and stdout
+        # tails on failure).
         """The cpp_wrapper-generated .so must not trigger Triton kernel
         compilation from a static initializer (dlopen-time): doing so
         runs Triton -> mlir::verify -> llvm::StdThreadPool, whose workers
@@ -867,9 +1032,16 @@ run()
 
 
 class TestLazyTmaGlobalScratch(InductorTestCase):
+    # [CLASS DOC] Test case holding a subprocess regression test for TMA global scratch sizing
+    # under lazy compilation.
     device = GPU_TYPE
 
     def test_lazy_tma_global_scratch_scales_with_launch_grid(self):
+        # [FUNCTION DOC] Skips without a GPU, when not on real CUDA, below compute capability 9,
+        # or without Triton host tensor descriptor TMA support. Writes the module-level TMA script
+        # into a temporary directory and runs it in a subprocess with synchronous CUDA launches
+        # and the inductor cache dir set there (timeout 180 seconds). Asserts return code zero,
+        # reporting the last 80 stderr lines on failure.
         if not RUN_GPU:
             self.skipTest("GPU not available")
         if GPU_TYPE != "cuda" or torch.version.hip:
@@ -907,15 +1079,23 @@ class TestLazyTmaGlobalScratch(InductorTestCase):
 
 
 class DynamicShapesGpuWrapperGpuTests(InductorTestCase):
+    # [CLASS DOC] Test case on the GPU device receiving dynamic-shapes copies of the wrapper
+    # template tests (name suffix gpu_wrapper) plus a hand-written annotation test.
     device = GPU_TYPE
 
     def test_annotation_training(self):
+        # [FUNCTION DOC] Compiles with the annotate_training and cpp_wrapper options a function
+        # created by a factory that builds random activation and weight tensors, matmuls them and
+        # applies layer norm, and runs it. Passes if it does not raise.
         batch_size = 32
         seq_length = 50
         hidden_size = 768
 
         def create_test_fn():
+            # [FUNCTION DOC] HELPER: Factory returning the inner test function.
             def test_fn():
+                # [FUNCTION DOC] HELPER: Builds a random activation and weight on the device,
+                # matmuls them, applies a new layer norm, and returns True.
                 inp = torch.randn(
                     batch_size, seq_length, hidden_size, device=self.device
                 )
@@ -956,6 +1136,15 @@ def make_test_case(
     code_string_count=None,
     check_code=True,
 ):
+    # [FUNCTION DOC] HELPER: Builds a wrapper-mode test and registers it on GpuWrapperTemplate.
+    # Looks up the test function by name (with the device suffix when a device is given) on the
+    # given test instance, raising AssertionError if it is not callable, and optionally marks it
+    # slow. The generated method runs under the cpp_wrapper config, sets up and tears down the
+    # source test class, preserves the dispatch key state, runs the function through the cpp code
+    # capture helper, and when check_code is true asserts the code mentions the C++ wrapper code
+    # cache and that each requested substring appears the requested number of times. The method
+    # gets the source name and a deep copy of its metadata, and is only registered when condition
+    # is true.
     test_name = f"{name}_{device}" if device else name
     if code_string_count is None:
         code_string_count = {}
@@ -967,6 +1156,10 @@ def make_test_case(
 
     @config.patch(cpp_wrapper=True)
     def fn(self):
+        # [FUNCTION DOC] HELPER: Generated test body (the self argument is the receiving test
+        # case): calls the source class setUpClass and setUp, runs the source function with a
+        # dense dispatch key forced into the TLS include set under a guard that restores it,
+        # optionally verifies the generated code, and always tears down the source test.
         tests.setUpClass()
         tests.setUp()
         try:
@@ -1005,6 +1198,9 @@ def make_test_case(
 if RUN_GPU:
 
     class BaseTest(NamedTuple):
+        # [CLASS DOC] HELPER: Named tuple describing one test to wrap: test name, device suffix
+        # (default GPU type, may be None for no suffix), source test instance (default a GPU tests
+        # object), and whether to check the generated code.
         name: str
         device: str = GPU_TYPE
         tests: InductorTestCase = test_torchinductor.GPUTests()

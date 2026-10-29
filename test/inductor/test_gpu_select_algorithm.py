@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] GPU (CUDA and XPU) tests for inductor algorithm selection with int8 weight-only
+# quantized matmul patterns. Reuses the CPU select-algorithm test base class and the generic model
+# checker by importing the sibling test modules (relative first, then absolute); if they raise a
+# skip at import, exits cleanly when run as a script and re-raises otherwise. Defines a decorator
+# that forces max-autotune style config and a fake autotune cache. Import time: instantiates
+# device-generic test classes for cuda and xpu only.
 import functools
 import sys
 import unittest
@@ -41,7 +47,17 @@ BaseTestSelectAlgorithm = test_cpu_select_algorithm.BaseTestSelectAlgorithm
 
 
 def patches(fn):
+    # [FUNCTION DOC] HELPER: Decorator factory used on tests. Wraps the test function with
+    # patchers for verbose dynamo config, inductor config (debug, max_autotune and epilogue_fusion
+    # on), a tightened autotune verification tolerance (absolute and relative 1e-4) and a
+    # replacement of the algorithm selector cache lookup with a fake that never reads a cache. The
+    # returned wrapper clears the dynamo counters and seeds the torch RNG with 12345 before each
+    # call, then delegates to the patched test.
     def skip_cache(self, choices, name, key, benchmark, hint_override=None):
+        # [FUNCTION DOC] HELPER: Replacement for the selector cache lookup. Returns an empty
+        # mapping when no benchmark function is supplied; otherwise runs the benchmark over the
+        # choices to get a mapping of choice to timing and multiplies the timing of every extern
+        # kernel choice by 1000 so that generated template choices win. Returns the timings.
         if benchmark is None:
             return {}
         timings = benchmark(choices)
@@ -64,6 +80,9 @@ def patches(fn):
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that clears the global dynamo counters, reseeds the torch
+        # RNG with a fixed seed, and calls the patched test function with the received arguments,
+        # returning its result.
         counters.clear()
         torch.manual_seed(12345)
         return fn(*args, **kwargs)
@@ -72,6 +91,10 @@ def patches(fn):
 
 
 class TestSelectAlgorithmGpu(BaseTestSelectAlgorithm):
+    # [CLASS DOC] Device-generic test class (instantiated for cuda and xpu) derived from the CPU
+    # algorithm selection base class. The class attribute common is the shared model-checking
+    # helper from the inductor torchinductor tests. Holds the int8 weight-only quantization
+    # matcher tests.
     common = check_model
 
     @inductor_config.patch(
@@ -92,7 +115,19 @@ class TestSelectAlgorithmGpu(BaseTestSelectAlgorithm):
     def test_int8_woq_mm_gpu(
         self, device, dtype, batch_size, mid_dim, in_features, out_features
     ):
+        # [FUNCTION DOC] Builds a bfloat16 module computing a linear layer with an int8-packed
+        # weight converted back to the input dtype, multiplied by a per-channel scale, and
+        # compiles/checks it with freezing on and shape padding off under the autotune patches.
+        # Inputs are random three-dimensional activations (batch, mid dim, in features). Compares
+        # to eager through the shared checker and asserts that the weight-only-quant pattern
+        # matcher counter equals one. Skipped without CUDA or XPU and under slow gradcheck.
+        # Parametrized over batch size, mid dim, in and out features.
         def _convert_weight_to_int8pack(w):
+            # [FUNCTION DOC] HELPER: Quantizes a floating weight per output channel to int8. Moves
+            # the weight to CPU to compute dynamic per-channel scale and zero point (signed int8),
+            # moves them back to the weight device, applies the decomposed per-channel quantize op
+            # along axis zero with range minus 128 to 127. Returns the int8 weight and the scale
+            # cast to bfloat16.
             # Move to CPU for quantization calculation, then back to original device
             device = w.device
             w_cpu = w.cpu()
@@ -113,11 +148,18 @@ class TestSelectAlgorithmGpu(BaseTestSelectAlgorithm):
             return w_int8, scale.to(torch.bfloat16)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small module holding one frozen (no gradient) parameter wrapping
+            # the int8 weight.
             def __init__(self, w):
+                # [FUNCTION DOC] HELPER: Stores the given int8 weight as a parameter that does not
+                # require gradients.
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(w, requires_grad=False)
 
             def forward(self, x, scale):
+                # [FUNCTION DOC] HELPER: Casts the stored weight to the input dtype, applies a
+                # linear layer to the input, and multiplies the result by the given scale; returns
+                # the product.
                 return (
                     torch.nn.functional.linear(x, self.linear_weight.to(x.dtype))
                     * scale
@@ -147,7 +189,16 @@ class TestSelectAlgorithmGpu(BaseTestSelectAlgorithm):
     def test_int8_woq_mm_concat_gpu(
         self, device, dtype, batch_size, mid_dim, in_features, out_features
     ):
+        # [FUNCTION DOC] Same idea as the single-weight test but with three int8 weights sharing
+        # the same input, under freezing and the CPP concat-linear option (patched through
+        # inductor config). Builds three matmul branches each scaled by its own per-channel scale,
+        # compiles and checks against eager via the shared checker, and asserts that the weight-
+        # only-quant pattern matcher counter equals three. Skipped without CUDA or XPU and under
+        # slow gradcheck. Parametrized over batch size and mid dim, with fixed feature sizes.
         def _convert_weight_to_int8pack(w):
+            # [FUNCTION DOC] HELPER: Same as the helper in the previous test: quantizes a weight
+            # per output channel to int8 using CPU-computed dynamic scale and zero point, and
+            # returns the int8 weight with the bfloat16 scale.
             # Move to CPU for quantization calculation, then back to original device
             device = w.device
             w_cpu = w.cpu()
@@ -168,13 +219,21 @@ class TestSelectAlgorithmGpu(BaseTestSelectAlgorithm):
             return w_int8, scale.to(torch.bfloat16)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding three frozen int8 weight parameters used for
+            # three parallel matmul branches.
             def __init__(self, w1, w2, w3):
+                # [FUNCTION DOC] HELPER: Stores the three int8 weights as parameters that do not
+                # require gradients.
                 super().__init__()
                 self.w1 = torch.nn.Parameter(w1, requires_grad=False)
                 self.w2 = torch.nn.Parameter(w2, requires_grad=False)
                 self.w3 = torch.nn.Parameter(w3, requires_grad=False)
 
             def forward(self, x, scale1, scale2, scale3):
+                # [FUNCTION DOC] HELPER: Flattens the leading dimensions of the input, multiplies
+                # by each transposed weight cast to the input dtype, scales each result by its own
+                # scale, and reshapes each back to the original leading dimensions. Returns a
+                # tuple of the three outputs.
                 # Ref: _linear_fp_act_int8_weight_impl in torchao/dtypes/uintx/plain_layout.py
                 y1 = (
                     torch.mm(x.reshape(-1, x.shape[-1]), self.w1.t().to(x.dtype))

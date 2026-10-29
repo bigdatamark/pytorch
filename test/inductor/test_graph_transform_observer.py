@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Inductor test verifying that the graph transform observer writes dot graph files
+# when the SDPA pattern rewriter transforms a compiled graph. Defines optional-dependency flags
+# (whether the pydot package and the dot executable are available) at import time. Run as a
+# script, tests are only executed on Linux.
 import glob
 import math
 import os
@@ -26,7 +30,14 @@ HAS_DOT = shutil.which("dot") is not None
 
 
 class TestGraphTransformObserver(TestCase):
+    # [CLASS DOC] Test case for the graph transform observer logging of inductor graph passes.
     def test_sdpa_rewriter(self):
+        # [FUNCTION DOC] Returns silently (passing) unless CUDA with Triton, fused attention
+        # support, pydot and the dot executable are all available. Otherwise sets the graph-
+        # transform log directory config to a fresh temporary directory, disables inductor caches
+        # (both mutated without restoration), compiles manual dot-product attention with fullgraph
+        # and runs it once on random CUDA inputs, then scans the directory for files ending in
+        # input_graph.dot and output_graph.dot and asserts both kinds were produced.
         if not (
             HAS_CUDA_AND_TRITON
             and PLATFORM_SUPPORTS_FUSED_ATTENTION
@@ -38,6 +49,9 @@ class TestGraphTransformObserver(TestCase):
         def dot_prod_attention(
             query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Reference attention: matmul of query with the transposed key,
+            # scaled by the inverse square root of the embedding size, softmax over the last
+            # dimension, then matmul with value. Returns the attended tensor.
             """Input tensors assumed to have shape (batch_size, n_head, seq_len, embed_dim)"""
             return (
                 torch.matmul(query, key.transpose(-2, -1))
