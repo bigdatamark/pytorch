@@ -1,4 +1,15 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor scheduler (torch._inductor.scheduler). Two test classes:
+# the device generic TestScheduler, mostly unit tests that build scheduler objects without
+# running their constructors and drive individual methods with mock nodes (extern kernel
+# benchmarking lookup, memory pool and stream propagation on fusion, combo kernel grouping,
+# argument reconstruction for scheduler nodes, fusability of memory dependencies, nested
+# reduction axis choice, graph partition signature cleaning, fusion limits, prologue fusion
+# hooks) plus end to end compile tests (estimated runtime logging, flop counting, index_add
+# fusion correctness, expand reuse realization); and TestScoreFusionMemory, which checks kernel
+# counts for fusion scoring by buffer overlap. Import-time side effects: creates a logger for
+# the inductor_metrics artifact and instantiates both classes per device type (allowing xpu)
+# into this module namespace.
 
 from unittest import skipIf
 from unittest.mock import Mock
@@ -44,14 +55,21 @@ from torch.utils._sympy.functions import FloorDiv
 
 
 def FlopCounterMode(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Create a flop counter mode from the given arguments with display
+    # turned off, so nothing is printed.
     return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
 
 
 def get_total_flops(mode):
+    # [FUNCTION DOC] HELPER: Sum all flop counts recorded under the global entry of the given
+    # flop counter mode and return the total.
     return sum(v for _, v in mode.flop_counts["Global"].items())
 
 
 def random_tensor(size, dtype, **kwargs):
+    # [FUNCTION DOC] HELPER: Create a random tensor of the given size and dtype. Floating dtypes
+    # use normal random values; integer dtypes use random integers from 0 to 99. Extra keyword
+    # arguments are passed through. Raises ValueError for any other dtype.
     if dtype in [torch.half, torch.bfloat16, torch.float, torch.double]:
         return torch.randn(size, dtype=dtype, **kwargs)
     elif dtype in [torch.uint8, torch.int8, torch.short, torch.int, torch.long]:
@@ -61,7 +79,12 @@ def random_tensor(size, dtype, **kwargs):
 
 
 def cT(device, dtype):
+    # [FUNCTION DOC] HELPER: Return a tensor factory bound to a device and dtype. The factory
+    # takes dimension sizes and an optional requires-grad flag and builds a random tensor
+    # through the random tensor helper.
     def T(*shape, requires_grad=False):
+        # [FUNCTION DOC] HELPER: Build a random tensor with the given shape using the enclosing
+        # device and dtype.
         return random_tensor(
             shape, requires_grad=requires_grad, device=device, dtype=dtype
         )
@@ -73,13 +96,20 @@ inductor_metrics_log = torch._logging.getArtifactLogger(__name__, "inductor_metr
 
 
 def _test_cases(device, dtype):
+    # [FUNCTION DOC] HELPER: Return a list of test cases for the device and dtype. Each case is
+    # a tuple of a callable, a list of example input tensors, and an empty keyword dictionary.
+    # The callables are matmul, add, a composite of two matmuls with pointwise ops, and a matmul
+    # followed by relu.
     T = cT(device, dtype)
 
     def composite(x, y, z):
+        # [FUNCTION DOC] HELPER: Add 10 to x, divide y by 12, multiply the two as matrices, then
+        # multiply the result with z.
         tmp = torch.mm(x + 10, y / 12)
         return torch.mm(tmp, z)
 
     def composite_relu(x, y):
+        # [FUNCTION DOC] HELPER: Matrix multiply x and y, then apply relu.
         tmp = torch.mm(x, y)
         return torch.relu(tmp)
 
@@ -93,7 +123,14 @@ def _test_cases(device, dtype):
 
 
 class TestScheduler(TestCase):
+    # [CLASS DOC] Scheduler tests, run once per device type. Many tests build Scheduler or
+    # scheduler node objects without calling their constructors and attach only the attributes
+    # the method under test needs, using mocks for nodes, backends and the graph. Two helper
+    # methods create mock scheduler nodes and extern kernel scheduler nodes.
     def _mock_base_snode(self, name, device=None):
+        # [FUNCTION DOC] HELPER: Create a mock base scheduler node with the given name and
+        # optional device. Name and first name return the name, the node lists itself as its
+        # only node, buffer name sets are empty, and it is neither a template nor a reduction.
         node = Mock()
         node.get_name.return_value = name
         node.get_first_name.return_value = name
@@ -106,6 +143,9 @@ class TestScheduler(TestCase):
         return node
 
     def _extern_snode_for_op(self, op_overload, python_kernel_name):
+        # [FUNCTION DOC] HELPER: Create an extern kernel scheduler node without running
+        # constructors, wrapping an extern kernel IR node that only has the given op overload
+        # and python kernel name attributes set.
         node = object.__new__(ir.ExternKernel)
         node.op_overload = op_overload
         node.python_kernel_name = python_kernel_name
@@ -114,6 +154,11 @@ class TestScheduler(TestCase):
         return snode
 
     def test_get_benchmarkable_extern_fn_uses_op_overload(self):
+        # [FUNCTION DOC] Checks the lookup of a benchmarkable function for extern kernels is
+        # based on the op overload rather than the python kernel name: a non-extern node gives
+        # no function, matrix multiply and scaled matrix multiply overloads give the matching
+        # aten packet even with a renamed kernel name, a missing op overload gives none, and a
+        # relu out overload gives none.
         self.assertIsNone(_get_benchmarkable_extern_fn(Mock(spec=BaseSchedulerNode)))
         self.assertIs(
             _get_benchmarkable_extern_fn(
@@ -143,6 +188,10 @@ class TestScheduler(TestCase):
         )
 
     def test_fuse_two_nodes_propagates_mempool(self):
+        # [FUNCTION DOC] Fuses two mock nodes on one device using a mock backend that returns a
+        # third node. The scheduler is built without its constructor. Checks the fused node is
+        # returned, inherits the memory pool and stream assignment of its inputs, and replaces
+        # the two inputs in the fused nodes set.
         scheduler = object.__new__(Scheduler)
         device = torch.device("cuda", 0)
         node1 = self._mock_base_snode("node1", device)
@@ -169,6 +218,11 @@ class TestScheduler(TestCase):
 
     @inductor_config.patch(combo_kernel_max_num_nodes=16)
     def test_combo_kernel_grouping_respects_mempool(self):
+        # [FUNCTION DOC] With the combo kernel node limit patched to 16, calls the default
+        # grouping of nodes for combo kernels on a mock scheduler with four nodes on one stream:
+        # two sharing a memory pool, one with no pool and one in another pool. Expects groups
+        # split by pool: the two pool members together, then the default node, then the other
+        # pool node.
         scheduler = Mock()
         device = torch.device("cuda", 0)
         pool_node1 = self._mock_base_snode("pool_node1", device)
@@ -201,6 +255,10 @@ class TestScheduler(TestCase):
         )
 
     def test_snode_args_kwargs_removes_filled_positional_kwargs(self):
+        # [FUNCTION DOC] Uses a mock node for an mm with dtype output overload and one keyword
+        # filled in as a positional argument by the fill helper. Checks the reconstructed
+        # arguments include the filled value (float16) as the third argument and that the
+        # keyword arguments end up empty.
         snode = Mock()
         snode.node = Mock()
         snode.node.inputs = [torch.empty(2, 2), torch.empty(2, 2)]
@@ -218,6 +276,9 @@ class TestScheduler(TestCase):
         self.assertEqual(kwargs, {})
 
     def test_snode_args_kwargs_preserves_keyword_only_kwargs(self):
+        # [FUNCTION DOC] Uses a mock node for an addmm out overload with three inputs and a
+        # keyword that the fill helper does not move into the positional list. Checks three
+        # positional arguments and that the keyword argument mapping is preserved unchanged.
         snode = Mock()
         snode.node = Mock()
         snode.node.inputs = [
@@ -236,6 +297,11 @@ class TestScheduler(TestCase):
         self.assertEqual(kwargs, {"alpha": 2})
 
     def test_snode_args_kwargs_unflattens_fallback_kernel_args(self):
+        # [FUNCTION DOC] Builds a fallback kernel IR node (without constructors) for a
+        # concatenation whose unflatten function packs the tensor inputs into a list argument
+        # and the constant into a dimension keyword. Checks the first positional argument is a
+        # list of two tensors of shape two by three, the second positional argument is the
+        # dimension, and the keyword arguments are empty.
         node = object.__new__(ir.FallbackKernel)
         node.inputs = [torch.empty(2, 3), torch.empty(2, 3)]
         node.constant_args = (1,)
@@ -256,6 +322,13 @@ class TestScheduler(TestCase):
         self.assertEqual(kwargs, {})
 
     def test_fusable_read_and_write_broadcast_requires_index_equivalence(self):
+        # [FUNCTION DOC] Table driven test of the scheduler method deciding whether a read
+        # dependency can be fused with a write dependency, under a mock graph with a real size
+        # variable allocator. Each case gives a read, a write and the expected result without
+        # and with index equivalence allowed (quotient broadcast, quotient with tail, pure
+        # broadcast, dynamic dense, exact gapped, producer broadcast, producer alias). A final
+        # check with loop ordering after fusion enabled expects true in both modes for a
+        # normalized read with an extra loop dimension.
         d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
         w0, w1 = sympy.symbols("w0 w1", integer=True, nonnegative=True)
 
@@ -367,6 +440,12 @@ class TestScheduler(TestCase):
                 )
 
     def test_nested_reduction_grouped_axis_from_ranges(self):
+        # [FUNCTION DOC] Checks the grouped axis chosen for nested reductions from range sizes
+        # using a mock grouped node under a mock graph. Expects the reduction axis for ranges
+        # matching the outer reduction size, the pointwise axis when ranges match the outer
+        # numel, the reduction axis for the single dimension case with outer numel 1, the
+        # pointwise axis for a single dimension matching the outer numel, and none when sizes
+        # match neither.
         grouped = Mock()
         graph = Mock(sizevars=SizeVarAllocator())
 
@@ -436,12 +515,22 @@ class TestScheduler(TestCase):
             )
 
     def test_nested_reduction_axis_from_loop_body(self):
+        # [FUNCTION DOC] Checks classification of the grouped axis of a nested reduction from
+        # loop body index expressions. Builds mock outer and grouped reductions whose loop
+        # bodies load one buffer with a given index over iteration and reduction variables, and
+        # compares the stride pattern of the grouped index with the outer one. Same pattern with
+        # the reduction variable innermost, or with the reduction variable outermost, gives the
+        # reduction axis; a differing pattern gives the pointwise axis; unmatched patterns give
+        # none.
         outer_x0, outer_x1, outer_r = sympy.symbols("outer_x0 outer_x1 outer_r")
         grouped_x0, grouped_x1, grouped_r = sympy.symbols(
             "grouped_x0 grouped_x1 grouped_r"
         )
 
         def make_body(index, iter_vars, reduce_vars):
+            # [FUNCTION DOC] HELPER: Create a mock loop body with the given iteration and
+            # reduction variables, a single load indexed by the given expression, and memory
+            # usage listing one load entry.
             body = Mock()
             body.iter_vars = iter_vars
             body.reduce_vars = reduce_vars
@@ -452,6 +541,9 @@ class TestScheduler(TestCase):
             return body
 
         def make_reduction(index, iter_vars, reduce_vars):
+            # [FUNCTION DOC] HELPER: Create a mock reduction scheduler node with ranges of two
+            # iteration dimensions of 16 and one reduction dimension of 16, whose body is made
+            # by the body helper.
             node = Mock()
             node.is_reduction.return_value = True
             node.get_ranges.return_value = ([16, 16], [16])
@@ -459,6 +551,8 @@ class TestScheduler(TestCase):
             return node
 
         def classify(outer_index, grouped_index):
+            # [FUNCTION DOC] HELPER: Build an outer and a grouped mock reduction from the two
+            # index expressions and return the grouped axis computed from the loop bodies.
             outer = make_reduction(outer_index, (outer_x0, outer_x1), (outer_r,))
             grouped = make_reduction(
                 grouped_index, (grouped_x0, grouped_x1), (grouped_r,)
@@ -497,6 +591,12 @@ class TestScheduler(TestCase):
         )
 
     def test_partition_signature_cleaning_only_removes_current_codegen_buffers(self):
+        # [FUNCTION DOC] Builds a graph partition signature with live, previously removed, and
+        # removed-during-codegen inputs, outputs and constants, plus a set of buffers removed
+        # during codegen. Calls the scheduler method that cleans removed buffers from signatures
+        # and checks that only entries removed during this codegen are dropped from input nodes,
+        # input deallocation flags, output nodes and constant names, while earlier removed
+        # entries stay and the cudagraph skip flag stays false.
         scheduler = Scheduler.__new__(Scheduler)
 
         live_input = Mock()
@@ -584,6 +684,11 @@ class TestScheduler(TestCase):
     @skipCUDAIf(not SM70OrLater, "GPU capability is < SM70")
     @xfailIfNoAcceleratorTriton
     def test_disable_get_estimated_runtime_logging(self, device, dtype):
+        # [FUNCTION DOC] Skips on cpu. Turns off inductor metrics logging, then compiles each
+        # test case and checks that bytes accessed is zero and no node runtime or element count
+        # entries are truthy, i.e. estimates are not computed when logging is off. Resets the
+        # dynamo and metrics state, and restores default logging at the end (not guarded by a
+        # finally block).
         if device == "cpu":
             return
         tc = _test_cases(device, dtype)
@@ -622,6 +727,11 @@ class TestScheduler(TestCase):
     )
     @skipIf(not IS_BIG_GPU, "we can't use Triton only as a backend for max autotune")
     def test_flop_counter_op(self, device, dtype, options):
+        # [FUNCTION DOC] Parametrized over dtype and two max autotune backend options. Skips on
+        # cpu. Turns on inductor metrics logging, compiles each test case, and compares the flop
+        # total measured by a flop counter mode on the compiled run with the Inductor flop
+        # counter; also checks non-add ops have a nonzero count. Resets the counter after each
+        # case and restores default logging at the end.
         if device == "cpu":
             return
 
@@ -652,6 +762,9 @@ class TestScheduler(TestCase):
         torch._logging.set_logs()
 
     def test_fusion_prevent_too_many_reads_and_writes_prevents_fusion(self):
+        # [FUNCTION DOC] Two mock nodes read and write overlapping buffers, with the second
+        # reading the first's write. With a threshold of 5 and six unique buffers after fusion,
+        # the method preventing fusion for too many reads and writes must return true.
         """Test that fusion is prevented when unique I/O buffers exceed threshold"""
         # Setup: Create nodes with many unique I/O buffers
         # node1: reads [A, B, C], writes [D]
@@ -677,6 +790,9 @@ class TestScheduler(TestCase):
         self.assertTrue(result)
 
     def test_fusion_prevent_too_many_reads_and_writes_allows_fusion(self):
+        # [FUNCTION DOC] Same setup as the previous test with fewer buffers: four unique input
+        # and output buffers after fusion against a threshold of 5, so the method must return
+        # false.
         """Test that fusion is allowed when intermediate buffers are removed"""
         # Setup: Create nodes where node2 reads node1's output
         # node1: reads [A, B], writes [C]
@@ -698,6 +814,9 @@ class TestScheduler(TestCase):
         self.assertFalse(result)
 
     def _create_mock_node(self, name: str, reads: list[str], writes: list[str]) -> Mock:
+        # [FUNCTION DOC] HELPER: Create a mock base scheduler node with the given name whose
+        # reads and writes are sets of mock dependencies named from the given lists, attached as
+        # its read and write information.
         """Helper method to create a mock scheduler node with specified reads/writes"""
         node = Mock(spec=BaseSchedulerNode)
         node.get_name = Mock(return_value=name)
@@ -725,7 +844,17 @@ class TestScheduler(TestCase):
         return node
 
     def test_prologue_fusion_uses_template_aliasing_hook(self):
+        # [FUNCTION DOC] Checks that prologue fusion consults the template's own hook for
+        # aliasing or mutation rather than the node's generic method. Builds a scheduler without
+        # its constructor and mocks, runs the internal can-fuse check for a prologue and
+        # template pair, asserts the hook is called once with the template node and the generic
+        # method is not called. Expects fusion allowed when the hook says no conflict and
+        # refused when it says conflict.
         def make_prologue_and_template(hook_blocks: bool):
+            # [FUNCTION DOC] HELPER: Build mock prologue and template scheduler nodes (both on
+            # cpu) and a template whose input is the prologue buffer and allows prologue fusion.
+            # The flag sets what the template's aliasing hook returns. Returns the three
+            # objects.
             prologue_node = Mock()
             template_node = Mock()
             template = Mock()
@@ -767,6 +896,9 @@ class TestScheduler(TestCase):
             return prologue_node, template_node, template
 
         def can_fuse_prologue(hook_blocks: bool) -> bool:
+            # [FUNCTION DOC] HELPER: Build a mostly mocked scheduler, backend and choices
+            # handler, run the internal can-fuse check on the prologue and template mocks under
+            # a mock graph, verify the hook was consulted as described, and return the result.
             scheduler = Scheduler.__new__(Scheduler)
             scheduler.mutation_renames = {}
             scheduler._has_multi_stream_nodes = Mock(return_value=False)
@@ -809,6 +941,9 @@ class TestScheduler(TestCase):
     @xfailIfNoAcceleratorTriton
     @onlyCUDA
     def test_index_add_fusion_prevented(self):
+        # [FUNCTION DOC] Skipped unless on CUDA with triton. Regression test that an index_add
+        # scatter followed by a gather from the same buffer is not fused wrongly: compiles the
+        # function and checks the result is close to eager.
         """
         Test that index_add_ (scatter with atomic_add mode) is not fused with
         subsequent reads from the same buffer, preventing read-after-write hazards.
@@ -818,6 +953,9 @@ class TestScheduler(TestCase):
         """
 
         def fn(f, batch):
+            # [FUNCTION DOC] HELPER: Square the features and add a constant, scatter-add them by
+            # batch index into a zero buffer, then gather from that buffer, add a small
+            # constant, and divide the features by it.
             # Scatter: atomic writes to shared location
             f_u = f**2 + 0.00987654321
             n_batch = batch.max() + 1
@@ -850,11 +988,15 @@ class TestScheduler(TestCase):
     @xfailIfNoAcceleratorTriton
     @onlyCUDA
     def test_atomic_add_no_fusion_correctness(self):
+        # [FUNCTION DOC] Skipped unless on CUDA with triton. Checks an index_add followed by
+        # reading the same buffer gives the eager result when compiled with a fresh cache.
         """
         Test that atomic_add operations produce correct results.
         """
 
         def fn(x, idx):
+            # [FUNCTION DOC] HELPER: Scatter-add x into a zero buffer by index, then return the
+            # gathered values plus one.
             out = torch.zeros(10, device=x.device)
             out.index_add_(0, idx, x)  # atomic_add: scatter to shared locations
             return out[idx] + 1.0  # read from same buffer: requires sync
@@ -881,7 +1023,17 @@ class TestScheduler(TestCase):
     @xfailIfNoAcceleratorTriton
     @onlyCUDA
     def test_expand_reuse_does_not_realize_before_reduction(self):
+        # [FUNCTION DOC] Skipped unless on CUDA with triton. Compiles with fullgraph a function
+        # using index selects, broadcasted views, a product with a reduction over two dimensions
+        # and an index_add into the output. Checks it matches eager and that exactly two IR
+        # nodes exist before fusion and a single kernel is generated, i.e. the expanded operands
+        # are not realized before the reduction. Shape sizes are enclosing variables defined
+        # after the function.
         def fn(icrd1, icrd2, wcrd, ocrd, meta, input1, input2, weight, output):
+            # [FUNCTION DOC] HELPER: Select entries along dimensions from three inputs by
+            # coordinate tensors, view them for broadcasting, multiply with the metadata vector,
+            # sum over two dimensions, index_add into the output by output coordinates, and
+            # return the output.
             input1_selected = torch.index_select(input1, 2, icrd1)
             input2_selected = torch.index_select(input2, 2, icrd2)
             weight_selected = torch.index_select(weight, 3, wcrd)
@@ -952,12 +1104,22 @@ class TestScheduler(TestCase):
     @xfailIfNoAcceleratorTriton
     @onlyCUDA
     def test_expand_reuse_realizes_in_deterministic_mode(self):
+        # [FUNCTION DOC] Skipped unless on CUDA with triton. Checks that under deterministic
+        # algorithms and under the deterministic Inductor config, an expanded pointwise product
+        # feeding a reduction is realized, giving two IR nodes and two kernels with eager
+        # matching results. Temporarily enables deterministic algorithms (warn only) and
+        # restores the previous settings in a finally block.
         def fn(a, b, c, d, e):
+            # [FUNCTION DOC] HELPER: Multiply five inputs, view the product with a trailing size
+            # one dimension, expand it, and sum over the middle dimension.
             x = a * b * c * d * e
             y = x.view(8, 8, 1).expand(8, 8, 16)
             return y.sum(dim=1)
 
         def check_realizes():
+            # [FUNCTION DOC] HELPER: Reset state, compile the function with fullgraph, run it on
+            # the enclosing arguments, and check results against the enclosing expected value,
+            # with two IR nodes before fusion and two generated kernels.
             torch._dynamo.reset()
             metrics.reset()
             with fresh_inductor_cache():
@@ -989,6 +1151,10 @@ class TestScheduler(TestCase):
 
 
 class TestScoreFusionMemory(TestCase):
+    # [CLASS DOC] Tests of fusion scoring by buffer overlap. Each test patches the fusion memory
+    # threshold (some also the minimum overlap ratio), compiles a small function, compares with
+    # eager, and checks the number of generated kernels in the metrics. Tests are skipped
+    # without a GPU.
     """
     Tests for _score_fusion_memory_by_buffer_overlap.
 
@@ -1006,6 +1172,8 @@ class TestScoreFusionMemory(TestCase):
     @inductor_config.patch("score_fusion_memory_threshold", 1)
     @inductor_config.patch("min_overlap_ratio", 0.5)
     def test_exact_same_reads_should_fuse(self) -> None:
+        # [FUNCTION DOC] Two pointwise ops read the exact same input and must fuse into one
+        # kernel; checks results against eager and the generated kernel count of one.
         """
         Case 1: Exact matches in read/write → should fuse into 1 kernel.
 
@@ -1014,6 +1182,8 @@ class TestScoreFusionMemory(TestCase):
         """
 
         def exact_reads(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Return x times two and x plus one, both read from the same
+            # input.
             # Both operations read the exact same input
             out1 = x * 2
             out2 = x + 1
@@ -1037,6 +1207,9 @@ class TestScoreFusionMemory(TestCase):
     @inductor_config.patch("score_fusion_memory_threshold", 1)
     @inductor_config.patch("min_overlap_ratio", 0.5)
     def test_split_cat_large_overlap_should_fuse(self) -> None:
+        # [FUNCTION DOC] Splits an input into four slices and concatenates them in two reversed
+        # pairs. The slices overlap strongly in the same buffer so the ops must fuse into one
+        # kernel; checks results against eager and a kernel count of one.
         """
         Case 2: Reads on different offset but overlap is huge (split/cat) → should fuse into 1 kernel.
 
@@ -1046,6 +1219,8 @@ class TestScoreFusionMemory(TestCase):
         """
 
         def split_and_process(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Split x into four parts along the last dimension and return
+            # two concatenations of reversed pairs of the parts.
             s1, s2, s3, s4 = torch.split(x, x.shape[-1] // 4, dim=-1)
             out1 = torch.cat([s4, s3], dim=-1)
             out2 = torch.cat([s2, s1], dim=-1)
@@ -1070,6 +1245,13 @@ class TestScoreFusionMemory(TestCase):
     @skipIf(not HAS_GPU, "GPU not available")
     @inductor_config.patch("score_fusion_memory_threshold", 1)
     def test_partial_overlap_below_threshold(self) -> None:
+        # [FUNCTION DOC] Each of two outputs concatenates a small slice of the input with three
+        # copies of another tensor, so the shared buffer is a small fraction of each op's reads
+        # and the scoring should give no fusion; checks results against eager and a kernel count
+        # of two.
+        # KNOWN ISSUE: the inline comments call the extra tensors three times larger than a
+        # slice, but they are the same width as one slice; only the concatenation repeats them
+        # three times. The description is loose, though the ratio argument holds.
         """
         Case 3: Partial overlap below the 0.5 threshold → should NOT fuse (2 kernels).
 
@@ -1089,6 +1271,8 @@ class TestScoreFusionMemory(TestCase):
         def partial_overlap_split(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Split x into four parts and return two concatenations, each
+            # of one slice followed by three copies of y or z respectively.
             # Split x into 4 parts, use different slices in each output
             s1, s2, _, _ = torch.split(x, x.shape[-1] // 4, dim=-1)
             # op1 reads: s1 (small slice of x) + y (large separate tensor)

@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor inplace padding, where a padded copy of a buffer is produced
+# by writing the pad value into extra trailing space of an over-allocated source buffer instead
+# of a new allocation. Tests assert on the inplace_padding counter and on generated code.
+# Import-time side effects: appends the test directory to the import path and reads the
+# environment variables controlling the inplace padding default and perf timing. Most tests need
+# a GPU, and the entry point only runs when one exists.
 import os
 import sys
 import unittest
@@ -32,6 +38,9 @@ aten = torch.ops.aten
 
 
 def num_inplace_padding():
+    # [FUNCTION DOC] HELPER: Return the current value of the inplace_padding counter in the
+    # Dynamo inductor counters, i.e. how many times inplace padding was applied since counters
+    # were last cleared.
     from torch._dynamo.utils import counters
 
     return counters["inductor"]["inplace_padding"]
@@ -46,13 +55,22 @@ DO_PERF_TEST = os.environ.get("DO_PERF_TEST") == "1"
 
 @inductor_config.patch(inplace_padding=enable_inplace_padding)
 class InplacePaddingTest(TestCase):
+    # [CLASS DOC] Test case run with the inplace_padding config set to the module level flag
+    # (true unless the environment variable disables it). Each test compiles a small function
+    # containing a constant pad and checks both numerical correctness and whether the inplace
+    # padding counter changed.
     def test_skip_pad_due_to_fusion(self):
+        # [FUNCTION DOC] Pads a strided input and then reduces it with a sum. Padding fuses into
+        # the downstream reduction, so numerics must match eager and the inplace padding counter
+        # must stay zero.
         """
         If the padding can be fused with downstream op, there would
         be little benefit to do inplace padding.
         """
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Pad the last dimension by 8 with a large constant and sum
+            # over that dimension.
             x = aten.constant_pad_nd(x, (0, 8, 0, 0), 12345.0)
             return x.sum(dim=-1)
 
@@ -63,6 +81,9 @@ class InplacePaddingTest(TestCase):
         self.assertEqual(num_inplace_padding(), 0)
 
     def test_skip_pad_input(self):
+        # [FUNCTION DOC] Pads a graph input and feeds a matmul. Inductor does not allocate graph
+        # inputs, so inplace padding must be skipped: result must match eager and the counter
+        # must be zero.
         """
         Don't apply the padding to graph input since Inductor does not
         allocatae the input and can not guarantee enough trailing space
@@ -70,6 +91,8 @@ class InplacePaddingTest(TestCase):
         """
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Pad the first argument on the last dimension by 8 and
+            # matrix multiply with the second.
             x = aten.constant_pad_nd(x, (0, 8, 0, 0), 12345.0)
             return x @ y
 
@@ -81,7 +104,13 @@ class InplacePaddingTest(TestCase):
         self.assertEqual(num_inplace_padding(), 0)
 
     def test_pad_non_zero(self):
+        # [FUNCTION DOC] Compiles an add followed by a pad and matmul on an odd-shaped input.
+        # Checks via FileCheck on the generated code that the intermediate buffer is
+        # over-allocated by one column and viewed with as_strided, that results match eager, and
+        # that the counter is exactly one.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, pad the last dimension by 1 with a large constant,
+            # then multiply the result with itself as matrices.
             x = x + 1
             x = aten.constant_pad_nd(x, (0, 1, 0, 0), 12345.0)
 
@@ -114,7 +143,14 @@ class InplacePaddingTest(TestCase):
     @inductor_config.patch(cpp_wrapper=True)
     @inductor_config.patch("triton.autotune_at_compile_time", True)
     def test_pad_non_zero_cpp_wrapper(self):
+        # [FUNCTION DOC] Same scenario as the non-zero padding test but under the C++ wrapper
+        # with compile-time autotuning. Wraps the wrapper's autotune block generation with a
+        # mock that records it was called and checks the example-value generation for buf0 uses
+        # the over-allocated size. Then checks the generated code restrides buf0 via as_strided,
+        # results match eager, the counter is one, and the mock was invoked.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, pad the last dimension by 1 with a large constant,
+            # then multiply the result with itself as matrices.
             x = x + 1
             x = aten.constant_pad_nd(x, (0, 1, 0, 0), 12345.0)
 
@@ -132,6 +168,10 @@ class InplacePaddingTest(TestCase):
         compile_time_autotune_called = False
 
         def mock_generate_and_run_autotune_block(wrapper):
+            # [FUNCTION DOC] HELPER: Replacement for the autotune block generator. Sets the
+            # enclosing flag to record the call, runs the original generator, checks that the
+            # autotune call text contains the expected example value line for buf0, and returns
+            # the original output.
             nonlocal compile_time_autotune_called
             compile_time_autotune_called = True
             out = orig_generate_and_run_autotune_block(wrapper)
@@ -159,7 +199,12 @@ class InplacePaddingTest(TestCase):
         self.assertTrue(compile_time_autotune_called)
 
     def test_pad_too_large(self):
+        # [FUNCTION DOC] Uses an input whose stride gives only 5 spare elements per row while
+        # the pad needs 8, so inplace padding is not applicable. Results must match eager and
+        # the counter must be zero.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Pad the first argument on the last dimension by 8 and
+            # matrix multiply with the second.
             x = aten.constant_pad_nd(x, (0, 8, 0, 0), 12345.0)
             return x @ y
 
@@ -172,12 +217,17 @@ class InplacePaddingTest(TestCase):
 
     @inductor_config.patch(can_inplace_pad_graph_input=True)
     def test_mutating_padding_input(self):
+        # [FUNCTION DOC] With graph input padding allowed by config, the padding source is also
+        # mutated in place after the pad. Verifies results still match eager and that inplace
+        # padding was applied exactly once.
         """
         Even if `aten.constant_pad_nd` input get inplace updated,
         doing inplace-padding still generates the correct result.
         """
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Pad x by 8 on the last dimension, add 5 to x in place, then
+            # matrix multiply the padded copy with y.
             x2 = aten.constant_pad_nd(x, (0, 8, 0, 0), 12345.0)
             x.add_(5)
             return x2 @ y
@@ -192,6 +242,9 @@ class InplacePaddingTest(TestCase):
         self.assertEqual(num_inplace_padding(), 1)
 
     def test_mutating_padding_output(self):
+        # [FUNCTION DOC] The padded tensor is mutated in place by an add before the matmul, so
+        # the pad's user is not a matmul and inplace padding is skipped. Results must match
+        # eager and the counter must be zero.
         """
         Inplace padding does not take effect since the `aten.add_` op
         cause the user of the padding output to be not matmul. We skip
@@ -199,6 +252,8 @@ class InplacePaddingTest(TestCase):
         """
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Pad x by 8 on the last dimension, add one to the padded
+            # tensor in place, then matrix multiply with y.
             x = aten.constant_pad_nd(x, (0, 8, 0, 0), 12345.0)
             x.add_(1)
             return x @ y
@@ -215,6 +270,13 @@ class InplacePaddingTest(TestCase):
     @inductor_config.patch(force_shape_pad=True)
     @serialTest()
     def test_linear_and_cel(self):
+        # [FUNCTION DOC] Large bf16 linear plus cross entropy forward and backward with forced
+        # shape padding and deterministic mode, where empty tensors are filled with nan. Side
+        # effects: enables deterministic algorithms, sets the fill uninitialized flag, and sets
+        # the cuBLAS workspace environment variable, none restored. Compares loss and gradients
+        # of eager and compiled runs, raises AssertionError on mismatch, checks the counter
+        # equals the config flag value, and optionally benchmarks with triton when perf testing
+        # is on.
         # Use nan for torch.empty
         torch.use_deterministic_algorithms(True)
         torch.utils.deterministic.fill_uninitialized_empty = True
@@ -226,6 +288,8 @@ class InplacePaddingTest(TestCase):
         ce = torch.nn.CrossEntropyLoss()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Clear gradients on the input and linear parameters, compute
+            # cross entropy loss of the linear output, run backward, and return the loss.
             x.grad = None
             linear.weight.grad = None
             linear.bias.grad = None
@@ -260,6 +324,8 @@ class InplacePaddingTest(TestCase):
     @inductor_config.patch(max_autotune=True)
     @serialTest()
     def test_linear_and_cel_max_autotune(self):
+        # [FUNCTION DOC] Reruns the linear plus cross entropy test with max autotune enabled to
+        # reproduce a past failure; it simply calls the other test method.
         self.test_linear_and_cel()
 
 
