@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] HELPER: Functional Adam optimizer for internal use by the distributed
+# optimizer: gradients are passed to step explicitly instead of being
+# read from parameters. Defines one private class; nothing is publicly
+# exported.
 import torch
 import torch.optim._functional as F
 from torch import Tensor
@@ -21,6 +25,12 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalAdam:
+    # [CLASS DOC] HELPER: Adam/AMSGrad optimizer with a single parameter group and
+    # explicit-gradient updates. State: defaults mapping (lr, eps, beta1,
+    # beta2, weight_decay), amsgrad, maximize, foreach and fused flags,
+    # param_group, and a per-parameter state mapping lazily filled with
+    # step, exp_avg, exp_avg_sq and optionally max_exp_avg_sq. Updates are
+    # done by step (all parameters) or step_param (one parameter).
     def __init__(
         self,
         params: list[Tensor],
@@ -34,6 +44,12 @@ class _FunctionalAdam:
         fused: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Validates hyperparameters and stores them with the
+        # single parameter group and an empty state mapping; emits the
+        # TorchScript functional-optimizer deprecation warning. Raises
+        # ValueError for a negative learning rate, epsilon or weight
+        # decay, a beta outside zero to one, or an empty parameter list
+        # when empty lists are not allowed.
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -67,6 +83,12 @@ class _FunctionalAdam:
         self.param_group = {"params": params}
 
     def step_param(self, param: Tensor, grad: Tensor | None):
+        # [FUNCTION DOC] HELPER: Applies one Adam update to a single parameter with an
+        # optional gradient. Lazily creates that parameter's state,
+        # then calls the functional adam routine without autograd; if
+        # the gradient is None the routine receives empty parameter and
+        # gradient lists, so nothing is updated. Mutates parameter and
+        # state; returns nothing.
         """
         Similar to step, but operates on a single parameter and optionally a
         gradient tensor.
@@ -127,6 +149,12 @@ class _FunctionalAdam:
             )
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Applies one Adam update using the given gradients,
+        # aligned one-to-one with the parameters (None entries are
+        # skipped). Lazily creates per-parameter state, gathers tensors
+        # and calls the functional adam routine without autograd.
+        # Raises ValueError if the lengths differ. Mutates parameters
+        # and state; returns nothing.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []

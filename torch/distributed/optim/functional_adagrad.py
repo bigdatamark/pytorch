@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] HELPER: Functional Adagrad optimizer for internal use by the
+# distributed optimizer: gradients are passed to step explicitly instead
+# of being read from parameters. Defines one private class; nothing is
+# publicly exported.
 import torch
 import torch.optim._functional as F
 from torch import Tensor
@@ -21,6 +25,12 @@ __all__: list[str] = []
 # NOTE: This should be only used by distributed optimizer internals
 # and not meant to expose to the user.
 class _FunctionalAdagrad:
+    # [CLASS DOC] HELPER: Adagrad optimizer with a single parameter group and an
+    # explicit-gradient step. State: defaults mapping (lr, lr_decay, eps,
+    # weight_decay, initial accumulator value, warmup settings),
+    # coalesce_grad, foreach, fused and maximize flags, param_group, and a
+    # per-parameter state mapping holding sum and step tensors created
+    # eagerly at construction.
     def __init__(
         self,
         params: list[Tensor],
@@ -37,6 +47,12 @@ class _FunctionalAdagrad:
         maximize: bool = False,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Stores hyperparameters and the single parameter
+        # group, and eagerly initializes each parameter's sum (filled
+        # with the initial accumulator value) and step tensor; emits
+        # the TorchScript functional-optimizer deprecation warning.
+        # Raises ValueError if the parameter list is empty and empty
+        # lists are not allowed.
         _scripted_functional_optimizer_deprecation_warning(stacklevel=2)
         self.defaults = {
             "lr": lr,
@@ -69,6 +85,16 @@ class _FunctionalAdagrad:
             }
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Applies one Adagrad update using the given gradients,
+        # aligned one-to-one with the parameters (None entries are
+        # skipped). Gathers sums and steps, tracks whether any gradient
+        # is sparse or any parameter complex, and calls the functional
+        # adagrad routine without autograd. Raises ValueError if the
+        # lengths differ. Mutates parameters and state; returns
+        # nothing.
+        # KNOWN ISSUE: the functional routine is called with the full parameter list
+        # rather than the list of parameters that have gradients, so if some gradients
+        # are None the lists passed in are misaligned.
         params = self.param_group["params"]
         params_with_grad = []
         grads = []

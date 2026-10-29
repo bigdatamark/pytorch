@@ -2,7 +2,15 @@
 # mypy: allow-untyped-defs
 
 
+# [MODULE DOC] Source text templates (format strings with placeholders for types, args
+# and decorator) from which the RemoteModule forward, forward_async and
+# _remote_forward functions are generated. Defines a common prefix and
+# two _remote_forward variants, selected by get_remote_module_template.
 def get_remote_module_template(enable_moving_cpu_tensors_to_cuda: bool):
+    # [FUNCTION DOC] Returns the full RemoteModule source template text: the common
+    # prefix followed by the remote-forward variant that moves CPU
+    # tensors to CUDA when the flag is true, otherwise the simple
+    # variant.
     return _TEMPLATE_PREFIX + (
         _REMOTE_FORWARD_TEMPLATE_ENABLE_MOVING_CPU_TENSORS_TO_CUDA
         if enable_moving_cpu_tensors_to_cuda

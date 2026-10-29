@@ -1,5 +1,14 @@
 #!/usr/bin/python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines RemoteModule, an nn.Module proxy for a module living on another
+# RPC worker. Contains RPC-side helpers to build the remote module and
+# list its parameter references, the private _RemoteModule base class
+# (generated forward and forward_async methods, unsupported-method stubs,
+# pickling checks), the public RemoteModule class, and reducers/receivers
+# used to serialize RemoteModules and script modules over RPC. Import-
+# time side effects: instantiates the non-scriptable generated-methods
+# template and registers custom RPC pickling reducers for RemoteModule
+# and RecursiveScriptModule.
 import collections
 import io
 import sys
@@ -76,12 +85,19 @@ _REMOTE_MODULE_ATTRIBUTES_IGNORE_FOR_PICKLING = (
 
 # RPC handler.
 def _instantiate_template(module_interface_cls, enable_moving_cpu_tensors_to_cuda):
+    # [FUNCTION DOC] HELPER: Runs on the remote worker: generates and imports the
+    # scriptable template module for the given interface class, so the
+    # remote side has the matching generated code. Returns nothing.
     instantiator.instantiate_scriptable_remote_module_template(
         module_interface_cls, enable_moving_cpu_tensors_to_cuda
     )
 
 
 def _create_module(module_cls, args, kwargs, device):
+    # [FUNCTION DOC] HELPER: Runs on the remote worker: constructs the user module
+    # from class, args and kwargs, moves it to the device and returns
+    # it. Raises ValueError if the constructed object is not an
+    # nn.Module.
     module = module_cls(*args, **kwargs)
     if not isinstance(module, nn.Module):
         raise ValueError(
@@ -95,6 +111,9 @@ def _create_module(module_cls, args, kwargs, device):
 def _create_module_with_interface(
     module_cls, args, kwargs, device, module_interface_cls
 ):
+    # [FUNCTION DOC] HELPER: Runs on the remote worker: builds the module, scripts it
+    # with TorchScript when an interface class is given, and returns an
+    # RRef to it (typed by the interface).
     module = _create_module(module_cls, args, kwargs, device)
     if module_interface_cls is not None:
         module = torch.jit.script(module)
@@ -102,6 +121,9 @@ def _create_module_with_interface(
 
 
 def _param_rrefs(module_rref, recurse) -> list[rpc.RRef[Parameter]]:
+    # [FUNCTION DOC] HELPER: Runs on the owning worker: returns a list of RRefs, one
+    # per parameter of the module held by the given RRef (recursively
+    # or direct members only).
     ret: list[rpc.RRef[Parameter]] = [
         rpc.RRef(param) for param in module_rref.local_value().parameters(recurse)
     ]
@@ -109,11 +131,20 @@ def _param_rrefs(module_rref, recurse) -> list[rpc.RRef[Parameter]]:
 
 
 def _raise_not_supported(name: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError stating that the named method is not
+    # supported for RemoteModule.
     raise ValueError(f"Method ``{name}`` not supported for RemoteModule")
 
 
 class _RemoteModule(nn.Module):
+    # [CLASS DOC] HELPER: Base implementation of RemoteModule: a local nn.Module shell
+    # whose forward and forward_async are generated methods that call the
+    # real module through an RRef. State: on (worker name or rank), device
+    # (string), is_device_map_set, is_scriptable, generated_methods and
+    # module_rref; only these are pickled. Most nn.Module methods are
+    # overridden to raise ValueError, while train and eval run remotely.
     def __new__(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Logs API usage once and allocates the instance.
         # Use __new__ for logging purposes.
         torch._C._log_api_usage_once("torch.distributed.nn.api.remote_module")
         return super().__new__(cls)
@@ -126,6 +157,18 @@ class _RemoteModule(nn.Module):
         kwargs: dict[str, Any] | None = None,
         _module_interface_cls: Any = None,
     ):
+        # [FUNCTION DOC] Creates the module remotely and installs local forward
+        # methods. Validates RPC is initialized, resolves the target
+        # worker and device, then either (with an interface class)
+        # instantiates the scriptable template on both sides and
+        # creates the module synchronously, or uses the shared non-
+        # scriptable template and creates the module with a remote
+        # call. Finally installs generated methods and checks that all
+        # attributes are declared for pickling. Raises AssertionError
+        # if RPC is not initialized and AttributeError for undeclared
+        # attributes.
+        # KNOWN ISSUE: in the scriptable branch the remote template instantiation is
+        # requested twice; the first future is overwritten and never waited on.
         """
         RemoteModule instance can only be created after RPC initialization.
 
@@ -275,6 +318,9 @@ class _RemoteModule(nn.Module):
         self._check_attribute_picklability()
 
     def remote_parameters(self, recurse: bool = True) -> list[rpc.RRef[Parameter]]:
+        # [FUNCTION DOC] Returns a list of RRefs to the remote module's parameters
+        # (all of them, or only direct ones when recurse is false),
+        # obtained by a synchronous RPC to the owning worker.
         """
         Return a list of :class:`~torch.distributed.rpc.RRef` pointing to the remote module's parameters.
 
@@ -294,17 +340,22 @@ class _RemoteModule(nn.Module):
         return rpc.rpc_sync(self.on, _param_rrefs, args=(self.module_rref, recurse))
 
     def get_module_rref(self) -> rpc.RRef[nn.Module]:
+        # [FUNCTION DOC] Returns the RRef pointing to the remote module.
         """Return an :class:`~torch.distributed.rpc.RRef` (``RRef[nn.Module]``) pointing to the remote module."""
         return self.module_rref
 
     @torch.jit.export
     def __getstate__(self):
+        # [FUNCTION DOC] Always raises RuntimeError: RemoteModule cannot be pickled
+        # with the plain Python pickler, only through RPC.
         raise RuntimeError(
             "Cannot pickle RemoteModule in python pickler. RemoteModule can only be pickled when using RPC"
         )
 
     @torch.jit.export
     def __setstate__(self, state):
+        # [FUNCTION DOC] Always raises RuntimeError: RemoteModule cannot be unpickled
+        # with the plain Python pickler, only through RPC.
         raise RuntimeError(
             "Cannot unpickle RemoteModule in python pickler. RemoteModule can only be unpickled when using RPC"
         )
@@ -312,45 +363,73 @@ class _RemoteModule(nn.Module):
     def register_buffer(
         self, name: str, tensor: Tensor | None, persistent: bool = True
     ) -> None:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.register_buffer.__name__)
 
     def register_parameter(self, name: str, param: Parameter | None) -> None:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.register_parameter.__name__)
 
     def add_module(self, name: str, module: Module | None) -> None:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.add_module.__name__)
 
     def apply(self, fn: Callable[[Module], None]) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.apply.__name__)
 
     def cuda(self, device: int | device | None = None) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.cuda.__name__)
 
     def ipu(self, device: int | device | None = None) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.ipu.__name__)
 
     def xpu(self, device: int | device | None = None) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.xpu.__name__)
 
     def cpu(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.cpu.__name__)
 
     def type(self, dst_type: dtype | str) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.type.__name__)
 
     def float(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.float.__name__)
 
     def double(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.double.__name__)
 
     def half(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.half.__name__)
 
     def bfloat16(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.bfloat16.__name__)
 
     def to(self, *args, **kwargs) -> T:  # type: ignore[misc, return, type-var]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.to.__name__)
 
     def register_backward_hook(  # type: ignore[return]
@@ -358,6 +437,8 @@ class _RemoteModule(nn.Module):
         hook: Callable[[Module, _grad_t, _grad_t], _grad_t | None],
         # pyrefly: ignore [bad-return]
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.register_backward_hook.__name__)
 
     def register_forward_pre_hook(  # type: ignore[return]
@@ -370,6 +451,8 @@ class _RemoteModule(nn.Module):
         with_kwargs: bool = False,
         # pyrefly: ignore [bad-return]
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.register_forward_pre_hook.__name__)
 
     def register_forward_hook(  # type: ignore[return, override]
@@ -380,9 +463,13 @@ class _RemoteModule(nn.Module):
         with_kwargs: bool = False,
         # pyrefly: ignore [bad-return]
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.register_forward_hook.__name__)
 
     def state_dict(self, *args, **kwargs):
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.state_dict.__name__)
 
     def load_state_dict(
@@ -391,9 +478,13 @@ class _RemoteModule(nn.Module):
         strict: bool = True,
         assign: bool = False,
     ):
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.load_state_dict.__name__)
 
     def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        # [FUNCTION DOC] Unsupported: always raises ValueError telling the user to
+        # call remote_parameters instead.
         raise ValueError(
             "Method ``parameters`` not supported for RemoteModule. Please use ``remote_parameters`` instead."
         )
@@ -405,9 +496,13 @@ class _RemoteModule(nn.Module):
         remove_duplicate: bool = True,
         # pyrefly: ignore [bad-return]
     ) -> Iterator[tuple[str, Parameter]]:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.named_parameters.__name__)
 
     def buffers(self, recurse: bool = True) -> Iterator[Tensor]:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.buffers.__name__)
 
     def named_buffers(  # type: ignore[return]
@@ -417,15 +512,23 @@ class _RemoteModule(nn.Module):
         remove_duplicate: bool = True,
         # pyrefly: ignore [bad-return]
     ) -> Iterator[tuple[str, Tensor]]:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.named_buffers.__name__)
 
     def children(self) -> Iterator[Module]:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.children.__name__)
 
     def named_children(self) -> Iterator[tuple[str, Module]]:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.named_children.__name__)
 
     def modules(self) -> Iterator[Module]:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.modules.__name__)
 
     def named_modules(
@@ -434,27 +537,49 @@ class _RemoteModule(nn.Module):
         prefix: str = "",
         remove_duplicate: bool = True,
     ):
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.named_modules.__name__)
 
     def train(self, mode: bool = True) -> Self:
+        # [FUNCTION DOC] Switches the remote module to training mode by calling train
+        # on the module over a synchronous RPC; returns whatever that
+        # remote call returns.
         return self.module_rref.rpc_sync().train()  # type: ignore[operator, union-attr]
 
     def eval(self) -> Self:
+        # [FUNCTION DOC] Switches the remote module to evaluation mode by calling eval
+        # on the module over a synchronous RPC; returns whatever that
+        # remote call returns.
         return self.module_rref.rpc_sync().eval()  # type: ignore[operator, union-attr]
 
     def requires_grad_(self, requires_grad: bool = True) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.requires_grad_.__name__)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.zero_grad.__name__)
 
     def share_memory(self) -> Self:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.share_memory.__name__)
 
     def extra_repr(self) -> str:  # type: ignore[return]
+        # [FUNCTION DOC] Unsupported on RemoteModule: always raises ValueError saying
+        # the method is not supported (no remote call is made).
         _raise_not_supported(self.extra_repr.__name__)
 
     def _prepare_init(self, remote_device_str: str) -> bool:
+        # [FUNCTION DOC] HELPER: Common initialization: asserts RPC is active, parses
+        # the remote device string, stores on (worker name, or rank if
+        # no name), device (string) and whether the remote worker has a
+        # device map. Returns True if the device is a cuda device,
+        # meaning CPU inputs may be moved to it. Raises AssertionError
+        # if RPC is not initialized.
         """Prepare the initialization and returns whether to enable automatically moving CPU tensors to CUDA devices."""
         # Sanity check.
         if not rpc._is_current_rpc_agent_set():
@@ -481,6 +606,9 @@ class _RemoteModule(nn.Module):
         return enable_moving_cpu_tensors_to_cuda
 
     def _init_template(self, module_interface_cls, enable_moving_cpu_tensors_to_cuda):
+        # [FUNCTION DOC] HELPER: Instantiates the scriptable template locally for the
+        # interface class and stores its generated methods on the
+        # instance.
         """Instantiate template on local side."""
         generated_module = instantiator.instantiate_scriptable_remote_module_template(
             module_interface_cls, enable_moving_cpu_tensors_to_cuda
@@ -488,6 +616,9 @@ class _RemoteModule(nn.Module):
         self.generated_methods = generated_module._generated_methods
 
     def _check_attribute_picklability(self):
+        # [FUNCTION DOC] HELPER: Verifies every instance attribute name is listed
+        # either as pickled or as intentionally unpickled; raises
+        # AttributeError for any other.
         """Check if all the attribute has explicitly defined whether to be pickled (i.e., picklability)."""
         for k in self.__dict__:
             if (
@@ -500,6 +631,9 @@ class _RemoteModule(nn.Module):
                 )
 
     def _install_generated_methods(self):
+        # [FUNCTION DOC] HELPER: Binds each generated function (exported for
+        # TorchScript) to this instance as a method named after the
+        # function.
         for method in self.generated_methods:
             method_name = method.__name__
             method = torch.jit.export(method)
@@ -511,6 +645,14 @@ class _RemoteModule(nn.Module):
         module_rref: rpc.RRef[nn.Module],
         _module_interface_cls: Any = None,
     ):
+        # [FUNCTION DOC] Alternative constructor: builds a RemoteModule around an
+        # existing module RRef instead of creating a new remote module,
+        # so several wrappers can share one remote module. Resolves the
+        # target device, sets scriptable or non-scriptable generated
+        # methods, stores the RRef, installs the methods and checks
+        # attributes. Returns the new instance. Raises AssertionError
+        # if RPC is not initialized.
+        # KNOWN ISSUE: the docstring example uses remote_module1 before assigning it.
         """
         Besides the constructor, a RemoteModule instance can also be initialized given a module RRef.
 
@@ -603,6 +745,12 @@ class _RemoteModule(nn.Module):
 
 
 class RemoteModule(_RemoteModule):
+    # [CLASS DOC] Public RemoteModule: an nn.Module-like handle to a module created on
+    # a remote worker, exposing a blocking forward and an asynchronous
+    # forward_async that mirror the remote module's forward. Adds no state
+    # beyond its base class; its constructor only forwards remote_device,
+    # module_cls, args and kwargs (without the experimental interface
+    # option).
     """
         A RemoteModule instance can only be created after RPC initialization.
 
@@ -685,12 +833,18 @@ class RemoteModule(_RemoteModule):
         args: tuple | None = None,
         kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Creates the remote module by delegating to the base
+        # constructor with the device string, class, args and kwargs.
         super().__init__(remote_device, module_cls, args, kwargs)
 
 
 def _remote_module_receiver(
     *remote_module_pickled_attrs,
 ):
+    # [FUNCTION DOC] HELPER: RPC unpickling function: rebuilds a RemoteModule from the
+    # tuple of pickled attributes without calling the constructor,
+    # restores the RRef through its deserializer, and installs the
+    # generated methods. Returns the new module.
     """Deserializes a RemoteModule."""
     serialized_remote_module = _SerializedRemoteModule._make(
         remote_module_pickled_attrs
@@ -711,6 +865,11 @@ def _remote_module_receiver(
 
 
 def _remote_module_reducer(remote_module):
+    # [FUNCTION DOC] HELPER: RPC pickling reducer: returns the receiver function and
+    # the tuple of values to pickle. The RRef is serialized with its
+    # own serializer; only declared attributes are kept. Attributes in
+    # neither declared list are skipped with a message printed to
+    # standard error.
     """Serialize a RemoteModule."""
     pickled_attrs = {}
     for k, v in remote_module.__dict__.items():
@@ -737,6 +896,8 @@ def _remote_module_reducer(remote_module):
 def _recursive_script_module_receiver(
     recursive_script_module_serialized,
 ):
+    # [FUNCTION DOC] HELPER: Unpickling function for a plain script module: loads a
+    # TorchScript module from the given bytes and returns it.
     """Deserializes a RecursiveScriptModule that does not contain a script RemoteModule."""
     f = io.BytesIO(recursive_script_module_serialized)
     m = torch.jit.load(f)
@@ -744,6 +905,10 @@ def _recursive_script_module_receiver(
 
 
 def _recursive_script_module_reducer(recursive_script_module):
+    # [FUNCTION DOC] HELPER: Pickling reducer for script modules: raises RuntimeError
+    # if the script module contains a script RemoteModule (module_rref
+    # present); otherwise saves it to bytes and returns the receiver
+    # function with those bytes.
     """Serialize a RecursiveScriptModule that does not contain a script RemoteModule, and raises an error otherwise."""
     if hasattr(recursive_script_module._c, "module_rref"):
         raise RuntimeError(

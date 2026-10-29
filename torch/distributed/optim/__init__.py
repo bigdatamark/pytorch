@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Package torch.distributed.optim: distributed and functional
+# optimizers. Public exports are as_functional_optim,
+# DistributedOptimizer (only when the RPC backend is compiled in),
+# PostLocalSGDOptimizer and ZeroRedundancyOptimizer. Private functional
+# optimizer classes and the in-backward optimizer helpers are imported
+# here for internal use.
 """
 :mod:`torch.distributed.optim` exposes DistributedOptimizer, which takes a list
 of remote parameters (:class:`~torch.distributed.rpc.RRef`) and runs the

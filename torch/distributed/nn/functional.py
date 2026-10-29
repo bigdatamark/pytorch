@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Differentiable (autograd-aware) wrappers around torch.distributed
+# collectives: broadcast, gather, scatter, reduce, reduce_scatter,
+# all_gather, all_to_all, all_to_all_single and all_reduce, plus a
+# private all-gather-into-tensor variant. Each public function is backed
+# by a private autograd Function whose backward applies the matching
+# collective on gradients. Most are deprecated in favor of functional
+# collectives and raise under torch.compile. Imports group and ReduceOp
+# from torch.distributed at import time.
 import warnings
 
 import torch
@@ -12,6 +20,9 @@ from torch.distributed import group, ReduceOp
 
 
 def _not_supported_under_compile(name, *, suggestion=None):
+    # [FUNCTION DOC] HELPER: Always raises RuntimeError saying the named function is
+    # not supported under torch.compile, with an optional suggestion of
+    # an alternative to use.
     msg = (
         f"torch.distributed.nn.functional.{name} is not supported under torch.compile."
     )
@@ -21,6 +32,8 @@ def _not_supported_under_compile(name, *, suggestion=None):
 
 
 def _deprecated(name, suggestion):
+    # [FUNCTION DOC] HELPER: Emits a FutureWarning that the named function is
+    # deprecated and the suggested alternative should be used.
     warnings.warn(
         f"torch.distributed.nn.functional.{name} is deprecated, "
         f"use {suggestion} instead.",
@@ -30,6 +43,10 @@ def _deprecated(name, suggestion):
 
 
 def broadcast(tensor, src, group=group.WORLD):
+    # [FUNCTION DOC] Broadcasts the tensor from rank src to all ranks of the group and
+    # returns the received tensor (a clone, not in place), with
+    # autograd support. Raises RuntimeError under torch.compile; emits
+    # a deprecation warning.
     """
     Broadcasts the tensor to the whole group.
 
@@ -56,6 +73,9 @@ def broadcast(tensor, src, group=group.WORLD):
 
 
 def gather(tensor, dst=0, group=group.WORLD):
+    # [FUNCTION DOC] Gathers the tensor from every rank onto rank dst and returns a
+    # tuple of tensors (one per rank), with autograd support. Raises
+    # RuntimeError under torch.compile.
     """
     Gathers a list of tensors in a single process.
 
@@ -73,6 +93,11 @@ def gather(tensor, dst=0, group=group.WORLD):
 
 
 def scatter(tensors, src=0, group=group.WORLD):
+    # [FUNCTION DOC] Scatters the given list of tensors from rank src so each rank
+    # receives one; returns this rank's tensor, with autograd support.
+    # Non-source ranks still pass a tensor list of the same length in
+    # order to size the output. Raises RuntimeError under
+    # torch.compile.
     """
     Scatters a list of tensors to all processes in a group.
 
@@ -95,6 +120,9 @@ def scatter(tensors, src=0, group=group.WORLD):
 
 
 def reduce(tensor, dst, op=ReduceOp.SUM, group=group.WORLD):
+    # [FUNCTION DOC] Reduces the tensor with the given reduction op onto rank dst and
+    # returns the result (a clone), with autograd support; only dst
+    # holds the final value. Raises RuntimeError under torch.compile.
     """
     Reduces the tensor data across all machines.
 
@@ -118,6 +146,10 @@ def reduce(tensor, dst, op=ReduceOp.SUM, group=group.WORLD):
 
 
 def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=group.WORLD):
+    # [FUNCTION DOC] Reduces the list of input tensors across ranks and scatters the
+    # results so each rank gets one piece, written into the output
+    # tensor which is also returned; with autograd support. Raises
+    # RuntimeError under torch.compile; emits a deprecation warning.
     """
     Reduces, then scatters a list of tensors to all processes in a group.
 
@@ -146,6 +178,9 @@ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=group.WORLD):
 
 
 def all_gather(tensor, group=group.WORLD):
+    # [FUNCTION DOC] Gathers the tensor from all ranks and returns a tuple of tensors
+    # (one per rank), with autograd support. Raises RuntimeError under
+    # torch.compile; emits a deprecation warning.
     """
     Gathers tensors from the whole group in a list.
 
@@ -169,6 +204,10 @@ def all_gather(tensor, group=group.WORLD):
 
 
 def _all_gather_base(output_tensor, input_tensor, group=group.WORLD):
+    # [FUNCTION DOC] HELPER: Experimental single-tensor all-gather: gathers inputs
+    # from all ranks into the pre-sized output tensor and returns it,
+    # with autograd support (backward only works on NCCL-like
+    # backends). Raises RuntimeError under torch.compile.
     """
     Single tensor all gather. Gathers a single tensor from all ranks, and puts them in a single output tensor.
 
@@ -207,6 +246,10 @@ def _all_gather_base(output_tensor, input_tensor, group=group.WORLD):
 
 
 def all_to_all(output_tensor_list, input_tensor_list, group=group.WORLD):
+    # [FUNCTION DOC] Every rank splits its input list of tensors across ranks and
+    # receives one piece from each rank into the output list; returns a
+    # tuple of the output tensors, with autograd support. Raises
+    # RuntimeError under torch.compile.
     """
     Each process scatters list of input tensors to all processes in a group and return gathered list of tensors in output list.
 
@@ -231,6 +274,10 @@ def all_to_all_single(
     input_split_sizes=None,
     group=group.WORLD,
 ):
+    # [FUNCTION DOC] Splits the input tensor along dim 0 (optionally with given split
+    # sizes), exchanges pieces among ranks and writes the concatenation
+    # into output, which is returned; with autograd support. Raises
+    # RuntimeError under torch.compile; emits a deprecation warning.
     """
     Each process splits input tensor and then scatters the split list to all processes in a group.
 
@@ -265,6 +312,10 @@ def all_to_all_single(
 
 
 def all_reduce(tensor, op=ReduceOp.SUM, group=group.WORLD):
+    # [FUNCTION DOC] Reduces the tensor across all ranks with the given op so every
+    # rank gets the same result (a clone), with autograd support.
+    # Raises RuntimeError under torch.compile; emits a deprecation
+    # warning.
     """
     Reduces the tensor data across all machines in such a way that all get the final result.
 
@@ -292,9 +343,14 @@ def all_reduce(tensor, op=ReduceOp.SUM, group=group.WORLD):
 
 
 class _Broadcast(Function):
+    # [CLASS DOC] HELPER: Autograd Function for broadcast. Forward clones the tensor
+    # and broadcasts it from src; backward sums the gradients onto src
+    # with a reduce and zeroes the result on non-source ranks.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, src, group, tensor):
+        # [FUNCTION DOC] HELPER: Saves src, group and the global rank on ctx, clones
+        # the tensor, broadcasts it in the group and returns it.
         ctx.src = src
         ctx.group = group
         ctx.global_rank = dist.get_rank()
@@ -307,6 +363,9 @@ class _Broadcast(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Reduces the gradient (sum) to the source rank; non-
+        # source ranks get zeros. Returns no gradient for src and
+        # group.
         gx = _Reduce.apply(ctx.src, ReduceOp.SUM, ctx.group, grad_output)
         if ctx.src != ctx.global_rank:
             gx.zero_()
@@ -314,9 +373,14 @@ class _Broadcast(Function):
 
 
 class _Gather(Function):
+    # [CLASS DOC] HELPER: Autograd Function for gather. Forward gathers tensors onto
+    # dst; backward scatters the gradients from dst.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, dst, group, tensor):
+        # [FUNCTION DOC] HELPER: Saves dst and group; allocates one zero tensor per
+        # rank, gathers the contiguous input (on dst receives into the
+        # list, elsewhere sends only) and returns the tuple.
         ctx.dst = dst
         ctx.group = group
         # Need to create a list of tensors here to do the
@@ -336,13 +400,21 @@ class _Gather(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] HELPER: Scatters the incoming gradients from dst back to all
+        # ranks; no gradient for dst and group.
         return (None, None) + (_Scatter.apply(ctx.dst, ctx.group, *grad_outputs),)
 
 
 class _Scatter(Function):
+    # [CLASS DOC] HELPER: Autograd Function for scatter. Forward scatters tensors from
+    # src; backward gathers the gradients onto src.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, src, group, *tensors):
+        # [FUNCTION DOC] HELPER: Saves src and group, checks that all input tensors
+        # have the same size (AssertionError otherwise), scatters them
+        # from src into a zero tensor shaped like the first and returns
+        # this rank's piece.
         ctx.src = src
         ctx.group = group
         if not all(t.size() == tensors[0].size() for t in tensors):
@@ -357,13 +429,20 @@ class _Scatter(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Gathers the gradient onto src and returns the
+        # gathered tuple placed after the empty gradients for src and
+        # group.
         return (None, None) + _Gather.apply(ctx.src, ctx.group, grad_output)
 
 
 class _Reduce(Function):
+    # [CLASS DOC] HELPER: Autograd Function for reduce. Forward reduces to src with
+    # the given op; backward broadcasts the gradient from src.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, src, op, group, tensor):
+        # [FUNCTION DOC] HELPER: Saves src and group, clones the tensor, reduces it
+        # onto src and returns it.
         ctx.src = src
         ctx.group = group
         tensor = tensor.clone()
@@ -373,13 +452,20 @@ class _Reduce(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Broadcasts the gradient from the destination rank; no
+        # gradient for src, op and group.
         return (None, None, None) + (_Broadcast.apply(ctx.src, ctx.group, grad_output),)
 
 
 class _Reduce_Scatter(Function):
+    # [CLASS DOC] HELPER: Autograd Function for reduce_scatter. Forward reduce-
+    # scatters inputs; backward all-gathers the gradient.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, op, group, tensor, *input_tensor_list):
+        # [FUNCTION DOC] HELPER: Saves group, makes tensors contiguous, reduce-
+        # scatters the input list into the output tensor and returns
+        # it.
         ctx.group = group
         # Need contiguous tensors for collectives.
         tensor = tensor.contiguous()
@@ -390,13 +476,21 @@ class _Reduce_Scatter(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: All-gathers the gradient over the group; returns no
+        # gradient for op, group and the output tensor argument slots.
         return (None, None, None) + _AllGather.apply(ctx.group, grad_output)
 
 
 class _AllGather(Function):
+    # [CLASS DOC] HELPER: Autograd Function for all_gather. Forward gathers tensors
+    # from all ranks; backward sums gradients over ranks and returns this
+    # rank's piece.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, group, tensor):
+        # [FUNCTION DOC] HELPER: Saves group, gathers the contiguous tensor from all
+        # ranks into freshly allocated tensors and returns them as a
+        # tuple.
         # Need contiguous tensors for collectives.
         tensor = tensor.contiguous()
 
@@ -410,6 +504,10 @@ class _AllGather(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] HELPER: Computes the input gradient: for NCCL and XCCL
+        # backends via a reduce-scatter of the gradients, otherwise via
+        # all-to-all then summing, since other backends lack reduce-
+        # scatter. Returns no gradient for the group.
         if dist.get_backend(group=ctx.group) in (dist.Backend.NCCL, dist.Backend.XCCL):
             rank = dist.get_rank(group=ctx.group)
             gx = torch.empty_like(grad_outputs[rank])
@@ -424,9 +522,14 @@ class _AllGather(Function):
 
 
 class _AllGatherBase(Function):
+    # [CLASS DOC] HELPER: Autograd Function for the single-tensor all-gather. Forward
+    # gathers into a preallocated output; backward reduce-scatters the
+    # gradient.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, output_tensor, input_tensor, group):
+        # [FUNCTION DOC] HELPER: Saves group, gathers the contiguous input from all
+        # ranks into the given output tensor and returns it.
         ctx.group = group
         dist._all_gather_base(output_tensor, input_tensor.contiguous(), group=group)
         return output_tensor
@@ -434,6 +537,10 @@ class _AllGatherBase(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Only supported on NCCL and XCCL: reduce-scatters
+        # (sum) the gradient into a tensor whose first dimension is
+        # divided by the world size. Raises RuntimeError if that
+        # dimension is not divisible or the backend is unsupported.
         if dist.get_backend(group=ctx.group) in (dist.Backend.NCCL, dist.Backend.XCCL):
             world_size = dist.get_world_size(group=ctx.group)
             out_size = list(grad_output.size())
@@ -453,9 +560,14 @@ class _AllGatherBase(Function):
 
 
 class _AlltoAll(Function):
+    # [CLASS DOC] HELPER: Autograd Function for all_to_all. Forward exchanges tensors
+    # between ranks; backward performs the reverse exchange.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, group, out_tensor_list, *tensors):
+        # [FUNCTION DOC] HELPER: Saves group and the input tensor sizes; for Gloo
+        # emulates all-to-all with one scatter per rank, otherwise uses
+        # all-to-all; returns the output tensors as a tuple.
         ctx.group = group
         ctx.input_tensor_size_list = [
             tensors[i].size() for i in range(dist.get_world_size(group=group))
@@ -479,6 +591,9 @@ class _AlltoAll(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        # [FUNCTION DOC] HELPER: Allocates tensors with the original input sizes and
+        # runs all-to-all on the gradients to route them back; no
+        # gradient for group and output list.
         tensor_list = [
             torch.empty(
                 size, device=grad_outputs[0].device, dtype=grad_outputs[0].dtype
@@ -489,9 +604,14 @@ class _AlltoAll(Function):
 
 
 class _AlltoAllSingle(Function):
+    # [CLASS DOC] HELPER: Autograd Function for all_to_all_single. Forward exchanges
+    # splits of one tensor; backward does the reverse exchange with split
+    # sizes swapped.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, group, output, output_split_sizes, input_split_sizes, input):
+        # [FUNCTION DOC] HELPER: Saves group, input size and swapped split sizes, runs
+        # all-to-all-single into output and returns output.
         ctx.group = group
         ctx.input_size = input.size()
         ctx.output_split_sizes = input_split_sizes
@@ -508,6 +628,9 @@ class _AlltoAllSingle(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Allocates a tensor of the original input size and
+        # runs all-to-all-single on the contiguous gradient with
+        # swapped split sizes; no gradients for the other arguments.
         tensor = torch.empty(
             ctx.input_size, device=grad_output.device, dtype=grad_output.dtype
         )
@@ -523,9 +646,14 @@ class _AlltoAllSingle(Function):
 
 
 class _AllReduce(Function):
+    # [CLASS DOC] HELPER: Autograd Function for all_reduce. Forward all-reduces a
+    # clone of the tensor; backward all-reduces the gradient with the same
+    # op.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, op, group, tensor):
+        # [FUNCTION DOC] HELPER: Saves group and op, clones the tensor, all-reduces it
+        # and returns it.
         ctx.group = group
         ctx.op = op
         tensor = tensor.clone(memory_format=torch.contiguous_format)
@@ -535,4 +663,6 @@ class _AllReduce(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: All-reduces the incoming gradient with the same op
+        # and group; no gradient for op and group.
         return (None, None) + (_AllReduce.apply(ctx.op, ctx.group, grad_output),)

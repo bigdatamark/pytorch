@@ -1,5 +1,11 @@
 #!/usr/bin/python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Generates and imports, at runtime, the Python module that supplies the
+# forward methods of a RemoteModule, from the text templates in
+# remote_module_template. Contains helpers to read argument and return
+# types from a TorchScript interface, a string-based module loader, and
+# scriptable and non-scriptable instantiation entry points. Generated
+# modules are cached in sys.modules.
 import importlib.abc
 import importlib.util
 import sys
@@ -14,6 +20,13 @@ _FILE_PREFIX = "_remote_module_"
 
 
 def get_arg_return_types_from_interface(module_interface):
+    # [FUNCTION DOC] Inspects the forward method of a TorchScript interface class.
+    # Returns a tuple of three strings: comma-joined argument names,
+    # comma-joined typed arguments with defaults (the self argument is
+    # dropped from both), and the single return type. Raises
+    # AssertionError if the class is not a TorchScript interface, has
+    # no forward method, or forward does not have exactly one return
+    # value.
     if not getattr(module_interface, "__torch_script_interface__", False):
         raise AssertionError(
             "Expect a TorchScript class interface decorated by @torch.jit.interface."
@@ -56,6 +69,10 @@ def get_arg_return_types_from_interface(module_interface):
 
 
 class _StringLoader(importlib.abc.SourceLoader):
+    # [CLASS DOC] HELPER: Import loader that serves a module from an in-memory source
+    # string. Stores the source in data; reports a fake filename and no
+    # filesystem stats, and executes the module by compiling the source
+    # directly to avoid bytecode caching.
     """
     A custom loader for dynamically generated Python source code.
 
@@ -66,22 +83,32 @@ class _StringLoader(importlib.abc.SourceLoader):
     """
 
     def __init__(self, data: str) -> None:
+        # [FUNCTION DOC] HELPER: Stores the generated source text.
         self.data = data
 
     def get_source(self, fullname: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the stored source for any module name.
         return self.data
 
     def get_data(self, path: str) -> bytes:
+        # [FUNCTION DOC] HELPER: Returns the stored source encoded as UTF-8 bytes
+        # regardless of path.
         return self.data.encode("utf-8")
 
     def get_filename(self, fullname: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns a synthetic filename derived from the module
+        # name.
         return f"<{fullname}>.py"
 
     def path_stats(self, path: str) -> dict:
+        # [FUNCTION DOC] HELPER: Always raises OSError because the source has no file
+        # on disk.
         # Raise OSError since source is dynamically generated (no filesystem stats)
         raise OSError("dynamically generated module has no filesystem stats")
 
     def exec_module(self, module) -> None:
+        # [FUNCTION DOC] HELPER: Compiles the stored source and executes it in the
+        # given module namespace. Mutates the module; returns nothing.
         """
         Execute the module by compiling and running the source directly.
 
@@ -97,6 +124,12 @@ class _StringLoader(importlib.abc.SourceLoader):
 def _do_instantiate_remote_module_template(
     generated_module_name, str_dict, enable_moving_cpu_tensors_to_cuda
 ):
+    # [FUNCTION DOC] HELPER: Returns the generated module with the given name,
+    # building it on first use: formats the template (chosen by the
+    # CPU-to-CUDA flag) with the string mapping, loads it through the
+    # string loader, registers it in sys.modules and runs it. If
+    # already in sys.modules, returns the cached module. Raises
+    # AssertionError if no import spec can be made.
     if generated_module_name in sys.modules:
         return sys.modules[generated_module_name]
 
@@ -117,6 +150,14 @@ def _do_instantiate_remote_module_template(
 def instantiate_scriptable_remote_module_template(
     module_interface_cls, enable_moving_cpu_tensors_to_cuda=True
 ):
+    # [FUNCTION DOC] Builds (or fetches from cache) the generated RemoteModule methods
+    # module for a TorchScript interface class. Derives a module name
+    # from the interface's qualified name, extracts argument and return
+    # types from its forward method, fills in the template fields
+    # (import of the interface, typed signature, future return type,
+    # script decorator) and instantiates it. The flag controls whether
+    # CPU tensors are moved to the module's CUDA device. Raises
+    # ValueError if the class is not a TorchScript interface.
     if not getattr(module_interface_cls, "__torch_script_interface__", False):
         raise ValueError(
             f"module_interface_cls {module_interface_cls} must be a type object decorated by "
@@ -156,6 +197,10 @@ def instantiate_scriptable_remote_module_template(
 
 
 def instantiate_non_scriptable_remote_module_template():
+    # [FUNCTION DOC] Builds (or fetches from cache) the generic generated module whose
+    # forward methods accept any positional and keyword arguments, with
+    # no type annotations and no script decorator. CPU-to-CUDA tensor
+    # moving is always enabled. Returns the module.
     generated_module_name = f"{_FILE_PREFIX}non_scriptable"
     str_dict = dict(
         assign_module_interface_cls="module_interface_cls = None",

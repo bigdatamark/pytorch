@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Deprecated command line launcher that spawns one training process per
+# local rank by delegating to torch.distributed.run (torchrun). Adds a
+# legacy --use-env flag on top of the torchrun parser. Importing has no
+# side effects; running as a script calls main.
 r"""
 Module ``torch.distributed.launch``.
 
@@ -166,6 +170,11 @@ from torch.distributed.run import get_args_parser, run
 
 
 def parse_args(args):
+    # [FUNCTION DOC] Builds the torchrun argument parser, adds the --use-env/--use_env
+    # flag (default False; when True the local rank is passed via the
+    # LOCAL_RANK environment variable instead of a --local-rank
+    # argument), and parses the given argument list (None means
+    # sys.argv). Returns the parsed namespace.
     parser = get_args_parser()
     parser.add_argument(
         "--use-env",
@@ -181,6 +190,9 @@ def parse_args(args):
 
 
 def launch(args):
+    # [FUNCTION DOC] Validates parsed arguments and runs the job through torchrun's
+    # run function. Raises ValueError if no_python is set without
+    # use_env. Side effect: spawns the worker processes.
     if args.no_python and not args.use_env:
         raise ValueError(
             "When using the '--no-python' flag, you must also set the '--use-env' flag."
@@ -199,6 +211,9 @@ def launch(args):
     category=FutureWarning,
 )
 def main(args=None):
+    # [FUNCTION DOC] Deprecated entry point (emits a FutureWarning on call): parses
+    # the command line (or the given list) and launches the job.
+    # Returns nothing.
     args = parse_args(args)
     launch(args)
 

@@ -7,4 +7,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+# [PACKAGE DOC] Package for the torchrun/elastic launcher API. Re-exports
+# elastic_launch, launch_agent and LaunchConfig from
+# torch.distributed.launcher.api.
 from torch.distributed.launcher.api import elastic_launch, launch_agent, LaunchConfig

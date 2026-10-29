@@ -4,6 +4,13 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Auto-wrapping policies and utilities for FSDP. Provides callable
+# policies (always, lambda, transformer-layer and size based), policy
+# classes (ModuleWrapPolicy, CustomPolicy) that map modules to wrapping
+# kwargs, the enable_wrap context manager with the wrap annotation, and
+# the private recursive wrapping machinery. Import-time side effect:
+# attaches default exclude and force-leaf module sets as attributes of
+# size_based_auto_wrap_policy.
 import contextlib
 import copy
 from abc import ABC, abstractmethod
@@ -32,6 +39,13 @@ def _post_order_apply(
     root_module: nn.Module,
     fn: Callable[[nn.Module], nn.Module | None],
 ):
+    # [FUNCTION DOC] HELPER: Applies fn to every module under root_module in post-
+    # order (children first), visiting each shared module once. If fn
+    # returns a module, it replaces the original in its parent by
+    # attribute assignment; None leaves it unchanged. Raises
+    # AssertionError if a replacement is requested for the root (no
+    # parent or name) or fn returns something other than None or a
+    # module.
     """
     This applies ``fn`` to every module in the module tree of ``root_module``
     following a post-order traversal. If ``fn`` returns an :class:`nn.Module`,
@@ -47,6 +61,10 @@ def _post_order_apply(
         module_name: str,
         parent_module: nn.Module | None,
     ):
+        # [FUNCTION DOC] HELPER: Recursive step of the post-order traversal: processes
+        # unvisited children first, then applies fn to the module and
+        # swaps in a returned replacement on the parent. Raises
+        # AssertionError on invalid replacement requests.
         for child_module_name, child_module in module.named_children():
             if child_module not in visited_modules:
                 visited_modules.add(child_module)
@@ -77,6 +95,11 @@ def _construct_wrap_fn(
     target_module_to_kwargs: dict[nn.Module, dict[str, Any]],
     fsdp_fn: Callable,
 ) -> Callable[[nn.Module], nn.Module | None]:
+    # [FUNCTION DOC] HELPER: Builds the function used with the post-order traversal:
+    # for a module that is a key of the target mapping and is not the
+    # root, it calls fsdp_fn with the module and its kwargs and returns
+    # the wrapped result; otherwise returns None. The root is never
+    # wrapped here because the caller handles it.
     """
     This constructs the "wrap" function to pass to :func:`_post_order_apply`
     based on ``target_module_to_kwargs``, which should be constructed from the
@@ -84,6 +107,8 @@ def _construct_wrap_fn(
     """
 
     def fn(module: nn.Module) -> nn.Module | None:
+        # [FUNCTION DOC] HELPER: Returns the wrapped module for targeted non-root
+        # modules, else None.
         # Explicitly avoid wrapping the root module since for FSDP, it is
         # handled by the caller
         if module in target_module_to_kwargs and module is not root_module:
@@ -101,6 +126,12 @@ def _run_mixed_precision_override_policy(
     root_kwargs: dict[str, Any],
     target_module_to_kwargs: dict[nn.Module, dict[str, Any]],
 ):
+    # [FUNCTION DOC] HELPER: Mixed-precision override policy: for every non-ignored
+    # module (found by walking the root) that is an instance of the
+    # given classes, ensures an entry in the target mapping (new
+    # entries reuse the root kwargs object, not a copy) and sets that
+    # entry's mixed_precision to None. Mutates and returns the target
+    # mapping.
     module_classes_tuple = tuple(set(module_classes))
     for module in root_module.modules():
         if module in ignored_modules:
@@ -115,6 +146,8 @@ def _run_mixed_precision_override_policy(
 
 
 def always_wrap_policy(*args, **kwargs) -> bool:
+    # [FUNCTION DOC] Auto wrap policy that ignores all arguments and always returns
+    # True, so every submodule is wrapped.
     """
     A simple recursive wrap policy that always returns ``True``. This means
     that every submodule is wrapped by the wrapper class in
@@ -124,6 +157,9 @@ def always_wrap_policy(*args, **kwargs) -> bool:
 
 
 class _Policy(ABC):
+    # [CLASS DOC] HELPER: Abstract base for wrapping policies. A policy decides, for a
+    # root module, ignored modules and root kwargs, which modules get the
+    # API applied and with which kwargs, via _run_policy.
     """
     This defines an abstract base class that represents a policy for applying
     a module-level API.
@@ -136,6 +172,8 @@ class _Policy(ABC):
         ignored_modules: set[nn.Module],
         root_kwargs: dict[str, Any],
     ) -> dict[nn.Module, dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Abstract: subclasses return a mapping from each
+        # target module to its kwargs.
         """
         This should return a dict ``target_module_to_kwargs`` that maps from
         each target module to wrap to its kwargs.
@@ -149,6 +187,10 @@ def _module_wrap_policy(
     nonwrapped_numel: int,
     module_classes: set[type[nn.Module]],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Auto wrap policy: while recursing it returns True so
+    # traversal continues; when deciding for a module it returns
+    # whether the module is an instance of any given module class. The
+    # nonwrapped_numel argument is unused.
     """
     This auto wrap policy wraps every module that is an instance of any type in
     ``module_classes`` as its own FSDP instance. The root module given by
@@ -176,12 +218,18 @@ def _module_wrap_policy(
 
 
 class ModuleWrapPolicy(_Policy):
+    # [CLASS DOC] Policy that targets every non-ignored module that is an instance of
+    # the given module classes, each getting a shallow copy of the root
+    # kwargs. Stores the class set and its string form. Also callable as a
+    # legacy auto wrap policy function.
     """
     This policy applies to every module of the specified module classes,
     passing in the kwargs given to the root.
     """
 
     def __init__(self, module_classes: Iterable[type[nn.Module]]):
+        # [FUNCTION DOC] Stores the module classes as a set (and its string form for
+        # repr).
         module_classes_set = set(module_classes)
         self._module_classes = module_classes_set
         self._module_classes_str = str(module_classes_set)
@@ -192,6 +240,9 @@ class ModuleWrapPolicy(_Policy):
         ignored_modules: set[nn.Module],
         root_kwargs: dict[str, Any],
     ) -> dict[nn.Module, dict[str, Any]]:
+        # [FUNCTION DOC] Walks the root's modules, skipping ignored ones, and returns
+        # a mapping from each instance of the configured classes to a
+        # shallow copy of the root kwargs.
         module_classes = tuple(self._module_classes)
         target_module_to_kwargs: dict[nn.Module, dict[str, Any]] = {}
         for module in root_module.modules():
@@ -203,16 +254,25 @@ class ModuleWrapPolicy(_Policy):
         return target_module_to_kwargs
 
     def __call__(self, module, recurse, *args, **kwargs):
+        # [FUNCTION DOC] Legacy callable form: returns True when recursing, otherwise
+        # whether the module is an instance of the configured classes.
+        # Extra arguments are ignored.
         # nonwrapped_numel is not used.
         return _module_wrap_policy(
             module, recurse, nonwrapped_numel=-1, module_classes=self._module_classes
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the default representation followed by the string
+        # form of the module class set.
         return super().__repr__() + f"({self._module_classes_str})"
 
 
 class CustomPolicy(_Policy):
+    # [CLASS DOC] Policy driven by a user function mapping each module to False
+    # (skip), True (apply with the root kwargs) or a kwargs dictionary
+    # (apply with the root kwargs overridden by it). An empty dictionary
+    # counts as skip.
     """
     This policy takes in a lambda function that maps a given ``nn.Module`` to
     either ``False``, ``True``, or a kwarg dictionary.
@@ -238,6 +298,7 @@ class CustomPolicy(_Policy):
     """
 
     def __init__(self, lambda_fn: Callable[[nn.Module], bool | dict[str, Any]]):
+        # [FUNCTION DOC] Stores the user function.
         self._lambda_fn = lambda_fn
 
     def _run_policy(
@@ -246,6 +307,11 @@ class CustomPolicy(_Policy):
         ignored_modules: set[nn.Module],
         root_kwargs: dict[str, Any],
     ) -> dict[nn.Module, dict[str, Any]]:
+        # [FUNCTION DOC] Calls the user function on each non-ignored module and builds
+        # the mapping of targeted modules to kwargs (a copy of the root
+        # kwargs, updated by a returned dictionary). Raises ValueError
+        # if the function returns something other than a boolean or
+        # dictionary.
         target_module_to_kwargs: dict[nn.Module, dict[str, Any]] = {}
         for module in root_module.modules():
             if module in ignored_modules:
@@ -270,6 +336,9 @@ class CustomPolicy(_Policy):
 def lambda_auto_wrap_policy(
     module: nn.Module, recurse: bool, nonwrapped_numel: int, lambda_fn: Callable
 ) -> bool:
+    # [FUNCTION DOC] Legacy auto wrap policy: returns True while recursing; otherwise
+    # returns the result of the user function on the module.
+    # nonwrapped_numel is unused.
     """
     A convenient auto wrap policy to wrap submodules based on an arbitrary user
     function. If `lambda_fn(submodule) == True``, the submodule will be wrapped as
@@ -301,6 +370,11 @@ def transformer_auto_wrap_policy(
     nonwrapped_numel: int,
     transformer_layer_cls: set[type[nn.Module]],
 ) -> bool:
+    # [FUNCTION DOC] Legacy auto wrap policy equivalent to the module-class policy
+    # with the transformer layer classes; useful so that shared
+    # embeddings end up in the same FSDP instance. Returns True while
+    # recursing, else whether the module is an instance of those
+    # classes.
     """
     See :func:`_module_wrap_policy`, where ``transformer_layer_cls`` is the
     same as ``module_classes``. Note that shared parameters must be wrapped in
@@ -313,6 +387,9 @@ def transformer_auto_wrap_policy(
 def _wrap_module_cls_individually(
     module: nn.Module, module_classes: Sequence[type], recurse: bool, *args, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Legacy auto wrap policy: returns True while recursing,
+    # otherwise whether the module is an instance of any of the given
+    # classes. Extra arguments are ignored.
     if recurse:
         # always recurse
         return True
@@ -328,6 +405,9 @@ def _or_policy(
     nonwrapped_numel: int,
     policies,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Combines several legacy policies: returns True if any
+    # policy, called with the module, recurse flag and unwrapped
+    # parameter count, returns True.
     """
     A policy that wraps ``module`` if any policy in the passed in iterable of
     ``policies`` returns ``True``.
@@ -347,6 +427,12 @@ def size_based_auto_wrap_policy(
     force_leaf_modules: set[type[nn.Module]] | None = None,
     exclude_wrap_modules: set[type[nn.Module]] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Size based auto wrap policy. Uses the given or default (function
+    # attribute) force-leaf and exclude sets. A module is large when
+    # its not-yet-wrapped parameter count is at least min_num_params.
+    # While recursing it returns True if the module is large and not a
+    # force-leaf type (keep descending); when deciding it returns True
+    # if the module is large and not an excluded type (wrap it).
     """
     A size-based auto wrap policy.
 
@@ -401,6 +487,11 @@ size_based_auto_wrap_policy.FORCE_LEAF_MODULES = {nn.MultiheadAttention}  # type
 def enable_wrap(
     *, wrapper_cls: Any, **wrapper_kwargs: Any
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that turns on the global auto-wrap context with
+    # the given wrapper class and keyword arguments, so wrap calls
+    # inside the block wrap modules with them. Restores the global
+    # state on exit. Raises NotImplementedError if nested inside
+    # another such context.
     """
     Context manager to wrap modules using a wrapper.
 
@@ -434,6 +525,10 @@ def enable_wrap(
 
 
 def wrap(module: nn.Module, **wrap_overrides: Any) -> nn.Module:
+    # [FUNCTION DOC] Wraps the module with the active context's wrapper class, using
+    # the context kwargs updated by the given overrides; outside an
+    # enable_wrap context returns the module unchanged. Raises
+    # AssertionError if the context has no wrapper class.
     """
     Annotate that a module should be wrapped. Annotated modules will only be
     wrapped if inside of an :func:`enable_wrap` context manager. This allows
@@ -472,6 +567,10 @@ def wrap(module: nn.Module, **wrap_overrides: Any) -> nn.Module:
 
 
 def _wrap(module: nn.Module, wrapper_cls: Callable, **kwargs) -> nn.Module:
+    # [FUNCTION DOC] HELPER: Constructs the wrapper around the module with the given
+    # kwargs; if the module has a _wrap_overrides attribute, those
+    # values take priority over the kwargs. Raises AssertionError if no
+    # wrapper class is given.
     if wrapper_cls is None:
         raise AssertionError("Expected wrapper_cls to be set")
     if hasattr(module, "_wrap_overrides"):
@@ -494,6 +593,15 @@ def _recursive_wrap(
     only_wrap_children: bool = False,
     **kwargs: Any,
 ) -> tuple[nn.Module, int]:
+    # [FUNCTION DOC] HELPER: Recursively wraps submodules for which the auto wrap
+    # policy says to wrap, bottom-up, skipping ignored modules and
+    # replacing children in place by attribute assignment. Counts
+    # parameters not yet wrapped; after wrapping children, the module
+    # itself is wrapped when the policy accepts the remaining count
+    # (unless only_wrap_children). Returns the resulting module and the
+    # number of parameter elements that were wrapped. Raises
+    # AssertionError if the policy or wrapper class is missing or a
+    # child is already an instance of the wrapper class.
     """
     Wraps submodules of ``module`` for which ``auto_wrap_policy`` returns
     ``True`` with ``wrapper_cls``.
@@ -566,6 +674,11 @@ def _recursive_wrap(
 
 
 class _ConfigAutoWrap:
+    # [CLASS DOC] HELPER: Context manager holding the global auto-wrap state as class
+    # attributes: whether a context is active, the wrapper class and the
+    # wrapper kwargs. Entering enables the context with the instance's
+    # kwargs; exiting resets the state. Only one context may be active at
+    # a time.
     """
     Helper class to wrap modules based on default config args via a context manager.
     See :func:`enable_wrap` for more information.
@@ -576,10 +689,17 @@ class _ConfigAutoWrap:
     kwargs: dict[str, Any] = {}  # Wrapper's args
 
     def __init__(self, **kwargs: dict[str, Any]):
+        # [FUNCTION DOC] HELPER: Stores the keyword arguments (including wrapper_cls)
+        # for use on enter.
         self.kwargs = kwargs
 
     @staticmethod
     def enable_autowrap_context(kwargs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Activates the global context: records the wrapper
+        # class taken out of the kwargs (removing it from them) and the
+        # remaining kwargs. Raises NotImplementedError if already
+        # active and AssertionError if wrapper_cls is absent. Mutates
+        # the passed kwargs and class-level state.
         if _ConfigAutoWrap.in_autowrap_context:
             raise NotImplementedError(
                 "You are already within an autowrap context and we currently do not supported nested autowrap."
@@ -597,12 +717,18 @@ class _ConfigAutoWrap:
 
     @staticmethod
     def disable_autowrap_context() -> None:
+        # [FUNCTION DOC] HELPER: Resets the global context: inactive, no wrapper
+        # class, empty kwargs.
         _ConfigAutoWrap.in_autowrap_context = False
         _ConfigAutoWrap.wrapper_cls = None
         _ConfigAutoWrap.kwargs = {}
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: Enables the global auto-wrap context using this
+        # instance's kwargs.
         self.enable_autowrap_context(self.kwargs)
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # [FUNCTION DOC] HELPER: Disables the global auto-wrap context; does not
+        # suppress exceptions.
         self.disable_autowrap_context()

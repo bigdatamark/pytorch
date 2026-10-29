@@ -6,6 +6,11 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Public API for launching a torchelastic job in-process: the
+# LaunchConfig dataclass, the elastic_launch callable wrapper and the
+# launch_agent function that sets up rendezvous, worker spec and
+# LocalElasticAgent and runs it. Exports LaunchConfig, elastic_launch and
+# launch_agent. Import-time side effect: creates a module logger.
 import os
 import sys
 import uuid
@@ -46,6 +51,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class LaunchConfig:
+    # [CLASS DOC] Dataclass holding all settings for an elastic launch: node counts
+    # (min_nodes, max_nodes), workers per node, rendezvous
+    # backend/endpoint/configs, run id, role, restart and monitoring
+    # settings, start method, logging specs, metrics config, NUMA options,
+    # signal list, stdout/stderr duplication filters, virtual local rank
+    # and shutdown timeout. After construction, __post_init__ fills in
+    # defaults and normalizes values.
     """
     Creates a rendezvous config.
 
@@ -123,6 +135,15 @@ class LaunchConfig:
     shutdown_timeout: int | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Normalizes the config after construction. Copies a legacy
+        # rdzv_timeout (when not -1) into the rendezvous configs,
+        # otherwise defaults the rendezvous timeout to 900 seconds if
+        # absent. Creates default logs specs if none given. If NUMA
+        # options are unset and the accelerator count equals
+        # nproc_per_node, uses the default NUMA options. Resolves
+        # shutdown_timeout from the TORCH_ELASTIC_SHUTDOWN_TIMEOUT
+        # environment variable (default 30) when unset. Raises
+        # ValueError for a negative shutdown_timeout. Mutates self.
         default_timeout = 900
         if self.rdzv_timeout != -1:
             self.rdzv_configs["timeout"] = self.rdzv_timeout
@@ -157,6 +178,10 @@ class LaunchConfig:
 
 
 class elastic_launch:
+    # [CLASS DOC] Callable wrapper that binds a LaunchConfig, an entrypoint (function
+    # or command string) and an optional health check server. Calling it
+    # with positional arguments runs launch_agent and returns a mapping
+    # from global rank to that worker's return value.
     """
     Launches a torchelastic agent on the container that invoked the entrypoint.
 
@@ -189,11 +214,17 @@ class elastic_launch:
         entrypoint: Callable | str | None,
         health_check_server: HealthCheckServer | None = None,
     ):
+        # [FUNCTION DOC] Stores the config, entrypoint and optional health check
+        # server for later calls.
         self._config = config
         self._entrypoint = entrypoint
         self._health_check_server = health_check_server
 
     def __call__(self, *args):
+        # [FUNCTION DOC] Runs launch_agent with the stored config, entrypoint and
+        # health check server, passing the positional arguments as the
+        # entrypoint arguments. Returns its result (mapping from rank
+        # to return value).
         return launch_agent(
             self._config,
             self._entrypoint,
@@ -203,6 +234,14 @@ class elastic_launch:
 
 
 def _get_entrypoint_name(entrypoint: Callable | str | None, args: list[Any]) -> str:
+    # [FUNCTION DOC] HELPER: Derives a display name for the entrypoint: the function
+    # name for a callable; for a string equal to the Python executable,
+    # the first argument that does not start with a hyphen (empty
+    # string if none); otherwise the string itself; empty string for
+    # anything else.
+    # KNOWN ISSUE: the docstring says the function's qualified name is used but the
+    # code uses its plain name. An empty-string argument would also raise an
+    # IndexError.
     """Retrieve entrypoint name with the rule:
     1. If entrypoint is a function, use ``entrypoint.__qualname__``.
     2. If entrypoint is a string, check its value:
@@ -225,6 +264,10 @@ def _get_entrypoint_name(entrypoint: Callable | str | None, args: list[Any]) -> 
 def _get_addr_and_port(
     rdzv_parameters: RendezvousParameters,
 ) -> tuple[str | None, int | None]:
+    # [FUNCTION DOC] HELPER: For the static rendezvous backend, parses the rendezvous
+    # endpoint into a master address and port; for other backends
+    # returns a pair of None. Raises ValueError if the endpoint is
+    # empty or has no port.
     if rdzv_parameters.backend != "static":
         return (None, None)
     endpoint = rdzv_parameters.endpoint
@@ -247,6 +290,18 @@ def launch_agent(
     args: list[Any],
     health_check_server: HealthCheckServer | None = None,
 ) -> dict[int, Any]:
+    # [FUNCTION DOC] Launches a local elastic agent for this node and blocks until
+    # workers finish. Generates a random run id if missing (mutating
+    # the config), logs the config, builds rendezvous parameters, sets
+    # the TORCHELASTIC_SIGNALS_TO_HANDLE environment variable,
+    # optionally starts an early health check server when a health
+    # check port is configured and a feature knob is on, builds the
+    # WorkerSpec and LocalElasticAgent, initializes metrics, and runs
+    # the agent. Returns a mapping from global rank to return value.
+    # Raises ChildFailedError if any worker failed, re-raises
+    # SignalException (without shutting down rendezvous) and other
+    # errors after recording a failure event; otherwise the rendezvous
+    # handler is shut down at the end.
     if not config.run_id:
         run_id = str(uuid.uuid4().int)
         logger.warning("config has no run_id, generated a random run_id: %s", run_id)

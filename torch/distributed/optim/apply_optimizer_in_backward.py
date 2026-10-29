@@ -1,3 +1,9 @@
+# [MODULE DOC] Support for running optimizers inside the backward pass. Defines two
+# weak-keyed global maps from parameter to registered hook handles and to
+# the parameter's gradient-accumulation autograd node, a function that
+# attaches per-parameter optimizers (optionally via hooks that step and
+# clear the gradient), and a function that collects those optimizers from
+# a module. Nothing is publicly exported.
 from collections.abc import Iterable
 from typing import Any, no_type_check
 
@@ -21,6 +27,15 @@ def _apply_optimizer_in_backward(
     optimizer_kwargs: dict[str, Any],
     register_hook: bool = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each parameter, creates its own optimizer instance of
+    # the given class with the given keyword arguments and records it,
+    # its class and its kwargs in private list attributes set on the
+    # parameter. If register_hook is true, registers a hook on the
+    # parameter's gradient accumulation node that steps every in-
+    # backward optimizer of the parameter and then sets the gradient to
+    # None; hook handles are stored in the global handle map. The
+    # accumulation node is created once and reused for shared
+    # parameters. Logs API usage. Returns nothing.
     """
     Upon ``backward()``, the optimizer specified for each parameter will fire after
     the gradient has been accumulated into the parameter.
@@ -55,6 +70,11 @@ def _apply_optimizer_in_backward(
 
     @no_type_check
     def _apply_optimizer_in_backward_to_param(param: torch.nn.Parameter) -> None:
+        # [FUNCTION DOC] HELPER: Per-parameter worker for the enclosing function:
+        # caches the parameter's AccumulateGrad node, builds the
+        # optimizer, appends bookkeeping attributes to the parameter,
+        # and (unless register_hook is false) installs the step-then-
+        # clear-gradient hook, remembering its handle.
         # view_as creates a node in autograd graph that allows us access to the
         # parameter's AccumulateGrad autograd function object. We register a
         # hook on this object to fire the optimizer when the gradient for
@@ -84,6 +104,10 @@ def _apply_optimizer_in_backward(
             return
 
         def optimizer_hook(*_unused) -> None:
+            # [FUNCTION DOC] HELPER: Hook run when the parameter's gradient has been
+            # accumulated: steps each in-backward optimizer of the
+            # parameter, then sets its gradient to None. Ignores its
+            # arguments.
             for opt in param._in_backward_optimizers:  # type: ignore[attr-defined]
                 opt.step()
 
@@ -99,6 +123,9 @@ def _apply_optimizer_in_backward(
 
 
 def _get_in_backward_optimizers(module: torch.nn.Module) -> list[torch.optim.Optimizer]:
+    # [FUNCTION DOC] HELPER: Returns a flat list of all in-backward optimizers
+    # attached to the parameters of the module (parameters without any
+    # contribute nothing).
     """
     Return a list of in-backward optimizers applied to ``module``'s parameters. Note that these
     optimizers are not intended to directly have their ``step`` or ``zero_grad`` methods called
