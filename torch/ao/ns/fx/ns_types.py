@@ -1,3 +1,6 @@
+# [MODULE DOC] Type definitions for the FX numeric suite: result-type enum, subgraph tuple,
+# and type aliases for single results, nested results mappings, and node target types.
+# No import-time side effects beyond defining these names.
 import enum
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -6,12 +9,15 @@ from torch.fx.graph import Node
 
 
 class NSSingleResultValuesType(str, enum.Enum):
+    # [CLASS DOC] String enum of the kinds of logged values: weight, node_output, node_input.
     WEIGHT = "weight"
     NODE_OUTPUT = "node_output"
     NODE_INPUT = "node_input"
 
 
 class NSSubgraph(NamedTuple):
+    # [CLASS DOC] Named tuple describing a matched subgraph: its start node, end node, and the base op node
+    # (the node whose target type identifies the subgraph).
     start_node: Node
     end_node: Node
     base_op_node: Node

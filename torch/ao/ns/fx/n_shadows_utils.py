@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for the "n shadows" numeric suite workflow: for each matched linear
+# subgraph of a model, create several transformed (e.g. differently quantized) copies that run as
+# shadows of the original with loggers attached, then extract and summarize the logged results.
+# Contains subgraph extraction, shadow graph construction, weight extraction and result
+# grouping/printing helpers. Defines module constants for shadow name prefixes and the set of
+# binary functions; no other import-time side effects.
 import collections
 import copy
 import operator
@@ -36,14 +42,19 @@ BINARY_FUNCTIONS = {
 
 
 def _get_attr_name(subgraph_idx, subgraph_candidate_idx):
+    # [FUNCTION DOC] HELPER: Returns the attribute name for a shadow submodule: the shadow prefix, the subgraph index and the candidate index joined by underscores.
     return f"{SHADOW_NODE_NAME_PREFIX}_{subgraph_idx}_{subgraph_candidate_idx}"
 
 
 def _get_attr_wrapper_name(subgraph_idx, subgraph_candidate_idx):
+    # [FUNCTION DOC] HELPER: Returns the attribute name for a shadow wrapper module: the wrapper prefix, subgraph index and candidate index joined by underscores.
     return f"{SHADOW_WRAPPER_NODE_NAME_PREFIX}_{subgraph_idx}_{subgraph_candidate_idx}"
 
 
 class OutputProp:
+    # [CLASS DOC] HELPER: Interpreter-style pass over a GraphModule graph. After propagate runs on example inputs,
+    # each node whose result is a tensor has that result stored on its traced_result attribute.
+    # State: the module, its graph, and a mapping of module names to submodules.
     """
     Output propagation (modeled from shape propagation).
 
@@ -55,18 +66,26 @@ class OutputProp:
     """
 
     def __init__(self, mod):
+        # [FUNCTION DOC] HELPER: Stores the module, its graph, and a dictionary of its named submodules.
         self.mod = mod
         self.graph = mod.graph
         self.modules = dict(self.mod.named_modules())
 
     def propagate(self, *args):
+        # [FUNCTION DOC] HELPER: Executes the graph node by node, consuming args in order for placeholders, and records
+        # tensor results on node.traced_result (mutating the graph's nodes). Supports placeholder, get_attr,
+        # call_function, call_method and call_module nodes; raises a runtime error for a missing attribute path.
+        # Returns None.
+        # KNOWN ISSUE: an output node (or any other op) reuses the previous result or hits an unbound variable; only the listed ops are intended.
         args_iter = iter(args)
         env: dict[str, Node] = {}
 
         def load_arg(a):
+            # [FUNCTION DOC] HELPER: Replaces Node references in a with their computed values from the environment.
             return torch.fx.graph.map_arg(a, lambda n: env[n.name])
 
         def fetch_attr(target: str):
+            # [FUNCTION DOC] HELPER: Resolves a dotted attribute path on the module; raises a runtime error naming the missing prefix.
             target_atoms = target.split(".")
             attr_itr = self.mod
             for i, atom in enumerate(target_atoms):
@@ -104,6 +123,10 @@ class OutputProp:
 
 
 def _get_dedup_subgraphs(matches: dict[str, _MatchResult]) -> dict[str, list[Node]]:
+    # [FUNCTION DOC] HELPER: Converts matcher results (unique per node) into a mapping from match name to a chronological
+    # list of nodes, unique per subgraph. Walks matches in reverse insertion order, skipping any match that
+    # shares a node with an earlier one; normalizes the irregular match node structure (single node, pair,
+    # or nested tuple with three nodes) into a list. Raises an error on unexpected shapes.
     # the original matches variable is unique by node, make it unique by subgraph
     # instead
     seen_nodes = set()
@@ -173,6 +196,9 @@ def _get_dedup_subgraphs(matches: dict[str, _MatchResult]) -> dict[str, list[Nod
             # in https://github.com/pytorch/pytorch/pull/80521/files#r975918836
 
             def _order_nodes(node_a, node_b, node_c) -> list[Node]:
+                # [FUNCTION DOC] HELPER: Given three linear-chain nodes in unknown order, returns them as a list ordered last, middle,
+                # first, found by checking whether each node's first arg and first user are within the set. Raises an error
+                # if the three nodes do not form a chain.
                 nodes = [node_a, node_b, node_c]
                 first_node = None
                 mid_node = None
@@ -226,6 +252,9 @@ def _get_logger_for_subgraph(
     logger_cls: Callable,
     fqn: str | None,
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Instantiates logger_cls for the output of a subgraph from first_node to last_node, with a model
+    # name encoding the subgraph and candidate indices, an empty string used if fqn is None, and the qconfig
+    # string. The logger is disabled initially (enabled set to false) and returned.
     """
     Given a model and a linear subgraph starting from `first_node` and
     ending with `last_node`, creates a logger for the end of this
@@ -258,6 +287,12 @@ def create_submodule_from_subgraph(
     first_node: Node,
     last_node: Node,
 ) -> GraphModule:
+    # [FUNCTION DOC] Builds a new GraphModule containing a copy of the linear subgraph from first_node to last_node of model.
+    # Inputs of the first node become placeholders (unique names; list args handled elementwise); later
+    # nodes receive the previous copy as first arg, with Parameter args copied as new attributes and numeric/dtype
+    # args reused. call_module targets are deep-copied. Raises an error for binary functions after the first node,
+    # nodes with multiple users, unsupported ops or argument types, or more than 100 iterations.
+    # KNOWN ISSUE: Parameter handling calls a placeholder method on the GraphModule instead of its graph, which looks wrong and would fail.
     """
     Input: a model, and a linear subgraph within the model from first_node to
       last_node.
@@ -289,7 +324,9 @@ def create_submodule_from_subgraph(
     #
 
     class M(torch.nn.Module):
+        # [CLASS DOC] HELPER: Empty module used only to obtain a blank traced GraphModule.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Placeholder forward that does nothing; its traced nodes are erased immediately.
             pass
 
     m = M()
@@ -322,6 +359,8 @@ def create_submodule_from_subgraph(
             def _add_placeholder(
                 g: Graph, node: Node, seen_names, old_name_to_new_node
             ):
+                # [FUNCTION DOC] HELPER: Adds a placeholder to graph g named after node plus a counter that keeps names unique within
+                # seen_names, records the mapping from old node name to the placeholder, and returns the placeholder.
                 # note: for graphs starting with patterns such as `y = x + x`, we
                 # need to ensure we do not add multiple placeholders with the
                 # same name
@@ -470,6 +509,14 @@ def create_one_transformed_and_logged_copy_of_subgraph(
     custom_prepare_fn: Callable | None = None,
     custom_prepare_kwargs: dict[str, Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Instruments one candidate copy of the subgraph first_node..last_node inside mt (mutating mt and its graph).
+    # Candidate 0 is the float baseline: an OutputLogger module is attached after last_node. For candidate k>0,
+    # the qconfig for first_node is looked up in entry k-1 of the qconfig list (a None qconfig means nothing is
+    # added); the subgraph is copied into a wrapper module, prepared with prepare_fx or custom_prepare_fn
+    # (whose kwargs must not include example_inputs, prepare_custom_config or qconfig_mapping, else an error is raised),
+    # attached to mt as a shadow wrapper, called from the graph with the first node's Node args, and followed by an
+    # OutputComparisonLogger taking the wrapper output and last_node. The single-element list last_added_shadow_node_list
+    # tracks where to insert next and is updated. Raises an error if a target attribute name already exists. Recompiles mt.
     """
     Given a subgraph in `mt` and a subgraph candidate idx, inserts the
     subgraph candidate copy and instruments it with loggers.
@@ -632,6 +679,12 @@ def create_n_transformed_and_logged_copies_of_subgraph(
     custom_prepare_fn: Callable | None = None,
     custom_prepare_kwargs: dict[str, Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Creates the baseline plus one transformed copy per qconfig mapping for one subgraph of mt and instruments each
+    # with loggers, in natural order. Silently returns (with a printed message in two cases) when the subgraph contains
+    # non-Node items, no example input (traced_result of the previous node) is available, or no qconfig applies to the
+    # first node. Example inputs are taken from the previous node's traced_result.
+    # KNOWN ISSUE: when the previous input is a tuple, example_inputs becomes a generator rather than a tuple, which can be consumed once only.
+    # Mutates mt through create_one_transformed_and_logged_copy_of_subgraph.
     """
     Given a model `mt` and a subgraph_idx, creates the needed copies
     of the subgraph for all qconfigs, and instruments them with loggers.
@@ -730,6 +783,11 @@ def create_add_loggers_graph(
     qconfig_mapping: QConfigMapping,
     node_name_to_qconfig: dict[str, QConfigAny],
 ) -> None:
+    # [FUNCTION DOC] Mutates model's graph so each deduplicated subgraph has a shadow path. Step 1: for each subgraph (or lone node),
+    # either create a quantized shadow wrapper (when the first node has a qconfig) or copy the plain nodes, each followed
+    # by a logger (OutputLogger for the original, OutputComparisonLogger for the shadow). Step 2: rewire each shadow's
+    # inputs so they come from the preceding shadow outputs, to measure propagated error. Model is recompiled.
+    # Raises an error on attribute name collisions, non-linear subgraphs, or missing shadow modules.
     r"""
     Given a model, a model graph partition (currently a set of matched
     subgraphs) and instructions how to transform each subgraph
@@ -765,6 +823,7 @@ def create_add_loggers_graph(
     from torch.ao.ns._numeric_suite_fx import OutputComparisonLogger, OutputLogger
 
     def _get_subgraph_containing_node(node, subgraphs_dedup):
+        # [FUNCTION DOC] HELPER: Returns the first subgraph (list of nodes) containing node, or None.
         for subgraph in subgraphs_dedup.values():
             if node in subgraph:
                 return subgraph
@@ -976,6 +1035,8 @@ def create_add_loggers_graph(
             first_node, last_node = n, n
 
         def maybe_remap_node_to_shadow(node):
+            # [FUNCTION DOC] HELPER: Maps a Node argument to the output of the shadow of its producing subgraph; non-Nodes,
+            # placeholders and get_attr nodes are returned unchanged.
             """
             If unshadowed `node` has a shadow version, return that. If not,
             return `node`.
@@ -1015,6 +1076,11 @@ def create_add_loggers_graph(
 
 
 def _get_weight_info_from_shadow_wrapper(shadow_wrapper: torch.nn.Module):
+    # [FUNCTION DOC] HELPER: Inspects a shadow wrapper module's graph and, for its second placeholder (assumed to be the weight),
+    # finds the single quantize node using it. Returns a pair of the quantize function (per-tensor or per-channel)
+    # and a tuple of its remaining arguments (scale and zero point values fetched from the wrapper, plus axis for
+    # per-channel, and dtype). Returns None if there is no such placeholder. Raises an error if the weight has
+    # more than one user or an unexpected quantize function.
     # input: shadow wrapper module
     # output if shadow wrapper module has a weighted op:
     #   (quantize_fn, (quantize_fn_args))
@@ -1067,6 +1133,11 @@ def _get_weight_info_from_shadow_wrapper(shadow_wrapper: torch.nn.Module):
 
 
 def extract_weight_comparison(m: GraphModule) -> NSResultsType:
+    # [FUNCTION DOC] Scans m for call_function nodes of weighted ops (currently only the functional linear), and for each with a
+    # shadow wrapper consuming the same first input, quantizes the weight using the wrapper's quantization parameters.
+    # Returns a results mapping under a single model key and the weight result type, with two entries per match
+    # (float and quantized, named by subgraph index), each carrying the weight values, node info, fqn and the SQNR
+    # between the float and quantized weights. Wrapper names are assumed to split into four parts on underscores.
     # example graph:
     #
     #   w1 = self.w1
@@ -1178,6 +1249,10 @@ def extract_weight_comparison(m: GraphModule) -> NSResultsType:
 
 # TODO(future PR): redesign this to make it easier to consume outputs
 def group_results_by_subgraph(results: NSResultsType) -> Any:
+    # [FUNCTION DOC] Regroups flat logger results (keyed by subgraph name with a candidate suffix) into a mapping from subgraph
+    # name to a mapping from candidate index string to a record with ref node name/type, fqn, values, qconfig string,
+    # comparisons and comparison function name. Only the first result of each entry is used, and only the first
+    # results type key present is processed. Names must split into exactly three parts on underscores.
     """
     Creates a comparison of results
 
@@ -1273,6 +1348,9 @@ def group_results_by_subgraph(results: NSResultsType) -> Any:
 def create_results_comparison(
     results_grouped,
 ) -> Any:
+    # [FUNCTION DOC] Converts grouped results into a per-subgraph summary: reference node name, type and fqn from candidate 0,
+    # plus a candidates mapping (excluding the baseline) with qconfig string, comparison function name, stacked raw
+    # comparisons as a tensor, and their mean. Returns a dict.
     """
     Input:
 
@@ -1353,6 +1431,9 @@ def create_results_comparison(
 def print_n_shadows_summary(
     results_comparison,
 ) -> None:
+    # [FUNCTION DOC] Prints a table with one row per subgraph (node name, type, fqn and the mean comparison for each candidate)
+    # using the optional tabulate library; if it is missing, prints an install hint and returns.
+    # KNOWN ISSUE: the header count uses the length of the node type string of the last-checked rows rather than the number of candidates, so the number of candidate columns can be wrong.
     """
     Input:
 

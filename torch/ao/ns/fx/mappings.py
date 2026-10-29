@@ -1,3 +1,6 @@
+# [MODULE DOC] Mappings used by the FX numeric suite: groups of related ops (float, QAT, fused,
+# quantized variants), per-op input/output dtype categories, and op types that cannot be matched.
+# Import-time side effect: binds the module-level alias toq to torch.ops.quantized.
 import operator
 from typing import TYPE_CHECKING
 
@@ -27,6 +30,12 @@ toq = torch.ops.quantized
 
 
 def get_base_name_to_sets_of_related_ops() -> dict[str, set[NSNodeTargetType]]:
+    # [FUNCTION DOC] Builds and returns a mapping from a string base name (a counter rendered as text)
+    # to a set of related op types (modules, functions, method names) that should be treated as
+    # the same logical op across float, fused, QAT, reference and quantized forms. Starts from a
+    # hardcoded list of sets, then merges in connections from the native backend config and the
+    # lowering/quantization mappings: a new pair is added to the first set containing either
+    # member (pairs matching no set are dropped). Returns a freshly built dict each call.
     # note: this set is modified below by items from backend_config
     sets_of_related_ops: list[set[NSNodeTargetType]] = [
         # conv modules
@@ -462,6 +471,8 @@ def get_base_name_for_op(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]],
     op: NSNodeTargetType,
 ) -> str | None:
+    # [FUNCTION DOC] Returns the base name of the first set of related ops containing op, or None
+    # if op is in no set. Pure lookup, no mutation.
     for base_name, set_of_related_ops in base_name_to_sets_of_related_ops.items():
         if op in set_of_related_ops:
             return base_name
@@ -473,6 +484,9 @@ def add_op_to_sets_of_related_ops(
     op: NSNodeTargetType,
     related_op: NSNodeTargetType | None,
 ) -> None:
+    # [FUNCTION DOC] Mutates the mapping: if related_op is given, adds op to the set containing it
+    # and raises an error if related_op is in no set. If related_op is None, creates a new set
+    # holding only op under the smallest unused integer-string base name.
     if related_op is not None:
         for set_of_related_ops in base_name_to_sets_of_related_ops.values():
             if related_op in set_of_related_ops:
@@ -489,6 +503,9 @@ def add_op_to_sets_of_related_ops(
 
 # TODO(future PR): clean this up
 def get_node_type_to_io_type_map() -> dict[str, set[NSNodeTargetType]]:
+    # [FUNCTION DOC] Returns a mapping with eight keys (funs/mods io_type fp32, int8, fp32_or_int8,
+    # funs fp16, meths fp32_or_int8) to sets of function, module or method-name node targets,
+    # classifying the dtype category of the inputs/outputs of each op. Sets are built fresh per call.
     FUNS_IO_TYPE_FP32: set[NSNodeTargetType] = {
         F.linear,
         F.conv1d,
@@ -722,6 +739,9 @@ def get_node_type_to_io_type_map() -> dict[str, set[NSNodeTargetType]]:
 
 
 def get_unmatchable_types_map() -> dict[str, set[NSNodeTargetType]]:
+    # [FUNCTION DOC] Returns a mapping with keys funs_unmatchable, mods_unmatchable and
+    # meths_unmatchable to sets of node targets (e.g. shape/view style ops) that must not be
+    # matched as subgraph base ops between models.
     FUNS_UNMATCHABLE: set[NSNodeTargetType] = {
         torch.quantize_per_tensor,
         operator.getitem,

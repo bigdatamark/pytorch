@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FX graph passes for the numeric suite: add loggers to a model graph, and build a
+# combined graph in which subgraphs of model A shadow the matched subgraphs of model B (with dtype
+# casts and loggers inserted). Main entry points: add_loggers_to_model and create_a_shadows_b.
+# No import-time side effects.
 from collections.abc import Callable
 from typing import Any
 
@@ -25,6 +29,9 @@ from .utils import (
 
 
 def _maybe_get_fqn(node: Node, gm: GraphModule) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the module fully-qualified-name scope recorded for node in gm, or None if gm has
+    # no node-to-scope table. For an observer call_module node, uses the observed (first input) node
+    # instead, since observers have no recorded scope. Raises an error if a call_module target is not a string.
     fqn = None
     if hasattr(gm, "_node_name_to_scope"):
         # fqn on observers is not present, because they do not
@@ -55,6 +62,11 @@ def _insert_logger_after_node(
     index_of_arg: int,
     fqn: str | None,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Creates a logger_cls instance, attaches it to gm under a fresh unique attribute name
+    # derived from node name plus suffix, and adds a call_module node applying it to node in node's graph.
+    # Returns the new logger node. The logger is constructed positionally with the reference node name,
+    # node name, model name, ref name, target type string, reference target type, results type,
+    # index within arg, index of arg and fqn.
     """
     Given a starting graph of
 
@@ -96,6 +108,11 @@ def add_loggers_to_model(
     logger_cls: Callable,
     model_name: str,
 ) -> GraphModule:
+    # [FUNCTION DOC] Returns a new GraphModule built from a copy of gm's graph, with loggers inserted. Nodes in the
+    # inputs mapping get a NODE_INPUT logger after each Node argument (or each Node in a list argument)
+    # chosen by get_arg_indices_of_inputs_to_log; nodes in the outputs mapping get a NODE_OUTPUT logger
+    # after the node. Mapping values are (ref_name, ref_node_type) pairs. The output node is copied with
+    # its first normalized input. Does not modify the original graph, but loggers are created on the new module.
     """
     Takes the graph of gm, adds loggers to the output
     of each node in nodes_to_instrument. Returns a GraphModule with the new
@@ -106,6 +123,7 @@ def add_loggers_to_model(
     env: dict[str, Any] = {}
 
     def load_arg(a):
+        # [FUNCTION DOC] HELPER: Maps Node references in a to the corresponding nodes of the new graph by name.
         return map_arg(a, lambda node: env[node.name])
 
     for node in gm.graph.nodes:
@@ -207,6 +225,9 @@ def _insert_quantize_per_tensor_node(
     zero_point: torch.Tensor | int,
     dtype_cast_name: str,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Stores scale and zero_point as new attributes on gm_b (unique names derived from node_a),
+    # creates get_attr nodes for them in graph_c, and creates a quantize_per_tensor call on prev_node_c
+    # with quint8 dtype named dtype_cast_name. Returns the quantize node.
     # copy scale
     scale_node_name = get_new_attr_name_with_prefix(node_a.name + "_input_scale_")(gm_b)
     setattr(gm_b, scale_node_name, scale)
@@ -242,6 +263,14 @@ def _insert_dtype_cast_after_node(
     logger_cls: Callable,
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]],
 ) -> Node | list[Node]:
+    # [FUNCTION DOC] HELPER: Inserts into graph_c a dtype cast of prev_node_c (a node or a list of nodes) to the input
+    # dtype expected by node_a, based on the io types of node_a and node_c. Chooses dequantize for
+    # fp32-from-int8/fp16/fp32_or_int8, an Identity module when types are equal and known, quantize_per_tensor
+    # for int8-from-fp32 when qparams are inferable, or a half-precision conversion method for fp16-from-fp32.
+    # Raises an error for unhandled combinations or types. Registers new Identity modules on gm_b.
+    # Returns the new node, or a list of new nodes for list input.
+    # KNOWN ISSUE: for list input, quantize-with-qparams and fp16 conversion cases are not handled; they
+    # fall to the module branch and raise an error because no module class is set.
     """
     Given a starting graph C (derived from graph B) of
 
@@ -399,6 +428,10 @@ def _copy_node_from_a_to_c(
     gm_b: GraphModule,
     graph_c: Graph,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Copies node_a from gm_a into graph_c. A get_attr node has its (detached, if tensor) object
+    # stored on gm_b under a fresh name and a matching get_attr node created. A dequantize or to
+    # call_method node is copied recursively along with its first input (and the dtype argument for to).
+    # Raises an error for other call_method targets or other ops. Returns the copied node.
     """
     Simple copy of node_a to graph_c.
     """
@@ -455,6 +488,12 @@ def _can_insert_copy_of_subgraph_a(
     gm_a: GraphModule,
     num_non_param_args_node_a: int,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns False if the chain of nodes from subgraph_a start to end (followed through first
+    # inputs) has any non-primary argument or keyword argument that the copy routine cannot handle:
+    # a Node must resolve (past observers) to a get_attr, or a call_method dequantize/to; lists and tuples
+    # must contain only Nodes. The first argument (and second when the start node has two non-param inputs)
+    # is skipped. Otherwise returns True. Mirrors the logic of the subgraph copy function.
+    # KNOWN ISSUE: the keyword-argument loop continues the positional index, and a list or tuple argument is only checked for Node elements, while non-Node scalars pass.
     """
     This function returns `False` if the input subgraph cannot be copied by
     `_insert_copy_of_subgraph_a_after_input_node_c`. This usually means
@@ -470,6 +509,8 @@ def _can_insert_copy_of_subgraph_a(
     nodes.reverse()
 
     def _can_insert(node_a_arg, gm_a):
+        # [FUNCTION DOC] HELPER: Returns whether a single argument is copyable: a Node (after skipping observers) that is a
+        # get_attr or a dequantize/to method call; a list or tuple whose elements are all Nodes; any other value is accepted.
         if isinstance(node_a_arg, Node):
             arg_a = return_first_non_observer_node(node_a_arg, gm_a)
             if arg_a.op == "call_method":
@@ -533,6 +574,10 @@ def _insert_copy_of_subgraph_a_after_input_node_c(
     gm_b: GraphModule,
     node_name_prefix: str,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Copies the chain of nodes in subgraph_a (start to end, found by following first inputs)
+    # into the graph of input_node_c, one node at a time. The first copy receives input_node_c (and
+    # input_node_c_2 if given); each later copy receives the previous copy as its only non-param input.
+    # Raises an error if input_node_c is not a Node or list. Returns the last copied node.
     """
     TODO(before land): real docblock
     """
@@ -577,6 +622,13 @@ def _insert_copy_of_node_a_after_input_node_c(
     gm_b: GraphModule,
     node_name_prefix: str,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Creates in input_node_c's graph a copy of node_a whose first argument is input_node_c and
+    # whose second is input_node_c_2 when given. Other args/kwargs are normalized and copied from gm_a:
+    # Nodes (past observers) are copied via get_attr/dequantize/to copying, int/float/dtype values are
+    # reused. A call_module node points to the same module object from gm_a, registered on gm_b under a
+    # new name; call_function/call_method nodes keep their target. Raises an error for other ops or
+    # unsupported argument types. Returns the new node.
+    # KNOWN ISSUE: the argument-copy helper tests and reports the enclosing kwarg_val variable instead of its own arg parameter, so for positional args of unsupported types the check is wrong or fails with an undefined variable.
     """
     Assume that node_a from graph_a has
       args (input, (input2)?, arg1, ...), and
@@ -639,6 +691,8 @@ def _insert_copy_of_node_a_after_input_node_c(
     new_kwargs = {}
 
     def _copy_arg(arg):
+        # [FUNCTION DOC] HELPER: Returns a copy of a single non-primary argument: Node values are replaced by a copy placed in
+        # graph_c; int, float and dtype values pass through; other types raise an error.
         # copy the other inputs from the other graph
         if isinstance(arg, Node):
             arg = return_first_non_observer_node(arg, gm_a)
@@ -723,6 +777,14 @@ def create_a_shadows_b(
     should_log_inputs: bool,
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]] | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Builds and returns graph C: a copy of gm_b's graph where, for each matched subgraph pair in
+    # matched_subgraph_pairs (name -> (subgraph_a, subgraph_b)), a copy of the subgraph_a nodes is added
+    # as a shadow of the subgraph_b start node, fed through a dtype cast, with output loggers on both the
+    # A copy and the B end node, and optional input loggers (when should_log_inputs) for both. Pairs whose
+    # op types do not support shadowing, have unknown io dtypes, lack inferable int8 qparams, or have an
+    # uncopyable subgraph are skipped with a printed message and the B node is copied unchanged.
+    # node_type_to_io_type_map defaults to the standard mapping. Mutates gm_b (new attributes and modules);
+    # returns a new GraphModule built on gm_b and the new graph. Raises an error for unhandled input types.
     """
     Creates a new GraphModule consisting of the graph of C, with the meaningful
     nodes of A shadowing the corresponding nodes of B.  For example,
@@ -758,6 +820,7 @@ def create_a_shadows_b(
     env_c: dict[str, Any] = {}
 
     def load_arg(a):
+        # [FUNCTION DOC] HELPER: Maps Node references in a to the corresponding nodes of graph C by name.
         return map_arg(a, lambda node: env_c[node.name])
 
     start_node_b_to_matched_subgraph_a_and_name = {}
