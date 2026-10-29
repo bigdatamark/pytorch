@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for SegmentGenerator, which builds command segments from utilization
+# records. Defines fixed base timestamps and command names, a shared record builder,
+# and two unused timestamp formatting helpers. Import-time side effect: edits sys.path.
+
 import os
 import sys
 import unittest
@@ -37,7 +42,11 @@ PYPIP_INSTALL_NAME = "python pip install install1"
 
 
 class TestSegmentGenerator(unittest.TestCase):
+    # [CLASS DOC]
+    # Tests of SegmentGenerator.generate covering empty input, single and multiple
+    # records and commands, and the default and a customized gap threshold.
     def test_generate_empty_records(self) -> None:
+        # [FUNCTION DOC] Checks that no records produce no segments.
         records: list[UtilizationRecord] = []
 
         # execute
@@ -48,6 +57,7 @@ class TestSegmentGenerator(unittest.TestCase):
         self.assertEqual(segments, [])
 
     def test_generate_single_record(self) -> None:
+        # [FUNCTION DOC] Checks that one record with one command gives one segment.
         record = UtilizationRecord(
             timestamp=TEST_TS_BASE, cmd_names=[PYTEST1_NAME], level="PYTHON_CMD"
         )
@@ -61,6 +71,8 @@ class TestSegmentGenerator(unittest.TestCase):
         self.assertEqual(len(segments), 1)
 
     def test_generate_single_record_with_multiple_cmds(self) -> None:
+        # [FUNCTION DOC] Checks that one record listing two python commands gives two
+        # segments.
         record = UtilizationRecord(
             timestamp=TEST_TS_BASE,
             cmd_names=[PYTEST1_NAME, PYPIP_INSTALL_NAME],
@@ -76,6 +88,8 @@ class TestSegmentGenerator(unittest.TestCase):
         self.assertEqual(len(segments), 2)
 
     def test_generate_multiple_records(self) -> None:
+        # [FUNCTION DOC] Checks that the base records give one segment per command
+        # with the expected start and end times.
         records = get_base_test_records()
 
         # execute
@@ -90,6 +104,8 @@ class TestSegmentGenerator(unittest.TestCase):
         )
 
     def test_generate_cmd_interval_larger_than_default_threshold_setting(self) -> None:
+        # [FUNCTION DOC] Adds two records separated by more than the default 60
+        # second threshold and checks the first command splits into two segments.
         records = get_base_test_records()
 
         # record has more than 1 minute gap than last default record
@@ -129,6 +145,8 @@ class TestSegmentGenerator(unittest.TestCase):
         )
 
     def test_generate_multiple_segments_with_customized_threshold(self) -> None:
+        # [FUNCTION DOC] Uses a 10 second threshold on the base records and checks the
+        # first command splits into two segments.
         # set threshold to consider as continuous segment to 10 seconds
         test_threshold = 10
 
@@ -155,12 +173,16 @@ class TestSegmentGenerator(unittest.TestCase):
     def validate_segment(
         self, segment: OssCiSegmentV1, name: str, start_at: float, end_at: float
     ) -> None:
+        # [FUNCTION DOC] HELPER: Asserts the segment's name, start and end times.
         self.assertEqual(segment.name, name)
         self.assertEqual(segment.start_at, start_at)
         self.assertEqual(segment.end_at, end_at)
 
 
 def get_base_test_records() -> list[UtilizationRecord]:
+    # [FUNCTION DOC] HELPER: Builds six records at 0, 5, 10, 15, 30 and 40 seconds
+    # from the base time: the first command at the first five, a pip install command
+    # at 10 and 15 seconds, and no commands in the last.
     record1 = UtilizationRecord(
         timestamp=TEST_TS_BASE, cmd_names=[PYTEST1_NAME], level="PYTHON_CMD"
     )
@@ -197,9 +219,13 @@ if __name__ == "__main__":
 
 
 def getTimestampStr(timestamp: float) -> str:
+    # [FUNCTION DOC] HELPER: Formats a timestamp as a string with no decimals. Unused
+    # here and defined after the main guard.
     return f"{timestamp:.0f}"
 
 
 def getCurrentTimestampStr() -> str:
+    # [FUNCTION DOC] HELPER: Returns the current time formatted by getTimestampStr.
+    # Unused here.
     timestamp_now = datetime.now().timestamp()
     return getTimestampStr(timestamp_now)

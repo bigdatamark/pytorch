@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Script that uploads additional test dashboard info for every run attempt found
+# in S3 for a given workflow run id. Run via the command line only.
+
 import argparse
 import sys
 

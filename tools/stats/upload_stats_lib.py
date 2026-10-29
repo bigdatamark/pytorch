@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Shared library for the CI stats upload scripts: GitHub API access helpers,
+# downloading workflow artifacts from GitHub or S3, uploading documents to
+# DynamoDB or gzipped json lines to S3, reading them back, zip extraction, job id
+# and job name lookup and detection of rerun-disabled-tests reports. Imports boto3
+# and requests at import time (boto3 is required).
+
 from __future__ import annotations
 
 import gzip
@@ -24,6 +31,7 @@ PYTORCH_REPO = "https://api.github.com/repos/pytorch/pytorch"
 
 @lru_cache
 def get_s3_resource() -> Any:
+    # [FUNCTION DOC] Returns the boto3 S3 resource, created once and cached.
     return boto3.resource("s3")
 
 
@@ -36,6 +44,8 @@ MAX_RETRY_IN_NON_DISABLED_MODE = 3 * 3
 
 
 def _get_request_headers() -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns GitHub API headers (accept type and token
+    # authorization). Raises a key error if the GITHUB_TOKEN variable is unset.
     return {
         "Accept": "application/vnd.github.v3+json",
         "Authorization": "token " + os.environ["GITHUB_TOKEN"],
@@ -43,6 +53,11 @@ def _get_request_headers() -> dict[str, str]:
 
 
 def _get_artifact_urls(prefix: str, workflow_run_id: int) -> dict[Path, str]:
+    # [FUNCTION DOC] HELPER: Lists all artifacts of the workflow run through the
+    # paginated GitHub API and returns a mapping from artifact name (as a path) to
+    # download url for those whose name starts with prefix.
+    # KNOWN ISSUE: the docstring mentions only 'test-report' names, but any prefix
+    # is accepted.
     """Get all workflow artifacts with 'test-report' in the name."""
     response = requests.get(
         f"{PYTORCH_REPO}/actions/runs/{workflow_run_id}/artifacts?per_page=100",
@@ -65,6 +80,11 @@ def _get_artifact_urls(prefix: str, workflow_run_id: int) -> dict[Path, str]:
 def _download_artifact(
     artifact_name: Path, artifact_url: str, workflow_run_attempt: int
 ) -> Path:
+    # [FUNCTION DOC] HELPER: Downloads one artifact zip from artifact_url into a file
+    # named after artifact_name in the current directory and returns that path.
+    # Parses the run attempt marker in the name and prints a skip message if it
+    # differs from workflow_run_attempt.
+    # KNOWN ISSUE: despite the message, a mismatching artifact is still downloaded.
     # [Artifact run attempt]
     # All artifacts on a workflow share a single namespace. However, we can
     # re-run a workflow and produce a new set of artifacts. To avoid name
@@ -96,6 +116,11 @@ def download_s3_artifacts(
     workflow_run_attempt: int,
     job_id: int | None = None,
 ) -> list[Path]:
+    # [FUNCTION DOC]
+    # Downloads every object in the gha-artifacts bucket under the run attempt's
+    # artifact folder whose name starts with prefix (optionally only those whose name
+    # contains the job id) into the current directory. Returns the local paths. Prints
+    # a warning annotation if nothing was found.
     bucket = get_s3_resource().Bucket(GHA_ARTIFACTS_BUCKET)
     objs = bucket.objects.filter(
         Prefix=f"pytorch/pytorch/{workflow_run_id}/{workflow_run_attempt}/artifact/{prefix}"
@@ -125,6 +150,9 @@ def download_s3_artifacts(
 def download_gha_artifacts(
     prefix: str, workflow_run_id: int, workflow_run_attempt: int
 ) -> list[Path]:
+    # [FUNCTION DOC]
+    # Finds the workflow run's GitHub artifacts whose names start with prefix,
+    # downloads each into the current directory and returns the local paths.
     artifact_urls = _get_artifact_urls(prefix, workflow_run_id)
     paths = []
     for name, url in artifact_urls.items():
@@ -138,6 +166,10 @@ def upload_to_dynamodb(
     docs: list[Any],
     generate_partition_key: Callable[[str, dict[str, Any]], str] | None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Batch-writes the documents to the DynamoDB table. Each document is mutated: a
+    # partition key field is added when a key generator is given, and a millisecond
+    # timestamp field is always set.
     print(f"Writing {len(docs)} documents to DynamoDB {dynamodb_table}")
     # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/dynamodb.html#batch-writing
     with boto3.resource("dynamodb").Table(dynamodb_table).batch_writer() as batch:
@@ -155,6 +187,9 @@ def upload_to_s3(
     key: str,
     docs: list[dict[str, Any]],
 ) -> None:
+    # [FUNCTION DOC]
+    # Serializes the documents as newline separated json, compresses with gzip and
+    # puts the result at the given bucket and key with gzip content encoding.
     print(f"Writing {len(docs)} documents to S3 {bucket_name}/{key}")
     body = io.StringIO()
     for doc in docs:
@@ -176,6 +211,9 @@ def read_from_s3(
     bucket_name: str,
     key: str,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Inverse of upload_to_s3: fetches the object, gunzips it and parses each
+    # non-empty line as json, returning the list of documents.
     print(f"Reading from s3://{bucket_name}/{key}")
     body = (
         get_s3_resource()
@@ -191,9 +229,15 @@ def read_from_s3(
 
 
 def remove_nan_inf(old: Any) -> Any:
+    # [FUNCTION DOC]
+    # Returns a copy of a nested structure of lists, mappings and tuples (keys
+    # included) in which NaN and infinite floats are replaced by their string form,
+    # so json serialization stays valid. Other values are returned unchanged.
     # Casta NaN, inf, -inf to string from float since json.dumps outputs invalid
     # json with them
     def _helper(o: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Recursive worker that rebuilds containers and
+        # stringifies non-finite floats.
         if isinstance(o, float) and (math.isinf(o) or math.isnan(o)):
             return str(o)
         if isinstance(o, list):
@@ -213,6 +257,9 @@ def upload_workflow_stats_to_s3(
     collection: str,
     docs: list[dict[str, Any]],
 ) -> None:
+    # [FUNCTION DOC]
+    # Uploads docs to the ossci-raw-job-status bucket under a key made of the
+    # collection name, workflow run id and run attempt.
     bucket_name = "ossci-raw-job-status"
     key = f"{collection}/{workflow_run_id}/{workflow_run_attempt}"
     upload_to_s3(bucket_name, key, docs)
@@ -223,6 +270,8 @@ def upload_file_to_s3(
     bucket: str,
     key: str,
 ) -> None:
+    # [FUNCTION DOC]
+    # Uploads the local file to the given bucket and key using the S3 client.
     """
     Upload a local file to S3
     """
@@ -235,6 +284,12 @@ def upload_file_to_s3(
 
 
 def unzip(p: Path) -> Path:
+    # [FUNCTION DOC]
+    # Extracts the zip file p into a sibling directory named with an unzipped prefix
+    # plus the file stem and returns that directory. Raises AssertionError if p is
+    # not a file; bad zip files raise from the zip library.
+    # KNOWN ISSUE: the docstring says it returns None for non-zip input, but it
+    # raises instead.
     """Unzip the provided zipfile to a similarly-named directory.
 
     Returns None if `p` is not a zipfile.
@@ -260,6 +315,11 @@ def is_rerun_disabled_tests(
     workflow_run_attempt: int,
     tests: dict[str, dict[str, int]],
 ) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if every test in the report was run more times than a normal
+    # retry budget allows, or if the job that produced the report (found from its
+    # path, then looked up by name) has a name mentioning rerun_disabled_tests.
+    # Note that an empty tests mapping counts as True.
     """
     Check if the test report is coming from rerun_disabled_tests workflow where
     each test is run multiple times
@@ -275,6 +335,9 @@ def is_rerun_disabled_tests(
 
 
 def get_job_id(report: Path) -> int | None:
+    # [FUNCTION DOC]
+    # Parses the job id from the first component of the report path (the text after
+    # its last underscore). Returns None if that text is not an integer.
     # [Job id in artifacts]
     # Retrieve the job id from the report path. In our GHA workflows, we append
     # the job id to the end of the report name, so `report` looks like:
@@ -290,6 +353,11 @@ def get_job_id(report: Path) -> int | None:
 def get_job_name(
     id: int | None, workflow_id: int | None, workflow_run_attempt: int | None
 ) -> str | None:
+    # [FUNCTION DOC]
+    # Returns the name of the CI job with the given id, or None if the id is None,
+    # the lookup fails or any exception occurs. Without a workflow id it queries the
+    # single job endpoint; with one it lists all jobs of that workflow run attempt
+    # (paginated, cached) and indexes by id. Results are memoized.
     if id is None:
         return None
     try:
@@ -305,6 +373,9 @@ def get_job_name(
 
             @lru_cache
             def _get_jobs(workflow_id: int) -> dict[int, str]:
+                # [FUNCTION DOC] HELPER: Pages through the run attempt's jobs and
+                # returns a mapping from job id to name; stops early with the
+                # partial mapping on a non-200 response.
                 jobs: dict[int, str] = {}
                 # Paginate
                 page = 1

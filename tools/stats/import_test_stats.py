@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Helpers for downloading and locally caching CI test statistics (test times, test
+# ratings, TD heuristic data, the disabled-tests list) and for copying pytest
+# failure caches into the additional CI files folder. Defines file name constants,
+# REPO_ROOT and the cache lifespan. No import-time side effects besides constants.
+
 from __future__ import annotations
 
 import datetime
@@ -19,6 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def get_disabled_issues() -> list[str]:
+    # [FUNCTION DOC]
+    # Reads the comma separated REENABLED_ISSUES environment variable (empty by
+    # default), prints the resulting list and returns it as a list of strings.
+    # Note an unset variable yields a list holding one empty string.
     reenabled_issues = os.getenv("REENABLED_ISSUES", "")
     issue_numbers = reenabled_issues.split(",")
     print("Ignoring disabled issues: ", issue_numbers)
@@ -45,6 +55,13 @@ def fetch_and_cache(
     url: str,
     process_fn: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns the JSON mapping found at url, using a file cache named name inside
+    # dirpath (created if missing, parents must exist). A cached file younger than
+    # FILE_CACHE_LIFESPAN_SECONDS is returned directly. Otherwise the download is
+    # tried up to three times (5 second timeout), passed through process_fn, written
+    # to the cache and returned. If all attempts fail it prints a message and returns
+    # an empty mapping; it never raises for download errors.
     """
     This fetch and cache utils allows sharing between different process.
     """
@@ -54,6 +71,8 @@ def fetch_and_cache(
     print(f"Downloading {url} to {path}")
 
     def is_cached_file_valid() -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the cache file at the enclosing path
+        # was modified less than FILE_CACHE_LIFESPAN_SECONDS ago.
         # Check if the file is new enough (see: FILE_CACHE_LIFESPAN_SECONDS). A real check
         # could make a HEAD request and check/store the file's ETag
         fname = Path(path)
@@ -81,6 +100,9 @@ def fetch_and_cache(
 
 
 def get_test_times() -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the generated test-times statistics and returns the
+    # mapping; returns an empty mapping on failure.
     return get_from_test_infra_generated_stats(
         "test-times.json",
         TEST_TIMES_FILE,
@@ -89,6 +111,10 @@ def get_test_times() -> dict[str, dict[str, float]]:
 
 
 def get_test_class_times() -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the generated per-test-class times statistics and
+    # returns the mapping; returns an empty mapping on failure.
+    # KNOWN ISSUE: the failure message says "test times" rather than class times.
     return get_from_test_infra_generated_stats(
         "test-class-times.json",
         TEST_CLASS_TIMES_FILE,
@@ -99,7 +125,15 @@ def get_test_class_times() -> dict[str, dict[str, float]]:
 def get_disabled_tests(
     dirpath: str, filename: str = DISABLED_TESTS_FILE
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC]
+    # Downloads the condensed disabled-tests list into dirpath/filename (cached) and
+    # returns a mapping from test name to a (link, platforms) pair, dropping tests
+    # whose issue number is listed as re-enabled. Returns an empty mapping if the
+    # download fails so that all tests stay enabled.
     def process_disabled_test(the_response: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Converts the raw response (test name to issue number,
+        # link, platforms) into test name to (link, platforms), skipping re-enabled
+        # issues reported by get_disabled_issues.
         # remove re-enabled tests and condense even further by getting rid of pr_num
         disabled_issues = get_disabled_issues()
         disabled_test_from_issues = {}
@@ -120,6 +154,9 @@ def get_disabled_tests(
 
 
 def get_test_file_ratings() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the generated per-file test ratings used for test
+    # reordering; returns an empty mapping on failure.
     return get_from_test_infra_generated_stats(
         "file_test_rating.json",
         TEST_FILE_RATINGS_FILE,
@@ -128,6 +165,9 @@ def get_test_file_ratings() -> dict[str, Any]:
 
 
 def get_test_class_ratings() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the generated per-test-class ratings used for test
+    # reordering; returns an empty mapping on failure.
     return get_from_test_infra_generated_stats(
         "file_test_class_rating.json",
         TEST_CLASS_RATINGS_FILE,
@@ -136,6 +176,9 @@ def get_test_class_ratings() -> dict[str, Any]:
 
 
 def get_td_heuristic_historial_edited_files_json() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the historical edited files data used by the test
+    # discovery heuristics; returns an empty mapping on failure.
     return get_from_test_infra_generated_stats(
         "td_heuristic_historical_edited_files.json",
         TD_HEURISTIC_HISTORICAL_EDITED_FILES,
@@ -144,6 +187,9 @@ def get_td_heuristic_historial_edited_files_json() -> dict[str, Any]:
 
 
 def get_td_heuristic_profiling_json() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Fetches (with caching) the profiling data used by the test discovery
+    # heuristics; returns an empty mapping on failure.
     return get_from_test_infra_generated_stats(
         "td_heuristic_profiling.json",
         TD_HEURISTIC_PROFILING_FILE,
@@ -152,6 +198,10 @@ def get_td_heuristic_profiling_json() -> dict[str, Any]:
 
 
 def copy_pytest_cache() -> None:
+    # [FUNCTION DOC]
+    # Copies the pytest last-failed cache file from the repo into the additional CI
+    # files folder under the previous-failures name. Does nothing if the source is
+    # missing; raises if the destination folder does not exist.
     original_path = REPO_ROOT / ".pytest_cache/v/cache/lastfailed"
     if not original_path.exists():
         return
@@ -162,6 +212,10 @@ def copy_pytest_cache() -> None:
 
 
 def copy_additional_previous_failures() -> None:
+    # [FUNCTION DOC]
+    # Copies the additional previous-failures file from the pytest cache folder into
+    # the additional CI files folder. Does nothing if the source is missing; raises
+    # if the destination folder does not exist.
     original_path = (
         REPO_ROOT / ".pytest_cache" / TD_HEURISTIC_PREVIOUSLY_FAILED_ADDITIONAL
     )
@@ -178,6 +232,10 @@ def copy_additional_previous_failures() -> None:
 def get_from_test_infra_generated_stats(
     from_file: str, to_file: str, failure_explanation: str
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Downloads the named file from the test-infra
+    # generated-stats branch into the additional CI files folder (saved as to_file)
+    # using fetch_and_cache. On any exception prints failure_explanation and returns
+    # an empty mapping.
     url = f"https://raw.githubusercontent.com/pytorch/test-infra/generated-stats/stats/{from_file}"
     try:
         return fetch_and_cache(

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # Copyright 2004-present Facebook. All Rights Reserved.
 
+# [MODULE DOC]
+# Unit tests for the operator YAML generator script: model filter creation, the
+# verification that all requested assets and versions are present, and filling
+# output operators without including all overloads. Includes helpers producing mock
+# command line options and a mock operator dependency graph. Imports the generator
+# module by bare name, so it must be run with its folder on the import path.
+
 import argparse
 import json
 import unittest
@@ -17,6 +24,8 @@ from gen_operators_yaml import (
 
 
 def _mock_options():
+    # [FUNCTION DOC] HELPER: Returns a namespace of fake generator options (two root
+    # operators, test model name, no overload inclusion for static and closure ops).
     options = argparse.Namespace()
     options.root_ops = "aten::add,aten::cat"
     options.training_root_ops = []
@@ -36,6 +45,8 @@ def _mock_options():
 
 
 def _mock_load_op_dep_graph():
+    # [FUNCTION DOC] HELPER: Returns a fake dependency graph mapping add and cat
+    # operators to sets containing themselves and a shared strided operator.
     result = defaultdict(set)
     result["aten::add"] = {"aten::add", "aten::as_strided_"}
     result["aten::cat"] = {"aten::cat", "aten::as_strided_"}
@@ -43,10 +54,17 @@ def _mock_load_op_dep_graph():
 
 
 class GenOperatorsYAMLTest(unittest.TestCase):
+    # [CLASS DOC]
+    # Test case for the operator YAML generator helpers: the model config filter,
+    # asset and version verification, and output filling.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing.
         pass
 
     def test_filter_creation(self) -> None:
+        # [FUNCTION DOC] Builds a filter for model abc with versions 100 and 101 and
+        # checks it keeps exactly two of four sample configs (matching name and
+        # version).
         filter_func = make_filter_from_options(
             model_name="abc",
             model_versions=["100", "101"],
@@ -101,6 +119,8 @@ class GenOperatorsYAMLTest(unittest.TestCase):
             )
 
     def test_verification_success(self) -> None:
+        # [FUNCTION DOC] Checks that verifying all specified assets and versions
+        # against matching filtered configs raises no exception.
         filter_func = make_filter_from_options(
             model_name="abc",
             model_versions=["100", "101"],
@@ -144,6 +164,8 @@ class GenOperatorsYAMLTest(unittest.TestCase):
             )
 
     def test_verification_fail(self) -> None:
+        # [FUNCTION DOC] Checks that verification raises a runtime error when a
+        # requested asset, version or model name has no matching config.
         config = [
             {
                 "model": {
@@ -231,6 +253,11 @@ class GenOperatorsYAMLTest(unittest.TestCase):
     def test_fill_output_with_arguments_not_include_all_overloads(
         self, mock_parse_options: Mock, mock_load_op_dep_graph: Mock
     ) -> None:
+        # [FUNCTION DOC] With mocked option parsing and dependency graph loading, fills
+        # an output mapping for a model and checks every resulting operator has overload
+        # inclusion disabled.
+        # KNOWN ISSUE: the mock parameter names are swapped relative to the decorator
+        # order (the bottom patch is passed first); both are unused so it is harmless.
         parser = argparse.ArgumentParser(description="Generate used operators YAML")
         options = get_parser_options(parser)
 

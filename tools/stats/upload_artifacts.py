@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script that copies selected GitHub Actions artifacts (sccache stats, test jsons,
+# test reports, usage logs) of a workflow run attempt to the gha-artifacts S3
+# bucket, stripping the run attempt from file names. Run via command line with
+# required workflow run id, run attempt and repo arguments.
+
 import argparse
 import os
 import re
@@ -17,6 +23,11 @@ FILENAME_REGEX = r"-runattempt\d+"
 
 
 def get_artifacts(repo: str, workflow_run_id: int, workflow_run_attempt: int) -> None:
+    # [FUNCTION DOC]
+    # In a temporary directory (the process working directory is changed to it and
+    # not restored), downloads each artifact kind in ARTIFACTS for the run attempt
+    # and uploads every downloaded zip to S3 under the repo, run id, attempt and
+    # artifact path, with the run attempt marker removed from the file name.
     with TemporaryDirectory() as temp_dir:
         print("Using temporary directory:", temp_dir)
         os.chdir(temp_dir)

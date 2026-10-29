@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script that gathers dynamo performance csv files from the test-reports S3
+# artifacts of a workflow run, turns each csv row into a document annotated with
+# run and job metadata, and uploads the documents to a DynamoDB table with
+# generated partition keys. Command line arguments are described in the main block.
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +38,13 @@ def get_perf_stats(
     head_branch: str,
     match_filename: str,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Downloads test-reports artifacts of the run attempt into a temporary directory
+    # (process working directory is changed and not restored), skipping zips whose
+    # names do not match the expected pattern. Unzips each and, for every csv file
+    # whose base name matches match_filename, converts each row into a mapping with
+    # added workflow id, attempt, test name, runner, job id, file name and head branch.
+    # Processed csv files are deleted. Returns all rows. The repo argument is unused.
     match_filename_regex = re.compile(match_filename)
     perf_stats = []
     with TemporaryDirectory() as temp_dir:
@@ -87,6 +100,10 @@ def get_perf_stats(
 
 
 def generate_partition_key(repo: str, doc: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # Builds a partition key from the repo, workflow id, job id, test name, file name
+    # and an md5 hash of the whole document. Raises a key error if the document lacks
+    # one of those fields.
     """
     Generate an unique partition key for the document on DynamoDB
     """

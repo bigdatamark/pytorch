@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Script that converts a job's raw utilization log (produced by the monitor; first
+# line metadata, later lines records) into database models and uploads them to S3.
+# SegmentGenerator derives python command segments, UtilizationDbConverter builds the
+# metadata and time series rows, UploadUtilizationData orchestrates reading (from S3
+# artifacts or a local file), conversion and upload, with helper file readers and
+# argument parsing. Import-time side effect: edits sys.path; needs pandas.
+
 import os
 import sys
 from pathlib import Path
@@ -34,6 +42,9 @@ JOB_TEST_ARTIFACT_PREFIX = "logs-test"
 
 
 class SegmentGenerator:
+    # [CLASS DOC]
+    # Stateless helper that turns utilization records into segments, one per
+    # continuous run of a python command name across record timestamps.
     """
     generates test segment from utilization records, currently it only generate segments on python commands level
     segment_delta_threshold is the threshold to determine if a segment is continuous or not, default is 60 seconds.
@@ -42,6 +53,14 @@ class SegmentGenerator:
     def generate(
         self, records: list[UtilizationRecord], segment_delta_threshold: int = 60
     ) -> list[OssCiSegmentV1]:
+        # [FUNCTION DOC]
+        # Flattens the records into (time, command) rows, keeps the distinct commands
+        # starting with python, and for each finds windows of timestamps whose gaps
+        # are within segment_delta_threshold seconds. Returns one segment (level
+        # python command, name the command, start and end in epoch seconds, empty
+        # extra info) per window. An empty record list gives an empty result.
+        # KNOWN ISSUE: if records exist but none lists a command, the frame has no
+        # columns and the time conversion raises a key error.
         if len(records) == 0:
             return []
 
@@ -94,6 +113,9 @@ class SegmentGenerator:
         time_column_name: str,
         df: Any,  # the lintrunner keep complaining about the type of df, but it's not a problem
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Sorts the frame by the time column, starts a new
+        # window wherever the gap to the previous row exceeds threshold seconds, and
+        # returns a list of mappings with the first and last time of each window.
         time_threshold = pd.Timedelta(seconds=threshold)
         df = df.sort_values(by=time_column_name).reset_index(drop=True)
         df["time_diff"] = df[time_column_name].diff()
@@ -110,6 +132,11 @@ class SegmentGenerator:
 
 
 class UtilizationDbConverter:
+    # [CLASS DOC]
+    # Converts parsed log models (metadata, records, segments) plus workflow info
+    # into the database models: one metadata row and one time series row per record.
+    # State: the inputs, a creation timestamp taken at construction and the end time
+    # (latest record timestamp). Entry point is convert.
     """convert utilization log model to db model"""
 
     def __init__(
@@ -119,6 +146,9 @@ class UtilizationDbConverter:
         records: list[UtilizationRecord],
         segments: list[OssCiSegmentV1],
     ):
+        # [FUNCTION DOC]
+        # Stores the inputs, records the creation time as now and the end time as the
+        # largest record timestamp. Raises ValueError if records is empty.
         self.metadata = metadata
         self.records = records
         self.segments = segments
@@ -130,11 +160,15 @@ class UtilizationDbConverter:
     def convert(
         self,
     ) -> tuple[OssCiUtilizationMetadataV1, list[OssCiUtilizationTimeSeriesV1]]:
+        # [FUNCTION DOC] Returns the metadata row and the list of time series rows.
         db_metadata = self._to_oss_ci_metadata()
         timeseries = self._to_oss_ci_timeseries_list()
         return db_metadata, timeseries
 
     def _to_oss_ci_metadata(self) -> OssCiUtilizationMetadataV1:
+        # [FUNCTION DOC] HELPER: Builds the metadata row from the workflow info and
+        # log metadata; missing gpu count, cpu count or gpu type become 0, 0 and empty;
+        # the data model version is stored as a string and tags are empty.
         return OssCiUtilizationMetadataV1(
             repo=self.info.repo,
             workflow_id=self.info.workflow_run_id,
@@ -155,6 +189,8 @@ class UtilizationDbConverter:
         )
 
     def _to_oss_ci_timeseries_list(self) -> list[OssCiUtilizationTimeSeriesV1]:
+        # [FUNCTION DOC] HELPER: Converts every record to a time series row of type
+        # utilization tagged record.
         return [
             self._to_oss_ci_time_series(record, type="utilization", tags=["record"])
             for record in self.records
@@ -163,6 +199,9 @@ class UtilizationDbConverter:
     def _to_oss_ci_time_series(
         self, record: UtilizationRecord, type: str, tags: list[str]
     ) -> OssCiUtilizationTimeSeriesV1:
+        # [FUNCTION DOC] HELPER: Builds one time series row for a record with the given
+        # type and tags; the payload is the string form of the record's data json
+        # (or of an empty mapping when the record has no data).
         return OssCiUtilizationTimeSeriesV1(
             created_at=self.created_at,
             type=type,
@@ -179,6 +218,11 @@ class UtilizationDbConverter:
 
 
 class UploadUtilizationData:
+    # [CLASS DOC]
+    # Orchestrates the pipeline for one job: read the raw log (local file or S3
+    # artifact), parse it into log models, generate segments, convert to database
+    # models and upload them. State: artifact prefix, workflow info, a segment
+    # generator, and debug, dry-run and local-path settings. Entry point is start.
     """
     main class to handle utilization data conversion and s3 upload
     fetches raw log data from s3, convert to log model, then convert to db model, and upload to s3
@@ -192,6 +236,7 @@ class UploadUtilizationData:
         debug: bool = False,
         local_path: str = "",
     ):
+        # [FUNCTION DOC] Stores the settings and creates the segment generator.
         self.artifact_prefix = artifact_prefix
         self.info = info
         self.segment_generator = SegmentGenerator()
@@ -200,6 +245,13 @@ class UploadUtilizationData:
         self.local_path = local_path
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # Loads log data from the local path if set, otherwise from the job's S3
+        # artifact. Returns early (printing a message) when metadata or valid records
+        # are missing. Otherwise generates segments, converts to database models,
+        # prints the first time series row, and unless in dry run mode uploads the
+        # metadata and time series to S3 (collection names get a debug prefix in
+        # debug mode, and keys include the data model version).
         if self.local_path:
             metadata, valid_records, _ = self.get_log_data_from_local(self.local_path)
         else:
@@ -273,6 +325,8 @@ class UploadUtilizationData:
         file_name: str,
         docs: list[dict[str, Any]],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Uploads docs to the utilization bucket under a key
+        # built from collection, version, repo, run id, attempt, job id and file name.
         bucket_name = UTILIZATION_BUCKET
         key = f"{collection}/{version}/{repo}/{workflow_run_id}/{workflow_run_attempt}/{job_id}/{file_name}"
         upload_to_s3(bucket_name, key, docs)
@@ -284,6 +338,10 @@ class UploadUtilizationData:
     ) -> tuple[
         UtilizationMetadata | None, list[UtilizationRecord], list[UtilizationRecord]
     ]:
+        # [FUNCTION DOC]
+        # Reads the local log file and parses it. Returns a triple of metadata (None on
+        # failure), valid records and error records; failures give None and empty lists.
+        # KNOWN ISSUE: the artifact_prefix parameter is unused.
         test_log_content = read_file(file_path)
         if not test_log_content:
             return None, [], []
@@ -302,6 +360,11 @@ class UploadUtilizationData:
     ) -> tuple[
         UtilizationMetadata | None, list[UtilizationRecord], list[UtilizationRecord]
     ]:
+        # [FUNCTION DOC]
+        # Downloads the job's artifacts with the given prefix from S3 (into the current
+        # directory), requires exactly one, reads its log content (zip or text) and
+        # parses it. Returns metadata, valid records and error records, or None with
+        # empty lists when zero or several artifacts are found or parsing fails.
         artifact_paths = download_s3_artifacts(
             artifact_prefix, workflow_run_id, workflow_run_attempt, job_id
         )
@@ -330,6 +393,9 @@ class UploadUtilizationData:
         return metadata, records, error_records
 
     def _process_raw_record(self, line: str) -> tuple[UtilizationRecord | None, bool]:
+        # [FUNCTION DOC] HELPER: Parses one json line into a record. Returns the record
+        # and True if it has no error text, the record and False if it has one, or
+        # None and False if parsing fails (the failure is printed).
         try:
             record = UtilizationRecord.from_json(line)
             if record.error:
@@ -343,6 +409,9 @@ class UploadUtilizationData:
         self,
         lines: list[str],
     ) -> tuple[list[UtilizationRecord], list[UtilizationRecord]]:
+        # [FUNCTION DOC] HELPER: Parses all lines after the first (the metadata line)
+        # and splits them into valid records and records carrying an error; unparsable
+        # lines are dropped.
         results = [self._process_raw_record(line) for line in lines[1:]]
         valid_records = [
             record for record, valid in results if valid and record is not None
@@ -358,6 +427,11 @@ class UploadUtilizationData:
     ) -> tuple[
         UtilizationMetadata | None, list[UtilizationRecord], list[UtilizationRecord]
     ]:
+        # [FUNCTION DOC]
+        # Splits the log text into lines, parses the first as metadata and the rest as
+        # records. Returns None with empty lists when the content is empty, has fewer
+        # than two lines, the metadata cannot be parsed, or its data model version
+        # differs from the current one; otherwise metadata, valid and error records.
         if not content:
             return None, [], []
         lines = content.splitlines()
@@ -383,6 +457,9 @@ class UploadUtilizationData:
 
 
 def handle_file(file_path: Path) -> str:
+    # [FUNCTION DOC] Returns the usage log text from a zip archive (the usage log
+    # entry) or a plain text file, chosen by file name pattern; prints a message and
+    # returns an empty string for other file types.
     if file_path.match("*.zip"):
         print(f"extracting {TEST_USAGE_LOG_FILENAME} from zip file {file_path}")
         return unzip_file(file_path, TEST_USAGE_LOG_FILENAME)
@@ -394,6 +471,9 @@ def handle_file(file_path: Path) -> str:
 
 
 def read_file(file_path: str | Path) -> str:
+    # [FUNCTION DOC] Returns the text of the file, or an empty string (after printing
+    # a warning annotation) if it does not exist, has an unsupported path type, or
+    # reading fails. Never raises.
     try:
         if isinstance(file_path, Path):
             if file_path.is_file():
@@ -415,6 +495,10 @@ def read_file(file_path: str | Path) -> str:
 
 
 def unzip_file(path: Path, file_name: str) -> str:
+    # [FUNCTION DOC] Returns the decoded text of the named entry inside the zip file,
+    # or an empty string after printing a warning if anything fails.
+    # KNOWN ISSUE: the warning formats the Python builtin named object instead of
+    # the file path.
     try:
         with zipfile.ZipFile(path) as zip_file:
             # Read the desired file from the zip archive
@@ -425,6 +509,12 @@ def unzip_file(path: Path, file_name: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Parses the command line: required workflow run id, attempt, workflow name, job
+    # id and job name; optional repo, debug and dry-run flags, artifact prefix and
+    # local log path. Exits the process on invalid arguments.
+    # KNOWN ISSUE: several help texts (workflow name, job id, job name) wrongly say
+    # they are the id of the workflow to get artifacts from.
     """
     Parse command line arguments.
 

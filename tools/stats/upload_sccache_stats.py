@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Script that downloads the sccache-stats artifacts of a workflow run attempt from
+# S3, parses the json files they contain and uploads them to S3 as the
+# sccache_stats collection. Takes workflow run id and attempt on the command line.
+
 from __future__ import annotations
 
 import argparse
@@ -16,6 +21,12 @@ from tools.stats.upload_stats_lib import (
 def get_sccache_stats(
     workflow_run_id: int, workflow_run_attempt: int
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Downloads the sccache-stats artifacts into a temporary directory (the process
+    # working directory is changed to it and not restored) and returns the parsed
+    # contents of every json file found recursively there.
+    # KNOWN ISSUE: the downloaded artifacts are never unzipped, so unless they are
+    # plain json files nothing is found.
     with TemporaryDirectory() as temp_dir:
         print("Using temporary directory:", temp_dir)
         os.chdir(temp_dir)

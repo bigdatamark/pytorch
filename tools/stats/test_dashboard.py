@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Utilities that build additional dashboard info for a workflow run: look up CI job
+# names via the GitHub API, derive build names and test configs from them, collect
+# test-discovery exclusion files from S3 artifacts, and upload the grouped result to
+# S3. Defines REGEX_JOB_INFO; no import-time side effects.
+
 from __future__ import annotations
 
 import json
@@ -26,6 +32,10 @@ REGEX_JOB_INFO = r"(.*) \/ .*test \(([^,]*), .*\)"
 
 @lru_cache(maxsize=1000)
 def get_job_name(job_id: int) -> str:
+    # [FUNCTION DOC]
+    # Queries the GitHub Actions API for the job with the given id and returns its
+    # name. Results are memoized. On any failure prints a message and returns the
+    # placeholder NoJobName instead of raising.
     try:
         return cast(
             str,
@@ -41,6 +51,10 @@ def get_job_name(job_id: int) -> str:
 
 @lru_cache(maxsize=1000)
 def get_build_name(job_name: str) -> str:
+    # [FUNCTION DOC]
+    # Extracts the build name (first group of the job info pattern) from a test job
+    # name. Memoized. Returns NoBuildEnv and prints a message if the name does not
+    # match.
     try:
         return re.match(REGEX_JOB_INFO, job_name).group(1)  # type: ignore[union-attr]
     except AttributeError:
@@ -50,6 +64,9 @@ def get_build_name(job_name: str) -> str:
 
 @lru_cache(maxsize=1000)
 def get_test_config(job_name: str) -> str:
+    # [FUNCTION DOC]
+    # Extracts the test config (second group of the job info pattern) from a test job
+    # name. Memoized. Returns NoTestConfig and prints a message if there is no match.
     try:
         return re.match(REGEX_JOB_INFO, job_name).group(2)  # type: ignore[union-attr]
     except AttributeError:
@@ -60,6 +77,12 @@ def get_test_config(job_name: str) -> str:
 def get_td_exclusions(
     workflow_run_id: int, workflow_run_attempt: int
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Downloads and unzips the test-jsons artifacts of the given workflow run attempt
+    # into a temporary directory, reads every test-discovery exclusions json file, and
+    # returns a mapping from build name to test config to the sorted list of excluded
+    # test files. Side effect: changes the process working directory to the temporary
+    # directory and never restores it.
     with TemporaryDirectory() as temp_dir:
         print("Using temporary directory:", temp_dir)
         os.chdir(temp_dir)
@@ -89,6 +112,10 @@ def get_td_exclusions(
 
 
 def get_all_run_attempts(workflow_run_id: int) -> list[int]:
+    # [FUNCTION DOC]
+    # Lists the objects stored in the gha-artifacts bucket under the workflow run's
+    # prefix and returns the sorted distinct run attempt numbers found as the first
+    # path component; entries that are not integers are skipped.
     # Returns all run attempts for a given workflow run id that have test
     # artifacts
     bucket = get_s3_resource().Bucket("gha-artifacts")
@@ -106,6 +133,9 @@ def get_all_run_attempts(workflow_run_id: int) -> list[int]:
 
 
 def upload_additional_info(workflow_run_id: int, workflow_run_attempt: int) -> None:
+    # [FUNCTION DOC]
+    # Computes the test-discovery exclusions for the run attempt and uploads them as
+    # a single document to S3 under the additional_info/td_exclusions type.
     exclusions = get_td_exclusions(workflow_run_id, workflow_run_attempt)
 
     upload_workflow_stats_to_s3(

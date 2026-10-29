@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Standalone system utilization monitor. Samples CPU, memory, running python/pytest
+# processes and (via pynvml or amdsmi when importable) per-GPU usage in a background
+# thread, aggregates the samples at a log interval and prints metadata and record
+# json lines to stdout until terminated by SIGINT or SIGTERM. Main contents are the
+# UsageData and GpuData records, SharedResource, UsageLogger, parse_args and main.
+# Import-time side effects: edits sys.path, reads job/workflow environment
+# variables, and probes for the optional GPU libraries.
 """
 A Python script that logging the system-level utilization usage in json format.
 Data collected: CPU, memory, GPU memory utilization, and GPU utilization if available.
@@ -59,6 +67,10 @@ _workflow_name = os.environ.get("WORKFLOW_NAME", "")
 
 @dataclasses.dataclass
 class UsageData:
+    # [CLASS DOC]
+    # Record of one data collection sample: cpu and memory percentages, the list of
+    # observed process descriptions (mappings with pid and cmd) and a list of
+    # GpuData entries (empty without GPUs).
     """
     Dataclass for storing usage data. This is the data that will be logged to the usage_log file.
     """
@@ -71,6 +83,9 @@ class UsageData:
 
 @dataclasses.dataclass
 class GpuData:
+    # [CLASS DOC]
+    # Record of one GPU sample: device uuid, compute and memory utilization percent,
+    # allocated memory percent, and allocated and total memory values in megabytes.
     """
     Dataclass for storing gpu data. This is the data that will be logged to the usage_log file.
     """
@@ -99,6 +114,10 @@ except ModuleNotFoundError:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Parses the process command line: a debug flag, a log interval (seconds, default
+    # 5) and a data collect interval (seconds, default 1). Returns the namespace;
+    # exits the process on invalid arguments.
     """
     Parse command line arguments.
 
@@ -128,6 +147,10 @@ def parse_args() -> argparse.Namespace:
 
 
 class SharedResource:
+    # [CLASS DOC]
+    # Lock-protected buffer shared by the collector thread (producer) and the output
+    # loop (consumer). Holds lists of UsageData samples, error strings and log
+    # strings; all access goes through the lock.
     """
     thread-safe utils for shared resources used in both worker processor
     and main processor during UsageLogger.
@@ -136,12 +159,18 @@ class SharedResource:
     """
 
     def __init__(self, is_debug_mode: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Creates empty sample, error and log buffers and the lock.
+        # KNOWN ISSUE: is_debug_mode is accepted but never used.
         self._data_list: list[UsageData] = []
         self._data_errors: list[str] = []
         self._data_logs: list[str] = []
         self._lock = threading.Lock()
 
     def get_and_reset(self) -> tuple[list[UsageData], list[str], list[str]]:
+        # [FUNCTION DOC]
+        # Atomically returns deep copies of the buffered samples, errors and logs (in
+        # that order) and then clears all three buffers.
         """
         get deepcopy of list of usageData and list of string errors
         """
@@ -159,20 +188,32 @@ class SharedResource:
         return copy_data, copy_errors, copy_logs
 
     def add_data(self, data: UsageData) -> None:
+        # [FUNCTION DOC] Appends one sample to the buffer under the lock.
         with self._lock:
             self._data_list.append(data)
 
     def add_error(self, error: Exception) -> None:
+        # [FUNCTION DOC] Appends the string form of the error to the buffer.
         with self._lock:
             self._data_errors.append(str(error))
 
     def add_log(self, log: str) -> None:
+        # [FUNCTION DOC]
+        # Appends a log string to the buffer under the lock.
+        # KNOWN ISSUE: also prints a leftover debug message to stdout, which pollutes
+        # the json output stream.
         with self._lock:
             print("here log")
             self._data_logs.append(log)
 
 
 class UsageLogger:
+    # [CLASS DOC]
+    # Drives monitoring: a collector thread samples system and GPU usage every data
+    # collect interval into a SharedResource, while the calling thread aggregates and
+    # prints json records every log interval. State: intervals, metadata record, GPU
+    # library flags and handles, debug flag, shared buffer and an exit event. Key
+    # methods are start, stop and log_json.
     """
     Collect and display usage data, including:
     CPU, memory, GPU memory utilization, and GPU utilization.
@@ -188,6 +229,13 @@ class UsageLogger:
         pynvml_enabled: bool = False,
         amdsmi_enabled: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores the intervals and flags, builds the metadata record (job and workflow
+        # ids from environment, start time now), discovers GPU handles and CPU count
+        # (failures are recorded in the metadata error field), and creates the shared
+        # buffer and exit event.
+        # KNOWN ISSUE: the docstring describes log_interval as the data collection
+        # interval; it actually controls how often aggregated records are logged.
         """
         log_interval: Time interval in seconds for collecting usage data; default is 5 seconds.
         is_debug_mode:
@@ -219,6 +267,10 @@ class UsageLogger:
         self.exit_event = threading.Event()
 
     def _collect_data(self) -> None:
+        # [FUNCTION DOC] HELPER: Collector thread body. Until the exit event is set,
+        # samples cpu, memory, processes and GPU data into the shared buffer, records
+        # any exception as an error instead of raising, and sleeps for the collect
+        # interval after each iteration.
         """
         Collects the data every data_collect_interval (in seconds).
         """
@@ -249,6 +301,8 @@ class UsageLogger:
                 time.sleep(self._data_collect_interval)
 
     def _generate_stats(self, data_list: list[float]) -> UtilizationStats:
+        # [FUNCTION DOC] HELPER: Returns average and maximum (rounded to two
+        # decimals) plus the raw values; an empty input gives default empty stats.
         """
         Generate stats from the data list.
         """
@@ -266,6 +320,15 @@ class UsageLogger:
         )
 
     def _output_data(self) -> None:
+        # [FUNCTION DOC] HELPER: Main-thread loop. Logs the metadata record once, then
+        # until exit each iteration drains the shared buffer, builds a record with
+        # cpu and memory stats, command names, GPU stats (if a GPU library is on) and
+        # logs, and prints it as json. If errors arrive with no data, or any step
+        # fails, an error record is logged instead. Sleeps for the log interval per
+        # iteration and shuts down GPU libraries on exit.
+        # KNOWN ISSUE: the continue taken when no data was collected still runs the
+        # finally block, so an empty record is logged; the check on the level field
+        # is always true.
         """
         output the data.
         """
@@ -336,6 +399,9 @@ class UsageLogger:
         self._shutdown_gpu_connections()
 
     def _calculate_gpu_utilization(self, data_list: list[UsageData]) -> list[GpuUsage]:
+        # [FUNCTION DOC] HELPER: Groups samples by GPU uuid and returns one GpuUsage
+        # per GPU with stats for utilization, memory utilization, allocated memory
+        # percent and value, and the latest total memory value.
         """
         Calculates the GPU utilization.
         """
@@ -374,24 +440,36 @@ class UsageLogger:
         return calculate_gpu
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # Starts the collector thread, runs the output loop on the calling thread
+        # until stop is requested, then waits for the collector thread to finish.
         collect_thread = threading.Thread(target=self._collect_data)
         collect_thread.start()
         self._output_data()
         collect_thread.join()
 
     def stop(self, *args: Any) -> None:
+        # [FUNCTION DOC] Sets the exit event so both loops end; extra arguments are
+        # ignored so it can be used as a signal handler.
         """
         Exits the program gracefully. this shuts down the logging loop.
         """
         self.exit_event.set()
 
     def log_json(self, stats: Any) -> None:
+        # [FUNCTION DOC] Prints the given stats (a json string) to stdout.
         """
         Logs the stats in json format to stdout.
         """
         print(stats)
 
     def _collect_gpu_data(self) -> list[GpuData]:
+        # [FUNCTION DOC] HELPER: Queries every known GPU handle through pynvml (or
+        # amdsmi if pynvml is not enabled) and returns a GpuData list with utilization
+        # and memory figures in megabytes and percent. Empty when no library is on.
+        # KNOWN ISSUE: in the amdsmi branch the gfx activity value is also indexed as
+        # a mapping to read memory activity, which looks inconsistent with using it as
+        # a plain utilization number.
         gpu_data_list = []
         if self._has_pynvml:
             # Iterate over the available GPUs
@@ -443,6 +521,9 @@ class UsageLogger:
         return gpu_data_list
 
     def _initial_gpu_handler(self) -> None:
+        # [FUNCTION DOC] HELPER: Fetches GPU handles from the enabled library, records
+        # the logical CPU count, and fills the metadata gpu count, cpu count and gpu
+        # type. Any exception is stored in the metadata error field, not raised.
         """
         Initializes the GPU handlers if gpus are available, and updates the log summary info.
         """
@@ -473,6 +554,8 @@ class UsageLogger:
             self._metadata.error = str(e)
 
     def _shutdown_gpu_connections(self) -> None:
+        # [FUNCTION DOC] HELPER: Shuts down the amdsmi and pynvml libraries when
+        # enabled, ignoring their library errors.
         if self._has_amdsmi:
             try:
                 amdsmi.amdsmi_shut_down()
@@ -485,6 +568,9 @@ class UsageLogger:
                 pass
 
     def _pynvml_get_per_process_gpu_info(self, handle: Any) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Lists compute processes on an NVIDIA GPU handle as
+        # mappings with pid, GPU memory in megabytes and, when readable, the command
+        # line. Not called anywhere in this module.
         processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         per_process_info = []
 
@@ -503,6 +589,9 @@ class UsageLogger:
         return per_process_info
 
     def _rocm_get_per_process_gpu_info(self, handle: Any) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Same as the pynvml variant for AMD GPUs, falling back
+        # to the raw process entry when the per-process info API is missing. Not
+        # called anywhere in this module.
         processes = amdsmi.amdsmi_get_gpu_process_list(handle)
         per_process_info = []
         for p in processes:
@@ -528,7 +617,12 @@ class UsageLogger:
         return per_process_info
 
     def _get_process_info(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Returns pid and command line mappings for the python
+        # or pytest processes currently running on the machine.
         def get_processes_running_python_tests() -> list[Any]:
+            # [FUNCTION DOC] HELPER: Scans all processes and keeps those whose name
+            # and command line mention python, or whose command line mentions
+            # pytest; processes that cannot be inspected are skipped.
             python_test_processes = []
             for process in psutil.process_iter():
                 try:
@@ -548,6 +642,10 @@ class UsageLogger:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: initializes whichever GPU libraries imported successfully, parses
+    # arguments, builds a UsageLogger, registers SIGTERM and SIGINT handlers that
+    # stop it, and runs it until stopped.
     """
     Main function of the program.
     """

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Metric emission helper for CI scripts. Provides process-wide global metrics, an
+# environment-variable backed metric descriptor, and emit_metric, which enriches a
+# metrics mapping with workflow and caller info and uploads it to S3 as a gzipped
+# json line. Import-time side effect: tries to import the upload helper (needs
+# boto3) and sets EMIT_METRICS accordingly, printing a message if that fails.
+
 from __future__ import annotations
 
 import datetime
@@ -24,6 +31,10 @@ except ImportError as e:
 
 
 class EnvVarMetric:
+    # [CLASS DOC]
+    # Describes one metric value read from an environment variable: the metric name,
+    # the variable name, whether it is required (default yes) and an optional
+    # conversion function applied to the raw string. Call value to read it.
     name: str
     env_var: str
     required: bool = True
@@ -37,12 +48,18 @@ class EnvVarMetric:
         required: bool = True,
         type_conversion_fn: Any = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the metric name, environment variable name, required
+        # flag and optional conversion function on the instance.
         self.name = name
         self.env_var = env_var
         self.required = required
         self.type_conversion_fn = type_conversion_fn
 
     def value(self) -> Any:
+        # [FUNCTION DOC]
+        # Reads the environment variable. An unset or empty value gives None when the
+        # metric is optional and raises ValueError naming the variable when required.
+        # Otherwise returns the value, converted by the conversion function if set.
         value = os.environ.get(self.env_var)
 
         # Github CI will set some env vars to an empty string
@@ -65,6 +82,9 @@ global_metrics: dict[str, Any] = {}
 
 
 def add_global_metric(metric_name: str, metric_value: Any) -> None:
+    # [FUNCTION DOC]
+    # Records a name and value in the module-level global metrics mapping, which is
+    # merged into every metric emitted later by this process (mutates global state).
     """
     Adds stats that should be emitted with every metric by the current process.
     If the emit_metrics method specifies a metric with the same name, it will
@@ -77,6 +97,15 @@ def emit_metric(
     metric_name: str,
     metrics: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC]
+    # Merges the global metrics with the given metrics (given ones win), gathers
+    # workflow info from environment variables plus the calling file, module and
+    # function and a UTC timestamp, and uploads one document to the ossci-raw-job-status
+    # bucket under a unique key when EMIT_METRICS is on. If a required variable is
+    # missing it warns and returns without uploading; upload errors are turned into
+    # warnings. Raises ValueError if metrics is None.
+    # KNOWN ISSUE: environment values are read twice and falsy converted values (such
+    # as a zero) are dropped from the document.
     """
     Upload a metric to DynamoDB (and from there, the HUD backend database).
 

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script that counts merged external ("open source" labeled) pull requests and
+# their distinct authors via the GitHub search API for date ranges, excluding bot
+# users, and uploads the per-period counts to S3. Defines the bot user filter set
+# and small HTTP helpers; the command line logic runs only as a script.
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +40,11 @@ def _fetch_url(
     method: str | None = None,
     reader: Callable[[Any], Any] = lambda x: x.read(),
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Performs an HTTP request to url with the given headers,
+    # optional json body and method, adding a token authorization header (mutating
+    # the headers mapping) when GITHUB_TOKEN is set and the url targets the GitHub
+    # API. Returns whatever reader produces from the response. On an HTTP error it
+    # prints details (including rate limit usage for forbidden responses) and re-raises.
     token = os.environ.get("GITHUB_TOKEN")
     if token is not None and url.startswith("https://api.github.com/"):
         headers["Authorization"] = f"token {token}"
@@ -58,6 +69,11 @@ def fetch_json(
     params: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Fetches and parses json from the GitHub API url, appending url-quoted query
+    # parameters when given and sending the optional data as a json body.
+    # KNOWN ISSUE: the return annotation says a list, but the search endpoint used by
+    # the caller returns a mapping.
     headers = {"Accept": "application/vnd.github.v3+json"}
     if params is not None and len(params) > 0:
         url += "?" + "&".join(
@@ -72,6 +88,15 @@ def fetch_json(
 def get_external_pr_data(
     start_date: datetime.date, end_date: datetime.date, period_length: int = 1
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Walks from start_date until end_date in windows of period_length days and, for
+    # each window, searches closed, merged, non-reverted open-source PRs, ignoring
+    # bot authors. Returns one mapping per window with the date, running PR count,
+    # running distinct user count and user list.
+    # KNOWN ISSUE: the paging loop condition depends on a list that is never
+    # filled, so only the first page (up to 100 results) of each window is read.
+    # KNOWN ISSUE: the PR count and user set are not reset between windows, so
+    # values are cumulative rather than per window.
     pr_info = []
     period_begin_date = start_date
 

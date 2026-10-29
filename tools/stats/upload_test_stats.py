@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Script and helpers for turning the xml test reports of a workflow run attempt
+# (downloaded from S3) into json test case records. Uploads a per-class summary,
+# the failed or rerun cases and, for trusted refs, all cases to S3, backfills
+# per-report json files that were not uploaded while jobs ran, and finally uploads
+# additional dashboard info. The upload sequence only runs when executed as a script.
+
 from __future__ import annotations
 
 import argparse
@@ -22,6 +29,10 @@ from tools.stats.upload_stats_lib import (
 
 
 def should_upload_full_test_run(head_branch: str | None, head_repository: str) -> bool:
+    # [FUNCTION DOC]
+    # Returns True only when the head repository is pytorch/pytorch and the head
+    # branch is main or a trunk tag made of the prefix trunk/ followed by a 40
+    # character hexadecimal sha. A missing branch counts as non-matching.
     """Return True if we should upload the full test_run dataset.
 
     Rules:
@@ -41,6 +52,12 @@ def parse_xml_report(
     workflow_run_attempt: int,
     job_id: int | None = None,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Parses the xml report and converts every element with the given tag into a
+    # mapping (via process_xml_element) extended with the workflow id, run attempt,
+    # job id (derived from the report path when not given) and the invoking file,
+    # which is the name of the report's parent folder. Returns the list of mappings.
+    # Raises on malformed xml. Prints progress.
     """Convert a test report xml file into a JSON-serializable list of test cases."""
     print(f"Parsing {tag}s for test report: {report}")
 
@@ -76,6 +93,13 @@ def parse_xml_report(
 def process_xml_element(
     element: ET.Element, output_numbers: bool = True
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Recursively converts an xml element into a mapping: attributes become entries
+    # (converted to integer or float when possible and output_numbers is set), stripped
+    # non-empty text and tail become text and tail entries, and children are stored
+    # under their tag names, becoming a list when a tag repeats.
+    # KNOWN ISSUE: children are always converted with the default number conversion,
+    # ignoring a False output_numbers passed to the parent call.
     """Convert a test suite element into a JSON-serializable dict."""
     ret: dict[str, Any] = {}
 
@@ -133,6 +157,11 @@ def process_xml_element(
 
 
 def get_tests(workflow_run_id: int, workflow_run_attempt: int) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Downloads and unzips the test-report artifacts into a temporary directory (the
+    # process working directory is changed and not restored), parses every xml file
+    # for test case elements in a process pool and returns the flattened list of
+    # test case mappings.
     with TemporaryDirectory() as temp_dir:
         print("Using temporary directory:", temp_dir)
         os.chdir(temp_dir)
@@ -169,6 +198,12 @@ def get_tests(workflow_run_id: int, workflow_run_attempt: int) -> list[dict[str,
 def backfill_test_jsons_while_running(
     workflow_run_id: int, workflow_run_attempt: int
 ) -> None:
+    # [FUNCTION DOC]
+    # Downloads the test-report and test-jsons artifacts, unzips them in a temporary
+    # directory (working directory changed, not restored), and for each xml report
+    # without a matching existing json file, parses it and uploads the test cases to
+    # the gha-artifacts bucket under a test_jsons_while_running key. Reports not
+    # under a test-reports folder are skipped with a message.
     # The bucket name name is a bit misleading, usually the jsons should be
     # uploaded while the job is running, but that won't happen if the job
     # doesn't have permissions to write to the bucket or if there was an error
@@ -228,12 +263,19 @@ def backfill_test_jsons_while_running(
 
 
 def summarize_test_cases(test_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Groups test cases by file, class name, job id, workflow id, run attempt and
+    # invoking file, and returns one summary mapping per group with counts of tests,
+    # failures, errors, skipped and successes (first matching of failure, error,
+    # skipped, else success) and the summed time. Raises a key error if a case lacks
+    # job, workflow, attempt, invoking file or time fields.
     """Group test cases by classname, file, and job_id. We perform the aggregation
     manually instead of using the `test-suite` XML tag because xmlrunner does
     not produce reliable output for it.
     """
 
     def get_key(test_case: dict[str, Any]) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the grouping tuple for a test case.
         return (
             test_case.get("file"),
             test_case.get("classname"),
@@ -245,6 +287,8 @@ def summarize_test_cases(test_cases: list[dict[str, Any]]) -> list[dict[str, Any
         )
 
     def init_value(test_case: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Returns a new summary mapping for the case's group
+        # with all counters zero.
         return {
             "file": test_case.get("file"),
             "classname": test_case.get("classname"),
@@ -286,6 +330,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Upload test stats to s3")
     parser.add_argument(
         "--workflow-run-id",
+        # KNOWN ISSUE: no integer type is given, so the id is passed on as a string.
         required=True,
         help="id of the workflow to get artifacts from",
     )
