@@ -1,3 +1,9 @@
+# [MODULE DOC] Python-side autograd graph utilities: the abstract Node interface for grad_fn
+# objects, GradientEdge and get_gradient_edge, increment_version, context managers for saved tensor
+# hooks (saved_tensors_hooks, save_on_cpu, disable_saved_tensors_hooks), node_creation_hook,
+# region_activation_memory_budget, stream-related setters, register_multi_grad_hook and
+# allow_mutation_on_saved_tensors, plus internal logging-hook and engine-run helpers. Creates a module
+# logger at import; no other import-time side effects.
 import abc
 import contextlib
 import contextvars
@@ -56,8 +62,13 @@ log = logging.getLogger(__name__)
 
 
 class Node(abc.ABC):
+    # [CLASS DOC] Abstract base class describing the interface of autograd graph nodes (grad_fn objects):
+    # name, next_functions, metadata, hook registration. C++ node types and custom Function backward
+    # classes are treated as virtual subclasses through __subclasshook__, so isinstance works without
+    # inheritance. Methods here are abstract and raise NotImplementedError.
     @abc.abstractmethod
     def name(self) -> str:
+        # [FUNCTION DOC] Abstract: return the node's name, e.g. the backward class name string.
         r"""Return the name.
 
         Example::
@@ -74,6 +85,8 @@ class Node(abc.ABC):
     @property
     @abc.abstractmethod
     def next_functions(self) -> tuple[tuple[Optional["Node"], int], ...]:
+        # [FUNCTION DOC] Abstract property: tuple of (next node or None, output index) edges to the input
+        # functions; None marks inputs that do not require grad.
         r"""Return the edges from this node to its input functions.
 
         Each entry is a ``(Node, int)`` pair. The node is ``None`` for an input
@@ -84,24 +97,31 @@ class Node(abc.ABC):
 
     @abc.abstractmethod
     def metadata(self) -> dict:
+        # [FUNCTION DOC] Abstract: return the node's metadata dictionary.
         r"""Return the metadata."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def _sequence_nr(self) -> int:
+        # [FUNCTION DOC] HELPER: Abstract: return the node's sequence number.
         raise NotImplementedError
 
     @property
     @abc.abstractmethod
     def _input_metadata(self) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Abstract property: list of the node's input metadata.
         raise NotImplementedError
 
     @abc.abstractmethod
     def _register_hook_dict(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: register the hook dictionary of a tensor on this node.
         raise NotImplementedError
 
     @abc.abstractmethod
     def register_hook(self, fn: Callable[..., Any]) -> RemovableHandle:
+        # [FUNCTION DOC] Abstract: register a hook called when gradients for this node are computed, with
+        # the grad inputs and grad outputs; it may return replacement grad inputs. Returns a handle whose
+        # remove method unregisters the hook.
         r"""Register a backward hook.
 
         The hook will be called every time a gradient with respect to the
@@ -147,6 +167,8 @@ class Node(abc.ABC):
 
     @abc.abstractmethod
     def register_prehook(self, fn: Callable[..., Any]) -> RemovableHandle:
+        # [FUNCTION DOC] Abstract: register a pre-hook called with the grad outputs before the node runs;
+        # it may return replacement grad outputs. Returns a removable handle.
         r"""Register a backward pre-hook.
 
         The hook will be called every time a gradient with respect to the
@@ -183,6 +205,9 @@ class Node(abc.ABC):
 
     @classmethod
     def __subclasshook__(cls, subclass: type) -> bool:
+        # [FUNCTION DOC] Class hook making Node a virtual base: for Node itself, returns True if the
+        # subclass is a C++ autograd function type exposed in the functions module or derives from
+        # BackwardCFunction; otherwise returns NotImplemented so default checks apply.
         if cls is Node and (
             (
                 subclass is not None
@@ -195,6 +220,9 @@ class Node(abc.ABC):
 
 
 def _get_grad_fn_or_grad_acc(t: Union[torch.Tensor, "GradientEdge"]) -> Node:
+    # [FUNCTION DOC] HELPER: Return the node that computes the gradient for a tensor or edge: the edge's
+    # node, the tensor's grad_fn, or for leaf tensors requiring grad the AccumulateGrad node found by
+    # taking a view. Raises an assertion error if no node is found.
     if isinstance(t, GradientEdge):
         return t.node
     if t.requires_grad and t.grad_fn is None:
@@ -208,6 +236,9 @@ def _get_grad_fn_or_grad_acc(t: Union[torch.Tensor, "GradientEdge"]) -> Node:
 
 
 class GradientEdge(NamedTuple):
+    # [CLASS DOC] Named tuple identifying one gradient edge in the autograd graph: the node, the output
+    # index on it, and an optional ownership token node that keeps the C++ graph alive when the node
+    # itself (a Python-owned node) would not. Created by get_gradient_edge.
     """Object representing a given gradient edge within the autograd graph.
 
     To get the gradient edge where a given Tensor gradient will be computed,
@@ -222,6 +253,9 @@ class GradientEdge(NamedTuple):
 
 
 def get_gradient_edge(tensor: torch.Tensor) -> GradientEdge:
+    # [FUNCTION DOC] Return the GradientEdge where the gradient of the tensor is computed (its grad_fn
+    # or AccumulateGrad node and output number). Adds an ownership token for Python-based nodes so the
+    # graph stays alive. Raises RuntimeError if the tensor does not require grad.
     """Get the gradient edge for computing the gradient of the given Tensor.
 
     In particular, it is equivalent to call
@@ -250,6 +284,9 @@ def get_gradient_edge(tensor: torch.Tensor) -> GradientEdge:
 
 
 def increment_version(tensor: torch.Tensor | Iterable[torch.Tensor]) -> None:
+    # [FUNCTION DOC] Bump the version counter of a tensor or each tensor in an iterable, to flag in-place
+    # modification unknown to autograd. Does nothing useful for inference-mode tensors. Mutates version
+    # metadata via the C++ binding.
     """Update autograd metadata tracking whether the given Tensor was modified in place.
 
     This is to enable more accurate error checking within the autograd engine.
@@ -271,6 +308,9 @@ def increment_version(tensor: torch.Tensor | Iterable[torch.Tensor]) -> None:
 
 
 class saved_tensors_hooks:
+    # [CLASS DOC] Context manager that pushes a (pack_hook, unpack_hook) pair as default saved tensor
+    # hooks for the duration of the with block: pack is applied when a tensor is saved for backward and
+    # unpack when it is needed. State: the two stored callables. Only the innermost pair is active.
     """Context-manager that sets a pair of pack / unpack hooks for saved tensors.
 
     Use this context-manager to define how intermediary results of an operation
@@ -342,19 +382,25 @@ class saved_tensors_hooks:
         pack_hook: Callable[[torch.Tensor], Any],
         unpack_hook: Callable[[Any], torch.Tensor],
     ) -> None:
+        # [FUNCTION DOC] Store the pack and unpack hooks; nothing is registered until entering the context.
         self.pack_hook = pack_hook
         self.unpack_hook = unpack_hook
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Push the stored hooks onto the global default saved tensors hook stack.
         torch._C._autograd._push_saved_tensors_default_hooks(
             self.pack_hook, self.unpack_hook
         )
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Pop the default saved tensors hooks pushed on enter; arguments are ignored.
         torch._C._autograd._pop_saved_tensors_default_hooks()
 
 
 class save_on_cpu(saved_tensors_hooks):
+    # [CLASS DOC] Context manager (a saved_tensors_hooks subclass) that stores saved tensors on CPU in
+    # the forward pass and moves them back to their original device for backward. Optionally uses pinned
+    # memory (asynchronous copies) via pin_memory and a device_type module to test availability.
     """Context manager under which tensors saved by the forward pass will be stored on cpu, then retrieved for backward.
 
     When performing operations within this context manager, intermediary
@@ -405,9 +451,14 @@ class save_on_cpu(saved_tensors_hooks):
     """
 
     def __init__(self, pin_memory: bool = False, device_type: str = "cuda") -> None:
+        # [FUNCTION DOC] Build pack and unpack functions and pass them to the parent. Pack returns the device
+        # and a CPU copy (pinned and non-blocking copied when pin_memory is set and the device module is
+        # available and the tensor is not sparse); unpack moves the tensor back to its device. Unknown
+        # device_type falls back to the cuda module.
         device_module = getattr(torch, device_type, torch.cuda)
 
         def pack_to_cpu(tensor: torch.Tensor) -> tuple[torch.device, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Pack a tensor into (original device, CPU copy), optionally pinned.
             if not pin_memory:
                 return (tensor.device, tensor.cpu())
             is_pinnable = device_module.is_available() and not tensor.is_sparse
@@ -421,6 +472,7 @@ class save_on_cpu(saved_tensors_hooks):
             return (tensor.device, packed)
 
         def unpack_from_cpu(packed: tuple[torch.device, torch.Tensor]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Move a packed CPU tensor back to its original device.
             device, tensor = packed
             return tensor.to(device, non_blocking=pin_memory)
 
@@ -429,6 +481,9 @@ class save_on_cpu(saved_tensors_hooks):
 
 @contextlib.contextmanager
 def disable_saved_tensors_hooks(error_message: str) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that disables saved tensor default hooks: while active, using them
+    # raises RuntimeError with the given message. Remembers any previously set message and restores it
+    # (or re-enables hooks) on exit, even if the body raises. Mutates global C++ autograd state.
     """Context-manager that disables the saved tensors default hooks feature.
 
     Useful for if you are creating a feature that does not work with saved
@@ -464,6 +519,9 @@ def disable_saved_tensors_hooks(error_message: str) -> Generator[None, None, Non
 
 
 class node_creation_hook:
+    # [CLASS DOC] Context manager that registers a thread-local hook called with every newly created and
+    # fully populated autograd Node inside the block (also on engine worker threads). Nested managers
+    # call all hooks in registration order. Hooks must not create new autograd nodes. State: the hook.
     """Context-manager that registers a hook called on each autograd Node created within it.
 
     In that context, ``hook`` is called once for every autograd graph node
@@ -529,18 +587,25 @@ class node_creation_hook:
     """
 
     def __init__(self, hook: Callable[[Node], None]) -> None:
+        # [FUNCTION DOC] Store the node-creation hook callable.
         self.hook = hook
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Push the hook onto the C++ node creation hook stack.
         torch._C._autograd._push_node_creation_hook(self.hook)
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Pop the node creation hook pushed on enter; arguments are ignored.
         torch._C._autograd._pop_node_creation_hook()
 
 
 def region_activation_memory_budget(
     budget: float,
 ) -> contextlib.AbstractContextManager[None]:
+    # [FUNCTION DOC] Prototype: return a context manager (an fx traceback annotation) tagging ops traced
+    # in the block with an activation memory budget ratio in [0, 1] (0 = full recompute, 1 = default
+    # strategy) for the torch.compile min-cut partitioner. Raises TypeError if budget is not a non-bool
+    # number, ValueError if outside [0, 1], RuntimeError when called outside torch.compile (eager mode).
     r"""Context-manager that sets the activation memory budget for the region of
     a compiled forward traced under it.
 
@@ -604,6 +669,8 @@ def region_activation_memory_budget(
 
 
 def set_warn_on_accumulate_grad_stream_mismatch(enabled: bool) -> None:
+    # [FUNCTION DOC] Enable or disable the warning emitted when the AccumulateGrad node's stream differs
+    # from the stream of the node producing the incoming gradient. Sets a global flag in the C++ engine.
     """Whether to warn when the AccumulateGrad node's stream does not match the stream
     of the node that produced the incoming gradient.
     """
@@ -611,6 +678,10 @@ def set_warn_on_accumulate_grad_stream_mismatch(enabled: bool) -> None:
 
 
 def set_override_stale_capture_stream(enabled: bool) -> None:
+    # [FUNCTION DOC] Set the process-global flag controlling how autograd handles a stale non-capturing
+    # stream during CUDA graph capture: when enabled, such streams are replaced by the producer's
+    # capturing stream and end-of-backward leaf syncs crossing the capture boundary are skipped; when
+    # disabled, a RuntimeError is raised for the default stream or for such leaf syncs.
     """Control behavior when autograd detects a stale non-capturing stream during
     CUDA graph capture.
 
@@ -652,19 +723,25 @@ def set_override_stale_capture_stream(enabled: bool) -> None:
 
 
 class _MultiHandle(RemovableHandle):
+    # [CLASS DOC] HELPER: RemovableHandle that wraps several handles; removing it removes all of them.
+    # Picklable via getstate/setstate. State: the tuple of handles.
     handles: tuple[RemovableHandle, ...]
 
     def __init__(self, handles: tuple[RemovableHandle, ...]) -> None:
+        # [FUNCTION DOC] HELPER: Store the tuple of wrapped handles (parent init is not called).
         self.handles = handles
 
     def remove(self) -> None:
+        # [FUNCTION DOC] HELPER: Remove every wrapped handle.
         for handle in self.handles:
             handle.remove()
 
     def __getstate__(self) -> tuple[RemovableHandle, ...]:
+        # [FUNCTION DOC] HELPER: Pickle support: state is the tuple of handles.
         return self.handles
 
     def __setstate__(self, state: tuple[RemovableHandle, ...]) -> None:
+        # [FUNCTION DOC] HELPER: Pickle support: restore the tuple of handles.
         self.handles = state
 
 
@@ -675,6 +752,13 @@ def register_multi_grad_hook(
     *,
     mode: Literal["all", "any"] = "all",
 ) -> RemovableHandle:
+    # [FUNCTION DOC] Register tensor hooks that fire once per backward on groups of tensors. Mode "all":
+    # the hook gets a list of grads (None for tensors whose grad was not computed) after the last grad
+    # of the tensors the engine will actually execute is ready. Mode "any": hook gets the first grad
+    # computed; later ones in the same backward are ignored. Per-backward state is keyed by the current
+    # graph task id. Raises ValueError for an unsupported mode; hooks raise an assertion error if called
+    # outside backward. In "any" mode tensors not requiring grad are skipped. Returns a handle that
+    # removes all registered hooks.
     r"""Register a multi-grad backward hook.
 
     There are two supported modes: ``"all"`` and ``"any"``.
@@ -737,7 +821,11 @@ def register_multi_grad_hook(
         len_tensors = len(tensors)
 
         def get_inner_hook(idx: int) -> Callable[[torch.Tensor], None]:
+            # [FUNCTION DOC] HELPER: Create the per-tensor hook for "all" mode that records its grad at index idx.
             def inner_hook(grad: torch.Tensor) -> None:
+                # [FUNCTION DOC] HELPER: Record grad in the per-task buffer; on the first call compute how many of the
+                # tracked nodes the engine will run; when the last expected grad arrives call fn with the buffer and
+                # free the per-task state. Asserts it runs inside backward.
                 nonlocal count, nb_calls, buffer, fn
                 id = torch._C._current_graph_task_id()
                 if id == -1:
@@ -778,6 +866,8 @@ def register_multi_grad_hook(
 
         @functools.wraps(fn)
         def wrapped_fn(grad: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: "any" mode hook: calls fn with the grad only the first time per backward
+            # task (guarded by a lock), ignoring later grads. Asserts it runs inside backward.
             nonlocal ran_hook
             id = torch._C._current_graph_task_id()
             if id == -1:
@@ -820,6 +910,9 @@ _SID: TypeAlias = tuple[int, int]
 
 
 def _get_tid(tensor: torch.Tensor) -> _TID:
+    # [FUNCTION DOC] HELPER: Return an identity key (object id, data pointer, version) for a tensor; the
+    # data pointer is 0 for fake and functional tensors.
+    # KNOWN ISSUE: marked FIXME in code as almost certainly a bug since fake/functional tensors share pointer 0.
     # FIXME: This is almost definitely a bug.
     if isinstance(
         tensor,
@@ -835,6 +928,8 @@ def _get_tid(tensor: torch.Tensor) -> _TID:
 
 
 def _get_sid(tensor: torch.Tensor) -> _SID:
+    # [FUNCTION DOC] HELPER: Return a storage key (data pointer, version) used to find aliases of a
+    # tensor; data pointer is 0 for fake and functional tensors (marked FIXME in code).
     # FIXME: This is almost definitely a bug.
     if isinstance(
         tensor,
@@ -850,12 +945,19 @@ def _get_sid(tensor: torch.Tensor) -> _SID:
 
 
 class _Handle:
+    # [CLASS DOC] HELPER: Empty marker class whose instances act as weak-referenceable handles for saved tensors.
     pass
 
 
 class _swap_with_cloned(saved_tensors_hooks):
+    # [CLASS DOC] HELPER: saved_tensors_hooks pair used by allow_mutation_on_saved_tensors: pack records
+    # the tensor (and aliasing info) in the shared context and returns a handle; unpack returns the
+    # cloned tensor if one was made on mutation, else the original.
     def __init__(self, ctx: "_AllowMutationOnSavedContext") -> None:
+        # [FUNCTION DOC] HELPER: Build pack and unpack hooks bound to ctx and register them with the parent.
         def pack_hook(tensor: torch.Tensor) -> _Handle:
+            # [FUNCTION DOC] HELPER: Save the tensor: record its tid under its sid and keep the original in ctx
+            # keyed by a handle (reusing the handle if the same tensor version was already saved). Returns the handle.
             tid = _get_tid(tensor)
             sid = _get_sid(tensor)
             # Tensors saved for backward have an entry in _tid_to_weakhandle
@@ -875,6 +977,8 @@ class _swap_with_cloned(saved_tensors_hooks):
             return handle
 
         def unpack_hook(handle: _Handle) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Return the clone (if any) or original tensor for the handle. Raises an
+            # assertion error when used outside the allow_mutation context or when the handle is unknown.
             error_msg = (
                 "Trying to backward outside of the 'allow_mutation_on_saved_tensors' context"
                 "in which the graph was originally recorded."
@@ -893,7 +997,10 @@ class _swap_with_cloned(saved_tensors_hooks):
 
 
 class _CloneArgBeforeMutateMode(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode that, before any op writing in place to a tensor, clones the
+    # saved originals aliasing the written tensor into ctx.cloned (and drops the original). State: ctx.
     def __init__(self, ctx: "_AllowMutationOnSavedContext") -> None:
+        # [FUNCTION DOC] HELPER: Store the shared mutation context.
         self.ctx = ctx
 
     def __torch_dispatch__(
@@ -903,9 +1010,13 @@ class _CloneArgBeforeMutateMode(TorchDispatchMode):
         args: tuple[Any, ...] = (),
         kwargs: dict[Any, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Dispatch hook: for each schema argument that is written (out kwarg, list in
+        # foreach ops, or plain tensor) clone any saved aliases first, then run the op with the same args.
         kwargs = kwargs or {}
 
         def maybe_clone(t: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: For tensor t, clone and swap out every saved tensor sharing its storage key
+            # that has not been cloned yet, skipping entries already cleared by backward.
             tid = _get_tid(t)
             sid = _get_sid(t)
             ctx = self.ctx
@@ -945,13 +1056,18 @@ class _CloneArgBeforeMutateMode(TorchDispatchMode):
 
 
 class _AllowMutationOnSavedContext:
+    # [CLASS DOC] HELPER: Holds state for allow_mutation_on_saved_tensors: weak maps of handle to cloned
+    # and to original saved tensors, weak map of tensor key to handle, and a map of storage key to the
+    # set of tensor keys saved from it.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Create the empty state maps.
         self.cloned: MutableMapping[_Handle, torch.Tensor] = WeakKeyDictionary()
         self.original: MutableMapping[_Handle, torch.Tensor] = WeakKeyDictionary()
         self.tid_to_weakhandle: MutableMapping[_TID, _Handle] = WeakValueDictionary()
         self.sid_to_tid: dict[_SID, set[_TID]] = defaultdict(set)
 
     def clear(self) -> None:
+        # [FUNCTION DOC] HELPER: Empty all state maps.
         self.cloned.clear()
         self.original.clear()
         self.tid_to_weakhandle.clear()
@@ -962,6 +1078,10 @@ class _AllowMutationOnSavedContext:
 def allow_mutation_on_saved_tensors() -> Generator[
     _AllowMutationOnSavedContext, None, None
 ]:
+    # [FUNCTION DOC] Context manager allowing in-place mutation of tensors saved for backward: installs
+    # the swap-on-save hooks and a dispatch mode that clones saved tensors before mutation. Yields the
+    # state context (cleared on exit). Sets a module-global enabled flag for the duration and resets it
+    # on exit. Raises RuntimeError if nested. Forward and backward must both run inside it.
     """Context manager under which mutating tensors saved for backward is allowed.
 
     Under this context manager, tensors saved for backward are cloned on mutation,
@@ -1011,9 +1131,14 @@ def allow_mutation_on_saved_tensors() -> Generator[
 def _register_logging_hooks_on_whole_graph(
     t_outputs: Sequence[torch.Tensor | GradientEdge],
 ) -> Callable[[], None]:
+    # [FUNCTION DOC] HELPER: Register a prehook on every node reachable from the given outputs that logs
+    # (debug level) the executing node and shapes/dtypes of its grad outputs. Returns a function that
+    # removes all the hooks.
     grad_fns = list(map(_get_grad_fn_or_grad_acc, t_outputs))
 
     def iter_graph(roots: list[Node]) -> Iterator[Node]:
+        # [FUNCTION DOC] HELPER: Breadth-first generator over the graph from the roots following
+        # next_functions, visiting each node once.
         if not roots:
             return
         seen: set[Node] = set()
@@ -1034,6 +1159,7 @@ def _register_logging_hooks_on_whole_graph(
             yield node
 
     def fmt(t: torch.Tensor | None) -> str:
+        # [FUNCTION DOC] HELPER: Format a tensor as dtype abbreviation plus shape, or "None".
         # Avoid circular import
         from torch.utils._dtype_abbrs import dtype_abbrs
 
@@ -1042,6 +1168,7 @@ def _register_logging_hooks_on_whole_graph(
         return f"{dtype_abbrs[t.dtype]}[{', '.join(map(str, t.shape))}]"
 
     def prehook(grad_outputs: Sequence[torch.Tensor | None]) -> None:
+        # [FUNCTION DOC] HELPER: Log the currently executing autograd node and its grad outputs at debug level.
         node = torch._C._current_autograd_node()
         grad_outputs_str = f"[{','.join(fmt(t) for t in grad_outputs)}]"
         log_str = f"Executing: {node} with grad_outputs: {grad_outputs_str}"
@@ -1050,6 +1177,7 @@ def _register_logging_hooks_on_whole_graph(
     handles = [node.register_prehook(prehook) for node in iter_graph(grad_fns)]
 
     def unregister_hooks() -> None:
+        # [FUNCTION DOC] HELPER: Remove all registered logging prehooks.
         for handle in handles:
             handle.remove()
 
@@ -1061,6 +1189,10 @@ def _engine_run_backward(
     *args: Any,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Run the C++ autograd engine backward for the given outputs (extra args pass
+    # through) and return its result tuple. If debug logging is enabled attaches logging hooks for the
+    # call. Stashes the current contextvars context in thread-local storage so compiler config is visible
+    # on device threads, and erases it afterwards in a finally block (to avoid a GIL destructor deadlock).
     attach_logging_hooks = log.getEffectiveLevel() <= logging.DEBUG
     if attach_logging_hooks:
         unregister_hooks = _register_logging_hooks_on_whole_graph(t_outputs)
