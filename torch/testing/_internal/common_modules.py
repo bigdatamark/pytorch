@@ -1,5 +1,21 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] ModuleInfo database for the generic nn.Module tests (the TestModule suites in
+# the test files).
+# Defines the data classes used to describe test samples (FunctionInput, ModuleInput,
+# ErrorModuleInput, ModuleErrorEnum), the ModuleInfo metadata record, and the modules decorator
+# that parametrizes a device-generic test over ModuleInfo entries, train/eval mode and dtype.
+# Contains one sample-generator function per tested module (module_inputs_torch_nn_*),
+# error-sample generators (module_error_inputs_torch_nn_*), no-batch-dim reference helpers, shared
+# decorator lists for RNN-family modules, and the module_db list that ties them together with
+# per-module skips and tolerances.
+# Import-time side effects: builds MODULE_CLASSES from the public names of the listed nn
+# namespaces and fills MODULE_CLASS_NAMES (first namespace wins for aliases); queries the MPS
+# backend for the macOS version; constructs every ModuleInfo in module_db. No tensors are
+# created at import.
+# KNOWN ISSUE: MODULE_NAMESPACES lists the quantized modules namespace twice and MODULES_TO_SKIP
+# lists the quantized MaxPool2d twice; the duplicates are harmless.
+
 import torch
 import unittest
 from copy import deepcopy
@@ -71,16 +87,28 @@ TrainEvalMode = Enum('TrainEvalMode', ('train_only', 'eval_only', 'train_and_eva
 
 
 class modules(_TestParametrizer):
+    # [CLASS DOC] Decorator class (a test parametrizer) that expands a device-generic test into
+    # one test per ModuleInfo, training/eval mode and dtype.
+    # State: module_info_list (list of ModuleInfo), allowed_dtypes (set or None meaning all
+    # supported), train_eval_mode (a TrainEvalMode value) and skip_if_dynamo (bool).
+    # Only valid inside device-specific test classes; the generated test receives module_info,
+    # dtype and training keyword arguments.
     """ PROTOTYPE: Decorator for specifying a list of modules over which to run a test. """
 
     def __init__(self, module_info_iterable, allowed_dtypes=None,
                  train_eval_mode=TrainEvalMode.train_and_eval, skip_if_dynamo=True):
+        # [FUNCTION DOC] Stores the module infos as a list, the allowed dtypes as a set (or
+        # None), the train/eval mode selector and the skip-if-dynamo flag. No validation and
+        # no side effects.
         self.module_info_list = list(module_info_iterable)
         self.allowed_dtypes = set(allowed_dtypes) if allowed_dtypes is not None else None
         self.train_eval_mode = train_eval_mode
         self.skip_if_dynamo = skip_if_dynamo
 
     def _get_training_flags(self, module_info):
+        # [FUNCTION DOC] HELPER: Returns the list of training flags to test for a ModuleInfo: true
+        # for train-only or both modes, false for eval-only or both modes. If the module's train
+        # and eval behavior do not differ, only the first flag is kept. Pure function.
         training_flags = []
         if (self.train_eval_mode == TrainEvalMode.train_only or
                 self.train_eval_mode == TrainEvalMode.train_and_eval):
@@ -97,6 +125,18 @@ class modules(_TestParametrizer):
         return training_flags
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator used by the parametrization machinery: for every ModuleInfo,
+        # training flag and dtype (supported dtypes for the device type, intersected with
+        # allowed_dtypes) it yields a tuple of wrapped test, test name, parameter kwargs
+        # (module_info, dtype, training) and a decorator factory bound to the ModuleInfo.
+        # The name is the formatted module name, with a train_mode or eval_mode suffix when both
+        # modes are generated. Unless skip_if_dynamo is false or the inductor test flag is on, the
+        # test is wrapped to skip under Dynamo.
+        # Raises RuntimeError if device_cls is None (decorator used outside device-type
+        # instantiation). On any error while building a test it prints a message naming the test
+        # and module, then re-raises.
+        # KNOWN ISSUE: dtypes are held in a set, so the generation order of dtype variants
+        # is not deterministic.
         if device_cls is None:
             raise RuntimeError('The @modules decorator is only intended to be used in a device-specific '
                                'context; use it with instantiate_device_type_tests() instead of '
@@ -124,6 +164,9 @@ class modules(_TestParametrizer):
 
                     @wraps(test)
                     def test_wrapper(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Thin forwarding wrapper that calls the original
+                        # test with the same arguments; it exists so the functools wrapper can be
+                        # given its own decorators without mutating the original test.
                         return test(*args, **kwargs)
 
                     if self.skip_if_dynamo and not torch.testing._internal.common_utils.TEST_WITH_TORCHINDUCTOR:
@@ -140,6 +183,9 @@ class modules(_TestParametrizer):
 
 
 def get_module_common_name(module_cls):
+    # [FUNCTION DOC] Returns the display name for a module class: the precomputed short dotted
+    # name such as nn.Linear from MODULE_CLASS_NAMES if present, otherwise the class's own
+    # name. Pure lookup.
     if module_cls in MODULE_CLASS_NAMES:
         # Example: "nn.Linear"
         return MODULE_CLASS_NAMES[module_cls]
@@ -148,19 +194,36 @@ def get_module_common_name(module_cls):
 
 
 class FunctionInput:
+    # [CLASS DOC] Plain container (slots only) for the positional and keyword arguments of
+    # one function call.
+    # Attributes: args (tuple) and kwargs (dict). Used for both module constructor input
+    # and forward input.
     """ Contains args and kwargs to pass as input to a function. """
     __slots__ = ['args', 'kwargs']
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Captures any positional arguments as the args tuple and any keyword
+        # arguments as the kwargs dict, without copying.
         self.args = args
         self.kwargs = kwargs
 
 
 class ModuleInput:
+    # [CLASS DOC] One test sample for a module: constructor arguments, forward arguments, a
+    # description suffix and an optional reference function.
+    # Attributes: constructor_input and forward_input (FunctionInput; forward may be None), desc
+    # (string appended to subtest names), reference_fn (None or a wrapper taking the module plus
+    # forward arguments and returning the expected output).
+    # Invariant: when a reference is given it is replaced by a wrapper that deep-copies the
+    # arguments and passes the module's parameter list as an extra argument.
     """ Contains args / kwargs for module instantiation + forward pass. """
     __slots__ = ['constructor_input', 'forward_input', 'desc', 'reference_fn']
 
     def __init__(self, constructor_input, forward_input=None, desc='', reference_fn=None):
+        # [FUNCTION DOC] Stores the inputs, description and reference. If a reference function is
+        # supplied, replaces it with a wrapper that deep-copies the positional and keyword
+        # arguments (to avoid side effects) and calls the reference with the module, the list of
+        # module parameters and the copied arguments. No other side effects.
         self.constructor_input = constructor_input  # Inputs to pass during construction
         self.forward_input = forward_input  # Inputs to pass to forward()
         self.desc = desc  # Description for this set of inputs
@@ -170,6 +233,9 @@ class ModuleInput:
 
             @wraps(reference_fn)
             def copy_reference_fn(m, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Wrapper around the user reference: deep-copies the
+                # arguments, then returns the reference's result called with the module, a list of
+                # its parameters and the copied arguments.
                 # Copy inputs to avoid undesired side effects from calling the reference.
                 args, kwargs = deepcopy(args), deepcopy(kwargs)
 
@@ -179,11 +245,17 @@ class ModuleInput:
             self.reference_fn = copy_reference_fn
 
 class ModuleErrorEnum(Enum):
+    # [CLASS DOC] Enumeration of the stage at which a module sample is expected to raise:
+    # CONSTRUCTION_ERROR (building the module) or FORWARD_ERROR (calling it).
     """ Enumerates when error is raised when testing modules. """
     CONSTRUCTION_ERROR = 0
     FORWARD_ERROR = 1
 
 class ErrorModuleInput:
+    # [CLASS DOC] A ModuleInput that is expected to raise, together with the
+    # expected failure details.
+    # Attributes (slots): module_error_input (the ModuleInput), error_on (a ModuleErrorEnum
+    # value), error_type (exception class) and error_regex (pattern the message must match).
     """
     A ModuleInput that will cause the operation to throw an error plus information
     about the resulting error.
@@ -197,6 +269,9 @@ class ErrorModuleInput:
                  error_on=ModuleErrorEnum.CONSTRUCTION_ERROR,
                  error_type=RuntimeError,
                  error_regex):
+        # [FUNCTION DOC] Stores the sample and the expectation. error_on defaults to
+        # construction-time failure and error_type to RuntimeError; error_regex is
+        # keyword-only and required.
         self.module_error_input = module_error_input
         self.error_on = error_on
         self.error_type = error_type
@@ -204,6 +279,15 @@ class ErrorModuleInput:
 
 
 class ModuleInfo:
+    # [CLASS DOC] Metadata record describing how a torch.nn module class is tested: its sample
+    # generators, supported dtypes per device, decorators and tolerances.
+    # Attributes mirror the constructor arguments (module_cls, module_inputs_func,
+    # module_error_inputs_func, decorators combined with skips, dtypes, dtypesIfMPS, dtypesIfHpu,
+    # supports_gradgrad, gradcheck_nondet_tol, module_memformat_affects_out,
+    # train_and_eval_differ, gradcheck_fast_mode) plus is_lazy, true when the class derives from
+    # the lazy-module mixin.
+    # Key methods: get_decorators, supported_dtypes and the name properties. Instances are
+    # collected in module_db.
     """ Module information to be used in testing. """
 
     def __init__(self,
@@ -225,6 +309,11 @@ class ModuleInfo:
                                             # When set to None, defers to the default value provided by the wrapper
                                             # function around gradcheck (testing._internal.common_utils.gradcheck)
                  ):
+        # [FUNCTION DOC] Records the module class and testing options. The decorators and skips
+        # are concatenated into one tuple (decorators first). Keyword-only options default to
+        # floating-point dtypes, a fixed reduced dtype set for MPS and a bfloat16/float32 set for
+        # HPU, gradgrad support on, zero nondeterminism tolerance and no error generator. Computes
+        # is_lazy from the class hierarchy.
         self.module_cls = module_cls
         self.module_inputs_func = module_inputs_func
         self.decorators = (*(decorators if decorators else []), *(skips if skips else []))
@@ -240,6 +329,9 @@ class ModuleInfo:
         self.is_lazy = issubclass(module_cls, torch.nn.modules.lazy.LazyModuleMixin)
 
     def get_decorators(self, test_class, test_name, device, dtype, param_kwargs):
+        # [FUNCTION DOC] Returns the flat list of decorators that apply to a test: DecorateInfo
+        # entries contribute their decorators only when active for the given test class, test
+        # name, device, dtype and parameter kwargs; any other entry is included unconditionally.
         result = []
         for decorator in self.decorators:
             if isinstance(decorator, DecorateInfo):
@@ -250,6 +342,8 @@ class ModuleInfo:
         return result
 
     def supported_dtypes(self, device_type):
+        # [FUNCTION DOC] Returns the dtype collection to test for a device type: the MPS list for
+        # mps, the HPU list for hpu, otherwise the default dtypes.
         if device_type == 'mps':
             return self.dtypesIfMPS
         elif device_type == 'hpu':
@@ -259,15 +353,24 @@ class ModuleInfo:
 
     @property
     def name(self):
+        # [FUNCTION DOC] Property returning the common display name of the module class,
+        # such as nn.Linear.
         return get_module_common_name(self.module_cls)
 
     @property
     def formatted_name(self):
+        # [FUNCTION DOC] Property returning the name with dots replaced by underscores, suitable
+        # for building test names.
         return self.name.replace('.', '_')
 
 # Start of module inputs functions.
 
 def module_inputs_torch_nn_Linear(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Linear: batched input with bias, batched
+    # without bias, and an unbatched 1D input; each has an explicit reference computed from
+    # the module parameters.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     module_inputs = [
@@ -288,9 +391,17 @@ def module_inputs_torch_nn_Linear(module_info, device, dtype, requires_grad, tra
 
 
 def module_inputs_torch_nn_Bilinear(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Bilinear: batched with bias, without bias, and
+    # unbatched inputs; the reference is computed with an einsum over the two inputs and
+    # the module parameters.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def bilinear_reference_fn(m, p, x1, x2, bias=True):
+        # [FUNCTION DOC] HELPER: Computes the expected bilinear output for batched inputs with an
+        # einsum over the weight, then adds the bias when enabled (viewed as a vector for batch
+        # size one, otherwise broadcast across the batch).
         result = torch.einsum('bn,anm,bm->ba', x1, p[0], x2)
         if bias:
             if x1.shape[0] == 1:
@@ -317,6 +428,16 @@ def module_inputs_torch_nn_Bilinear(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_KLDivLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.KLDivLoss: cases for default, sum, batchmean and none
+    # reduction plus log_target, each on a 10x10 input and on a scalar input; the reference is
+    # kldivloss_reference. Reads an optional log_target keyword to decide whether the target is
+    # built in log space.
+    # KNOWN ISSUE: scalar_target is computed but never used (a FIXME notes this); the scalar
+    # samples pass the scalar input as both input and target. The log_target case sets the
+    # constructor option but the target is built from the keyword argument, so it stays log-space
+    # unless that keyword is passed.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases: list[tuple[str, dict]] = [
@@ -330,6 +451,9 @@ def module_inputs_torch_nn_KLDivLoss(module_info, device, dtype, requires_grad, 
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of kldivloss_reference for the given input(s) and the bound case
+            # options. The case options are bound as defaults so each sample keeps its own.
             return kldivloss_reference(i, t, **constructor_kwargs)
 
         input = make_input((10, 10)).log()
@@ -357,7 +481,16 @@ def module_inputs_torch_nn_KLDivLoss(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.NLLLoss: cases for default, sum/none reduction,
+    # ignore_index (including negative) and class weights; each case is run on a 2D (15x4)
+    # input, a 4D spatial input, a 6D higher-dimensional input and a 3D input. Inputs are
+    # log-softmaxed over dim 1 and targets are random class indices below 4; references are
+    # nllloss_reference and nlllossNd_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     def make_input(shape, device=device, dtype=dtype, requires_grad=requires_grad):
+        # [FUNCTION DOC] HELPER: Creates a random tensor of the given shape, log-softmaxed over
+        # dim 1, with requires_grad applied after the softmax so it is a leaf.
         return make_tensor(shape, device=device, dtype=dtype,
                            requires_grad=False).log_softmax(dim=1).requires_grad_(requires_grad)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -380,6 +513,9 @@ def module_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_grad, tr
     for desc, constructor_kwargs in cases:
 
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of nllloss_reference for the given input(s) and the bound case
+            # options. The case options are bound as defaults so each sample keeps its own.
             return nllloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -391,6 +527,9 @@ def module_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_grad, tr
         )
 
         def nd_reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference for the spatial and
+            # higher-dimensional cases: returns nlllossNd_reference for the input and
+            # target with the bound case options.
             return nlllossNd_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -424,6 +563,12 @@ def module_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_GaussianNLLLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.GaussianNLLLoss: cases for default, sum, mean and
+    # none reduction plus a homoscedastic variant (variance of shape 1x3, otherwise 4x1 with
+    # absolute values) on 4x3 inputs; the reference is the generic no-batch-dim reference. The
+    # homoscedastic flag is removed from the constructor options before use.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -452,6 +597,12 @@ def module_inputs_torch_nn_GaussianNLLLoss(module_info, device, dtype, requires_
 
 
 def module_inputs_torch_nn_PoissonNLLLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.PoissonNLLLoss: cases for the reductions, full, no
+    # log_input and both; input and target are 2x3x4x5 (targets are non-negative whole numbers).
+    # For float16 the value range is narrowed to avoid overflow in the reference exponential; a
+    # nested reference function computes the expected loss.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Narrow the input range for fp16 so `i.exp()` summed over numel doesn't
     # blow past 65504 in the `full` reference path; the default (-9, 9) range
     # gives `exp(8.9) ~= 7300` and over 120 elements overflows fp16 to inf,
@@ -473,6 +624,10 @@ def module_inputs_torch_nn_PoissonNLLLoss(module_info, device, dtype, requires_g
     ]
 
     def poissonnllloss_reference_fn(i, t, log_input=True, full=False, reduction='mean', eps=1e-8):
+        # [FUNCTION DOC] HELPER: Expected Poisson negative log-likelihood: exponential form when
+        # log_input else logarithm with eps; when full, adds the Stirling term masked to zero
+        # where the target is at most one; then returns the elementwise result, its mean (sum over
+        # element count) or its sum per the reduction.
         if log_input:
             result = i.exp() - t.mul(i)
         else:
@@ -491,6 +646,10 @@ def module_inputs_torch_nn_PoissonNLLLoss(module_info, device, dtype, requires_g
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters
+            # and returns the result of the nested poisson reference for the given input(s) and
+            # the bound case options. The case options are bound as defaults so each sample
+            # keeps its own.
             return poissonnllloss_reference_fn(i, t, **constructor_kwargs)
 
         log_input = constructor_kwargs.get('log_input', True)
@@ -507,6 +666,11 @@ def module_inputs_torch_nn_PoissonNLLLoss(module_info, device, dtype, requires_g
 
 
 def module_inputs_torch_nn_MSELoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MSELoss: cases for default, sum, mean and none
+    # reduction, each on a 2x3x4x5 input and on a scalar input; a nested reference computes
+    # squared error with the matching reduction.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -518,6 +682,8 @@ def module_inputs_torch_nn_MSELoss(module_info, device, dtype, requires_grad, tr
     ]
 
     def mse_loss_reference_fn(m, p, i, t, reduction='mean'):
+        # [FUNCTION DOC] HELPER: Expected squared error: elementwise for reduction none, the sum
+        # divided by element count for mean, otherwise the sum.
         if reduction == 'none':
             return (i - t).pow(2)
         elif reduction == 'mean':
@@ -546,6 +712,16 @@ def module_inputs_torch_nn_MSELoss(module_info, device, dtype, requires_grad, tr
 
 
 def no_batch_dim_reference_fn(m, p, *args, **kwargs):
+    # [FUNCTION DOC] Reference implementation used to check that a module accepts unbatched
+    # input: each positional tensor gets a batch dimension added (dim 0 when batch_first, which
+    # defaults to true, else dim 1), the module is run under frozen RNG state, and the output has
+    # that dimension removed.
+    # Bound keyword options (removed before calling the module): batch_first, kwargs_to_batchify
+    # (mapping from keyword name to the dim at which that tensor argument gets a batch dimension)
+    # and is_criterion (when true and the module's reduction is none, one more leading dimension
+    # is squeezed from the result). Only modules returning a single tensor are supported.
+    # Raises AssertionError if kwargs_to_batchify is given but is not a dict. First two arguments
+    # (module, parameters) are accepted and ignored for the parameters.
     """Reference function for modules supporting no batch dimensions.
 
     Unbatched inputs are unsqueezed to form a
@@ -564,6 +740,9 @@ def no_batch_dim_reference_fn(m, p, *args, **kwargs):
         is_criterion[bool] : Specify if the module is a criterion and handle the reduction for output accordingly.
     """
     def get_and_pop(key, default):
+        # [FUNCTION DOC] HELPER: Returns the value of a keyword argument (or the default
+        # when absent) and removes it from the enclosing keyword dictionary so it is not
+        # passed to the module.
         v = kwargs.get(key, default)
         if key in kwargs:
             kwargs.pop(key)
@@ -593,6 +772,11 @@ def no_batch_dim_reference_fn(m, p, *args, **kwargs):
 
 
 def no_batch_dim_reference_mha(m, p, *args, **kwargs):
+    # [FUNCTION DOC] Reference for MultiheadAttention with unbatched input: adds a batch
+    # dimension to each positional tensor (dim 0 unless batch_first is false, which is removed
+    # from keywords) and to a non-None key_padding_mask, runs the module under frozen RNG state,
+    # and returns the output squeezed at the batch dim together with the attention weights
+    # squeezed at dim 0.
     """Reference function for MultiheadAttention supporting no batch dimensions.
 
     Unbatched inputs are unsqueezed to form a
@@ -612,6 +796,15 @@ def no_batch_dim_reference_mha(m, p, *args, **kwargs):
 
 
 def no_batch_dim_reference_rnn_gru(m, p, *args, **kwargs):
+    # [FUNCTION DOC] Reference for RNN and GRU with unbatched input. Accepts the input alone or
+    # the input plus an initial hidden state (given a batch dim at dim 1), adds a batch dim to the
+    # input according to the required batch_first keyword (removed before the call), runs the
+    # module under frozen RNG state and returns the output squeezed at the batch dim and the final
+    # hidden state squeezed at dim 1.
+    # Raises KeyError if batch_first is missing.
+    # KNOWN ISSUE: with any other positional argument count the input variable is never bound
+    # (UnboundLocalError); also packed-sequence samples use this reference although it calls
+    # tensor-only methods on the input.
     """Reference function for RNN and GRU supporting no batch dimensions.
 
     Unbatched inputs are unsqueezed to form a
@@ -636,6 +829,13 @@ def no_batch_dim_reference_rnn_gru(m, p, *args, **kwargs):
 
 
 def no_batch_dim_reference_lstm(m, p, *args, **kwargs):
+    # [FUNCTION DOC] Reference for LSTM with unbatched input. Accepts the input alone or with an
+    # initial (hidden, cell) pair (each given a batch dim at dim 1), adds a batch dim to the input
+    # per the required batch_first keyword (removed before the call), runs the module under frozen
+    # RNG state and returns the output squeezed at the batch dim plus the hidden and cell states
+    # squeezed at dim 1.
+    # Raises KeyError if batch_first is missing; other positional argument counts leave the
+    # input unbound (UnboundLocalError).
     """Reference function for LSTM supporting no batch dimensions.
 
     Unbatched inputs are unsqueezed to form a
@@ -660,6 +860,9 @@ def no_batch_dim_reference_lstm(m, p, *args, **kwargs):
 
 
 def no_batch_dim_reference_lstmcell(m, p, *args, **kwargs):
+    # [FUNCTION DOC] Reference for LSTMCell with unbatched input: takes the input and a (hidden,
+    # cell) pair, adds a leading batch dim to all three, runs the module under frozen RNG state
+    # and returns the two outputs with the batch dim removed.
     """Reference function for LSTMCell supporting no batch dimensions.
 
     The module is passed the input and target in batched form with a single item.
@@ -673,6 +876,9 @@ def no_batch_dim_reference_lstmcell(m, p, *args, **kwargs):
 
 
 def generate_regression_criterion_inputs(make_input):
+    # [FUNCTION DOC] HELPER: Builds three ModuleInput samples (reduction none, mean and sum) for
+    # loss modules, each with 4-element unbatched input and target made by the supplied tensor
+    # factory and checked with the criterion-aware no-batch-dim reference. Returns a list.
     return [
         ModuleInput(
             constructor_input=FunctionInput(reduction=reduction),
@@ -683,6 +889,11 @@ def generate_regression_criterion_inputs(make_input):
 
 
 def module_inputs_torch_nn_AvgPool1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AvgPool1d: unbatched input with kernel size 2
+    # (checked with the no-batch-dim reference), a batched input, a stride variant and a stride
+    # plus padding variant.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -701,6 +912,10 @@ def module_inputs_torch_nn_AvgPool1d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_AvgPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AvgPool2d: unbatched and batched inputs, stride and
+    # stride plus padding variants, and the same three variants again with divisor_override set.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -729,6 +944,11 @@ def module_inputs_torch_nn_AvgPool2d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_AvgPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AvgPool3d: unbatched and batched inputs plus many
+    # stride, padding and divisor_override combinations; several names mirror special GPU kernel
+    # paths (fixed kernel width, general output, non-overlapping windows).
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -781,6 +1001,10 @@ def module_inputs_torch_nn_AvgPool3d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_AdaptiveAvgPool1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveAvgPool1d: output size 3 on a batched input,
+    # the same on an unbatched input (no-batch-dim reference) and output size 1.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -797,6 +1021,10 @@ def module_inputs_torch_nn_AdaptiveAvgPool1d(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_AdaptiveAvgPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveAvgPool2d: single-int size, unbatched input,
+    # 1x1 output, tuple size, and a tuple with a None entry meaning keep the input size.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -818,6 +1046,10 @@ def module_inputs_torch_nn_AdaptiveAvgPool2d(module_info, device, dtype, require
                     desc='tuple_none')]
 
 def module_inputs_torch_nn_AdaptiveAvgPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveAvgPool3d: single-int size, unbatched input,
+    # tuple size, tuple with a None entry, and a small input where the last dimension is shrunk.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -840,6 +1072,10 @@ def module_inputs_torch_nn_AdaptiveAvgPool3d(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_AdaptiveMaxPool1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveMaxPool1d: output size 3 on batched and
+    # on unbatched inputs.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -853,6 +1089,10 @@ def module_inputs_torch_nn_AdaptiveMaxPool1d(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_AdaptiveMaxPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveMaxPool2d: single-int size, unbatched input,
+    # tuple size, and a tuple with a None entry.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -872,6 +1112,11 @@ def module_inputs_torch_nn_AdaptiveMaxPool2d(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_AdaptiveMaxPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.AdaptiveMaxPool3d: single-int size, unbatched
+    # input, tuple sizes (one with None), and two cases whose input sizes are not multiples of
+    # the output sizes.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -897,6 +1142,11 @@ def module_inputs_torch_nn_AdaptiveMaxPool3d(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_BatchNorm1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.BatchNorm1d: affine default on 2D input, 3D input,
+    # simple averaging (momentum None), no affine, no running statistics, 3D without affine,
+    # zero-size batch, and no bias.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -927,6 +1177,10 @@ def module_inputs_torch_nn_BatchNorm1d(module_info, device, dtype, requires_grad
 
 
 def module_inputs_torch_nn_BatchNorm2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.BatchNorm2d: default, simple averaging, custom
+    # momentum, no affine, no running statistics, zero-size batch, and no bias on 4D inputs.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -953,6 +1207,10 @@ def module_inputs_torch_nn_BatchNorm2d(module_info, device, dtype, requires_grad
 
 
 def module_inputs_torch_nn_BatchNorm3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.BatchNorm3d: default, simple averaging, custom
+    # momentum, no affine, no running statistics, zero-size batch, and no bias on 5D inputs.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -979,6 +1237,11 @@ def module_inputs_torch_nn_BatchNorm3d(module_info, device, dtype, requires_grad
 
 
 def module_error_inputs_torch_nn_BatchNorm1d_2d_3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for BatchNorm1d/2d/3d: two samples with epsilon of -1
+    # and 0 (input shape chosen from the module class under test) expecting a ValueError on
+    # forward saying eps must be positive.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     if module_info.module_cls == torch.nn.BatchNorm1d:
@@ -1011,6 +1274,14 @@ def module_error_inputs_torch_nn_BatchNorm1d_2d_3d(module_info, device, dtype, r
 
 
 def module_inputs_torch_nn_ConvNd(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for the ConvNd family: requires the keyword N (number of
+    # spatial dimensions) and reads optional lazy (constructor omits the input channel count)
+    # and transposed (skips same-padding) flags. For each padding variant it builds a batched
+    # sample and an unbatched sample (no-batch-dim reference) with kernel size 3, 4 input and
+    # 5 output channels.
+    # Raises KeyError if N is not supplied.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     N = kwargs['N']
     lazy = kwargs.get('lazy', False)
     transposed = kwargs.get('transposed', False)
@@ -1031,6 +1302,11 @@ def module_inputs_torch_nn_ConvNd(module_info, device, dtype, requires_grad, tra
 
 
 def module_inputs_torch_nn_CosineEmbeddingLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CosineEmbeddingLoss: cases for default, sum, mean and
+    # none reduction and a margin of 0.7; two 15x10 inputs and a target of plus/minus one derived
+    # from the sign of random values; the reference is cosineembeddingloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -1045,6 +1321,10 @@ def module_inputs_torch_nn_CosineEmbeddingLoss(module_info, device, dtype, requi
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i1, i2, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters
+            # and returns the result of cosineembeddingloss_reference for the given input(s)
+            # and the bound case options. The case options are bound as defaults so each sample
+            # keeps its own.
             return cosineembeddingloss_reference(i1, i2, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -1059,6 +1339,10 @@ def module_inputs_torch_nn_CosineEmbeddingLoss(module_info, device, dtype, requi
 
 
 def module_inputs_torch_nn_ELU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ELU: alpha 2 with an explicit reference on a 3D
+    # input, a scalar input, an unbatched input and a 4D input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1078,6 +1362,10 @@ def module_inputs_torch_nn_ELU(module_info, device, dtype, requires_grad, traini
 
 
 def module_inputs_torch_nn_CELU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CELU: alpha 2 with an explicit reference on a 3D
+    # input and a scalar input, plus an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1095,6 +1383,10 @@ def module_inputs_torch_nn_CELU(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_GLU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.GLU: default dim, an explicit dim of 1 on a 3D input,
+    # and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1110,6 +1402,10 @@ def module_inputs_torch_nn_GLU(module_info, device, dtype, requires_grad, traini
 
 
 def module_inputs_torch_nn_GELU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.GELU: exact (none) approximation with an erf-based
+    # reference on scalar and 3D inputs, and an unbatched input with default settings.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1127,6 +1423,10 @@ def module_inputs_torch_nn_GELU(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_ReLU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReLU: scalar, unbatched, and 4D / 5D inputs labelled
+    # as channels-last memory format samples.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1146,6 +1446,10 @@ def module_inputs_torch_nn_ReLU(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_ReLU6(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReLU6: scalar, unbatched, and 4D / 5D inputs labelled
+    # as channels-last memory format samples.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1165,6 +1469,10 @@ def module_inputs_torch_nn_ReLU6(module_info, device, dtype, requires_grad, trai
 
 
 def module_inputs_torch_nn_LeakyReLU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LeakyReLU: default slope, unbatched, a custom
+    # negative slope, a zero slope and a scalar with custom slope.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1186,6 +1494,11 @@ def module_inputs_torch_nn_LeakyReLU(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_PReLU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.PReLU: scalar, unbatched, and 1d/2d/3d inputs each
+    # with a single shared parameter and with one parameter per channel; the 1d/2d/3d references
+    # use a clamp-based formula with the first parameter.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1223,6 +1536,10 @@ def module_inputs_torch_nn_PReLU(module_info, device, dtype, requires_grad, trai
 
 
 def module_inputs_torch_nn_SELU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.SELU: 3D input, unbatched input and scalar input
+    # with default settings.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1238,6 +1555,10 @@ def module_inputs_torch_nn_SELU(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_SiLU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.SiLU: scalar and 3D inputs with a sigmoid-times-input
+    # reference, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1255,6 +1576,10 @@ def module_inputs_torch_nn_SiLU(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_Softmax(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softmax: dim 1 on a 10x20 input and dim 0 on a
+    # scalar, both with explicit references, and an unbatched input with dim -1.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1272,6 +1597,10 @@ def module_inputs_torch_nn_Softmax(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_Softmax2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softmax2d: a 4D input with an explicit reference and
+    # an unbatched 3D input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1285,6 +1614,10 @@ def module_inputs_torch_nn_Softmax2d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_LogSoftmax(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LogSoftmax: dim 1 on 2D and 4D inputs and dim 0 on a
+    # scalar, all with explicit log-of-softmax references, and an unbatched input with dim -1.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1306,6 +1639,10 @@ def module_inputs_torch_nn_LogSoftmax(module_info, device, dtype, requires_grad,
 
 
 def module_inputs_torch_nn_Softmin(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softmin: dim 1 on 2D and 4D inputs, dim 0 on a
+    # scalar, and an unbatched input with dim -1.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1324,6 +1661,10 @@ def module_inputs_torch_nn_Softmin(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_Softplus(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softplus: default, custom beta, beta with threshold,
+    # beta with threshold on a scalar (explicit references), and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1353,6 +1694,10 @@ def module_inputs_torch_nn_Softplus(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_Softshrink(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softshrink: default lambda, lambda 1 on 3D and scalar
+    # inputs, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1371,6 +1716,10 @@ def module_inputs_torch_nn_Softshrink(module_info, device, dtype, requires_grad,
 
 
 def module_inputs_torch_nn_Softsign(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Softsign: 3D and scalar inputs with an explicit
+    # reference, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1388,6 +1737,9 @@ def module_inputs_torch_nn_Softsign(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_Tanh(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Tanh: 4D, scalar and unbatched inputs.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1404,6 +1756,9 @@ def module_inputs_torch_nn_Tanh(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_Tanhshrink(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Tanhshrink: 4D, scalar and unbatched inputs.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1419,6 +1774,10 @@ def module_inputs_torch_nn_Tanhshrink(module_info, device, dtype, requires_grad,
 
 
 def module_inputs_torch_nn_Threshold(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Threshold: threshold 2 with replacement values 1 and
+    # 10 on 4D input, a scalar input, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1438,6 +1797,10 @@ def module_inputs_torch_nn_Threshold(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_Mish(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Mish: 3D and scalar inputs with an explicit reference
+    # built from the softplus function, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1455,6 +1818,10 @@ def module_inputs_torch_nn_Mish(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_L1Loss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.L1Loss: a 2x3x4 input with an explicit per-batch
+    # reference, a scalar input, plus the shared regression-criterion samples for each reduction.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -1470,6 +1837,10 @@ def module_inputs_torch_nn_L1Loss(module_info, device, dtype, requires_grad, tra
 
 
 def module_inputs_torch_nn_SmoothL1Loss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.SmoothL1Loss: cases for default, sum, mean and none
+    # reduction, each on a 5x10 input and on a scalar; the reference is smoothl1loss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
 
@@ -1483,6 +1854,9 @@ def module_inputs_torch_nn_SmoothL1Loss(module_info, device, dtype, requires_gra
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of smoothl1loss_reference for the given input(s) and the bound
+            # case options. The case options are bound as defaults so each sample keeps its own.
             return smoothl1loss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -1505,6 +1879,12 @@ def module_inputs_torch_nn_SmoothL1Loss(module_info, device, dtype, requires_gra
 
 
 def module_inputs_torch_nn_BCELoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.BCELoss: cases for default, sum, mean, none
+    # reduction and per-element weights on 15x10 inputs clamped to the open unit interval with
+    # binary targets, plus a scalar-weight sample on scalar input; a nested reference computes
+    # the expected loss.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -1518,6 +1898,9 @@ def module_inputs_torch_nn_BCELoss(module_info, device, dtype, requires_grad, tr
     ]
 
     def bce_loss_reference_fn(m, p, i, t, reduction='mean', weight=None):
+        # [FUNCTION DOC] HELPER: Expected binary cross entropy from probabilities: elementwise
+        # loss, scaled by the weight if given, then reduced by none, mean (sum over element
+        # count) or sum.
         result = -(t * i.log() + (1 - t) * (1 - i).log())
 
         if weight is not None:
@@ -1553,6 +1936,14 @@ def module_inputs_torch_nn_BCELoss(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_BCEWithLogitsLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.BCEWithLogitsLoss: cases for default, sum, mean, none
+    # reduction, weights and scalar weights on 15x10 inputs with binary targets; a nested
+    # reference computes the numerically stable loss.
+    # KNOWN ISSUE: inputs are drawn from the narrow unit interval like the plain BCE
+    # samples, which does not exercise large-magnitude logits; pos_weight is untested (a
+    # TODO in the reference).
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -1567,6 +1958,9 @@ def module_inputs_torch_nn_BCEWithLogitsLoss(module_info, device, dtype, require
     ]
 
     def bce_withlogitsloss_reference_fn(m, p, i, t, reduction='mean', weight=None):
+        # [FUNCTION DOC] HELPER: Expected binary cross entropy from logits using the
+        # max-subtraction stable formulation, scaled by the weight if given, then reduced by none,
+        # mean or sum. pos_weight is not supported (TODO in code).
         # TODO: add pos_weight to the definition here and corresponding SampleInputs
         max_val = (-i).clamp(min=0)
         result = (1 - t).mul_(i).add_(max_val).add_((-max_val).exp_().add_((-i - max_val).exp_()).log_())
@@ -1595,6 +1989,13 @@ def module_inputs_torch_nn_BCEWithLogitsLoss(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_CrossEntropyLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CrossEntropyLoss: loops over the reductions and cases
+    # (default, class weights, ignore_index, label smoothing, both): each builds class-index
+    # targets on 4D, 3D, 2D and higher-dimensional inputs; when ignore_index is absent it also
+    # builds class-probability targets on four shapes and an unbatched sample with the criterion
+    # reference. The reference is cross_entropy_loss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=torch.long, requires_grad=False)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -1611,6 +2012,10 @@ def module_inputs_torch_nn_CrossEntropyLoss(module_info, device, dtype, requires
     module_inputs = []
     for reduction, (desc, constructor_kwargs) in product(reductions, cases):
         def reference_fn(m, p, i, t, reduction=reduction, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of cross_entropy_loss_reference for the given input(s) and the
+            # bound case options. The reduction and case options are bound as defaults so each
+            # sample keeps its own.
             return cross_entropy_loss_reference(i, t, reduction=reduction, **constructor_kwargs)
 
         module_inputs.append(
@@ -1683,6 +2088,12 @@ def module_inputs_torch_nn_CrossEntropyLoss(module_info, device, dtype, requires
 
 
 def module_error_inputs_torch_nn_CrossEntropyLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.CrossEntropyLoss: seven forward-stage errors:
+    # integer target with probability shape, non-long target with index shape, batch size
+    # mismatch, wrongly shaped weight, ignore_index with probability targets, label smoothing out
+    # of range, and mismatched target spatial size.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -1782,6 +2193,16 @@ def module_error_inputs_torch_nn_CrossEntropyLoss(module_info, device, dtype, re
 
 
 def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, requires_grad, training, **kwargs_):
+    # [FUNCTION DOC] Sample generator for nn.LinearCrossEntropyLoss: builds a large grid of
+    # samples for the fused linear plus cross-entropy module. Reads optional keywords
+    # allow_retain_graph (default true) and acc_dtype. Samples sweep reductions, ignore_index,
+    # label smoothing, class weights, extra output dims, index and probability targets and
+    # chunking options, plus bias coverage and chunked probability targets. The reference reshapes
+    # the first parameter and optional bias and calls linear_cross_entropy_loss_reference.
+    # The count and order of samples must stay identical across devices because tests depend on
+    # it, and the sample list is append-only (entries consume fixed random draws).
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Return a list of module_inputs.
     #
     # Important: module_inputs size and the ordering of its items must
@@ -1791,9 +2212,15 @@ def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, re
     acc_dtype = kwargs_.get('acc_dtype')
 
     def make_input(batch_dims, in_features):
+        # [FUNCTION DOC] HELPER: Returns a standard-normal tensor with the batch dimensions
+        # followed by the feature count, using the enclosing device, dtype and requires_grad.
         return torch.randn((*batch_dims, in_features), device=device, dtype=dtype, requires_grad=requires_grad)
 
     def reference_fn(m, p, i, t):
+        # [FUNCTION DOC] HELPER: Sample reference: reshapes the module's first parameter to
+        # classes, output dims and in_features (and the optional second parameter as bias) and
+        # returns linear_cross_entropy_loss_reference using the module's weight, reduction,
+        # ignore_index and label_smoothing.
         # p[0] is linear.weight; p[1] is linear.bias when bias=True.
         linear_weight = p[0].reshape(m.num_classes, *m.out_features, i.shape[-1])
         linear_bias = (
@@ -1806,6 +2233,9 @@ def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, re
             reduction=m.reduction, ignore_index=m.ignore_index, label_smoothing=m.label_smoothing)
 
     def make_target(num_classes, shape, target_dtype):
+        # [FUNCTION DOC] HELPER: Creates a target: for a floating dtype, uniform values in the
+        # unit interval of the given shape (probability target); otherwise random integer class
+        # indices below num_classes. Never requires grad.
         if target_dtype.is_floating_point:
             return make_tensor(shape, low=0, high=1, device=device, dtype=target_dtype, requires_grad=False)
         else:
@@ -1819,6 +2249,12 @@ def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, re
             )
 
     def sizes_and_options():
+        # [FUNCTION DOC] HELPER: Generator yielding pairs of (batch count, input features, class
+        # count) and chunking options for two size configurations (batched and unbatched). Yields
+        # no-options first; if acc_dtype was requested it yields only an accumulator dtype option;
+        # otherwise an empty options set and, for batched sizes, fixed chunk size 2 and
+        # aspect-ratio chunking 2 and 4.
+        # The order is append-only because each entry consumes fixed random draws.
         # APPEND-ONLY: never reorder/insert/remove entries -- each consumes
         # fixed RNG draws, so a mid-stream change shifts later samples and
         # moves the cancellation-sensitive index-target ULP caps in test_nn.py.
@@ -1841,6 +2277,13 @@ def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, re
                 yield sizes, dict(chunking_method="aspect_ratio:4")
 
     def samples():
+        # [FUNCTION DOC] HELPER: Generator yielding (module args, module kwargs, (input, target))
+        # triples. First a product over reduction, ignore_index, label smoothing, class weight and
+        # extra output dims (skipping impossible or redundant combinations) for index and
+        # probability targets, with extra samples exercising out-of-range ignore_index and
+        # all-ignored targets; then minimal bias coverage (with and without chunked options);
+        # finally chunked probability-target samples for mean and sum.
+        # Targets are adjusted so mean reduction never normalizes by zero valid entries.
         for (num_batches, in_features, num_classes), options in sizes_and_options():
             if num_batches is None:
                 batch_dims = ()
@@ -2021,6 +2464,11 @@ def module_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, re
 
 
 def module_error_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.LinearCrossEntropyLoss: five errors: integer
+    # probability target, batch size mismatch, input feature mismatch, weight of wrong shape
+    # (construction) and label smoothing out of range (construction).
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     return [
         # Non-floating-point target with same shape as input (soft-target path)
@@ -2089,6 +2537,12 @@ def module_error_inputs_torch_nn_LinearCrossEntropyLoss(module_info, device, dty
 
 
 def module_inputs_torch_nn_CTCLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CTCLoss: cases for default, sum, mean and none
+    # reduction and blank index 14, for int and long targets; inputs are 50x3x15 log-probabilities
+    # and each case uses padded 2D or concatenated 1D targets with lengths given as int tuples or
+    # tensors (four samples per case and dtype). The reference is ctcloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, requires_grad=False)
 
@@ -2104,6 +2558,9 @@ def module_inputs_torch_nn_CTCLoss(module_info, device, dtype, requires_grad, tr
     module_inputs = []
     for target_dtype, (desc, constructor_kwargs) in product(target_dtypes, cases):
         def reference_fn(m, p, i, t, il, tl, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of ctcloss_reference for the given input(s) and the bound case
+            # options. The case options are bound as defaults so each sample keeps its own.
             return ctcloss_reference(i, t, il, tl, **constructor_kwargs)
 
         blank = constructor_kwargs.get('blank', 0)
@@ -2153,6 +2610,11 @@ def module_inputs_torch_nn_CTCLoss(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_GroupNorm(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.GroupNorm: ten samples on 1D and 2D inputs covering
+    # affine, no bias, plain group norm, a large batch, and the instance-norm-like (groups equal
+    # channels) and layer-norm-like (one group) configurations without affine.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2199,6 +2661,11 @@ def module_inputs_torch_nn_GroupNorm(module_info, device, dtype, requires_grad, 
 
 
 def module_error_inputs_torch_nn_GroupNorm(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.GroupNorm: two construction-time
+    # ValueError samples where the channel count is not divisible by the group count, with
+    # the numbers in the message.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     """
     Error inputs for GroupNorm that test error messages include actual values.
     """
@@ -2225,6 +2692,10 @@ def module_error_inputs_torch_nn_GroupNorm(module_info, device, dtype, requires_
 
 
 def module_inputs_torch_nn_Hardshrink(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Hardshrink: lambda 2 on 4D and scalar inputs, and an
+    # unbatched input with default settings.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2247,6 +2718,9 @@ def module_inputs_torch_nn_Hardshrink(module_info, device, dtype, requires_grad,
 
 
 def module_inputs_torch_nn_Hardswish(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Hardswish: an unbatched input and a 4D input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2264,6 +2738,10 @@ def module_inputs_torch_nn_Hardswish(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_Hardtanh(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Hardtanh: default clamp range with an explicit clamp
+    # reference on 3D and scalar inputs, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2288,6 +2766,11 @@ def module_inputs_torch_nn_Hardtanh(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_HingeEmbeddingLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.HingeEmbeddingLoss: cases for default, sum, mean,
+    # none reduction and a margin of 0.5, each on a 10-element input and on a scalar; targets are
+    # plus/minus one; the reference is hingeembeddingloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -2302,6 +2785,10 @@ def module_inputs_torch_nn_HingeEmbeddingLoss(module_info, device, dtype, requir
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters
+            # and returns the result of hingeembeddingloss_reference for the given input(s) and
+            # the bound case options. The case options are bound as defaults so each sample
+            # keeps its own.
             return hingeembeddingloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2323,6 +2810,10 @@ def module_inputs_torch_nn_HingeEmbeddingLoss(module_info, device, dtype, requir
 
 
 def module_inputs_torch_nn_HuberLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.HuberLoss: cases for default, sum, mean and none
+    # reduction on 5x10 inputs; the reference is huberloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases: list[tuple[str, dict]] = [
@@ -2335,6 +2826,9 @@ def module_inputs_torch_nn_HuberLoss(module_info, device, dtype, requires_grad, 
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of huberloss_reference for the given input(s) and the bound case
+            # options. The case options are bound as defaults so each sample keeps its own.
             return huberloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2349,6 +2843,13 @@ def module_inputs_torch_nn_HuberLoss(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_InstanceNormNd(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for the InstanceNormNd family: requires the keyword N (1, 2
+    # or 3) and reads an optional lazy flag (constructor omits the feature count). Samples cover
+    # default settings, tracked statistics without affine, unbatched variants with the
+    # no-batch-dim reference, affine, and affine without bias.
+    # Raises KeyError if N is not supplied.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     lazy = kwargs.get('lazy', False)
     N = kwargs['N']
@@ -2401,6 +2902,11 @@ def module_inputs_torch_nn_InstanceNormNd(module_info, device, dtype, requires_g
             desc='affine_not_bias'),]
 
 def module_inputs_torch_nn_LayerNorm(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LayerNorm: seven samples covering 1D and 3D
+    # normalized shapes with and without elementwise affine, a large batch, an empty batch, and
+    # affine without bias.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2435,9 +2941,19 @@ def module_inputs_torch_nn_LayerNorm(module_info, device, dtype, requires_grad, 
     ]
 
 def module_inputs_torch_nn_RMSNorm(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.RMSNorm: six samples (1D and 3D normalized shapes,
+    # with and without elementwise affine, large batch, empty batch) each using a nested reference
+    # that normalizes by the root mean square in float32.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def rms_norm_reference_fn(m, p, i):
+        # [FUNCTION DOC] HELPER: Expected RMS normalization: casts the input to float32, divides
+        # by the root of the mean of squares over the normalized trailing dims plus epsilon,
+        # multiplies by the weight if present, and casts back to the input dtype.
+        # KNOWN ISSUE: a fallback epsilon for a module whose eps is None is computed but the
+        # formula uses the module's eps directly, so that case would fail with a type error.
         eps = m.eps
         if eps is None:
             eps = torch.finfo(i.dtype).eps
@@ -2486,6 +3002,10 @@ def module_inputs_torch_nn_RMSNorm(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_LocalResponseNorm(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LocalResponseNorm: 1D, 2D (uneven padding) and 3D
+    # inputs with custom parameters.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2505,6 +3025,10 @@ def module_inputs_torch_nn_LocalResponseNorm(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_LPPool1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LPPool1d: a norm of 1.5, an integer norm with kernel
+    # and stride on batched input, and the same on an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2525,6 +3049,10 @@ def module_inputs_torch_nn_LPPool1d(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_LPPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LPPool2d: integer norm with kernel on batched and
+    # unbatched inputs, and a fractional norm of 1.5.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2544,6 +3072,10 @@ def module_inputs_torch_nn_LPPool2d(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_LPPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LPPool3d: integer norm with kernel on batched and
+    # unbatched inputs, and a fractional norm of 1.5.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2563,6 +3095,10 @@ def module_inputs_torch_nn_LPPool3d(module_info, device, dtype, requires_grad, t
 
 
 def module_inputs_torch_nn_MaxPool1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MaxPool1d: kernel 4 on 3D input, kernel with stride,
+    # and return_indices enabled.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2582,6 +3118,10 @@ def module_inputs_torch_nn_MaxPool1d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_MaxPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MaxPool2d: 3x3 kernel with stride 2 and padding 1 on
+    # 3D input, on 4D input, and with return_indices enabled.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2601,6 +3141,10 @@ def module_inputs_torch_nn_MaxPool2d(module_info, device, dtype, requires_grad, 
 
 
 def module_error_inputs_torch_nn_MaxPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.MaxPool2d: three forward-stage RuntimeError
+    # samples: 2D input, 5D input, and padding larger than half the kernel size.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     """
     Error inputs for MaxPool2d that test error messages for invalid inputs.
     """
@@ -2641,6 +3185,10 @@ def module_error_inputs_torch_nn_MaxPool2d(module_info, device, dtype, requires_
 
 
 def module_inputs_torch_nn_MaxPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MaxPool3d: default stride, explicit stride, stride
+    # with padding, and return_indices enabled.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2663,9 +3211,18 @@ def module_inputs_torch_nn_MaxPool3d(module_info, device, dtype, requires_grad, 
 
 
 def module_inputs_torch_nn_FractionalMaxPool2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.FractionalMaxPool2d: ratio-based and size-based
+    # output with explicit random samples, return_indices, and unbatched variants checked with the
+    # no-batch-dim reference. The nested sample factory creates double-precision uniform values
+    # regardless of dtype.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_random_samples():
+        # [FUNCTION DOC] HELPER: Returns a fresh double-precision tensor of uniform random
+        # numbers in the unit interval on the target device, used as the fractional
+        # pooling window offsets.
         return torch.empty((1, 3, 2), dtype=torch.double, device=device).uniform_()
 
     return [
@@ -2697,9 +3254,18 @@ def module_inputs_torch_nn_FractionalMaxPool2d(module_info, device, dtype, requi
 
 
 def module_inputs_torch_nn_FractionalMaxPool3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.FractionalMaxPool3d: ratio-based, size-based and
+    # asymmetric-size output with explicit random samples, return_indices, and unbatched variants
+    # checked with the no-batch-dim reference. The nested sample factory creates double-precision
+    # uniform values regardless of dtype.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_random_samples():
+        # [FUNCTION DOC] HELPER: Returns a fresh double-precision tensor of uniform random
+        # numbers in the unit interval on the target device, used as the fractional
+        # pooling window offsets.
         return torch.empty((2, 4, 3), dtype=torch.double, device=device).uniform_()
 
     return [
@@ -2735,6 +3301,10 @@ def module_inputs_torch_nn_FractionalMaxPool3d(module_info, device, dtype, requi
 
 
 def module_inputs_torch_nn_Sigmoid(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Sigmoid: scalar, unbatched, and 4D / 5D inputs
+    # labelled as channels-last memory format samples.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2763,6 +3333,10 @@ def module_inputs_torch_nn_Sigmoid(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_LogSigmoid(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LogSigmoid: scalar and 3D inputs with a
+    # log-of-sigmoid reference, and an unbatched input.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -2787,6 +3361,11 @@ def module_inputs_torch_nn_LogSigmoid(module_info, device, dtype, requires_grad,
 
 
 def module_inputs_torch_nn_MarginRankingLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MarginRankingLoss: cases for default, sum, mean,
+    # none reduction and a margin of 0.5 on 50-element inputs with sign targets; the
+    # reference is marginrankingloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=torch.long, requires_grad=False)
 
@@ -2801,6 +3380,10 @@ def module_inputs_torch_nn_MarginRankingLoss(module_info, device, dtype, require
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i1, i2, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters
+            # and returns the result of marginrankingloss_reference for the given input(s) and
+            # the bound case options. The case options are bound as defaults so each sample
+            # keeps its own.
             return marginrankingloss_reference(i1, i2, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2815,6 +3398,11 @@ def module_inputs_torch_nn_MarginRankingLoss(module_info, device, dtype, require
 
 
 def module_inputs_torch_nn_MultiLabelMarginLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MultiLabelMarginLoss: cases for default, sum, mean
+    # and none reduction on a 1D 10-element and a 5x10 input with random integer targets; the
+    # reference is multilabelmarginloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=torch.long, requires_grad=False)
 
@@ -2828,6 +3416,10 @@ def module_inputs_torch_nn_MultiLabelMarginLoss(module_info, device, dtype, requ
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of multilabelmarginloss_reference for the given input(s) and
+            # the bound case options. The case options are bound as defaults so each sample
+            # keeps its own.
             return multilabelmarginloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2850,6 +3442,11 @@ def module_inputs_torch_nn_MultiLabelMarginLoss(module_info, device, dtype, requ
 
 
 def module_inputs_torch_nn_MultiMarginLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MultiMarginLoss: cases for default, sum, mean, none
+    # reduction, p of 2, margin 0.5 and class weights on a 5x10 input with class-index targets;
+    # the reference is multimarginloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=torch.long, requires_grad=False)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -2867,6 +3464,9 @@ def module_inputs_torch_nn_MultiMarginLoss(module_info, device, dtype, requires_
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of multimarginloss_reference for the given input(s) and the bound
+            # case options. The case options are bound as defaults so each sample keeps its own.
             return multimarginloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2881,6 +3481,10 @@ def module_inputs_torch_nn_MultiMarginLoss(module_info, device, dtype, requires_
 
 
 def module_error_inputs_torch_nn_MultiMarginLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.MultiMarginLoss: one forward-stage sample where
+    # the target length differs from the batch size (regression test for an unclear message).
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     """
     Error inputs for MultiMarginLoss that test the improved error message
     for inconsistent target size.
@@ -2906,6 +3510,11 @@ def module_error_inputs_torch_nn_MultiMarginLoss(module_info, device, dtype, req
 
 
 def module_inputs_torch_nn_MultiLabelSoftMarginLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MultiLabelSoftMarginLoss: cases for default, sum,
+    # mean, none reduction and weights on 5x10 inputs with 0/1 targets; a nested reference
+    # computes the expected loss.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=torch.long, requires_grad=False)
     make_weight = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
@@ -2919,6 +3528,9 @@ def module_inputs_torch_nn_MultiLabelSoftMarginLoss(module_info, device, dtype, 
     ]
 
     def multilabelsoftmargin_loss_reference_fn(m, p, i, t, reduction='mean', weight=None):
+        # [FUNCTION DOC] HELPER: Expected multilabel soft margin loss: per-element log-sigmoid
+        # terms, optionally scaled by weight, summed over the class dim and divided by the class
+        # count, then reduced by none, mean or sum.
         result = t * i.sigmoid().log() + (1 - t) * (-i).sigmoid().log()
         if weight is not None:
             result *= weight
@@ -2945,6 +3557,11 @@ def module_inputs_torch_nn_MultiLabelSoftMarginLoss(module_info, device, dtype, 
 
 
 def module_inputs_torch_nn_SoftMarginLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.SoftMarginLoss: cases for default, sum,
+    # mean and none reduction on 5x5 inputs with plus/minus one targets; the
+    # reference is softmarginloss_reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -2958,6 +3575,9 @@ def module_inputs_torch_nn_SoftMarginLoss(module_info, device, dtype, requires_g
     module_inputs = []
     for desc, constructor_kwargs in cases:
         def reference_fn(m, p, i, t, constructor_kwargs=constructor_kwargs):
+            # [FUNCTION DOC] HELPER: Sample reference: ignores the module and its parameters and
+            # returns the result of softmarginloss_reference for the given input(s) and the bound
+            # case options. The case options are bound as defaults so each sample keeps its own.
             return softmarginloss_reference(i, t, **constructor_kwargs)
 
         module_inputs.append(
@@ -2972,6 +3592,15 @@ def module_inputs_torch_nn_SoftMarginLoss(module_info, device, dtype, requires_g
 
 
 def module_inputs_torch_nn_TransformerEncoder(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.TransformerEncoder: reuses every
+    # TransformerEncoderLayer sample: each layer sample is turned into a real encoder layer
+    # (device and dtype injected) wrapped by a two-layer encoder, and a source-mask keyword is
+    # renamed to the mask keyword that the encoder expects.
+    # KNOWN ISSUE: it mutates the keyword dictionaries of the reused layer samples in place,
+    # ignores extra keyword options, passes no module_info to the layer generator, and drops the
+    # layer samples' reference functions.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Reuse the TransformerEncoderLayer samples since the forward args are nearly the same.
     samples = []
     for layer_module_input in module_inputs_torch_nn_TransformerEncoderLayer(
@@ -2997,6 +3626,14 @@ def module_inputs_torch_nn_TransformerEncoder(module_info, device, dtype, requir
     return samples
 
 def module_inputs_torch_nn_TransformerEncoderLayer(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.TransformerEncoderLayer: three basic samples
+    # (default relu, gelu, no bias), then an unbatched grid over source mask, key padding mask,
+    # norm_first, batch_first and bias checked with the no-batch-dim reference; when training is
+    # true it adds fast-path samples whose reference reruns the module in eval and no-grad mode
+    # and compares with the train-mode result (no reference when bias is disabled because the
+    # fast path does not run).
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     samples = [
@@ -3044,6 +3681,9 @@ def module_inputs_torch_nn_TransformerEncoderLayer(module_info, device, dtype, r
     # since the fast path requires no_grad mode, we run the fast path in .eval()
     # and no_grad() in the reference_fn and verify that against the results in train mode.
     def fast_path_reference_fn(module, parameters, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Reference that runs the same module in eval mode under no-grad
+        # (enabling the inference fast path) and returns that output, then restores train mode.
+        # Raises AssertionError if the module is not in training mode on entry.
         if not module.training:
             raise AssertionError("Expected module.training to be True")
         module.train(False)
@@ -3072,6 +3712,12 @@ def module_inputs_torch_nn_TransformerEncoderLayer(module_info, device, dtype, r
 
 
 def module_inputs_torch_nn_TransformerDecoderLayer(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.TransformerDecoderLayer: three basic samples (relu,
+    # gelu, no bias), then a grid over target mask, key padding mask, norm_first, bias and
+    # batch_first, producing for each combination an unbatched sample (no-batch-dim reference) and
+    # a batched sample whose masks are expanded to the batch.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     samples = [
@@ -3139,6 +3785,12 @@ def module_inputs_torch_nn_TransformerDecoderLayer(module_info, device, dtype, r
 
 
 def module_inputs_torch_nn_Transformer(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Transformer: a grid over mask, key padding mask,
+    # norm_first, bias and batch_first with one encoder and one decoder layer; each combination
+    # yields an unbatched sample (no-batch-dim reference) and a batched sample whose key padding
+    # masks are expanded to the batch.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = []
     # Samples below are for validating the no-batch-dim support.
@@ -3185,6 +3837,10 @@ def module_inputs_torch_nn_Transformer(module_info, device, dtype, requires_grad
 
 
 def module_inputs_torch_nn_Embedding(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.Embedding: a 2x3 index input and a discontiguous
+    # (expanded) 7x512 index input; indices are random below 4.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_empty = partial(torch.empty, device=device, dtype=torch.long, requires_grad=False)
     return [
         ModuleInput(
@@ -3200,6 +3856,11 @@ def module_inputs_torch_nn_Embedding(module_info, device, dtype, requires_grad, 
 
 
 def module_error_inputs_torch_nn_Embedding(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.Embedding: an out-of-range index (CPU
+    # only, since CUDA asserts in the kernel), float indices, and a negative
+    # num_embeddings at construction.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     """
     Error inputs for Embedding that test error messages for invalid inputs.
     """
@@ -3251,6 +3912,11 @@ def module_error_inputs_torch_nn_Embedding(module_info, device, dtype, requires_
 
 
 def module_inputs_torch_nn_MultiheadAttention(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.MultiheadAttention: all combinations of bias,
+    # add_bias_kv, add_zero_attn, key padding mask and attention mask on unbatched 3x3 inputs, for
+    # both batch_first settings, using the MHA-specific no-batch-dim reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Currently all samples below are for validating the no-batch-dim support.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = []
@@ -3282,6 +3948,11 @@ def module_inputs_torch_nn_MultiheadAttention(module_info, device, dtype, requir
 
 
 def module_inputs_torch_nn_RNN_GRU_Cell(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for RNNCell and GRUCell: unbatched input and hidden state
+    # with and without bias, and for RNN (keyword is_rnn true) also the relu nonlinearity; all use
+    # the no-batch-dim reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Currently all samples below are for validating the no-batch-dim support.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = [
@@ -3313,6 +3984,11 @@ def module_inputs_torch_nn_RNN_GRU_Cell(module_info, device, dtype, requires_gra
 
 
 def module_inputs_torch_nn_LSTMCell(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for LSTMCell: unbatched input with a hidden/cell pair,
+    # with and without bias, using the LSTM-cell no-batch-dim reference. Returns a tuple rather
+    # than a list.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Currently all samples below are for validating the no-batch-dim support.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = (
@@ -3331,6 +4007,10 @@ def module_inputs_torch_nn_LSTMCell(module_info, device, dtype, requires_grad, t
     return samples
 
 def make_packed_sequence(inp, batch_sizes):
+    # [FUNCTION DOC] HELPER: Packs a padded tensor into a PackedSequence using the given lengths.
+    # Temporarily clears requires_grad on the input, packs, then re-applies the original flag to
+    # the packed data (the input is left with requires_grad false). Lengths must be sorted in
+    # decreasing order. Returns the PackedSequence.
     required_grad = inp.requires_grad
     inp.requires_grad_(False)  # user won't have access to inp so won't be able to get its grads
     seq = pack_padded_sequence(inp, batch_sizes)
@@ -3339,6 +4019,13 @@ def make_packed_sequence(inp, batch_sizes):
 
 
 def module_inputs_torch_nn_RNN_GRU(module_info, device, dtype, requires_grad, training, with_packed_sequence=False, **kwargs):
+    # [FUNCTION DOC] Sample generator for RNN and GRU: requires the keyword is_rnn and an optional
+    # with_packed_sequence parameter. Sweeps nonlinearity (RNN only), bias, batch_first and
+    # bidirectional, giving an unbatched input without and with initial hidden state, and
+    # optionally two packed-sequence samples; all use the RNN/GRU no-batch-dim reference.
+    # Raises KeyError if is_rnn is not supplied.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Currently all samples below are for validating the no-batch-dim support.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     is_rnn = kwargs['is_rnn']
@@ -3401,6 +4088,11 @@ def module_inputs_torch_nn_RNN_GRU(module_info, device, dtype, requires_grad, tr
 
 
 def module_inputs_torch_nn_LSTM(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.LSTM: sweeps bias, batch_first, bidirectional and
+    # projection size with two layers, giving an unbatched input without and with an initial
+    # (hidden, cell) state, using the LSTM no-batch-dim reference.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     # Currently all samples below are for validating the no-batch-dim support.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     bias = (False, True)
@@ -3443,6 +4135,10 @@ def module_inputs_torch_nn_LSTM(module_info, device, dtype, requires_grad, train
 
 
 def module_inputs_torch_nn_ReflectionPad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReflectionPad1d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 1D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3458,6 +4154,10 @@ def module_inputs_torch_nn_ReflectionPad1d(module_info, device, dtype, requires_
     ]
 
 def module_inputs_torch_nn_ReflectionPad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReflectionPad2d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 2D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3473,6 +4173,10 @@ def module_inputs_torch_nn_ReflectionPad2d(module_info, device, dtype, requires_
     ]
 
 def module_inputs_torch_nn_ReflectionPad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReflectionPad3d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 3D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3488,6 +4192,10 @@ def module_inputs_torch_nn_ReflectionPad3d(module_info, device, dtype, requires_
     ]
 
 def module_inputs_torch_nn_ReplicationPad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReplicationPad1d: scalar padding on an unbatched
+    # input (no-batch-dim reference) and tuple padding on a batched input for 1D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3503,6 +4211,10 @@ def module_inputs_torch_nn_ReplicationPad1d(module_info, device, dtype, requires
     ]
 
 def module_inputs_torch_nn_ReplicationPad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReplicationPad2d: scalar padding on an unbatched
+    # input (no-batch-dim reference) and tuple padding on a batched input for 2D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3518,6 +4230,10 @@ def module_inputs_torch_nn_ReplicationPad2d(module_info, device, dtype, requires
     ]
 
 def module_inputs_torch_nn_ReplicationPad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ReplicationPad3d: scalar padding on an unbatched
+    # input (no-batch-dim reference) and tuple padding on a batched input for 3D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3533,6 +4249,10 @@ def module_inputs_torch_nn_ReplicationPad3d(module_info, device, dtype, requires
     ]
 
 def module_inputs_torch_nn_ZeroPad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ZeroPad1d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 1D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3548,6 +4268,10 @@ def module_inputs_torch_nn_ZeroPad1d(module_info, device, dtype, requires_grad, 
     ]
 
 def module_inputs_torch_nn_ZeroPad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ZeroPad2d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 2D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3563,6 +4287,10 @@ def module_inputs_torch_nn_ZeroPad2d(module_info, device, dtype, requires_grad, 
     ]
 
 def module_inputs_torch_nn_ZeroPad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ZeroPad3d: scalar padding on an unbatched input
+    # (no-batch-dim reference) and tuple padding on a batched input for 3D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3578,6 +4306,11 @@ def module_inputs_torch_nn_ZeroPad3d(module_info, device, dtype, requires_grad, 
     ]
 
 def module_inputs_torch_nn_ConstantPad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ConstantPad1d: scalar padding with a fill value on an
+    # unbatched input (no-batch-dim reference) and tuple padding with a fill value on another
+    # input for 1D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3593,6 +4326,11 @@ def module_inputs_torch_nn_ConstantPad1d(module_info, device, dtype, requires_gr
     ]
 
 def module_inputs_torch_nn_ConstantPad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ConstantPad2d: scalar padding with a fill value on an
+    # unbatched input (no-batch-dim reference) and tuple padding with a fill value on another
+    # input for 2D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3608,6 +4346,11 @@ def module_inputs_torch_nn_ConstantPad2d(module_info, device, dtype, requires_gr
     ]
 
 def module_inputs_torch_nn_ConstantPad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.ConstantPad3d: scalar padding with a fill value on an
+    # unbatched input (no-batch-dim reference) and tuple padding with a fill value on another
+    # input for 3D padding.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     return [
@@ -3623,9 +4366,19 @@ def module_inputs_torch_nn_ConstantPad3d(module_info, device, dtype, requires_gr
     ]
 
 def module_inputs_torch_nn_CircularPad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CircularPad1d: scalar padding on an unbatched input,
+    # and three tuple paddings (including padding equal to the length) on a 1x2x3 input checked
+    # with a nested reference built by concatenating wrapped slices.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def padding1d_circular_ref(inp, pad):
+        # [FUNCTION DOC] HELPER: Expected circular padding on the last dim: concatenates the last
+        # left-pad entries, the input, and the first right-pad entries. Takes the input and a
+        # (left, right) pair.
+        # KNOWN ISSUE: a left pad of zero would take the whole tensor because of negative-zero
+        # slicing; samples avoid it.
         r""" input:
                 [[[0., 1., 2.],
                   [3., 4., 5.]]]
@@ -3660,9 +4413,18 @@ def module_inputs_torch_nn_CircularPad1d(module_info, device, dtype, requires_gr
     ]
 
 def module_inputs_torch_nn_CircularPad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CircularPad2d: scalar padding on an unbatched input,
+    # and three tuple paddings on small 4D inputs checked with a nested reference that wraps
+    # height then width.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def padding2d_circular_ref(inp, pad):
+        # [FUNCTION DOC] HELPER: Expected circular padding on the last two dims: wraps the
+        # height using the top and bottom pads, then the width using the left and right pads of
+        # the four-element padding. Zero pads would misbehave due to negative-zero slicing;
+        # samples avoid it.
         r"""input:
                 [[[[0., 1., 2],
                    [3., 4., 5.]]]]
@@ -3701,10 +4463,18 @@ def module_inputs_torch_nn_CircularPad2d(module_info, device, dtype, requires_gr
     ]
 
 def module_inputs_torch_nn_CircularPad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Sample generator for nn.CircularPad3d: scalar padding on an unbatched input,
+    # and three tuple paddings on small 5D inputs checked with a nested reference that wraps
+    # depth, height then width.
+    # Standard sample-function signature (module_info, device, dtype, requires_grad, training,
+    # extra keyword options); returns a list of ModuleInput. Only creates random tensors.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
 
     def padding3d_circular_ref(inp, pad):
+        # [FUNCTION DOC] HELPER: Expected circular padding on the last three dims: wraps depth,
+        # height, then width using the six-element padding. Zero pads would misbehave due to
+        # negative-zero slicing; samples avoid it.
         r"""input:
                 [[[[[ 0.,  1.,  2.],
                     [ 3.,  4.,  5.]],
@@ -3798,6 +4568,11 @@ rnn_gru_lstm_module_info_decorators = (
 # Start of module error inputs functions.
 
 def module_error_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.NLLLoss: an empty input with an empty
+    # weight whose dtype differs from the input dtype, expecting a forward RuntimeError
+    # about scalar types.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     """
     Error inputs for NLLLoss that test weight dtype must match input dtype.
     Regression test for device parity between CPU and CUDA with empty tensors.
@@ -3820,6 +4595,14 @@ def module_error_inputs_torch_nn_NLLLoss(module_info, device, dtype, requires_gr
     ]
 
 def module_error_inputs_torch_nn_RNN_GRU_Cell(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for RNNCell and GRUCell: six forward-stage
+    # errors: wrong input size, wrong hidden size, batch size mismatch, hidden state with
+    # too many dimensions, and the same hidden-size error built with relu and tanh as
+    # third constructor argument.
+    # KNOWN ISSUE: the generator is shared with GRUCell, where a third positional argument is the
+    # bias flag, so those two samples do not test a nonlinearity there.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = [
         ErrorModuleInput(
@@ -3880,6 +4663,10 @@ def module_error_inputs_torch_nn_RNN_GRU_Cell(module_info, device, dtype, requir
     return samples
 
 def module_error_inputs_torch_nn_LSTMCell(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for LSTMCell: four forward-stage errors: wrong input
+    # size, wrong hidden size, batch size mismatch, and hidden state with too many dimensions.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     samples = [
         ErrorModuleInput(
@@ -3923,6 +4710,12 @@ def module_error_inputs_torch_nn_LSTMCell(module_info, device, dtype, requires_g
 
 
 def module_error_inputs_torch_nn_RNN_GRU(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for RNN and GRU: construction errors for non-positive
+    # hidden_size, num_layers and input_size, wrong types for bias, batch_first, input_size and
+    # hidden_size, and one forward error for input dtype differing from weight dtype (the
+    # mismatched dtype is float64, or float16 on MPS, when dtype is float32; otherwise float32).
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     # use float64 for dtype mismatch test if current dtype is float32, otherwise use float32
     # MPS doesn't support float64, so use float16 instead
     # Extract device type from device string (e.g., 'mps:0' -> 'mps')
@@ -4032,6 +4825,10 @@ def module_error_inputs_torch_nn_RNN_GRU(module_info, device, dtype, requires_gr
     return samples
 
 def module_error_inputs_torch_nn_Pad1d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for the 1D padding modules: one forward ValueError for
+    # a 4D input (1D padding accepts 2D or 3D). Reads is_constant to add a fill value argument.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     is_constant = kwargs.get('is_constant', False)
@@ -4050,6 +4847,10 @@ def module_error_inputs_torch_nn_Pad1d(module_info, device, dtype, requires_grad
     ]
 
 def module_error_inputs_torch_nn_Pad2d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for the 2D padding modules: one forward ValueError for
+    # a 2D input (2D padding accepts 3D or 4D). Reads is_constant to add a fill value argument.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     is_constant = kwargs.get('is_constant', False)
@@ -4068,6 +4869,10 @@ def module_error_inputs_torch_nn_Pad2d(module_info, device, dtype, requires_grad
     ]
 
 def module_error_inputs_torch_nn_Pad3d(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for the 3D padding modules: one forward ValueError for
+    # a 2D input (3D padding accepts 4D or 5D). Reads is_constant to add a fill value argument.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     is_constant = kwargs.get('is_constant', False)
@@ -4086,6 +4891,10 @@ def module_error_inputs_torch_nn_Pad3d(module_info, device, dtype, requires_grad
     ]
 
 def module_error_inputs_torch_nn_HuberLoss(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.HuberLoss: one construction TypeError for
+    # a complex delta.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     return [
         ErrorModuleInput(
             ModuleInput(
@@ -4099,6 +4908,10 @@ def module_error_inputs_torch_nn_HuberLoss(module_info, device, dtype, requires_
 
 
 def module_error_inputs_torch_nn_Softmax(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.Softmax: one construction TypeError for
+    # a boolean dim.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     return [
         ErrorModuleInput(
             ModuleInput(
@@ -4112,6 +4925,10 @@ def module_error_inputs_torch_nn_Softmax(module_info, device, dtype, requires_gr
 
 
 def module_error_inputs_torch_nn_LogSoftmax(module_info, device, dtype, requires_grad, training, **kwargs):
+    # [FUNCTION DOC] Error-sample generator for nn.LogSoftmax: two construction TypeErrors for a
+    # float dim and a boolean dim.
+    # Standard sample-function signature; returns a list of ErrorModuleInput, each giving the
+    # stage (construction or forward), the expected exception type and a message regex.
     return [
         ErrorModuleInput(
             ModuleInput(
