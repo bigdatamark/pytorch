@@ -1,8 +1,18 @@
+# [MODULE DOC] Python wrappers for the ops of the libtorch_agn_2_9 test extension, which
+# exercises the libtorch-stable ABI (torch::stable Tensor API) from C++. Each function is a thin
+# wrapper that calls the default overload of the matching op registered under
+# torch.ops.libtorch_agn_2_9 and returns its result unchanged; the extension library must
+# already be loaded (the package init does this). No import-time side effects except registering
+# a fake implementation for my_narrow_symint.
 import torch
 from torch import Tensor
 
 
 def sgd_out_of_place(param, grad, weight_decay, lr, maximize) -> Tensor:
+    # [FUNCTION DOC] Calls the op performing one SGD step on a single parameter, returning a new
+    # tensor (param is not modified). Expects 1D float CPU tensors of equal shape; weight_decay
+    # and lr are doubles, maximize is a bool.
+    # KNOWN ISSUE: the docstring does not document the maximize argument.
     """
     Computes a single step of SGD on a single parameter Tensor with grad.
 
@@ -26,6 +36,7 @@ def sgd_out_of_place(param, grad, weight_decay, lr, maximize) -> Tensor:
 
 
 def identity(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op that returns the input tensor unchanged.
     """
     Returns the input tensor
 
@@ -39,6 +50,7 @@ def identity(t) -> Tensor:
 
 
 def my_abs(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a new tensor holding the absolute value of t.
     """
     Returns abs on the input tensor, outputs a new Tensor
 
@@ -52,6 +64,7 @@ def my_abs(t) -> Tensor:
 
 
 def my_is_cpu(t) -> bool:
+    # [FUNCTION DOC] Calls the op returning whether t lives on the CPU, as a bool.
     """
     Returns is_cpu on the input tensor.
 
@@ -65,6 +78,8 @@ def my_is_cpu(t) -> bool:
 
 
 def my_ones_like(tensor, device) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a new tensor of ones with the dtype, shape and other
+    # attributes of tensor, placed on the device given as a string.
     """
     Returns a new Tensor like the input tensor, but with all ones
 
@@ -80,6 +95,8 @@ def my_ones_like(tensor, device) -> Tensor:
 
 
 def exp_neg_is_leaf(t1, t2, t3) -> tuple[Tensor, Tensor, bool]:
+    # [FUNCTION DOC] Calls the op returning a tuple of exp of t1, negation of t2 and a bool
+    # saying whether t3 is a leaf.
     """
     Returns a Tensor, Tensor, bool tuple corresponding to the respective inputs
     t1, t2, and t3.
@@ -96,6 +113,8 @@ def exp_neg_is_leaf(t1, t2, t3) -> tuple[Tensor, Tensor, bool]:
 
 
 def neg_exp(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the negation of the exponential of t, composed from
+    # stable ops.
     """
     Returns a Tensor composing neg of exp
 
@@ -108,6 +127,7 @@ def neg_exp(t) -> Tensor:
 
 
 def divide_neg_exp(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning negation of t divided by exp of t.
     """
     Returns a Tensor division of neg and exp
 
@@ -120,6 +140,7 @@ def divide_neg_exp(t) -> Tensor:
 
 
 def is_contiguous(t) -> bool:
+    # [FUNCTION DOC] Calls the op returning a bool saying whether t is contiguous.
     """
     Returns a bool indicating if the input tensor is contiguous
 
@@ -132,6 +153,7 @@ def is_contiguous(t) -> bool:
 
 
 def my_transpose(t, dim0, dim1) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t with dim0 and dim1 swapped.
     """
     Returns t.transpose(dim0, dim1)
 
@@ -144,6 +166,8 @@ def my_transpose(t, dim0, dim1) -> Tensor:
 
 
 def my_empty_like(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning an uninitialized tensor with the same attributes as
+    # t.
     """
     Returns t.empty_like()
 
@@ -156,6 +180,7 @@ def my_empty_like(t) -> Tensor:
 
 
 def my_zero_(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op that zeroes t in place and returns it.
     """
     Returns t.zero_()
 
@@ -168,6 +193,8 @@ def my_zero_(t) -> Tensor:
 
 
 def my_amax(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the amax reduction of t over a single (op-defined)
+    # dimension.
     """
     Returns t.amax()
 
@@ -180,6 +207,9 @@ def my_amax(t) -> Tensor:
 
 
 def my_amax_vec(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the amax reduction of t, taking the dimensions as a
+    # vector inside the C++ op.
+    # KNOWN ISSUE: the docstring is a copy of my_amax and does not describe the vector variant.
     """
     Returns t.amax()
 
@@ -192,6 +222,8 @@ def my_amax_vec(t) -> Tensor:
 
 
 def fill_infinity(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op that fills t in place with infinity and returns the same
+    # tensor.
     """
     Fills the tensor with inf.
 
@@ -204,6 +236,8 @@ def fill_infinity(t) -> Tensor:
 
 
 def test_default_constructor(defined) -> bool:
+    # [FUNCTION DOC] Calls the op testing the default constructed stable Tensor; returns whether
+    # the resulting tensor is defined, for a defined or undefined case selected by the flag.
     """
     Tests the default constructor for torch::stable::Tensor.
 
@@ -216,6 +250,8 @@ def test_default_constructor(defined) -> bool:
 
 
 def mv_tensor_accessor(m, v) -> Tensor:
+    # [FUNCTION DOC] Calls the op computing a matrix-vector product of a 2D tensor (N by M) and
+    # a 1D tensor (M) using tensor accessors; returns a 1D tensor of size N.
     """
     Returns matrix-vector product.
 
@@ -230,6 +266,8 @@ def mv_tensor_accessor(m, v) -> Tensor:
 
 
 def my_pad(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op padding t with fixed parameters (padding 1, 2, 2, 1, constant
+    # mode, value 0); returns the padded tensor.
     """
     Pads the input tensor with hardcoded padding parameters.
 
@@ -242,6 +280,8 @@ def my_pad(t) -> Tensor:
 
 
 def my_narrow(t, dim, start, length) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the narrowed view of t along dim from start for
+    # length elements.
     """
     Returns a new tensor that is a narrowed version of the input tensor.
 
@@ -257,6 +297,9 @@ def my_narrow(t, dim, start, length) -> Tensor:
 
 
 def my_narrow_symint(t, dim, start, length) -> Tensor:
+    # [FUNCTION DOC] Calls the narrow-and-clone op whose schema takes start and length as
+    # symbolic ints; returns a clone of the narrowed view. Tests SymInt arguments through the
+    # stable ABI.
     """
     Narrows and clones a tensor, with SymInt schema for start and length.
     Used to test that SymInt arguments work through the stable ABI.
@@ -267,12 +310,17 @@ def my_narrow_symint(t, dim, start, length) -> Tensor:
 
 @torch.library.register_fake("libtorch_agn_2_9::my_narrow_symint")
 def my_narrow_symint_fake(t, dim, start, length):
+    # [FUNCTION DOC] Fake (meta) implementation registered for my_narrow_symint: returns an
+    # empty tensor whose shape equals t's shape with the dimension dim replaced by length, with
+    # the dtype and device of t. Does not read data.
     shape = list(t.shape)
     shape[dim] = length
     return torch.empty(shape, dtype=t.dtype, device=t.device)
 
 
 def my_copy_(dst, src, non_blocking) -> Tensor:
+    # [FUNCTION DOC] Calls the op copying src into dst in place (non_blocking flag forwarded)
+    # and returns dst.
     """
     Returns tensor dst that is updated with src elements.
 
@@ -287,6 +335,7 @@ def my_copy_(dst, src, non_blocking) -> Tensor:
 
 
 def my_clone(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a clone of t.
     """
     Returns a clone of input tensor.
 
@@ -299,6 +348,8 @@ def my_clone(t) -> Tensor:
 
 
 def test_device_guard(device_index) -> int:
+    # [FUNCTION DOC] Calls the op that creates a device guard for the given device index and
+    # returns the current CUDA device index observed while the guard is active.
     """
     Tests the DeviceGuard functionality by creating a device guard and returning an empty tensor.
 
@@ -311,6 +362,8 @@ def test_device_guard(device_index) -> int:
 
 
 def test_device_guard_set_index() -> int:
+    # [FUNCTION DOC] Calls the op that creates a device guard at index 1, switches it to index
+    # 0, and returns the current CUDA device index.
     """
     Tests the DeviceGuard set_index functionality by creating a device guard with index 1,
     then setting it to index 0, and returning the current device.
@@ -321,6 +374,8 @@ def test_device_guard_set_index() -> int:
 
 
 def test_stream(device_index) -> int:
+    # [FUNCTION DOC] Calls the op returning the id of the current stream for the given device
+    # index, as an integer.
     """
     Tests the Stream functionality by getting the current stream ID for the specified device.
 
@@ -333,6 +388,7 @@ def test_stream(device_index) -> int:
 
 
 def test_get_current_device_index() -> int:
+    # [FUNCTION DOC] Calls the op returning the current device index as an integer.
     """
     Tests the getCurrentDeviceIndex functionality by getting the current device index.
 
@@ -342,6 +398,8 @@ def test_get_current_device_index() -> int:
 
 
 def my_new_empty_dtype_variant(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a new uninitialized tensor of shape 2 by 5 and dtype
+    # bfloat16 on the device of t.
     """
     Returns a new empty tensor with shape [2, 5] and dtype bfloat16
 
@@ -354,6 +412,8 @@ def my_new_empty_dtype_variant(t) -> Tensor:
 
 
 def my_new_zeros_dtype_variant(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a new zero-filled float tensor of shape 2 by 5 on
+    # the device of t.
     """
     Returns a new tensor filled with 0s with shape [2, 5] and dtype Float
 
@@ -366,6 +426,8 @@ def my_new_zeros_dtype_variant(t) -> Tensor:
 
 
 def my_flatten(t, start_dim=0, end_dim=-1) -> Tensor:
+    # [FUNCTION DOC] Calls the op flattening dimensions start_dim through end_dim (defaults 0
+    # and -1) into one; returns the flattened tensor.
     """
     Flattens the input tensor from start_dim to end_dim into a single dimension.
 
@@ -380,6 +442,8 @@ def my_flatten(t, start_dim=0, end_dim=-1) -> Tensor:
 
 
 def my_optional_tensor_ref(maybe_tensor, default_size) -> Tensor:
+    # [FUNCTION DOC] Calls the op taking an optional tensor by const reference (tests boxing);
+    # returns the tensor if given, else a zeros tensor of size default_size.
     """
     Tests TORCH_BOX with const std::optional<Tensor>& parameter.
     Returns the tensor if present, otherwise returns a zeros tensor of specified size.
@@ -396,6 +460,7 @@ def my_optional_tensor_ref(maybe_tensor, default_size) -> Tensor:
 
 
 def my_storage_offset(t) -> int:
+    # [FUNCTION DOC] Calls the op returning the storage offset of t as an integer.
     """
     Returns the storage offset of the input tensor.
 
@@ -408,6 +473,7 @@ def my_storage_offset(t) -> int:
 
 
 def my_element_size(t) -> int:
+    # [FUNCTION DOC] Calls the op returning the element size of t in bytes.
     """
     Returns the element size in bytes of the input tensor.
 
@@ -420,6 +486,7 @@ def my_element_size(t) -> int:
 
 
 def my_unsqueeze(t, dim) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t with a size-one dimension inserted at dim.
     """
     Returns a new tensor with a dimension of size one inserted at the specified position.
 
@@ -433,6 +500,7 @@ def my_unsqueeze(t, dim) -> Tensor:
 
 
 def my_squeeze(t, dim) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t with dimension dim removed if it has size one.
     """
     Returns a tensor with the specified dimension of size 1 removed.
 
@@ -446,6 +514,7 @@ def my_squeeze(t, dim) -> Tensor:
 
 
 def my_select(t, dim, index) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t indexed at index along dim (one fewer dimension).
     """
     Slices the tensor along the selected dimension at the given index.
 
@@ -460,6 +529,7 @@ def my_select(t, dim, index) -> Tensor:
 
 
 def my_matmul(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the matrix product of self and other.
     """
     Matrix product of two tensors.
 
@@ -473,6 +543,8 @@ def my_matmul(self, other) -> Tensor:
 
 
 def my_layout(t: Tensor, layout: torch.layout) -> bool:
+    # [FUNCTION DOC] Calls the op returning a bool saying whether the layout of t equals the
+    # given torch layout.
     """
     Checks whether a tensor has the given layout.
 

@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Python package for the libtorch_agn_2_9 test extension. Importing it locates the
+# single compiled _C shared library next to this file (raises an error if there is not exactly
+# one), loads it with torch.ops.load_library so its stable ops get registered, and imports the
+# ops submodule. Exports: ops.
 import sys
 from pathlib import Path
 

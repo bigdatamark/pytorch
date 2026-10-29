@@ -1,3 +1,9 @@
+# [MODULE DOC] Helpers for the Python/C++ API parity tests of torch.nn modules and functionals.
+# Defines the namedtuples describing a module or functional test (TorchNNModuleTestParams,
+# TorchNNFunctionalTestParams) and CppArg, the shared C++ harness source string (file read/write
+# of IValues and a non-equal random tensor generator), the failure help message, and utilities
+# to build the C++ argument statements, serialize argument dictionaries, register tests on a
+# unittest class, and clean up temp folders. Importing has no side effects beyond imports.
 import os
 import shutil
 import unittest
@@ -128,6 +134,9 @@ torch::Tensor _rand_tensor_non_equal(torch::IntArrayRef size) {
 
 
 def compile_cpp_code_inline(name, cpp_sources, functions):
+    # [FUNCTION DOC] HELPER: Compiles the given C++ sources into an extension with load_inline
+    # (debug symbols on, not verbose) and returns the loaded module exposing the listed
+    # functions. Compilation errors propagate from the cpp_extension machinery.
     cpp_module = torch.utils.cpp_extension.load_inline(
         name=name,
         cpp_sources=cpp_sources,
@@ -141,14 +150,21 @@ def compile_cpp_code_inline(name, cpp_sources, functions):
 
 
 def compute_temp_file_path(cpp_tmp_folder, variant_name, file_suffix):
+    # [FUNCTION DOC] HELPER: Returns the path of the temp file named after the variant name and
+    # the suffix, with a pt extension, inside the given folder.
     return os.path.join(cpp_tmp_folder, f"{variant_name}_{file_suffix}.pt")
 
 
 def is_torch_nn_functional_test(test_params_dict):
+    # [FUNCTION DOC] HELPER: Returns true if the test parameter mapping's constructor entry
+    # (default empty) has a textual form mentioning wrap_functional, which identifies functional
+    # tests as opposed to module tests.
     return "wrap_functional" in str(test_params_dict.get("constructor", ""))
 
 
 def convert_to_list(python_input):
+    # [FUNCTION DOC] HELPER: Normalizes the input to a list; a single tensor becomes a
+    # one-element list and any other iterable is converted with list.
     if isinstance(python_input, torch.Tensor):
         return [python_input]
     else:
@@ -156,6 +172,8 @@ def convert_to_list(python_input):
 
 
 def set_python_tensors_requires_grad(python_tensors):
+    # [FUNCTION DOC] HELPER: Returns a list where every tensor that is not of long dtype has
+    # requires_grad enabled in place; long tensors are passed through unchanged.
     return [
         tensor.requires_grad_(True) if tensor.dtype != torch.long else tensor
         for tensor in python_tensors
@@ -163,20 +181,29 @@ def set_python_tensors_requires_grad(python_tensors):
 
 
 def move_python_tensors_to_device(python_tensors, device):
+    # [FUNCTION DOC] HELPER: Returns a list of the given tensors moved to the device (new
+    # tensors where a copy is needed).
     return [tensor.to(device) for tensor in python_tensors]
 
 
 def has_test(unit_test_class, test_name):
+    # [FUNCTION DOC] HELPER: Returns whether the test class already has an attribute with the
+    # given test name.
     return hasattr(unit_test_class, test_name)
 
 
 def add_test(unit_test_class, test_name, test_fn):
+    # [FUNCTION DOC] HELPER: Attaches test_fn to the unittest class under test_name (mutates the
+    # class). Raises RuntimeError if an attribute with that name already exists.
     if has_test(unit_test_class, test_name):
         raise RuntimeError("Found two tests with the same name: " + test_name)
     setattr(unit_test_class, test_name, test_fn)
 
 
 def set_cpp_tensors_requires_grad(cpp_tensor_stmts, python_tensors):
+    # [FUNCTION DOC] HELPER: Given C++ tensor statements and the matching (name, tensor) pairs
+    # of Python tensors, returns the statements with a requires-grad call appended for each
+    # whose Python tensor is not long dtype. Raises an error if the two lengths differ.
     if len(cpp_tensor_stmts) != len(python_tensors):
         raise AssertionError(
             f"Expected len(cpp_tensor_stmts) == len(python_tensors), got {len(cpp_tensor_stmts)} vs {len(python_tensors)}"
@@ -190,10 +217,14 @@ def set_cpp_tensors_requires_grad(cpp_tensor_stmts, python_tensors):
 
 
 def move_cpp_tensors_to_device(cpp_tensor_stmts, device):
+    # [FUNCTION DOC] HELPER: Returns the C++ tensor statements each with a call that moves the
+    # tensor to the given device string appended.
     return [f'{tensor_stmt}.to("{device}")' for tensor_stmt in cpp_tensor_stmts]
 
 
 def is_criterion_test(test_instance):
+    # [FUNCTION DOC] HELPER: Returns true if the test instance is a CriterionTest from common_nn
+    # (i.e. has a target).
     return isinstance(test_instance, common_nn.CriterionTest)
 
 
@@ -214,10 +245,19 @@ def is_criterion_test(test_instance):
 # ]
 # ```
 def compute_cpp_args_construction_stmts_and_forward_arg_symbols(test_params):
+    # [FUNCTION DOC] HELPER: For the test params, builds the C++ statements that declare each
+    # forward argument by looking it up by name in arg_dict (input args also get requires-grad,
+    # all get moved to the test device), followed by the declarations of the "other" args.
+    # Returns a pair: the full ordered list of declaration statements (input, target, extra,
+    # other) and the list of argument names to pass to forward (input, target, extra only;
+    # "other" args are excluded).
     device = test_params.device
     cpp_forward_args_symbols = []
 
     def add_cpp_forward_args(args):
+        # [FUNCTION DOC] HELPER: Builds a lookup statement for each (name, value) pair, records
+        # the names in the enclosing forward-argument symbol list (mutation), and returns the
+        # statements.
         args_stmts = []
         for arg_name, _ in args:
             args_stmts.append(f'auto {arg_name} = arg_dict.at("{arg_name}")')
@@ -254,6 +294,10 @@ def compute_cpp_args_construction_stmts_and_forward_arg_symbols(test_params):
 
 
 def serialize_arg_dict_as_script_module(arg_dict):
+    # [FUNCTION DOC] HELPER: Flattens the input, target, extra_args and other entries of
+    # arg_dict into one name-to-tensor mapping, registers each as a buffer on a fresh empty
+    # module, and returns it scripted with TorchScript so C++ can load it. Raises an error if
+    # any value is not a tensor.
     arg_dict_flat = dict(
         arg_dict["input"]
         + arg_dict["target"]
@@ -300,6 +344,11 @@ def serialize_arg_dict_as_script_module(arg_dict):
 #     )
 # ```
 def compute_arg_dict(test_params_dict, test_instance):
+    # [FUNCTION DOC] HELPER: Builds the argument dictionary (keys input, target, extra_args,
+    # other, each a list of CppArg) for a test. Inputs are named i0, i1, ..., targets t0...
+    # (criterion tests only), extra args e0...; entries of the optional cpp_var_map from the
+    # params dict are appended to "other" when the value is a tensor or the special string
+    # meaning the test's input. Raises RuntimeError for any other string or value type.
     arg_dict = {
         "input": [],
         "target": [],
@@ -308,6 +357,8 @@ def compute_arg_dict(test_params_dict, test_instance):
     }
 
     def put_args_into_arg_dict(arg_type, arg_type_prefix, args):
+        # [FUNCTION DOC] HELPER: Appends a CppArg named by the prefix plus the index for each
+        # argument to the list under arg_type in the enclosing arg_dict (mutation).
         for i, arg in enumerate(args):
             arg_dict[arg_type].append(CppArg(name=arg_type_prefix + str(i), value=arg))
 
@@ -341,6 +392,9 @@ def compute_arg_dict(test_params_dict, test_instance):
 
 
 def decorate_test_fn(test_fn, test_cuda, has_impl_parity, device):
+    # [FUNCTION DOC] HELPER: Wraps test_fn with unittest decorators and returns it: for cuda
+    # device, skip when CUDA is unavailable or when the test is excluded from CUDA; if
+    # has_impl_parity is false, mark as expected failure.
     if device == "cuda":
         test_fn = unittest.skipIf(not TEST_CUDA, "CUDA unavailable")(test_fn)
         test_fn = unittest.skipIf(not test_cuda, "Excluded from CUDA tests")(test_fn)
@@ -382,6 +436,8 @@ NOTE [How to check NN module / functional API parity between Python and C++ fron
 
 
 def generate_error_msg(name, cpp_value, python_value):
+    # [FUNCTION DOC] HELPER: Builds the parity-failure message naming the value, the C++ and
+    # Python values, and the how-to-fix guidance text.
     return (
         f"Parity test failed: {name} in C++ has value: {cpp_value}, "
         f"which does not match the corresponding value in Python: {python_value}.\n{MESSAGE_HOW_TO_FIX_CPP_PARITY_TEST_FAILURE}"
@@ -389,6 +445,8 @@ def generate_error_msg(name, cpp_value, python_value):
 
 
 def try_remove_folder(folder_path):
+    # [FUNCTION DOC] HELPER: Removes the folder tree if it exists; any error during removal is
+    # only reported as a warning, never raised.
     if os.path.exists(folder_path):
         # Don't block the process if this fails, but show the error message as warning.
         try:

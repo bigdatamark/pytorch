@@ -1,3 +1,8 @@
+# [MODULE DOC] Sample torch.nn.functional function used by test_cpp_api_parity to check that the
+# Python/C++ parity harness works for functional APIs. Defines sample_functional (doubles or
+# quadruples the input depending on a flag), registers it on torch.nn.functional at import time,
+# holds the matching C++ source string, and the functional_tests list of test parameter
+# mappings (parity, no-parity, and one explicitly skipped case).
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_nn import wrap_functional
@@ -16,6 +21,8 @@ is different from the C++ equivalent.
 
 
 def sample_functional(x, has_parity):
+    # [FUNCTION DOC] Multiplies x by 2 when has_parity is true (matching the C++ version),
+    # otherwise by 4 (deliberately diverging from C++). Returns a new tensor; no side effects.
     if has_parity:
         return x * 2
     else:

@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Python package for the libtorch_agn_2_13 test extension. Importing it locates
+# the single compiled _C shared library next to this file (raises an error if there is not
+# exactly one), loads it with torch.ops.load_library so its stable ops get registered, and
+# imports the ops submodule, and registers a fake (meta) implementation for the
+# identity_with_fake_module op at import time. Exports: ops.
 import sys
 from pathlib import Path
 
@@ -20,6 +25,8 @@ from . import ops
 # impl is available as soon as the extension is imported.
 @torch.library.register_fake("libtorch_agn_2_13::identity_with_fake_module")
 def _(t):
+    # [FUNCTION DOC] Fake implementation of identity_with_fake_module: returns an empty tensor with
+    # the same shape, dtype and device as t, without touching data. Registered at import time.
     return torch.empty_like(t)
 
 

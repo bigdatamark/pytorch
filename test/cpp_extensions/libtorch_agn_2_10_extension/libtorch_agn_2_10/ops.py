@@ -1,8 +1,17 @@
+# [MODULE DOC] Python wrappers for the ops of the libtorch_agn_2_10 test extension, which
+# exercises the libtorch-stable ABI added through PyTorch 2.10 (foreach ops, Device API,
+# parallel_for, dtype/layout-aware factories, conversions, reductions, bitwise ops, CUDA stream
+# helpers, string arguments). Each function is a thin wrapper calling the default overload of
+# the matching op registered under torch.ops.libtorch_agn_2_10. Ops from the 2.9 extension are
+# reachable through the module-level attribute and directory hooks defined at the end. The
+# extension library must already be loaded; no import-time side effects.
 import torch
 from torch import Tensor
 
 
 def my__foreach_mul_(tensors, others) -> ():
+    # [FUNCTION DOC] Calls the op that multiplies each tensor in tensors by the corresponding
+    # one in others, in place. Returns nothing.
     """
     Updates tensors to be the result of pointwise multiplying with others.
 
@@ -16,6 +25,8 @@ def my__foreach_mul_(tensors, others) -> ():
 
 
 def my__foreach_mul(tensors, others) -> list[Tensor]:
+    # [FUNCTION DOC] Calls the op returning a new list holding the pointwise product of each
+    # tensor with the corresponding other tensor.
     """
     Returns a list of tensors that are the results of pointwise multiplying
     tensors and others.
@@ -30,6 +41,8 @@ def my__foreach_mul(tensors, others) -> list[Tensor]:
 
 
 def make_tensor_clones_and_call_foreach(t1, t2) -> list[Tensor]:
+    # [FUNCTION DOC] Calls the op that clones both tensors and runs the foreach multiply on the
+    # clones, returning a list with the squares of t1 and t2 (inputs are untouched).
     """
     Returns a list of 2 tensors corresponding to the square of the inputs.
 
@@ -45,6 +58,7 @@ def make_tensor_clones_and_call_foreach(t1, t2) -> list[Tensor]:
 
 
 def test_tensor_device(t):
+    # [FUNCTION DOC] Calls the op returning the Device of tensor t.
     """
     Tests Tensor device() method.
 
@@ -57,6 +71,8 @@ def test_tensor_device(t):
 
 
 def test_device_constructor(is_cuda, index, use_str):
+    # [FUNCTION DOC] Calls the op that builds a Device with CUDA or CPU type (per is_cuda) and
+    # the given index, either from a device type or from a string (per use_str), and returns it.
     """
     Tests creating a Device from DeviceType and index, or from a string.
 
@@ -73,6 +89,7 @@ def test_device_constructor(is_cuda, index, use_str):
 
 
 def test_device_equality(d1, d2) -> bool:
+    # [FUNCTION DOC] Calls the op comparing two devices; returns a bool.
     """
     Tests Device equality operator.
 
@@ -86,6 +103,8 @@ def test_device_equality(d1, d2) -> bool:
 
 
 def test_device_set_index(device, index):
+    # [FUNCTION DOC] Calls the op that sets the index of a device and returns the updated
+    # device.
     """
     Tests Device set_index() method.
 
@@ -99,6 +118,7 @@ def test_device_set_index(device, index):
 
 
 def test_device_index(device) -> int:
+    # [FUNCTION DOC] Calls the op returning the index of a device as an integer.
     """
     Tests Device index() method.
 
@@ -111,6 +131,7 @@ def test_device_index(device) -> int:
 
 
 def test_device_is_cuda(device) -> bool:
+    # [FUNCTION DOC] Calls the op returning whether the device is a CUDA device.
     """
     Tests Device is_cuda() method.
 
@@ -123,6 +144,7 @@ def test_device_is_cuda(device) -> bool:
 
 
 def test_device_is_cpu(device) -> bool:
+    # [FUNCTION DOC] Calls the op returning whether the device is a CPU device.
     """
     Tests Device is_cpu() method.
 
@@ -135,6 +157,9 @@ def test_device_is_cpu(device) -> bool:
 
 
 def test_parallel_for(size, grain_size) -> Tensor:
+    # [FUNCTION DOC] Calls the op that fills a 1D int64 tensor of the given size using
+    # parallel_for with the given grain size, each element holding its index (thread id may be
+    # encoded in the upper 32 bits when several threads run); returns the tensor.
     """
     Tests the parallel_for functionality by using it to fill a tensor with indices.
     Args:
@@ -147,6 +172,8 @@ def test_parallel_for(size, grain_size) -> Tensor:
 
 
 def test_get_num_threads() -> int:
+    # [FUNCTION DOC] Calls the op returning the number of threads of the parallel backend as an
+    # integer.
     """
     Tests the get_num_threads functionality by returning the number of threads
     for the parallel backend.
@@ -159,6 +186,8 @@ def test_get_num_threads() -> int:
 def my_empty(
     size, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
 ) -> Tensor:
+    # [FUNCTION DOC] Calls the op creating an uninitialized tensor of the given size with
+    # optional dtype, layout, device, pin_memory and memory_format (None means default).
     """
     Creates an empty tensor with the specified size, dtype, layout, device, pin_memory, and memory_format.
 
@@ -178,6 +207,7 @@ def my_empty(
 
 
 def my_reshape(t, shape) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t reshaped to shape (a view when possible).
     """
     Returns a tensor with the same data but different shape.
 
@@ -191,6 +221,7 @@ def my_reshape(t, shape) -> Tensor:
 
 
 def my_view(t, size) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a view of t with the new size.
     """
     Returns a new tensor with the same data as the input tensor but of a different shape.
 
@@ -204,6 +235,7 @@ def my_view(t, size) -> Tensor:
 
 
 def my_view_dtype(t, dtype) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a view of t that reinterprets its data as dtype.
     """
     Returns a view of the input tensor with the same data reinterpreted as dtype.
 
@@ -217,6 +249,7 @@ def my_view_dtype(t, dtype) -> Tensor:
 
 
 def my_shape(t) -> tuple[int]:
+    # [FUNCTION DOC] Calls the op returning the shape of t as a tuple of ints.
     """
     Returns a shape of the input tensor.
 
@@ -229,6 +262,8 @@ def my_shape(t) -> tuple[int]:
 
 
 def get_any_data_ptr(t, mutable) -> int:
+    # [FUNCTION DOC] Calls the op returning the data pointer of t as an integer, taking the
+    # mutable or const pointer path according to the flag.
     """
     Return data pointer value of the tensor.
     Args:
@@ -240,6 +275,9 @@ def get_any_data_ptr(t, mutable) -> int:
 
 
 def get_template_any_data_ptr(t, dtype, mutable) -> int:
+    # [FUNCTION DOC] Calls the op returning the data pointer of t as an integer, using a typed
+    # accessor for the given dtype. Raises RuntimeError (from the op) when the tensor dtype
+    # differs from dtype.
     """
     Return data pointer value of the tensor iff it has dtype.
     Args:
@@ -255,6 +293,8 @@ def get_template_any_data_ptr(t, dtype, mutable) -> int:
 
 
 def my_get_curr_cuda_blas_handle() -> int:
+    # [FUNCTION DOC] Calls the op returning the current cuBLAS handle pointer as an integer.
+    # Requires CUDA.
     """
     Return the current cuBlasHandle_t pointer value.
     """
@@ -262,6 +302,9 @@ def my_get_curr_cuda_blas_handle() -> int:
 
 
 def my_string_op(t, accessor, passthru) -> tuple[list[str], int]:
+    # [FUNCTION DOC] Calls the op testing string inputs and outputs: queries a tensor property
+    # named by accessor (dim, size or stride, the latter two along dimension 0) and returns a
+    # tuple of a list of strings (accessor, value, passthru) and the integer value.
     """
     The purpose of this op is to test inputting and outputting strings in a
     stable custom op. This particular op takes in a Tensor, a string denoting
@@ -281,6 +324,8 @@ def my_string_op(t, accessor, passthru) -> tuple[list[str], int]:
 
 
 def my_get_current_cuda_stream(device_index: int) -> int:
+    # [FUNCTION DOC] Calls the op returning the current CUDA stream pointer for the device
+    # index, as an integer. Requires CUDA.
     """
     Return the current cudaStream_t pointer value.
 
@@ -291,6 +336,8 @@ def my_get_current_cuda_stream(device_index: int) -> int:
 
 
 def my_set_current_cuda_stream(stream: int, device_index: int):
+    # [FUNCTION DOC] Calls the op that makes the CUDA stream given by its pointer value current
+    # for the device index. Requires CUDA.
     """
     Set the current stream to cudaStream_t pointer value.
 
@@ -304,6 +351,8 @@ def my_set_current_cuda_stream(stream: int, device_index: int):
 
 
 def my_get_cuda_stream_from_pool(high_priority: bool, device_index: int) -> int:
+    # [FUNCTION DOC] Calls the op returning a CUDA stream pointer value taken from the pool,
+    # high priority if requested, for the device index. Requires CUDA.
     """
     Return the cudaStream_t pointer value from pool.
 
@@ -317,6 +366,10 @@ def my_get_cuda_stream_from_pool(high_priority: bool, device_index: int) -> int:
 
 
 def my_cuda_stream_synchronize(stream: int, device_index: int):
+    # [FUNCTION DOC] Calls the op that synchronizes the CUDA stream given by pointer value on
+    # the device index. Requires CUDA.
+    # KNOWN ISSUE: calls the op packet directly instead of its default overload, unlike every
+    # other wrapper in the file.
     """
     Synchronize cuda stream.
 
@@ -328,6 +381,10 @@ def my_cuda_stream_synchronize(stream: int, device_index: int):
 
 
 def my_from_blob(data_ptr, sizes, strides, device, dtype) -> Tensor:
+    # [FUNCTION DOC] Calls the op wrapping existing memory (data pointer, sizes, strides,
+    # device, dtype) as a tensor via the stable from_blob; the tensor does not own the memory.
+    # KNOWN ISSUE: the docstring lists storage_offset and layout arguments that this function
+    # does not take.
     """
     Creates a Tensor from existing memory using torch::stable::from_blob.
 
@@ -348,6 +405,8 @@ def my_from_blob(data_ptr, sizes, strides, device, dtype) -> Tensor:
 
 
 def test_std_cuda_check_success() -> int:
+    # [FUNCTION DOC] Calls the op exercising the stable CUDA check macro with a successful call;
+    # returns the current CUDA device index.
     """
     Test STD_CUDA_CHECK macro with a successful CUDA operation.
     Returns the current CUDA device index.
@@ -356,6 +415,8 @@ def test_std_cuda_check_success() -> int:
 
 
 def test_std_cuda_check_error() -> None:
+    # [FUNCTION DOC] Calls the op exercising the stable CUDA check macro with a failing CUDA
+    # call; the op raises RuntimeError carrying the CUDA error message.
     """
     Test STD_CUDA_CHECK macro with a failing CUDA operation.
     This should raise a RuntimeError with the CUDA error message.
@@ -364,6 +425,8 @@ def test_std_cuda_check_error() -> None:
 
 
 def test_std_cuda_kernel_launch_check_success() -> None:
+    # [FUNCTION DOC] Calls the op that launches a trivial kernel and verifies the launch-check
+    # macro reports no error.
     """
     Test STD_CUDA_KERNEL_LAUNCH_CHECK macro with a successful kernel launch.
     Launches a simple kernel and checks for errors.
@@ -372,6 +435,8 @@ def test_std_cuda_kernel_launch_check_success() -> None:
 
 
 def test_std_cuda_kernel_launch_check_error() -> None:
+    # [FUNCTION DOC] Calls the op that performs an invalid kernel launch; the op raises
+    # RuntimeError with the launch error message.
     """
     Test STD_CUDA_KERNEL_LAUNCH_CHECK macro with an invalid kernel launch.
     This should raise a RuntimeError with the CUDA kernel launch error message.
@@ -380,6 +445,8 @@ def test_std_cuda_kernel_launch_check_error() -> None:
 
 
 def my__foreach_mul_vec(tensors, others) -> list[Tensor]:
+    # [FUNCTION DOC] Calls the foreach multiply variant that takes the lists as const vector
+    # references (tests boxing); returns the list of products.
     """
     Returns a list of tensors that are the results of pointwise multiplying
     tensors and others. This variant tests const std::vector<Tensor>& parameters.
@@ -394,6 +461,8 @@ def my__foreach_mul_vec(tensors, others) -> list[Tensor]:
 
 
 def my_string_op_const_string_ref(t, accessor, passthru) -> tuple[list[str], int]:
+    # [FUNCTION DOC] Same behavior as my_string_op but the C++ op takes strings as const string
+    # references (tests boxing).
     """
     Tests TORCH_BOX with const std::string& parameters.
 
@@ -410,6 +479,8 @@ def my_string_op_const_string_ref(t, accessor, passthru) -> tuple[list[str], int
 
 
 def my_string_op_const_string_view_ref(t, accessor, passthru) -> tuple[list[str], int]:
+    # [FUNCTION DOC] Same behavior as my_string_op but the C++ op takes strings as const
+    # string_view references (tests boxing).
     """
     Tests TORCH_BOX with const std::string_view& parameters.
 
@@ -426,6 +497,8 @@ def my_string_op_const_string_view_ref(t, accessor, passthru) -> tuple[list[str]
 
 
 def my_string_op_string_ref(t, accessor, passthru) -> tuple[list[str], int]:
+    # [FUNCTION DOC] Same behavior as my_string_op but the C++ op takes strings as non-const
+    # string references (tests boxing).
     """
     Tests TORCH_BOX with std::string& (non-const) parameters.
 
@@ -442,6 +515,7 @@ def my_string_op_string_ref(t, accessor, passthru) -> tuple[list[str], int]:
 
 
 def my_set_requires_grad(t, requires_grad) -> Tensor:
+    # [FUNCTION DOC] Calls the op that sets requires_grad on t and returns it.
     """
     Sets the requires_grad attribute on a tensor.
 
@@ -455,6 +529,7 @@ def my_set_requires_grad(t, requires_grad) -> Tensor:
 
 
 def my_to_device(t, device) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t moved to the given device.
     """
     Moves a tensor to the specified device.
 
@@ -468,6 +543,7 @@ def my_to_device(t, device) -> Tensor:
 
 
 def my_to_dtype(t, dtype) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning t converted to dtype.
     """
     Converts a tensor to the specified dtype.
 
@@ -481,6 +557,8 @@ def my_to_dtype(t, dtype) -> Tensor:
 
 
 def my_contiguous(t) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a contiguous version of t in the default memory
+    # format.
     """
     Returns a contiguous tensor with the default memory format.
 
@@ -493,6 +571,8 @@ def my_contiguous(t) -> Tensor:
 
 
 def my_contiguous_memory_format(t, memory_format) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a contiguous version of t in the given memory
+    # format.
     """
     Returns a contiguous tensor with the specified memory format.
 
@@ -517,6 +597,8 @@ def my_to_dtype_layout(
     copy=False,
     memory_format=None,
 ) -> Tensor:
+    # [FUNCTION DOC] Calls the op converting t by optional dtype, layout, device, pin_memory and
+    # memory_format, with non_blocking and copy flags; returns the converted tensor.
     """
     Converts a tensor to the specified dtype, layout, device, and/or memory format.
 
@@ -545,6 +627,8 @@ def my_new_empty(
     device=None,
     pin_memory=None,
 ) -> Tensor:
+    # [FUNCTION DOC] Calls the op creating a new uninitialized tensor of the given size,
+    # inheriting unspecified properties from self.
     """
     Creates a new uninitialized tensor with the specified size and properties.
 
@@ -571,6 +655,8 @@ def my_new_zeros(
     device=None,
     pin_memory=None,
 ) -> Tensor:
+    # [FUNCTION DOC] Calls the op creating a new zero-filled tensor of the given size,
+    # inheriting unspecified properties from self.
     """
     Creates a new tensor filled with zeros with the specified size and properties.
 
@@ -590,6 +676,8 @@ def my_new_zeros(
 
 
 def my_sum(self, dim=None, keepdim=False, dtype=None) -> Tensor:
+    # [FUNCTION DOC] Calls the op summing self over the dims (all if none), optionally keeping
+    # dims and casting to dtype; returns a new tensor.
     """
     Returns the sum of the tensor along the specified dimensions.
 
@@ -605,6 +693,8 @@ def my_sum(self, dim=None, keepdim=False, dtype=None) -> Tensor:
 
 
 def my_sum_out(out, self, dim=None, keepdim=False, dtype=None) -> Tensor:
+    # [FUNCTION DOC] Calls the op summing self over dims into the preallocated out tensor
+    # (modified in place); returns out.
     """
     Computes the sum of the tensor along the specified dimensions and writes
     the result to the output tensor.
@@ -624,6 +714,8 @@ def my_sum_out(out, self, dim=None, keepdim=False, dtype=None) -> Tensor:
 
 
 def my_sum_all(self) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a scalar tensor holding the sum of all elements of
+    # self.
     """
     Returns the sum of all elements in the tensor (reduces to a scalar).
 
@@ -636,6 +728,7 @@ def my_sum_all(self) -> Tensor:
 
 
 def my_sum_dim1(self) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the sum of self along dimension 1.
     """
     Returns the sum of the tensor along dimension 1.
 
@@ -650,6 +743,8 @@ def my_sum_dim1(self) -> Tensor:
 def my_full(
     size, fill_value, dtype=None, layout=None, device=None, pin_memory=None
 ) -> Tensor:
+    # [FUNCTION DOC] Calls the op creating a tensor of the given size filled with fill_value,
+    # with optional dtype, layout, device and pin_memory.
     """
     Creates a tensor filled with a scalar value.
 
@@ -669,6 +764,7 @@ def my_full(
 
 
 def my_subtract(self, other, alpha=1.0) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning self minus alpha times other.
     """
     Subtracts other from self, scaled by alpha.
 
@@ -685,6 +781,7 @@ def my_subtract(self, other, alpha=1.0) -> Tensor:
 
 
 def my_bitwise_and(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the element-wise bitwise AND.
     """
     Computes the element-wise bitwise AND of self and other.
 
@@ -698,6 +795,7 @@ def my_bitwise_and(self, other) -> Tensor:
 
 
 def my_bitwise_or(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the element-wise bitwise OR.
     """
     Computes the element-wise bitwise OR of self and other.
 
@@ -711,6 +809,7 @@ def my_bitwise_or(self, other) -> Tensor:
 
 
 def my_bitwise_left_shift(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning self shifted left element-wise by other.
     """
     Computes the element-wise left bitwise shift of self by other.
 
@@ -724,6 +823,7 @@ def my_bitwise_left_shift(self, other) -> Tensor:
 
 
 def my_bitwise_right_shift(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning self shifted right element-wise by other.
     """
     Computes the element-wise right bitwise shift of self by other.
 
@@ -737,6 +837,7 @@ def my_bitwise_right_shift(self, other) -> Tensor:
 
 
 def my_permute(self, dims) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning a view of self with dimensions reordered by dims.
     """
     Returns a view of the input tensor with its dimensions rearranged.
 
@@ -750,6 +851,8 @@ def my_permute(self, dims) -> Tensor:
 
 
 def my_index_select(self, dim, index) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the entries of self along dim chosen by the 1D index
+    # tensor.
     """
     Indexes the input tensor along dimension dim using entries in index.
 
@@ -764,6 +867,7 @@ def my_index_select(self, dim, index) -> Tensor:
 
 
 def my_floor_divide(self, other) -> Tensor:
+    # [FUNCTION DOC] Calls the op returning the element-wise floor division of self by other.
     """
     Computes the element-wise floor division of self by other.
 
@@ -777,6 +881,8 @@ def my_floor_divide(self, other) -> Tensor:
 
 
 def my_is_pinned(self) -> bool:
+    # [FUNCTION DOC] Calls the op returning whether the storage of self is in pinned memory, as
+    # a bool.
     """
     Returns whether the tensor's storage is allocated in pinned memory.
 
@@ -801,6 +907,10 @@ _NAMESPACE = "libtorch_agn_2_10"
 
 
 def __getattr__(name):
+    # [FUNCTION DOC] Module-level attribute hook: for a public name (not starting with an
+    # underscore) looks the op up in the torch.ops namespace of this version and returns its
+    # default overload, so ops compiled from the 2.9 extension are reachable here. Raises
+    # AttributeError for underscore names and for names missing from the namespace.
     """Proxy for inherited ops from previous versions."""
     if name.startswith("_"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -812,6 +922,9 @@ def __getattr__(name):
 
 
 def __dir__():
+    # [FUNCTION DOC] Module-level directory hook: returns a sorted, de-duplicated list of the
+    # public callable names defined in this module plus all public names in the torch.ops
+    # namespace of this version (native plus inherited ops).
     """List all available ops (native + inherited)."""
     native = [
         name

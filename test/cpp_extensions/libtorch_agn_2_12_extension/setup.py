@@ -1,3 +1,9 @@
+# [MODULE DOC] Build script (setuptools) for the libtorch_agn_2_12 test extension, an example of
+# a libtorch-agnostic (stable ABI, abi3) extension targeting PyTorch 2.12. It also compiles the
+# csrc of the earlier version extensions (2.9 to 2.11) for forward compatibility testing.
+# Defines ROOT_DIR and CSRC_DIR, a custom clean command and get_extension. Executing it calls
+# setup (BuildExtension with no python ABI suffix, plus the clean command); CUDA sources are
+# included only when CUDA is available.
 import distutils.command.clean
 import shutil
 from pathlib import Path
@@ -25,7 +31,14 @@ PREV_CSRC_DIRS = [
 
 
 class clean(distutils.command.clean.clean):
+    # [CLASS DOC] Custom distutils clean command: after the default clean it deletes built
+    # shared objects in the package folder and the build, dist and egg-info directories next to
+    # the script.
     def run(self):
+        # [FUNCTION DOC] Runs the default clean, then unlinks every shared object found under
+        # the libtorch_agn_2_12 package folder, then recursively removes the build, dist and
+        # egg-info directories if they exist (removal errors ignored). Side effect: file
+        # deletion.
         # Run default behavior first
         distutils.command.clean.clean.run(self)
 
@@ -44,6 +57,11 @@ class clean(distutils.command.clean.clean):
 
 
 def get_extension():
+    # [FUNCTION DOC] Builds and returns a one-element list holding the abi3 extension named for
+    # the package with a _C suffix. Compile flags set the target PyTorch version macro and the
+    # library name macro (plus color diagnostics off Windows); sources are all cpp files under
+    # csrc and the earlier extensions' csrc. If CUDA is available it adds a CUDA define, nvcc
+    # flags, switches to CUDAExtension and also collects cu files.
     extra_compile_args = {
         "cxx": [
             "-DTORCH_TARGET_VERSION=0x020c000000000000",

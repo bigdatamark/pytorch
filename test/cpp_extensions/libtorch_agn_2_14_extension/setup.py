@@ -1,3 +1,9 @@
+# [MODULE DOC] Build script (setuptools) for the libtorch_agn_2_14 test extension, an example of
+# a libtorch-agnostic (stable ABI, abi3) extension targeting PyTorch 2.14. It also compiles the
+# csrc of the earlier version extensions (2.9 to 2.13) for forward compatibility testing.
+# Defines ROOT_DIR and CSRC_DIR, a custom clean command and get_extension. Executing it calls
+# setup (BuildExtension with no python ABI suffix, plus the clean command); CUDA sources are
+# included only when CUDA is available.
 import distutils.command.clean
 import shutil
 from pathlib import Path
@@ -27,7 +33,14 @@ PREV_CSRC_DIRS = [
 
 
 class clean(distutils.command.clean.clean):
+    # [CLASS DOC] Custom distutils clean command: after the default clean it deletes built
+    # shared objects in the package folder and the build, dist and egg-info directories next to
+    # the script.
     def run(self):
+        # [FUNCTION DOC] Runs the default clean, then unlinks every shared object found under
+        # the libtorch_agn_2_14 package folder, then recursively removes the build, dist and
+        # egg-info directories if they exist (removal errors ignored). Side effect: file
+        # deletion.
         # Run default behavior first
         distutils.command.clean.clean.run(self)
 
@@ -46,6 +59,11 @@ class clean(distutils.command.clean.clean):
 
 
 def get_extension():
+    # [FUNCTION DOC] Returns two extensions: the op extension _C (this version's csrc plus
+    # inherited 2.9 to 2.13 csrc, excluding the interop module source, and excluding mps sources
+    # unless MPS is available) and a separate importable _interop abi3 extension built from the
+    # interop module source. Both get the target version macro; _C also gets the library name
+    # macro, CUDA flags/sources when CUDA is available, and an MPS define when MPS is available.
     common_cxx = ["-DTORCH_TARGET_VERSION=0x020e000000000000"]
     if not IS_WINDOWS:
         common_cxx.append("-fdiagnostics-color=always")

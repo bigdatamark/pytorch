@@ -1,8 +1,17 @@
+# [MODULE DOC] Python wrappers for the ops of the libtorch_agn_2_11 test extension, which tests
+# the stable from_blob API with deleter callbacks (plain function deleters and capturing-lambda
+# deleters, host and CUDA memory) and their global call counters. Each function is a thin
+# wrapper calling the default overload of the matching op under torch.ops.libtorch_agn_2_11. Ops
+# of the 2.9 and 2.10 extensions are reachable through the module-level attribute and directory
+# hooks at the end. The extension library must already be loaded; no import-time side effects.
 import torch
 from torch import Tensor
 
 
 def my_from_blob_with_deleter(data_ptr, sizes, strides, device, dtype) -> Tensor:
+    # [FUNCTION DOC] Calls the op wrapping existing memory (data pointer, sizes, strides,
+    # device, dtype) as a tensor with a deleter that increments a global call counter when the
+    # storage is freed. Returns the tensor; the caller keeps the memory valid.
     """
     Creates a Tensor from existing memory with a deleter callback.
 
@@ -25,6 +34,8 @@ def my_from_blob_with_deleter(data_ptr, sizes, strides, device, dtype) -> Tensor
 
 
 def get_deleter_call_count() -> int:
+    # [FUNCTION DOC] Calls the op returning how many times the plain test deleter ran, as an
+    # integer.
     """
     Returns the number of times the test deleter has been called.
     """
@@ -32,6 +43,8 @@ def get_deleter_call_count() -> int:
 
 
 def reset_deleter_call_count() -> None:
+    # [FUNCTION DOC] Calls the op resetting the plain deleter call counter to zero. Mutates
+    # global state in the library. Returns nothing.
     """
     Resets the deleter call counter to zero.
     """
@@ -39,6 +52,9 @@ def reset_deleter_call_count() -> None:
 
 
 def my_from_blob_with_cuda_deleter(numel: int, device) -> Tensor:
+    # [FUNCTION DOC] Calls the op that allocates numel floats with cudaMalloc on the CUDA device
+    # and returns a 1D float32 tensor of zeros owning that memory; the deleter frees it with
+    # cudaFree when the tensor is destroyed. Requires CUDA.
     """
     Creates a CUDA tensor that owns its memory via cudaMalloc.
 
@@ -58,6 +74,8 @@ def my_from_blob_with_cuda_deleter(numel: int, device) -> Tensor:
 
 
 def my_from_blob_with_lambda_deleter(data_ptr, sizes, strides, device, dtype) -> Tensor:
+    # [FUNCTION DOC] Same as my_from_blob_with_deleter but the deleter is a capturing lambda,
+    # exercising that code path; it increments the lambda counter.
     """
     Creates a Tensor from existing memory with a capturing-lambda deleter.
 
@@ -79,6 +97,8 @@ def my_from_blob_with_lambda_deleter(data_ptr, sizes, strides, device, dtype) ->
 
 
 def get_lambda_deleter_call_count() -> int:
+    # [FUNCTION DOC] Calls the op returning how many times the capturing-lambda test deleter
+    # ran, as an integer.
     """
     Returns the number of times the lambda test deleter has been called.
     """
@@ -86,6 +106,8 @@ def get_lambda_deleter_call_count() -> int:
 
 
 def reset_lambda_deleter_call_count() -> None:
+    # [FUNCTION DOC] Calls the op resetting the lambda deleter call counter to zero. Mutates
+    # global state in the library. Returns nothing.
     """
     Resets the lambda deleter call counter to zero.
     """
@@ -93,6 +115,8 @@ def reset_lambda_deleter_call_count() -> None:
 
 
 def my_from_blob_with_cuda_lambda_deleter(numel: int, device) -> Tensor:
+    # [FUNCTION DOC] Same as my_from_blob_with_cuda_deleter but uses the capturing-lambda
+    # deleter path. Returns a 1D float32 zero tensor on the device. Requires CUDA.
     """
     Creates a CUDA tensor that owns its memory via cudaMalloc, using a lambda deleter.
 
@@ -123,6 +147,10 @@ _NAMESPACE = "libtorch_agn_2_11"
 
 
 def __getattr__(name):
+    # [FUNCTION DOC] Module-level attribute hook: for a public name (not starting with an
+    # underscore) looks the op up in the torch.ops namespace of this version and returns its
+    # default overload, so ops compiled from the 2.9 and 2.10 extensions are reachable here.
+    # Raises AttributeError for underscore names and for names missing from the namespace.
     """Proxy for inherited ops from previous versions."""
     if name.startswith("_"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -134,6 +162,9 @@ def __getattr__(name):
 
 
 def __dir__():
+    # [FUNCTION DOC] Module-level directory hook: returns a sorted, de-duplicated list of the
+    # public callable names defined in this module plus all public names in the torch.ops
+    # namespace of this version (native plus inherited ops).
     """List all available ops (native + inherited)."""
     native = [
         name

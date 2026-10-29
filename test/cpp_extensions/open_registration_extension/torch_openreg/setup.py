@@ -1,3 +1,9 @@
+# [MODULE DOC] Build script for the torch_openreg out-of-tree accelerator backend example.
+# Unless invoked with clean or dist_info, it first builds the C++ dependencies with cmake
+# (configure, then build and install into the package folder, using PyTorch's install dir), then
+# calls setup to build the small C stub extension torch_openreg._C linked against the
+# torch_bindings library, package the shared libraries, and register the torch.backends autoload
+# entry point. Defines the platform flags and BASE_DIR at import time.
 import multiprocessing
 import os
 import platform
@@ -19,6 +25,9 @@ RUN_BUILD_DEPS = any(arg in {"clean", "dist_info"} for arg in sys.argv)
 
 
 def make_relative_rpath_args(path):
+    # [FUNCTION DOC] HELPER: Returns the linker arguments that add an rpath relative to the
+    # loaded library's location for the given sub path (loader path on macOS, origin elsewhere),
+    # or an empty list on Windows.
     if IS_DARWIN:
         return ["-Wl,-rpath,@loader_path/" + path]
     elif IS_WINDOWS:
@@ -28,6 +37,9 @@ def make_relative_rpath_args(path):
 
 
 def get_pytorch_dir():
+    # [FUNCTION DOC] HELPER: Returns the directory of the installed torch package. Side effect:
+    # sets the environment variable that disables device backend autoload before importing
+    # torch, to avoid a circular import if the accelerator was already built and installed.
     # Disable autoload of the accelerator
 
     # We must do this for two reasons:
@@ -40,6 +52,11 @@ def get_pytorch_dir():
 
 
 def build_deps():
+    # [FUNCTION DOC] HELPER: Runs cmake to configure the project in a build subfolder (created
+    # if needed) with the install prefix at the torch_openreg package folder, the Python include
+    # dir and the PyTorch dir, then builds the install target in Release with parallel jobs
+    # equal to the CPU count. Raises CalledProcessError if a cmake step fails. Side effects:
+    # creates files, runs subprocesses.
     build_dir = os.path.join(BASE_DIR, "build")
     os.makedirs(build_dir, exist_ok=True)
 
@@ -74,7 +91,14 @@ def build_deps():
 
 
 class BuildClean(clean):
+    # [CLASS DOC] Custom distutils clean command for the openreg build; it replaces the default
+    # clean behavior rather than extending it.
     def run(self):
+        # [FUNCTION DOC] Removes the build, install and torch_openreg/lib directories if
+        # present, then deletes every shared object file found under the torch_openreg package
+        # folder. Does not call the base class clean. Side effect: file deletion.
+        # KNOWN ISSUE: the base class clean.run is never invoked, so default distutils cleanup
+        # is skipped.
         for i in ["build", "install", "torch_openreg/lib"]:
             dirs = os.path.join(BASE_DIR, i)
             if os.path.exists(dirs) and os.path.isdir(dirs):
@@ -87,6 +111,13 @@ class BuildClean(clean):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: runs build_deps unless clean or dist_info was requested (the
+    # constant RUN_BUILD_DEPS is true in exactly that case, despite its name), picks platform
+    # specific link and compile flags (MSVC runtime flags on Windows, warning and aliasing flags
+    # elsewhere), and calls setup with the C stub extension, shared library package data, the
+    # clean command and the torch.backends entry point.
+    # KNOWN ISSUE: RUN_BUILD_DEPS is true when the build must be skipped, so its name is
+    # inverted.
     if not RUN_BUILD_DEPS:
         build_deps()
 

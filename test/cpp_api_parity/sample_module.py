@@ -1,3 +1,7 @@
+# [MODULE DOC] Sample torch.nn.Module used by test_cpp_api_parity to check that the Python/C++
+# parity harness works for module APIs. Defines SampleModule, attaches it to torch.nn at import
+# time, holds the matching C++ source string, and the module_tests list of test parameter
+# mappings (parity, no-parity, and one explicitly skipped case).
 import torch
 
 
@@ -14,7 +18,14 @@ is different from the C++ equivalent.
 
 
 class SampleModule(torch.nn.Module):
+    # [CLASS DOC] Tiny module with one 3x4 parameter and an optional nested copy of itself.
+    # Attributes: has_parity (selects whether forward matches the C++ equivalent),
+    # has_submodule, param, and submodule (only present when has_submodule is true; the
+    # submodule itself has no further submodule).
     def __init__(self, has_parity, has_submodule):
+        # [FUNCTION DOC] Stores the flags, optionally builds a nested SampleModule (same
+        # has_parity, no grandchild), registers an uninitialized 3x4 parameter named param, then
+        # calls reset_parameters.
         super().__init__()
         self.has_parity = has_parity
         if has_submodule:
@@ -26,10 +37,16 @@ class SampleModule(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        # [FUNCTION DOC] Fills param with ones in place under no-grad. Mirrors the C++ reset
+        # behavior.
         with torch.no_grad():
             self.param.fill_(1)
 
     def forward(self, x):
+        # [FUNCTION DOC] Returns x plus param times 2 plus the submodule output (0 if there is
+        # none) when has_parity is true; otherwise x plus param times 4 plus the submodule
+        # output plus 3, which intentionally differs from the C++ module. Param (3x4) broadcasts
+        # against x.
         submodule_forward_result = (
             self.submodule(x) if hasattr(self, "submodule") else 0
         )
