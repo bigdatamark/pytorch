@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor debug trace output. Checks that compiling with tracing enabled
+# writes the debug trace directory with the expected artifacts and logs the scheduler IR before
+# and after fusion, that the debug printer tolerates constant example inputs, that max-autotune
+# with several templates runs without logging failures, and that autotuning-result logging
+# passes the arguments the real debug formatter requires. Skips the whole module when the
+# inductor test library import raises a skip.
 import logging
 import os
 import re
@@ -28,6 +34,8 @@ except unittest.SkipTest:
 
 
 def filesize(filename: Path):
+    # [FUNCTION DOC] HELPER: Raises an assertion error if the path does not exist; otherwise
+    # returns its size in bytes.
     if not filename.exists():
         raise AssertionError(f"{filename} is missing")
     return os.stat(filename).st_size
@@ -35,9 +43,19 @@ def filesize(filename: Path):
 
 @config.patch("trace.enabled", True)
 class TestDebugTrace(test_torchinductor.TestCase):
+    # [CLASS DOC] Debug trace tests; the class decorator turns on the trace enabled config for
+    # every test. Based on the shared inductor test case.
     def test_debug_trace(self):
+        # [FUNCTION DOC] Compiles a function (realized add, then add, then matrix multiply) on
+        # CPU with a temporary trace directory and caches disabled, capturing warning logs from
+        # the debug module and the pre- and post-fusion IR logs. Finds the logged debug trace
+        # path, checks it is a directory containing the readable, runnable and transformed graph
+        # files and the output code above size thresholds, and compares both fusion logs to
+        # expected text. Removes the trace directory only on success.
         @torch.compile
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function: realizes input a plus one, adds two, and
+            # returns the matrix product with b.
             a = test_operators.realize(a + 1) + 2
             return torch.matmul(a, b)
 
@@ -253,10 +271,17 @@ op2.node.kernel = extern_kernels.mm""",
     # AOT compiler have not supported windows yet.
     @skipIfWindows
     def test_debug_printer_const(self):
+        # [FUNCTION DOC] Regression test that ahead-of-time compiling an exported model whose
+        # second example input is a plain integer constant does not break the debug printer.
+        # Skipped on Windows where the AOT compiler is unsupported. Only checks that
+        # compilation completes.
         """Test that having a const example_input does not break the debug printer."""
 
         class Model(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Toy module whose forward takes a tensor and a constant and
+            # returns the sum of the tensor.
             def forward(self, x, ks0):
+                # [FUNCTION DOC] HELPER: Returns the sum of x; the second argument is ignored.
                 return x.sum()
 
         example_inputs = (
@@ -270,13 +295,21 @@ op2.node.kernel = extern_kernels.mm""",
 
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     def test_debug_multi_tempalte(self):
+        # [FUNCTION DOC] Compiles a linear plus relu model in max-autotune mode on the GPU with
+        # a fresh cache while capturing warnings of the debug logger; passes if running it
+        # raises no failure (nothing about the log content is asserted). Skipped without a GPU.
         class ToyModel(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Small module with a hundred by hundred linear layer and
+            # a relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and relu submodules.
                 super().__init__()
                 self.l = torch.nn.Linear(100, 100)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and then the relu to
+                # the input.
                 return self.relu(self.l(x))
 
         # no failure
@@ -294,7 +327,13 @@ op2.node.kernel = extern_kernels.mm""",
 
 
 class TestLogAutotuningResultsCallSite(test_torchinductor.TestCase):
+    # [CLASS DOC] Regression tests for the call site of autotuning result logging.
     def test_log_results_forwards_required_args_to_debug_formatter(self):
+        # [FUNCTION DOC] Installs a recorder as the debug handler, calls the selector cache
+        # log_results with explicit prescreening time of none, and checks the recorder was
+        # called. Then binds the recorded positional and keyword arguments to the real debug
+        # formatter signature, which raises a type error if a required argument (such as the
+        # prescreening time) is missing.
         # Regression: AlgorithmSelectorCache.log_results omitted
         # prescreening_elapse, which raised TypeError under
         # TORCH_COMPILE_DEBUG=1 + LOG_AUTOTUNE_RESULTS=1 (those flags route
@@ -308,7 +347,11 @@ class TestLogAutotuningResultsCallSite(test_torchinductor.TestCase):
         captured: dict = {}
 
         class _Recorder:
+            # [FUNCTION DOC] HELPER: Stand-in debug handler that stores the arguments of
+            # log_autotuning_results in the shared captured mapping.
             def log_autotuning_results(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Records the received positional and keyword arguments
+                # in the captured mapping under the args and kwargs keys.
                 captured["args"] = args
                 captured["kwargs"] = kwargs
 

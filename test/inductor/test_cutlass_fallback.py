@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Regression tests for how Inductor max-autotune handles CUTLASS GEMM choices
+# (issue 171094): falling back to ATen when every CUTLASS benchmark fails, keeping the ATen
+# extern choice in prescreening, and routing CUTLASS benchmarking through a subprocess with
+# restart on sticky CUDA errors. Defines a module flag HAS_CUTLASS from an import attempt at
+# import time.
 """Tests for CUTLASS fallback and subprocess isolation (#171094)."""
 
 import os
@@ -25,6 +30,9 @@ except ImportError:
 
 
 def _get_path_without_sccache() -> str:
+    # [FUNCTION DOC] HELPER: Returns the PATH environment variable string with every entry
+    # that contains the sccache directory removed (entries are split and rejoined on the
+    # colon separator).
     """Get the PATH environment variable without sccache."""
     path_envs = os.environ.get("PATH", "").split(":")
     path_envs = [env for env in path_envs if "/opt/cache/bin" not in env]
@@ -32,9 +40,16 @@ def _get_path_without_sccache() -> str:
 
 
 class TestCutlassFallback(TestCase):
+    # [CLASS DOC] GPU tests of CUTLASS-to-ATen fallback during GEMM autotuning. setUp skips
+    # without CUDA plus triton or on HIP; each test needs CUTLASS and SM90 and runs with a PATH
+    # stripped of sccache. Results of compiled mm/addmm are compared with eager execution.
     """Tests for CUTLASS fallback behavior when benchmarks fail."""
 
     def setUp(self):
+        # [FUNCTION DOC] Skips when CUDA with triton is unavailable or on HIP. Temporarily sets
+        # the environment flag that disables the fresh inductor test cache while the base setUp
+        # runs, then restores the previous value (empty string if it was unset) and seeds the
+        # random generator.
         if not HAS_CUDA_AND_TRITON:
             self.skipTest("CUDA and triton are not available")
         if torch.version.hip:
@@ -53,6 +68,7 @@ class TestCutlassFallback(TestCase):
         torch.random.manual_seed(1234)
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base tearDown and then clears Inductor caches.
         super().tearDown()
         clear_caches()
 
@@ -60,10 +76,16 @@ class TestCutlassFallback(TestCase):
     @unittest.skipIf(not SM90OrLater, "requires SM90+")
     @mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
     def test_fallback_to_aten_when_cutlass_benchmarks_fail(self):
+        # [FUNCTION DOC] Forces the CUTLASS template caller benchmark to always report infinite
+        # time, compiles a matrix multiply with max-autotune over CUTLASS and ATen backends, and
+        # checks that compilation does not crash and the result matches eager within a loose
+        # tolerance (the ATen fallback is used). Resets dynamo and caches first.
         """ATen fallback is used when all CUTLASS benchmarks return inf."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         def mock_cuda_benchmark(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement benchmark that ignores its arguments and
+            # returns infinity.
             return float("inf")
 
         with config.patch(
@@ -79,6 +101,8 @@ class TestCutlassFallback(TestCase):
 
                 @torch.compile
                 def fn(a, b):
+                    # [FUNCTION DOC] HELPER: Compiled function returning the matrix product of
+                    # its two inputs.
                     return torch.mm(a, b)
 
                 # Use dimensions that trigger CUTLASS selection
@@ -97,6 +121,11 @@ class TestCutlassFallback(TestCase):
     @unittest.skipIf(not SM90OrLater, "requires SM90+")
     @mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
     def test_extern_kernel_included_in_prescreening(self):
+        # [FUNCTION DOC] Wraps the selector cache prescreen method with a recorder that collects
+        # every returned candidate, compiles a matrix multiply with CUTLASS prescreening enabled
+        # and many profiling configs, then, only if prescreening produced candidates, asserts
+        # that at least one is an ExternKernelCaller. If prescreening never triggers the test
+        # passes without asserting.
         """Test that ExternKernelCaller choices are included in prescreening candidates."""
         prescreening_candidates = []
 
@@ -104,6 +133,9 @@ class TestCutlassFallback(TestCase):
 
         @staticmethod
         def capturing_prescreen(choices, name, inputs_key, prescreen_cache):
+            # [FUNCTION DOC] HELPER: Calls the original prescreen function with the same
+            # arguments, appends any returned candidates to the shared list of captured
+            # candidates and returns the result.
             result = original_prescreen(choices, name, inputs_key, prescreen_cache)
             if result:
                 prescreening_candidates.extend(result)
@@ -125,6 +157,8 @@ class TestCutlassFallback(TestCase):
 
                 @torch.compile
                 def fn(a, b):
+                    # [FUNCTION DOC] HELPER: Compiled function returning the matrix product of
+                    # its two inputs.
                     return torch.mm(a, b)
 
                 M, N, K = 256, 2048, 3520
@@ -153,10 +187,15 @@ class TestCutlassFallback(TestCase):
     @unittest.skipIf(not SM90OrLater, "requires SM90+")
     @mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
     def test_addmm_fallback_on_cutlass_failure(self):
+        # [FUNCTION DOC] Like the mm fallback test but for the bias-add matrix multiply: all
+        # CUTLASS benchmarks are forced to infinite time, the compiled function must not crash
+        # and must match the eager result within a loose tolerance.
         """addmm falls back to ATen when CUTLASS benchmarks fail."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         def mock_cuda_benchmark(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement benchmark that ignores its arguments and
+            # returns infinity.
             return float("inf")
 
         with config.patch(
@@ -172,6 +211,8 @@ class TestCutlassFallback(TestCase):
 
                 @torch.compile
                 def fn(bias, a, b):
+                    # [FUNCTION DOC] HELPER: Compiled function computing a bias-add matrix
+                    # multiply of its inputs.
                     return torch.addmm(bias, a, b)
 
                 # Use dimensions from issue #171094
@@ -191,6 +232,10 @@ class TestCutlassFallback(TestCase):
     @unittest.skipIf(not SM90OrLater, "requires SM90+")
     @mock.patch.dict(os.environ, {"PATH": _get_path_without_sccache()})
     def test_issue_171094_dimensions(self):
+        # [FUNCTION DOC] Regression test using the exact shapes from the issue: compiles the
+        # bias-add matrix multiply under max-autotune with CUTLASS and ATen backends in bfloat16
+        # on CUDA, and checks it completes without illegal memory access and matches eager
+        # within a loose tolerance.
         """Regression test with exact dimensions from #171094."""
         with config.patch(
             {
@@ -204,6 +249,8 @@ class TestCutlassFallback(TestCase):
 
             @torch.compile
             def fn(bias, a, b):
+                # [FUNCTION DOC] HELPER: Compiled function computing a bias-add matrix multiply
+                # of its inputs.
                 return torch.addmm(bias, a, b)
 
             # Exact dimensions from issue #171094
@@ -221,9 +268,16 @@ class TestCutlassFallback(TestCase):
 
 
 class TestCutlassSubprocessRouting(TestCase):
+    # [CLASS DOC] Tests of CUTLASS subprocess benchmarking routing and error recovery. Uses
+    # mock choice objects and a pool object created without running its constructor, so no
+    # GPU needed.
     """Tests for CUTLASS subprocess benchmarking routing and error recovery."""
 
     def test_cutlass_forces_subprocess_benchmarking(self):
+        # [FUNCTION DOC] With in-subprocess autotuning disabled, builds the benchmark function
+        # for a choice list containing an extern caller and a CUTLASS caller (autospec mocks)
+        # and asserts the returned partial wraps the subprocess benchmark method, i.e. CUTLASS
+        # forces subprocess use.
         """make_benchmark_fn routes to subprocess when CUTLASS choices are present."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
@@ -240,6 +294,8 @@ class TestCutlassSubprocessRouting(TestCase):
             self.assertEqual(fn.func, AlgorithmSelectorCache.benchmark_in_sub_process)
 
     def test_no_subprocess_without_cutlass(self):
+        # [FUNCTION DOC] With in-subprocess autotuning disabled and only an extern caller mock,
+        # asserts the benchmark function builder returns the current-process benchmark method.
         """make_benchmark_fn uses current process when no CUTLASS and autotune_in_subproc=False."""
         mock_extern = mock.create_autospec(ExternKernelCaller, instance=True)
 
@@ -255,6 +311,10 @@ class TestCutlassSubprocessRouting(TestCase):
             )
 
     def test_subprocess_restart_on_illegal_address(self):
+        # [FUNCTION DOC] Builds a tuning pool without running its constructor, giving it a queue
+        # that yields a mock process whose get raises a runtime error mentioning an illegal
+        # address. Asserts the pool target returns infinity and that the process was restarted
+        # exactly once.
         """TuningProcessPool restarts subprocess on cudaErrorIllegalAddress."""
         from torch._inductor.autotune_process import TuningProcessPool
 
@@ -277,6 +337,9 @@ class TestCutlassSubprocessRouting(TestCase):
         mock_process.restart.assert_called_once()
 
     def test_subprocess_restart_on_launch_failure(self):
+        # [FUNCTION DOC] Same as the illegal-address restart test but the mock process raises
+        # a runtime error naming a launch failure; asserts infinity is returned and one
+        # restart happens.
         """TuningProcessPool restarts subprocess on cudaErrorLaunchFailure."""
         from torch._inductor.autotune_process import TuningProcessPool
 
@@ -297,6 +360,8 @@ class TestCutlassSubprocessRouting(TestCase):
         mock_process.restart.assert_called_once()
 
     def test_subprocess_no_restart_on_other_errors(self):
+        # [FUNCTION DOC] Mock process raises a runtime error with an unrelated message; asserts
+        # the pool target returns infinity and that the process is not restarted.
         """TuningProcessPool does not restart on non-sticky CUDA errors."""
         from torch._inductor.autotune_process import TuningProcessPool
 
@@ -317,6 +382,11 @@ class TestCutlassSubprocessRouting(TestCase):
         mock_process.restart.assert_not_called()
 
     def test_cutlass_ordered_after_triton_in_subprocess(self):
+        # [FUNCTION DOC] Patches the subprocess benchmark function with a recorder that stores
+        # the choices it receives, and patches the current-process benchmark and extern check,
+        # then runs the selector subprocess benchmark with a CUTLASS mock and a generic mock.
+        # Asserts two choices are recorded with the non-CUTLASS choice first and the CUTLASS
+        # one second.
         """benchmark_in_sub_process orders Triton before CUTLASS."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
@@ -326,6 +396,8 @@ class TestCutlassSubprocessRouting(TestCase):
         captured_choices = []
 
         def capture_benchmark(choices):
+            # [FUNCTION DOC] HELPER: Appends the received choices to the shared captured list
+            # and returns a mapping giving every choice a time of one.
             captured_choices.extend(choices)
             return dict.fromkeys(choices, 1.0)
 
@@ -358,10 +430,16 @@ class TestCutlassSubprocessRouting(TestCase):
             self.assertIsInstance(captured_choices[1], CUTLASSTemplateCaller)
 
     def test_prescreen_includes_extern_with_enough_cutlass(self):
+        # [FUNCTION DOC] Prescreening with one extern mock and twelve CUTLASS mocks (each
+        # reports a swizzle in its info dictionary) under prescreening config: asserts the
+        # result is non-empty, contains an ExternKernelCaller, and that the extern choice
+        # is first.
         """prescreen_choices includes ExternKernelCaller when >= 10 CUTLASS candidates."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         def make_cutlass_mock(swizzle="2"):
+            # [FUNCTION DOC] HELPER: Creates an autospec mock CUTLASS caller whose info
+            # dictionary method returns a mapping holding the given swizzle value (default "2").
             m = mock.create_autospec(CUTLASSTemplateCaller, instance=True)
             m.info_dict.return_value = {"swizzle": swizzle}
             return m
@@ -389,10 +467,14 @@ class TestCutlassSubprocessRouting(TestCase):
         self.assertIsInstance(result[0], ExternKernelCaller)
 
     def test_prescreen_skipped_with_few_cutlass(self):
+        # [FUNCTION DOC] Prescreening with one extern mock and only five CUTLASS mocks: asserts
+        # the result is an empty list.
         """prescreen_choices returns [] when < 10 CUTLASS candidates."""
         from torch._inductor.codegen.cutlass.kernel import CUTLASSTemplateCaller
 
         def make_cutlass_mock(swizzle="2"):
+            # [FUNCTION DOC] HELPER: Creates an autospec mock CUTLASS caller whose info
+            # dictionary method returns a mapping holding the given swizzle value (default "2").
             m = mock.create_autospec(CUTLASSTemplateCaller, instance=True)
             m.info_dict.return_value = {"swizzle": swizzle}
             return m

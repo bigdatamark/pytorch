@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the CUTLASS epilogue visitor tree (EVT) support in Inductor. Uses
+# mock IR buffers and scheduler nodes to check the Python EVT code generated from pointwise
+# epilogue IR (reads, writes, renames and source text), the creation of CUTLASS example
+# tensors, and the rendered C++ EVT argument/type code. Optional cutlass imports and module-
+# level fixtures (example tensors, epilogue source, mock tile description) are only defined
+# when cutlass is importable.
 import unittest
 
 import sympy
@@ -25,10 +31,15 @@ from torch.testing._internal.inductor_utils import (
 
 
 def _is_cuda_sm90_or_sm10x():
+    # [FUNCTION DOC] HELPER: Returns True when the CUDA device is SM90 or an SM10x part, based
+    # on the imported capability flags.
     return bool(IS_SM90) or bool(IS_SM10X)
 
 
 def _cuda_evt_arch_supported():
+    # [FUNCTION DOC] HELPER: Reports whether the CUTLASS EVT tracer supports the current GPU
+    # arch. Always True for non-CUDA devices; for CUDA, imports the cutlass_cppgen compute-
+    # capability map and checks that the detected arch number is a key in it.
     if GPU_TYPE != "cuda":
         return True
 
@@ -85,16 +96,27 @@ if try_import_cutlass():
 
     # For SM100
     class MockMathInstruction:
+        # [CLASS DOC] HELPER: Minimal stand-in for a CUTLASS math instruction; only carries an
+        # opcode class.
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Sets the opcode class attribute to the tensor-op opcode
+            # class of the cutlass library.
             self.opcode_class = cutlass_lib.library.OpcodeClass.TensorOp
 
     class MockTileDescription:
+        # [CLASS DOC] HELPER: Minimal stand-in for a CUTLASS tile description used by the SM100
+        # path: fixed threadblock shape, unit cluster shape and a mock math instruction (class
+        # attributes only).
         threadblock_shape = (128, 128, 8)
         # SM100 path
         cluster_shape = (1, 1, 1)
         math_instruction = MockMathInstruction()
 
     def _create_mock_buffer_name_map(example_tensors):
+        # [FUNCTION DOC] HELPER: Builds a mapping from tensor name to a mock computed buffer,
+        # one for each entry of the input mapping whose value is a CUTLASS tensor. Each buffer
+        # is float32 and copies the tensor shape and stride; other entries are skipped. Returns
+        # the mapping.
         name_to_buffer = {}
         for name, tensor in example_tensors.items():
             if isinstance(tensor, CutlassTensor):
@@ -106,13 +128,23 @@ if try_import_cutlass():
 
 
 class MockSchedulerNode(BaseSchedulerNode):
+    # [CLASS DOC] HELPER: Minimal scheduler node wrapping a single IR node plus the set of buffer
+    # names whose last use is this node. Bypasses the base-class constructor.
     def __init__(self, node, last_usage=None):
+        # [FUNCTION DOC] HELPER: Stores the wrapped node and its last-usage set (an empty
+        # ordered set when none is given). Does not call the parent initializer.
         self.node = node
         self.last_usage = last_usage or OrderedSet()
 
 
 class MockComputedBuffer(ComputedBuffer):
+    # [CLASS DOC] HELPER: Lightweight computed buffer for tests. Holds a name, a pointwise data
+    # node built from the given inner function and sizes (no device), and a fixed layout with
+    # the given strides. Reports one read so it is never inlined into consumers.
     def __init__(self, name, inner_fn, dtype, size, strides=None):
+        # [FUNCTION DOC] HELPER: Initializes name, a pointwise data node (integer ranges from
+        # size, given dtype and inner function) and a fixed layout (no device, optional
+        # strides). No parent init.
         self.name = name
         ranges = [sympy.Integer(x) for x in size]
         self.data = Pointwise(
@@ -121,20 +153,30 @@ class MockComputedBuffer(ComputedBuffer):
         self.layout = FixedLayout(None, dtype, ranges, strides)
 
     def get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the buffer name given at construction.
         return self.name
 
     def num_reads(self):
+        # [FUNCTION DOC] HELPER: Always returns one, which keeps the buffer from being inlined.
         # Needed to not inline in ComputedBuffer
         return 1
 
 
 class TestCutlassEVT(TestCase):
+    # [CLASS DOC] Test case for CUTLASS EVT codegen. Tests are guarded by skip decorators for
+    # XPU platform support, CUDA SM90 (or SM90/SM10x) capability and cutlass availability.
+    # device_type is the GPU type of the test environment.
     device_type = GPU_TYPE
 
     @skipXPUIf(not Xe2_Or_Later, "Unsupported platform")
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_accumulator_return(self):
+        # [FUNCTION DOC] Checks Python EVT codegen when a consumer reads the accumulator buffer
+        # and the accumulator itself is also returned. Builds two chained pointwise mock buffers
+        # over a mock graph handler, then compares reads, writes, renames and generated source
+        # to expected text. The accumulator appears among the writes and a temp alias is renamed
+        # to it.
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import V
 
@@ -146,12 +188,17 @@ class TestCutlassEVT(TestCase):
         # buf0 is acc
         # buf1 is external
         def inner_fn_buf3(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the third buffer: loads the accumulator
+            # and two external buffers at the index and returns the product of the first two
+            # plus the third.
             tmp0 = buf0.make_loader()(index)
             tmp1 = buf1.make_loader()(index)
             tmp2 = buf2.make_loader()(index)
             return tmp0 * tmp1 + tmp2
 
         def inner_fn_buf4(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the fourth buffer: returns the sum of
+            # the accumulator load and the load of the third buffer at the index.
             tmp0 = buf0.make_loader()(index)
             tmp3 = buf3.make_loader()(index)
             return tmp0 + tmp3
@@ -193,6 +240,10 @@ return tmp_0, tmp_2, D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_disjoint_read_indexing(self):
+        # [FUNCTION DOC] Checks that EVT codegen rejects a read of the accumulator through a
+        # permuted view. The first buffer is read through a permutation, then codegen is run and
+        # the raised not-implemented error is captured; its message (unsupported indexing with
+        # index strides and layout stride) is compared to expected text.
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import V
 
@@ -205,12 +256,17 @@ return tmp_0, tmp_2, D""",
         # buf0 is acc
         # buf1 is external
         def inner_fn_buf3(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the third buffer: loads the permuted
+            # accumulator view and two external buffers, returning the product of the first two
+            # plus the third.
             tmp0 = permuted_buf_0.make_loader()(index)
             tmp1 = buf1.make_loader()(index)
             tmp2 = buf2.make_loader()(index)
             return tmp0 * tmp1 + tmp2
 
         def inner_fn_buf4(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the fourth buffer: returns the sum of
+            # the unpermuted accumulator load and the third buffer load.
             tmp0 = buf0.make_loader()(index)
             tmp3 = buf3.make_loader()(index)
             return tmp0 + tmp3
@@ -243,6 +299,10 @@ index strides [200, 60000, 1], and layout stride [60000, 200, 1]""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_broadcasting(self):
+        # [FUNCTION DOC] Checks Python EVT codegen with a broadcast output: the last buffer has
+        # a trailing dimension of one and squares the third buffer. Compares reads, writes,
+        # renames and the generated source (a multiply used twice, then the add with the
+        # accumulator) to expected text.
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import V
 
@@ -254,12 +314,16 @@ index strides [200, 60000, 1], and layout stride [60000, 200, 1]""",
         # buf0 is acc
         # buf1 is external
         def inner_fn_buf3(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the third buffer: product of accumulator
+            # and first external load plus the second external load.
             tmp0 = buf0.make_loader()(index)
             tmp1 = buf1.make_loader()(index)
             tmp2 = buf2.make_loader()(index)
             return tmp0 * tmp1 + tmp2
 
         def inner_fn_buf4(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the fourth buffer: accumulator load plus
+            # the square of the third buffer load.
             tmp0 = buf0.make_loader()(index)
             tmp3 = buf3.make_loader()(index)
             return tmp0 + tmp3 * tmp3
@@ -304,6 +368,10 @@ return tmp_0, tmp_2, D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen(self):
+        # [FUNCTION DOC] Baseline Python EVT codegen test where the accumulator is not an output
+        # (it is passed in the removed-buffers set). Verifies reads, writes (only third and
+        # fourth buffers), renames and the generated function text, where the accumulator is
+        # used directly.
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import V
 
@@ -315,12 +383,16 @@ return tmp_0, tmp_2, D""",
         # buf0 is acc
         # buf1 is external
         def inner_fn_buf3(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the third buffer: accumulator times
+            # first external load, plus the second external load.
             tmp0 = buf0.make_loader()(index)
             tmp1 = buf1.make_loader()(index)
             tmp2 = buf2.make_loader()(index)
             return tmp0 * tmp1 + tmp2
 
         def inner_fn_buf4(index):
+            # [FUNCTION DOC] HELPER: Pointwise body for the fourth buffer: accumulator load plus
+            # third buffer load.
             tmp0 = buf0.make_loader()(index)
             tmp3 = buf3.make_loader()(index)
             return tmp0 + tmp3
@@ -361,6 +433,10 @@ return tmp_1, D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_neg_constant(self):
+        # [FUNCTION DOC] Checks EVT codegen for unary negation and constant ops as produced by
+        # decomposed SiLU: one plus the exponential of the negated accumulator. Verifies no
+        # external reads, a single write, and that negation is emitted as subtraction from zero
+        # in the generated source.
         """Test EVT codegen for neg and constant ops (used in decomposed SiLU)."""
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import ops, V
@@ -369,6 +445,8 @@ return tmp_1, D""",
         buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise body: loads the accumulator and returns a float
+            # constant of one plus the exponential of the negated load.
             x = buf0.make_loader()(index)
             c = ops.constant(1, torch.float32)
             return c + ops.exp(ops.neg(x))
@@ -398,6 +476,9 @@ return D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_sigmoid_decomposed(self):
+        # [FUNCTION DOC] Checks that a decomposed sigmoid (one divided by one plus exp of
+        # negation) is not folded into an activation and stays as separate negate, exp, add and
+        # divide steps in the generated source; also verifies empty reads and a single write.
         """Test EVT codegen for decomposed sigmoid: 1/(1+exp(-x))."""
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import ops, V
@@ -406,6 +487,8 @@ return D""",
         buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise body computing one divided by the sum of one and
+            # the exponential of the negated accumulator load.
             x = buf0.make_loader()(index)
             neg_x = ops.neg(x)
             exp_neg = ops.exp(neg_x)
@@ -441,6 +524,9 @@ return D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_py_codegen_silu_fused(self):
+        # [FUNCTION DOC] Checks that the SiLU pattern (x divided by one plus exp of negated x)
+        # is fused by the activation-fusing pass into a single silu call; the generated source
+        # is only that call plus the return.
         """Test EVT codegen for SiLU: x/(1+exp(-x)) is folded to silu(x)."""
         from torch._inductor.codegen.cutlass.python_evt import CutlassEVTCodegen
         from torch._inductor.virtualized import ops, V
@@ -449,6 +535,8 @@ return D""",
         buf0 = MockComputedBuffer("buf0", None, torch.float32, size)
 
         def inner_fn(index):
+            # [FUNCTION DOC] HELPER: Pointwise body computing the accumulator load divided by
+            # the sum of one and the exponential of its negation.
             x = buf0.make_loader()(index)
             neg_x = ops.neg(x)
             exp_neg = ops.exp(neg_x)
@@ -478,6 +566,10 @@ return D""",
     @skipCUDAIf(not SM90OrLater, "need sm_90")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_example_tensor_creation(self):
+        # [FUNCTION DOC] Checks create_example_tensors: with two mock buffers (row-major and
+        # column-major style strides) and a rename map aliasing the accumulator to the first
+        # buffer, the returned tensors carry the buffer shapes, strides and the float32 CUTLASS
+        # element type.
         from torch._inductor.codegen.cutlass.lib_extensions.evt_extensions import (
             create_example_tensors,
         )
@@ -511,9 +603,16 @@ return D""",
     @skipCUDAIf(not _is_cuda_sm90_or_sm10x(), "need sm_90 or sm_10x")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_evt_argument_codegen(self):
+        # [FUNCTION DOC] Checks the rendered C++ EVT argument struct for the module-level bias
+        # epilogue source. Traces the epilogue for the detected arch, renders the argument type
+        # with the mock name map and compares to expected text, which differs on XPU (extra null
+        # default for the stored aux). Skips when the arch is unsupported by the EVT tracer.
         arch = int(cutlass_arch(GPU_TYPE))
 
         def render_code():
+            # [FUNCTION DOC] HELPER: Traces the shared epilogue code for the detected arch and
+            # returns the first element of the rendered argument type result (the argument
+            # source string).
             epilogue_functor = _trace(BIAS_CODE, EXAMPLE_TENSORS, arch)
             return _render_argument_type(
                 epilogue_functor,
@@ -578,6 +677,10 @@ return D""",
     @skipCUDAIf(not _is_cuda_sm90_or_sm10x(), "need sm_90 or sm_10x")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_evt_argument_codegen_return_accumulator(self):
+        # [FUNCTION DOC] Same as the argument-codegen test but for an epilogue that returns the
+        # accumulator-derived value as well as the sum with bias. Builds its own example
+        # tensors, renders the argument type and compares to expected text (differs for XPU).
+        # Skips on unsupported arch.
         arch = int(cutlass_arch(GPU_TYPE))
 
         code = """
@@ -602,6 +705,9 @@ def fn(accum, bias):
         }
 
         def render_code():
+            # [FUNCTION DOC] HELPER: Traces the local epilogue source with its own example
+            # tensors for the detected arch and returns the first element of the rendered
+            # argument type result.
             epilogue_functor = _trace(code, example_tensors, arch)
             return _render_argument_type(
                 epilogue_functor,
@@ -647,7 +753,15 @@ def fn(accum, bias):
     @skipCUDAIf(not _is_cuda_sm90_or_sm10x(), "need sm_90 or sm_10x")
     @unittest.skipIf(not try_import_cutlass(), "requires cutlass")
     def test_evt_codegen(self):
+        # [FUNCTION DOC] Checks the full EVT type code from the trace entry point for the bias
+        # epilogue with float32 types, the mock tile description and automatic epilogue
+        # schedule. Takes the third result element and compares to expected C++ text for SM90,
+        # SM10x and XPU (each branch applies only on its platform). Skips on unsupported arch.
         def render_code():
+            # [FUNCTION DOC] HELPER: Runs the trace entry point with the bias epilogue, example
+            # tensors, float32 types, mock tile, auto schedule, mock name map, an identity size
+            # hint function and the device type, and returns the third element of the result
+            # (the C++ code).
             return trace(
                 BIAS_CODE,
                 EXAMPLE_TENSORS,

@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor decomposition of the DTensor shard-dim all-to-all op into
+# the functional c10d all-to-all plus wait collectives. Covers graph tracing of the
+# decomposition, numerical equivalence against a pure-tensor reference run on simulated ranks,
+# the backward formula (swapped gather and shard dims), the cases where the decomposition
+# declines, and the autograd registration of the op. No real process group is used; the group
+# size lookup and collectives are mocked.
 
 import math
 import unittest
@@ -15,6 +21,11 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 @unittest.skipIf(not torch.distributed.is_available(), "requires distributed support")
 class TestDecomposeShardDimAllToAll(TestCase):
+    # [CLASS DOC] Tests of the shard-dim all-to-all decomposition; skipped when torch
+    # distributed is unavailable. Helper methods provide a reference implementation (concatenate
+    # along the gather dim, then split along the shard dim), a local simulation of the
+    # decomposition across ranks, access to the registered decomposition, a group size mock, and
+    # tracing/calling helpers.
     def _reference_shard_dim_alltoall(
         self,
         inputs: list[torch.Tensor],
@@ -22,6 +33,10 @@ class TestDecomposeShardDimAllToAll(TestCase):
         gather_dim: int,
         shard_dim: int,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Reference result of the op for a list of per-rank inputs. The
+        # group size is the number of inputs; it concatenates all inputs along the gather dim
+        # and splits the result into that many equal chunks along the shard dim (negative dims
+        # are wrapped). Returns the list of per-rank chunks.
         group_size = len(inputs)
         ndim = inputs[0].dim()
         gathered = torch.cat(inputs, dim=gather_dim % ndim)
@@ -34,6 +49,15 @@ class TestDecomposeShardDimAllToAll(TestCase):
         gather_dim: int,
         shard_dim: int,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Runs the registered decomposition once per simulated rank
+        # without a real group. Computes, for each rank input, the same pre-collective layout
+        # (shard dim split into group-size pieces, moved to the front and made contiguous) and
+        # the collective result each rank would receive (the rank-th slice from every rank,
+        # concatenated on the first dim). Mocks the functional all-to-all single op to assert
+        # the group name is the test one, both split size lists are all ones and the input
+        # equals that rank pre-collective tensor, then return the precomputed result; the wait
+        # op is mocked as identity. Runs with the decomposition config on and the group size
+        # mocked. Returns the list of per-rank outputs.
         group_size = len(inputs)
         ndim = inputs[0].dim()
         gather_dim = gather_dim % ndim
@@ -63,6 +87,11 @@ class TestDecomposeShardDimAllToAll(TestCase):
         current_rank = 0
 
         def all_to_all_single(input, output_split_sizes, input_split_sizes, group_name):
+            # [FUNCTION DOC] HELPER: Mock all-to-all single; asserts the group name, the output
+            # and input split sizes (all ones with length of group size) and that the input
+            # equals the current rank pre-collective tensor, then returns that rank precomputed
+            # collective output. The current rank is read from the enclosing scope and updated
+            # by the loop.
             self.assertEqual(group_name, "test_pg")
             self.assertEqual(output_split_sizes, [1] * group_size)
             self.assertEqual(input_split_sizes, [1] * group_size)
@@ -70,6 +99,7 @@ class TestDecomposeShardDimAllToAll(TestCase):
             return collective_outputs[current_rank]
 
         def wait_tensor(input):
+            # [FUNCTION DOC] HELPER: Mock wait op that returns its input unchanged.
             return input
 
         outputs = []
@@ -97,9 +127,14 @@ class TestDecomposeShardDimAllToAll(TestCase):
         return outputs
 
     def _decomp(self):
+        # [FUNCTION DOC] HELPER: Looks up and returns the registered decomposition callable for
+        # the shard dim all-to-all op from the Inductor decomposition table.
         return select_decomp_table()[torch.ops._dtensor.shard_dim_alltoall.default]
 
     def _group_size_mock(self, group_size: int):
+        # [FUNCTION DOC] HELPER: Returns an (unstarted) patcher object that replaces the
+        # distributed group-size-by-name lookup with a function returning the given fixed group
+        # size; callers use it as a context manager.
         return mock.patch(
             "torch.distributed.distributed_c10d._get_group_size_by_name",
             return_value=group_size,
@@ -114,9 +149,15 @@ class TestDecomposeShardDimAllToAll(TestCase):
         shard_dim: int = 1,
         group_size: int = 4,
     ) -> fx.GraphModule:
+        # [FUNCTION DOC] HELPER: Traces the shard dim all-to-all op on an empty tensor of the
+        # given shape and dtype with a fake-tensor make_fx trace, using the Inductor
+        # decomposition table, the decomposition config enabled and the group size mocked.
+        # Returns the resulting graph module.
         inp = torch.empty(shape, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function that applies the shard dim all-to-all op
+            # with the captured gather dim, shard dim and the test group name.
             return torch.ops._dtensor.shard_dim_alltoall.default(
                 x, gather_dim, shard_dim, "test_pg"
             )
@@ -140,6 +181,10 @@ class TestDecomposeShardDimAllToAll(TestCase):
         group_size: int = 4,
         enabled: bool = True,
     ):
+        # [FUNCTION DOC] HELPER: Calls the registered decomposition directly on an empty
+        # tensor with the given shape, dtype, dims and mocked group size, with the
+        # decomposition config set to the enabled flag. Returns whatever it returns (may be a
+        # not-implemented sentinel).
         inp = torch.empty(shape, dtype=dtype)
         get_group_size = self._group_size_mock(group_size)
         with config.patch({"decompose_shard_dim_alltoall": enabled}):
@@ -147,6 +192,11 @@ class TestDecomposeShardDimAllToAll(TestCase):
                 return self._decomp()(inp, gather_dim, shard_dim, "test_pg")
 
     def test_decomposition_exposes_c10d_collective(self) -> None:
+        # [FUNCTION DOC] Traces the decomposition for an eight by five by six input gathering
+        # the last dim and sharding the first, with a group of four. Asserts the graph passes
+        # linting, the original op is gone, the functional all-to-all and wait ops are present,
+        # the all-to-all split sizes are all ones and group name is the test one, the output
+        # value shape is two by five by twenty-four, and the decomposition counter equals one.
         counters.clear()
         gm = self._trace_decomp(shape=(8, 5, 6), gather_dim=2, shard_dim=0)
         gm.graph.lint()
@@ -169,6 +219,10 @@ class TestDecomposeShardDimAllToAll(TestCase):
         self.assertEqual(counters["inductor"]["decompose_shard_dim_alltoall"], 1)
 
     def test_decomposition_matches_original_api_semantics_locally(self) -> None:
+        # [FUNCTION DOC] For several group sizes, shapes and gather/shard dim pairs
+        # (including a negative dim), builds per-rank inputs from a range, runs the local
+        # simulation and compares it with the reference (subtests per case); also asserts
+        # each output is contiguous.
         cases = [
             (4, (5, 8), 0, 1),
             (4, (8, 5, 6), 2, 0),
@@ -204,6 +258,10 @@ class TestDecomposeShardDimAllToAll(TestCase):
                 self.assertTrue(all(out.is_contiguous() for out in actual))
 
     def test_backward_formula_matches_original_api_semantics_locally(self) -> None:
+        # [FUNCTION DOC] Checks the backward formula: forward outputs come from the reference,
+        # per-rank gradient outputs are built from ranges offset by rank, and the expected
+        # gradients are the reference result with gather and shard dims swapped. Asserts the
+        # local decomposition run with swapped dims gives the same gradients.
         group_size = 4
         input_shape = (8, 5, 6)
         gather_dim = 2
@@ -236,6 +294,10 @@ class TestDecomposeShardDimAllToAll(TestCase):
         self.assertEqual(actual_grads, expected_grads)
 
     def test_falls_back_for_unsupported_cases(self) -> None:
+        # [FUNCTION DOC] For each of four cases (config disabled, shard size not divisible by
+        # group size, complex dtype, same gather and shard dim) calls the decomposition and
+        # asserts it returns the not-implemented sentinel and that the decomposition counter
+        # stays zero. Counters cleared per case.
         cases = [
             {"shape": (5, 8), "enabled": False},
             {"shape": (5, 7)},
@@ -253,6 +315,12 @@ class TestDecomposeShardDimAllToAll(TestCase):
                 )
 
     def test_shard_dim_alltoall_registered_autograd_backward(self) -> None:
+        # [FUNCTION DOC] Registers a CPU implementation of the op in a scoped library that
+        # records its calls (first call returns a detached clone, later calls return a tensor
+        # filled with seven), runs the op on an input requiring grad and sums and back-
+        # propagates. Asserts two calls happened, the backward call has the gather and shard
+        # dims swapped with the same group name and a non-grad input, the output required grad,
+        # and the input gradient is all sevens.
         import torch.distributed.tensor._collective_utils
 
         calls = []
@@ -260,6 +328,9 @@ class TestDecomposeShardDimAllToAll(TestCase):
         with torch.library._scoped_library("_dtensor", "IMPL") as lib:
 
             def impl(input, gather_dim: int, shard_dim: int, group_name):
+                # [FUNCTION DOC] HELPER: Recording implementation: appends its arguments to the
+                # shared call list, returns a detached clone on the first call and a tensor of
+                # sevens shaped like the input after.
                 calls.append((input, gather_dim, shard_dim, group_name))
                 if len(calls) == 1:
                     return input.detach().clone()

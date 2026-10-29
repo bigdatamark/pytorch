@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor deterministic mode. Checks that toggling the global
+# deterministic algorithms switch updates the inductor deterministic config, that deterministic
+# mode disables matmul padding benchmarks, max-autotune template autotuning and coordinate-
+# descent tuning, that batch-invariant persistent reductions and deterministic cumulative sums
+# give bitwise-stable results, that reorder-for-locality keeps random draw order, and that a few
+# HuggingFace models give bitwise-identical results across two runs. Defines the repository root
+# path at import.
 import contextlib
 import os
 import pathlib
@@ -30,16 +37,25 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
 @instantiate_parametrized_tests
 class DeterministicTest(TestCase):
+    # [CLASS DOC] Deterministic mode test case with parametrized tests. setUp enters a fresh
+    # Inductor cache context that is exited in tearDown so tests do not share compile caches.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs the base setUp, then creates an exit stack holding a fresh-
+        # cache context.
         super().setUp()
         self._exit_stack = contextlib.ExitStack()
         self._exit_stack.enter_context(fresh_cache())
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Closes the exit stack (leaving the fresh-cache context) and runs
+        # base teardown.
         self._exit_stack.close()
         super().tearDown()
 
     def test_use_deterministic_algorithsm(self):
+        # [FUNCTION DOC] Saves the current deterministic algorithms state, then toggles it on,
+        # off and on (warn-only mode) and asserts the inductor deterministic config follows each
+        # value. Always restores the saved state in a final block.
         old_val = torch.are_deterministic_algorithms_enabled()
         try:
             for new_val in [True, False, True]:
@@ -50,10 +66,16 @@ class DeterministicTest(TestCase):
 
     @parametrize("deterministic", [False, True])
     def test_mm_padding(self, deterministic):
+        # [FUNCTION DOC] Parametrized by the deterministic flag. Compiles a matrix multiply of
+        # two odd sized (2049 square) tensors on the GPU under that config and checks the result
+        # against eager. Asserts the matmul-padding benchmark counter is zero in deterministic
+        # mode and positive otherwise.
         with inductor_config.patch(deterministic=deterministic):
 
             @torch.compile()
             def foo(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function returning the matrix product of its
+                # two inputs.
                 return x @ y
 
             inps = [torch.rand([2049, 2049], device=GPU_TYPE) for _ in range(2)]
@@ -69,10 +91,16 @@ class DeterministicTest(TestCase):
     @inductor_config.patch(max_autotune=True)
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_max_autotune(self, deterministic):
+        # [FUNCTION DOC] Parametrized by the deterministic flag; runs under max-autotune and
+        # requires a big GPU. Compiles a matrix multiply of two 2048 square tensors, compares to
+        # eager, and asserts the algorithm-selection autotune counter is zero when deterministic
+        # and positive otherwise.
         with inductor_config.patch(deterministic=deterministic):
 
             @torch.compile()
             def foo(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function returning the matrix product of its
+                # two inputs.
                 return x @ y
 
             inps = [torch.rand([2048, 2048], device=GPU_TYPE) for _ in range(2)]
@@ -85,8 +113,12 @@ class DeterministicTest(TestCase):
                 self.assertTrue(counters["inductor"]["select_algorithm_autotune"] > 0)
 
     def test_pointwise_coordesc_tuning(self):
+        # [FUNCTION DOC] Compiles a pointwise add of one in max-autotune mode on the GPU, checks
+        # the result against eager and asserts the coordinate-descent tuning benchmark counter
+        # is positive.
         @torch.compile(mode="max-autotune")
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function adding one to its input.
             return x + 1
 
         x = torch.randn(2048, device=GPU_TYPE)
@@ -96,12 +128,18 @@ class DeterministicTest(TestCase):
 
     @parametrize("deterministic", [False, True])
     def test_reduction_coordesc_tuning(self, deterministic):
+        # [FUNCTION DOC] Parametrized by the deterministic flag; enables coordinate descent
+        # tuning in the config. Compiles a last-dimension sum of a 2048 square GPU tensor,
+        # checks it against eager, and asserts the coordinate-descent benchmark counter is zero
+        # when deterministic, positive otherwise.
         with inductor_config.patch(
             deterministic=deterministic, coordinate_descent_tuning=True
         ):
 
             @torch.compile()
             def foo(x):
+                # [FUNCTION DOC] HELPER: Compiled function summing its input over the
+                # last dimension.
                 return x.sum(dim=-1)
 
             inp = torch.rand([2048, 2048], device=GPU_TYPE)
@@ -117,10 +155,17 @@ class DeterministicTest(TestCase):
     @unittest.skipIf(not HAS_GPU_AND_TRITON, "requires GPU + Triton")
     @inductor_config.patch(batch_invariant=True)
     def test_persistent_reduction_batch_invariance(self):
+        # [FUNCTION DOC] With the batch-invariant config on and a GPU with triton, compiles a
+        # layer norm over bfloat16 data (768 features, 1024 rows). After computing the full
+        # result, repeatedly halves the number of rows (resetting dynamo each time to force
+        # recompile) and asserts each prefix output is bitwise equal to the matching prefix of
+        # the full result.
         H = 768
         FULL = 1024
 
         def fn(x, w, b):
+            # [FUNCTION DOC] HELPER: Applies layer norm over the last dimension with the given
+            # weight and bias.
             return torch.nn.functional.layer_norm(x, (H,), weight=w, bias=b)
 
         torch.manual_seed(0)
@@ -147,6 +192,11 @@ class DeterministicTest(TestCase):
 
     @unittest.skipIf(not HAS_GPU_AND_TRITON, "requires GPU + Triton")
     def test_cumsum_deterministic(self):
+        # [FUNCTION DOC] Requires GPU and triton. Turns on deterministic algorithms (error mode)
+        # and compares a compiled cumulative sum of a large, odd sized float tensor bitwise (via
+        # integer views) against eager and across five repeated compiled calls.
+        # KNOWN ISSUE: sets the global deterministic algorithms flag and never restores it in
+        # this test.
         from torch._inductor.utils import run_and_get_code
 
         x = torch.randn(1_000_003, device=GPU_TYPE, dtype=torch.float32)
@@ -160,9 +210,15 @@ class DeterministicTest(TestCase):
         self.assertEqual(result.view(torch.int32), eager.view(torch.int32))
 
     def test_reorder_for_locality_preserves_randint_order(self):
+        # [FUNCTION DOC] With random fallback enabled, checks that compiling a function that
+        # seeds the generator, draws a four-row random integer tensor and then discards a two-
+        # row draw returns the same values as eager execution seeded the same way, i.e.
+        # scheduling reorder keeps the order of random draws.
         with inductor_config.patch(fallback_random=True):
 
             def fn():
+                # [FUNCTION DOC] HELPER: Seeds the generator, draws a four-row and a two-row
+                # random integer tensor, discarding the second, and returns the first.
                 torch.manual_seed(0)
                 out = torch.randint(0, 100, (4, 1), dtype=torch.int64)
                 _ = torch.randint(0, 100, (2, 1), dtype=torch.int64)
@@ -184,6 +240,12 @@ class DeterministicTest(TestCase):
     @parametrize("training_or_inference", ["training", "inference"])
     @parametrize("precision", ["float32", "bfloat16", "float16", "amp"])
     def test_run2run_determinism(self, model_name, training_or_inference, precision):
+        # [FUNCTION DOC] Parametrized by model name, training or inference, and precision.
+        # Skipped on ROCm and in fbcode. Runs the HuggingFace benchmark script in a subprocess
+        # with caches disabled and the deterministic env flag on, saving model outputs to a
+        # temporary pickle; then runs it again with benchmarking results distorted (inverse) and
+        # a flag comparing outputs with the saved file. Asserts the second run stdout reports
+        # the result as bitwise equivalent. The first run result is not checked.
         """
         Test run2run determinism for a few huggingface models.
 
@@ -192,6 +254,9 @@ class DeterministicTest(TestCase):
         """
 
         def _setup_env(env):
+            # [FUNCTION DOC] HELPER: Fills the subprocess environment mapping: disables the
+            # autotune, fx-graph remote and fx-graph caches and, if the enclosing determinism
+            # toggle is true, sets the deterministic env flag.
             env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"  # disable autotune cache
             env["TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE"] = "0"
             env["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
