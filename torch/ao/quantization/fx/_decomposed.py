@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines the 'quantized_decomposed' custom operator library: decomposed
+# (functional) quantize, dequantize, choose-qparams and fake-quant ops whose
+# quantization parameters are passed as explicit arguments instead of being stored on a
+# quantized tensor. Each op is declared with a schema on the library and given a
+# reference implementation (CompositeExplicitAutograd, or Autograd for
+# fake_quant_per_channel) plus a Meta implementation that only computes output shape and
+# dtype. Variants: per tensor (scalar, tensor and tensor2 parameter forms), per channel,
+# per token, per channel group, plus a no-fuse dtype conversion. Import-time side
+# effects: creates the Library named quantized_decomposed, builds the dtype to (min,
+# max) bounds table, and registers all schemas and kernels globally.
 import math
 
 import torch
@@ -24,6 +34,10 @@ _DTYPE_TO_QVALUE_BOUNDS.update(
 
 # Helper to check the passed in quant min and max are valid for the dtype
 def _quant_min_max_bounds_check(quant_min, quant_max, dtype):
+    # [FUNCTION DOC] HELPER: Validates that quant_min and quant_max fit inside the
+    # representable range of dtype (table lookup). Raises ValueError for an unsupported
+    # dtype and AssertionError if quant_min is below or quant_max above the dtype
+    # bounds. Returns nothing.
     if dtype not in _DTYPE_TO_QVALUE_BOUNDS:
         raise ValueError(f"Unsupported dtype: {dtype}")
     quant_min_lower_bound, quant_max_upper_bound = _DTYPE_TO_QVALUE_BOUNDS[dtype]
@@ -56,6 +70,11 @@ def quantize_per_tensor(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Reference per-tensor affine quantization. Casts float16/bfloat16
+    # input to float32, requires float32 (AssertionError otherwise), checks the quant
+    # range against dtype, then computes round(input / scale) + zero_point, clamps to
+    # [quant_min, quant_max] and casts to dtype. Returns the quantized tensor; qparams
+    # are not stored on it.
     """Affine quantization for the Tensor using the same quantization parameters to map
     from floating point to quantized values
 
@@ -94,6 +113,10 @@ def quantize_per_tensor_meta(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for quantize_per_tensor: same input dtype checks
+    # (float16/bfloat16 upcast, then must be float32, else AssertionError); returns an
+    # empty tensor with input's shape and the requested dtype. No range check on
+    # quant_min/quant_max.
     if input.dtype in [torch.float16, torch.bfloat16]:
         input = input.to(torch.float32)
     if input.dtype != torch.float32:
@@ -120,6 +143,9 @@ def quantize_per_tensor_tensor(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Overload of quantize_per_tensor taking scale and zero_point as
+    # one-element tensors. Raises AssertionError if either does not have exactly one
+    # element, then extracts Python scalars and delegates to quantize_per_tensor.
     """Affine quantization for the Tensor using the same quantization parameters to map
     from floating point to quantized values
     Same as `quantize_per_tensor` but scale and zero_point are Scalar Tensor instead of
@@ -152,6 +178,9 @@ def quantize_per_tensor_tensor_meta(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for the tensor overload: upcasts float16/bfloat16
+    # input, requires scale and zero_point to have one element and input to be float32
+    # (AssertionError otherwise), returns an empty tensor of input shape with dtype.
     if input.dtype in [torch.float16, torch.bfloat16]:
         input = input.to(torch.float32)
     if zero_point.numel() != 1:
@@ -187,6 +216,12 @@ def quantize_per_tensor_tensor2(
     quant_max: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Overload of quantize_per_tensor where scale, zero_point, quant_min
+    # and quant_max are all one-element tensors. Raises AssertionError if scale or
+    # zero_point is not one element (quant_min/quant_max are not checked here), converts
+    # all to scalars and delegates to quantize_per_tensor.
+    # KNOWN ISSUE: the docstring is copied from the tensor overload and does not mention
+    # quant_min/quant_max being tensors.
     """Affine quantization for the Tensor using the same quantization parameters to map
     from floating point to quantized values
     Same as `quantize_per_tensor` but scale and zero_point are Scalar Tensor instead of
@@ -219,6 +254,8 @@ def quantize_per_tensor_tensor2_meta(
     quant_max: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for the tensor2 overload; simply forwards all arguments
+    # to quantize_per_tensor_tensor_meta.
     return quantize_per_tensor_tensor_meta(
         input,
         scale,
@@ -250,6 +287,11 @@ def dequantize_per_tensor(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Reference per-tensor affine dequantization. Requires input.dtype to
+    # equal dtype (AssertionError otherwise); out_dtype defaults to float32. If dtype is
+    # a supported quantized dtype returns (input cast to out_dtype minus zero_point)
+    # times scale; otherwise raises ValueError. quant_min and quant_max are unused (kept
+    # as metadata for pattern matching).
     """Affine dequantization for the Tensor using the same quantization parameters to map
     from quantized values to floating point values
 
@@ -302,6 +344,10 @@ def dequantize_per_tensor_meta(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for dequantize_per_tensor: returns an empty tensor with
+    # input's shape and out_dtype (default float32). Performs no validation.
+    # KNOWN ISSUE: scale and zero_point are annotated as Tensor although the op schema
+    # takes float and int.
     if out_dtype is None:
         out_dtype = torch.float32
     return torch.empty_like(input, dtype=out_dtype)
@@ -328,6 +374,9 @@ def dequantize_per_tensor_tensor(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Overload of dequantize_per_tensor with one-element tensor scale and
+    # zero_point. Raises AssertionError if either is not a single element; extracts
+    # scalars and delegates to dequantize_per_tensor, passing out_dtype through.
     """Affine dequantization for the Tensor using the same quantization parameters to map
     from quantized values to floating point values
     Same as `dequantize_per_tensor` but scale and zero_point are Scalar Tensor instead of
@@ -363,6 +412,10 @@ def dequantize_per_tensor_tensor_meta(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for the tensor overload: out_dtype defaults to float32;
+    # raises AssertionError if zero_point or scale is not one element or input.dtype
+    # differs from dtype; raises ValueError for unsupported dtype; returns an empty
+    # tensor of input shape and out_dtype.
     if out_dtype is None:
         out_dtype = torch.float32
     if zero_point.numel() != 1:
@@ -405,6 +458,10 @@ def dequantize_per_tensor_tensor2(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Overload of dequantize_per_tensor where scale, zero_point,
+    # quant_min and quant_max are tensors. Checks scale and zero_point have one element
+    # (AssertionError), converts all to scalars and delegates to dequantize_per_tensor
+    # with out_dtype.
     """Affine dequantization for the Tensor using the same quantization parameters to map
     from quantized values to floating point values
     Same as `dequantize_per_tensor` but scale and zero_point are Scalar Tensor instead of
@@ -440,6 +497,8 @@ def dequantize_per_tensor_tensor2_meta(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for the tensor2 dequantize overload; forwards to
+    # dequantize_per_tensor_tensor_meta including out_dtype.
     return dequantize_per_tensor_tensor_meta(
         input, scale, zero_point, quant_min, quant_max, dtype, out_dtype=out_dtype
     )
@@ -455,6 +514,13 @@ quantized_decomposed_lib.define(
 def choose_qparams_tensor(
     input: torch.Tensor, qmin: int, qmax: int, eps: float, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Derives per-tensor affine qparams from input. Requires
+    # float32/float16/bfloat16 input and a dtype with known bounds (AssertionError
+    # otherwise), validates qmin/qmax, takes the global min and max of input and returns
+    # the (scale, zero_point) tensors from determine_qparams using eps and no custom
+    # qrange.
+    # KNOWN ISSUE: the docstring names the range arguments quant_min/quant_max while the
+    # parameters are qmin/qmax.
     """Given an input Tensor, derive the per tensor affine quantization parameter
     (scale and zero_point) for target quantized Tensor from the Tensor
 
@@ -509,6 +575,9 @@ quantized_decomposed_lib.define(
 def choose_qparams_symmetric_tensor(
     input: torch.Tensor, qmin: int, qmax: int, eps: float, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Same as choose_qparams_tensor but passes the per_tensor_symmetric
+    # qscheme to determine_qparams, so the zero_point is symmetric. Same dtype checks
+    # (AssertionError) and qmin/qmax validation; returns (scale, zero_point).
     """Given an input Tensor, derive the per tensor affine quantization parameter
     (scale and zero_point) for target quantized Tensor from the Tensor
 
@@ -553,6 +622,10 @@ def choose_qparams_symmetric_tensor(
 def choose_qparams_tensor_meta(
     input: torch.Tensor, quant_min: int, quant_max: int, eps: float, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Meta kernel for choose_qparams.tensor: requires
+    # float32/float16/bfloat16 input and quant_min < quant_max (AssertionError
+    # otherwise); returns a one-element double tensor (scale) and one-element int64
+    # tensor (zero_point) on input's device.
     if input.dtype not in [
         torch.float32,
         torch.float16,
@@ -574,6 +647,8 @@ def choose_qparams_tensor_meta(
 def choose_qparams_symmetric_tensor_meta(
     input: torch.Tensor, quant_min: int, quant_max: int, eps: float, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Meta kernel for choose_qparams_symmetric.tensor: no validation;
+    # returns one-element double scale and int64 zero_point tensors on input's device.
     return torch.empty(1, dtype=torch.double, device=input.device), torch.empty(
         1, dtype=torch.int64, device=input.device
     )
@@ -581,6 +656,9 @@ def choose_qparams_symmetric_tensor_meta(
 
 # Helper function used to implement per-channel quantization against any axis
 def _permute_to_axis_zero(x, axis):
+    # [FUNCTION DOC] HELPER: Swaps dimension axis with dimension 0 of x. Returns the
+    # permuted tensor and the permutation list (a swap, so it is its own inverse and can
+    # be used to permute back).
     new_axis_list = list(range(x.dim()))
     new_axis_list[axis] = 0
     new_axis_list[0] = axis
@@ -604,6 +682,11 @@ def quantize_per_channel(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Reference per-channel affine quantization along axis. Upcasts
+    # half/bfloat16 input, requires float32 and axis < input.dim() (AssertionError),
+    # checks quant range for dtype, moves axis to the front, reshapes scales and
+    # zero_points to broadcast over it, computes round(input / scale) + zero_point
+    # clamped to [quant_min, quant_max], permutes back and casts to dtype.
     """Affine per channel quantization for the Tensor using the same quantization
     parameters for each channel/axis to map from floating point to quantized values
 
@@ -654,6 +737,9 @@ def quantize_per_channel_meta(
     quant_max: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for quantize_per_channel: same dtype, axis and
+    # quant-range checks (AssertionError / ValueError); returns an empty tensor of input
+    # shape and dtype.
     if input.dtype in [torch.float16, torch.bfloat16]:
         input = input.to(torch.float32)
     if input.dtype != torch.float32:
@@ -688,6 +774,11 @@ def dequantize_per_channel(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Reference per-channel dequantization along axis. Requires
+    # input.dtype == dtype and axis < input.dim() (AssertionError), out_dtype defaults
+    # to float32, checks quant range. Moves axis to the front, computes (input -
+    # zero_points) * scales (zero_points may be None, meaning no shift), casts to
+    # out_dtype and permutes back.
     """Affine per channel dequantization for the Tensor using the same quantization
     parameters for each channel/axis to map from quantized values to floating point values
 
@@ -753,6 +844,8 @@ def dequantize_per_channel_meta(
     *,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for dequantize_per_channel: same dtype/axis/quant-range
+    # checks; returns an empty tensor of input shape and out_dtype (default float32).
     if input.dtype != dtype:
         raise AssertionError(
             f"Expecting input to have dtype {dtype}, but got dtype: {input.dtype}"
@@ -779,6 +872,11 @@ def choose_qparams_per_token(
     input: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Symmetric int8 per-token qparams: for input of shape (M1..Mn, N)
+    # takes the absolute max over the last dimension (kept as size 1), upcasts float16
+    # scales to float32, and returns scales = max(absmax, 1e-5) / 127 with all-zero
+    # zero_points of the same shape. Only torch.int8 is supported; any other dtype
+    # raises a bare Exception.
     """Choose quantization parameters for per token quantization. This means for a N dimension Tensor
     (M1, M2, ...Mn, N), we calculate scales/zero_points for each N elements and quantize
     every N elements with the same quantization parameter. The dimension for scales/zero_points
@@ -819,6 +917,10 @@ def choose_qparams_per_token_meta(
     input: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Meta kernel: returns a double scale tensor and an int64 zero_point
+    # tensor of shape (leading dims of input, 1) on input's device.
+    # KNOWN ISSUE: dtypes (double / int64) differ from the reference kernel, which
+    # returns scales in the input float dtype and zero_points as floats.
     size = list(input.shape[:-1]) + [1]
     return torch.empty(size, dtype=torch.double, device=input.device), torch.empty(
         size, dtype=torch.int64, device=input.device
@@ -839,6 +941,12 @@ def _choose_qparams_per_token_asymmetric_impl(
     input: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Asymmetric int8 (range -128..127) per-token qparams
+    # following the XNNPACK scheme. Per last-dimension row it takes min and max extended
+    # to include zero, scale = (max - min) / 255 clamped to float32 eps, picks the
+    # zero_point from whichever end gives the smaller error, clamps and rounds it into
+    # range. Returns (scale as float64, zero_point as int64), each with trailing
+    # dimension 1. The dtype argument is unused.
     """Choose quantization parameters for per token quantization. This means for a N dimension Tensor
     (M1, M2, ...Mn, N), we calculate scales/zero_points for each N elements and quantize
     every N elements with the same quantization parameter. The dimension for scales/zero_points
@@ -892,6 +1000,8 @@ def choose_qparams_per_token_asymmetric(
     input: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Op entry for asymmetric per-token qparams; delegates to
+    # _choose_qparams_per_token_asymmetric_impl and returns its (scale, zero_point).
     return _choose_qparams_per_token_asymmetric_impl(input, dtype)
 
 
@@ -904,6 +1014,8 @@ def choose_qparams_per_token_asymmetric_meta(
     input: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Meta kernel: returns double scale and int64 zero_point tensors of
+    # shape (leading dims of input, 1) on input's device.
     size = list(input.shape[:-1]) + [1]
     return torch.empty(size, dtype=torch.double, device=input.device), torch.empty(
         size, dtype=torch.int64, device=input.device
@@ -911,6 +1023,9 @@ def choose_qparams_per_token_asymmetric_meta(
 
 
 def _per_token_quant_qparam_dim_check(input, scales, zero_points):
+    # [FUNCTION DOC] HELPER: Checks that scales and zero_points each contain exactly one
+    # element per token (product of all but the last input dimension). Raises
+    # AssertionError on a mismatch.
     num_tokens = math.prod(list(input.size())[:-1])
     if num_tokens != scales.numel():
         raise AssertionError(f"num_tokens: {num_tokens} scales: {scales.size()}")
@@ -935,6 +1050,10 @@ def quantize_per_token(
     quant_max: int,
     dtype: torch.dtype,
 ):
+    # [FUNCTION DOC] Per-token affine quantization: validates the quant range for dtype
+    # and the number of scales/zero_points (AssertionError), then computes input * (1 /
+    # scales) + zero_points, rounds, clamps to [quant_min, quant_max] and casts to
+    # dtype. Scales broadcast over the last dimension.
     """Per token quantization for the Tensor using the quantization parameters to map
     from floating point to quantized values. This means for a N dimension Tensor
     (M1, M2, ...Mn, N), we calculate scales/zero_points for each N elements and quantize
@@ -974,6 +1093,8 @@ def quantize_per_token_meta(
     quant_max: int,
     dtype: torch.dtype,
 ):
+    # [FUNCTION DOC] Meta kernel for quantize_per_token: checks only the quant range for
+    # dtype, returns an empty tensor of input shape and dtype.
     _quant_min_max_bounds_check(quant_min, quant_max, dtype)
     return torch.empty_like(input, dtype=dtype)
 
@@ -994,6 +1115,12 @@ def dequantize_per_token(
     dtype: torch.dtype,
     output_dtype: torch.dtype = torch.float32,
 ):
+    # [FUNCTION DOC] Per-token dequantization: subtracts zero_points, multiplies by
+    # scales (broadcast over the last dimension) and casts the result to output_dtype
+    # (default float32; scales are float64 so the cast is needed). quant_min, quant_max
+    # and dtype are unused.
+    # KNOWN ISSUE: the docstring describes mapping floating point to quantized values,
+    # which is the quantize direction.
     """Per token dequantization for the Tensor using the quantization parameters to map
     from floating point to quantized values. This means for a N dimension Tensor
     (M1, M2, ...Mn, N), we calculate scales/zero_points for each N elements and quantize
@@ -1028,6 +1155,9 @@ def dequantize_per_token_meta(
     dtype: torch.dtype,
     output_dtype: torch.dtype = torch.float32,
 ):
+    # [FUNCTION DOC] Meta kernel for dequantize_per_token: checks the quant range for
+    # dtype and returns an empty tensor of input shape and output_dtype (fp16 not
+    # specially handled, see TODO).
     _quant_min_max_bounds_check(quant_min, quant_max, dtype)
     # TODO: support fp16
     return torch.empty_like(input, dtype=output_dtype)
@@ -1052,6 +1182,13 @@ def quantize_per_channel_group(
     dtype: torch.dtype,
     group_size=128,
 ):
+    # [FUNCTION DOC] Groupwise quantization of a 2-d tensor: every group_size
+    # consecutive elements of a row share one scale and zero_point. Raises
+    # AssertionError if group_size <= 1, the last dimension is not divisible by
+    # group_size, input is not 2-d, or input contains NaN. When group_size exceeds the
+    # last dimension and there is a single scale (GPTQ single column case) it is clamped
+    # to the last dimension. Computes round(x / scale + zero_point), clamps to
+    # [quant_min, quant_max], casts to dtype and restores the input shape.
     if group_size <= 1:
         raise AssertionError("group_size must be > 1")
     # needed for GPTQ single column quantize
@@ -1093,6 +1230,11 @@ def quantize_per_channel_group_meta(
     dtype: torch.dtype,
     group_size=128,
 ):
+    # [FUNCTION DOC] Meta kernel for quantize_per_channel_group: performs the same
+    # group_size / divisibility / 2-d checks (AssertionError) and returns an empty
+    # tensor of input shape and dtype.
+    # KNOWN ISSUE: the docstring is placed here but really describes the quantize
+    # operation; the reference kernel has none.
     """Groupwise quantization within each channel for a 2-d Tensor using the quantization parameters
     to map from floating point to quantized values. This means for each row of a 2-d Tensor
     (M, N), we calculate scales/zero_points for each `group_size` elements
@@ -1145,6 +1287,13 @@ def dequantize_per_channel_group(
     group_size: int = 128,
     output_dtype: torch.dtype = torch.float32,
 ):
+    # [FUNCTION DOC] Groupwise dequantization of a 2-d integer tensor w_int8: same
+    # group_size rules as quantize_per_channel_group (AssertionError on group_size <= 1,
+    # non-divisible last dimension, or non-2-d input; group_size clamped for the
+    # single-scale case). Reshapes into groups, subtracts zero_points (an int32 zero
+    # when None), multiplies by scales, restores shape and casts to output_dtype.
+    # KNOWN ISSUE: the docstring describes mapping floating point to quantized values
+    # and names the first argument input instead of w_int8.
     """Groupwise dequantization within each channel for a 2-d Tensor using the quantization parameters
     to map from floating point to quantized values. This means for each row of a 2-d Tensor
     (M, N), we calculate scales/zero_points for each `group_size` elements
@@ -1191,9 +1340,18 @@ quantized_decomposed_lib.define(
 
 
 class FakeQuantPerChannel(torch.autograd.Function):
+    # [CLASS DOC] autograd Function implementing per-channel fake quantization (quantize
+    # then dequantize in float32) along an axis. The forward saves a boolean mask of
+    # elements that fell inside [quant_min, quant_max]; the backward is a
+    # straight-through estimator that passes the gradient only where the mask is true.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, input, scales, zero_points, axis, quant_min, quant_max):
+        # [FUNCTION DOC] Fake-quantizes input along axis: casts scales to float32 and
+        # zero_points to int32, requires float32 input and axis < input.dim()
+        # (AssertionError), broadcasts scales/zero_points over the other dimensions,
+        # computes (clamp(round(input / scale) + zp, quant_min, quant_max) - zp) *
+        # scale. Saves the in-range mask on ctx and returns the result.
         if scales.dtype != torch.float32:
             scales = scales.to(torch.float32)
         if zero_points.dtype != torch.int32:
@@ -1219,6 +1377,9 @@ class FakeQuantPerChannel(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, gy):
+        # [FUNCTION DOC] Straight-through gradient: multiplies gy by the saved in-range
+        # mask; returns None for the five non-tensor-gradient inputs (scales,
+        # zero_points, axis, quant_min, quant_max).
         (mask,) = ctx.saved_tensors
         return gy * mask, None, None, None, None, None
 
@@ -1232,6 +1393,8 @@ def fake_quant_per_channel(
     quant_min: int,
     quant_max: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Autograd-registered op entry that applies FakeQuantPerChannel to
+    # its arguments and returns the fake-quantized tensor.
     return FakeQuantPerChannel.apply(
         input, scales, zero_points, axis, quant_min, quant_max
     )
@@ -1246,6 +1409,8 @@ def fake_quant_per_channel_meta(
     quant_min: int,
     quant_max: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel for fake_quant_per_channel: returns an empty tensor
+    # with the same shape and dtype as input.
     return torch.empty_like(input)
 
 
@@ -1260,9 +1425,14 @@ quantized_decomposed_lib.define(
     "CompositeExplicitAutograd",
 )
 def convert_element_type(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # [FUNCTION DOC] Op that casts input to dtype by calling the prims
+    # convert_element_type op; registered as a no-fuse variant so compilers do not fuse
+    # the cast away.
     return torch.ops.prims.convert_element_type.default(input, dtype)
 
 
 @impl(quantized_decomposed_lib, "convert_element_type.no_fuse", "Meta")
 def convert_element_type_meta(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # [FUNCTION DOC] Meta kernel: returns an empty tensor of input shape with the
+    # requested dtype.
     return torch.empty_like(input, dtype=dtype)
