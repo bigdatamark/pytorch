@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor utilities: local shape/global offset computation
+# (including _StridedShard FSDP+TP layouts), global tensor shape/stride inference,
+# _StridedShard split/replicate/alltoall collectives, optimizer updates on strided-
+# sharded parameters, ExplicitRedistributionContext, and is_tensor_shardable checks.
+# Several multi-process classes are re-instantiated under LocalTensor at the bottom
+# of the file; running the file calls run_tests.
 
 
 import itertools
@@ -55,6 +61,8 @@ c10d_functional = torch.ops.c10d_functional
 
 
 def SS(td, sf):
+    # [FUNCTION DOC] HELPER: Shorthand that returns a _StridedShard placement on tensor dim td
+    # with split factor sf.
     return _StridedShard(td, split_factor=sf)
 
 
@@ -63,7 +71,14 @@ R = Replicate()
 
 
 class LocalTest(TestCase):
+    # [CLASS DOC] Single-process tests (no process group) of the pure-Python shard
+    # layout helpers.
     def test_strided_shard_to_replicate_preserves_even_unbacked_shape(self):
+        # [FUNCTION DOC] Checks _StridedShard._to_replicate_tensor with an unbacked symbolic
+        # batch size under a FakeTensorMode: temporarily replaces placement_types.pad_tensor and
+        # funcol.all_gather_single with fakes (restored in a finally block), then asserts exactly
+        # one pad call with a statically zero pad size and a result whose dim 0 is statically
+        # known to equal the evenly gathered size.
         import torch.distributed.tensor.placement_types as placement_types
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import (
@@ -72,7 +87,9 @@ class LocalTest(TestCase):
         )
 
         class Mesh:
+            # [CLASS DOC] HELPER: Stub mesh whose size method always reports 4 ranks.
             def size(self, mesh_dim=0):
+                # [FUNCTION DOC] HELPER: Returns 4 regardless of mesh_dim.
                 return 4
 
         pad_sizes = []
@@ -80,12 +97,16 @@ class LocalTest(TestCase):
         old_all_gather = placement_types.funcol.all_gather_single
 
         def fake_pad_tensor(tensor, pad_dim, pad_size):
+            # [FUNCTION DOC] HELPER: Fake pad_tensor; records pad_size in the enclosing list
+            # and returns an uninitialized tensor whose pad_dim is grown by pad_size.
             pad_sizes.append(pad_size)
             shape = list(tensor.shape)
             shape[pad_dim] = shape[pad_dim] + pad_size
             return tensor.new_empty(shape)
 
         def fake_all_gather(tensor, gather_dim, group):
+            # [FUNCTION DOC] HELPER: Fake all_gather_single; returns an uninitialized tensor
+            # with gather_dim multiplied by 4. No communication occurs.
             shape = list(tensor.shape)
             shape[gather_dim] = shape[gather_dim] * 4
             return tensor.new_empty(shape)
@@ -119,6 +140,11 @@ class LocalTest(TestCase):
         self.assertFalse(replicate_tensor.shape[0] != 2048 * batch)
 
     def test_compute_local_shape_and_global_offset_uneven(self):
+        # [FUNCTION DOC] Verifies _compute_local_shape_and_global_offset for uneven sharding on
+        # 2D meshes with plain Shard and _StridedShard placement combinations ((SS,S), (S,S) with
+        # and without empty shards, (SS,SS), (S,SS), 3D (S,SS,S)). Loops over every mesh
+        # coordinate and compares local shape and global offset with hand-derived values; a zero-
+        # sized shard is expected to report the dim size as its offset.
         # This case is not only 'uneven' bug also has an empty shard
         # (e.g. most DP ranks have local shape 18,4096, one has 8,4096, one has 0,4096
         global_shape = (4096, 4096)
@@ -390,11 +416,16 @@ class LocalTest(TestCase):
 
 
 class UtilTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process (8 ranks) tests of global/local shape and offset computation on
+    # device meshes of 1 to 4 dims, including FSDP+TP and HSDP+TP strided layouts.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks for this test class, 8.
         return 8
 
     def _compute_start_end_offsets(self, global_offset, local_size, n_dim):
+            # [FUNCTION DOC] HELPER: Converts per-dim global offsets and local sizes into a
+            # list of (start, end) pairs, one per each of the first n_dim dims.
         offset = []
         for i in range(n_dim):
             offset.append(((global_offset[i]), (global_offset[i] + local_size[i])))
@@ -402,6 +433,10 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_global_tensor_shape_1D(self):
+        # [FUNCTION DOC] Checks compute_global_tensor_shape for 1D meshes with Shard(1),
+        # Shard(0) and Replicate. For Shard the per-rank sharded dim sizes are 0..world_size-1
+        # and the expected global size is their sum with the other dim 5; for Replicate the
+        # global shape equals the local shape.
         one_d_placements = [[Shard(1)], [Shard(0)], [Replicate()]]
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         for placements in one_d_placements:
@@ -410,6 +445,9 @@ class UtilTest(DTensorTestBase):
 
                 @maybe_run_for_local_tensor
                 def get_local_shape(rank):
+                # [FUNCTION DOC] HELPER: Builds the rank-dependent local shape (sharded dim
+                # size equals the rank) for the current placement; run per-rank when LocalTensor
+                # is used.
                     local_shape = (
                         torch.Size([5, uneven_dim[rank]])
                         if placements[0].dim == 1
@@ -434,12 +472,17 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_global_tensor_shape_1D_invalid_shape(self):
+        # [FUNCTION DOC] Checks that compute_global_tensor_shape raises RuntimeError (non-
+        # sharded dims must have identical size across ranks) when odd ranks report a different
+        # non-sharded dim size.
         one_d_placement = [Shard(1)]
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
         uneven_dim = list(range(self.world_size))
 
         @maybe_run_for_local_tensor
         def get_local_shape(rank):
+            # [FUNCTION DOC] HELPER: Returns a local shape whose non-sharded dim is 5 on even
+            # ranks and 6 on odd ranks.
             local_shape = (
                 torch.Size([5, uneven_dim[rank]])
                 if rank % 2 == 0
@@ -461,6 +504,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_global_tensor_shape_failure_2D(self):
+        # [FUNCTION DOC] Checks error paths of compute_global_tensor_shape: NotImplementedError
+        # for more than one placement on a 2D mesh, and RuntimeError when the placement count
+        # does not match the mesh dims.
         placement_2D = [Shard(0), Shard(1)]
         device_mesh_2D = init_device_mesh(self.device_type, (2, 2))
         with self.assertRaisesRegex(
@@ -485,6 +531,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_local_shape_and_global_offset_1D(self):
+        # [FUNCTION DOC] For every tensor length from 0 to twice the world size and placements
+        # Shard(0) or Replicate on a 1D mesh, verifies that slicing the global tensor by the
+        # computed local shape and global offset equals the DTensor local tensor.
         one_d_placements = [[Shard(0)], [Replicate()]]
 
         device_mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -513,6 +562,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_local_shape_and_global_offset_2D(self):
+        # [FUNCTION DOC] For all six 2D placement combinations of Shard(0), Shard(1), Replicate
+        # on a 2x4 mesh and dim-0 sizes 1..8, verifies that slicing the global tensor by the
+        # computed local shape and global offset equals the DTensor local tensor on each rank.
         two_d_placements_options = [Shard(0), Shard(1), Replicate()]
         # Generating 6 two-d placements combinations
         two_d_placements = list(
@@ -545,6 +597,9 @@ class UtilTest(DTensorTestBase):
                     local_tensor,
                     global_tensor,
                 ):
+                    # [FUNCTION DOC] HELPER: Asserts local_tensor equals the slice of
+                    # global_tensor given by the start/end bounds on both dims; run per-rank
+                    # under LocalTensor.
                     # Check the local tensor of dtensor is exactly the same
                     # if we slice the global_tensor with local_size and global_offset
                     self.assertEqual(
@@ -563,6 +618,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_local_shape_and_global_offset_3D(self):
+        # [FUNCTION DOC] Checks compute_local_shape_and_global_offset on a 2x2xN mesh with
+        # placements (_StridedShard(0, split_factor=2), Shard(0), Shard(0)) against closed-form
+        # local shape and offset computed from the mesh coordinate.
         global_tensor_shape = torch.Size([2 * self.world_size, 2 * self.world_size])
         mesh_size_0 = 2
         mesh_size_1 = 2
@@ -588,6 +646,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_compute_local_shape_and_global_offset_4D(self):
+        # [FUNCTION DOC] Checks compute_local_shape_and_global_offset on a 4D mesh with two
+        # different strided/Shard placement mixes (dims 0 and 1 sharded, then all on dim 0)
+        # against closed-form local shapes and offsets derived from the mesh coordinate.
         global_tensor_shape = torch.Size([2 * self.world_size, 2 * self.world_size])
         mesh_size_0 = 1
         mesh_size_1 = 2
@@ -635,6 +696,9 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_fsdp_tp_meta_compute(self):
+        # [FUNCTION DOC] Checks local shape (2,2) and global offset for FSDP+TP placements
+        # (_StridedShard on dp, Shard on tp); the shard index along dim 0 is tp_rank times
+        # dp_size plus dp_rank.
         # FSDP + TP sharding
         tp_size = 2
         dp_size = self.world_size // tp_size
@@ -660,6 +724,8 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_uneven_fsdp_tp_meta_compute(self):
+        # [FUNCTION DOC] Checks FSDP+TP strided placements on an uneven (15,5) tensor: per-rank
+        # dim-0 sizes and offsets are compared with hard-coded tables indexed by rank.
         # FSDP + TP uneven sharding
         tp_size = 2
         dp_size = self.world_size // tp_size
@@ -677,6 +743,8 @@ class UtilTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise(rank, local_shape, global_offset):
+            # [FUNCTION DOC] HELPER: Asserts dim-0 of local_shape and global_offset equal the
+            # expected tables entry for the given rank.
             self.assertEqual(local_shape[0], expected_shapes[rank])
             self.assertEqual(global_offset[0], expected_offsets[rank])
 
@@ -684,6 +752,8 @@ class UtilTest(DTensorTestBase):
 
     @with_comms
     def test_hsdp_tp_meta_compute(self):
+        # [FUNCTION DOC] Checks HSDP+TP placements (Replicate, _StridedShard, Shard): local
+        # shape (2,2) and offset from dp_shard and tp ranks, ignoring the replicate dim.
         # HSDP + TP sharding
         tp_size = 2
         dp_shard_size = 2
@@ -712,12 +782,20 @@ class UtilTest(DTensorTestBase):
 
 
 class UtilSingleDeviceTest(TestCase):
+    # [CLASS DOC] Single-process tests of compute_global_tensor_info and
+    # compute_local_tensor_info, using mock meshes or a fake process group.
     def test_compute_global_tensor_info_unsupported_placement(self):
+        # [FUNCTION DOC] Checks that compute_global_tensor_info raises RuntimeError for a
+        # Placement subclass it does not know.
         class MockDeviceMesh:
+            # [CLASS DOC] HELPER: Mock mesh whose size for a dim equals the dim argument.
             def size(self, x):
+                # [FUNCTION DOC] HELPER: Returns x as the mesh size.
                 return x
 
         class FakePlacement(Placement):
+            # [CLASS DOC] HELPER: Placement subclass with no behavior, used as an
+            # unsupported placement.
             pass
 
         device_mesh: Any = MockDeviceMesh()
@@ -726,8 +804,12 @@ class UtilSingleDeviceTest(TestCase):
             compute_global_tensor_info(local_tensor, device_mesh, [FakePlacement()])
 
     def test_compute_global_tensor_info_non_shard_placements(self):
+        # [FUNCTION DOC] Checks compute_global_tensor_info returns the local size and stride
+        # unchanged for Replicate and Partial placements.
         class MockDeviceMesh:
+            # [CLASS DOC] HELPER: Mock mesh whose size for a dim equals the dim argument.
             def size(self, x):
+                # [FUNCTION DOC] HELPER: Returns x as the mesh size.
                 return x
 
         device_mesh: Any = MockDeviceMesh()
@@ -739,8 +821,13 @@ class UtilSingleDeviceTest(TestCase):
         self.assertEqual(global_stride, local_tensor.stride())
 
     def test_compute_global_tensor_info_shard_placement(self):
+        # [FUNCTION DOC] Checks compute_global_tensor_info for Shard(0), Shard(1), Shard(2) on
+        # a mock mesh with sizes 2, 3, 4: global size multiplies each dim, and strides of earlier
+        # dims scale by the sizes of the later sharded dims.
         class MockDeviceMesh:
+            # [CLASS DOC] HELPER: Mock mesh whose size for a dim is dim plus 2.
             def size(self, dim):
+                # [FUNCTION DOC] HELPER: Returns dim plus 2.
                 return dim + 2
 
         device_mesh: Any = MockDeviceMesh()
@@ -756,6 +843,11 @@ class UtilSingleDeviceTest(TestCase):
         self.assertEqual(global_stride[2], local_tensor.stride()[2] * 3)
 
     def test_compute_tensor_info(self):
+        # [FUNCTION DOC] Initializes a fake process group of 256 ranks and an (8,8,4) mesh; for
+        # every Shard(0..2)/Replicate placement triple checks that compute_global_tensor_info
+        # matches the shape and stride of the fully replicated DTensor and that
+        # compute_local_tensor_info and redistribute back recover the original local shape and
+        # stride. Destroys the process group at the end (not in a finally block).
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
         world_size = 256
@@ -814,12 +906,18 @@ class UtilSingleDeviceTest(TestCase):
 
 
 class TestStridedSharding(DTensorTestBase):
+    # [CLASS DOC] Multi-process (4 ranks) tests of _StridedShard split and to-replicate
+    # behavior on 1D and 2D meshes.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks for this test class, 4.
         return 4
 
     @with_comms
     def test_1d_mesh_strided_sharding(self):
+        # [FUNCTION DOC] On a 1D mesh, checks that _StridedShard split with split_factor 1
+        # equals contiguous chunks and with factor 2 gives interleaved chunks, and that
+        # _to_replicate_tensor restores the full tensor.
         mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
         # Test 1: 1-d tensor over 1-d mesh
         x = torch.arange(2 * self.world_size, device=self.device_type)
@@ -831,6 +929,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise(rank, tensor_list, x):
+            # [FUNCTION DOC] HELPER: Asserts this rank's chunk equals the contiguous reshaped
+            # row and returns it.
             shard_x = tensor_list[rank]
             self.assertEqual(shard_x, x.view(self.world_size, -1)[rank])
             return shard_x
@@ -854,6 +954,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise(rank, tensor_list, x):
+            # [FUNCTION DOC] HELPER: Asserts this rank's chunk equals the interleaved
+            # (transposed view) row and returns it.
             shard_x = tensor_list[rank]
             self.assertEqual(shard_x, x.view(-1, self.world_size).swapdims(-1, 0)[rank])
             return shard_x
@@ -871,6 +973,10 @@ class TestStridedSharding(DTensorTestBase):
 
     @with_comms
     def test_2d_mesh_strided_sharding(self):
+        # [FUNCTION DOC] On a 2D mesh, shards a 1D tensor over both mesh dims, first with split
+        # factor 1 then with split factor 2 on the outer dim (expected [0,1,4,5] and [2,3,6,7] at
+        # the outer level), and checks _to_replicate_tensor recovers the tensor by gathering mesh
+        # dim 1 then dim 0.
         # Test 2: 1-d tensor over 2-d mesh
         mesh_2d = init_device_mesh(
             self.device_type, (2, self.world_size // 2), mesh_dim_names=("dim0", "dim1")
@@ -893,6 +999,9 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim0_local_rank):
+            # [FUNCTION DOC] HELPER: Asserts this rank's outer-level chunk equals the matching
+            # row of the tensor viewed by the outer mesh size; returns the chunk and that
+            # expected row.
             expected_shard_dim0 = x.view(mesh_dim0_size, -1)[mesh_dim0_local_rank]
             shard_x = tensor_list[mesh_dim0_local_rank]
             self.assertEqual(shard_x, expected_shard_dim0)
@@ -905,6 +1014,9 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim1_local_rank):
+            # [FUNCTION DOC] HELPER: Asserts the inner-level chunk equals the matching row of
+            # the outer shard viewed by the inner mesh size; returns the chunk and the outer
+            # expected value.
             expected_shard_dim1 = shard_x.view(mesh_dim1_size, -1)[mesh_dim1_local_rank]
             shard_x2 = tensor_list[mesh_dim1_local_rank]
             self.assertEqual(shard_x2, expected_shard_dim1)
@@ -948,6 +1060,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim0_local_rank):
+            # [FUNCTION DOC] HELPER: Asserts the outer shard equals a hard-coded list per outer
+            # rank; returns shard and expected.
             shard_x = tensor_list[mesh_dim0_local_rank]
             expected_shard_dim0 = (
                 torch.tensor([0, 1, 4, 5], device=self.device_type)
@@ -964,6 +1078,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim1_local_rank):
+            # [FUNCTION DOC] HELPER: Asserts the inner shard equals the view-based expected
+            # row; returns shard and outer expected.
             shard_x2 = tensor_list[mesh_dim1_local_rank]
             expected_shard_dim1 = expected_shard_dim0.view(mesh_dim1_size, -1)[
                 mesh_dim1_local_rank
@@ -995,6 +1111,9 @@ class TestStridedSharding(DTensorTestBase):
 
     @with_comms
     def test_2d_mesh_2d_tensor_strided_sharding(self):
+        # [FUNCTION DOC] 2D tensor on a 2D mesh with _StridedShard on tensor dim 1 (split
+        # factor 2 on mesh dim 0, factor 1 on mesh dim 1); checks hard-coded per-rank shards and
+        # that _to_replicate_tensor over mesh dim 1 then mesh dim 0 recovers the original tensor.
         # Test 2: 1-d tensor over 2-d mesh
         mesh_2d = init_device_mesh(
             self.device_type, (2, self.world_size // 2), mesh_dim_names=("dim0", "dim1")
@@ -1018,6 +1137,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim0_local_rank, tensor_list):
+            # [FUNCTION DOC] HELPER: Asserts the outer shard equals hard-coded 2x2 values per
+            # outer rank; returns shard and expected.
             shard_x2 = tensor_list[mesh_dim0_local_rank]
             expected_shard_dim0 = (
                 torch.tensor([[0, 2], [4, 6]], device=self.device_type)
@@ -1037,6 +1158,8 @@ class TestStridedSharding(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def maybe_compute_rankwise_strided(mesh_dim1_local_rank, rank, tensor_list):
+            # [FUNCTION DOC] HELPER: Asserts the final shard equals the hard-coded per-rank 2x1
+            # value; returns shard and outer expected.
             shard_x = tensor_list[mesh_dim1_local_rank]
             expected_shard_dim1 = [
                 torch.tensor(value, device=self.device_type)
@@ -1076,6 +1199,9 @@ class TestStridedSharding(DTensorTestBase):
 
     @with_comms
     def test_2d_mesh_uneven_strided_shard(self):
+        # [FUNCTION DOC] Redistributes tensors of sizes 2, 3, 5, 11 from fully replicated to
+        # (_StridedShard(dim 1, split factor 2), Shard(1)) on a 2D mesh and checks full_tensor
+        # recovers the original.
         mesh = init_device_mesh(
             self.device_type,
             (self.world_size // 2, 2),
@@ -1095,12 +1221,18 @@ class TestStridedSharding(DTensorTestBase):
 
 
 class Test_StridedShard_Propagation(LocalDTensorTestBase):
+    # [CLASS DOC] Tests of operator sharding propagation with _StridedShard placements, run
+    # under LocalTensorMode on 16 ranks.
     @property
     def world_size(self) -> int:
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 16.
         return 16
 
     @with_comms
     def test_einsum_propagation(self):
+        # [FUNCTION DOC] Under LocalTensorMode, multiplies a Shard(1),Shard(1) matrix by a
+        # Shard(0),Shard(0) matrix (no all-gather) and by a strided variant (four all-gathers
+        # expected), and checks both full results agree.
         with LocalTensorMode(ranks=self.world_size):
             mesh = init_device_mesh("cpu", (4, 4))
             input_tensor = torch.arange(16 * 16).float().view(16, 16)
@@ -1134,6 +1266,9 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
 
     @with_comms
     def test_pointwise_propagation(self):
+        # [FUNCTION DOC] On a 2x2x2x2 mesh with a strided placement mix, checks
+        # that sum over dim 0 and over dim 1 issue zero collectives and the full
+        # results equal the plain tensor sums.
         with LocalTensorMode(ranks=self.world_size):
             mesh = init_device_mesh("cpu", (2, 2, 2, 2))
             input_tensor = torch.arange(32).float().view(2, 16)
@@ -1157,6 +1292,8 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
 
     @with_comms
     def test_inplace_op_with_strided_shard(self):
+        # [FUNCTION DOC] Checks inplace mul_ and add_ on strided-sharded DTensors incur no
+        # communication, keep the placements, and give correct values.
         """Test that inplace ops work correctly with strided shard placements.
 
         This verifies that the inplace_op flag is correctly passed during strategy
@@ -1205,6 +1342,11 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
         view_into_shape: list[int],
         expected_placements_after_view,
     ):
+        # [FUNCTION DOC] HELPER: Validates view propagation. Asserts element counts
+        # match, checks the expected placements by distributing the viewed global
+        # tensor and comparing flattened local data with the original DTensor, then
+        # asserts viewing the DTensor yields exactly the expected placements and same
+        # local data. Raises AssertionError on any mismatch.
         if math.prod(original_full_tensor.shape) != math.prod(view_into_shape):
             raise AssertionError(
                 f"Expected shapes to have same product, got {math.prod(original_full_tensor.shape)} vs {math.prod(view_into_shape)}"
@@ -1232,6 +1374,9 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
 
     @with_comms
     def test_view_propagation(self):
+        # [FUNCTION DOC] Runs run_view_propagation for several strided/Shard/Replicate
+        # placement cases on a (3,2,2) mesh and a (3,4) mesh (12 ranks each), expecting
+        # placements to be propagated through reshaping views.
         with LocalTensorMode(ranks=12):
             mesh = init_device_mesh("cpu", (3, 2, 2))
 
@@ -1267,6 +1412,8 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
     @expectedFailure
     @with_comms
     def test_view_propagation_not_supported_yet(self):
+        # [FUNCTION DOC] Expected-failure test: view cases that need _StridedShard dim shift or
+        # a changed split factor, which view propagation does not yet support.
         # TODO: need to extend the StridedShard support for view propagation
         with LocalTensorMode(ranks=16):
             mesh = init_device_mesh("cpu", (2, 2, 2, 2))
@@ -1286,6 +1433,8 @@ class Test_StridedShard_Propagation(LocalDTensorTestBase):
 
 
 class Test_StridedShard_Optimizer(DTensorTestBase):
+    # [CLASS DOC] Tests that optimizers update FSDP+TP parameters (strided sharded DTensors)
+    # the same as a replicated reference, on 4 ranks.
     """Test optimizer updates with _StridedShard placement using FSDP+TP.
 
     This test uses FSDP+TP to create parameters with placement
@@ -1297,6 +1446,7 @@ class Test_StridedShard_Optimizer(DTensorTestBase):
 
     @property
     def world_size(self) -> int:
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 4.
         return 4
 
     def _test_optimizer_with_fsdp_tp(
@@ -1304,6 +1454,11 @@ class Test_StridedShard_Optimizer(DTensorTestBase):
         optimizer_cls: type,
         optimizer_kwargs: dict | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a bias-free two-layer MLP, a replicated reference copy
+        # and an FSDP+TP copy (TP on a 2-way mesh, then fully_shard on the dp mesh), checks
+        # parameters are 2-placement DTensors, then for 5 iterations compares gradients and
+        # updated parameters against the reference using the given optimizer class and extra
+        # keyword arguments (learning rate 0.01).
         """Test an optimizer with FSDP+TP parallelized model.
 
         Creates a 2D mesh (dp_size x tp_size), applies TP then FSDP,
@@ -1336,12 +1491,16 @@ class Test_StridedShard_Optimizer(DTensorTestBase):
         torch.manual_seed(42)
 
         class SimpleMLP(nn.Module):
+            # [CLASS DOC] HELPER: Bias-free two-layer MLP (dim to 4*dim and back)
+            # with relu in between.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: Creates the in_proj and out_proj linear layers.
                 super().__init__()
                 self.in_proj = nn.Linear(dim, dim * 4, bias=False)
                 self.out_proj = nn.Linear(dim * 4, dim, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies in_proj, relu, then out_proj to x.
                 return self.out_proj(torch.relu(self.in_proj(x)))
 
         dim = 16
@@ -1413,42 +1572,56 @@ class Test_StridedShard_Optimizer(DTensorTestBase):
 
     @with_comms
     def test_sgd_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with SGD.
         self._test_optimizer_with_fsdp_tp(torch.optim.SGD)
 
     @with_comms
     def test_sgd_optimizer_with_momentum(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with SGD with momentum 0.9.
         self._test_optimizer_with_fsdp_tp(
             torch.optim.SGD, optimizer_kwargs={"momentum": 0.9}
         )
 
     @with_comms
     def test_adam_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with Adam.
         self._test_optimizer_with_fsdp_tp(torch.optim.Adam)
 
     @with_comms
     def test_adamw_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with AdamW.
         self._test_optimizer_with_fsdp_tp(torch.optim.AdamW)
 
     @with_comms
     def test_rmsprop_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with RMSprop.
         self._test_optimizer_with_fsdp_tp(torch.optim.RMSprop)
 
     @with_comms
     def test_adagrad_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with Adagrad.
         self._test_optimizer_with_fsdp_tp(torch.optim.Adagrad)
 
     @with_comms
     def test_adadelta_optimizer(self):
+        # [FUNCTION DOC] Runs the FSDP+TP optimizer comparison with Adadelta.
         self._test_optimizer_with_fsdp_tp(torch.optim.Adadelta)
 
 
 class Test_StridedShard_with_shard_order(LocalDTensorTestBase):
+    # [CLASS DOC] Tests conversion between _StridedShard placements and shard order, on 32
+    # ranks under LocalTensorMode.
     @property
     def world_size(self) -> int:
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 32.
         return 32
 
     @with_comms
     def test_StridedShard_to_shard_order(self):
+        # [FUNCTION DOC] On a 2x2x2x2x2 mesh, samples 25 random shard orders (fixed seed) for a
+        # 3D tensor, converts each to _StridedShard placements, verifies the reverse conversion
+        # returns the same shard order, and that local tensors match those from distributing by
+        # shard order.
         with LocalTensorMode(ranks=self.world_size):
             mesh = DeviceMesh("cpu", torch.arange(self.world_size).view(2, 2, 2, 2, 2))
             shard_iter = generate_shard_orders(mesh, 3)
@@ -1485,6 +1658,8 @@ class Test_StridedShard_with_shard_order(LocalDTensorTestBase):
 
     @with_comms
     def test_StridedShard_not_convertible_to_shard_order(self):
+        # [FUNCTION DOC] Checks that _maybe_convert_StridedShard_to_shard_order returns None
+        # for three placement lists on a 4x8 mesh that cannot be expressed as a shard order.
         with LocalTensorMode(ranks=self.world_size):
             mesh = DeviceMesh("cpu", torch.arange(self.world_size).view(4, 8))
             unconvertible_placements_list = [
@@ -1500,12 +1675,18 @@ class Test_StridedShard_with_shard_order(LocalDTensorTestBase):
 
 
 class Test2DStridedLocalShard(DTensorTestBase):
+    # [CLASS DOC] Multi-process (4 ranks) tests of local shards and offsets for 2D FSDP-plus-TP
+    # style DTensors.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 4.
         return 4
 
     @with_comms
     def test_fsdp1_tp_2d_dtensor_local_shards_and_offsets(self):
+        # [FUNCTION DOC] Mimics FSDP1+TP: from_local with Replicate,Shard(0) then redistribute
+        # to Shard(0),Shard(0), expecting exactly one all-gather, a one-row local shard per rank,
+        # and local shape (1,2) with offset equal to the rank.
         # We are mimicking the behavior of FSDP1 + TP.
         # Currently, the 2D DTensor's local shard is correct, since from_local + redistribute incurs a all_gather behind the scene.
         # When we have a global_tensor of [0, 1, 2, 3, 4, 5, 6, 7], the local shard of 2D DTensor would be:
@@ -1539,6 +1720,10 @@ class Test2DStridedLocalShard(DTensorTestBase):
 
     @with_comms
     def test_fsdp2_tp_2d_dtensor_local_shards_and_offsets(self):
+        # [FUNCTION DOC] Mimics FSDP2+TP: builds a DTensor directly from a locally chunked
+        # shard with strided placement and no communication, and checks full_tensor reproduces
+        # the global tensor. Comments note offsets from compute_local_shape_and_global_offset are
+        # not correct for resharding yet.
         # We are mimicking the behavior of FSDP2 + TP.
         # Currently, the 2D DTensor's local shard is incorrect for resharding, since we want to avoid extra communication.
         # It's incorrect for resharding, since `compute_local_shape_and_global_offset`
@@ -1562,6 +1747,8 @@ class Test2DStridedLocalShard(DTensorTestBase):
 
             @maybe_run_for_local_tensor
             def get_sharded_param(rank, chunks):
+                # [FUNCTION DOC] HELPER: Returns the chunk indexed 0 for ranks
+                # below 2 and 1 otherwise.
                 shard_rank = 0 if rank // 2 == 0 else 1
                 return chunks[shard_rank]
 
@@ -1590,7 +1777,16 @@ class Test2DStridedLocalShard(DTensorTestBase):
 
 
 class LocalTensorTestBase(TestCase):
+    # [CLASS DOC] HELPER: Test base for LocalTensor tests; overrides assertEqual to compare
+    # per-rank tensors and sets up a fake process group of world_size ranks (subclasses must
+    # define world_size).
     def assertEqual(self, lhs, rhs, **kwargs):
+        # [FUNCTION DOC] HELPER: Equality assertion that disables any active
+        # LocalTensorMode while comparing. Two LocalTensors must have equal ranks and
+        # per-rank-equal tensors; one LocalTensor is compared per rank to the other
+        # value; otherwise defers to the base assertEqual.
+        # KNOWN ISSUE: the keyword arguments (such as msg) are dropped in both LocalTensor
+        # branches, and the inner re-check of both being LocalTensor is redundant.
         mode = local_tensor_mode()
         with nullcontext() if mode is None else mode.disable():
             if isinstance(lhs, LocalTensor) and isinstance(rhs, LocalTensor):
@@ -1614,12 +1810,17 @@ class LocalTensorTestBase(TestCase):
 
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Raises NotImplementedError; subclasses override with their
+            # rank count.
         raise NotImplementedError("override world-size in your subclass")
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Returns a 1D CPU device mesh spanning world_size ranks.
         return init_device_mesh("cpu", (self.world_size,))
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a fake process group with rank 0 and world_size
+        # ranks (global side effect).
         super().setUp()
         torch.distributed.init_process_group(
             # TODO: test other ranks too
@@ -1629,6 +1830,8 @@ class LocalTensorTestBase(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Calls base tearDown, then destroys the process
+        # group, ignoring AssertionError.
         super().tearDown()
         try:
             dist.destroy_process_group()
@@ -1637,17 +1840,25 @@ class LocalTensorTestBase(TestCase):
 
 
 class TestStridedShardCollectiveOpUtils:
+    # [CLASS DOC] HELPER: Mixin with utilities for strided-shard collective tests: a
+    # ShardConfig named tuple (mesh_dim, split_factor defaulting to 1), a range tensor builder,
+    # placement conversion, and logical shape computation.
     from collections import namedtuple
 
     ShardConfig = namedtuple("ShardConfig", ["mesh_dim", "split_factor"], defaults=(1,))
 
     def _range_tensor(self, *shape) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns a tensor of consecutive integers from 0 viewed with
+        # the given shape.
         """Create a tensor with sequential values reshaped to the given shape."""
         return torch.arange(math.prod(shape)).view(shape)
 
     def _convert_default_order_placements_to_ShardConfig(
         self, placements: Sequence[Placement]
     ) -> dict[int, list["TestStridedShardCollectiveOpUtils.ShardConfig"]]:
+            # [FUNCTION DOC] HELPER: Maps each tensor dim to the list of ShardConfig (mesh dim
+            # index, split factor; 1 for plain Shard) for Shard and _StridedShard placements in
+            # mesh order; other placements are skipped.
         """
         Convert placements to a shard_map for use with _get_logical_shape.
 
@@ -1687,6 +1898,10 @@ class TestStridedShardCollectiveOpUtils:
         operate_mesh_dim: int,
         full_tensor_shape: tuple[int, ...],
     ) -> list[int]:
+            # [FUNCTION DOC] HELPER: Starting from the full shape, applies this rank's local
+            # shard size for every sharded mesh dim except operate_mesh_dim, in shard_map order,
+            # and returns the resulting shape list. Raises AssertionError if the mesh has no
+            # coordinate for this rank.
         """
         Compute the logical shape after applying sharding, excluding `operate_mesh_dim`.
 
@@ -1725,12 +1940,16 @@ class TestStridedShardCollectiveOpUtils:
 
 
 class TestStridedShardReplicate(TestStridedShardCollectiveOpUtils, DTensorTestBase):
+    # [CLASS DOC] Tests _StridedShard conversion to and from Replicate on a 4-rank mesh.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 4.
         return 4
 
     @with_comms
     def test_StridedShard_to_replicate(self):
+        # [FUNCTION DOC] For split factors 2..16 and tensor sizes 1..199, checks
+        # _to_replicate_tensor on a strided-sharded 1D tensor equals the replicated local tensor.
         mesh = self.build_device_mesh()
         for split_factor in range(2, 17):
             for tensor_size in range(1, 200):
@@ -1756,6 +1975,9 @@ class TestStridedShardReplicate(TestStridedShardCollectiveOpUtils, DTensorTestBa
 
     @with_comms
     def test_replicate_to_StridedShard(self):
+        # [FUNCTION DOC] For split factors 2..16 and tensor sizes 1..199, checks
+        # _replicate_to_strided_shard from a replicated tensor equals the strided-
+        # sharded local tensor.
         mesh = self.build_device_mesh()
         coordinate = mesh.get_coordinate()
         for split_factor in range(2, 17):
@@ -1776,10 +1998,12 @@ class TestStridedShardReplicate(TestStridedShardCollectiveOpUtils, DTensorTestBa
 
 
 class TestStridedShardAlltoAll(TestStridedShardCollectiveOpUtils, LocalTensorTestBase):
+    # [CLASS DOC] Tests _StridedShard all-to-all redistribution on 126 LocalTensor ranks.
     """Tests for _StridedShard layout and collective operations."""
 
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 126.
         return 126
 
     def _do_alltoall(
@@ -1791,6 +2015,9 @@ class TestStridedShardAlltoAll(TestStridedShardCollectiveOpUtils, LocalTensorTes
         logical_shape: list[int],
         target_tensor_dim: int,
     ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Calls _to_new_shard_dim on the given placement
+            # to move sharding to target_tensor_dim; raises AssertionError if the
+            # placement is not a _StridedShard.
         """Perform alltoall redistribution to a new shard dimension."""
         if not isinstance(shard_spec, _StridedShard):
             raise AssertionError(f"expected _StridedShard, got {type(shard_spec)}")
@@ -1800,6 +2027,10 @@ class TestStridedShardAlltoAll(TestStridedShardCollectiveOpUtils, LocalTensorTes
 
     @with_comms
     def test_StridedShard_alltoall_to_Shard(self):
+        # [FUNCTION DOC] Runs several mesh/tensor/placement cases (including empty-
+        # rank padding regression) where an all-to-all moves sharding from a strided
+        # shard to a Shard on another tensor dim, and compares the result to directly
+        # distributing with the target placements.
         """
         Test _StridedShard alltoall from _StridedShard to Shard.
         """
@@ -1889,11 +2120,15 @@ class TestStridedShardAlltoAll(TestStridedShardCollectiveOpUtils, LocalTensorTes
 
 
 class TestExplicitRedistribute(LocalTensorTestBase):
+    # [CLASS DOC] Tests ExplicitRedistributionContext with LocalTensor on 4 ranks.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 4.
         return 4
 
     def test_message_fn_not_called_in_fastpath(self):
+        # [FUNCTION DOC] Checks that with no ExplicitRedistributionContext active, a
+        # redistributing matmul does not call OpSchema string formatting.
         """Test that message_fn is not called when no ExplicitRedistributionContext is active.
 
         This ensures that string formatting overhead is avoided in the common case.
@@ -1918,6 +2153,10 @@ class TestExplicitRedistribute(LocalTensorTestBase):
                 mock_str.assert_not_called()
 
     def test_explicit_matmul(self):
+        # [FUNCTION DOC] Checks implicit redistribution in matmul: allowed by default (one
+        # collective), raises RuntimeError in explicit mode, logs a warning in warn mode, is fine
+        # after a manual redistribute, and for backward the strict, non-strict and enable flags
+        # control whether an error is raised.
         with LocalTensorMode(self.world_size):
             device_mesh = self.build_device_mesh()
             dim = 128
@@ -1983,17 +2222,24 @@ class TestExplicitRedistribute(LocalTensorTestBase):
 
 
 class TestIsTensorShardable(LocalTensorTestBase):
+    # [CLASS DOC] Tests is_tensor_shardable and is_tensor_evenly_shardable on 8
+    # LocalTensor ranks.
     @property
     def world_size(self):
+            # [FUNCTION DOC] HELPER: Returns the number of ranks, 8.
         return 8
 
     def _create_spec(
         self, mesh_shape: tuple[int, ...], placements: list[Placement]
+            # [FUNCTION DOC] HELPER: Builds a CPU mesh of mesh_shape and returns a DTensorSpec
+            # with the placements.
     ) -> DTensorSpec:
         mesh = init_device_mesh("cpu", mesh_shape)
         return DTensorSpec(mesh=mesh, placements=tuple(placements))
 
     def test_is_tensor_shardable(self):
+        # [FUNCTION DOC] Checks is_tensor_shardable: sizes smaller than the mesh are not
+        # shardable, and a strided placement with split factor 2 is reported not shardable.
         spec = self._create_spec((4,), [Shard(0)])
         self.assertTrue(is_tensor_shardable([8], spec))
         self.assertTrue(is_tensor_shardable([10], spec))
@@ -2007,6 +2253,8 @@ class TestIsTensorShardable(LocalTensorTestBase):
         self.assertFalse(is_tensor_shardable([8, 8], spec))
 
     def test_is_tensor_evenly_shardable(self):
+        # [FUNCTION DOC] Checks is_tensor_evenly_shardable: uneven sizes and a strided
+        # placement with split factor 3 are reported not evenly shardable.
         spec = self._create_spec((4,), [Shard(0)])
         self.assertTrue(is_tensor_evenly_shardable([8], spec))
         self.assertFalse(is_tensor_evenly_shardable([10], spec))
