@@ -1,4 +1,13 @@
 # Owner(s): ["module: distributions"]
+# [MODULE DOC] Unit tests for torch.distributions. Defines the registry of example and invalid-
+# parameter configurations for every distribution (_get_examples and _get_bad_examples) and
+# several test classes: TestDistributions (device-generic via instantiate_device_type_tests at
+# the bottom, CUDA/XPU excluded), TestDistributionsGPU, TestRsample, TestDistributionShapes,
+# TestKL, TestConstraints, TestNumericalStability, TestLazyLogitsInitialization,
+# TestAgainstScipy, TestFunctors, TestValidation, TestJit. Many checks compare against
+# scipy.stats and are skipped when NumPy/SciPy are missing (TEST_NUMPY). Import time: computes
+# device_type from the current accelerator and tries to import numpy/scipy. Running as a script
+# enables the default-dtype check and calls run_tests only when LAPACK is available.
 
 """
 Note [Randomized statistical tests]
@@ -146,6 +155,11 @@ except ImportError:
 
 
 def pairwise(Dist, *params):
+    # [FUNCTION DOC] HELPER: Builds two instances of Dist for pairwise comparison, e.g. for KL
+    # tests. Each entry of params is a sequence; params1 has each sequence tiled len(p) times
+    # as rows and params2 is its transpose, so the two distributions have batch shape (n, n)
+    # and element (i, j) pairs parameter i of the first with parameter j of the second. Returns
+    # the tuple.
     """
     Creates a pair of distributions `Dist` initialized to test each element of
     param with each other.
@@ -156,6 +170,9 @@ def pairwise(Dist, *params):
 
 
 def is_all_nan(tensor):
+    # [FUNCTION DOC] HELPER: Returns a boolean scalar tensor that is true only when
+    # every element of the tensor is NaN (uses self-inequality, so it is also true for
+    # an empty tensor).
     """
     Checks if all entries of a tensor is nan.
     """
@@ -170,6 +187,13 @@ Example = namedtuple("Example", ["Dist", "params"])
 # test that uses this generator expects all the examples to pass, but MPS does
 # not yet fully support all of the distributions
 def _get_examples():
+    # [FUNCTION DOC] HELPER: Returns the registry of valid test configurations: a list of
+    # Example named tuples, one per distribution class, whose params is a list of
+    # keyword-argument dictionaries. Tensors are freshly random (randn-based) on each call, most
+    # requiring grad, and cover scalar, vector, batched and extreme (1e-5 scale) parameters.
+    # Generic tests iterate over this. A new distribution must be added here (test_has_examples
+    # checks it). Every test using it expects all examples to pass on every device, so a
+    # distribution unsupported on MPS cannot be listed per device (see the TODO above it).
     return [
         Example(
             Bernoulli,
@@ -832,6 +856,10 @@ def _get_examples():
 
 # Register all distributions for bad examples by appending to this list.
 def _get_bad_examples():
+    # [FUNCTION DOC] HELPER: Returns the registry of invalid configurations as Example tuples:
+    # per distribution, keyword-argument dictionaries whose parameters violate the constraints
+    # (negative or zero scale, probabilities outside [0, 1], non-positive-definite matrices,
+    # non-callable transforms, etc.). Used by validation tests expecting ValueError/TypeError.
     return [
         Example(
             Bernoulli,
@@ -1246,10 +1274,18 @@ def _get_bad_examples():
 
 
 class DistributionsTestCase(TestCase):
+    # [CLASS DOC] HELPER: Base class for the distribution tests in this file. Enables the CUDA
+    # memory leak check and non-default-stream mode, and forces distribution argument validation
+    # on in setUp. Provides shared statistical helpers: _check_sampler_discrete (chi-square test
+    # against a reference pmf), _check_sampler_sampler (binned two-sample bias test against
+    # reference random variates) and _check_log_prob (per-element log_prob comparison).
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Enables default argument validation globally via
+        # set_default_validate_args(True) (a global side effect that is not reset afterwards),
+        # then runs the parent setUp.
         """The tests assume that the validation flag is set."""
         torch.distributions.Distribution.set_default_validate_args(True)
         super().setUp()
@@ -1258,6 +1294,13 @@ class DistributionsTestCase(TestCase):
     def _check_sampler_discrete(
         self, torch_dist, ref_dist, message, num_samples=10000, failure_rate=1e-3
     ):
+        # [FUNCTION DOC] HELPER: Chi-square goodness-of-fit check of a discrete torch
+        # distribution against a scipy-like reference exposing pmf. Draws num_samples samples,
+        # converts bfloat16 to float, counts unique values, renormalizes the reference pmf over
+        # the observed values, and asserts the buckets with counts and expected counts above 5
+        # hold more than 90 percent of the mass. Remaining low-count values are merged into one
+        # remainder bucket. Asserts the chi-square p-value exceeds failure_rate, using message
+        # on failure. Skipped without NumPy.
         """Runs a Chi2-test for the support, but ignores tail instead of combining"""
         torch_samples = torch_dist.sample((num_samples,)).squeeze()
         torch_samples = (
@@ -1284,6 +1327,10 @@ class DistributionsTestCase(TestCase):
         self.assertGreater(p, failure_rate, message)
 
     def _check_log_prob(self, dist, asset_fn):
+        # [FUNCTION DOC] HELPER: Draws one sample from dist, computes log_prob, flattens batch
+        # and event data and calls asset_fn(index, sample_row_squeezed, log_prob_scalar) for
+        # every batch element so the caller can compare against a reference. Assumes the event
+        # data can be reshaped to one row per batch element.
         # checks that the log_prob matches a reference function
         s = dist.sample()
         log_probs = dist.log_prob(s)
@@ -1302,6 +1349,13 @@ class DistributionsTestCase(TestCase):
         num_samples=10000,
         failure_rate=1e-3,
     ):
+        # [FUNCTION DOC] HELPER: Statistical check that torch_dist.sample matches a
+        # reference sampler exposing rvs. Draws num_samples from each, optionally projects
+        # multivariate samples onto a random axis, optionally maps circular values through
+        # cosine, labels torch samples +1 and reference -1, shuffles and sorts by value,
+        # splits into 10 bins whose means should be near zero, and asserts every bin mean
+        # lies within an erfinv-derived threshold for failure_rate. Uses numpy global RNG
+        # for the projection axis.
         # Checks that the .sample() method matches a reference function.
         torch_samples = torch_dist.sample((num_samples,)).squeeze()
         torch_samples = torch_samples.cpu().numpy()
@@ -1335,20 +1389,33 @@ class DistributionsTestCase(TestCase):
 
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestDistributions(DistributionsTestCase):
+    # [CLASS DOC] Device-generic test class (instantiated per device at the bottom of the file)
+    # for the distributions API: sampling shapes, log_prob/entropy against scipy and analytic
+    # values, gradients, enumerate_support, broadcasting, cdf/icdf, modes and similar. setUp and
+    # tearDown set and clear the default device so tensors are created on the test device.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp, then makes the test's primary device the global
+        # default device.
         super().setUp()
         torch.set_default_device(self.get_primary_device())
 
     def tearDown(self):
+        # [FUNCTION DOC] Resets the global default device to None, then runs the base tearDown.
         torch.set_default_device(None)
         super().tearDown()
 
     def test_default_device(self, device):
+        # [FUNCTION DOC] Checks that the global default device type matches the device argument
+        # and that a newly created random tensor lands on that device.
         device_type = torch.device(device).type
         self.assertEqual(torch.get_default_device().type, device_type)
         self.assertEqual(torch.randn(10).device.type, device_type)
 
     def _gradcheck_log_prob(self, dist_ctor, ctor_params):
+        # [FUNCTION DOC] HELPER: Runs gradcheck on log_prob. Builds dist_ctor(*ctor_params),
+        # takes one sample (detached with requires_grad for continuous support), asserts the
+        # sample size equals batch_shape plus event_shape, then gradchecks log_prob with respect
+        # to the sample and the constructor parameters; raises on failure.
         # performs gradient checks on log_prob
         distribution = dist_ctor(*ctor_params)
         s = distribution.sample()
@@ -1359,11 +1426,16 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(s.size(), expected_shape)
 
         def apply_fn(s, *params):
+            # [FUNCTION DOC] HELPER: Function under gradcheck: builds a distribution from params
+            # and returns the log_prob of the sample s.
             return dist_ctor(*params).log_prob(s)
 
         gradcheck(apply_fn, (s,) + tuple(ctor_params), raise_exception=True)
 
     def _check_forward_ad(self, fn):
+        # [FUNCTION DOC] HELPER: Under a forward-AD dual level, applies fn to a dual scalar
+        # tensor and asserts the tangent of the output has no non-zero entries, i.e. the
+        # sampling op has zero derivative.
         with fwAD.dual_level():
             x = torch.tensor(1.0)
             t = torch.tensor(1.0)
@@ -1374,6 +1446,10 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def _check_enumerate_support(self, dist, examples):
+        # [FUNCTION DOC] HELPER: For each (params, expected) pair, builds the distribution with
+        # parameters converted to tensors and asserts enumerate_support(expand=False) equals
+        # expected (cast to the result dtype) and enumerate_support(expand=True) equals expected
+        # expanded over batch and event shape.
         for params, expected in examples:
             params = {k: torch.tensor(v) for k, v in params.items()}
             d = dist(**params)
@@ -1387,6 +1463,8 @@ class TestDistributions(DistributionsTestCase):
             self.assertEqual(actual, expected_with_expand)
 
     def test_repr(self):
+        # [FUNCTION DOC] For every example distribution and parameter set, asserts repr starts
+        # with the class name.
         for Dist, params in _get_examples():
             for param in params:
                 dist = Dist(**param)
@@ -1394,6 +1472,8 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_sample_detached(self):
+        # [FUNCTION DOC] For every example having a parameter that requires grad, asserts that
+        # sample() returns a tensor that does not require grad. Expected to fail on MPS.
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
                 variable_params = [
@@ -1410,6 +1490,8 @@ class TestDistributions(DistributionsTestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_rsample_requires_grad(self):
+        # [FUNCTION DOC] For every example with a grad-requiring parameter and a distribution
+        # with has_rsample, asserts rsample() returns a tensor that requires grad.
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
                 if not any(getattr(p, "requires_grad", False) for p in param.values()):
@@ -1425,6 +1507,9 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_enumerate_support_type(self):
+        # [FUNCTION DOC] For every example, asserts that sample() and enumerate_support() return
+        # the same Python type; distributions whose enumerate_support raises NotImplementedError
+        # are ignored.
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
                 dist = Dist(**param)
@@ -1443,14 +1528,23 @@ class TestDistributions(DistributionsTestCase):
                     pass
 
     def test_lazy_property_grad(self):
+        # [FUNCTION DOC] Verifies lazy_property keeps autograd working: a dummy class property
+        # depending on a tensor gives gradient one both with and without no_grad around the
+        # first call, and a MultivariateNormal scale_tril first computed under no_grad still
+        # yields a gradient to the covariance matrix when later accessed with grad enabled.
         x = torch.randn(1, requires_grad=True)
 
         class Dummy:
+            # [CLASS DOC] HELPER: Local class with one lazy_property y returning x plus one.
             @lazy_property
             def y(self):
+                # [FUNCTION DOC] HELPER: Lazily computed property returning the closed-over
+                # tensor x plus one.
                 return x + 1
 
         def test():
+            # [FUNCTION DOC] HELPER: Clears x.grad, backpropagates through a fresh Dummy().y and
+            # asserts x.grad is ones.
             x.grad = None
             Dummy().y.backward()
             self.assertEqual(x.grad, torch.ones(1))
@@ -1468,6 +1562,9 @@ class TestDistributions(DistributionsTestCase):
         self.assertIsNotNone(cov.grad)
 
     def test_has_examples(self):
+        # [FUNCTION DOC] Asserts every Distribution subclass visible in this module's globals
+        # (except Distribution and ExponentialFamily) has an entry in _get_examples; failure
+        # message asks to add it.
         distributions_with_examples = {e.Dist for e in _get_examples()}
         for Dist in globals().values():
             if (
@@ -1483,6 +1580,10 @@ class TestDistributions(DistributionsTestCase):
                 )
 
     def test_support_attributes(self):
+        # [FUNCTION DOC] For each example checks that the instance support event_dim equals
+        # the event_shape rank and that the class-level support gives the same event_dim
+        # and is_discrete as the instance (class-level lookups raising NotImplementedError
+        # are skipped).
         for Dist, params in _get_examples():
             for param in params:
                 d = Dist(**param)
@@ -1500,6 +1601,11 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_distribution_expand(self):
+        # [FUNCTION DOC] For each example and for expansion shapes (empty, (2,), (2, 1)):
+        # expands the batch shape and asserts the class is preserved, sample and log_prob
+        # shapes/values are consistent with the original, batch_shape is the expanded one,
+        # and mean and variance equal the expanded originals when implemented. Expected to
+        # fail on MPS.
         shapes = [torch.Size(), torch.Size((2,)), torch.Size((2, 1))]
         for Dist, params in _get_examples():
             for param in params:
@@ -1529,10 +1635,15 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_distribution_subclass_expand(self):
+        # [FUNCTION DOC] Like test_distribution_expand but on an empty subclass of each
+        # distribution class: expand by a leading dimension of 2 must keep the subclass type,
+        # produce samples of the expected shape and equal log_prob.
         expand_by = torch.Size((2,))
         for Dist, params in _get_examples():
 
             class SubClass(Dist):
+                # [CLASS DOC] HELPER: Empty subclass of the distribution under test, to verify
+                # expand preserves subclasses.
                 pass
 
             for param in params:
@@ -1551,6 +1662,11 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_bernoulli(self):
+        # [FUNCTION DOC] Bernoulli checks (double precision): sample shapes for tensor, 0-d
+        # tensor and float probs, samples not requiring grad, gradcheck of log_prob, log_prob
+        # against the analytic formula for probs and equivalent logits, rsample raising
+        # NotImplementedError, entropy against known values (including probs 0), and forward AD
+        # of bernoulli ops having zero tangent.
         p = torch.tensor([0.7, 0.2, 0.4], requires_grad=True)
         r = torch.tensor(0.3, requires_grad=True)
         s = 0.3
@@ -1569,6 +1685,9 @@ class TestDistributions(DistributionsTestCase):
         self._gradcheck_log_prob(Bernoulli, (p,))
 
         def ref_log_prob(idx, val, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the log of the success
+            # probability if the sample is truthy, otherwise of the failure probability, for
+            # batch element idx.
             prob = p[idx]
             self.assertEqual(log_prob, math.log(prob if val else 1 - prob))
 
@@ -1594,6 +1713,8 @@ class TestDistributions(DistributionsTestCase):
         self._check_forward_ad(lambda x: x.bernoulli_(x))
 
     def test_bernoulli_enumerate_support(self):
+        # [FUNCTION DOC] Checks Bernoulli.enumerate_support returns [0, 1] with the expected
+        # batch shapes.
         examples = [
             ({"probs": [0.1]}, [[0], [1]]),
             ({"probs": [0.1, 0.9]}, [[0], [1]]),
@@ -1602,6 +1723,8 @@ class TestDistributions(DistributionsTestCase):
         self._check_enumerate_support(Bernoulli, examples)
 
     def test_bernoulli_3d(self):
+        # [FUNCTION DOC] Checks Bernoulli sample shapes for a (2, 3, 5) probability tensor with
+        # several sample_shape values.
         p = torch.full((2, 3, 5), 0.5).requires_grad_()
         self.assertEqual(Bernoulli(p).sample().size(), (2, 3, 5))
         self.assertEqual(
@@ -1612,6 +1735,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_geometric(self):
+        # [FUNCTION DOC] Geometric checks (double precision): sample shapes, probs 1 giving
+        # sample 0 with log_prob 0 at 0 and minus infinity at 1, samples not requiring grad,
+        # gradcheck of log_prob, ValueError for probs 0, rsample raising NotImplementedError and
+        # forward AD of geometric_ having zero tangent.
         p = torch.tensor([0.7, 0.2, 0.4], requires_grad=True)
         r = torch.tensor(0.3, requires_grad=True)
         s = 0.3
@@ -1634,10 +1761,14 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_geometric_log_prob_and_entropy(self):
+        # [FUNCTION DOC] Compares Geometric log_prob (probs and logits forms) and entropy with
+        # scipy.stats.geom (loc minus one). Skipped without NumPy.
         p = torch.tensor([0.7, 0.2, 0.4], requires_grad=True)
         s = 0.3
 
         def ref_log_prob(idx, val, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy geometric logpmf at the
+            # sample for the batch element's probability.
             prob = p[idx].detach().cpu()
             self.assertEqual(log_prob, scipy.stats.geom(prob, loc=-1).logpmf(val.cpu()))
 
@@ -1660,6 +1791,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_geometric_sample(self):
+        # [FUNCTION DOC] Statistical test: Geometric samples for probs 0.01, 0.18 and 0.8 pass a
+        # chi-square test against scipy geom, with seed 0.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for prob in [0.01, 0.18, 0.8]:
             self._check_sampler_discrete(
@@ -1671,6 +1804,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_binomial(self):
+        # [FUNCTION DOC] Binomial gradcheck of log_prob with respect to probs and to logits for
+        # total_count 1, 2 and 10, and rsample raising NotImplementedError. Also registered
+        # below under half and bfloat16 default dtypes.
         p = torch.arange(0.05, 1, 0.1).requires_grad_()
         for total_count in [1, 2, 10]:
             self._gradcheck_log_prob(lambda p: Binomial(total_count, p), [p])
@@ -1684,6 +1820,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_binomial_sample(self):
+        # [FUNCTION DOC] Statistical chi-square test of Binomial samples against scipy binom for
+        # a grid of probs and total_count values (seed 0).
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for prob in [0.01, 0.1, 0.5, 0.8, 0.9]:
             for count in [2, 10, 100, 500]:
@@ -1697,10 +1835,14 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_binomial_log_prob_and_entropy(self):
+        # [FUNCTION DOC] Compares Binomial log_prob (from probs and from logits) and entropy
+        # with scipy.stats.binom for several total_count values.
         probs = torch.arange(0.05, 1, 0.1)
         for total_count in [1, 2, 10]:
 
             def ref_log_prob(idx, x, log_prob):
+                # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy binomial logpmf at x
+                # for the batch element's probability.
                 p = probs.view(-1)[idx].item()
                 expected = scipy.stats.binom(total_count, p).logpmf(x.cpu())
                 self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -1720,6 +1862,9 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_binomial_stable(self):
+        # [FUNCTION DOC] Checks Binomial log_prob is finite for logits of plus/minus 100 at
+        # value 0, and that the gradient of log_prob with respect to zero logits at value 0
+        # equals minus 0.5.
         logits = torch.tensor([-100.0, 100.0], dtype=torch.float)
         total_count = 1.0
         x = torch.tensor([0.0, 0.0], dtype=torch.float)
@@ -1735,6 +1880,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_binomial_log_prob_vectorized_count(self):
+        # [FUNCTION DOC] Checks Binomial log_prob with vector-valued total_count (broadcast
+        # against probs) matches scipy binom logpmf.
         probs = torch.tensor([0.2, 0.7, 0.9])
         for total_count, sample in [
             (torch.tensor([10]), torch.tensor([7.0, 3.0, 9.0])),
@@ -1747,6 +1894,8 @@ class TestDistributions(DistributionsTestCase):
             self.assertEqual(log_prob, expected, atol=1e-4, rtol=0)
 
     def test_binomial_enumerate_support(self):
+        # [FUNCTION DOC] Checks Binomial.enumerate_support yields 0..total_count with the right
+        # batch shapes.
         examples = [
             ({"probs": [0.1], "total_count": 2}, [[0], [1], [2]]),
             ({"probs": [0.1, 0.9], "total_count": 2}, [[0], [1], [2]]),
@@ -1760,6 +1909,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_binomial_extreme_vals(self):
+        # [FUNCTION DOC] Checks Binomial with probs 0 or 1: samples are exactly 0 or
+        # total_count, log_prob is near 0 at the certain outcome and probability 0 elsewhere,
+        # and with zero total_count the sample and log_prob are zero.
         total_count = 100
         bin0 = Binomial(total_count, 0)
         self.assertEqual(bin0.sample(), 0)
@@ -1781,6 +1933,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_binomial_vectorized_count(self):
+        # [FUNCTION DOC] With seed 1, checks Binomial with a tensor total_count: probs 1 gives
+        # total_count, and 100000 samples at probs 0.5 do not exceed total_count and match the
+        # mean and variance.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         total_count = torch.tensor([[4, 7], [3, 8]], dtype=torch.float64)
         bin0 = Binomial(total_count, torch.tensor(1.0))
@@ -1794,6 +1949,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_negative_binomial(self):
+        # [FUNCTION DOC] NegativeBinomial gradcheck of log_prob with respect to probs and
+        # logits; rsample and entropy raise NotImplementedError.
         p = torch.arange(0.05, 1, 0.1).requires_grad_()
         for total_count in [1, 2, 10]:
             self._gradcheck_log_prob(lambda p: NegativeBinomial(total_count, p), [p])
@@ -1805,10 +1962,14 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_negative_binomial_log_prob(self):
+        # [FUNCTION DOC] Compares NegativeBinomial log_prob (probs and logits forms) with scipy
+        # nbinom logpmf, using failure probability one minus p. Skipped without NumPy.
         probs = torch.arange(0.05, 1, 0.1)
         for total_count in [1, 2, 10]:
 
             def ref_log_prob(idx, x, log_prob):
+                # [FUNCTION DOC] HELPER: Asserts log_prob equals scipy nbinom logpmf at x for
+                # the batch element.
                 p = probs.view(-1)[idx].item()
                 expected = scipy.stats.nbinom(total_count, 1 - p).logpmf(x.cpu())
                 self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -1823,6 +1984,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_negative_binomial_log_prob_vectorized_count(self):
+        # [FUNCTION DOC] Checks NegativeBinomial log_prob with vector-valued total_count against
+        # scipy nbinom.
         probs = torch.tensor([0.2, 0.7, 0.9])
         for total_count, sample in [
             (torch.tensor([10]), torch.tensor([7.0, 3.0, 9.0])),
@@ -1835,6 +1998,9 @@ class TestDistributions(DistributionsTestCase):
             self.assertEqual(log_prob, expected, atol=1e-4, rtol=0)
 
     def test_zero_excluded_binomial(self):
+        # [FUNCTION DOC] Draws 1e8 samples from Binomial(total_count 1, probs 0.9 and 0.1) and
+        # checks values stay within [0, 1], plus 10000 samples at 0.5 each yield more than 4000
+        # zeros and ones (raising AssertionError otherwise). Large memory use.
         vals = Binomial(
             total_count=torch.tensor(1.0),
             probs=torch.tensor(0.9),
@@ -1862,6 +2028,8 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_torch_binomial_dtype_errors(self):
+        # [FUNCTION DOC] Checks torch.binomial raises ValueError with messages about
+        # floating-point dtypes when count or prob has an integer dtype (int, long, short).
         dtypes = [torch.int, torch.long, torch.short]
 
         for count_dtype in dtypes:
@@ -1887,6 +2055,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_multinomial_1d(self):
+        # [FUNCTION DOC] Multinomial checks: sample shapes for 1-d probs, gradcheck of log_prob
+        # for probs and logits, and rsample raising NotImplementedError.
         total_count = 10
         p = torch.tensor([0.1, 0.2, 0.3], requires_grad=True)
         self.assertEqual(Multinomial(total_count, p).sample().size(), (3,))
@@ -1899,6 +2069,8 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     @set_default_dtype_if_supported(torch.double)
     def test_multinomial_1d_log_prob_and_entropy(self):
+        # [FUNCTION DOC] Compares Multinomial log_prob (probs and logits forms) and entropy with
+        # scipy.stats.multinomial. Skipped without NumPy.
         total_count = 10
         p = torch.tensor([0.1, 0.2, 0.3], requires_grad=True)
         dist = Multinomial(total_count, probs=p)
@@ -1934,6 +2106,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_multinomial_2d(self):
+        # [FUNCTION DOC] Multinomial with 2-d probs: sample shapes for several sample_shape
+        # values, gradchecks, and extreme probs (identity matrix) giving samples that put all
+        # counts on one category.
         total_count = 10
         probabilities = [[0.1, 0.2, 0.3], [0.5, 0.3, 0.2]]
         probabilities_1 = [[1.0, 0.0], [0.0, 1.0]]
@@ -1956,6 +2131,9 @@ class TestDistributions(DistributionsTestCase):
 
     @skipMPS  # very long runtime on MPS
     def test_multinomial_sequential_draw(self):
+        # [FUNCTION DOC] Draws 300000 permutations from torch.multinomial without replacement
+        # over 26 equal weights and asserts fewer than 10 duplicates, regression for gh-132395.
+        # Skipped on MPS.
         # Adapted after script mentioned in https://github.com/pytorch/pytorch/issues/132395
         torch.manual_seed(0xDE0B6B3A764007E8)
         prob = torch.ones(26)
@@ -1973,6 +2151,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_categorical_1d(self):
+        # [FUNCTION DOC] Categorical with 1-d probs: mean and variance are all NaN, sample shape
+        # and no grad, gradcheck of log_prob and rsample raising NotImplementedError.
         p = torch.tensor([0.1, 0.2, 0.3], requires_grad=True)
         self.assertTrue(is_all_nan(Categorical(p).mean))
         self.assertTrue(is_all_nan(Categorical(p).variance))
@@ -1986,6 +2166,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_categorical_2d(self):
+        # [FUNCTION DOC] Categorical with 2-d probs: mean/variance shape and NaN values, sample
+        # shapes, gradcheck, extreme probs sample check, log_prob against analytic probabilities
+        # for probs and logits, entropy known values and -inf logits entropy (gh-40553).
         probabilities = [[0.1, 0.2, 0.3], [0.5, 0.3, 0.2]]
         probabilities_1 = [[1.0, 0.0], [0.0, 1.0]]
         p = torch.tensor(probabilities, requires_grad=True)
@@ -2006,6 +2189,8 @@ class TestDistributions(DistributionsTestCase):
         )
 
         def ref_log_prob(idx, val, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the log of the normalized
+            # probability of the sampled category for batch element idx.
             sample_prob = p[idx][val] / p[idx].sum()
             self.assertEqual(log_prob, math.log(sample_prob))
 
@@ -2024,6 +2209,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(e, torch.tensor([0.6365, 0.5983]), atol=1e-4, rtol=0)
 
     def test_categorical_enumerate_support(self):
+        # [FUNCTION DOC] Checks Categorical.enumerate_support returns the category indices with
+        # the right shapes.
         examples = [
             ({"probs": [0.1, 0.2, 0.7]}, [0, 1, 2]),
             ({"probs": [[0.1, 0.9], [0.3, 0.7]]}, [[0], [1]]),
@@ -2033,6 +2220,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_one_hot_categorical_1d(self):
+        # [FUNCTION DOC] OneHotCategorical with 1-d probs: sample shapes, samples not requiring
+        # grad, gradcheck and rsample raising NotImplementedError.
         p = torch.tensor([0.1, 0.2, 0.3], requires_grad=True)
         self.assertEqual(OneHotCategorical(p).sample().size(), (3,))
         self.assertFalse(OneHotCategorical(p).sample().requires_grad)
@@ -2044,6 +2233,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_one_hot_categorical_2d(self):
+        # [FUNCTION DOC] OneHotCategorical with 2-d probs: sample shapes, gradcheck, and
+        # log_prob equal to the Categorical log_prob of the argmax index.
         probabilities = [[0.1, 0.2, 0.3], [0.5, 0.3, 0.2]]
         p = torch.tensor(probabilities, requires_grad=True)
         self.assertEqual(OneHotCategorical(p).sample().size(), (2, 3))
@@ -2058,6 +2249,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(dist.log_prob(x), Categorical(p).log_prob(x.max(-1)[1]))
 
     def test_one_hot_categorical_enumerate_support(self):
+        # [FUNCTION DOC] Checks OneHotCategorical.enumerate_support yields identity rows with
+        # the right shapes.
         examples = [
             ({"probs": [0.1, 0.2, 0.7]}, [[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
             ({"probs": [[0.1, 0.9], [0.3, 0.7]]}, [[[1, 0]], [[0, 1]]]),
@@ -2065,9 +2258,11 @@ class TestDistributions(DistributionsTestCase):
         self._check_enumerate_support(OneHotCategorical, examples)
 
     def test_poisson_forward_ad(self):
+        # [FUNCTION DOC] Checks forward AD of torch.poisson gives zero tangent.
         self._check_forward_ad(torch.poisson)
 
     def test_poisson_shape(self):
+        # [FUNCTION DOC] Checks Poisson sample shapes for 2-d, 1-element and float rates.
         rate = torch.randn(2, 3).abs().requires_grad_()
         rate_1d = torch.randn(1).abs().requires_grad_()
         self.assertEqual(Poisson(rate).sample().size(), (2, 3))
@@ -2080,11 +2275,16 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_poisson_log_prob(self):
+        # [FUNCTION DOC] Compares Poisson log_prob to scipy poisson logpmf (including zero
+        # rate), gradchecks it, and checks that at rate zero and value one the gradient wrt rate
+        # is infinity.
         rate = torch.randn(2, 3).abs().requires_grad_()
         rate_1d = torch.randn(1).abs().requires_grad_()
         rate_zero = torch.zeros([], requires_grad=True)
 
         def ref_log_prob(ref_rate, idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals scipy poisson logpmf using the
+            # flattened rate element.
             l = ref_rate.view(-1)[idx].detach()
             expected = scipy.stats.poisson.logpmf(x.cpu(), l.cpu())
             self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -2106,6 +2306,9 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_poisson_sample(self, device):
+        # [FUNCTION DOC] Statistical test for Poisson samples with seed 1 under default dtypes
+        # float, bfloat16, half (and double except on MPS), rates 0.1, 1 and 5; restores the
+        # default dtype in a finally block. Takes the test device.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         saved_dtype = torch.get_default_dtype()
         try:
@@ -2126,6 +2329,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_poisson_tensor_sample(self):
+        # [FUNCTION DOC] Statistical chi-square test of Poisson with a 1-element tensor rate
+        # (seed 1).
         set_rng_seed(1)
         for rate in [0.12, 0.9, 4.0]:
             self._check_sampler_discrete(
@@ -2138,6 +2343,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_relaxed_bernoulli(self):
+        # [FUNCTION DOC] RelaxedBernoulli: sample shapes for tensor, 0-d and float probs,
+        # samples not requiring grad, gradchecks for log_prob, and rsample supporting backward.
         p = torch.tensor([0.7, 0.2, 0.4], requires_grad=True)
         r = torch.tensor(0.3, requires_grad=True)
         s = 0.3
@@ -2163,13 +2370,20 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_rounded_relaxed_bernoulli(self):
+        # [FUNCTION DOC] Statistical test: rounding RelaxedBernoulli samples matches Bernoulli
+        # across probs and temperatures, and a huge temperature yields rsample of exactly 0.5.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
 
         class Rounded:
+            # [CLASS DOC] HELPER: Wrapper exposing sample() that rounds samples of the
+            # wrapped distribution.
             def __init__(self, dist):
+                # [FUNCTION DOC] HELPER: Stores the wrapped distribution.
                 self.dist = dist
 
             def sample(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Returns the rounded samples of the
+                # wrapped distribution.
                 return torch.round(self.dist.sample(*args, **kwargs))
 
         for probs, temp in product([0.1, 0.2, 0.8], [0.1, 1.0, 10.0]):
@@ -2189,6 +2403,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_relaxed_one_hot_categorical_1d(self):
+        # [FUNCTION DOC] RelaxedOneHotCategorical with 1-d probs: sample shapes, samples not
+        # requiring grad and gradcheck of log_prob (with validation off).
         p = torch.tensor([0.1, 0.2, 0.3], requires_grad=True)
         temp = torch.tensor(0.67, requires_grad=True)
         self.assertEqual(
@@ -2212,6 +2428,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_relaxed_one_hot_categorical_2d(self):
+        # [FUNCTION DOC] RelaxedOneHotCategorical with 2-d probs: sample shapes and
+        # gradchecks at temperatures 3 and 0.25 (lower temperatures are numerically unstable
+        # for gradcheck).
         probabilities = [[0.1, 0.2, 0.3], [0.5, 0.3, 0.2]]
         temp = torch.tensor([3.0], requires_grad=True)
         # The lower the temperature, the more unstable the log_prob gradcheck is
@@ -2236,22 +2455,35 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_argmax_relaxed_categorical(self):
+        # [FUNCTION DOC] Statistical test: argmax of RelaxedOneHotCategorical samples matches
+        # scipy multinomial for several probs/temperatures, and very high temperature gives
+        # uniform rsample.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
 
         class ArgMax:
+            # [CLASS DOC] HELPER: Wrapper whose sample returns the argmax index over the last
+            # dim of the wrapped distribution's samples.
             def __init__(self, dist):
+                # [FUNCTION DOC] HELPER: Stores the wrapped distribution.
                 self.dist = dist
 
             def sample(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Returns the argmax index of samples from the
+                # wrapped distribution.
                 s = self.dist.sample(*args, **kwargs)
                 _, idx = torch.max(s, -1)
                 return idx
 
         class ScipyCategorical:
+            # [CLASS DOC] HELPER: Adapter turning scipy multinomial pmf over one-hot vectors
+            # into a pmf over category indices.
             def __init__(self, dist):
+                # [FUNCTION DOC] HELPER: Stores the wrapped scipy distribution.
                 self.dist = dist
 
             def pmf(self, samples):
+                # [FUNCTION DOC] HELPER: Converts integer category samples to one-hot rows and
+                # returns the scipy pmf.
                 new_samples = np.zeros(samples.shape + self.dist.p.shape)
                 new_samples[np.arange(samples.shape[0]), samples] = 1
                 return self.dist.pmf(new_samples)
@@ -2275,6 +2507,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_uniform(self):
+        # [FUNCTION DOC] Uniform checks: sample shapes, log_prob of minus infinity and cdf 0/1
+        # outside the range (validation off), gradchecks, rsample gradients equal one minus the
+        # base random draw for low and the draw for high, and forward AD of uniform_.
         low = torch.zeros(5, 5, requires_grad=True)
         high = (torch.ones(5, 5) * 3).requires_grad_()
         low_1d = torch.zeros(1, requires_grad=True)
@@ -2316,6 +2551,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_vonmises_sample(self):
+        # [FUNCTION DOC] Statistical test of VonMises samples against scipy vonmises over locs
+        # and concentrations using cosine of circular samples. Skipped without NumPy and
+        # expected failure on MPS.
         for loc in [0.0, math.pi / 2.0]:
             for concentration in [0.03, 0.3, 1.0, 10.0, 100.0]:
                 self._check_sampler_sampler(
@@ -2327,6 +2565,8 @@ class TestDistributions(DistributionsTestCase):
                 )
 
     def test_vonmises_logprob(self):
+        # [FUNCTION DOC] Checks that exp of VonMises log_prob integrates to about 1 over [0, 2
+        # pi) for a range of concentrations (tolerance 1e-3).
         concentrations = [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
         for concentration in concentrations:
             grid = torch.arange(0.0, 2 * math.pi, 1e-4)
@@ -2337,6 +2577,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_cauchy(self):
+        # [FUNCTION DOC] Cauchy checks: mean is NaN and variance infinite, sample shapes,
+        # gradchecks, rsample gradients (loc one, scale equal to the standard Cauchy draw) and
+        # forward AD of cauchy_.
         loc = torch.zeros(5, 5, requires_grad=True)
         scale = torch.ones(5, 5, requires_grad=True)
         loc_1d = torch.zeros(1, requires_grad=True)
@@ -2369,6 +2612,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_halfcauchy(self):
+        # [FUNCTION DOC] HalfCauchy checks: infinite mean and variance, sample shapes,
+        # gradchecks and rsample gradient of scale equal to the absolute standard Cauchy draw.
         scale = torch.ones(5, 5, requires_grad=True)
         scale_1d = torch.ones(1, requires_grad=True)
         self.assertTrue(torch.isinf(HalfCauchy(scale_1d).mean).all())
@@ -2394,6 +2639,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_halfnormal(self):
+        # [FUNCTION DOC] HalfNormal checks: sample shapes, near-zero samples for tiny scale,
+        # gradchecks, and log_prob broadcasting of a (3, 1) value against a (2, 1, 4) scale to
+        # shape (2, 3, 4).
         std = torch.randn(5, 5).abs().requires_grad_()
         std_1d = torch.randn(1).abs().requires_grad_()
         std_delta = torch.tensor([1e-5, 1e-5])
@@ -2423,9 +2671,12 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_halfnormal_logprob(self):
+        # [FUNCTION DOC] Compares HalfNormal log_prob with scipy halfnorm logpdf.
         std = torch.randn(5, 1).abs().requires_grad_()
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals scipy halfnorm logpdf at x for the
+            # batch element's scale.
             s = std.view(-1)[idx].detach().cpu()
             expected = scipy.stats.halfnorm(scale=s).logpdf(x.cpu())
             self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -2434,6 +2685,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_halfnormal_sample(self):
+        # [FUNCTION DOC] Statistical test of HalfNormal samples against scipy halfnorm for
+        # scales 0.1, 1, 10.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for std in [0.1, 1.0, 10.0]:
             self._check_sampler_sampler(
@@ -2445,6 +2698,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_inversegamma(self):
+        # [FUNCTION DOC] InverseGamma checks: sample shapes, gradcheck of log_prob and
+        # broadcasting of log_prob to shape (2, 3, 4).
         alpha = torch.randn(2, 3).exp().requires_grad_()
         beta = torch.randn(2, 3).exp().requires_grad_()
         alpha_1d = torch.randn(1).exp().requires_grad_()
@@ -2464,6 +2719,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_inversegamma_sample(self):
+        # [FUNCTION DOC] Statistical test of InverseGamma samples against scipy invgamma over
+        # concentrations and rates.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for concentration, rate in product([2, 5], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -2475,6 +2732,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_lognormal(self):
+        # [FUNCTION DOC] LogNormal checks: sample shapes, near-deterministic samples for tiny
+        # std, gradchecks, log_prob broadcasting and forward AD of log_normal_.
         mean = torch.randn(5, 5, requires_grad=True)
         std = torch.randn(5, 5).abs().requires_grad_()
         mean_1d = torch.randn(1, requires_grad=True)
@@ -2510,10 +2769,13 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_lognormal_logprob(self):
+        # [FUNCTION DOC] Compares LogNormal log_prob with scipy lognorm logpdf.
         mean = torch.randn(5, 1, requires_grad=True)
         std = torch.randn(5, 1).abs().requires_grad_()
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals scipy lognorm logpdf at x for the
+            # batch element.
             m = mean.view(-1)[idx].detach().cpu()
             s = std.view(-1)[idx].detach().cpu()
             expected = scipy.stats.lognorm(s=s, scale=math.exp(m)).logpdf(x.cpu())
@@ -2523,6 +2785,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_lognormal_sample(self):
+        # [FUNCTION DOC] Statistical test of LogNormal samples against scipy lognorm over means
+        # and stds.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for mean, std in product([-1.0, 0.0, 1.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -2534,6 +2798,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_logisticnormal(self):
+        # [FUNCTION DOC] LogisticNormal checks: samples have one more event dim than the
+        # parameters, tiny-std samples match the closed-form stick-breaking values, and
+        # gradchecks of log_prob with validation off (gradcheck can perturb samples slightly off
+        # the simplex).
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         mean = torch.randn(5, 5).requires_grad_()
         std = torch.randn(5, 5).abs().requires_grad_()
@@ -2577,6 +2845,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_logisticnormal_logprob(self):
+        # [FUNCTION DOC] Smoke test: LogisticNormal log_prob of a sample has the batch shape
+        # (5,). The TODO says proper value checks are missing.
         mean = torch.randn(5, 7).requires_grad_()
         std = torch.randn(5, 7).abs().requires_grad_()
 
@@ -2589,7 +2859,13 @@ class TestDistributions(DistributionsTestCase):
             raise AssertionError(f"Expected log_prob shape (5,), got {shape}")
 
     def _get_logistic_normal_ref_sampler(self, base_dist):
+        # [FUNCTION DOC] HELPER: Returns a function that maps a multivariate normal base
+        # distribution's samples to the stick-breaking (logistic normal) simplex with numpy,
+        # used as a reference sampler.
         def _sampler(num_samples):
+            # [FUNCTION DOC] HELPER: Draws num_samples from the base distribution and applies
+            # the stick-breaking transform (sigmoid with offset, cumulative product, padding) to
+            # return simplex samples.
             x = base_dist.rvs(num_samples)
             offset = np.log((x.shape[-1] + 1) - np.ones_like(x).cumsum(-1))
             z = 1.0 / (1.0 + np.exp(offset - x))
@@ -2605,6 +2881,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_logisticnormal_sample(self):
+        # [FUNCTION DOC] Statistical test of LogisticNormal samples against the numpy reference
+        # sampler for several means and diagonal covariances (multivariate projection).
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         means = map(np.asarray, [(-1.0, -1.0), (0.0, 0.0), (1.0, 1.0)])
         covs = map(np.diag, [(0.1, 0.1), (1.0, 1.0), (10.0, 10.0)])
@@ -2622,6 +2900,9 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_mixture_same_family_shape(self):
+        # [FUNCTION DOC] Checks MixtureSameFamily sample shapes for scalar, batched and
+        # multi-batched mixtures of univariate Normal and of Independent-Normal (event dim
+        # 1) components.
         normal_case_1d = MixtureSameFamily(
             Categorical(torch.rand(5)), Normal(torch.randn(5), torch.rand(5))
         )
@@ -2669,11 +2950,15 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_mixture_same_family_normal_log_prob(self):
+        # [FUNCTION DOC] Compares MixtureSameFamily(Categorical, Normal) log_prob with a scipy
+        # logsumexp mixture.
         probs = torch.rand(10, 5).softmax(dim=-1)
         loc = torch.randn(10, 5)
         scale = torch.rand(10, 5)
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the log-sum-exp of component logpdf
+            # plus log weights.
             p = probs[idx].cpu().numpy()
             m = loc[idx].cpu().numpy()
             s = scale[idx].cpu().numpy()
@@ -2689,11 +2974,15 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_mixture_same_family_binomial_log_prob(self):
+        # [FUNCTION DOC] Compares MixtureSameFamily(Categorical, Binomial) log_prob with a scipy
+        # logsumexp mixture.
         max_count = 20
         probs = torch.rand(10, 5).softmax(dim=-1)
         binom_probs = torch.rand(10, 5)
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the log-sum-exp of component
+            # binomial logpmf plus log weights.
             p = probs[idx].cpu().numpy()
             binom_p = binom_probs[idx].cpu().numpy()
             mix = scipy.stats.multinomial(1, p)
@@ -2710,17 +2999,25 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_mixture_same_family_sample(self):
+        # [FUNCTION DOC] Statistical test of MixtureSameFamily(Categorical, Normal) samples
+        # against a scipy-based reference mixture sampler.
         probs = torch.rand(5).softmax(dim=-1)
         loc = torch.randn(5)
         scale = torch.rand(5)
 
         class ScipyMixtureNormal:
+            # [CLASS DOC] HELPER: Reference mixture of normals sampled with scipy.
             def __init__(self, probs, mu, std):
+                # [FUNCTION DOC] HELPER: Stores mixture probabilities, means and
+                # standard deviations.
                 self.probs = probs
                 self.mu = mu
                 self.std = std
 
             def rvs(self, n_sample):
+                # [FUNCTION DOC] HELPER: Draws n_sample values by drawing every component and a
+                # one-hot component selection, returning the selected component sample per draw
+                # as an array.
                 comp_samples = [
                     scipy.stats.norm(m, s).rvs(n_sample)
                     for m, s in zip(self.mu, self.std)
@@ -2743,6 +3040,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_normal(self):
+        # [FUNCTION DOC] Normal checks: sample shapes, extreme-parameter samples, gradchecks,
+        # rsample gradients (loc ones, scale equal to the standard normal draw), log_prob
+        # against the analytic density, and forward AD of normal ops with zero tangent.
         loc = torch.randn(5, 5, requires_grad=True)
         scale = torch.randn(5, 5).abs().requires_grad_()
         loc_1d = torch.randn(1, requires_grad=True)
@@ -2781,6 +3081,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(z.size(), (5, 5))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the analytic normal log-density for
+            # the batch element.
             m = loc.view(-1)[idx]
             s = scale.view(-1)[idx]
             expected = math.exp(-((x - m) ** 2) / (2 * s**2)) / math.sqrt(
@@ -2797,6 +3099,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_normal_sample(self):
+        # [FUNCTION DOC] Statistical test of Normal samples against scipy norm over locs
+        # and scales.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for loc, scale in product([-1.0, 0.0, 1.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -2808,6 +3112,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_lowrank_multivariate_normal_shape(self):
+        # [FUNCTION DOC] LowRankMultivariateNormal shape and gradient checks (double precision):
+        # sample sizes for unbatched, batched and multi-batched means with unbatched and batched
+        # cov_factor/cov_diag and sample shapes (), (2,) and (2, 7), then gradchecks log_prob
+        # for three batch combinations.
         mean = torch.randn(5, 3, requires_grad=True)
         mean_no_batch = torch.randn(3, requires_grad=True)
         mean_multi_batch = torch.randn(6, 5, 3, requires_grad=True)
@@ -2906,6 +3214,12 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_lowrank_multivariate_normal_log_prob(self):
+        # [FUNCTION DOC] Compares LowRankMultivariateNormal log_prob with scipy
+        # multivariate_normal logpdf (mean squared error below 1e-3) using the covariance
+        # cov_factor times its transpose plus diag(cov_diag), then checks batched log_prob
+        # equals a stack of per-element unbatched distributions. Skipped without NumPy. The
+        # comment mentions scale_tril equivalence but only the factor/diag parametrization
+        # is exercised.
         mean = torch.randn(3, requires_grad=True)
         cov_factor = torch.randn(3, 1, requires_grad=True)
         cov_diag = torch.randn(3).abs().requires_grad_()
@@ -2950,6 +3264,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_lowrank_multivariate_normal_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0): LowRankMultivariateNormal samples match
+        # scipy multivariate_normal with the equivalent dense covariance.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         mean = torch.randn(5, requires_grad=True)
         cov_factor = torch.randn(5, 1, requires_grad=True)
@@ -2966,6 +3282,9 @@ class TestDistributions(DistributionsTestCase):
         )
 
     def test_lowrank_multivariate_normal_properties(self):
+        # [FUNCTION DOC] Checks LowRankMultivariateNormal properties (mean, variance,
+        # covariance_matrix, scale_tril, precision_matrix, entropy) equal those of a
+        # MultivariateNormal built from the equivalent dense covariance.
         loc = torch.randn(5)
         cov_factor = torch.randn(5, 2)
         cov_diag = torch.randn(5).abs()
@@ -2981,6 +3300,9 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_lowrank_multivariate_normal_moments(self):
+        # [FUNCTION DOC] With seed 0 draws 100000 rsamples from a LowRankMultivariateNormal and
+        # checks the empirical mean and variance match the distribution's mean and variance
+        # within tolerance.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         mean = torch.randn(5)
         cov_factor = torch.randn(5, 2)
@@ -2995,6 +3317,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_multivariate_normal_shape(self):
+        # [FUNCTION DOC] MultivariateNormal shape and gradient checks: sample sizes for
+        # unbatched, batched and multi-batched means with covariance, precision_matrix and
+        # scale_tril parametrizations and sample shapes (), (2,), (2, 7), then gradchecks
+        # log_prob for each parametrization using a custom gradcheck wrapper.
         mean = torch.randn(5, 3, requires_grad=True)
         mean_no_batch = torch.randn(3, requires_grad=True)
         mean_multi_batch = torch.randn(6, 5, 3, requires_grad=True)
@@ -3072,6 +3398,9 @@ class TestDistributions(DistributionsTestCase):
         def multivariate_normal_log_prob_gradcheck(
             mean, covariance=None, precision=None, scale_tril=None
         ):
+            # [FUNCTION DOC] HELPER: Draws a sample from MultivariateNormal built from mean and
+            # exactly one of covariance, precision, scale_tril, then runs gradcheck of log_prob
+            # with respect to the sample and all given parameters.
             mvn_samples = (
                 MultivariateNormal(mean, covariance, precision, scale_tril)
                 .sample()
@@ -3079,6 +3408,10 @@ class TestDistributions(DistributionsTestCase):
             )
 
             def gradcheck_func(samples, mu, sigma, prec, scale_tril):
+                # [FUNCTION DOC] HELPER: Function under gradcheck. Symmetrizes the covariance
+                # and precision (average with the transpose) and takes the lower triangle of
+                # scale_tril so that perturbations stay valid, then returns the
+                # MultivariateNormal log_prob of samples.
                 if sigma is not None:
                     sigma = 0.5 * (sigma + sigma.mT)  # Ensure symmetry of covariance
                 if prec is not None:
@@ -3105,12 +3438,18 @@ class TestDistributions(DistributionsTestCase):
 
     @set_default_dtype_if_supported(torch.double)
     def test_multivariate_normal_stable_with_precision_matrix(self):
+        # [FUNCTION DOC] Regression check that constructing a MultivariateNormal from an
+        # RBF-kernel precision matrix succeeds (no exception); no values are asserted.
         x = torch.randn(10)
         P = torch.exp(-((x - x.unsqueeze(-1)) ** 2))  # RBF kernel
         MultivariateNormal(x.new_zeros(10), precision_matrix=P)
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_multivariate_normal_log_prob(self):
+        # [FUNCTION DOC] Compares MultivariateNormal log_prob from covariance, precision and
+        # scale_tril parametrizations with scipy multivariate_normal logpdf (mean squared error
+        # below 1e-3), then verifies batched log_prob matches a stack of unbatched
+        # distributions. Skipped without NumPy.
         mean = torch.randn(3, requires_grad=True)
         tmp = torch.randn(3, 10)
         cov = (torch.matmul(tmp, tmp.t()) / tmp.size(-1)).requires_grad_()
@@ -3170,6 +3509,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_multivariate_normal_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) that MultivariateNormal samples match scipy
+        # multivariate_normal for covariance, precision and scale_tril parametrizations.
+        # KNOWN ISSUE: the failure message for the precision case labels the matrix as atol.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         mean = torch.randn(3, requires_grad=True)
         tmp = torch.randn(3, 10)
@@ -3205,6 +3547,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_multivariate_normal_properties(self):
+        # [FUNCTION DOC] Checks MultivariateNormal built from scale_tril: covariance_matrix
+        # equals scale_tril times its transpose, covariance times precision is the identity, and
+        # scale_tril equals the Cholesky factor of the covariance.
         loc = torch.randn(5)
         scale_tril = transform_to(constraints.lower_cholesky)(torch.randn(5, 5))
         m = MultivariateNormal(loc=loc, scale_tril=scale_tril)
@@ -3216,6 +3561,8 @@ class TestDistributions(DistributionsTestCase):
 
     @set_default_dtype_if_supported(torch.double)
     def test_multivariate_normal_moments(self):
+        # [FUNCTION DOC] With seed 0 draws 100000 rsamples and checks empirical mean and
+        # variance against the distribution's mean and variance.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         mean = torch.randn(5)
         scale_tril = transform_to(constraints.lower_cholesky)(torch.randn(5, 5))
@@ -3230,6 +3577,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_wishart_shape(self):
+        # [FUNCTION DOC] Wishart shape and gradient checks: sample sizes (event shape of two
+        # matrix dims) for unbatched, batched and multi-batched df with covariance, precision
+        # and scale_tril parametrizations and several sample shapes, then gradchecks log_prob
+        # for each. Mirrors the MultivariateNormal tests.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 3
 
@@ -3300,11 +3651,17 @@ class TestDistributions(DistributionsTestCase):
         def wishart_log_prob_gradcheck(
             df=None, covariance=None, precision=None, scale_tril=None
         ):
+            # [FUNCTION DOC] HELPER: Draws a Wishart sample from df and exactly one of
+            # covariance, precision, scale_tril and runs gradcheck of log_prob with respect to
+            # the sample and given parameters.
             wishart_samples = (
                 Wishart(df, covariance, precision, scale_tril).sample().requires_grad_()
             )
 
             def gradcheck_func(samples, nu, sigma, prec, scale_tril):
+                # [FUNCTION DOC] HELPER: Function under gradcheck. Symmetrizes covariance and
+                # precision, takes the lower triangle of scale_tril, and returns the Wishart
+                # log_prob of samples.
                 if sigma is not None:
                     sigma = 0.5 * (sigma + sigma.mT)  # Ensure symmetry of covariance
                 if prec is not None:
@@ -3329,6 +3686,9 @@ class TestDistributions(DistributionsTestCase):
 
     @skipMPS  # flaky failure
     def test_wishart_stable_with_precision_matrix(self):
+        # [FUNCTION DOC] Regression check (seed 0) that constructing a Wishart from an
+        # RBF-kernel precision matrix succeeds; no values are asserted. Skipped on MPS because
+        # of flakiness.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 10
         x = torch.randn(ndim)
@@ -3338,6 +3698,10 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     @set_default_dtype_if_supported(torch.double)
     def test_wishart_log_prob(self):
+        # [FUNCTION DOC] Compares Wishart log_prob from covariance, precision and scale_tril
+        # with scipy wishart logpdf (df shifted by one for scipy older than 1.7.0), then
+        # verifies batched log_prob equals a stack of unbatched distributions. Skipped
+        # without NumPy.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 3
         df = torch.rand([], requires_grad=True) + ndim - 1
@@ -3402,6 +3766,9 @@ class TestDistributions(DistributionsTestCase):
     @skipMPS  # flaky failure
     @set_default_dtype_if_supported(torch.double)
     def test_wishart_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) that Wishart samples from covariance,
+        # precision and scale_tril parametrizations match scipy wishart (df adjusted for old
+        # scipy). Skipped on MPS.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 3
         df = torch.rand([], requires_grad=True) + ndim - 1
@@ -3435,6 +3802,9 @@ class TestDistributions(DistributionsTestCase):
         )
 
     def test_wishart_properties(self):
+        # [FUNCTION DOC] Checks Wishart built from scale_tril: covariance_matrix equals
+        # scale_tril times its transpose, covariance times precision is the identity, and
+        # scale_tril equals the Cholesky factor of the covariance.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 5
         df = torch.rand([]) + ndim - 1
@@ -3447,6 +3817,9 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(m.scale_tril, torch.linalg.cholesky(m.covariance_matrix))
 
     def test_wishart_moments(self):
+        # [FUNCTION DOC] With seed 0 draws 900000 (ndim squared times 100000) rsamples from a 3
+        # by 3 Wishart and checks empirical mean and variance against the distribution's within
+        # absolute tolerance 0.5.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         ndim = 3
         df = torch.rand([]) + ndim - 1
@@ -3461,6 +3834,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_exponential(self):
+        # [FUNCTION DOC] Exponential checks: sample shapes, gradcheck, rsample gradient equal to
+        # minus the standard exponential draw over rate squared, log_prob against log rate minus
+        # rate times x, forward AD of exponential_, and mean/variance of exponential_ for
+        # several dtypes and rates.
         rate = torch.randn(5, 5).abs().requires_grad_()
         rate_1d = torch.randn(1).abs().requires_grad_()
         self.assertEqual(Exponential(rate).sample().size(), (5, 5))
@@ -3481,6 +3858,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(z.size(), (5, 5))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals log rate minus rate times x for the
+            # batch element.
             m = rate.view(-1)[idx]
             expected = math.log(m) - m * x
             self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -3489,6 +3868,9 @@ class TestDistributions(DistributionsTestCase):
         self._check_forward_ad(lambda x: x.exponential_())
 
         def mean_var(lambd, sample):
+            # [FUNCTION DOC] HELPER: Fills sample in place with exponential_ draws for rate
+            # lambd and asserts the empirical mean is about 1 over lambd and variance about 1
+            # over lambd squared.
             sample.exponential_(lambd)
             mean = sample.float().mean()
             var = sample.float().var()
@@ -3502,6 +3884,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_exponential_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of Exponential samples against scipy expon
+        # for several rates.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         for rate in [1e-5, 1.0, 10.0]:
             self._check_sampler_sampler(
@@ -3513,6 +3897,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_laplace(self):
+        # [FUNCTION DOC] Laplace checks: sample shapes, near-deterministic samples for tiny
+        # scale, gradchecks, rsample gradients (loc one, scale from the uniform draw) and
+        # log_prob against the analytic density.
         loc = torch.randn(5, 5, requires_grad=True)
         scale = torch.randn(5, 5).abs().requires_grad_()
         loc_1d = torch.randn(1, requires_grad=True)
@@ -3551,6 +3938,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(z.size(), (5, 5))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals minus log of twice the scale minus
+            # |x - loc| over scale.
             m = loc.view(-1)[idx]
             s = scale.view(-1)[idx]
             expected = -math.log(2 * s) - abs(x - m) / s
@@ -3561,6 +3950,8 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     @set_default_dtype_if_supported(torch.double)
     def test_laplace_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of Laplace samples against scipy laplace over
+        # locs and scales.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         for loc, scale in product([-1.0, 0.0, 1.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -3571,6 +3962,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_gamma_shape(self):
+        # [FUNCTION DOC] Gamma sample shapes for tensor and float parameters and log_prob
+        # against scipy gamma logpdf. Skipped without NumPy.
         alpha = torch.randn(2, 3).exp().requires_grad_()
         beta = torch.randn(2, 3).exp().requires_grad_()
         alpha_1d = torch.randn(1).exp().requires_grad_()
@@ -3583,6 +3976,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(Gamma(0.5, 0.5).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy gamma logpdf for the
+            # batch element's concentration and rate.
             a = alpha.view(-1)[idx].detach().cpu()
             b = beta.view(-1)[idx].detach().cpu()
             expected = scipy.stats.gamma.logpdf(x.cpu(), a, scale=1 / b)
@@ -3592,6 +3987,7 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_gamma_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) of Gamma samples against scipy gamma.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for alpha, beta in product([0.1, 1.0, 5.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -3602,6 +3998,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_gamma_tensor_sample(self):
+        # [FUNCTION DOC] Statistical test of Gamma with 1-element tensor parameters against
+        # scipy gamma, using a stricter failure_rate of 1e-4.
         set_rng_seed(0)
         for alpha, beta in product([0.1, 1.0, 5.0], [0.1, 1.0, 10.0]):
             a, b = (
@@ -3616,6 +4014,9 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_gamma_sample_generator(self):
+        # [FUNCTION DOC] Checks Gamma.sample accepts a generator argument: requested shapes are
+        # honored, sampling without generator works, equal seeds give equal samples and
+        # different seeds give different samples.
         gamma = Gamma(torch.tensor(2.0), torch.tensor(1.0))
         device = gamma.concentration.device
         # sampling with a generator honors the requested shape
@@ -3642,6 +4043,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_pareto(self):
+        # [FUNCTION DOC] Pareto checks: infinite mean and variance for alpha 0.5, sample shapes,
+        # and log_prob against scipy pareto logpdf.
         scale = torch.randn(2, 3).abs().requires_grad_()
         alpha = torch.randn(2, 3).abs().requires_grad_()
         scale_1d = torch.randn(1).abs().requires_grad_()
@@ -3656,6 +4059,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(Pareto(1.0, 1.0).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy pareto logpdf for the
+            # batch element.
             s = scale.view(-1)[idx].detach().cpu()
             a = alpha.view(-1)[idx].detach().cpu()
             expected = scipy.stats.pareto.logpdf(x.cpu(), a, scale=s)
@@ -3665,6 +4070,7 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_pareto_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of Pareto samples against scipy pareto.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         for scale, alpha in product([0.1, 1.0, 5.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -3675,6 +4081,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_generalized_pareto(self):
+        # [FUNCTION DOC] GeneralizedPareto sample shapes and log_prob against scipy
+        # genpareto logpdf.
         loc = torch.randn(2, 3).requires_grad_()
         scale = torch.randn(2, 3).abs().requires_grad_()
         concentration = torch.randn(2, 3).requires_grad_()
@@ -3698,6 +4106,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(GeneralizedPareto(1.0, 1.0, 1.0).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy genpareto logpdf for the
+            # batch element.
             l = loc.view(-1)[idx].detach().cpu()
             s = scale.view(-1)[idx].detach().cpu()
             c = concentration.view(-1)[idx].detach().cpu()
@@ -3708,6 +4118,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_generalized_pareto_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of GeneralizedPareto samples against scipy
+        # genpareto over loc, scale and concentration grids, with failure_rate 7e-4.
         set_rng_seed(1)  # see note [Randomized statistical tests]
         for loc, scale, concentration in product(
             [-1.0, 0.0, 1.0], [0.1, 1.0, 10.0], [-0.5, 0.0, 0.5]
@@ -3720,6 +4132,9 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_gumbel(self, device):
+        # [FUNCTION DOC] Gumbel checks: sample shapes, saturating cdf values in float32 (and
+        # float64 except on MPS) far in each tail with validation off, and log_prob against
+        # scipy gumbel_r logpdf. Takes the test device.
         loc = torch.randn(2, 3, requires_grad=True)
         scale = torch.randn(2, 3).abs().requires_grad_()
         loc_1d = torch.randn(1, requires_grad=True)
@@ -3773,6 +4188,8 @@ class TestDistributions(DistributionsTestCase):
             )
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy gumbel_r logpdf for the
+            # batch element.
             l = loc.view(-1)[idx].detach().cpu()
             s = scale.view(-1)[idx].detach().cpu()
             expected = scipy.stats.gumbel_r.logpdf(x.cpu(), loc=l, scale=s)
@@ -3783,6 +4200,8 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     @set_default_dtype_if_supported(torch.double)
     def test_gumbel_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of Gumbel samples against scipy gumbel_r over
+        # locs and scales.
         set_rng_seed(1)  # see note [Randomized statistical tests]
         for loc, scale in product([-5.0, -1.0, -0.1, 0.1, 1.0, 5.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -3792,6 +4211,7 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_kumaraswamy_shape(self):
+        # [FUNCTION DOC] Checks Kumaraswamy sample shapes for tensor and float concentrations.
         concentration1 = torch.randn(2, 3).abs().requires_grad_()
         concentration0 = torch.randn(2, 3).abs().requires_grad_()
         concentration1_1d = torch.randn(1).abs().requires_grad_()
@@ -3815,6 +4235,9 @@ class TestDistributions(DistributionsTestCase):
     # Kumaraswamy distribution is not implemented in SciPy
     # Hence these tests are explicit
     def test_kumaraswamy_mean_variance(self):
+        # [FUNCTION DOC] Compares Kumaraswamy mean and variance with empirical values from
+        # 60000 samples (maximum absolute error below 0.01, ignoring NaN), since SciPy has
+        # no Kumaraswamy.
         c1_1 = torch.randn(2, 3).abs().requires_grad_()
         c0_1 = torch.randn(2, 3).abs().requires_grad_()
         c1_2 = torch.randn(4).abs().requires_grad_()
@@ -3844,6 +4267,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_fishersnedecor(self):
+        # [FUNCTION DOC] FisherSnedecor checks: NaN mean/variance for small df, sample shapes
+        # and log_prob against scipy f logpdf. Skipped without NumPy.
         df1 = torch.randn(2, 3).abs().requires_grad_()
         df2 = torch.randn(2, 3).abs().requires_grad_()
         df1_1d = torch.randn(1).abs()
@@ -3858,6 +4283,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(FisherSnedecor(1.0, 1.0).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy f logpdf for the
+            # batch element.
             f1 = df1.view(-1)[idx].detach()
             f2 = df2.view(-1)[idx].detach()
             expected = scipy.stats.f.logpdf(x.cpu(), f1.cpu(), f2.cpu())
@@ -3868,6 +4295,8 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     @expectedFailureMPS
     def test_fishersnedecor_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of FisherSnedecor samples against scipy f
+        # over a grid of df values. Expected failure on MPS.
         set_rng_seed(1)  # see note [Randomized statistical tests]
         for df1, df2 in product([0.1, 0.5, 1.0, 5.0, 10.0], [0.1, 0.5, 1.0, 5.0, 10.0]):
             self._check_sampler_sampler(
@@ -3878,6 +4307,7 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_chi2_shape(self):
+        # [FUNCTION DOC] Chi2 sample shapes and log_prob against scipy chi2 logpdf.
         df = torch.randn(2, 3).exp().requires_grad_()
         df_1d = torch.randn(1).exp().requires_grad_()
         self.assertEqual(Chi2(df).sample().size(), (2, 3))
@@ -3891,6 +4321,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(Chi2(0.5).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy chi2 logpdf for the
+            # batch element.
             d = df.view(-1)[idx].detach()
             expected = scipy.stats.chi2.logpdf(x.cpu(), d.cpu())
             self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -3899,6 +4331,7 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_chi2_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) of Chi2 samples against scipy chi2.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for df in [0.1, 1.0, 5.0]:
             self._check_sampler_sampler(
@@ -3907,6 +4340,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_studentT(self):
+        # [FUNCTION DOC] StudentT checks: NaN mean/variance for df 1, infinite variance for df
+        # 2, sample shapes and log_prob against scipy t logpdf.
         df = torch.randn(2, 3).exp().requires_grad_()
         df_1d = torch.randn(1).exp().requires_grad_()
         self.assertTrue(is_all_nan(StudentT(1).mean))
@@ -3923,6 +4358,8 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(StudentT(0.5).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the scipy t logpdf for the
+            # batch element.
             d = df.view(-1)[idx].detach().cpu()
             expected = scipy.stats.t.logpdf(x.cpu(), d)
             self.assertEqual(log_prob, expected, atol=1e-3, rtol=0)
@@ -3933,6 +4370,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_studentT_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 11) of StudentT samples against scipy t over df,
+        # loc and scale grids.
         set_rng_seed(11)  # see Note [Randomized statistical tests]
         for df, loc, scale in product(
             [0.1, 1.0, 5.0, 10.0], [-1.0, 0.0, 1.0], [0.1, 1.0, 10.0]
@@ -3946,6 +4385,8 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     @expectedFailureMPS
     def test_studentT_log_prob(self):
+        # [FUNCTION DOC] Compares StudentT log_prob of 10 samples per df/loc/scale combination
+        # with scipy t logpdf within 1e-3.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         num_samples = 10
         for df, loc, scale in product(
@@ -3966,6 +4407,7 @@ class TestDistributions(DistributionsTestCase):
                 )
 
     def test_dirichlet_shape(self):
+        # [FUNCTION DOC] Checks Dirichlet sample shapes for 2-d and 1-d concentrations.
         alpha = torch.randn(2, 3).exp().requires_grad_()
         alpha_1d = torch.randn(4).exp().requires_grad_()
         self.assertEqual(Dirichlet(alpha).sample().size(), (2, 3))
@@ -3976,6 +4418,9 @@ class TestDistributions(DistributionsTestCase):
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     @set_default_dtype_if_supported(torch.double)
     def test_dirichlet_log_prob(self, device):
+        # [FUNCTION DOC] Compares Dirichlet log_prob of 10 samples with scipy dirichlet logpdf;
+        # on MPS samples are converted to double and renormalized because float32 sums deviate
+        # from 1 too much for scipy.
         num_samples = 10
         alpha = torch.exp(torch.randn(5))
         dist = Dirichlet(alpha)
@@ -3999,6 +4444,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_dirichlet_log_prob_zero(self):
+        # [FUNCTION DOC] Checks Dirichlet log_prob at a boundary point (x of 0 where alpha is 1)
+        # matches scipy and is not NaN.
         # Specifically test the special case where x=0 and alpha=1.  The PDF is
         # proportional to x**(alpha-1), which in this case works out to 0**0=1.
         # The log PDF of this term should therefore be 0.  However, it's easy
@@ -4015,6 +4462,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_dirichlet_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) of Dirichlet samples against scipy dirichlet
+        # (multivariate projection).
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         alpha = torch.exp(torch.randn(3))
         self._check_sampler_sampler(
@@ -4025,6 +4474,8 @@ class TestDistributions(DistributionsTestCase):
         )
 
     def test_dirichlet_mode(self):
+        # [FUNCTION DOC] Checks Dirichlet.mode on edge cases, including a zero entry, a single
+        # peak and the all-ones case which gives NaN.
         # Test a few edge cases for the Dirichlet distribution mode. This also covers beta distributions.
         concentrations_and_modes = [
             ([2, 2, 1], [0.5, 0.5, 0.0]),
@@ -4037,6 +4488,7 @@ class TestDistributions(DistributionsTestCase):
             self.assertEqual(dist.mode, torch.tensor(mode))
 
     def test_beta_shape(self):
+        # [FUNCTION DOC] Checks Beta sample shapes for tensor and float concentrations.
         con1 = torch.randn(2, 3).exp().requires_grad_()
         con0 = torch.randn(2, 3).exp().requires_grad_()
         con1_1d = torch.randn(4).exp().requires_grad_()
@@ -4050,6 +4502,10 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_beta_log_prob(self):
+        # [FUNCTION DOC] Draws 100 scalar Beta distributions with random log-normal
+        # concentrations, samples once from each and compares the summed log_prob with scipy
+        # beta logpdf within 1e-3. Uses the numpy global RNG (not seeded here). Skipped
+        # without NumPy.
         for _ in range(100):
             con1 = np.exp(np.random.normal())
             con0 = np.exp(np.random.normal())
@@ -4065,6 +4521,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_beta_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 1) of Beta samples against scipy beta over a
+        # concentration grid, plus a check that very small concentrations (1e-6) in float and
+        # double produce a finite positive sample.
         set_rng_seed(1)  # see Note [Randomized statistical tests]
         for con1, con0 in product([0.1, 1.0, 10.0], [0.1, 1.0, 10.0]):
             self._check_sampler_sampler(
@@ -4085,6 +4544,10 @@ class TestDistributions(DistributionsTestCase):
     @dtypesIfCUDA(torch.double)
     @dtypesIfXPU(torch.double)
     def test_beta_underflow(self, dtype, device):
+        # [FUNCTION DOC] Checks Beta with tiny concentrations (0.01) for the given dtype: 50000
+        # samples contain no exact 0 or 1 (no gamma underflow), and about half of the samples
+        # fall below 0.1 and half above 0.9 within a tolerance that is looser on cuda, xpu and
+        # mps. Takes dtype and device.
         # For low values of (alpha, beta), the gamma samples can underflow
         # with float32 and result in a spurious mode at 0.5. To prevent this,
         # torch._sample_dirichlet works with double precision for intermediate
@@ -4106,6 +4569,10 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_continuous_bernoulli(self):
+        # [FUNCTION DOC] ContinuousBernoulli checks: sample shapes, samples not requiring grad,
+        # gradcheck, log_prob against the analytic density with a Taylor-expanded normalizer
+        # near probs 0.5 (for probs and logits forms), and entropy against known values
+        # including the clamped probs 0 case.
         p = torch.tensor([0.7, 0.2, 0.4], requires_grad=True)
         r = torch.tensor(0.3, requires_grad=True)
         s = 0.3
@@ -4124,6 +4591,9 @@ class TestDistributions(DistributionsTestCase):
         self._gradcheck_log_prob(ContinuousBernoulli, (p,))
 
         def ref_log_prob(idx, val, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals the analytic continuous Bernoulli
+            # log-density: val log p plus (1 - val) log(1 - p) plus log normalizing constant
+            # (series expansion within 0.001 of 0.5, otherwise the atanh closed form).
             prob = p[idx]
             if prob > 0.499 and prob < 0.501:  # using default value of lim here
                 log_norm_const = (
@@ -4165,6 +4635,8 @@ class TestDistributions(DistributionsTestCase):
         )
 
     def test_continuous_bernoulli_3d(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli sample shapes for a (2, 3, 5)
+        # probability tensor.
         p = torch.full((2, 3, 5), 0.5).requires_grad_()
         self.assertEqual(ContinuousBernoulli(p).sample().size(), (2, 3, 5))
         self.assertEqual(
@@ -4173,7 +4645,14 @@ class TestDistributions(DistributionsTestCase):
         self.assertEqual(ContinuousBernoulli(p).sample((2,)).size(), (2, 2, 3, 5))
 
     def test_lkj_cholesky_log_prob(self):
+        # [FUNCTION DOC] Checks LKJCholesky log_prob for dims 2 to 4 with concentration 1: after
+        # subtracting the log absolute Jacobian determinant of the map from Cholesky to
+        # correlation entries, the density is the same for two samples (and 0.5 for dim 2), and
+        # log_prob of a sample with an extra row raises ValueError.
         def tril_cholesky_to_tril_corr(x):
+            # [FUNCTION DOC] HELPER: Converts a vector of strictly-lower-triangular Cholesky
+            # entries to the vector of strictly-lower-triangular correlation matrix entries
+            # (rebuilds the diagonal so rows have unit norm, multiplies by the transpose).
             x = vec_to_tril_matrix(x, -1)
             diag = (1 - (x * x).sum(-1)).sqrt().diag_embed()
             x = x + diag
@@ -4206,6 +4685,10 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_independent_shape(self):
+        # [FUNCTION DOC] For each example and each reinterpreted_batch_ndims, wraps the
+        # distribution in Independent and checks log_prob, sample, has_rsample,
+        # enumerate_support, mean, variance and entropy shapes (where implemented) against the
+        # base distribution with batch dims absorbed.
         for Dist, params in _get_examples():
             for param in params:
                 base_dist = Dist(**param)
@@ -4248,6 +4731,9 @@ class TestDistributions(DistributionsTestCase):
 
     @expectedFailureMPS
     def test_independent_expand(self):
+        # [FUNCTION DOC] For each example, reinterpreted ndims and expansion shapes, expands an
+        # Independent distribution and checks sample shape, log_prob equality with the
+        # unexpanded version, and event_shape and batch_shape of the result.
         for Dist, params in _get_examples():
             for param in params:
                 base_dist = Dist(**param)
@@ -4269,6 +4755,8 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_cdf_icdf_inverse(self):
+        # [FUNCTION DOC] For every example with both cdf and icdf implemented, checks
+        # icdf(cdf(x)) recovers 20 samples with relative error below 1e-4 (double precision).
         # Tests the invertibility property on the distributions
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
@@ -4295,6 +4783,8 @@ class TestDistributions(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_gamma_log_prob_at_boundary(self):
+        # [FUNCTION DOC] Checks Gamma log_prob at zero for concentration 0.5, 1 and 2 (infinity,
+        # 0, minus infinity) against both the expected values and scipy gamma logpdf.
         for concentration, log_prob in [(0.5, inf), (1, 0), (2, -inf)]:
             dist = Gamma(concentration, 1)
             scipy_dist = scipy.stats.gamma(concentration)
@@ -4304,6 +4794,9 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_cdf_log_prob(self):
+        # [FUNCTION DOC] For every example with cdf and log_prob implemented, checks the
+        # autograd derivative of the cdf at a sample equals the pdf (exp of log_prob).
+        # Parameters are detached first.
         # Tests if the differentiation of the CDF gives the PDF at a given value
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
@@ -4339,6 +4832,9 @@ class TestDistributions(DistributionsTestCase):
                 )
 
     def test_valid_parameter_broadcasting(self):
+        # [FUNCTION DOC] Checks parameter broadcasting for Normal, FisherSnedecor, Gamma,
+        # Gumbel, Kumaraswamy, Laplace, Pareto and StudentT: the sample size must equal the
+        # expected broadcast shape, with and without an extra leading sample_shape of (2,).
         # Test correct broadcasting of parameter sizes for distributions that have multiple
         # parameters.
         # example type (distribution instance, expected sample shape)
@@ -4509,6 +5005,9 @@ class TestDistributions(DistributionsTestCase):
             )
 
     def test_invalid_parameter_broadcasting(self):
+        # [FUNCTION DOC] Checks that constructing Normal, FisherSnedecor, Gumbel, Gamma,
+        # Kumaraswamy, Laplace, Pareto or StudentT from non-broadcastable parameter shapes
+        # raises RuntimeError.
         # invalid broadcasting cases; should throw error
         # example type (distribution class, distribution params)
         invalid_examples = [
@@ -4581,6 +5080,11 @@ class TestDistributions(DistributionsTestCase):
             self.assertRaises(RuntimeError, dist, **kwargs)
 
     def _test_discrete_distribution_mode(self, dist, sanitized_mode, batch_isfinite):
+        # [FUNCTION DOC] HELPER: Checks mode optimality for a discrete distribution: for
+        # neighbours of the mode (plus or minus one, or the next one-hot class for
+        # OneHotCategorical) that are in the support and finite, log_prob at the mode must not
+        # be smaller than at the neighbour (1e-12 tolerance). Entries without a valid neighbour
+        # are replaced by fresh samples and masked out.
         # We cannot easily check the mode for discrete distributions, but we can look left and right
         # to ensure the log probability is smaller than at the mode.
         for step in [-1, 1]:
@@ -4607,6 +5111,10 @@ class TestDistributions(DistributionsTestCase):
             )  # Allow up to 1e-12 rounding error.
 
     def _test_continuous_distribution_mode(self, dist, sanitized_mode, batch_isfinite):
+        # [FUNCTION DOC] HELPER: Checks mode optimality for a continuous distribution: perturbs
+        # the (sanitized) mode by 1e-5 uniform noise in the unconstrained space of the support
+        # (10 points), maps back and asserts log_prob at the mode is not lower, treating equal
+        # infinities as ties, for every batch element with a finite mode.
         # We perturb the mode in the unconstrained space and expect the log probability to decrease.
         num_points = 10
         transform = transform_to(dist.support)
@@ -4631,6 +5139,11 @@ class TestDistributions(DistributionsTestCase):
     @expectedFailureMPS
     @set_default_dtype_if_supported(torch.double)
     def test_mode(self):
+        # [FUNCTION DOC] For every example distribution checks Distribution.mode: classes
+        # without a mode and TransformedDistribution raise NotImplementedError; otherwise modes
+        # are either fully finite or fully non-finite per event, undefined modes are replaced by
+        # samples, the discrete or continuous optimality helper is run, and log_prob at the mode
+        # is never NaN.
         discrete_distributions = (
             Bernoulli,
             Binomial,
@@ -4688,8 +5201,16 @@ class TestDistributions(DistributionsTestCase):
 # TODO: Enable CUDA/XPU in `instantiate_device_type_tests` and remove the following class
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestDistributionsGPU(DistributionsTestCase):
+    # [CLASS DOC] Tests that need an accelerator (CUDA or XPU) for Binomial/Poisson/Gamma/Beta
+    # sampling. Kept separate from TestDistributions because those device types are excluded
+    # from the device-generic instantiation (see the TODO above). Tensors are placed on the
+    # module-level device_type.
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     def test_zero_excluded_binomial(self):
+        # [FUNCTION DOC] Accelerator version of the zero-excluded Binomial check: 1e8 samples at
+        # probs 0.9 and 0.1 stay within [0, 1] and 10000 samples at 0.5 contain more than 4000
+        # of each value. Raises AssertionError otherwise. Large memory use; skipped without CUDA
+        # or XPU.
         vals = Binomial(
             total_count=torch.tensor(1.0).to(device_type),
             probs=torch.tensor(0.9).to(device_type),
@@ -4718,6 +5239,8 @@ class TestDistributionsGPU(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     def test_torch_binomial_dtype_errors(self):
+        # [FUNCTION DOC] Accelerator version of the torch.binomial dtype check: integer count or
+        # prob dtypes raise ValueError with the floating-point message.
         dtypes = [torch.int, torch.long, torch.short]
         device = device_type
 
@@ -4744,6 +5267,8 @@ class TestDistributionsGPU(DistributionsTestCase):
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_poisson_gpu_sample(self):
+        # [FUNCTION DOC] Chi-square test of Poisson samples drawn on the accelerator (seed 1)
+        # for rates 0.12, 0.9 and 4. Skipped without CUDA/XPU or NumPy.
         set_rng_seed(1)
         for rate in [0.12, 0.9, 4.0]:
             self._check_sampler_discrete(
@@ -4756,6 +5281,8 @@ class TestDistributionsGPU(DistributionsTestCase):
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_gamma_gpu_shape(self):
+        # [FUNCTION DOC] Accelerator version of the Gamma shape and log_prob check against
+        # scipy gamma.
         alpha = torch.randn(2, 3).to(device_type).exp().requires_grad_()
         beta = torch.randn(2, 3).to(device_type).exp().requires_grad_()
         alpha_1d = torch.randn(1).to(device_type).exp().requires_grad_()
@@ -4768,6 +5295,8 @@ class TestDistributionsGPU(DistributionsTestCase):
         self.assertEqual(Gamma(0.5, 0.5).sample((1,)).size(), (1,))
 
         def ref_log_prob(idx, x, log_prob):
+            # [FUNCTION DOC] HELPER: Asserts log_prob equals scipy gamma logpdf for the
+            # batch element.
             a = alpha.view(-1)[idx].detach().cpu()
             b = beta.view(-1)[idx].detach().cpu()
             expected = scipy.stats.gamma.logpdf(x.cpu(), a, scale=1 / b)
@@ -4778,6 +5307,9 @@ class TestDistributionsGPU(DistributionsTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA not found")
     @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
     def test_gamma_gpu_sample(self):
+        # [FUNCTION DOC] Statistical test (seed 0) of Gamma samples drawn on CUDA with 1-element
+        # tensor parameters against scipy gamma (failure_rate 1e-4). Skipped without CUDA (XPU
+        # is not covered).
         set_rng_seed(0)
         for alpha, beta in product([0.1, 1.0, 5.0], [0.1, 1.0, 10.0]):
             a, b = (
@@ -4793,6 +5325,9 @@ class TestDistributionsGPU(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     def test_beta_underflow_gpu(self):
+        # [FUNCTION DOC] Accelerator version of the Beta underflow check using float64
+        # concentration 0.01: no exact 0 or 1 samples and about half the mass below 0.1 and
+        # above 0.9 within 0.12.
         set_rng_seed(1)
         num_samples = 50000
         conc = torch.tensor(1e-2, dtype=torch.float64).to(device_type)
@@ -4812,8 +5347,15 @@ class TestDistributionsGPU(DistributionsTestCase):
 # the reparameterization trick and do not need to be tested for accuracy.
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestRsample(DistributionsTestCase):
+    # [CLASS DOC] Tests the accuracy of custom reparameterized gradients (rsample) for Gamma,
+    # Chi2, Dirichlet and Beta by comparing autograd gradients to finite differences of the
+    # scipy cdf along constant-cdf curves, and a Dirichlet tangent-field consistency check.
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_gamma(self):
+        # [FUNCTION DOC] Checks the Gamma rsample gradient wrt concentration for alphas 0.01 to
+        # 10000: 100 samples per alpha, gradient compared with minus d cdf/d alpha over pdf
+        # (finite differences with scipy) with maximum relative error below 5e-4. Skipped
+        # without NumPy.
         num_samples = 100
         for alpha in [1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]:
             alphas = torch.tensor(
@@ -4851,6 +5393,8 @@ class TestRsample(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_chi2(self):
+        # [FUNCTION DOC] Same as test_gamma for the Chi2 gradient wrt df (relative error
+        # below 1e-3).
         num_samples = 100
         for df in [1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]:
             dfs = torch.tensor(
@@ -4886,6 +5430,9 @@ class TestRsample(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_dirichlet_on_diagonal(self):
+        # [FUNCTION DOC] Checks the gradient of the first component of a Dirichlet rsample with
+        # respect to the first concentration against the Beta(alpha0, alpha1 plus alpha2) cdf
+        # finite difference, over a 3-value grid, with relative error below 1e-3.
         num_samples = 20
         grid = [1e-1, 1e0, 1e1]
         for a0, a1, a2 in product(grid, grid, grid):
@@ -4927,6 +5474,8 @@ class TestRsample(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_beta_wrt_alpha(self):
+        # [FUNCTION DOC] Checks the Beta rsample gradient with respect to concentration1 against
+        # finite differences of the scipy beta cdf over a grid (relative error below 5e-3).
         num_samples = 20
         grid = [1e-2, 1e-1, 1e0, 1e1, 1e2]
         for con1, con0 in product(grid, grid):
@@ -4967,6 +5516,8 @@ class TestRsample(DistributionsTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
     def test_beta_wrt_beta(self):
+        # [FUNCTION DOC] Same as test_beta_wrt_alpha but for the gradient with respect
+        # to concentration0.
         num_samples = 20
         grid = [1e-2, 1e-1, 1e0, 1e1, 1e2]
         for con1, con0 in product(grid, grid):
@@ -5004,6 +5555,9 @@ class TestRsample(DistributionsTestCase):
             )
 
     def test_dirichlet_multivariate(self):
+        # [FUNCTION DOC] Checks the Dirichlet rsample gradient with a loss on the third
+        # component around the critical alpha (0.25 times sqrt(5) minus one) against a
+        # hand-derived expected gradient within 0.002, using 100000 samples per shift.
         alpha_crit = 0.25 * (5.0**0.5 - 1.0)
         num_samples = 100000
         for shift in [-0.1, -0.05, -0.01, 0.0, 0.01, 0.05, 0.10]:
@@ -5036,11 +5590,19 @@ class TestRsample(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_dirichlet_tangent_field(self):
+        # [FUNCTION DOC] Checks that the Dirichlet reparameterization gradient field satisfies
+        # the continuity equation (log_prob derivative terms plus divergence of the tangent
+        # field, estimated with finite differences along the simplex) with error below 0.005,
+        # over a grid of alphas, in double precision. Also verifies the compute_v helper equals
+        # autograd gradients.
         num_samples = 20
         alpha_grid = [0.5, 1.0, 2.0]
 
         # v = dx/dalpha[0] is the reparameterized gradient aka tangent field.
         def compute_v(x, alpha):
+            # [FUNCTION DOC] HELPER: Builds the tangent field v (derivative of each coordinate
+            # of x wrt the first alpha) by calling _Dirichlet_backward with each unit vector of
+            # the three coordinates.
             return torch.stack(
                 [
                     _Dirichlet_backward(x, alpha, torch.eye(3, 3)[i].expand_as(x))[:, 0]
@@ -5098,13 +5660,23 @@ class TestRsample(DistributionsTestCase):
 
 
 class TestDistributionShapes(DistributionsTestCase):
+    # [CLASS DOC] Tests batch_shape, event_shape, sample, log_prob and entropy shapes for many
+    # distributions with scalar and tensor parameters. setUp defines scalar and tensor sample
+    # values (shapes (3, 2) and (3, 2, 3)) used to verify that log_prob accepts broadcastable
+    # values and raises ValueError for incompatible shapes.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp and stores scalar_sample (the integer 1),
+        # tensor_sample_1 (ones of shape 3 by 2) and tensor_sample_2 (ones of shape 3 by 2 by 3)
+        # for the shape tests.
         super().setUp()
         self.scalar_sample = 1
         self.tensor_sample_1 = torch.ones(3, 2)
         self.tensor_sample_2 = torch.ones(3, 2, 3)
 
     def test_entropy_shape(self):
+        # [FUNCTION DOC] For each example builds the distribution with validation off and checks
+        # entropy shape equals the batch shape (empty if scalar); distributions without entropy
+        # are skipped.
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
                 dist = Dist(validate_args=False, **param)
@@ -5119,6 +5691,9 @@ class TestDistributionShapes(DistributionsTestCase):
                     continue
 
     def test_bernoulli_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Bernoulli with scalar probs: empty batch/event shape, sample
+        # sizes, ValueError for a scalar log_prob argument, and log_prob sizes for the two
+        # tensor samples.
         bernoulli = Bernoulli(0.3)
         self.assertEqual(bernoulli._batch_shape, torch.Size())
         self.assertEqual(bernoulli._event_shape, torch.Size())
@@ -5133,6 +5708,9 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_bernoulli_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Bernoulli with a (3, 2) probs tensor: shapes, sample shape,
+        # log_prob sizes, ValueError for the incompatible (3, 2, 3) value and broadcasting for a
+        # (3, 1, 1) value.
         bernoulli = Bernoulli(torch.tensor([[0.6, 0.3], [0.6, 0.3], [0.6, 0.3]]))
         self.assertEqual(bernoulli._batch_shape, torch.Size((3, 2)))
         self.assertEqual(bernoulli._event_shape, torch.Size(()))
@@ -5147,6 +5725,7 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_geometric_shape_scalar_params(self):
+        # [FUNCTION DOC] Same as test_bernoulli_shape_scalar_params for Geometric.
         geometric = Geometric(0.3)
         self.assertEqual(geometric._batch_shape, torch.Size())
         self.assertEqual(geometric._event_shape, torch.Size())
@@ -5161,6 +5740,7 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_geometric_shape_tensor_params(self):
+        # [FUNCTION DOC] Same as test_bernoulli_shape_tensor_params for Geometric.
         geometric = Geometric(torch.tensor([[0.6, 0.3], [0.6, 0.3], [0.6, 0.3]]))
         self.assertEqual(geometric._batch_shape, torch.Size((3, 2)))
         self.assertEqual(geometric._event_shape, torch.Size(()))
@@ -5175,6 +5755,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_beta_shape_scalar_params(self):
+        # [FUNCTION DOC] Same as test_bernoulli_shape_scalar_params for Beta with
+        # scalar concentrations.
         dist = Beta(0.1, 0.1)
         self.assertEqual(dist._batch_shape, torch.Size())
         self.assertEqual(dist._event_shape, torch.Size())
@@ -5187,6 +5769,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_beta_shape_tensor_params(self):
+        # [FUNCTION DOC] Same as test_bernoulli_shape_tensor_params for Beta with (3,
+        # 2) concentrations.
         dist = Beta(
             torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
             torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]),
@@ -5202,6 +5786,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_binomial_shape(self):
+        # [FUNCTION DOC] Checks Binomial with scalar total_count and probs of shape (2,):
+        # shapes, sample sizes and ValueError for an incompatible value.
         dist = Binomial(10, torch.tensor([0.6, 0.3]))
         self.assertEqual(dist._batch_shape, torch.Size((2,)))
         self.assertEqual(dist._event_shape, torch.Size(()))
@@ -5211,6 +5797,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertRaises(ValueError, dist.log_prob, self.tensor_sample_2)
 
     def test_binomial_shape_vectorized_n(self):
+        # [FUNCTION DOC] Checks Binomial with tensor total_count (2, 3) and probs (3,): batch
+        # shape, sample sizes, log_prob sizes and ValueError for an incompatible value.
         dist = Binomial(
             torch.tensor([[10, 3, 1], [4, 8, 4]]), torch.tensor([0.6, 0.3, 0.1])
         )
@@ -5224,6 +5812,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertRaises(ValueError, dist.log_prob, self.tensor_sample_1)
 
     def test_multinomial_shape(self):
+        # [FUNCTION DOC] Checks Multinomial batch shape (3,) and event shape (2,): sample sizes,
+        # log_prob sizes, ValueError for an incompatible value and broadcasting.
         dist = Multinomial(10, torch.tensor([[0.6, 0.3], [0.6, 0.3], [0.6, 0.3]]))
         self.assertEqual(dist._batch_shape, torch.Size((3,)))
         self.assertEqual(dist._event_shape, torch.Size((2,)))
@@ -5234,6 +5824,9 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(dist.log_prob(torch.ones(3, 1, 2)).size(), torch.Size((3, 3)))
 
     def test_categorical_shape(self):
+        # [FUNCTION DOC] Checks Categorical shapes for unbatched, 1-batch and 2-d batched probs,
+        # including sample sizes, ValueError for scalar or incompatible log_prob values and
+        # broadcast results.
         # unbatched
         dist = Categorical(torch.tensor([0.6, 0.3, 0.1]))
         self.assertEqual(dist._batch_shape, torch.Size(()))
@@ -5275,6 +5868,10 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(dist.log_prob(torch.ones(3, 1)).size(), torch.Size((3, 3)))
 
     def test_one_hot_categorical_shape(self):
+        # [FUNCTION DOC] Checks OneHotCategorical shapes for unbatched (event shape (3,))
+        # and batched probs: sample sizes, ValueError for non-one-hot or mismatched values,
+        # and log_prob sizes for one-hot samples, enumerate_support output and
+        # identity-matrix values.
         # unbatched
         dist = OneHotCategorical(torch.tensor([0.6, 0.3, 0.1]))
         self.assertEqual(dist._batch_shape, torch.Size(()))
@@ -5313,6 +5910,9 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(dist.log_prob(sample).size(), torch.Size((3, 3)))
 
     def test_cauchy_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Cauchy with scalar parameters: empty batch/event shape,
+        # sample sizes, ValueError for a scalar log_prob argument and log_prob sizes for the
+        # tensor samples.
         cauchy = Cauchy(0, 1)
         self.assertEqual(cauchy._batch_shape, torch.Size())
         self.assertEqual(cauchy._event_shape, torch.Size())
@@ -5327,6 +5927,9 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_cauchy_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Cauchy with parameters of shape (2,): shapes, sample sizes,
+        # ValueError for the incompatible (3, 2, 3) value and broadcasting of a (2, 1) value to
+        # (2, 2).
         cauchy = Cauchy(torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(cauchy._batch_shape, torch.Size((2,)))
         self.assertEqual(cauchy._event_shape, torch.Size(()))
@@ -5341,6 +5944,7 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(cauchy.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_halfcauchy_shape_scalar_params(self):
+        # [FUNCTION DOC] Same as test_cauchy_shape_scalar_params for HalfCauchy.
         halfcauchy = HalfCauchy(1)
         self.assertEqual(halfcauchy._batch_shape, torch.Size())
         self.assertEqual(halfcauchy._event_shape, torch.Size())
@@ -5357,6 +5961,7 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_halfcauchy_shape_tensor_params(self):
+        # [FUNCTION DOC] Same as test_cauchy_shape_tensor_params for HalfCauchy.
         halfcauchy = HalfCauchy(torch.tensor([1.0, 1.0]))
         self.assertEqual(halfcauchy._batch_shape, torch.Size((2,)))
         self.assertEqual(halfcauchy._event_shape, torch.Size(()))
@@ -5373,6 +5978,9 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_dirichlet_shape(self):
+        # [FUNCTION DOC] Checks Dirichlet with a (3, 2) concentration: batch shape (3,), event
+        # shape (2,), sample sizes, log_prob on normalized simplex values, ValueError for an
+        # incompatible value and broadcasting of a (3, 1, 2) simplex value to (3, 3).
         dist = Dirichlet(torch.tensor([[0.6, 0.3], [1.6, 1.3], [2.6, 2.3]]))
         self.assertEqual(dist._batch_shape, torch.Size((3,)))
         self.assertEqual(dist._event_shape, torch.Size((2,)))
@@ -5388,6 +5996,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(dist.log_prob(simplex_sample).size(), torch.Size((3, 3)))
 
     def test_mixture_same_family_shape(self):
+        # [FUNCTION DOC] Checks MixtureSameFamily of a Categorical and Normal: scalar batch and
+        # event shape, sample sizes and log_prob sizes for the two tensor samples.
         dist = MixtureSameFamily(
             Categorical(torch.rand(5)), Normal(torch.randn(5), torch.rand(5))
         )
@@ -5401,6 +6011,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_gamma_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Gamma with scalar parameters: shapes, sample sizes and log_prob
+        # sizes (a scalar value is accepted and gives an empty result).
         gamma = Gamma(1, 1)
         self.assertEqual(gamma._batch_shape, torch.Size())
         self.assertEqual(gamma._event_shape, torch.Size())
@@ -5415,6 +6027,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_gamma_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Gamma with parameters of shape (2,): shapes, sample sizes,
+        # log_prob sizes, ValueError for the incompatible value and broadcasting.
         gamma = Gamma(torch.tensor([1.0, 1.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(gamma._batch_shape, torch.Size((2,)))
         self.assertEqual(gamma._event_shape, torch.Size(()))
@@ -5427,6 +6041,7 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(gamma.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_chi2_shape_scalar_params(self):
+        # [FUNCTION DOC] Same as test_gamma_shape_scalar_params for Chi2.
         chi2 = Chi2(1)
         self.assertEqual(chi2._batch_shape, torch.Size())
         self.assertEqual(chi2._event_shape, torch.Size())
@@ -5439,6 +6054,7 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_chi2_shape_tensor_params(self):
+        # [FUNCTION DOC] Same as test_gamma_shape_tensor_params for Chi2.
         chi2 = Chi2(torch.tensor([1.0, 1.0]))
         self.assertEqual(chi2._batch_shape, torch.Size((2,)))
         self.assertEqual(chi2._event_shape, torch.Size(()))
@@ -5449,6 +6065,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(chi2.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_studentT_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks StudentT with a scalar df: shapes, sample sizes, ValueError for
+        # a scalar log_prob argument and log_prob sizes for the tensor samples.
         st = StudentT(1)
         self.assertEqual(st._batch_shape, torch.Size())
         self.assertEqual(st._event_shape, torch.Size())
@@ -5461,6 +6079,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_studentT_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks StudentT with df of shape (2,): shapes, sample sizes, log_prob
+        # sizes, ValueError for the incompatible value and broadcasting.
         st = StudentT(torch.tensor([1.0, 1.0]))
         self.assertEqual(st._batch_shape, torch.Size((2,)))
         self.assertEqual(st._event_shape, torch.Size(()))
@@ -5471,6 +6091,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(st.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_pareto_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Pareto with scalar parameters: shapes, sample sizes and log_prob
+        # sizes (values are shifted by one to lie inside the support).
         pareto = Pareto(1, 1)
         self.assertEqual(pareto._batch_shape, torch.Size())
         self.assertEqual(pareto._event_shape, torch.Size())
@@ -5484,6 +6106,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_gumbel_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Gumbel with scalar parameters: shapes, sample sizes and
+        # log_prob sizes.
         gumbel = Gumbel(1, 1)
         self.assertEqual(gumbel._batch_shape, torch.Size())
         self.assertEqual(gumbel._event_shape, torch.Size())
@@ -5497,6 +6121,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_kumaraswamy_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Kumaraswamy with scalar parameters: shapes, sample sizes and
+        # log_prob sizes.
         kumaraswamy = Kumaraswamy(1, 1)
         self.assertEqual(kumaraswamy._batch_shape, torch.Size())
         self.assertEqual(kumaraswamy._event_shape, torch.Size())
@@ -5510,6 +6136,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_vonmises_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks VonMises with parameters of shape (2,): shapes, sample sizes and
+        # log_prob sizes including broadcasting of a (2, 1) value.
         von_mises = VonMises(torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(von_mises._batch_shape, torch.Size((2,)))
         self.assertEqual(von_mises._event_shape, torch.Size(()))
@@ -5525,6 +6153,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_vonmises_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks VonMises with scalar parameters: shapes, sample sizes and
+        # log_prob sizes.
         von_mises = VonMises(0.0, 1.0)
         self.assertEqual(von_mises._batch_shape, torch.Size())
         self.assertEqual(von_mises._event_shape, torch.Size())
@@ -5540,6 +6170,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_weibull_scale_scalar_params(self):
+        # [FUNCTION DOC] Checks Weibull (scale and concentration scalars): shapes, sample sizes
+        # and log_prob sizes.
         weibull = Weibull(1, 1)
         self.assertEqual(weibull._batch_shape, torch.Size())
         self.assertEqual(weibull._event_shape, torch.Size())
@@ -5553,6 +6185,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_wishart_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Wishart with scalar df and a 1 by 1 scale matrix: empty batch
+        # shape, event shape (1, 1), sample sizes and ValueError for a scalar log_prob argument.
         wishart = Wishart(torch.tensor(1), torch.tensor([[1.0]]))
         self.assertEqual(wishart._batch_shape, torch.Size())
         self.assertEqual(wishart._event_shape, torch.Size((1, 1)))
@@ -5561,6 +6195,9 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertRaises(ValueError, wishart.log_prob, self.scalar_sample)
 
     def test_wishart_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Wishart with df of shape (2,) and a batch of 1 by 1 matrices:
+        # batch shape (2,), event shape (1, 1), sample sizes, ValueError for an incompatible
+        # value and a (2, 1, 1) value giving a (2,) log_prob.
         wishart = Wishart(torch.tensor([1.0, 1.0]), torch.tensor([[[1.0]], [[1.0]]]))
         self.assertEqual(wishart._batch_shape, torch.Size((2,)))
         self.assertEqual(wishart._event_shape, torch.Size((1, 1)))
@@ -5570,6 +6207,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(wishart.log_prob(torch.ones(2, 1, 1)).size(), torch.Size((2,)))
 
     def test_normal_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Normal with scalar parameters: shapes, sample sizes, ValueError
+        # for a scalar log_prob argument and log_prob sizes for the tensor samples.
         normal = Normal(0, 1)
         self.assertEqual(normal._batch_shape, torch.Size())
         self.assertEqual(normal._event_shape, torch.Size())
@@ -5584,6 +6223,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_normal_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Normal with parameters of shape (2,): shapes, sample sizes,
+        # log_prob sizes, ValueError for the incompatible value and broadcasting.
         normal = Normal(torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(normal._batch_shape, torch.Size((2,)))
         self.assertEqual(normal._event_shape, torch.Size(()))
@@ -5596,6 +6237,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(normal.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_uniform_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Uniform with scalar bounds: shapes, sample sizes, ValueError for
+        # a scalar log_prob argument and log_prob sizes for the tensor samples.
         uniform = Uniform(0, 1)
         self.assertEqual(uniform._batch_shape, torch.Size())
         self.assertEqual(uniform._event_shape, torch.Size())
@@ -5610,6 +6253,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_uniform_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Uniform with bounds of shape (2,): shapes, sample sizes,
+        # log_prob sizes, ValueError for the incompatible value and broadcasting.
         uniform = Uniform(torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(uniform._batch_shape, torch.Size((2,)))
         self.assertEqual(uniform._event_shape, torch.Size(()))
@@ -5624,6 +6269,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(uniform.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_exponential_shape_scalar_param(self):
+        # [FUNCTION DOC] Checks Exponential with a scalar rate: shapes, sample sizes, ValueError
+        # for a scalar log_prob argument and log_prob sizes for the tensor samples.
         expon = Exponential(1.0)
         self.assertEqual(expon._batch_shape, torch.Size())
         self.assertEqual(expon._event_shape, torch.Size())
@@ -5638,6 +6285,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_exponential_shape_tensor_param(self):
+        # [FUNCTION DOC] Checks Exponential with rate of shape (2,): shapes, sample sizes,
+        # log_prob sizes, ValueError for the incompatible value and a (2, 2) value.
         expon = Exponential(torch.tensor([1.0, 1.0]))
         self.assertEqual(expon._batch_shape, torch.Size((2,)))
         self.assertEqual(expon._event_shape, torch.Size(()))
@@ -5650,6 +6299,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(expon.log_prob(torch.ones(2, 2)).size(), torch.Size((2, 2)))
 
     def test_laplace_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks Laplace with scalar parameters: shapes, sample sizes, ValueError
+        # for a scalar log_prob argument and log_prob sizes for the tensor samples.
         laplace = Laplace(0, 1)
         self.assertEqual(laplace._batch_shape, torch.Size())
         self.assertEqual(laplace._event_shape, torch.Size())
@@ -5664,6 +6315,8 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_laplace_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks Laplace with parameters of shape (2,): shapes, sample sizes,
+        # log_prob sizes, ValueError for the incompatible value and broadcasting.
         laplace = Laplace(torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0]))
         self.assertEqual(laplace._batch_shape, torch.Size((2,)))
         self.assertEqual(laplace._event_shape, torch.Size(()))
@@ -5676,6 +6329,8 @@ class TestDistributionShapes(DistributionsTestCase):
         self.assertEqual(laplace.log_prob(torch.ones(2, 1)).size(), torch.Size((2, 2)))
 
     def test_continuous_bernoulli_shape_scalar_params(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli with scalar probs: shapes, sample sizes,
+        # ValueError for a scalar log_prob argument and log_prob sizes for the tensor samples.
         continuous_bernoulli = ContinuousBernoulli(0.3)
         self.assertEqual(continuous_bernoulli._batch_shape, torch.Size())
         self.assertEqual(continuous_bernoulli._event_shape, torch.Size())
@@ -5692,6 +6347,9 @@ class TestDistributionShapes(DistributionsTestCase):
         )
 
     def test_continuous_bernoulli_shape_tensor_params(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli with a (3, 2) probs tensor: shapes, sample
+        # sizes, log_prob sizes, ValueError for the incompatible value and broadcasting of a (3,
+        # 1, 1) value.
         continuous_bernoulli = ContinuousBernoulli(
             torch.tensor([[0.6, 0.3], [0.6, 0.3], [0.6, 0.3]])
         )
@@ -5715,6 +6373,9 @@ class TestDistributionShapes(DistributionsTestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_mixture_same_family_mean_shape(self):
+        # [FUNCTION DOC] Checks that the mean of a MixtureSameFamily whose mixture has batch
+        # shape (3, 1) and components have batch shape (3, 3) has two dimensions (the mixture
+        # dimension is reduced over the component dimension).
         mix_distribution = Categorical(torch.ones([3, 1, 3]))
         component_distribution = Normal(torch.zeros([3, 3, 3]), torch.ones([3, 3, 3]))
         gmm = MixtureSameFamily(mix_distribution, component_distribution)
@@ -5723,11 +6384,28 @@ class TestDistributionShapes(DistributionsTestCase):
 
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestKL(DistributionsTestCase):
+    # [CLASS DOC] Tests torch.distributions.kl_divergence. setUp builds pairs of distributions
+    # (via pairwise, so every parameter combination is covered) into finite_examples (KL must
+    # match a Monte Carlo estimate or exponential-family formula) and infinite_examples (KL must
+    # be infinity because of support mismatch), plus Monte Carlo settings: precision 0.1, up to
+    # 1e7 samples in batches of 1e4.
     def setUp(self):
+        # [FUNCTION DOC] Builds the KL test fixtures. Defines a local Binomial subclass with
+        # total_count 30, creates pairwise distributions for many families (Bernoulli, Beta,
+        # Categorical, Cauchy, Chi2, Dirichlet, Exponential, Gamma, Gumbel, Laplace, LogNormal,
+        # Normal, Pareto, Poisson, Uniform variants, ContinuousBernoulli and others), and
+        # stores self.precision, self.max_samples, self.samples_per_batch, self.finite_examples
+        # (list of pair-of-pairs) and self.infinite_examples (list of single distribution
+        # pairs). The Pareto versus Normal pair is intentionally excluded because of the Monte
+        # Carlo variance.
         super().setUp()
 
         class Binomial30(Binomial):
+            # [CLASS DOC] HELPER: Binomial subclass with fixed total_count 30 so pairwise can
+            # build it from probs only.
             def __init__(self, probs):
+                # [FUNCTION DOC] HELPER: Initializes Binomial with total_count 30 and the
+                # given probs.
                 super().__init__(30, probs)
 
         # These are pairs of distributions with 4 x 4 parameters as specified.
@@ -5926,6 +6604,10 @@ class TestKL(DistributionsTestCase):
         ]
 
     def test_kl_monte_carlo(self):
+        # [FUNCTION DOC] For each finite example pair, compares the analytic kl_divergence with
+        # a Monte Carlo estimate (mean of log_prob difference over samples from p, drawing
+        # batches until the relative error ignoring NaN is below self.precision or max_samples
+        # is reached) and asserts the final error is below self.precision. Seed 0.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for (p, _), (_, q) in self.finite_examples:
             actual = kl_divergence(p, q)
@@ -5954,6 +6636,10 @@ class TestKL(DistributionsTestCase):
     # Multivariate normal has a separate Monte Carlo based test due to the requirement of random generation of
     # positive (semi) definite matrices. n is set to 5, but can be increased during testing.
     def test_kl_multivariate_normal(self):
+        # [FUNCTION DOC] Monte Carlo check of kl_divergence between 5 random pairs of 4-d
+        # MultivariateNormal distributions (random lower-triangular scales) against the
+        # estimator, with the same batched stopping rule and precision as test_kl_monte_carlo.
+        # Seed 0.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         n = 5  # Number of tests for multivariate_normal
         for i in range(n):
@@ -5988,6 +6674,8 @@ class TestKL(DistributionsTestCase):
             )
 
     def test_kl_multivariate_normal_batched(self):
+        # [FUNCTION DOC] Checks batched MultivariateNormal KL (7 batches of dim 3) equals the
+        # stack of per-batch unbatched KL values.
         b = 7  # Number of batches
         loc = [torch.randn(b, 3) for _ in range(2)]
         scale_tril = [
@@ -6010,6 +6698,8 @@ class TestKL(DistributionsTestCase):
         self.assertEqual(expected_kl, actual_kl)
 
     def test_kl_multivariate_normal_batched_broadcasted(self):
+        # [FUNCTION DOC] Like the batched KL test but q has an unbatched scale_tril that must
+        # broadcast against the batched p; compares with the stacked per-batch result.
         b = 7  # Number of batches
         loc = [torch.randn(b, 3) for _ in range(2)]
         scale_tril = [
@@ -6032,6 +6722,10 @@ class TestKL(DistributionsTestCase):
         self.assertEqual(expected_kl, actual_kl)
 
     def test_kl_lowrank_multivariate_normal(self):
+        # [FUNCTION DOC] Checks KL between LowRankMultivariateNormal pairs, and mixed
+        # low-rank/full pairs in both orders, against KL between the equivalent dense
+        # MultivariateNormal distributions (5 random instances, seed 0, maximum absolute error
+        # below self.precision).
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         n = 5  # Number of tests for lowrank_multivariate_normal
         for i in range(n):
@@ -6094,6 +6788,8 @@ class TestKL(DistributionsTestCase):
             )
 
     def test_kl_lowrank_multivariate_normal_batched(self):
+        # [FUNCTION DOC] Checks batched LowRankMultivariateNormal KL (7 batches) equals the
+        # stack of per-batch KL values.
         b = 7  # Number of batches
         loc = [torch.randn(b, 3) for _ in range(2)]
         cov_factor = [torch.randn(b, 3, 2) for _ in range(2)]
@@ -6120,6 +6816,9 @@ class TestKL(DistributionsTestCase):
         self.assertEqual(expected_kl, actual_kl)
 
     def test_kl_exponential_family(self):
+        # [FUNCTION DOC] For same-type ExponentialFamily pairs from
+        # finite_examples checks kl_divergence equals the generic Bregman
+        # divergence implementation _kl_expfamily_expfamily.
         for (p, _), (_, q) in self.finite_examples:
             if type(p) is type(q) and issubclass(type(p), ExponentialFamily):
                 actual = kl_divergence(p, q)
@@ -6138,6 +6837,8 @@ class TestKL(DistributionsTestCase):
                 )
 
     def test_kl_infinite(self):
+        # [FUNCTION DOC] Asserts kl_divergence is infinity for every pair in infinite_examples
+        # (supports not contained or incompatible parameters).
         for p, q in self.infinite_examples:
             self.assertTrue(
                 (kl_divergence(p, q) == inf).all(),
@@ -6145,6 +6846,9 @@ class TestKL(DistributionsTestCase):
             )
 
     def test_kl_edgecases(self):
+        # [FUNCTION DOC] Checks KL edge cases equal 0: identical degenerate Bernoulli (probs 0
+        # and 1), identical Categorical with a zero probability, and Uniform(0, 1) versus
+        # Beta(1, 1).
         self.assertEqual(kl_divergence(Bernoulli(0), Bernoulli(0)), 0)
         self.assertEqual(kl_divergence(Bernoulli(1), Bernoulli(1)), 0)
         self.assertEqual(
@@ -6157,6 +6861,8 @@ class TestKL(DistributionsTestCase):
         self.assertEqual(kl_divergence(Uniform(0, 1), Beta(1, 1)), 0)
 
     def test_kl_shape(self):
+        # [FUNCTION DOC] For every example whose kl_divergence(dist, dist) is implemented,
+        # asserts the result shape equals the distribution batch shape.
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
                 dist = Dist(**param)
@@ -6178,6 +6884,9 @@ class TestKL(DistributionsTestCase):
                 )
 
     def test_kl_transformed(self):
+        # [FUNCTION DOC] Regression test for gh-34859: KL between an Independent Normal and
+        # itself, and between an affine TransformedDistribution of it and itself, has the batch
+        # shape (2,).
         # Regression test for https://github.com/pytorch/pytorch/issues/34859
         scale = torch.ones(2, 3)
         loc = torch.zeros(2, 3)
@@ -6191,6 +6900,9 @@ class TestKL(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_entropy_monte_carlo(self):
+        # [FUNCTION DOC] For every example with an implemented entropy, compares the analytic
+        # entropy with the negative mean log_prob over 60000 samples (atol 0.2; infinite Monte
+        # Carlo entries are replaced by the analytic value). Seed 0, double precision.
         set_rng_seed(0)  # see Note [Randomized statistical tests]
         for Dist, params in _get_examples():
             for i, param in enumerate(params):
@@ -6220,6 +6932,9 @@ class TestKL(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_entropy_exponential_family(self):
+        # [FUNCTION DOC] For ExponentialFamily examples, checks the distribution's entropy
+        # equals the generic ExponentialFamily.entropy (Bregman divergence) implementation;
+        # either side raising NotImplementedError skips the case.
         for Dist, params in _get_examples():
             if not issubclass(Dist, ExponentialFamily):
                 continue
@@ -6248,7 +6963,15 @@ class TestKL(DistributionsTestCase):
 
 
 class TestConstraints(DistributionsTestCase):
+    # [CLASS DOC] Tests that distribution argument constraints and supports are consistent with
+    # the example parameters and samples.
     def test_params_constraints(self):
+        # [FUNCTION DOC] For each example and each parameter in arg_constraints: asserts the
+        # value has at least the constraint's event_dim dimensions, that its batch shape
+        # broadcasts with the distribution batch_shape, and (for non-dependent constraints) that
+        # the value satisfies the constraint. Scalars are wrapped in tensors, and probs of
+        # categorical-type distributions are normalized. Parameters without a constraint entry
+        # are ignored.
         normalize_probs_dists = (
             Categorical,
             Multinomial,
@@ -6286,6 +7009,9 @@ class TestConstraints(DistributionsTestCase):
                     self.assertTrue(constraint.check(value).all(), msg=message)
 
     def test_support_constraints(self):
+        # [FUNCTION DOC] For each example asserts the class support is a Constraint, and that a
+        # sample satisfies the instance support with the constraint event_dim equal to the event
+        # rank and a check result shape equal to batch_shape.
         for Dist, params in _get_examples():
             self.assertIsInstance(Dist.support, Constraint)
             for i, param in enumerate(params):
@@ -6305,6 +7031,9 @@ class TestConstraints(DistributionsTestCase):
 
 @skipIfTorchDynamo("Not a TorchDynamo suitable test")
 class TestNumericalStability(DistributionsTestCase):
+    # [CLASS DOC] Tests log_prob values and gradients at numerical extremes
+    # (zero/one probabilities, huge logits) for Bernoulli, Categorical, Multinomial
+    # and ContinuousBernoulli.
     def _test_pdf_score(
         self,
         dist_class,
@@ -6315,6 +7044,10 @@ class TestNumericalStability(DistributionsTestCase):
         expected_gradient=None,
         atol=1e-5,
     ):
+        # [FUNCTION DOC] HELPER: Builds dist_class from probs or logits (detached, requiring
+        # grad), evaluates log_prob at x, backpropagates the sum, and asserts the log_prob
+        # equals expected_value within atol and, if given, the parameter gradient equals
+        # expected_gradient within atol.
         if probs is not None:
             p = probs.detach().requires_grad_()
             dist = dist_class(p)
@@ -6340,6 +7073,9 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_bernoulli_gradient(self):
+        # [FUNCTION DOC] Checks Bernoulli log_prob and gradient for float and double tensors at
+        # probs 0, 1e-4 and 1 - 1e-4 and logits log(9999), including the clamped log(eps) value
+        # for probability 0.
         for tensor_type in [torch.FloatTensor, torch.DoubleTensor]:
             self._test_pdf_score(
                 dist_class=Bernoulli,
@@ -6390,6 +7126,8 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_bernoulli_with_logits_underflow(self):
+        # [FUNCTION DOC] Checks Bernoulli with very negative logits (about -1e38 or -1e308)
+        # gives log_prob 0 and gradient 0 at value 0 (no underflow problems).
         for tensor_type, lim in [
             (torch.FloatTensor, -1e38),
             (torch.DoubleTensor, -1e308),
@@ -6403,6 +7141,8 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_bernoulli_with_logits_overflow(self):
+        # [FUNCTION DOC] Checks Bernoulli with very large logits (about 1e38 or 1e308) gives
+        # log_prob 0 and gradient 0 at value 1 (no overflow problems).
         for tensor_type, lim in [
             (torch.FloatTensor, 1e38),
             (torch.DoubleTensor, 1e308),
@@ -6416,6 +7156,8 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_categorical_log_prob(self):
+        # [FUNCTION DOC] Checks OneHotCategorical with probs [0, 1] gives log_prob 0 for the
+        # one-hot sample [0, 1], in float and double.
         for dtype in [torch.float, torch.double]:
             p = torch.tensor([0, 1], dtype=dtype, requires_grad=True)
             categorical = OneHotCategorical(p)
@@ -6423,6 +7165,8 @@ class TestNumericalStability(DistributionsTestCase):
             self.assertEqual(log_pdf.item(), 0)
 
     def test_categorical_log_prob_with_logits(self):
+        # [FUNCTION DOC] Checks OneHotCategorical with logits [-inf, 0]: log_prob is 0 for the
+        # likely sample and minus infinity for the impossible one, in float and double.
         for dtype in [torch.float, torch.double]:
             p = torch.tensor([-inf, 0], dtype=dtype, requires_grad=True)
             categorical = OneHotCategorical(logits=p)
@@ -6432,6 +7176,8 @@ class TestNumericalStability(DistributionsTestCase):
             self.assertEqual(log_pdf_prob_0.item(), -inf)
 
     def test_multinomial_log_prob(self):
+        # [FUNCTION DOC] Checks Multinomial with probs [0, 1] and total_count 10 gives log_prob
+        # 0 for the sample [0, 10].
         for dtype in [torch.float, torch.double]:
             p = torch.tensor([0, 1], dtype=dtype, requires_grad=True)
             s = torch.tensor([0, 10], dtype=dtype)
@@ -6440,6 +7186,8 @@ class TestNumericalStability(DistributionsTestCase):
             self.assertEqual(log_pdf.item(), 0)
 
     def test_multinomial_log_prob_with_logits(self):
+        # [FUNCTION DOC] Checks Multinomial with logits [-inf, 0]: log_prob is 0 for [0, 10] and
+        # minus infinity for [10, 0].
         for dtype in [torch.float, torch.double]:
             p = torch.tensor([-inf, 0], dtype=dtype, requires_grad=True)
             multinomial = Multinomial(10, logits=p)
@@ -6449,7 +7197,15 @@ class TestNumericalStability(DistributionsTestCase):
             self.assertEqual(log_pdf_prob_0.item(), -inf)
 
     def test_continuous_bernoulli_gradient(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli log_prob values and gradients against
+        # analytic references for probs near 0.1, 0.4999 (Taylor-expansion region), 1e-4, 1 -
+        # 1e-4 and for logits, in float and double. The reference functions expec_val and
+        # expec_grad implement the closed forms.
         def expec_val(x, probs=None, logits=None):
+            # [FUNCTION DOC] HELPER: Reference ContinuousBernoulli log-likelihood at x for
+            # given probs or logits (logits converted to probs); raises AssertionError if
+            # neither is given. Uses the atanh normalizer outside (0.499, 0.501) and a series
+            # expansion inside.
             if probs is None and logits is None:
                 raise AssertionError("At least one of probs or logits must be provided")
             if logits is not None:
@@ -6468,6 +7224,9 @@ class TestNumericalStability(DistributionsTestCase):
             return log_lik
 
         def expec_grad(x, probs=None, logits=None):
+            # [FUNCTION DOC] HELPER: Reference derivative of the ContinuousBernoulli
+            # log-likelihood with respect to probs, or with respect to logits via the chain rule
+            # when logits are given; raises AssertionError if neither is provided.
             if probs is None and logits is None:
                 raise AssertionError("At least one of probs or logits must be provided")
             if logits is not None:
@@ -6558,6 +7317,9 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_continuous_bernoulli_with_logits_underflow(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli with extremely negative logits (-1e38 float,
+        # -1e308 double): log_prob at 0 equals the clamped-probability constant (2.76898 or
+        # 3.58473) and gradient 0.
         for tensor_type, lim, expected in [
             (torch.FloatTensor, -1e38, 2.76898),
             (torch.DoubleTensor, -1e308, 3.58473),
@@ -6571,6 +7333,8 @@ class TestNumericalStability(DistributionsTestCase):
             )
 
     def test_continuous_bernoulli_with_logits_overflow(self):
+        # [FUNCTION DOC] Checks ContinuousBernoulli with extremely positive logits: log_prob at
+        # 1 equals the clamped-probability constant (2.76898 or 3.58473) and gradient 0.
         for tensor_type, lim, expected in [
             (torch.FloatTensor, 1e38, 2.76898),
             (torch.DoubleTensor, 1e308, 3.58473),
@@ -6586,7 +7350,14 @@ class TestNumericalStability(DistributionsTestCase):
 
 # TODO: make this a pytest parameterized test
 class TestLazyLogitsInitialization(DistributionsTestCase):
+    # [CLASS DOC] Checks that distributions defined by either probs or logits (Categorical,
+    # OneHotCategorical, Bernoulli, Binomial, Multinomial) compute the other form lazily, i.e.
+    # the unused parameter is not stored in the instance dictionary after sampling, log_prob,
+    # enumerate_support and shape queries.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp and stores in self.examples the example entries of
+        # the five tested distribution classes (ContinuousBernoulli is excluded because its
+        # log_prob needs both forms).
         super().setUp()
         # ContinuousBernoulli is not tested because log_prob is not computed simply
         # from 'logits', but 'probs' is also needed
@@ -6598,6 +7369,10 @@ class TestLazyLogitsInitialization(DistributionsTestCase):
         ]
 
     def test_lazy_logits_initialization(self):
+        # [FUNCTION DOC] For the first probs-based example of each class, rebuilds the
+        # distribution from logits and checks the probs attribute is never
+        # materialized by log_prob of a sample, enumerate_support (NotImplementedError
+        # ignored) or batch_shape/event_shape.
         for Dist, params in self.examples:
             param = params[0].copy()
             if "probs" not in param:
@@ -6618,6 +7393,8 @@ class TestLazyLogitsInitialization(DistributionsTestCase):
             self.assertNotIn("probs", dist.__dict__, msg=message)
 
     def test_lazy_probs_initialization(self):
+        # [FUNCTION DOC] For the first example of each class built from probs, checks logits is
+        # never materialized by sample, enumerate_support or shape queries.
         for Dist, params in self.examples:
             param = params[0].copy()
             if "probs" not in param:
@@ -6638,7 +7415,17 @@ class TestLazyLogitsInitialization(DistributionsTestCase):
 @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
 @skipIfTorchDynamo("FIXME: Tries to trace through SciPy and fails")
 class TestAgainstScipy(DistributionsTestCase):
+    # [CLASS DOC] Compares mean, variance, stddev, cdf and icdf of torch distributions with
+    # equivalent scipy frozen distributions built from the same random double-precision
+    # parameters. The class is skipped without NumPy and under TorchDynamo.
     def setUp(self):
+        # [FUNCTION DOC] Builds self.distribution_pairs: a list of (torch distribution, scipy
+        # distribution) pairs for Bernoulli, Beta, Binomial, Cauchy, Dirichlet, Exponential,
+        # FisherSnedecor, Gamma, Geometric, Gumbel, GeneralizedPareto, HalfCauchy, HalfNormal,
+        # InverseGamma, Laplace, LogNormal, LowRankMultivariateNormal, Multinomial,
+        # MultivariateNormal, Normal, OneHotCategorical, Pareto, Poisson, StudentT, Uniform,
+        # VonMises, Weibull and Wishart, using random positive, real, simplex and covariance
+        # parameters of size 20 (unseeded).
         super().setUp()
         positive_var = torch.randn(20, dtype=torch.double).exp()
         positive_var2 = torch.randn(20, dtype=torch.double).exp()
@@ -6781,6 +7568,9 @@ class TestAgainstScipy(DistributionsTestCase):
         ]
 
     def test_mean(self):
+        # [FUNCTION DOC] Asserts the torch mean equals the scipy mean for every pair, skipping
+        # Cauchy and HalfCauchy (NaN mean); multivariate normals compare against the scipy
+        # mean attribute.
         for pytorch_dist, scipy_dist in self.distribution_pairs:
             if isinstance(pytorch_dist, (Cauchy, HalfCauchy)):
                 # Cauchy, HalfCauchy distributions' mean is nan, skipping check
@@ -6793,6 +7583,10 @@ class TestAgainstScipy(DistributionsTestCase):
                 self.assertEqual(pytorch_dist.mean, scipy_dist.mean(), msg=pytorch_dist)
 
     def test_variance_stddev(self):
+        # [FUNCTION DOC] Asserts torch variance and stddev equal scipy values for every pair.
+        # Cauchy, HalfCauchy and VonMises are skipped; Multinomial and OneHotCategorical use the
+        # diagonal of the scipy covariance; multivariate normals use the diagonal of the scipy
+        # cov attribute.
         for pytorch_dist, scipy_dist in self.distribution_pairs:
             if isinstance(pytorch_dist, (Cauchy, HalfCauchy, VonMises)):
                 # Cauchy, HalfCauchy distributions' standard deviation is nan, skipping check
@@ -6828,6 +7622,8 @@ class TestAgainstScipy(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_cdf(self):
+        # [FUNCTION DOC] For each pair draws 5 samples (double default dtype) and asserts torch
+        # cdf equals scipy cdf; pairs without cdf are skipped.
         for pytorch_dist, scipy_dist in self.distribution_pairs:
             samples = pytorch_dist.sample((5,))
             try:
@@ -6837,6 +7633,8 @@ class TestAgainstScipy(DistributionsTestCase):
             self.assertEqual(cdf, scipy_dist.cdf(samples), msg=pytorch_dist)
 
     def test_icdf(self):
+        # [FUNCTION DOC] For each pair evaluates icdf at uniform random probabilities (5 by
+        # batch shape) and asserts it equals scipy ppf; pairs without icdf are skipped.
         for pytorch_dist, scipy_dist in self.distribution_pairs:
             samples = torch.rand((5,) + pytorch_dist.batch_shape, dtype=torch.double)
             try:
@@ -6847,7 +7645,14 @@ class TestAgainstScipy(DistributionsTestCase):
 
 
 class TestFunctors(DistributionsTestCase):
+    # [CLASS DOC] Tests the CatTransform and StackTransform containers: domain/codomain checks,
+    # forward and inverse maps and log_abs_det_jacobian must equal the per-component results
+    # combined with concatenation or stacking.
     def test_cat_transform(self):
+        # [FUNCTION DOC] Checks CatTransform over three components (ExpTransform,
+        # AffineTransform, identity) along dim 0 with equal lengths: domain check, forward
+        # value, codomain check, inverse and log_abs_det_jacobian match the concatenation of the
+        # component results.
         x1 = -1 * torch.arange(1, 101, dtype=torch.float).view(-1, 100)
         x2 = (torch.arange(1, 101, dtype=torch.float).view(-1, 100) - 1) / 100
         x3 = torch.arange(1, 101, dtype=torch.float).view(-1, 100)
@@ -6888,6 +7693,8 @@ class TestFunctors(DistributionsTestCase):
         self.assertEqual(actual_jac, expected_jac)
 
     def test_cat_transform_non_uniform(self):
+        # [FUNCTION DOC] Like test_cat_transform but with unequal lengths [1, 2] and a nested
+        # CatTransform as the second component.
         x1 = -1 * torch.arange(1, 101, dtype=torch.float).view(-1, 100)
         x2 = torch.cat(
             [
@@ -6931,6 +7738,8 @@ class TestFunctors(DistributionsTestCase):
         self.assertEqual(actual_jac, expected_jac)
 
     def test_cat_event_dim(self):
+        # [FUNCTION DOC] Checks that CatTransform of two event_dim=1 affine transforms sums the
+        # component log_abs_det_jacobian values of the chunks (lengths [2, 2] along dim 1).
         t1 = AffineTransform(0, 2 * torch.ones(2), event_dim=1)
         t2 = AffineTransform(0, 2 * torch.ones(2), event_dim=1)
         dim = 1
@@ -6949,6 +7758,11 @@ class TestFunctors(DistributionsTestCase):
         self.assertEqual(actual_jac, expected_jac)
 
     def test_stack_transform(self):
+        # [FUNCTION DOC] Checks StackTransform over three components along dim 0: domain and
+        # codomain checks, forward map, inverse and log_abs_det_jacobian match the stack of the
+        # component results.
+        # KNOWN ISSUE: the inverse is applied to x (not y) on both the actual and expected side,
+        # so it checks consistency of the stacking only, not that it inverts the forward map.
         x1 = -1 * torch.arange(1, 101, dtype=torch.float)
         x2 = (torch.arange(1, 101, dtype=torch.float) - 1) / 100
         x3 = torch.arange(1, 101, dtype=torch.float)
@@ -6990,13 +7804,23 @@ class TestFunctors(DistributionsTestCase):
 
 
 class TestValidation(DistributionsTestCase):
+    # [CLASS DOC] Tests distribution argument validation (validate_args) on valid and
+    # invalid inputs.
     def test_valid(self):
+        # [FUNCTION DOC] Checks every example in _get_examples constructs without error when
+        # validate_args is true.
         for Dist, params in _get_examples():
             for param in params:
                 Dist(validate_args=True, **param)
 
     @set_default_dtype(torch.double)
     def test_invalid_log_probs_arg(self):
+        # [FUNCTION DOC] For every example except TransformedDistribution: with validation on,
+        # log_prob of values with wrong shape raises only ValueError, values outside the
+        # support raise the "must be within the support" ValueError (the unvalidated
+        # distribution may then raise RuntimeError), a valid sample is accepted, and an all-NaN
+        # value raises ValueError matching the support message (AssertionError with the
+        # distribution name if not).
         # Check that validation errors are indeed disabled,
         # but they might raise another error
         for Dist, params in _get_examples():
@@ -7046,6 +7870,9 @@ class TestValidation(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_invalid(self):
+        # [FUNCTION DOC] For every invalid example in _get_bad_examples asserts that
+        # constructing with validate_args true raises ValueError; otherwise raises
+        # AssertionError naming the distribution and example.
         for Dist, params in _get_bad_examples():
             for i, param in enumerate(params):
                 try:
@@ -7058,14 +7885,25 @@ class TestValidation(DistributionsTestCase):
                     ) from e
 
     def test_warning_unimplemented_constraints(self):
+        # [FUNCTION DOC] Checks a minimal Distribution subclass without declared constraints
+        # emits UserWarning both at construction and when log_prob validates a sample.
         class Delta(Distribution):
+            # [CLASS DOC] HELPER: Minimal Distribution that is a point mass at zero, with no
+            # arg_constraints or support defined, used to trigger the
+            # unimplemented-constraint warnings.
             def __init__(self, validate_args=True):
+                # [FUNCTION DOC] HELPER: Forwards validate_args to the base constructor.
                 super().__init__(validate_args=validate_args)
 
             def sample(self, sample_shape=torch.Size()):
+                # [FUNCTION DOC] HELPER: Returns a scalar zero tensor expanded to the
+                # sample shape.
                 return torch.tensor(0.0).expand(sample_shape)
 
             def log_prob(self, value):
+                # [FUNCTION DOC] HELPER: Validates the value if validation is enabled, then
+                # overwrites the input tensor in place with 0 where it was 0 and minus infinity
+                # elsewhere, and returns it (mutates the argument).
                 if self._validate_args:
                     self._validate_sample(value)
                 value[value != 0.0] = -float("inf")
@@ -7080,7 +7918,13 @@ class TestValidation(DistributionsTestCase):
 
 
 class TestJit(DistributionsTestCase):
+    # [CLASS DOC] Tests that distribution methods can be traced with torch.jit.trace and give
+    # the same results on new inputs. Helper methods generate examples and perturb parameters
+    # within constraints.
     def _examples(self):
+        # [FUNCTION DOC] HELPER: Generator over all examples whose parameters are all tensors,
+        # yielding the distribution class, the parameter names, the tuple of parameter values
+        # and a sample.
         for Dist, params in _get_examples():
             for param in params:
                 keys = param.keys()
@@ -7091,6 +7935,12 @@ class TestJit(DistributionsTestCase):
                 yield Dist, keys, values, sample
 
     def _perturb_tensor(self, value, constraint):
+        # [FUNCTION DOC] HELPER: Returns a changed copy of a parameter tensor that still
+        # satisfies the constraint: integer-greater-than adds 1, less-than subtracts a uniform
+        # value, greater-than(-or-equal) adds a uniform value, positive-(semi)definite adds the
+        # identity; otherwise floating tensors are perturbed by normal noise in the
+        # unconstrained space of the constraint transform, and long tensors have 0 and 1
+        # swapped. Raises NotImplementedError for other dtypes.
         if isinstance(constraint, constraints._IntegerGreaterThan):
             return value + 1
         if isinstance(constraint, constraints._LessThan):
@@ -7116,6 +7966,10 @@ class TestJit(DistributionsTestCase):
         raise NotImplementedError
 
     def _perturb(self, Dist, keys, values, sample):
+        # [FUNCTION DOC] HELPER: Under no_grad perturbs every parameter value according to the
+        # distribution's arg_constraints (looked up on the class, or on an instance when the
+        # constraints are parameter-dependent; missing keys default to real), then draws a new
+        # sample from the perturbed distribution. Returns the new values list and sample.
         with torch.no_grad():
             if isinstance(Dist.arg_constraints, dict):
                 values = [
@@ -7139,9 +7993,16 @@ class TestJit(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_sample(self):
+        # [FUNCTION DOC] Traces a function that builds the distribution and calls sample with
+        # torch.jit.trace for each all-tensor example (double default dtype), skipping Cauchy,
+        # HalfCauchy and VonMises, and checks the traced result equals the eager result under
+        # a forked RNG and that the trace contains a nondeterministic node (except for Beta
+        # and Dirichlet).
         for Dist, keys, values, sample in self._examples():
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution from the parameters and returns
+                # one sample.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.sample()
@@ -7170,11 +8031,15 @@ class TestJit(DistributionsTestCase):
                 )
 
     def test_rsample(self):
+        # [FUNCTION DOC] Same as test_sample but for rsample, only for distributions with
+        # has_rsample and skipping Cauchy and HalfCauchy.
         for Dist, keys, values, sample in self._examples():
             if not Dist.has_rsample:
                 continue
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution from the parameters and returns
+                # one reparameterized sample.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.rsample()
@@ -7203,6 +8068,9 @@ class TestJit(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_log_prob(self):
+        # [FUNCTION DOC] Traces log_prob and checks the traced function equals the eager one on
+        # perturbed parameters and sample (double dtype); LowRankMultivariateNormal and
+        # MultivariateNormal are skipped because traced results are wrong.
         for Dist, keys, values, sample in self._examples():
             # FIXME traced functions produce incorrect results
             xfail = [LowRankMultivariateNormal, MultivariateNormal]
@@ -7210,6 +8078,8 @@ class TestJit(DistributionsTestCase):
                 continue
 
             def f(sample, *values):
+                # [FUNCTION DOC] HELPER: Builds the distribution from the parameters and returns
+                # log_prob of the sample.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.log_prob(sample)
@@ -7227,6 +8097,9 @@ class TestJit(DistributionsTestCase):
             )
 
     def test_enumerate_support(self):
+        # [FUNCTION DOC] Traces enumerate_support and compares to eager on perturbed
+        # parameters; Binomial is skipped and distributions raising NotImplementedError at
+        # trace time are ignored.
         for Dist, keys, values, sample in self._examples():
             # FIXME traced functions produce incorrect results
             xfail = [Binomial]
@@ -7234,6 +8107,8 @@ class TestJit(DistributionsTestCase):
                 continue
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution and returns
+                # its enumerate_support.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.enumerate_support()
@@ -7254,9 +8129,13 @@ class TestJit(DistributionsTestCase):
             )
 
     def test_mean(self):
+        # [FUNCTION DOC] Traces the mean property and compares with eager on perturbed
+        # parameters, treating infinite entries as zero on both sides; NotImplementedError at
+        # trace time is ignored.
         for Dist, keys, values, sample in self._examples():
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution and returns its mean.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.mean
@@ -7279,11 +8158,14 @@ class TestJit(DistributionsTestCase):
             )
 
     def test_variance(self):
+        # [FUNCTION DOC] Same as test_mean for variance (cloning results before editing
+        # infinities), skipping Cauchy and HalfCauchy whose variance is infinite.
         for Dist, keys, values, sample in self._examples():
             if Dist in [Cauchy, HalfCauchy]:
                 continue  # infinite variance
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution and returns its variance.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.variance
@@ -7307,6 +8189,9 @@ class TestJit(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_entropy(self):
+        # [FUNCTION DOC] Traces entropy and compares with eager on perturbed parameters (double
+        # dtype); LowRankMultivariateNormal and MultivariateNormal are skipped because traced
+        # results are wrong.
         for Dist, keys, values, sample in self._examples():
             # FIXME traced functions produce incorrect results
             xfail = [LowRankMultivariateNormal, MultivariateNormal]
@@ -7314,6 +8199,7 @@ class TestJit(DistributionsTestCase):
                 continue
 
             def f(*values):
+                # [FUNCTION DOC] HELPER: Builds the distribution and returns its entropy.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 return dist.entropy()
@@ -7335,9 +8221,14 @@ class TestJit(DistributionsTestCase):
 
     @set_default_dtype(torch.double)
     def test_cdf(self):
+        # [FUNCTION DOC] Traces a function that returns icdf of cdf of a sample and compares
+        # with eager on perturbed parameters and sample (double dtype); distributions raising
+        # NotImplementedError are ignored.
         for Dist, keys, values, sample in self._examples():
 
             def f(sample, *values):
+                # [FUNCTION DOC] HELPER: Builds the distribution and returns the icdf applied to
+                # the cdf of the sample.
                 param = dict(zip(keys, values))
                 dist = Dist(**param)
                 cdf = dist.cdf(sample)
