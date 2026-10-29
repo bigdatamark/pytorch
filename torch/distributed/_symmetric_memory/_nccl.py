@@ -1,3 +1,8 @@
+# [MODULE DOC] Helpers to publish an externally-owned NCCL communicator into the
+# symmetric memory registry. Exports NcclCommRegistration (a handle that
+# unregisters on release) and register_external_nccl_comm (the registration
+# entry point). Import has no side effects; C extension functions are imported
+# lazily at call time.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -14,6 +19,10 @@ __all__ = ["NcclCommRegistration", "register_external_nccl_comm"]
 
 
 class NcclCommRegistration:
+    # [CLASS DOC] Handle for one registered external NCCL comm. State: group name,
+    # device, optional strong reference to the source comm, and an active flag.
+    # Usable as a context manager; unregisters on exit, on explicit unregister,
+    # or on garbage collection. Does not own the comm itself.
     r"""
     Handle returned by :func:`register_external_nccl_comm`.
 
@@ -35,12 +44,18 @@ class NcclCommRegistration:
         device: torch.device,
         comm: object | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the group name, device and optional comm reference
+        # and marks the registration active. Performs no registration itself.
         self._group_name = group_name
         self._device = device
         self._comm = comm
         self._active = True
 
     def unregister(self) -> None:
+        # [FUNCTION DOC] Removes the comm entry for this group and device from the
+        # registry via the lazily imported C function, then marks the handle
+        # inactive and drops the comm reference. No-op if already inactive.
+        # Raises ImportError if the build lacks symmetric-memory NCCL support.
         """Remove the registration. Idempotent."""
         if not self._active:
             return
@@ -53,12 +68,16 @@ class NcclCommRegistration:
         self._comm = None
 
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Context manager entry; returns this registration.
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # [FUNCTION DOC] Context manager exit; unregisters. Exceptions propagate.
         self.unregister()
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Best-effort unregister on finalization; swallows any
+        # Exception so teardown never raises.
         try:
             self.unregister()
         except Exception:
@@ -73,6 +92,10 @@ def register_external_nccl_comm(
     device: _device,
     comm: object | None = None,
 ) -> NcclCommRegistration:
+    # [FUNCTION DOC] Converts device to a torch device, registers the raw NCCL comm
+    # pointer under group_name via the lazily imported C function (side effect:
+    # mutates the global registry), and returns a NcclCommRegistration holding the
+    # optional comm reference. Raises ImportError without NCCL symmetric-memory support.
     r"""
     Publish an externally-owned ``ncclComm_t`` into PyTorch's symmetric memory
     registry under ``group_name``.
