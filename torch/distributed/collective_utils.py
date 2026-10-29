@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Collective helper primitives (broadcast, all_gather, typed all_gather_object) that
+# also work with a single rank (no process group), propagate failures from any rank to all ranks,
+# plus helpers to detect random number generator state desync across ranks.
+# No import-time side effects besides creating a module logger.
 
 
 """
@@ -37,6 +41,9 @@ T = TypeVar("T")
 
 @dataclass
 class SyncPayload(Generic[T]):
+    # [CLASS DOC] Dataclass envelope exchanged between ranks: the stage name used to detect
+    # out-of-sync ranks, a success flag, the payload value, and the exception (if any) caught
+    # on the producing rank.
     stage_name: str | None
     success: bool
     payload: T
@@ -51,6 +58,11 @@ def broadcast(
     rank: int = 0,
     pg: dist.ProcessGroup | None = None,
 ) -> T:
+    # [FUNCTION DOC] Broadcasts a value (or the result of a callable run only on the source rank)
+    # to all ranks in the group, wrapped in a SyncPayload. Without a group, runs locally.
+    # Raises an assertion error if success is false but data is not None. If the callable raises
+    # on the source rank, or success is false, every rank raises RuntimeError chained to the
+    # original exception. Returns the synchronized payload. Side effect: collective broadcast.
     """
     Broadcasts the data payload from rank 0 to all other ranks.
     Or if a function is passed, execute it in rank 0 and broadcast result to all other ranks.
@@ -128,6 +140,12 @@ def all_gather(
     stage_name: str | None = None,
     pg: dist.ProcessGroup | None = None,
 ) -> list[T]:
+    # [FUNCTION DOC] Runs the callable (or takes the plain value) on every rank, then gathers
+    # SyncPayload objects from all ranks using a type-checked object all_gather. Ranks whose stage
+    # name differs from rank 0's are reported in the error message and skipped. Raises RuntimeError
+    # if any rank failed. Returns the list of payloads in rank order (one element without a group).
+    # KNOWN ISSUE: ranks with a mismatched stage name only add to error_msg, which is raised only
+    # when some other rank also raised an exception; a pure stage mismatch is silently dropped.
     """
     A simple all_gather primitive with basic synchronization guard logic,
     by checking payload from all ranks has the same stage name.
@@ -211,6 +229,9 @@ def all_gather_object_enforce_type(
     # pyre-fixme[2]: Parameter must have a type that does not contain `Any`
     type_checker: Callable[[Any, Any], bool] = lambda x, y: type(x) is type(y),
 ) -> None:
+    # [FUNCTION DOC] Performs an object all_gather into object_list, then verifies that every
+    # gathered object passes type_checker against the first one (default: exact same type).
+    # Raises TypeError naming the first mismatching index. Mutates object_list in place.
     """
     Similar to plain all_gather_object but with additional type checking
     AFTER gather is done to ensure basic consistency.
@@ -240,6 +261,9 @@ def all_gather_object_enforce_type(
 
 
 def _summarize_ranks(ranks: Iterable[int]) -> str:
+    # [FUNCTION DOC] HELPER: Compresses a collection of distinct non-negative ranks into a
+    # comma-separated string of singletons and start:stop[:step] runs of evenly spaced ranks.
+    # Raises an assertion error on negative or duplicate ranks. Empty input fails at min().
     ranks = sorted(ranks)
     if min(ranks) < 0:
         raise AssertionError("ranks should all be positive")
@@ -285,6 +309,9 @@ def _summarize_ranks(ranks: Iterable[int]) -> str:
 def _check_philox_rng_sync(
     generator: torch.Generator, group: dist.ProcessGroup
 ) -> tuple[dict[Any, set], str]:
+    # [FUNCTION DOC] HELPER: All-gathers the generator state from the group and maps each
+    # (seed, offset) pair (first and second 8 bytes read as unsigned 64-bit) to the set of ranks
+    # holding it. Returns that mapping and the label "(Seed, Offset)". Collective call.
     local_state = generator.get_state()
     all_states = [torch.empty_like(local_state) for _ in range(group.size())]
     torch.distributed.all_gather(all_states, local_state)
@@ -301,6 +328,10 @@ def _check_philox_rng_sync(
 def _check_cpu_rng_sync(
     generator: torch.Generator, group: dist.ProcessGroup
 ) -> tuple[dict[Any, set], str]:
+    # [FUNCTION DOC] HELPER: All-gathers the CPU generator state tensor and maps the hash of each
+    # state to the set of ranks having it. Returns that mapping and the label "Generator state
+    # hash". Collective call. Note: all_gather is called without passing the group argument.
+    # KNOWN ISSUE: the group is only used for its size; the gather runs on the default group.
     # seed is returned as uint64_t from C impl, so may not fit in torch int64 tensor directly.
     state_tensor = generator.get_state()
     all_state_tensors = [torch.empty_like(state_tensor) for _ in range(group.size())]
@@ -317,6 +348,8 @@ def _check_cpu_rng_sync(
 def _check_rng_sync_internal(
     generator: torch.Generator, group: dist.ProcessGroup
 ) -> tuple[dict[Any, set], str]:
+    # [FUNCTION DOC] HELPER: Dispatches on generator device: cuda/xpu use the seed and offset
+    # check, cpu uses the state hash check. Raises NotImplementedError for other devices.
     if generator.device.type in {"cuda", "xpu"}:
         return _check_philox_rng_sync(generator, group)
     elif generator.device.type == "cpu":
@@ -328,6 +361,9 @@ def _check_rng_sync_internal(
 
 
 def _desync_table_str(tag: str, value_ranks: dict[Any, set[int]]) -> str:
+    # [FUNCTION DOC] HELPER: Formats a mapping from value to rank set as a two column table
+    # (summarized ranks, value). Uses the tabulate package when installed, otherwise a plain
+    # header plus one line per row.
     headers = ["Ranks", f"{tag} values"]
     rank_values = [
         [_summarize_ranks(ranks), str(value)] for value, ranks in value_ranks.items()
@@ -341,6 +377,9 @@ def _desync_table_str(tag: str, value_ranks: dict[Any, set[int]]) -> str:
 
 
 def _check_rng_sync(generator: torch.Generator, group: dist.ProcessGroup) -> str | None:
+    # [FUNCTION DOC] HELPER: Checks whether the generator state is identical across the group.
+    # If more than one distinct value exists, logs an error with a desync table and returns that
+    # message; otherwise returns None. Collective call.
     value_ranks, value_header = _check_rng_sync_internal(generator, group)
     log_str = None
     if len(value_ranks) > 1:

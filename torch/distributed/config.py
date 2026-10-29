@@ -1,4 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Global configuration flags for torch.distributed: compile_on_one_rank (deprecated
+# alias to the torch.compiler.config flag), use_torchcomms and pipeline_per_direction_p2p (both
+# default false, overridable by environment variables). At import, install_config_module adds
+# patch/save/load support to this module.
 
 """
 Global configuration flags for torch.distributed

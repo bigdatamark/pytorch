@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Experimental debug server for distributed jobs. Exports start_debug_server
+# (per-rank worker servers plus an HTTP frontend process on rank 0) and stop_debug_server.
+# Importing registers the torch_profile handler as a side effect. Uses module globals to hold
+# the worker server and frontend process.
 import logging
 import multiprocessing
 import socket
@@ -34,6 +38,12 @@ def start_debug_server(
     handlers: list["DebugHandler"] | None = None,
     fetch_timeout: float = 60.0,
 ) -> None:
+    # [FUNCTION DOC] Starts the debug server stack on this rank: connects to the TCP store,
+    # starts a worker server (bound to worker_port, ephemeral if 0) and publishes its URL under
+    # a per-rank key. On rank 0 only, also launches a daemon process running the frontend main
+    # with the given port, dump settings, handlers (default set if None), enabled dumps (stacks,
+    # fr_trace, torchcomms_health_check if None) and fetch timeout, optionally using the given
+    # multiprocessing start method. Raises an assertion error if already started. Sets globals.
     """
     Start the debug server stack on all workers. The frontend debug server is
     only started on rank0 while the per rank worker servers are started on all
@@ -128,6 +138,10 @@ def start_debug_server(
 
 
 def stop_debug_server() -> None:
+    # [FUNCTION DOC] Terminates the frontend process, shuts down the worker server, joins the
+    # process and resets both globals. Raises an assertion error if either was not started.
+    # KNOWN ISSUE: on ranks other than 0 the frontend process is never created, so this raises
+    # an assertion error there even though start_debug_server succeeded.
     """
     Shutdown the debug server and stop the frontend debug server process.
     """

@@ -1,3 +1,6 @@
+# [MODULE DOC] Concrete DebugHandler implementations for the debug frontend (index, stack traces,
+# py-spy, FlightRecorder, profiler, TCPStore, and others) with their Jinja templates, plus
+# default_handlers. Requires tabulate and the flight recorder components at import time.
 from __future__ import annotations
 
 import logging
@@ -177,33 +180,45 @@ TCPSTORE_TEMPLATE = """
 
 
 class IndexHandler(DebugHandler):
+    # [CLASS DOC] Serves the home page at the root path with a Home nav link.
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the single route for the root path.
         return [Route("/", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the Home nav link.
         return [NavLink("/", "Home")]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the index template.
         return {"index.html": INDEX_TEMPLATE}
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Renders the static index page.
         return req.frontend.render_template("index.html")
 
 
 class StacksHandler(DebugHandler):
+    # [CLASS DOC] Shows Python stack traces from all ranks at the stacks path, and supports
+    # periodic dumps under the file name "stacks".
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the stacks path.
         return [Route("/stacks", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the Python Stack Traces nav link.
         return [NavLink("/stacks", "Python Stack Traces")]
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches the traceback dump from every rank and renders the raw page.
         addrs, resps = fetch_all("dump_traceback", timeout=self.fetch_timeout)
         return req.frontend.render_template(
             "raw_resp.html", title="Stacks", addrs=addrs, resps=resps
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Fetches tracebacks from all ranks and returns text with an optional partial
+        # data summary followed by a section per rank (body, or an error line for failed ranks).
         addrs, resps = fetch_all("dump_traceback", timeout=self.fetch_timeout)
         parts: list[str] = []
         summary = format_fetch_summary(addrs, resps)
@@ -218,20 +233,28 @@ class StacksHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "stacks".
         return "stacks"
 
 
 class PySpyHandler(DebugHandler):
+    # [CLASS DOC] Shows py-spy stack dumps from all ranks (optional native and subprocess flags
+    # come from the query string) and supports periodic dumps under "pyspy_dump".
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the py-spy dump path.
         return [Route("/pyspy_dump", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the py-spy Stacks nav link.
         return [NavLink("/pyspy_dump", "py-spy Stacks")]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the py-spy page template.
         return {"pyspy_dump.html": PYSPY_DUMP_TEMPLATE}
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Forwards the request query to all ranks, adding the nonblocking flag
+        # if absent, and renders the py-spy page with the responses.
         query = req.get_raw_query()
         if "nonblocking" not in query:
             query = f"nonblocking=1&{query}" if query else "nonblocking=1"
@@ -243,6 +266,8 @@ class PySpyHandler(DebugHandler):
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Fetches non-blocking py-spy dumps from all ranks and returns text with an
+        # optional partial data summary and a section per rank (body or error line).
         addrs, resps = fetch_all(
             "pyspy_dump", "nonblocking=1", timeout=self.fetch_timeout
         )
@@ -259,11 +284,16 @@ class PySpyHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "pyspy_dump".
         return "pyspy_dump"
 
 
 class FlightRecorderHandler(DebugHandler):
+    # [CLASS DOC] Serves FlightRecorder data from all ranks as analyzed HTML tables (groups,
+    # memberships, collectives, NCCL calls) or raw JSON, for both the CPU-side trace and the NCCL
+    # active-only trace. Periodic dumps are plain text tables under the handler default name.
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns routes for the trace, trace JSON, NCCL trace and NCCL trace JSON paths.
         return [
             Route("/fr_trace", self._handle_fr_trace),
             Route("/fr_trace_json", self._handle_fr_trace_json),
@@ -272,6 +302,7 @@ class FlightRecorderHandler(DebugHandler):
         ]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns four nav links (CPU, its JSON, NCCL, its JSON).
         return [
             NavLink("/fr_trace", "FlightRecorder CPU"),
             NavLink("/fr_trace_json", "(JSON)"),
@@ -280,10 +311,15 @@ class FlightRecorderHandler(DebugHandler):
         ]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the FlightRecorder tables template.
         return {"fr_trace.html": FR_TRACE_TEMPLATE}
 
     @staticmethod
     def _build_db(addrs: list[str], resps: list[Response]) -> Database:
+        # [FUNCTION DOC] HELPER: Builds a flight recorder Database from per-rank responses. Skips
+        # non-200 responses, tags each dump with its rank and host, defaults missing entries to an
+        # empty list, and runs the analyzer allowing incomplete ranks. Raises RuntimeError if no rank
+        # responded. The version is taken from the first successful dump.
         config = JobConfig()
         args = config.parse_args(args=[])
         args.allow_incomplete_ranks = True
@@ -312,6 +348,8 @@ class FlightRecorderHandler(DebugHandler):
     def _render_tables(
         self, server: FrontendServer, addrs: list[str], resps: list[Response]
     ) -> bytes:
+        # [FUNCTION DOC] HELPER: Builds the database and renders the HTML page with the fetch
+        # summary and four tables.
         db = self._build_db(addrs, resps)
         return server.render_template(
             "fr_trace.html",
@@ -328,10 +366,12 @@ class FlightRecorderHandler(DebugHandler):
         )
 
     def _handle_fr_trace(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches the FlightRecorder JSON from all ranks and renders tables.
         addrs, resps = fetch_all("fr_trace_json", timeout=self.fetch_timeout)
         return self._render_tables(req.frontend, addrs, list(resps))
 
     def _handle_fr_trace_json(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches the FlightRecorder JSON from all ranks and renders it pretty-printed.
         addrs, resps = fetch_all("fr_trace_json", timeout=self.fetch_timeout)
         return req.frontend.render_template(
             "json_resp.html",
@@ -341,12 +381,14 @@ class FlightRecorderHandler(DebugHandler):
         )
 
     def _handle_fr_trace_nccl(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches active-only NCCL trace JSON from all ranks and renders tables.
         addrs, resps = fetch_all(
             "dump_nccl_trace_json", "onlyactive=true", timeout=self.fetch_timeout
         )
         return self._render_tables(req.frontend, addrs, list(resps))
 
     def _handle_fr_trace_nccl_json(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches active-only NCCL trace JSON from all ranks and renders it pretty-printed.
         addrs, resps = fetch_all(
             "dump_nccl_trace_json", "onlyactive=true", timeout=self.fetch_timeout
         )
@@ -358,6 +400,10 @@ class FlightRecorderHandler(DebugHandler):
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Returns plain-text tables (groups, memberships, collectives, NCCL calls) built
+        # from the FlightRecorder trace of all ranks, preceded by a partial data summary if any rank
+        # failed. Then tries the active-only NCCL trace the same way; any error there is replaced by a
+        # failure line. Errors in the first (CPU) trace propagate (for example when all ranks failed).
         parts = []
 
         addrs, resps = fetch_all("fr_trace_json", timeout=self.fetch_timeout)
@@ -417,20 +463,29 @@ class FlightRecorderHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "fr_trace".
         return "fr_trace"
 
 
 class ProfilerHandler(DebugHandler):
+    # [CLASS DOC] Triggers torch profiling on all ranks for a requested duration and renders a page
+    # with a button per rank to open the trace in the Perfetto UI. No periodic dump.
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the profile path.
         return [Route("/profile", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the torch profiler nav link.
         return [NavLink("/profile", "torch profiler")]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the profiler page template.
         return {"profile.html": PROFILE_TEMPLATE}
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Reads the duration query parameter (float, default 1 second), asks all
+        # ranks to profile for that long and renders the page with the responses. The page form
+        # is not limited server-side; a non-numeric value raises an error (reported as 500).
         duration = req.get_query_arg("duration", default=1.0, type=float)
         addrs, resps = fetch_all(
             "torch_profile", f"duration={duration}", timeout=self.fetch_timeout
@@ -439,19 +494,26 @@ class ProfilerHandler(DebugHandler):
 
 
 class WaitCountersHandler(DebugHandler):
+    # [CLASS DOC] Shows wait counter values (JSON) from all ranks; supports periodic dumps under
+    # "wait_counters".
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the wait counters path.
         return [Route("/wait_counters", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the Wait Counters nav link.
         return [NavLink("/wait_counters", "Wait Counters")]
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches wait counter values from all ranks and renders them as JSON.
         addrs, resps = fetch_all("wait_counter_values", timeout=self.fetch_timeout)
         return req.frontend.render_template(
             "json_resp.html", title="Wait Counters", addrs=addrs, resps=resps
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Fetches wait counters from all ranks and returns text with an optional partial
+        # data summary and a section per rank (pretty JSON or an error line).
         addrs, resps = fetch_all("wait_counter_values", timeout=self.fetch_timeout)
         parts: list[str] = []
         summary = format_fetch_summary(addrs, resps)
@@ -467,20 +529,28 @@ class WaitCountersHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "wait_counters".
         return "wait_counters"
 
 
 class TCPStoreHandler(DebugHandler):
+    # [CLASS DOC] Lists all keys and values of the job TCPStore (unprefixed), sorted by key; supports
+    # periodic dumps under "tcpstore".
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the tcpstore path.
         return [Route("/tcpstore", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the TCPStore nav link.
         return [NavLink("/tcpstore", "TCPStore")]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the TCPStore page template.
         return {"tcpstore.html": TCPSTORE_TEMPLATE}
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Connects to the store, reads all sorted keys and the textual form of
+        # their values, and renders the page.
         store = tcpstore_client(prefix="")
         keys = store.list_keys()
         keys.sort()
@@ -488,6 +558,7 @@ class TCPStoreHandler(DebugHandler):
         return req.frontend.render_template("tcpstore.html", keys=keys, values=values)
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Returns one line per store key (sorted) with the textual form of its value.
         store = tcpstore_client(prefix="")
         keys = store.list_keys()
         keys.sort()
@@ -496,34 +567,43 @@ class TCPStoreHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "tcpstore".
         return "tcpstore"
 
 
 class TorchCommsFlightRecorderHandler(DebugHandler):
+    # [CLASS DOC] Serves TorchComms FlightRecorder traces (active only) from all ranks as analyzed
+    # tables or raw JSON, reusing the FlightRecorderHandler database builder and the same
+    # tables template; supports periodic dumps under "torchcomms_fr_trace".
     """Handler for TorchComms FlightRecorder trace data."""
 
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns routes for the TorchComms trace and its JSON view.
         return [
             Route("/torchcomms_fr_trace", self._handle_torchcomms_fr_trace),
             Route("/torchcomms_fr_trace_json", self._handle_torchcomms_fr_trace_json),
         ]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the TorchComms FR nav link and its JSON link.
         return [
             NavLink("/torchcomms_fr_trace", "TorchComms FR"),
             NavLink("/torchcomms_fr_trace_json", "(JSON)"),
         ]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the shared FlightRecorder tables template.
         return {"fr_trace.html": FR_TRACE_TEMPLATE}
 
     def _handle_torchcomms_fr_trace(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches active-only TorchComms traces from all ranks and renders tables.
         addrs, resps = fetch_all(
             "torchcomms_fr_trace_json", "onlyactive=true", timeout=self.fetch_timeout
         )
         return self._render_tables(req.frontend, addrs, list(resps))
 
     def _handle_torchcomms_fr_trace_json(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches active-only TorchComms traces from all ranks and renders pretty JSON.
         addrs, resps = fetch_all(
             "torchcomms_fr_trace_json", "onlyactive=true", timeout=self.fetch_timeout
         )
@@ -537,6 +617,8 @@ class TorchCommsFlightRecorderHandler(DebugHandler):
     def _render_tables(
         self, server: FrontendServer, addrs: list[str], resps: list[Response]
     ) -> bytes:
+        # [FUNCTION DOC] HELPER: Builds the database via the FlightRecorder builder and renders the
+        # tables page titled for TorchComms with the fetch summary.
         db = FlightRecorderHandler._build_db(addrs, resps)
         return server.render_template(
             "fr_trace.html",
@@ -553,6 +635,9 @@ class TorchCommsFlightRecorderHandler(DebugHandler):
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Returns plain-text tables from the TorchComms traces of all ranks, preceded by
+        # a partial data summary if some ranks failed. Unlike the page handlers it does not
+        # request active-only traces. Raises if all ranks failed.
         addrs, resps = fetch_all("torchcomms_fr_trace_json", timeout=self.fetch_timeout)
         parts: list[str] = []
         summary = format_fetch_summary(addrs, resps)
@@ -576,6 +661,7 @@ class TorchCommsFlightRecorderHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "torchcomms_fr_trace".
         return "torchcomms_fr_trace"
 
 
@@ -613,19 +699,27 @@ HEALTH_CHECK_TEMPLATE = """
 
 
 class TorchCommsHealthCheckHandler(DebugHandler):
+    # [CLASS DOC] Queries TorchComms health from all ranks; if any reachable rank reports itself
+    # unhealthy, additionally requests a flight recorder dump file from all ranks. Used by the page
+    # and by periodic dumps (name "torchcomms_health_check").
     """Health check that detects watchdog timeouts and triggers FR dumps."""
 
     def routes(self) -> list[Route]:
+        # [FUNCTION DOC] Returns the route for the health check path.
         return [Route("/torchcomms_health_check", self._handle)]
 
     def nav_links(self) -> list[NavLink]:
+        # [FUNCTION DOC] Returns the TorchComms Health nav link.
         return [NavLink("/torchcomms_health_check", "TorchComms Health")]
 
     def templates(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns the health check page template.
         return {"torchcomms_health_check.html": HEALTH_CHECK_TEMPLATE}
 
     @staticmethod
     def _any_unhealthy(resps: list[Response]) -> bool:
+        # [FUNCTION DOC] HELPER: True if any 200 response has JSON whose healthy field is false.
+        # Non-200 responses and unparseable bodies (logged) are treated as healthy.
         """Return True if any rank explicitly reports itself as unhealthy.
 
         Only responses with a 200 status code are inspected.  Non-200
@@ -650,6 +744,8 @@ class TorchCommsHealthCheckHandler(DebugHandler):
         return False
 
     def _handle(self, req: HTTPRequestHandler) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches health from all ranks; if any is unhealthy also fetches the FR
+        # dump file from all ranks. Renders the page with both sets of responses.
         addrs, resps = fetch_all("torchcomms_health_check", timeout=self.fetch_timeout)
         dump_triggered = False
         dump_addrs: list[str] = []
@@ -670,6 +766,8 @@ class TorchCommsHealthCheckHandler(DebugHandler):
         )
 
     def dump(self) -> str | None:
+        # [FUNCTION DOC] Returns text with an optional partial data summary, one section per rank health
+        # response, and, if any rank is unhealthy, a section with each rank FR dump file result.
         addrs, resps = fetch_all("torchcomms_health_check", timeout=self.fetch_timeout)
         parts: list[str] = []
         summary = format_fetch_summary(addrs, resps)
@@ -697,10 +795,14 @@ class TorchCommsHealthCheckHandler(DebugHandler):
         return "\n".join(parts)
 
     def dump_filename(self) -> str:
+        # [FUNCTION DOC] Returns the fixed dump file name prefix "torchcomms_health_check".
         return "torchcomms_health_check"
 
 
 def default_handlers() -> list[DebugHandler]:
+    # [FUNCTION DOC] Returns fresh instances of the default handlers: index, stacks, py-spy,
+    # FlightRecorder, TorchComms FlightRecorder, TorchComms health check, profiler, wait counters
+    # and TCPStore.
     return [
         IndexHandler(),
         StacksHandler(),

@@ -1,3 +1,5 @@
+# [MODULE DOC] Default process group timeouts re-exported from the C++ layer: default_pg_timeout
+# (non-NCCL backends) and default_pg_nccl_timeout (None when NCCL support is not compiled in).
 from datetime import timedelta
 
 from torch._C._distributed_c10d import _DEFAULT_PG_TIMEOUT
