@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator profiles for generating fake kernels: records of the input and
+# output tensor metadata (rank, dtype, device, layout) for custom ops. Provides the
+# TensorMetadata and OpProfile data classes, a context manager that temporarily registers
+# fake kernels derived from profiles, and yaml save/load helpers. Import-time side effect:
+# creates a logger.
 import contextlib
 import io
 import logging
@@ -15,6 +20,8 @@ log = logging.getLogger(__name__)
 
 
 class MissingOpProfile(RuntimeError):
+    # [CLASS DOC] Error raised by a generated fake kernel when no recorded profile matches
+    # the given inputs.
     """
     This is raised when we don't have an operator profile available for the
     given inputs.
@@ -23,6 +30,8 @@ class MissingOpProfile(RuntimeError):
 
 @dataclass(frozen=True)
 class TensorMetadata:
+    # [CLASS DOC] Immutable (hashable) summary of a tensor: rank, dtype, device, layout.
+    # Used to match call inputs against recorded profiles and to build fake outputs.
     rank: int
     dtype: torch.dtype
     device: torch.device
@@ -30,6 +39,8 @@ class TensorMetadata:
 
     @staticmethod
     def maybe_from_tensor(t: Any) -> Optional["TensorMetadata"]:
+        # [FUNCTION DOC] Static method: returns a TensorMetadata for a Tensor argument, or
+        # None if t is not a Tensor.
         if not isinstance(t, torch.Tensor):
             return None
         return TensorMetadata(t.dim(), t.dtype, t.device, t.layout)
@@ -37,12 +48,23 @@ class TensorMetadata:
 
 @dataclass(frozen=True)
 class OpProfile:
+    # [CLASS DOC] Immutable (hashable) record of one observed call of an operator:
+    # args_profile holds per-argument TensorMetadata (None for non-tensor args) and
+    # out_profile is a single TensorMetadata or a tuple of them for multiple outputs.
     args_profile: tuple[TensorMetadata | None]
     out_profile: TensorMetadata | tuple[TensorMetadata]
 
 
 def _generate_fake_kernel(op_name: str, op_profile: set[OpProfile]) -> Callable:
+    # [FUNCTION DOC] HELPER: Builds a fake kernel for op_name from a set of profiles. The
+    # kernel scans the profiles for the first whose argument metadata matches the call
+    # (positional args followed by keyword values) and returns fake outputs with the
+    # recorded metadata; raises MissingOpProfile if none matches.
     def _match_args(args_profile: tuple[TensorMetadata | None], args: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if every given arg's metadata (None for non-tensors)
+        # equals the profile entry at the same position.
+        # KNOWN ISSUE: indexing the profile by position raises an index error if more args
+        # are passed than the profile has entries.
         return all(
             TensorMetadata.maybe_from_tensor(arg) == args_profile[i]
             for i, arg in enumerate(args)
@@ -51,9 +73,15 @@ def _generate_fake_kernel(op_name: str, op_profile: set[OpProfile]) -> Callable:
     def _generate_res(
         out_profile: TensorMetadata | tuple[TensorMetadata],
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Creates a fake output tensor (or a list of them for a tuple
+        # profile) using the active fake-impl context to make data-dependent sizes.
         ctx = torch.library.get_ctx()
 
         def _generate_tensor_out(t: TensorMetadata) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds an empty strided tensor of the profiled rank,
+            # dtype, device and layout, with each dimension a new dynamic size. Strides are
+            # cumulative products of the sizes starting from the first dimension (a
+            # column-major style layout).
             fake_shape = [ctx.new_dynamic_size() for _ in range(t.rank)]
             fake_strides = [-1] * t.rank
             expected = 1
@@ -77,6 +105,8 @@ def _generate_fake_kernel(op_name: str, op_profile: set[OpProfile]) -> Callable:
             return [_generate_tensor_out(t) for t in out_profile]
 
     def _fake_kernel(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: The generated fake kernel; returns outputs for the first
+        # matching profile or raises MissingOpProfile.
         for profile in op_profile:
             if _match_args(profile.args_profile, (*args, *kwargs.values())):
                 return _generate_res(profile.out_profile)
@@ -92,6 +122,12 @@ def _generate_fake_kernel(op_name: str, op_profile: set[OpProfile]) -> Callable:
 
 @contextlib.contextmanager
 def unsafe_generate_fake_kernels(op_profiles: dict[str, set[OpProfile]]) -> Generator:
+    # [FUNCTION DOC] Context manager that registers profile-derived fake kernels for each
+    # operator (names of the form namespace.opname) in op_profiles, overriding existing
+    # fakes, and logs a warning per op. CustomOpDef ops get register_fake called (their old
+    # abstract fn is saved); others get a temporary FRAGMENT library. Yields the list of
+    # temporary libraries. On exit destroys those libraries and restores saved abstract fns,
+    # raising AssertionError if an opdef vanished. Unsafe: assumes fixed output ranks.
     """
     Registers a fake kernel based on the given operator profiles. This fake
     kernel registration will override any existing fake kernel registrations.
@@ -190,11 +226,17 @@ def unsafe_generate_fake_kernels(op_profiles: dict[str, set[OpProfile]]) -> Gene
 
 
 def get_torch_version() -> str:
+    # [FUNCTION DOC] Returns the current torch major.minor version as a string.
     version = torch.__version__.split(".")
     return f"{int(version[0])}.{int(version[1])}"
 
 
 def generate_yaml_from_profiles(op_profiles: dict[str, set[OpProfile]]) -> str:
+    # [FUNCTION DOC] Serializes profiles to a yaml string with the torch version and a map
+    # of operator name to a list of profiles (dtype and layout as serialized enum values,
+    # device as a string). Imports yaml and export serde tables lazily.
+    # KNOWN ISSUE: None entries in args_profile are dropped when serializing, so positions
+    # of non-tensor arguments are lost and a reloaded profile may not align with call args.
     """
     Generates a yaml string from the given operator profiles which can be saved
     to a file. The yaml string can be loaded back into an operator profile
@@ -209,6 +251,8 @@ def generate_yaml_from_profiles(op_profiles: dict[str, set[OpProfile]]) -> str:
     )
 
     def serialize_tensor_metadata(t: TensorMetadata) -> dict:
+        # [FUNCTION DOC] HELPER: Converts a TensorMetadata to a plain mapping of rank,
+        # serialized dtype value, device string and serialized layout value.
         return {
             "rank": t.rank,
             "dtype": _TORCH_TO_SERIALIZE_DTYPE[t.dtype].value,
@@ -217,6 +261,8 @@ def generate_yaml_from_profiles(op_profiles: dict[str, set[OpProfile]]) -> str:
         }
 
     def serialize_op_profile(op: OpProfile) -> dict:
+        # [FUNCTION DOC] HELPER: Converts an OpProfile to a mapping with a list of serialized
+        # args (skipping None) and a serialized output or list of outputs.
         return {
             "args_profile": [
                 serialize_tensor_metadata(arg)
@@ -241,6 +287,9 @@ def generate_yaml_from_profiles(op_profiles: dict[str, set[OpProfile]]) -> str:
 
 
 def save_op_profiles(op_profiles: dict[str, set[OpProfile]], f: FileLike) -> None:
+    # [FUNCTION DOC] Writes the yaml form of op_profiles to f, which may be a path (file is
+    # written as text) or a BytesIO (utf-8 bytes written). Raises ValueError for any other
+    # type of f. Side effect: file I/O.
     """
     Serializes the given operator profiles into a yaml format and saves it to
     the given file. The operator profile can be loaded back using `load_op_profiles`.
@@ -261,6 +310,9 @@ def save_op_profiles(op_profiles: dict[str, set[OpProfile]], f: FileLike) -> Non
 
 
 def read_profiles_from_yaml(yaml_str: str) -> dict[str, set[OpProfile]]:
+    # [FUNCTION DOC] Parses yaml produced by save_op_profiles into a mapping of operator
+    # name to a set of OpProfile. Raises RuntimeError if the saved torch version differs
+    # from the current major.minor version. Lists of outputs become tuples.
     """
     Reads the yaml saved by `save_op_profiles` and returns the operator profiles.
     """
@@ -273,6 +325,7 @@ def read_profiles_from_yaml(yaml_str: str) -> dict[str, set[OpProfile]]:
     )
 
     def deserialize_tensor_metadata(data: dict) -> TensorMetadata:
+        # [FUNCTION DOC] HELPER: Rebuilds a TensorMetadata from its serialized mapping.
         return TensorMetadata(
             rank=data["rank"],
             dtype=_SERIALIZE_TO_TORCH_DTYPE[data["dtype"]],
@@ -281,6 +334,8 @@ def read_profiles_from_yaml(yaml_str: str) -> dict[str, set[OpProfile]]:
         )
 
     def deserialize_op_profile(data: dict) -> OpProfile:
+        # [FUNCTION DOC] HELPER: Rebuilds an OpProfile; a list output becomes a tuple of
+        # TensorMetadata, otherwise a single TensorMetadata.
         args_profile = tuple(
             deserialize_tensor_metadata(arg) for arg in data["args_profile"]
         )
@@ -309,6 +364,9 @@ def read_profiles_from_yaml(yaml_str: str) -> dict[str, set[OpProfile]]:
 
 
 def load_op_profiles(f: FileLike) -> dict[str, set[OpProfile]]:
+    # [FUNCTION DOC] Reads yaml text from a path or BytesIO f and returns the parsed
+    # profiles via read_profiles_from_yaml. Raises ValueError for other types of f, and
+    # RuntimeError on a torch version mismatch. Side effect: file I/O.
     """
     Loads the saved operator profiles from `save_op_profiles`.
     """

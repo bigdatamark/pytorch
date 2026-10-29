@@ -1,3 +1,8 @@
+# [MODULE DOC] Utilities for mapping a functional operator overload to its "out" variant
+# (an overload tagged torch.Tag.out whose mutable arguments receive the result).
+# Holds a manual registry for ops whose out variant cannot be discovered by naming,
+# plus schema-matching helpers and validation used by compiler passes.
+# Import-time side effects: creates a logger and an empty module-level registry dict.
 from __future__ import annotations
 
 import logging
@@ -17,6 +22,8 @@ def register_out_variant(
     functional_op: torch._ops.OpOverload,
     out_op: torch._ops.OpOverload,
 ) -> None:
+    # [FUNCTION DOC] Records functional_op -> out_op in the module-level manual registry,
+    # overwriting any previous entry. Side effect: mutates global state. Returns nothing.
     """Register a functional op -> out variant mapping."""
     _manual_out_variant_registry[functional_op] = out_op
 
@@ -24,11 +31,15 @@ def register_out_variant(
 def lookup_manual_out_variant(
     op: torch._ops.OpOverload,
 ) -> torch._ops.OpOverload | None:
+    # [FUNCTION DOC] Looks up op in the manual registry; returns the registered out
+    # overload or None if absent. No side effects.
     """Return the manually registered out variant for op, or None."""
     return _manual_out_variant_registry.get(op)
 
 
 def _is_functional(schema: torch._C.FunctionSchema) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op base name does not end with an underscore and
+    # no argument is a write (mutated) argument; otherwise False.
     """
     A schema is functional if no argument is written to and the name doesn't
     end with '_'.
@@ -40,6 +51,7 @@ def _is_functional(schema: torch._C.FunctionSchema) -> bool:
 
 
 def _is_mutable_arg(arg: torch._C.Argument) -> bool:
+    # [FUNCTION DOC] HELPER: True if the argument has alias info marking it as written to.
     return arg.alias_info is not None and arg.alias_info.is_write
 
 
@@ -47,6 +59,8 @@ def _signatures_match(
     schema_a: torch._C.FunctionSchema,
     schema_b: torch._C.FunctionSchema,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Compares the non-mutable arguments of two schemas positionally;
+    # True only if counts match and each pair has equal name, type string and default value.
     """Compare two schemas by their non-mutable arguments (name, type, default value)."""
     non_mutable_args_a = [arg for arg in schema_a.arguments if not _is_mutable_arg(arg)]
     non_mutable_args_b = [arg for arg in schema_b.arguments if not _is_mutable_arg(arg)]
@@ -66,6 +80,9 @@ def _has_valid_out_variant_returns(
     schema: torch._C.FunctionSchema,
     mutable_args: list[torch._C.Argument],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Validates out-variant returns: no returns is valid; otherwise
+    # the number of returns must equal the mutable args and each return, in order, must
+    # have alias info whose alias set equals that of the corresponding mutable arg.
     """Out variant must return either nothing or the mutable args themselves."""
     if len(schema.returns) == 0:
         return True
@@ -83,12 +100,19 @@ def _has_valid_out_variant_returns(
 
 
 def get_out_arg_names(out_op: torch._ops.OpOverload) -> list[str]:
+    # [FUNCTION DOC] Returns the names of the mutable (out) arguments of out_op's schema,
+    # in schema order.
     """Get the names of out arguments for an out variant op."""
     schema = out_op._schema
     return [arg.name for arg in schema.arguments if _is_mutable_arg(arg)]
 
 
 def to_out_variant(op: torch._ops.OpOverload) -> torch._ops.OpOverload | None:
+    # [FUNCTION DOC] Finds the out variant of a functional overload by scanning all
+    # overloads of the same op packet for one tagged torch.Tag.out whose non-mutable
+    # signature matches and whose mutable-arg count equals the functional op's return count.
+    # Raises RuntimeError if op is not functional, or if a matching candidate has invalid
+    # returns. Returns the first match, or None if none found. Does not consult the manual registry.
     """
     Given a functional operator overload, return its corresponding out variant.
     """
@@ -138,6 +162,9 @@ def to_out_variant(op: torch._ops.OpOverload) -> torch._ops.OpOverload | None:
 def check_out_variant(
     functional_op: torch._ops.OpOverload, expected_out_op: torch._ops.OpOverload
 ) -> None:
+    # [FUNCTION DOC] Validates that to_out_variant(functional_op) equals expected_out_op.
+    # Raises AssertionError with a diagnostic listing out-tagged overloads if none is found,
+    # or if the found variant differs from the expected one.
     """
     Checks that to_out_variant returns the expected out variant for a functional op.
     Raises AssertionError if the out variant is not valid.
@@ -163,6 +190,8 @@ def check_out_variant(
 
 
 def _get_out_variants_info(functional_op) -> str:
+    # [FUNCTION DOC] HELPER: Builds a newline-joined string listing every overload of the
+    # op packet tagged torch.Tag.out with its schema; empty string if none. Used for errors.
     """Collect information about overloads tagged with out for debugging."""
     namespace = functional_op.namespace
     op_name = functional_op._schema.name.split("::")[1]

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Autograd integration for custom operators: builds an Autograd-key kernel
+# from user-supplied backward / setup_context functions (make_autograd_impl) and provides
+# supports_tensorlist, which lets an autograd.Function accept and return lists of tensors
+# by flattening them with pytree. No import-time side effects beyond definitions.
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,17 +15,28 @@ from . import utils
 
 
 class InfoProtocol(Protocol):
+    # [CLASS DOC] HELPER: Structural type for objects holding an optional backward function
+    # and an optional setup_context function for an operator.
     _backward_fn: Callable | None
     _setup_context_fn: Callable | None
 
 
 @dataclasses.dataclass
 class Info:
+    # [CLASS DOC] HELPER: Dataclass implementing InfoProtocol; stores the backward and
+    # setup_context callables (each may be None) registered for an operator.
     _backward_fn: Callable | None
     _setup_context_fn: Callable | None
 
 
 def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
+    # [FUNCTION DOC] Builds and returns an autograd kernel (taking a dispatch keyset plus
+    # op args) for op. It creates a dynamic autograd.Function whose forward redispatches
+    # below autograd and calls info's setup_context (with defaults filled in), and whose
+    # backward calls info's backward and validates the gradient count. Out-variant ops
+    # raise if any input requires grad; otherwise grad-mode and requires-grad inputs
+    # choose between the Function and a plain no-grad redispatch. Tensor-list args wrap
+    # the Function with supports_tensorlist.
     name: str = f"GeneratedBackwardFor_{op._namespace}_{op._opname}_{op._overloadname}"
 
     schema = op._schema
@@ -35,15 +50,23 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
 
     @dataclass
     class Metadata:
+        # [CLASS DOC] HELPER: Extra trailing forward argument carrying the dispatch keyset
+        # and the keyword-only args, which autograd.Function cannot take as kwargs.
         keyset: _C.DispatchKeySet
         keyword_only_args: dict[str, Any]
 
     def redispatch_no_grad(keyset, args, kwargs):
+        # [FUNCTION DOC] HELPER: Redispatches op below the autograd key with autograd
+        # disabled for the call, restricting keyset to keys after autograd; returns result.
         with _C._AutoDispatchBelowAutograd():
             result = op.redispatch(keyset & _C._after_autograd_keyset, *args, **kwargs)
             return result
 
     def forward(ctx, *args):
+        # [FUNCTION DOC] HELPER: Forward of the generated Function. The last positional arg
+        # is a Metadata object; the rest are op args. Redispatches the op below autograd,
+        # then, if a setup_context function exists, fills default args back in and calls it
+        # (with keyword-only inputs separately when the schema has any). Returns the result.
         metadata = args[-1]
         args = args[:-1]
 
@@ -73,6 +96,11 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
             return result
 
     def backward(ctx, *grads):
+        # [FUNCTION DOC] HELPER: Backward of the generated Function. Temporarily drops the
+        # trailing metadata entry from needs_input_grad and calls the user backward. Raises
+        # RuntimeError if the number of returned grads is neither the forward input count
+        # nor the positional arg count, if extra grads are non-None, or if no backward was
+        # registered. Returns the grads plus a trailing None for the metadata input.
         if info._backward_fn:
             try:
                 prev_needs_input_grad = ctx.needs_input_grad
@@ -130,6 +158,10 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
     # The dispatcher passes any keyword-only-args as kwargs and the
     # rest of the args (even if specified as kwargs) as args.
     def autograd_impl(keyset, *args, **keyword_only_args):
+        # [FUNCTION DOC] HELPER: The returned Autograd kernel. For out ops, raises
+        # RuntimeError if grad is enabled and any input requires grad, else redispatches.
+        # Otherwise applies the generated Function when grad is enabled and a positional
+        # arg requires grad, else redispatches without grad. Returns the op result.
         if is_out_op:
             if _C.is_grad_enabled() and _C._any_requires_grad(
                 *args, **keyword_only_args
@@ -151,6 +183,11 @@ def make_autograd_impl(op: _ops.OpOverload, info: InfoProtocol) -> Callable:
 
 
 def supports_tensorlist(cls: Any) -> Any:
+    # [FUNCTION DOC] Class decorator: patches forward, backward and apply of an
+    # autograd.Function class (in place, and returns it) so list-of-tensor inputs and
+    # outputs work. apply flattens inputs with pytree and passes a spec metadata object as
+    # the last arg; forward unflattens, runs the original and flattens outputs; backward
+    # unflattens grads and checks the structure of returned grads matches the inputs.
     """Allows a given autograd.Function class to support List[Tensor] inputs/outputs.
 
     Regular autograd.Function has a constraint that it only directly supports autograd for
@@ -163,11 +200,17 @@ def supports_tensorlist(cls: Any) -> Any:
 
     @dataclass
     class TensorListMetadata:
+        # [CLASS DOC] HELPER: Carries the input pytree spec (set at apply time) and the
+        # output spec and tuple-ness of the result (filled in during forward).
         input_spec: _pytree.TreeSpec
         output_spec: _pytree.TreeSpec | None = None
         result_is_tuple: bool | None = None
 
     def new_forward(ctx, *args):
+        # [FUNCTION DOC] HELPER: Replacement forward. Raises NotImplementedError if the last
+        # arg is not TensorListMetadata, and RuntimeError if ctx already has _pt_metadata.
+        # Unflattens args, calls the original forward, records output spec / tuple-ness in
+        # the metadata, stores metadata on ctx, and returns the flattened output tuple.
         metadata = args[-1]
         args = args[:-1]
         if not isinstance(metadata, TensorListMetadata):
@@ -193,6 +236,11 @@ def supports_tensorlist(cls: Any) -> Any:
         return tuple(flat_result)
 
     def new_backward(ctx, *grads):
+        # [FUNCTION DOC] HELPER: Replacement backward. Raises NotImplementedError if ctx has
+        # no stored metadata. Unflattens grads, temporarily restructures needs_input_grad,
+        # calls the original backward, flattens its result (None entries treated as
+        # tensors), raises RuntimeError if the structure differs from the inputs, and
+        # returns flat grads plus a trailing None for the metadata input.
         if not hasattr(ctx, "_pt_metadata"):
             raise NotImplementedError(
                 "NYI: calling supports_tensorlist autograd.Function.backward directly. "
@@ -237,6 +285,9 @@ def supports_tensorlist(cls: Any) -> Any:
         return tuple(flat_grad_inputs + [None])
 
     def new_apply(*args):
+        # [FUNCTION DOC] HELPER: Replacement apply. Flattens args (lists of tensors stay
+        # leaves of the spec), calls the original apply with metadata, unflattens the output
+        # and unwraps a single-element tuple if the original result was not a tuple.
         flat_args, input_spec = _pytree.tree_flatten(args, is_leaf=not_list_of_tensor)
         metadata = TensorListMetadata(input_spec)
         result = orig_apply(*flat_args, metadata)  # type: ignore[misc]
@@ -260,6 +311,11 @@ def supports_tensorlist(cls: Any) -> Any:
 
 
 def not_list_of_tensor(tree):
+    # [FUNCTION DOC] Pytree is_leaf predicate: False for tuples, False for a list whose
+    # elements are all Tensors (treated as a leaf is NOT wanted here, so it is traversed
+    # as a unit by the caller's convention), True for other values and mixed lists.
+    # KNOWN ISSUE: name reads as "is not a list of tensors" but it is used as is_leaf, so
+    # a pure tensor list returns False, meaning it is not a leaf and is split into tensors.
     if isinstance(tree, tuple):
         return False
     if isinstance(tree, list):
@@ -268,6 +324,9 @@ def not_list_of_tensor(tree):
 
 
 def not_list_of_optional_tensor(tree):
+    # [FUNCTION DOC] Same as not_list_of_tensor but list elements may also be None: False
+    # for tuples and lists containing only Tensors/None, True otherwise. Used as the
+    # pytree leaf predicate when flattening gradients.
     if isinstance(tree, tuple):
         return False
     if isinstance(tree, list):

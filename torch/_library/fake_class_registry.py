@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Fake-class support for TorchBind script objects and opaque objects: a
+# FakeScriptObject wrapper (and FakeScriptMethod for its methods), a global registry of
+# user-registered fake classes keyed by full qualified class name, and conversion
+# helpers that turn real script objects into fake ones for tracing (maybe_to_fake_obj).
+# Public API: register_fake_class, deregister_fake_class, has_fake_class, find_fake_class.
+# Import-time side effects: creates a logger and the global registry instance.
 import copy
 import logging
 from typing import Any, Protocol
@@ -12,9 +18,19 @@ log = logging.getLogger(__name__)
 
 
 class FakeScriptObject:
+    # [CLASS DOC] Stand-in for a script (TorchBind) or opaque object during tracing. Holds
+    # wrapped_obj (the fake implementation), script_class_name and real_obj (a deepcopy of
+    # the real object where possible; opaque custom classes are not copied so mutations
+    # reach the real object). Attributes are immutable after construction (setattr raises),
+    # unknown attribute reads raise a descriptive error, and equality/hash delegate to
+    # real_obj. Methods are attached as FakeScriptMethod attributes by maybe_to_fake_obj.
     def __init__(
         self, wrapped_obj: Any, script_class_name: str, x: torch.ScriptObject | None
     ):
+        # [FUNCTION DOC] Sets wrapped_obj, script_class_name and real_obj, bypassing the
+        # blocking setattr. Unless x is an opaque custom class instance, real_obj is a
+        # deepcopy of x taken with dispatch modes disabled; if the copy raises RuntimeError
+        # or TypeError a warning is logged and x itself is used.
         # Use object.__setattr__ to bypass our custom __setattr__ during initialization
         object.__setattr__(self, "wrapped_obj", wrapped_obj)
         object.__setattr__(self, "script_class_name", script_class_name)
@@ -42,6 +58,9 @@ class FakeScriptObject:
         object.__setattr__(self, "real_obj", real_obj)
 
     def __getattribute__(self, name):
+        # [FUNCTION DOC] Normal attribute lookup; on a missing attribute re-raises
+        # AttributeError with a message explaining fake kernels must not depend on the
+        # object contents and how to allow members via register_custom_class.
         try:
             return super().__getattribute__(name)
         except AttributeError as e:
@@ -55,6 +74,7 @@ class FakeScriptObject:
             ) from e
 
     def __setattr__(self, name, value):
+        # [FUNCTION DOC] Always raises AttributeError; the object is read-only for users.
         raise AttributeError(
             f"Tried to call __setattr__ with attr '{name}' on a FakeScriptObject, "
             "implying that you are calling this inside of a fake kernel. "
@@ -65,10 +85,13 @@ class FakeScriptObject:
         )
 
     def __getitem__(self, key):
+        # [FUNCTION DOC] Indexes into real_obj (needed for DeviceMesh support).
         # This is needed for DeviceMesh support
         return self.real_obj[key]
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Equal if same object, or if real_obj is identical/equal to the other
+        # wrapper's real_obj, or (for non-wrappers) to the other value directly.
         if self is other:
             return True
         # Get real_obj without triggering custom __getattribute__
@@ -84,9 +107,11 @@ class FakeScriptObject:
         return self_real == other
 
     def __ne__(self, other):
+        # [FUNCTION DOC] Negation of equality.
         return not self.__eq__(other)
 
     def __hash__(self):
+        # [FUNCTION DOC] Hash of real_obj, or its identity-based id if it is unhashable.
         # Use real_obj's hash if available, otherwise use object id
         real_obj = object.__getattribute__(self, "real_obj")
         try:
@@ -96,6 +121,11 @@ class FakeScriptObject:
             return id(real_obj)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "FakeScriptObject":
+        # [FUNCTION DOC] Deep copies the wrapper using the memo to handle cycles. Copies
+        # wrapped_obj and real_obj (dispatch modes disabled), then re-creates other
+        # instance attributes: FakeScriptMethod entries are rebound to the new wrapper, and
+        # other values are taken from the new real_obj when it has the attribute, else
+        # copied by reference.
         if id(self) in memo:
             return memo[id(self)]
         new_obj = FakeScriptObject.__new__(FakeScriptObject)
@@ -130,6 +160,7 @@ class FakeScriptObject:
 
 
 def maybe_unwrap_fake_script_object(obj: Any) -> Any:
+    # [FUNCTION DOC] Returns real_obj if obj is a FakeScriptObject, else obj unchanged.
     """If obj is a FakeScriptObject, return the underlying real object."""
     if isinstance(obj, FakeScriptObject):
         return obj.real_obj
@@ -137,40 +168,58 @@ def maybe_unwrap_fake_script_object(obj: Any) -> Any:
 
 
 class FakeScriptMethod:
+    # [CLASS DOC] Callable bound to a FakeScriptObject and a method name (with the method's
+    # schema if known). Calling it dispatches through the call_torchbind higher-order op so
+    # the call is traceable.
     def __init__(
         self,
         self_fake_obj: FakeScriptObject,
         method_name: str,
         schema: torch.FunctionSchema | None,
     ):
+        # [FUNCTION DOC] Stores the bound fake object, method name and optional schema.
         self.self_fake_obj = self_fake_obj
         self.method_name = method_name
         self.schema = schema
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Invokes call_torchbind on the bound fake object and method name
+        # with the given arguments; returns its result.
         from torch._higher_order_ops.torchbind import call_torchbind
 
         return call_torchbind(self.self_fake_obj, self.method_name, *args, **kwargs)
 
 
 class HasStaticMethodFromReal(Protocol):
+    # [CLASS DOC] HELPER: Protocol describing a fake class with a from_real classmethod.
+    # KNOWN ISSUE: registration actually requires the __obj_unflatten__ classmethod, not
+    # from_real; the protocol name and method are out of date with the checks below.
     @classmethod
     def from_real(cls, real_obj: torch.ScriptObject):
+        # [FUNCTION DOC] HELPER: Protocol stub; takes a real script object and does nothing.
         pass
 
 
 class FakeClassRegistry:
+    # [CLASS DOC] Mapping from full qualified class name (for example the torch classes
+    # prefix plus namespace and class) to the registered fake class. Supports lookup,
+    # registration with override warning, deregistration and clearing.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates an empty registry dict.
         self._registered_class: dict[str, Any] = {}
 
     def has_impl(self, full_qualname: str) -> bool:
+        # [FUNCTION DOC] True if a fake class is registered under the name.
         return full_qualname in self._registered_class
 
     def get_impl(self, full_qualname: str) -> Any:
+        # [FUNCTION DOC] Returns the registered fake class; raises RuntimeError if absent.
         self._check_registered(full_qualname)
         return self._registered_class[full_qualname]
 
     def register(self, full_qualname: str, fake_class=None) -> None:
+        # [FUNCTION DOC] Stores fake_class under the name; logs a warning when overriding
+        # an existing registration.
         if self.has_impl(full_qualname):
             log.warning(
                 "%s is already registered. Previous fake class is overridden with  %s.",
@@ -180,6 +229,8 @@ class FakeClassRegistry:
         self._registered_class[full_qualname] = fake_class
 
     def deregister(self, full_qualname: str) -> Any:
+        # [FUNCTION DOC] Removes and returns the registered fake class; if none is
+        # registered, logs a warning and returns None.
         if not self.has_impl(full_qualname):
             log.warning(
                 "Cannot deregister %s. Please use register_fake_class to register it first."
@@ -190,9 +241,11 @@ class FakeClassRegistry:
             return self._registered_class.pop(full_qualname)
 
     def clear(self) -> None:
+        # [FUNCTION DOC] Removes all registrations.
         self._registered_class.clear()
 
     def _check_registered(self, full_qualname: str) -> None:
+        # [FUNCTION DOC] HELPER: Raises RuntimeError if the name is not registered.
         if full_qualname not in self._registered_class:
             raise RuntimeError(
                 f"{full_qualname} is not registered. Please use register_fake_class to register it first."
@@ -204,6 +257,8 @@ global_fake_class_registry = FakeClassRegistry()
 
 # TODO: add this check at compile time for __obj_flatten__.
 def _check_valid_flat_script_obj(flat_x):
+    # [FUNCTION DOC] HELPER: Validates the result of __obj_flatten__: must be a tuple whose
+    # elements are 2-tuples with a string first element; raises RuntimeError otherwise.
     if not isinstance(flat_x, tuple):
         raise RuntimeError("Expect flat x to be a tuple.")
 
@@ -218,6 +273,8 @@ def _check_valid_flat_script_obj(flat_x):
 
 
 def tracing_with_real(x: torch.ScriptObject) -> bool:
+    # [FUNCTION DOC] False if x has no tracing_mode method; otherwise True when it returns
+    # "real" and False when "fake". Raises AssertionError for any other mode.
     if not hasattr(x, "tracing_mode"):
         return False
 
@@ -232,6 +289,15 @@ def maybe_to_fake_obj(
     fake_mode,
     x: Any,
 ) -> FakeScriptObject | torch.ScriptObject:
+    # [FUNCTION DOC] Converts a real script/opaque object x into a fake for tracing under
+    # fake_mode. Real-tracing objects are returned unchanged. Opaque custom classes become
+    # a FakeScriptObject around a FakeOpaqueObject, copying registered member attributes
+    # (TypeError if a member is missing). Other TorchBind objects are flattened via
+    # __obj_flatten__ (validated), their tensors replaced by empty strided fakes (aliasing
+    # between tensors is broken, with a warning), rebuilt via the registered fake class's
+    # __obj_unflatten__, wrapped, and each real method gets a FakeScriptMethod (non-callable
+    # fake attribute raises RuntimeError; missing methods log a warning except a skip list).
+    # Raises AssertionError if opaque info is missing.
     import torch.utils._pytree as pytree
 
     # When tracing with real mode, people should implement meta kernels that can
@@ -347,6 +413,13 @@ def maybe_to_fake_obj(
 
 
 def register_fake_class(qualname, fake_class: HasStaticMethodFromReal | None = None):
+    # [FUNCTION DOC] Registers a fake class for the TorchBind class named by qualname
+    # (namespace::name), directly or as a decorator when fake_class is omitted. Checks that
+    # the real class exists, that the fake class defines an __obj_unflatten__ classmethod
+    # (RuntimeError otherwise), then stores it in the global registry. Returns the class
+    # (or the decorator).
+    # KNOWN ISSUE: the docstring says users must provide from_real, but the code requires
+    # an __obj_unflatten__ classmethod.
     r"""Register a fake implementation for this class.
 
     It's in the same spirit of registering a fake implementation for
@@ -414,6 +487,8 @@ def register_fake_class(qualname, fake_class: HasStaticMethodFromReal | None = N
     """
 
     def inner(fake_class: HasStaticMethodFromReal):
+        # [FUNCTION DOC] HELPER: Validates and registers fake_class (see outer function);
+        # returns fake_class.
         ns, name = parse_namespace(qualname)
 
         # This also checks whether the referred torch::class_ exists.
@@ -439,25 +514,32 @@ def register_fake_class(qualname, fake_class: HasStaticMethodFromReal | None = N
 
 
 def deregister_fake_class(qualname):
+    # [FUNCTION DOC] Removes the fake class registered for qualname from the global
+    # registry and returns it (None with a warning if not registered).
     return global_fake_class_registry.deregister(_full_qual_class_name(qualname))
 
 
 def has_fake_class(full_qualname) -> bool:
+    # [FUNCTION DOC] True if the global registry has a fake class for the full name.
     return global_fake_class_registry.has_impl(full_qualname)
 
 
 def find_fake_class(full_qualname) -> Any | None:
+    # [FUNCTION DOC] Returns the registered fake class for the full name, or None.
     if not has_fake_class(full_qualname):
         return None
     return global_fake_class_registry.get_impl(full_qualname)
 
 
 def _full_qual_class_name(qualname: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts namespace::name to the full dotted torch classes name.
     ns, name = parse_namespace(qualname)
     return "__torch__.torch.classes." + ns + "." + name
 
 
 def _is_script_object(obj: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if obj is a ScriptObject whose type name is under the
+    # torch classes namespace (a TorchBind object).
     return isinstance(
         obj, torch.ScriptObject
     ) and obj._type().qualified_name().startswith(  # type: ignore[attr-defined]
@@ -467,6 +549,8 @@ def _is_script_object(obj: Any) -> bool:
 
 # Return the namespace and class name from fully qualified name.
 def _ns_and_class_name(full_qualname: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Splits a five-part dotted full name and returns (namespace,
+    # class name); raises AssertionError if it does not have exactly five parts.
     splits = full_qualname.split(".")
     if len(splits) != 5:
         raise AssertionError(f"Could not split {full_qualname=}, expected 5 parts")
@@ -475,6 +559,8 @@ def _ns_and_class_name(full_qualname: str) -> tuple[str, str]:
 
 
 def _find_fake_class_for_script_object(x: torch.ScriptObject) -> Any:
+    # [FUNCTION DOC] HELPER: Looks up the fake class registered for x's class; raises
+    # RuntimeError with registration instructions if none exists.
     full_qualname = x._type().qualified_name()  # type: ignore[attr-defined]
     ns, class_name = _ns_and_class_name(full_qualname)
     fake_class = find_fake_class(full_qualname)
@@ -495,6 +581,10 @@ _CONVERT_FROM_REAL_NAME = "__obj_unflatten__"
 
 
 def _fake_obj_from_real(fake_mode, x) -> Any:
+    # [FUNCTION DOC] HELPER: Builds a fake object from real x via the fake class's from_real
+    # method, with a FakeImplCtx installed as the ctx getter so tensors can be fakified.
+    # Raises RuntimeError if the fake class lacks __obj_unflatten__.
+    # KNOWN ISSUE: checks for __obj_unflatten__ but then calls from_real, which may not exist.
     fake_class = _find_fake_class_for_script_object(x)
 
     from_real_method = getattr(fake_class, _CONVERT_FROM_REAL_NAME, None)

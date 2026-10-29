@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implementation of torch.library.custom_op and the CustomOpDef class that
+# backs it: a wrapper that defines an operator in the dispatcher from a Python function,
+# registers device kernels, fake (meta) impls, autograd formulas, vmap, autocast,
+# torch_dispatch and effect behavior, and tracks all such ops in the module-level OPDEFS
+# registry. Also contains helpers for library management, schema/aliasing checks and
+# in-place / out-variant handling.
+# Import-time side effects: creates a logger and the type aliases device_types_t / tags_t.
 import collections
 import inspect
 import logging
@@ -23,6 +30,8 @@ log = logging.getLogger(__name__)
 
 
 def _normalize_tags(tags: tags_t) -> tuple[_C.Tag, ...]:
+    # [FUNCTION DOC] HELPER: Converts None, a single Tag or a sequence of Tags to a tuple
+    # with duplicates removed (first occurrence order preserved).
     if tags is None:
         return ()
     if isinstance(tags, _C.Tag):
@@ -31,6 +40,8 @@ def _normalize_tags(tags: tags_t) -> tuple[_C.Tag, ...]:
 
 
 def _with_pt2_compliant_tag(tags: Sequence[_C.Tag]) -> list[_C.Tag]:
+    # [FUNCTION DOC] HELPER: Returns a list with the pt2_compliant_tag first followed by the
+    # given tags minus any existing copy of that tag.
     return [
         _C.Tag.pt2_compliant_tag,
         *(tag for tag in tags if tag != _C.Tag.pt2_compliant_tag),
@@ -74,6 +85,14 @@ def custom_op(
     schema: str | None = None,
     tags: tags_t = None,
 ) -> Union[Callable[[Callable[..., object]], "CustomOpDef"], "CustomOpDef"]:
+    # [FUNCTION DOC] Public API (exposed as torch.library.custom_op). Turns a type-annotated
+    # function into a custom operator named "namespace::name", either as a decorator (fn
+    # omitted) or directly. The schema is inferred from annotations, or taken from the
+    # schema argument, in which case write-aliased args must equal mutates_args exactly
+    # (ValueError otherwise). Creates a CustomOpDef, registers fn as the kernel for
+    # device_types (all devices when None), and enables python-object dispatch on the
+    # overload. Returns the CustomOpDef (or the decorator). Side effects: defines the op in
+    # the dispatcher and records it in OPDEFS.
     """Wraps a function into custom operator.
 
     Reasons why you may want to create a custom op include:
@@ -233,6 +252,10 @@ def custom_op(
     """
 
     def inner(fn: Callable[..., object]) -> CustomOpDef:
+        # [FUNCTION DOC] HELPER: Does the actual op creation for fn (see outer function).
+        # KNOWN ISSUE: when a schema is given and mutates_args is the string "unknown", the
+        # comparison uses the set of characters of the string, so the consistency check
+        # would raise for any schema with mutated args.
         import torch
 
         normalized_tags = _normalize_tags(tags)
@@ -270,6 +293,15 @@ def custom_op(
 
 
 class CustomOpDef:
+    # [CLASS DOC] Python-side definition of a custom operator created by custom_op. State:
+    # namespace, name, schema string, tags, the original function (_init_fn), per-device
+    # kernel table (_backend_fns, key None means default), optional fake impl, autograd
+    # backward / setup_context functions, torch_dispatch handlers, vmap fn, autocast dtypes,
+    # inplace / out flags, a set of disabled kernels, and the Library used to register with
+    # the dispatcher. Instances are callable (forward to the dispatcher overload) and are
+    # registered in the global OPDEFS mapping. Methods register behaviors (register_kernel,
+    # register_fake, register_autograd, register_torch_dispatch, register_vmap,
+    # register_autocast) and manage kernel enablement.
     """CustomOpDef is a wrapper around a function that turns it into a custom op.
 
     It has various methods for registering additional behavior for this
@@ -287,6 +319,10 @@ class CustomOpDef:
         fn: Callable,
         tags: tags_t = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes all state fields (empty kernel/fake/autograd/vmap
+        # tables), gets (or replaces) the library for the op, defines the op in the
+        # dispatcher with the given schema and tags, and records self in OPDEFS under its
+        # qualified name (replacing any previous def of the same name).
         # Fields used to interface with the PyTorch dispatcher
         self._namespace = namespace
         self._name = name
@@ -314,13 +350,21 @@ class CustomOpDef:
 
     @property
     def _qualname(self) -> str:
+        # [FUNCTION DOC] HELPER: Property; the qualified name "namespace::name".
         return f"{self._namespace}::{self._name}"
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a string showing the qualified op name.
         return f"<CustomOpDef({self._qualname})>"
 
     @contextmanager
     def set_kernel_enabled(self, device_type: str, enabled: bool = True):
+        # [FUNCTION DOC] Context manager that disables (enabled false) or enables the kernel
+        # for device_type by updating the disabled set, logging warnings for no-op requests
+        # or unregistered device types. A disabled device kernel falls back to the original
+        # function. On exit restores the original enabled/disabled state, even on error.
+        # KNOWN ISSUE: the docstring documents a parameter named disable, but the actual
+        # parameter is enabled.
         """
         Disable or re-enable an already registered kernel for this custom operator.
 
@@ -392,6 +436,17 @@ class CustomOpDef:
     def register_kernel(
         self, device_types: device_types_t, fn: Callable | None = None, /
     ) -> Callable:
+        # [FUNCTION DOC] Registers fn as the implementation for the given device type(s)
+        # (None means the default for all devices; usable as a decorator when fn is omitted).
+        # For each new device type, installs a dispatcher kernel that calls the stored
+        # (possibly disabled-switchable) function and validates the result: inplace ops must
+        # return their first arg, out ops must return their out kwargs, and other non-view
+        # ops are checked for illegal aliasing of inputs/outputs (RuntimeError on violation).
+        # Raises ValueError if a device-specific registration is requested for an op with no
+        # tensor args and no device argument; otherwise registers a backend-select kernel.
+        # Returns fn (or the decorator).
+        # KNOWN ISSUE: the nested kernels refer to the loop variable device_type when called,
+        # so registering several device types at once looks up the last one for all of them.
         """Register an implementation for a device type for this operator.
 
         Some valid device_types are: "cpu", "cuda", "xla", "mps", "ipu", "xpu".
@@ -431,6 +486,8 @@ class CustomOpDef:
         """
 
         def inner(fn):
+            # [FUNCTION DOC] HELPER: Performs the registration for fn for each device type
+            # and returns fn.
             if device_types is None or isinstance(device_types, str):
                 dtypes: list[str | None] = [device_types]
             else:
@@ -439,9 +496,15 @@ class CustomOpDef:
                 if device_type not in self._backend_fns:
 
                     def backend_impl(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Dispatcher kernel; runs the registered
+                        # function for the device type, then validates the result
+                        # (inplace / out return rules, or aliasing constraints for
+                        # non-view ops) raising RuntimeError on violation; returns result.
                         result = self._backend_fns[device_type](*args, **kwargs)
 
                         def get_module():
+                            # [FUNCTION DOC] HELPER: Returns the module defining the
+                            # device's registered function, for error messages.
                             fn = self._backend_fns[device_type]
                             return inspect.getmodule(fn)
 
@@ -497,6 +560,8 @@ class CustomOpDef:
                 # implementation depending on if the kernel is disabled.
                 @torch._disable_dynamo
                 def wrapped_fn(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Runs the original function if this device's
+                    # kernel is currently disabled, otherwise the registered fn.
                     if device_type in self._disabled_kernel:
                         return self._init_fn(*args, **kwargs)
                     else:
@@ -521,6 +586,10 @@ class CustomOpDef:
         return inner(fn)
 
     def register_fake(self, fn: Callable, /) -> Callable:
+        # [FUNCTION DOC] Stores fn as the fake (abstract/meta) implementation and returns it.
+        # For inplace or out tagged ops, which already get an autogenerated fake kernel,
+        # emits a warning that the registration is unnecessary (the provided fn is still
+        # used). Replaces any previous fake impl.
         r"""Register a FakeTensor implementation for this custom op.
 
         This is necessary to get the operator to work efficiently with torch.compile.
@@ -603,11 +672,17 @@ class CustomOpDef:
         return fn
 
     def register_effect(self, effect: EffectType | None) -> None:
+        # [FUNCTION DOC] Marks this op as having the given effect (or none) by registering it
+        # with the library under the op's qualified name.
         self._lib._register_effectful_op(self._qualname, effect)
 
     def register_torch_dispatch(
         self, torch_dispatch_class: Any, fn: Callable | None = None, /
     ) -> Callable:
+        # [FUNCTION DOC] Registers fn as the handler for this op when called with an instance
+        # of torch_dispatch_class (decorator form when fn is omitted). The first registration
+        # per class installs a forwarding rule in the library; later ones just replace the
+        # stored function. Returns fn (or the decorator).
         r"""Registers a torch_dispatch rule for the given operator and ``torch_dispatch_class``.
 
         This allows for open registration to specify the behavior between the operator
@@ -618,9 +693,12 @@ class CustomOpDef:
         """
 
         def register(fn):
+            # [FUNCTION DOC] HELPER: Stores fn in the dispatch table (installing the library
+            # rule if new) and returns fn.
             if torch_dispatch_class not in self._torch_dispatch_fns:
 
                 def inner(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Forwards to the currently stored handler for the class.
                     return self._torch_dispatch_fns[torch_dispatch_class](
                         *args, **kwargs
                     )
@@ -643,6 +721,9 @@ class CustomOpDef:
         *,
         setup_context: Callable | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the backward function and optional setup_context function used
+        # to build the autograd kernel. Raises RuntimeError if the op is tagged out or its
+        # schema is not functional (view ops allowed). Mutates only this object's fields.
         r"""Register a backward formula for this custom op.
 
         In order for an operator to work with autograd, you need to register
@@ -739,6 +820,9 @@ class CustomOpDef:
         self._setup_context_fn = setup_context
 
     def _register_to_dispatcher(self, tags: Sequence[_C.Tag]) -> None:
+        # [FUNCTION DOC] HELPER: Parses and validates the schema, defines the op in the
+        # dispatcher, records inplace / out flags (and the out kwarg names), then installs the
+        # fake, autograd and ADInplaceOrView dispatcher kernels.
         schema_str = self._name + self._schema
         cpp_schema = _C.parse_schema(schema_str)
         self._validate_schema(cpp_schema, schema_str)
@@ -753,6 +837,8 @@ class CustomOpDef:
         self._register_adinplaceorview_dispatcher_impl()
 
     def _validate_schema(self, schema: _C.FunctionSchema, schema_str: str) -> None:
+        # [FUNCTION DOC] HELPER: Raises NotImplementedError if the schema has keyword-only
+        # Tensor args and the op is not tagged out.
         if utils.has_kwarg_only_tensors(schema) and torch.Tag.out not in self._tags:
             # If you want to support this, the progression is:
             # - supporting kwarg-only Tensors that are non-differentiable
@@ -763,6 +849,8 @@ class CustomOpDef:
             )
 
     def _define_dispatcher_op(self, schema_str: str, tags: Sequence[_C.Tag]) -> None:
+        # [FUNCTION DOC] HELPER: Defines the schema in the library with the pt2-compliant tag
+        # added to tags, and stores the resulting op overload in _opoverload.
         self._lib.define(
             schema_str,
             tags=_with_pt2_compliant_tag(tags),
@@ -770,7 +858,11 @@ class CustomOpDef:
         self._opoverload = utils.lookup_op(self._qualname)
 
     def _register_fake_dispatcher_impl(self) -> None:
+        # [FUNCTION DOC] HELPER: Registers a fake impl with the library that delegates to the
+        # user fake function if present, else to an autogenerated trivial fake when possible,
+        # else raises RuntimeError telling the user to call register_fake.
         def fake_impl(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: The registered fake kernel; see enclosing method.
             if self._abstract_fn is None:
                 if utils.can_generate_trivial_fake_impl(self._opoverload):
                     return utils.generate_trivial_fake_impl(
@@ -787,10 +879,14 @@ class CustomOpDef:
         self._lib._register_fake(self._name, fake_impl, _stacklevel=5)
 
     def _register_autograd_dispatcher_impl(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the autograd kernel from this def (self provides the
+        # backward / setup_context fields lazily) and registers it on the Autograd key.
         autograd_impl = autograd.make_autograd_impl(self._opoverload, self)
         self._lib.impl(self._name, autograd_impl, "Autograd", with_keyset=True)
 
     def _register_adinplaceorview_dispatcher_impl(self) -> None:
+        # [FUNCTION DOC] HELPER: For view or mutable schemas, registers the ADInplaceOrView
+        # fallback and, for mutable ops, a version-bumping kernel. No-op otherwise.
         schema = self._opoverload._schema
         if not (schema._is_view_op() or schema.is_mutable):
             return
@@ -801,6 +897,10 @@ class CustomOpDef:
             self._register_mutation_version_bump(schema)
 
     def _register_mutation_version_bump(self, schema: _C.FunctionSchema) -> None:
+        # [FUNCTION DOC] HELPER: Registers an ADInplaceOrView kernel that increments the
+        # version counter of every mutated positional/keyword argument, then runs the C++
+        # fallback kernel for view ops, or redispatches past ADInplaceOrView for non-views.
+        # The library emits a "warn once" warning that is suppressed here.
         mutated_idxs, mutated_keys = utils.mutated_args_kwargs(schema)
 
         is_view = schema._is_view_op()
@@ -813,6 +913,8 @@ class CustomOpDef:
             after_ADInplaceOrView_keyset = _C._after_ADInplaceOrView_keyset
 
         def adinplaceorview_impl(keyset, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Bumps versions of mutated args present in the call, then
+            # runs the original (view) or redispatches (non-view) and returns the result.
             # The dispatcher normalizes non-keyword-only arguments into args.
             # Avoid filling defaults for every schema argument on this hot path.
             for idx in mutated_idxs:
@@ -842,11 +944,15 @@ class CustomOpDef:
             )
 
     def _register_backend_select_dispatcher(self, device_arg_index: int):
+        # [FUNCTION DOC] HELPER: Registers a BackendSelect kernel for ops without tensor
+        # inputs; it reads the device type from the argument at device_arg_index.
         """
         Switch on the device argument to select the correct backend to dispatch to.
         """
 
         def backend_select(keyset, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises RuntimeError if no kernel is registered for the
+            # device type; otherwise redispatches to that device's dispatch key.
             device = args[device_arg_index].type
             if device not in self._backend_fns:
                 raise RuntimeError(
@@ -863,12 +969,19 @@ class CustomOpDef:
         self._lib.impl(self._name, backend_select, "BackendSelect", with_keyset=True)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the underlying dispatcher op overload with the arguments.
         return self._opoverload(*args, **kwargs)
 
     def register_vmap(
         self,
         func: Callable | None = None,
     ):
+        # [FUNCTION DOC] Registers func as the vmap rule (signature: info, in_dims, then the op
+        # args) for this op; usable as a decorator when func is omitted. The first
+        # registration installs a FuncTorchBatched kernel that calls the vmap helper with the
+        # current functorch interpreter; later ones only replace the stored function.
+        # KNOWN ISSUE: the inner register returns None, so using this as a plain decorator
+        # rebinds the decorated name to None (the docstring examples rely on this form).
         r"""Register a vmap implementation to support :func:`torch.vmap` for this custom op.
 
         This API may be used as a decorator.
@@ -942,12 +1055,16 @@ class CustomOpDef:
         from torch._functorch.pyfunctorch import retrieve_current_functorch_interpreter
 
         def register(func):
+            # [FUNCTION DOC] HELPER: Stores func as the vmap function, installing the batched
+            # kernel on first use. Returns nothing.
             need_register = self._vmap_fn is None
             self._vmap_fn = func
 
             if need_register:
 
                 def wrapped_func(keyset, *args, **kwargs):
+                    # [FUNCTION DOC] HELPER: FuncTorchBatched kernel; runs the stored vmap
+                    # function through the functorch vmap helper for the current interpreter.
                     interpreter = retrieve_current_functorch_interpreter()
                     return custom_function_call_vmap_helper(
                         # pyrefly: ignore[bad-argument-type]
@@ -973,6 +1090,12 @@ class CustomOpDef:
         device_type: str,
         cast_inputs: _dtype,
     ):
+        # [FUNCTION DOC] Registers an autocast rule for device_type: inside autocast regions the
+        # op excludes the autocast key and runs with floating-point tensor inputs on that device
+        # (not float64) cast to cast_inputs. Raises ValueError if device_type is not a string or
+        # does not support autocast. Registers the kernel only the first time per device type
+        # (a later call does not update the stored dtype used by the kernel). Returns the kernel.
+        # KNOWN ISSUE: the docstring lists op and lib parameters that this method does not take.
         r"""Register an autocast dispatch rule for this custom op.
 
         Valid ``device_type`` values include any device type that supports autocast.
@@ -1022,6 +1145,8 @@ class CustomOpDef:
         autocast_dispatch_key = getattr(torch._C.DispatchKey, autocast_key)
 
         def kernel(_, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Autocast kernel; raises AssertionError if kwargs are
+            # passed, otherwise calls the op on cast args with the autocast key excluded.
             if len(kwargs) != 0:
                 raise AssertionError(
                     f"Custom ops do not support kwargs yet, got {list(kwargs.keys())}"
@@ -1040,6 +1165,9 @@ class CustomOpDef:
 # TODO: Merge this function with torch.amp.autocast_mode._cast, and refactor it
 # into a utility function once custom ops support arbitrary input types.
 def _cast(value, device_type: str, dtype: _dtype):
+    # [FUNCTION DOC] HELPER: Recursively casts eligible tensors (floating point, on the given
+    # device type, not float64) in value to dtype. Strings and bytes pass through; lists and
+    # tuples are rebuilt; other iterables become generators (lazy); other values pass through.
     if isinstance(value, torch.Tensor):
         is_eligible = (
             value.is_floating_point()
@@ -1060,6 +1188,8 @@ def _cast(value, device_type: str, dtype: _dtype):
 
 
 def increment_version(val: Any) -> None:
+    # [FUNCTION DOC] Bumps the autograd version counter of a Tensor, or of each Tensor in a
+    # tuple or list; other values are ignored. Mutates version counters.
     if isinstance(val, Tensor):
         torch.autograd.graph.increment_version(val)
     elif isinstance(val, (tuple, list)):
@@ -1092,12 +1222,16 @@ def increment_version(val: Any) -> None:
 
 
 OPDEF_TO_LIB: dict[str, "torch.library.Library"] = {}
+# OPDEFS holds CustomOpDef objects weakly, so a def disappears once user code drops it.
 OPDEFS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 
 
 def get_library_allowing_overwrite(
     namespace: str, name: str
 ) -> "torch.library.Library":
+    # [FUNCTION DOC] Returns a fresh FRAGMENT Library for the namespace, destroying (and
+    # thereby unregistering the op from) any library previously created for the same
+    # qualified name; records the new library in OPDEF_TO_LIB. Allows redefining an op.
     qualname = f"{namespace}::{name}"
 
     if qualname in OPDEF_TO_LIB:
@@ -1112,6 +1246,9 @@ def get_library_allowing_overwrite(
 def _maybe_get_opdef(
     op: CustomOpDef | _ops.OpOverload | str,
 ) -> CustomOpDef | None:
+    # [FUNCTION DOC] HELPER: Resolves op (a CustomOpDef, an OpOverload, or a qualified name
+    # string) to its CustomOpDef via the OPDEFS registry; returns None if not a custom op.
+    # Raises AssertionError if op is of an unsupported type.
     if isinstance(op, CustomOpDef):
         return op
     if isinstance(op, _ops.OpOverload):

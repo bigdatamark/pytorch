@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Infers an operator schema string (e.g. "name(Tensor x, int y=1) -> Tensor")
+# from a Python function's type annotations, for use when defining custom operators.
+# Contains the public infer_schema (exposed as torch.library.infer_schema), tables of
+# supported parameter and return types, and helpers for return parsing, tuple-to-list
+# suggestions and torch.Tag.inplace / torch.Tag.out handling.
+# Import-time side effects: builds the SUPPORTED_PARAM_TYPES table (imports the
+# distributed GroupName type if torch.distributed is available) and defines _TestTensor.
 import collections
 import inspect
 import typing
@@ -29,6 +36,16 @@ def infer_schema(
     op_name: str | None = None,
     tags: torch.Tag | typing.Sequence[torch.Tag] | None = (),
 ) -> str:
+    # [FUNCTION DOC] Builds a schema string from the signature of prototype_function: each
+    # parameter needs a supported type annotation (positional-only, varargs and varkwargs
+    # are rejected); keyword-only params follow a star marker; defaults of None, numbers,
+    # bools, strings, devices and dtypes are rendered into the schema. mutates_args is either
+    # the string "unknown" (all Tensors mutated) or names of mutated params, which get alias
+    # annotations. Tags: inplace needs the first positional Tensor to be the sole mutated arg
+    # and a Tensor return; out needs keyword-only mutable Tensor args and a matching return.
+    # Returns the schema, prefixed by op_name when given. Raises ValueError (via error_fn)
+    # for any unsupported annotation, default or arg combination, and AssertionError if both
+    # tags are given. Stringified annotations are evaluated with the function's globals.
     r"""Parses the schema of a given function with type hints. The schema is inferred from the
     function's type hints, and can be used to define a new operator.
 
@@ -87,9 +104,13 @@ def infer_schema(
         mutates_args = tuple(mutates_args)
 
     def error_fn(what):
+        # [FUNCTION DOC] HELPER: Raises ValueError with the message and the function signature.
         raise ValueError(f"infer_schema(func): {what} Got func with signature {sig})")
 
     def convert_type_string(annotation_type: str):
+        # [FUNCTION DOC] HELPER: Evaluates a stringified annotation in the prototype
+        # function's module globals and returns the resulting object. Any evaluation failure
+        # is reported via error_fn (ValueError), with extra advice for NameError.
         try:
             return eval(annotation_type, pf_globals, pf_locals)
         except NameError as e:
@@ -110,6 +131,8 @@ def infer_schema(
     def unstringify_types(
         tys: tuple[type[object] | str, ...],
     ) -> tuple[tuple[typing.Any, ...], bool]:
+        # [FUNCTION DOC] HELPER: Applies unstringify_type to each element; returns the new
+        # tuple and True if any changed, else the original tuple and False.
         res = []
         changed = False
         for ty in tys:
@@ -122,6 +145,9 @@ def infer_schema(
             return tys, False  # type: ignore[return-value]
 
     def unstringify_type(ty: type[object] | str) -> tuple[typing.Any, bool]:
+        # [FUNCTION DOC] HELPER: Converts a string annotation (possibly nested inside a
+        # generic type) to a real type. Returns the type and whether any string was
+        # converted; rebuilt generics use the builtin generic alias.
         # Dig through a generic type and if it contains a stringified type
         # convert that to a real type. The second return value indicates if the
         # type contained a string or not.
@@ -306,6 +332,10 @@ def derived_types(
     optional_base_list: bool,
     optional_list_base: bool,
 ):
+    # [FUNCTION DOC] Given a Python base type and its schema type name, returns a list of
+    # (python type, schema string) pairs: the base, its Optional form (name plus "?"), and
+    # optionally sequence/list variants of the base (name plus "[]"), of Optional elements
+    # ("?[]") and of Optional lists ("[]?"), in typing and builtin generic spellings.
     result: list[tuple[type | typing._SpecialForm | GenericAlias, str]] = [
         (base_type, cpp_type),
         # pyrefly: ignore [not-a-type]
@@ -313,6 +343,8 @@ def derived_types(
     ]
 
     def derived_seq_types(typ: type | typing._SpecialForm):
+        # [FUNCTION DOC] HELPER: Returns four spellings of a sequence-of-typ type (typing
+        # Sequence, typing List, and builtin generic aliases of Sequence and list).
         return (
             typing.Sequence[typ],  # type: ignore[valid-type]
             typing.List[typ],  # type: ignore[valid-type]  # noqa: UP006
@@ -339,6 +371,10 @@ def derived_types(
 
 
 def get_supported_param_types():
+    # [FUNCTION DOC] Builds the mapping from supported parameter annotation types to schema
+    # type strings (Tensor, SymInt for int, float, bool, str, Scalar, ScalarType, Device,
+    # plus GroupName as str when torch.distributed is available) with their Optional and
+    # list variants. Imports the distributed module lazily.
     data: list[tuple[type | typing._SpecialForm, str, bool, bool, bool]] = [
         # (python type, schema type, type[] variant, type?[] variant, type[]? variant
         (Tensor, "Tensor", True, True, False),
@@ -374,6 +410,11 @@ SUPPORTED_RETURN_TYPES = {
 
 
 def parse_return(annotation, error_fn):
+    # [FUNCTION DOC] Converts a return annotation to a schema return string. None gives an
+    # empty tuple "()"; a supported single type gives its schema name; a tuple annotation
+    # gives a parenthesized comma list (a single-element tuple is double-parenthesized);
+    # opaque custom types use their registered class name. Calls error_fn (raises) if the
+    # annotation is missing or unsupported.
     if annotation is None:
         return "()"
 
@@ -401,6 +442,8 @@ def parse_return(annotation, error_fn):
             )
 
     def _return_type_str(arg):
+        # [FUNCTION DOC] HELPER: Schema string for one tuple element: from the supported
+        # table, else the opaque type's registered class name.
         if ty := SUPPORTED_RETURN_TYPES.get(arg):
             return ty
         return _resolve_opaque_type_info(arg).class_name  # type: ignore[union-attr]
@@ -419,6 +462,9 @@ def _infer_out_return_schema(
     out_arg_names,
     error_fn,
 ):
+    # [FUNCTION DOC] HELPER: For torch.Tag.out ops, checks the return annotation is a single
+    # Tensor (one out arg) or a tuple of that many Tensors, else calls error_fn (raises).
+    # Returns the schema return: the aliased Tensor annotation, or a parenthesized list.
     if len(out_arg_aliases) == 1:
         return_annotation_matches_out_args = return_annotation is Tensor
     else:
@@ -444,6 +490,7 @@ SUPPORTED_PARAM_TYPES = get_supported_param_types()
 
 
 def supported_param(param: inspect.Parameter) -> bool:
+    # [FUNCTION DOC] True if the parameter is positional-or-keyword or keyword-only.
     return param.kind in (
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
@@ -451,6 +498,9 @@ def supported_param(param: inspect.Parameter) -> bool:
 
 
 def tuple_to_list(tuple_type: type[tuple]) -> type[list]:
+    # [FUNCTION DOC] HELPER: Converts a tuple type into a list type for error suggestions:
+    # bare or empty tuple gives plain list; one arg or a variadic form gives a list of that
+    # element type; several args give a list of a Union of them.
     """
     Convert `tuple_type` into a list type with the same type arguments. Assumes that `tuple_type` is typing.Tuple type.
     """
