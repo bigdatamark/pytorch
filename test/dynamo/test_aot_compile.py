@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for Dynamo ahead-of-time (AOT) compilation and serialization.
+# Defines helper models and a custom serializable backend, plus TestAOTCompile
+# (torch.compile(...).aot_compile, save_compiled_function / load_compiled_function,
+# module-level AOT compile, AOTI, DTensor, closures, external refs) and
+# TestTritonKernelSerialization (kernel side table round trip). Import-time side
+# effects: creates the global EPS tensor and MY_LAMBDA; no other global state.
 
 import contextlib
 import copy
@@ -50,6 +56,9 @@ EPS = torch.tensor(1e-7)
 
 
 def aot_eager_regional_inductor():
+    # [FUNCTION DOC] HELPER: Builds an aot_autograd backend whose forward and backward
+    # compilers are both regional_inductor, so only regions annotated with
+    # compile_with_inductor are lowered by Inductor. Takes no arguments.
     from torch._dynamo.backends.common import aot_autograd
     from torch.fx.passes.regional_inductor import regional_inductor
 
@@ -60,18 +69,26 @@ def aot_eager_regional_inductor():
 
 
 class SingleCondModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module with two Linear layers (width d) and a
+    # torch.cond between them that multiplies by 2 or 3 depending on whether the batch
+    # size is below 32. Used to exercise cond predicate caching.
     def __init__(self, d=64):
+        # [FUNCTION DOC] HELPER: Creates fc1 and fc2, both Linear(d, d); d defaults to 64.
         super().__init__()
         self.fc1 = torch.nn.Linear(d, d)
         self.fc2 = torch.nn.Linear(d, d)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies fc1, then a torch.cond on batch size < 32 choosing
+        # the double or triple branch, then fc2; returns the result.
         x = self.fc1(x)
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: Cond true branch; returns the input scaled by 2.0.
             return x * 2.0
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: Cond false branch; returns the input scaled by 3.0.
             return x * 3.0
 
         x = torch.cond(x.shape[0] < 32, true_fn, false_fn, (x,))
@@ -79,17 +96,29 @@ class SingleCondModel(torch.nn.Module):
 
 
 class MooType:
+    # [CLASS DOC] HELPER: Plain user-defined object holding one attribute x. Lives at
+    # module level so it can be referenced as an external global by compiled code.
     def __init__(self, x):
+        # [FUNCTION DOC] HELPER: Stores the argument as attribute x.
         self.x = x
 
 
 class CustomCompiledFunction(torch._dynamo.aot_compile.SerializableCallable):
+    # [CLASS DOC] HELPER: Minimal SerializableCallable backend result. Holds a
+    # GraphModule and its example inputs, runs the graph module when called, and
+    # serializes the graph module via GraphPickler (with the other attributes pickled).
     def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
+        # [FUNCTION DOC] HELPER: Stores the graph module and example inputs as attributes.
         self.gm = gm
         self.example_inputs = example_inputs
 
     @classmethod
     def serialize_compile_artifacts(cls, fn) -> bytes:
+        # [FUNCTION DOC] HELPER: Serializes a CustomCompiledFunction to bytes. Copies its
+        # attribute mapping, pickles the graph module with GraphPickler (ops filter off),
+        # then pickles the mapping. While pickling, GraphPickler.reducer_override is
+        # temporarily patched so sympy functions with a torch unpickler are rebuilt by
+        # name and any FakeTensorMode is replaced by None.
         import sympy
 
         from torch._subclasses import FakeTensorMode
@@ -99,6 +128,10 @@ class CustomCompiledFunction(torch._dynamo.aot_compile.SerializableCallable):
         graph_reducer_override = GraphPickler.reducer_override
 
         def _graph_reducer_override(self, obj):
+            # [FUNCTION DOC] HELPER: Replacement reducer used while pickling the graph module.
+            # Returns an unpickler and its handler name for sympy Function subclasses that
+            # define a torch unpickler; returns a None-constructor for a FakeTensorMode;
+            # otherwise defers to the original GraphPickler reducer_override.
             if (
                 inspect.isclass(obj)
                 and issubclass(obj, sympy.Function)
@@ -115,6 +148,9 @@ class CustomCompiledFunction(torch._dynamo.aot_compile.SerializableCallable):
 
     @classmethod
     def deserialize_compile_artifacts(cls, data: bytes):
+        # [FUNCTION DOC] HELPER: Inverse of serialize_compile_artifacts. Unpickles the
+        # state, rebuilds the graph module with GraphPickler under a fresh FakeTensorMode,
+        # recompiles it, and returns a new instance built from the state.
         state = pickle.loads(data)
         fake_mode = torch._subclasses.FakeTensorMode()
         state["gm"] = GraphPickler.loads(state["gm"], fake_mode)
@@ -122,10 +158,16 @@ class CustomCompiledFunction(torch._dynamo.aot_compile.SerializableCallable):
         return cls(**state)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs the stored graph module on the given args and kwargs
+        # and returns its result.
         return self.gm(*args, **kwargs)
 
 
 class MultiHeadSelfAttention(nn.Module):
+    # [CLASS DOC] HELPER: Grouped-query self attention module using flex_attention with
+    # a causal block mask. Class attributes cache the compiled flex_attention (keyed by
+    # compile spec) and the compiled create_block_mask so they are shared by instances.
+    # Holds q/k/v/out projections; supports plain tensors and DTensors.
     _flex_attention_cache: dict = {}
     _create_block_mask_fn = None
 
@@ -136,6 +178,11 @@ class MultiHeadSelfAttention(nn.Module):
         num_kv_heads: int,
         dropout: float = 0.0,
     ):
+        # [FUNCTION DOC] HELPER: Builds the projections (k and v sized by the kv head
+        # count; num_kv_heads falls back to num_heads when None), records enable_gqa when
+        # head counts differ, and lazily fills the class-level caches with torch.compile
+        # wrapped flex_attention and create_block_mask (fullgraph, static shapes).
+        # KNOWN ISSUE: dropout is stored but never applied in forward.
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -170,6 +217,8 @@ class MultiHeadSelfAttention(nn.Module):
             )
 
     def _shape_heads(self, x, B, S, num_heads):
+        # [FUNCTION DOC] HELPER: Reshapes a (B, S, hidden) tensor to (B, num_heads, S,
+        # head_dim) by viewing then swapping the sequence and head dimensions.
         return x.view(B, S, num_heads, self.head_dim).transpose(1, 2)
 
     def _forward_local(
@@ -179,6 +228,9 @@ class MultiHeadSelfAttention(nn.Module):
         value: torch.Tensor,
         block_mask,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Calls the compiled flex_attention on local query, key and
+        # value with the given block mask and the GQA flag, under an fx annotation marking
+        # the region to be compiled with Inductor. Returns the attention output.
         with fx_traceback.annotate({"compile_with_inductor": 1}):
             return self._flex_attention(
                 query=query,
@@ -194,6 +246,12 @@ class MultiHeadSelfAttention(nn.Module):
         key,
         value,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Converts DTensor q, k, v to local tensors, choosing the
+        # gradient placements: sharded on dim 0 or 1 (or replicated) on all three keeps the
+        # placements; query sharded on dim 2 with replicated key and value gives key and
+        # value Partial gradient placements; anything else raises NotImplementedError.
+        # KNOWN ISSUE: the return statement is indented inside the placement loop, so only
+        # the first mesh dimension is examined and returned; multi-dim meshes are ignored.
         from torch.distributed.tensor import Partial
 
         q_grad_placements = []
@@ -241,6 +299,10 @@ class MultiHeadSelfAttention(nn.Module):
             )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Projects x to q, k, v, builds a causal block mask via the
+        # compiled create_block_mask, and runs flex attention (locally, or via
+        # _qkv_to_local and DTensor.from_local when any of q, k, v is a DTensor). Returns
+        # the output projection of the re-merged heads.
         from torch.distributed.tensor import DTensor
 
         B, S, _ = x.shape
@@ -251,6 +313,8 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Create block_mask inside forward to test cross-compilation
         def causal_mask(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal mask predicate; True when the query index is at
+            # least the key/value index. Ignores batch and head indices.
             return q_idx >= kv_idx
 
         with fx_traceback.annotate({"compile_with_inductor": 1}):
@@ -274,6 +338,9 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    # [CLASS DOC] HELPER: Pre-norm transformer block: LayerNorm, self attention with
+    # residual, then a LayerNorm plus MLP (Linear, GELU, Linear, Dropout) under
+    # activation checkpointing with residual.
     def __init__(
         self,
         embed_dim: int,
@@ -282,6 +349,9 @@ class TransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
     ):
+        # [FUNCTION DOC] HELPER: Builds layer norms, the attention module, dropout and the
+        # MLP with hidden size embed_dim times mlp_ratio. The dropout argument is used only
+        # for the block's own dropouts, not passed to attention.
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.attn = MultiHeadSelfAttention(embed_dim, num_heads, num_kv_heads)
@@ -296,12 +366,17 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Adds the dropped-out attention output to x, then adds the
+        # non-reentrant checkpointed MLP output; returns the new activations.
         x = x + self.dropout1(self.attn(self.ln1(x)))
         x = x + checkpoint(lambda inp: self.mlp(self.ln2(inp)), x, use_reentrant=False)
         return x
 
 
 class Transformer(nn.Module):
+    # [CLASS DOC] HELPER: Small decoder-style model: embedding, learned positional
+    # parameter, a list of TransformerBlock layers, final LayerNorm and an untied
+    # bias-free output head. Stores the device mesh used to redistribute inputs.
     def __init__(
         self,
         vocab_size: int,
@@ -312,6 +387,8 @@ class Transformer(nn.Module):
         num_kv_heads: int,
         device_mesh=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds all submodules and stores device_mesh; positional
+        # embedding is a zero-initialized parameter of shape (1, max_seq_len, embed_dim).
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, embed_dim))
@@ -326,6 +403,9 @@ class Transformer(nn.Module):
         self.device_mesh = device_mesh
 
     def forward(self, input_ids):
+        # [FUNCTION DOC] HELPER: Redistributes input_ids (must be a DTensor) to Replicate on
+        # the stored mesh, embeds and adds positions, runs all blocks, final norm and head,
+        # and returns the logits.
         from torch.distributed.tensor import Replicate
 
         input_ids = input_ids.redistribute(self.device_mesh, [Replicate()])
@@ -340,16 +420,24 @@ class Transformer(nn.Module):
 
 
 class SimpleLinearModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module wrapping a single Linear(3, 3); the standard tiny model
+    # used across the AOT tests.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the Linear(3, 3) layer.
         super().__init__()
         self.linear = torch.nn.Linear(3, 3)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to x and returns the result.
         return self.linear(x)
 
 
 class RepeatInterleaveModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module that splits the last dim into two chunks and repeats
+    # each element of the first chunk twice along the last dim.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the first of two last-dim chunks of x with
+        # repeat_interleave(2) applied along the last dim.
         chunk = x.chunk(2, dim=-1)
         y = chunk[0]
         y_repeat = y.repeat_interleave(2, dim=-1)
@@ -357,21 +445,33 @@ class RepeatInterleaveModule(torch.nn.Module):
 
 
 class MultiModalMixin(torch.nn.Module):
+    # [CLASS DOC] HELPER: Mixin whose forward delegates to the next class in the MRO,
+    # used to build a forward that has a super call (closure over __class__).
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Calls the next forward in the MRO with x and returns it.
         return super().forward(x)
 
 
 class TextModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module whose forward adds one to its input.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns x plus one.
         return x + 1
 
 
 class TestVLLMModel(MultiModalMixin, TextModel):
+    # [CLASS DOC] HELPER: Model combining MultiModalMixin and TextModel to reproduce a
+    # vLLM-style multiple-inheritance forward with super calls.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Delegates to the next forward in the MRO; result is x plus
+        # one after passing through the mixin.
         return super().forward(x)
 
 
 def _subprocess_entry(fn, queue):
+    # [FUNCTION DOC] HELPER: Child-process entry point. Runs the callable fn; on any
+    # exception puts (exception name, message, formatted traceback) on the queue and
+    # re-raises; on success puts None on the queue.
     try:
         fn()
     except BaseException as exc:
@@ -384,6 +484,10 @@ def _subprocess_entry(fn, queue):
 
 
 def _run_in_subprocess(fn):
+    # [FUNCTION DOC] HELPER: Runs fn in a spawned child process and waits for it. Raises
+    # AssertionError with the child's error name, message and traceback if the child
+    # reported a failure. KNOWN ISSUE: the queue read happens after join and blocks
+    # forever if the child dies without reporting (e.g. a hard crash).
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     proc = ctx.Process(target=_subprocess_entry, args=(fn, queue))
@@ -396,12 +500,17 @@ def _run_in_subprocess(fn):
 
 
 def _subprocess_disable_guard_check():
+    # [FUNCTION DOC] HELPER: Subprocess body. With AOT compile enabled, AOT-compiles a
+    # tensor add, flips the global grad mode, and expects the call to fail with a
+    # GuardManager check error. After disable_guard_check the call must match eager.
+    # Always restores the previous grad mode; raises AssertionError on mismatch.
     import torch
     from torch._dynamo import config
 
     with config.patch(enable_aot_compile=True):
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
@@ -430,15 +539,20 @@ def _subprocess_disable_guard_check():
 
 
 def _subprocess_grad_mode_after_prior_compile():
+    # [FUNCTION DOC] HELPER: Subprocess body. AOT-compiles one function, resets dynamo,
+    # then AOT-compiles a subtraction under no_grad and checks that, called under
+    # no_grad, it matches eager; raises AssertionError otherwise.
     import torch
     from torch._dynamo import config
 
     with config.patch(enable_aot_compile=True):
 
         def warmup_fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y (warmup compile target).
             return x + y
 
         def target_fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x minus y (the function under test).
             return x - y
 
         torch.compile(warmup_fn, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
@@ -462,6 +576,11 @@ def _subprocess_grad_mode_after_prior_compile():
 
 
 def _subprocess_aot_compile_module():
+    # [FUNCTION DOC] HELPER: Subprocess body. Compiles a SimpleLinearModule with the
+    # inductor backend, AOT-compiles it for an eval/no_grad input and a train input,
+    # checks eval results match eager under fail_on_recompile and that backward runs,
+    # saves the compiled module to a temp file, resets dynamo, reloads it into a fresh
+    # compiled module and checks eval output again. Raises AssertionError on mismatch.
     import torch
     from torch._dynamo import config
 
@@ -478,11 +597,15 @@ def _subprocess_aot_compile_module():
 
         @contextmanager
         def train_mode(mdl):
+            # [FUNCTION DOC] HELPER: Context manager that puts the module in train mode and then
+            # yields.
             mdl.train()
             yield
 
         @contextmanager
         def eval_mode(mdl):
+            # [FUNCTION DOC] HELPER: Context manager that puts the module in eval mode and then
+            # yields.
             mdl.eval()
             yield
 
@@ -546,11 +669,16 @@ def _subprocess_aot_compile_module():
 
 
 class RedistributeModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module with a Linear(32, 32) whose forward also redistributes
+    # a DTensor input to fully replicated placements on a 2D mesh.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the Linear(32, 32) layer.
         super().__init__()
         self.linear = torch.nn.Linear(32, 32)
 
     def forward(self, x, d_x, mesh):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to x and redistributes d_x on the
+        # given mesh to (Replicate, Replicate). Returns the pair (linear output, result).
         x = self.linear(x)
 
         # need to do local import since tests don't always have c10d
@@ -564,8 +692,12 @@ class RedistributeModel(torch.nn.Module):
 
 
 def wrap_forward_function(fn: Callable):
+    # [FUNCTION DOC] HELPER: Returns a thin wrapper around fn that forwards all args and
+    # kwargs. Only the doc, annotations and type params are copied from fn (not the
+    # name or wrapped attribute), so the wrapper hides the original callable.
     @functools.wraps(fn, assigned=("__doc__", "__annotations__", "__type_params__"))
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the captured fn with the same args and kwargs.
         return fn(*args, **kwargs)
 
     return wrapped
@@ -574,12 +706,21 @@ def wrap_forward_function(fn: Callable):
 @torch._dynamo.config.patch("enable_aot_compile", True)
 @instantiate_parametrized_tests
 class TestAOTCompile(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Main test case for AOT compile. The class decorators enable the
+    # enable_aot_compile config and expand parametrized tests. Tests compile a function
+    # or module, compare with eager, save it to a per-test path under the Inductor cache
+    # dir, reset dynamo, reload it, and check results under fail_on_recompile.
     def path(self):
+        # [FUNCTION DOC] HELPER: Returns the per-test model file path (a model.pt inside a
+        # package directory named by the test id under the Inductor cache dir), creating
+        # the directory if needed.
         path = os.path.join(cache_dir(), f"package_{self.id()}")
         os.makedirs(path, exist_ok=True)
         return os.path.join(path, "model.pt")
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Test setup. Calls the parent setUp, resets dynamo, clears
+        # the dynamo counters and clears DynamoCache and PrecompileContext.
         super().setUp()
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
@@ -587,10 +728,15 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         PrecompileContext.clear()
 
     def test_aot_compile_basic_fn(self):
+        # [FUNCTION DOC] Test: AOT compiles an add using the custom serializable backend,
+        # checks it matches eager, saves, resets, reloads under fail_on_recompile and
+        # checks the loaded function again.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         compiled_fn = torch.compile(fn, fullgraph=True, backend=backend).aot_compile(
@@ -609,10 +755,15 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_aot_compile_autocast_guard_reload(self):
+        # [FUNCTION DOC] Test: AOT compiles under a CPU bfloat16 autocast context, saves,
+        # resets and reloads, then runs under autocast again and checks the output equals
+        # the eager autocast result (autocast guard survives reload).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus x times one.
             return x + 1 * x
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         x = torch.randn(3, 4)
@@ -632,9 +783,13 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         self.assertEqual(expected, actual)
 
     def test_aot_compile_basic_forward(self):
+        # [FUNCTION DOC] Test: AOT compiles a module's forward (the compiled function takes
+        # the module as first argument) with the custom backend, checks against eager, then
+        # saves, resets and reloads, and checks again.
         mod = SimpleLinearModule()
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         compiled_fn = torch.compile(
@@ -655,9 +810,13 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_aot_compile_repeat_interleave(self):
+        # [FUNCTION DOC] Test: AOT compiles the repeat_interleave module forward on a (2, 4)
+        # input with the custom backend, checks against eager, then saves, reloads and
+        # checks again. The mark_dynamic call is commented out in the code.
         mod = RepeatInterleaveModule()
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         inputs = (torch.randn(2, 4),)
@@ -683,9 +842,13 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_code_cache(self):
+        # [FUNCTION DOC] Test: round-trips a code object through SerializedCode after
+        # adding a dict constant to co_consts, and checks the re-serialized form equals the
+        # original.
         from torch._dynamo.package import SerializedCode
 
         def foo():
+            # [FUNCTION DOC] HELPER: Empty function whose code object is serialized.
             pass
 
         serialized_code = SerializedCode.from_code_object(foo.__code__)
@@ -698,8 +861,14 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         self.assertEqual(new_serialized_code, serialized_code)
 
     def test_decorated_function_aot(self):
+        # [FUNCTION DOC] Test: AOT compiles a function wrapped by a decorator that does not
+        # use functools.wraps (and asserts first dim > 1), with the custom backend, under
+        # fail_on_recompile, and checks the result against eager.
         def check_inputs(fn):
+            # [FUNCTION DOC] HELPER: Decorator returning a wrapper that checks each positional
+            # argument has first dim greater than one and then calls fn.
             def _fn(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Wrapper doing the shape check then calling the function.
                 for arg in args:
                     assert arg.shape[0] > 1  # noqa: S101
 
@@ -709,6 +878,7 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
 
         @check_inputs
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Returns twice x plus twice y.
             a = x + x
             b = y + y
             c = a + b
@@ -718,6 +888,7 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         expected = foo(*example_inputs)
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         with torch.compiler.set_stance("fail_on_recompile"):
@@ -730,7 +901,10 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_eager_backend(self):
+        # [FUNCTION DOC] Test: AOT compiles an add with the eager backend, checks against
+        # eager, then saves, resets, reloads under fail_on_recompile and checks again.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         compiled_fn = torch.compile(fn, fullgraph=True, backend="eager").aot_compile(
@@ -749,7 +923,10 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_aot_eager_backend(self):
+        # [FUNCTION DOC] Test: same flow as the eager backend test but with the aot_eager
+        # backend (compile, compare, save, reset, reload, compare).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         compiled_fn = torch.compile(
@@ -768,9 +945,14 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_decorated_function_with_functools_wrap_aot(self):
+        # [FUNCTION DOC] Test: like the decorated function test but the decorator uses
+        # functools.wraps; AOT compile under fail_on_recompile must match eager.
         def check_inputs(fn):
+            # [FUNCTION DOC] HELPER: Decorator returning a functools.wraps wrapper that checks
+            # each positional argument has first dim greater than one, then calls fn.
             @functools.wraps(fn)
             def _fn(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Wrapper doing the shape check then calling the function.
                 for arg in args:
                     assert arg.shape[0] > 1  # noqa: S101
 
@@ -780,6 +962,7 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
 
         @check_inputs
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Returns twice x plus twice y.
             a = x + x
             b = y + y
             c = a + b
@@ -789,6 +972,7 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         expected = foo(*example_inputs)
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         with torch.compiler.set_stance("fail_on_recompile"):
@@ -801,15 +985,23 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_aot_compile_disable_guard_check(self):
+        # [FUNCTION DOC] Test: runs the disable_guard_check subprocess scenario in a
+        # spawned process.
         _run_in_subprocess(_subprocess_disable_guard_check)
 
     def test_aot_compile_grad_mode_after_prior_compile(self):
+        # [FUNCTION DOC] Test: runs the grad-mode-after-prior-compile subprocess scenario in
+        # a spawned process.
         _run_in_subprocess(_subprocess_grad_mode_after_prior_compile)
 
     def test_aot_compile_torch_func_vmap_grad(self):
+        # [FUNCTION DOC] Test: AOT compiles a vmap of grad of a vector norm (float64, static
+        # shapes), compares with eager, then saves, resets, reloads and compares again.
         import torch.func as tf
 
         def value(pos):
+            # [FUNCTION DOC] HELPER: Returns the norm of the difference between the second and
+            # first rows of pos.
             return torch.linalg.norm(pos[1] - pos[0])
 
         batched_grad = tf.vmap(tf.grad(value, argnums=0), in_dims=(0,))
@@ -831,9 +1023,13 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, actual)
 
     def test_aot_compile_source_info(self):
+        # [FUNCTION DOC] Test: checks source_info() on an AOT compiled function returns a
+        # SourceInfo with two inlined sources whose first module is this test module, both
+        # before saving and after save and load.
         from torch._dynamo.package import SourceInfo
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Applies the global MY_LAMBDA to x and adds y.
             return MY_LAMBDA(x) + y
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
@@ -853,9 +1049,14 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         self.assertEqual(next(iter(source_info.inlined_sources)).module, __name__)
 
     def test_regional_inductor_backend(self):
+        # [FUNCTION DOC] Test: AOT compiles with the regional inductor backend where one
+        # annotated region is lowered by Inductor, checks forward and backward run and
+        # match eager, saves and reloads, then checks forward and backward again.
         import torch.fx.traceback as fx_traceback
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: sin(x), then a multiply by y and add of one inside a
+            # compile_with_inductor annotation, then sin of the result.
             sin = torch.sin(x)
             # Mark this region to be compiled with inductor
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -864,6 +1065,7 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             return torch.sin(add)
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Returns two random (3, 4) tensors that require grad.
             return (
                 torch.randn(3, 4, requires_grad=True),
                 torch.randn(3, 4, requires_grad=True),
@@ -883,7 +1085,12 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         compiled_fn(*test_inputs).sum().backward()
 
     def test_aot_compile_graph_break_error_fmt(self):
+        # [FUNCTION DOC] Test: AOT compiling a function with an explicit graph break and
+        # fullgraph raises Unsupported, and the munged error text must match the expected
+        # message (user-inserted graph break, hint, link and user code frame).
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Function with a torch._dynamo.graph_break between two
+            # doubled adds; used to trigger the Unsupported error.
             a = x + x
             torch._dynamo.graph_break()
             b = y + y
@@ -910,8 +1117,13 @@ from user code:
         )
 
     def test_guard_filter_override_aot(self):
+        # [FUNCTION DOC] Test: a guard_filter_fn that keeps every guard makes AOT compile
+        # raise PackageError mentioning that the CLOSURE_MATCH guard cannot be serialized.
         def check_inputs(fn):
+            # [FUNCTION DOC] HELPER: Decorator returning a wrapper that checks first dims and
+            # calls fn.
             def _fn(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Wrapper doing the shape check then calling the function.
                 for arg in args:
                     assert arg.shape[0] > 1  # noqa: S101
 
@@ -921,6 +1133,7 @@ from user code:
 
         @check_inputs
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Returns twice x plus twice y.
             a = x + x
             b = y + y
             c = a + b
@@ -930,6 +1143,7 @@ from user code:
         expected = foo(*example_inputs)  # noqa: F841
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend returning a CustomCompiledFunction for the graph.
             return CustomCompiledFunction(gm, example_inputs)
 
         with torch.compiler.set_stance("fail_on_recompile"):
@@ -949,7 +1163,10 @@ from user code:
                 ).aot_compile((example_inputs, {}))
 
     def test_aot_compile_basic_fn_inductor(self):
+        # [FUNCTION DOC] Test: AOT compiles an add with the inductor backend, compares with
+        # eager, saves, resets, reloads under fail_on_recompile and compares again.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         compiled_fn = torch.compile(fn, fullgraph=True, backend="inductor").aot_compile(
@@ -968,9 +1185,15 @@ from user code:
             self.assertEqual(expected, actual)
 
     def test_aot_compile_module(self):
+        # [FUNCTION DOC] Test: runs the AOT compile module save/load subprocess scenario in
+        # a spawned process.
         _run_in_subprocess(_subprocess_aot_compile_module)
 
     def test_aot_module_simplified_serializable_autograd(self):
+        # [FUNCTION DOC] Test: AOT compiles a Linear module forward (training graph) with
+        # inductor and checks the backend result is a
+        # BundledAOTAutogradSerializableCallable whose inner compiled_fn has a serialize
+        # attribute.
         mod = SimpleLinearModule()
         compiled_fn: SerializableCallable = torch.compile(
             mod, fullgraph=True, backend="inductor"
@@ -987,7 +1210,11 @@ from user code:
         self.assertIsNotNone(backend_result.compiled_fn.serialize)
 
     def test_aot_compile_portable_guards_unsafe(self):
+        # [FUNCTION DOC] Test: AOT compiles a function taking a sequence with the
+        # keep_portable_guards_unsafe guard filter, runs it on a namedtuple input, checks
+        # against eager, then saves, loads and checks again.
         def fn(xy):
+            # [FUNCTION DOC] HELPER: Returns the sum of the first two items of xy.
             return xy[0] + xy[1]
 
         compiled_fn = torch.compile(  # noqa: UNSPECIFIED_BACKEND
@@ -1008,7 +1235,10 @@ from user code:
         self.assertEqual(expected, actual)
 
     def test_aot_module_simplified_serializable_inference(self):
+        # [FUNCTION DOC] Test: same as the autograd serializable test but for a sin function
+        # compiled for inference; checks the backend result type and serialize attribute.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sin of x.
             return x.sin()
 
         compiled_fn: SerializableCallable = torch.compile(
@@ -1026,6 +1256,10 @@ from user code:
         self.assertIsNotNone(backend_result.compiled_fn.serialize)
 
     def test_aot_cache_predicate_not_pickleable(self):
+        # [FUNCTION DOC] Test: with cond marked cacheable and autograd and FX graph caching
+        # enabled, compiles the cond model with dynamic shapes for batch sizes 16 and 64
+        # and checks results match eager and that the fxgraph_cache_bypass counter stays
+        # zero (the SymBool predicate is picklable). Restores the cacheable flag after.
         import torch._functorch.config as functorch_config
         import torch._inductor.config as inductor_config
 
@@ -1063,10 +1297,16 @@ from user code:
             torch.ops.higher_order.cond._cacheable = old_cacheable
 
     def test_fullgraph_capture_with_pytree_module(self):
+        # [FUNCTION DOC] Test: captures a module with a pytree (dict, tensor, tensor) input
+        # and dict output via dynamo_graph_capture_for_export and checks the captured
+        # module matches the eager module on fresh inputs.
         from torch._dynamo.functional_export import dynamo_graph_capture_for_export
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with four Linear(3, 3) layers whose forward takes a
+            # tuple (dict with a and b, tensor, tensor) and returns a dict of four results.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear, linear1, linear2 and linear3 layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
                 self.linear1 = torch.nn.Linear(3, 3)
@@ -1074,6 +1314,8 @@ from user code:
                 self.linear3 = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the layers to shifted entries of the input pytree
+                # and returns a dict with keys y, z, w and v.
                 return {
                     "y": self.linear2(x[2] + 1),
                     "z": self.linear3(x[1] - 1),
@@ -1098,10 +1340,16 @@ from user code:
         self.assertEqual(compiled_mod(inputs), mod(inputs))
 
     def test_dynamic_settings(self):
+        # [FUNCTION DOC] Test: compiling with dynamic=False makes the backend see
+        # automatic_dynamic_shapes disabled while the global config stays enabled outside;
+        # the compiled add still matches eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         def backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend that asserts automatic_dynamic_shapes is False
+            # during compilation and returns a CustomCompiledFunction.
             self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
             return CustomCompiledFunction(gm, example_inputs)
 
@@ -1115,9 +1363,12 @@ from user code:
         self.assertEqual(expected, actual)
 
     def test_fullgraph_capture_with_pytree_func(self):
+        # [FUNCTION DOC] Test: function version of the pytree capture test; captures a
+        # function with a pytree input and dict output and compares with eager.
         from torch._dynamo.functional_export import dynamo_graph_capture_for_export
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns a dict from tuple entries: y, z, w and v.
             return {
                 "y": x[2] + 1,
                 "z": x[1] - 1,
@@ -1141,6 +1392,9 @@ from user code:
         self.assertEqual(compiled_foo(inputs), foo(inputs))
 
     def test_fullgraph_capture_schema_self_arg_no_collision(self):
+        # [FUNCTION DOC] Test: regression test; captures aten.where.self (whose schema has
+        # self as a non-first argument) and checks the captured function matches the op,
+        # guarding against a duplicate self parameter name and a SyntaxError on recompile.
         """Regression: aten op schemas with `self` at non-first position
         (e.g. `aten.where.self(Tensor condition, Tensor self, Tensor other)`)
         must not produce `def forward(self, condition, self, other):` and
@@ -1155,9 +1409,12 @@ from user code:
         self.assertEqual(compiled(cond, x, y), op(cond, x, y))
 
     def test_aot_compile_with_closure_save_and_load(self):
+        # [FUNCTION DOC] Test: AOT compiles a function that closes over a local integer,
+        # saves, loads without extra data and checks the loaded function matches eager.
         tmp = 2
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y plus the closed-over value.
             return x + y + tmp
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
@@ -1174,6 +1431,9 @@ from user code:
         self.assertEqual(expected, actual)
 
     def test_aot_compile_with_super_call(self):
+        # [FUNCTION DOC] Test: AOT compiles the forward of a model whose forward has a super
+        # call (free variable __class__), checks it matches eager, then saves, loads and
+        # checks again.
         fn = TestVLLMModel()
         compiled_fn = torch.compile(fn.forward, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
             ((torch.randn(3, 4),), {})
@@ -1190,10 +1450,14 @@ from user code:
         self.assertEqual(expected, actual)
 
     def test_aot_compile_with_global_tensor(self):
+        # [FUNCTION DOC] Test: AOT compiles a function that reads the module-level global
+        # tensor EPS and checks it matches eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y plus the global EPS tensor.
             return x + y + EPS
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Returns two random (3, 4) tensors.
             return (torch.randn(3, 4), torch.randn(3, 4))
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile((make_inputs(), {}))  # noqa: UNSPECIFIED_BACKEND
@@ -1202,7 +1466,10 @@ from user code:
         self.assertEqual(compiled_fn(*test_inputs), fn(*test_inputs))
 
     def test_aot_compile_with_default_args(self):
+        # [FUNCTION DOC] Test: AOT compiles a function with a defaulted second parameter
+        # called with one argument, then saves, loads and checks results match eager.
         def fn(x, y=1):
+            # [FUNCTION DOC] HELPER: Returns x plus x; y is unused.
             return x + x
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile(  # noqa: UNSPECIFIED_BACKEND
@@ -1220,13 +1487,18 @@ from user code:
 
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_aot_compile_with_aoti(self):
+        # [FUNCTION DOC] Test (GPU only): compiles an add with aot_compile_fullgraph and the
+        # AOTInductor wrapper under a default GPU device, checks against eager, then saves,
+        # loads and checks again.
         with torch.device(GPU_TYPE):
             from torch._dynamo.hooks import Hooks
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Returns x plus y.
                 return x + y
 
             def make_inputs():
+                # [FUNCTION DOC] HELPER: Returns two random (3, 4) tensors.
                 return (torch.randn(3, 4), torch.randn(3, 4))
 
             compiled_fn = torch._dynamo.aot_compile.aot_compile_fullgraph(
@@ -1248,12 +1520,17 @@ from user code:
 
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_aot_compile_with_aoti_module(self):
+        # [FUNCTION DOC] Test (GPU only): compiles a Linear module with aot_compile_module
+        # and the AOTInductor wrapper, checks forward, serializes, deserializes onto a
+        # deep copy of the module and checks that gradients after backward equal the
+        # eager gradients.
         with torch.device(GPU_TYPE):
             from torch._dynamo.hooks import Hooks
 
             mod = SimpleLinearModule()
 
             def make_inputs():
+                # [FUNCTION DOC] HELPER: Returns one random (4, 3) tensor in a tuple.
                 return (torch.randn(4, 3),)
 
             compiled_mod = torch._dynamo.aot_compile.aot_compile_module(
@@ -1264,6 +1541,7 @@ from user code:
             )
 
             def get_grads(m: torch.nn.Module):
+                # [FUNCTION DOC] HELPER: Returns a mapping from parameter name to its gradient.
                 return {name: p.grad for name, p in m.named_parameters()}
 
             original_mod = copy.deepcopy(mod)
@@ -1282,12 +1560,17 @@ from user code:
 
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_aot_compile_with_aoti_torch_compile(self):
+        # [FUNCTION DOC] Test (GPU only): torch.compile with the use_aoti option and
+        # aot_compile; checks it matches eager, saves, loads and checks again, and that the
+        # loaded artifacts report the aotinductor backend name.
         with torch.device(GPU_TYPE):
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Returns x plus y.
                 return x + y
 
             def make_inputs():
+                # [FUNCTION DOC] HELPER: Returns two random (3, 4) tensors.
                 return (torch.randn(3, 4), torch.randn(3, 4))
 
             compiled_fn = torch.compile(  # noqa: UNSPECIFIED_BACKEND
@@ -1306,6 +1589,10 @@ from user code:
 
     @unittest.skipIf(not c10d.is_available(), "requires c10d")
     def test_aot_compile_with_redistribute(self):
+        # [FUNCTION DOC] Test (requires c10d): under a fake process group of world size 4
+        # and a 2x2 CPU mesh, AOT compiles a module forward that redistributes a DTensor,
+        # checks against eager, saves, resets, reloads under fail_on_recompile and checks
+        # again. Always destroys the process group.
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.tensor import DTensor, Replicate
         from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -1340,11 +1627,16 @@ from user code:
             torch.distributed.destroy_process_group()
 
     def test_aot_compile_with_captured_module(self):
+        # [FUNCTION DOC] Test: a module whose forward was replaced by a compiled wrapper
+        # cannot be saved by default (RuntimeError listing the unserializable module); it
+        # saves when the module is passed as external_data, loading without it raises
+        # Missing required external ref, and loading with it matches eager.
         mod = SimpleLinearModule()
 
         fn = mod.forward
 
         def with_processing(f, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls f with the given args and kwargs.
             return f(*args, **kwargs)
 
         fn = functools.partial(with_processing, fn)
@@ -1380,11 +1672,15 @@ from user code:
             self.assertEqual(expected, actual)
 
     def test_aot_compile_with_captured_module_2(self):
+        # [FUNCTION DOC] Test: same as the captured module test except the module forward is
+        # only reassigned after compiling; verifies the same save, missing external ref and
+        # load-with-external_data behavior.
         mod = SimpleLinearModule()
 
         fn = mod.forward
 
         def with_processing(f, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls f with the given args and kwargs.
             return f(*args, **kwargs)
 
         fn = functools.partial(with_processing, fn)
@@ -1419,10 +1715,15 @@ from user code:
             self.assertEqual(expected, actual)
 
     def test_aot_compile_with_checkpoint(self):
+        # [FUNCTION DOC] Test: AOT compiles a function using non-reentrant activation
+        # checkpointing, checks against eager, then saves, resets, reloads under
+        # fail_on_recompile and checks again.
         from torch.utils.checkpoint import checkpoint
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Wraps compute in a non-reentrant checkpoint call.
             def compute(x, y):
+                # [FUNCTION DOC] HELPER: Returns twice x plus three times y.
                 return x * 2 + y * 3
 
             return checkpoint(compute, x, y, use_reentrant=False)
@@ -1443,12 +1744,17 @@ from user code:
             self.assertEqual(expected, actual)
 
     def test_external_refs_validation(self):
+        # [FUNCTION DOC] Test: a compiled function returning a MooType instance fails to
+        # load without globals (RuntimeError Missing required external ref) and loads
+        # correctly when f_globals is the function's globals.
         """Test that external refs tracking and f_globals parameter work correctly"""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns a MooType holding x plus y.
             return MooType(x + y)
 
         def make_inputs():
+            # [FUNCTION DOC] HELPER: Returns two random (3, 4) tensors.
             return (torch.randn(3, 4), torch.randn(3, 4))
 
         compiled_fn = torch.compile(fn, fullgraph=True).aot_compile((make_inputs(), {}))  # noqa: UNSPECIFIED_BACKEND
@@ -1470,9 +1776,14 @@ from user code:
         self.assertEqual(expected.x, actual.x)
 
     def test_builtins_dict_survives_serialization(self):
+        # [FUNCTION DOC] Test: AOT compiles a function that returns a value and the builtin
+        # type, saves, loads with the function globals and checks both outputs match eager.
+        # The comments in the body mention loading without f_globals, but the load passes
+        # them.
         """Test that __builtins_dict__ is preserved through serialize/deserialize."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one together with the builtin type.
             return x + 1, type
 
         x = torch.randn(4)
@@ -1492,10 +1803,14 @@ from user code:
 
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_cross_aot_compile(self):
+        # [FUNCTION DOC] Test (GPU only): AOT compiles an add using fake GPU inputs that
+        # require grad, saves, resets and reloads, then checks the loaded function output
+        # and the gradients from backward against eager.
         """Test cross-compilation using fake tensors and backward correctness"""
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x plus y.
             return x + y
 
         with FakeTensorMode(allow_non_fake_inputs=True):
@@ -1542,6 +1857,12 @@ from user code:
     @unittest.skipIf(not c10d.is_available(), "requires c10d")
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_cross_compile_realistic_transformer_model(self):
+        # [FUNCTION DOC] Test (requires c10d and GPU): cross-compiles a DTensor Transformer
+        # on a fake process group (world size 1): captures a graph under fake mode, exports
+        # joint descriptors, compiles with regional inductor into a serializable callable,
+        # serializes and deserializes it, and compares logits, loss and parameter
+        # gradients bitwise against an identically initialized eager model. Always
+        # destroys the process group.
         """
         Test cross-compilation with transformer model with DTensors,
         FlexAttention, and checkpointing using the compiler toolkit.
@@ -1560,6 +1881,9 @@ from user code:
             param_placements: list[Placement] | None = None,
             buffer_placements: list[Placement] | None = None,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Recursively converts non-DTensor parameters and buffers of
+            # the module (and children) to DTensors on the mesh with the given placements
+            # (default Replicate), replacing the attributes in place. Returns nothing.
             if param_placements is None:
                 param_placements = [Replicate()]
             if buffer_placements is None:
@@ -1587,6 +1911,9 @@ from user code:
                 )
 
         def init_weights_deterministic(module: nn.Module, seed: int = 42) -> None:
+            # [FUNCTION DOC] HELPER: Seeds the CPU and GPU generators, then fills every
+            # parameter that requires grad and every buffer (local tensor for DTensors) with
+            # normal values with mean zero and std 0.02 in place.
             """
             Initialize module weights deterministically using a fixed seed.
             This ensures reproducible results across eager and compiled runs.
@@ -1810,9 +2137,16 @@ from user code:
 
 
 class TestTritonKernelSerialization(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Test case for the triton kernel side table serialization helpers. It
+    # mutates the global kernel_side_table and resets it after the test.
     """Tests for triton kernel side table serialization."""
 
     def test_kernel_side_table_serialization_roundtrip(self):
+        # [FUNCTION DOC] Test: adds a mock kernel and constant args to kernel_side_table,
+        # serializes the kernels, resets the table (lookup then asserts), restores kernels
+        # and constant args via the deserialize helper, and checks the lookup returns the
+        # underlying function (torch.sin) and the constant args match. Resets the table at
+        # the end.
         """
         Test that the kernel_side_table is properly serialized and restored.
 
@@ -1833,7 +2167,10 @@ class TestTritonKernelSerialization(torch._inductor.test_case.TestCase):
             # Create a mock kernel-like object that mimics triton JITFunction structure.
             # Triton JITFunction has a `fn` attribute pointing to the wrapped function.
             class MockTritonKernel:
+                # [CLASS DOC] HELPER: Mock mimicking a triton JITFunction by exposing the wrapped
+                # function as attribute fn.
                 def __init__(self, fn):
+                    # [FUNCTION DOC] HELPER: Stores the wrapped function as attribute fn.
                     self.fn = fn
 
             # Use a real importable function (torch.sin) as the wrapped function
