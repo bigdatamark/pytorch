@@ -1,5 +1,15 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Training-behavior tests for the per-parameter-sharding FSDP API
+# (fully_shard). Covers forward-input device movement, parameter registration (sharded
+# DTensor vs unsharded tensor) across forward/backward, dtype casting after init, train parity
+# against replicated (DDP-style) models for single/multi-group setups with delays, CPU offload,
+# async unshard, activation checkpointing, partial-group forwards, shard placement functions,
+# shared/tied parameters, gradient accumulation, N-D/HSDP meshes, custom forward methods,
+# shared comm contexts, world size 1 and CUDA graphs. Multi-process classes derive from
+# FSDPTest and multi-thread classes from FSDPTestMultiThread. Import-time side effects: binds
+# c10d_ops/funcol op namespaces and computes the module-level device_type from get_devtype().
+
 import contextlib
 import copy
 import functools
@@ -85,13 +95,20 @@ device_type = torch.device(get_devtype())
 
 
 def _get_device_ids(rank: int) -> list[int] | None:
+    # [FUNCTION DOC] HELPER: Returns the device_ids argument for the replicate reference
+    # model: None on CPU, otherwise a one-element list holding the given rank.
     return None if device_type.type == "cpu" else [rank]
 
 
 class ChunkedHeadModel(nn.Module):
+    # [CLASS DOC] HELPER: Tiny language-model-like module: embedding, bias-free linear body,
+    # RMS norm, and a vocab-sized output head, optionally tied to the embedding weight. Its
+    # forward can stop before the head so tests can run the head separately in chunks.
     # At module scope so ``compiled_fsdp_test(compile_compute_on_module=...)``
     # can reference the type at decoration time.
     def __init__(self, dim: int, vocab_size: int, tie: bool) -> None:
+        # [FUNCTION DOC] HELPER: Builds embed, body, norm and head layers; when tie is true
+        # the head weight parameter is the same object as the embedding weight.
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
         self.body = nn.Linear(dim, dim, bias=False)
@@ -101,6 +118,8 @@ class ChunkedHeadModel(nn.Module):
             self.head.weight = self.embed.weight
 
     def forward(self, tokens: torch.Tensor, *, skip_head: bool = False) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Embeds the token ids, applies body and norm, and returns the
+        # hidden states if skip_head is true; otherwise returns the head's vocab logits.
         h = self.embed(tokens)
         h = self.body(h)
         h = self.norm(h)
@@ -110,15 +129,25 @@ class ChunkedHeadModel(nn.Module):
 
 
 class TestFullyShardForwardInputs(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread tests (2 ranks) of how the root FSDP module handles forward
+    # inputs: moving CPU inputs to the compute device and modules that take no inputs.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 as the number of threads/ranks.
         return 2
 
     def test_root_move_forward_input_to_device(self):
+        # [FUNCTION DOC] Checks a parameter-free root module wrapped by fully_shard moves CPU
+        # tensor inputs (including those nested inside a tuple) to the device before forward
+        # runs. The device check inside forward is skipped on CPU.
         device = torch.device(device_type.type, 0)
 
         class ParamlessModule(nn.Module):
+            # [CLASS DOC] HELPER: Module without parameters whose forward verifies its
+            # inputs are on the expected device and returns the sum of inputs plus one.
             def forward(self, x: torch.Tensor, ys: tuple[torch.Tensor, ...]):
+                # [FUNCTION DOC] HELPER: Raises AssertionError if x or either tuple entry is
+                # not on the device (non-CPU only); returns x + ys[0] + ys[1] + 1.
                 # Check that FSDP moved the inputs to GPU, including recursing
                 # into the tuple data structure
                 # Skip device check for CPU since torch.device("cpu") and
@@ -143,14 +172,19 @@ class TestFullyShardForwardInputs(FSDPTestMultiThread):
         model(x, ys)
 
     def test_root_no_forward_inputs(self):
+        # [FUNCTION DOC] Checks fully_shard works for a root module whose forward takes no
+        # arguments: output shape is 4x4 and backward runs without error.
         device = torch.device(device_type.type, 0)
 
         class ParameterOnlyModule(nn.Module):
+            # [CLASS DOC] HELPER: Module holding one 4x4 weight whose forward takes no inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the random 4x4 weight on the device.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(4, 4, device=device))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the weight multiplied by itself.
                 return self.weight @ self.weight
 
         model = ParameterOnlyModule()
@@ -161,11 +195,20 @@ class TestFullyShardForwardInputs(FSDPTestMultiThread):
 
 
 class TestFullyShardRegisteredParams(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread tests (4 ranks) of which kind of parameter is registered on
+    # the module at each point: sharded DTensor when resharded, plain unsharded tensor while
+    # unsharded after forward. Includes helper assertions for these checks.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4 as the number of threads/ranks.
         return 4
 
     def test_param_registration_after_forward(self):
+        # [FUNCTION DOC] For single-group and multi-group sharding and each
+        # reshard_after_forward setting (True, False, 2, None), checks parameters are
+        # DTensors before forward, are DTensors after forward only if resharding applies
+        # (otherwise plain tensors; with None the root stays unsharded), always equal the
+        # reference values, and become DTensors again after calling reshard manually.
         """Tests the parameter registration after forward."""
         device = torch.device(device_type.type, 0)
         # Single FSDP group
@@ -226,6 +269,9 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
             self._assert_same_params(model.parameters(), ref_model.parameters())
 
     def test_param_registration_after_backward(self):
+        # [FUNCTION DOC] For single and multiple FSDP groups and reshard_after_forward values
+        # True, False and 2, checks parameters are sharded DTensors both before forward and
+        # after a full forward/backward pass.
         """Tests the parameter registration after backward."""
         device = torch.device(device_type.type, 0)
         # Single FSDP group
@@ -248,6 +294,9 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
             self._assert_dtensor_params(model.parameters())
 
     def test_modules_to_run_forward_empty_for_single_module(self):
+        # [FUNCTION DOC] Applies fully_shard to a module and its two children individually and
+        # asserts each FSDP state's set of modules to run forward stays empty both before and
+        # after a forward/backward pass, so force-completion never fires for ungrouped states.
         # ``_force_complete_incomplete_states`` guards on
         # ``_modules_to_run_forward`` being non-empty. Single-module
         # ``fully_shard(m)`` registers the raw pre/post hooks instead of
@@ -267,6 +316,8 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
             self.assertEqual(submod._get_fsdp_state()._modules_to_run_forward, set())
 
     def _assert_tensor_params(self, params: Iterable[nn.Parameter]):
+        # [FUNCTION DOC] HELPER: Asserts the iterable is non-empty and every parameter is a
+        # plain tensor and not a DTensor (i.e. currently unsharded).
         # need to iterate over the list multiple times
         params = list(params)
         self.assertGreater(len(params), 0)
@@ -275,6 +326,8 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
             self.assertIsInstance(param, torch.Tensor)
 
     def _assert_dtensor_params(self, params: Iterable[nn.Parameter]):
+        # [FUNCTION DOC] HELPER: Asserts the iterable is non-empty and every parameter is a
+        # DTensor (i.e. currently sharded).
         params = list(params)
         self.assertGreater(len(params), 0)
         for param in params:
@@ -283,6 +336,8 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
     def _assert_same_params(
         self, params: Iterable[nn.Parameter], ref_params: Iterable[nn.Parameter]
     ):
+        # [FUNCTION DOC] HELPER: Asserts both iterables have equal length and each pair has
+        # equal shape and values, gathering DTensor parameters to a full tensor first.
         params, ref_params = list(params), list(ref_params)
         self.assertEqual(len(params), len(ref_params))
         for param, ref_param in zip(params, ref_params):
@@ -293,12 +348,19 @@ class TestFullyShardRegisteredParams(FSDPTestMultiThread):
 
 
 class TestFullyShardCastAfterInit(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread test (2 ranks) that a module can be cast to another dtype
+    # after fully_shard has been applied and still train in parity with a replicated copy.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 as the number of threads/ranks.
         return 2
 
     @wrapSwapTensorsTest(True)
     def test_to_float64_after_init(self):
+        # [FUNCTION DOC] Shards an MLP, casts it to float64, and checks the parameter, its
+        # local shard, and DTensor spec metadata all report float64. Then trains 10 steps
+        # against a replicated float64 reference with Adam, checking loss equality, sharded
+        # parity and gradient dtypes each step, alternating zero_grad set_to_none.
         """Tests that the user can cast the module to float64 after init."""
         # NOTE: Test fp64 instead of a lower precision dtype like bf16 for
         # better numerics. The important part is changing the dtype.
@@ -341,8 +403,14 @@ class TestFullyShardCastAfterInit(FSDPTestMultiThread):
 
 
 class TestFullyShard1DTrainingCore(FSDPTest):
+    # [CLASS DOC] Multi-process tests of core 1-D FSDP training: loss parity with a
+    # replicated model, many delay/offload/async-unshard combinations on a transformer,
+    # running a non-root module after the root, modules used multiple times in forward,
+    # explicit prefetching and post-optimizer events.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns up to 8 ranks: 8 on CPU, otherwise the smaller of 8
+        # and the device count.
         min_world_size = 8
         if device_type.type == "cpu":
             return min_world_size
@@ -350,6 +418,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_parity_single_group_shard_dim0(self):
+        # [FUNCTION DOC] Runs the single-group parity helper over three linear shape pairs
+        # (including sizes not divisible by the world size) with default dim-0 sharding.
         """
         Tests train parity with DDP for a single FSDP group when sharding
         parameters on dim-0.
@@ -368,6 +438,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_parity_single_group_shard_largest_dim(self):
+        # [FUNCTION DOC] Runs the single-group parity helper with a shard placement function
+        # that shards each parameter on its largest dim; shapes chosen to shard evenly.
         """
         Tests train parity with DDP for a single FSDP group when sharding
         parameters on their largest dim.
@@ -384,6 +456,10 @@ class TestFullyShard1DTrainingCore(FSDPTest):
     def _test_train_parity_single_group(
         self, lin_shapes: list[tuple[int, int]], use_shard_placement_fn: bool
     ):
+        # [FUNCTION DOC] HELPER: Builds a linear-ReLU-linear model with the given shapes, a
+        # replicated reference copy, and a copy sharded as a single FSDP group (optionally
+        # with a largest-dim shard placement function). Trains both for 10 Adam steps on
+        # rank-specific inputs, alternating zero_grad set_to_none, and asserts equal losses.
         torch.manual_seed(42)
         model = nn.Sequential(
             nn.Linear(*lin_shapes[0]), nn.ReLU(), nn.Linear(*lin_shapes[1])
@@ -393,6 +469,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-2)
 
         def _shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a shard placement on the index of the first
+            # largest dimension of the parameter's shape.
             return Shard(param.shape.index(max(param.shape)))
 
         shard_placement_fn = _shard_placement_fn if use_shard_placement_fn else None
@@ -416,6 +494,10 @@ class TestFullyShard1DTrainingCore(FSDPTest):
     )
     @compiled_fsdp_test(compile_compute_on_module=Transformer)
     def test_train_parity_multi_group(self):
+        # [FUNCTION DOC] Runs the multi-group transformer parity helper over reshard settings
+        # True/False/2 and combinations of artificial delays (after forward, before
+        # all-gather, before reduce-scatter, before optimizer) with default offload policy
+        # and synchronous unshard.
         """
         Tests train parity against DDP when using multiple parameter groups for
         communication (for communication and computation overlap plus memory
@@ -442,6 +524,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_train_parity_multi_group_cpu_offload_eager(self):
+        # [FUNCTION DOC] Runs the multi-group parity helper with CPU offload policies (pinned
+        # and non-pinned memory), reshard after forward, and the delay combinations.
         """
         Tests train parity against DDP when using multiple parameter groups for
         communication and CPU offloading.
@@ -470,6 +554,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
     )
     @compiled_fsdp_test(compile_compute_on_module=Transformer)
     def test_train_parity_multi_group_unshard_async_op(self):
+        # [FUNCTION DOC] Runs the multi-group parity helper with the async-unshard option
+        # enabled, reshard after forward, default offload and the delay combinations.
         """
         Tests train parity against DDP when using multiple parameter groups for
         communication and setting ``unshard_async_op=True``.
@@ -499,6 +585,13 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         delay_before_optim: bool,
         unshard_async_op: bool,
     ):
+        # [FUNCTION DOC] HELPER: Parity test of a 3-layer Transformer sharded per block plus
+        # root against a replicated reference (process-group gloo when test_device_type
+        # differs from the default device). Skips (returns) when exactly 2 or 3 delays are
+        # enabled, or pinned CPU offload on a CPU device. Optionally enables async unshard.
+        # Trains 10 Adam steps with random token inputs, injecting 100ms device sleeps via
+        # patched all-gather/reduce-scatter and around forward/backward/optimizer, and
+        # asserts losses match each step. Raises AssertionError on an unknown device type.
         # Only test individual delays or all four delays to save test time
         if (
             delay_after_forward
@@ -557,12 +650,16 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         orig_reduce_scatter = dist.reduce_scatter_single
 
         def delayed_all_gather(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Sleeps the device for the delay then forwards all
+            # arguments to the original single-tensor all-gather and returns its result.
             device_sleep(
                 device_type.type, int(delay_in_ms * get_cycles_per_ms(device_type.type))
             )
             return orig_all_gather(*args, **kwargs)
 
         def delayed_reduce_scatter(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Sleeps the device for the delay then forwards all
+            # arguments to the original single-tensor reduce-scatter and returns its result.
             device_sleep(
                 device_type.type, int(delay_in_ms * get_cycles_per_ms(device_type.type))
             )
@@ -606,6 +703,10 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         "Sleep is not supported on this device",
     )
     def test_non_root_forward_backward(self):
+        # [FUNCTION DOC] Runs forward/backward and an optimizer step on the whole 3-MLP
+        # model (root), then on only its first MLP (non-root), comparing losses with a
+        # manually all-reduced reference at each stage and the final outputs. Verifies the
+        # non-root run correctly syncs streams and queues its post-backward callback.
         """
         Tests running forward/backward through the root and then through a
         non-root. The non-root needs to synchronize streams/queue the callback.
@@ -652,6 +753,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_multi_forward_module(self):
+        # [FUNCTION DOC] Runs the multi-forward helper for reshard_after_forward True,
+        # False and 2.
         """
         Tests parity with DDP when running a module that participates multiple
         times in forward.
@@ -662,13 +765,24 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         )
 
     def _test_multi_forward_module(self, reshard_after_forward: bool | int):
+        # [FUNCTION DOC] HELPER: Shards the inner linear of a module that calls it twice per
+        # forward (plus the root) and trains 10 Adam steps against a replicated reference,
+        # asserting equal losses. Note the reshard_after_forward argument is not passed to
+        # fully_shard.
+        # KNOWN ISSUE: reshard_after_forward is accepted but never used, so all three
+        # subtest values run the same default configuration.
         class MultiForwardModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with inner (4->4) and outer (4->5) linears where the
+            # inner layer is applied twice in a single forward.
             def __init__(self, device: torch.device):
+                # [FUNCTION DOC] HELPER: Creates the inner and outer linear layers on device.
                 super().__init__()
                 self.inner = nn.Linear(4, 4, device=device)
                 self.outer = nn.Linear(4, 5, device=device)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies inner twice to x, sums the results and
+                # returns outer applied to the sum.
                 i = self.inner(x)
                 j = self.inner(x)
                 return self.outer(i + j)
@@ -698,6 +812,10 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_explicit_prefetching(self):
+        # [FUNCTION DOC] Shards each layer of an 8-layer Transformer and the root, then
+        # configures each layer to explicitly prefetch the next two layers' parameters in
+        # forward and the previous two in backward. Trains 10 AdamW steps against a
+        # replicated reference and asserts the losses match.
         torch.manual_seed(42)
         model_args = ModelArgs(n_layers=8, dropout_p=0.0)
         model = Transformer(model_args)
@@ -741,6 +859,10 @@ class TestFullyShard1DTrainingCore(FSDPTest):
     )
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_post_optim_event(self):
+        # [FUNCTION DOC] Registers an optimizer step post-hook that records an event on the
+        # current stream and sets it as the root's post-optimizer event, so the next forward
+        # syncs on it. Trains 10 AdamW steps with a device sleep after each step so the CPU
+        # runs ahead, then compares all losses with a replicated reference run.
         torch.manual_seed(42)
         model_args = ModelArgs(dropout_p=0.0)
         model = Transformer(model_args)
@@ -753,6 +875,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         def step_post_hook(
             fsdp_module: FSDPModule, opt: torch.optim.Optimizer, args, kwargs
         ) -> None:
+            # [FUNCTION DOC] HELPER: Optimizer post-step hook; records an event on the
+            # current device stream and passes it to the FSDP module as its post-optim event.
             post_optim_event = (
                 torch.get_device_module(device_type).current_stream().record_event()
             )
@@ -786,8 +910,15 @@ class TestFullyShard1DTrainingCore(FSDPTest):
 
 
 class TestFullyShard1DTrainingCompose(FSDPTest):
+    # [CLASS DOC] Multi-process tests of FSDP composed with other features: activation
+    # checkpointing (composable, utils, wrapper), grouped modules passed to one fully_shard
+    # call, chunked-loss patterns with partial forwards, mixed precision input casting,
+    # gradient accumulation, reshard toggles, recovery after an exception, and double
+    # forwards before backward.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 ranks (2 on CPU, otherwise the smaller of 2 and the
+        # device count) to limit numeric drift on the larger transformer.
         # Since these tests run with a larger transformer model, they may see
         # some numeric drift with >2 GPUs
         min_world_size = 2
@@ -797,6 +928,9 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @staticmethod
     def _snapshot_grad(grad: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns an independent copy of a gradient: the gathered full
+        # tensor for a DTensor, otherwise a clone. Used so later accumulation does not alter
+        # earlier per-chunk snapshots.
         # Used for per-chunk snapshots where ``param.grad`` accumulates across
         # chunks: each snapshot needs an independent copy.
         if isinstance(grad, DTensor):
@@ -807,6 +941,9 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
     @compiled_fsdp_test(compile_compute_on_module=Transformer)
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1661
     def test_train_parity_with_activation_checkpointing(self):
+        # [FUNCTION DOC] Runs the activation-checkpointing parity helper over
+        # reshard_after_forward True/False, three checkpoint implementations and three
+        # module groupings. Skipped below 2 GPUs; expected-failure on XPU.
         """
         Tests train parity against DDP when composing with activation
         checkpointing.
@@ -826,6 +963,14 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         checkpoint_impl: str,
         module_grouping: str,
     ):
+        # [FUNCTION DOC] HELPER: Builds a 3-layer Transformer, applies the chosen activation
+        # checkpointing (composable, utils flag in model args, or wrapper), and shards it per
+        # the grouping: "block" (per layer), "mem_eff" (grouped layers/embeddings/output, no
+        # weight tying, embedding does not unshard in backward) or "mem_eff_weight_tied"
+        # (embedding and output grouped). Trains 10 Adam steps against a replicated
+        # reference, checking sharded parity and equal losses. Raises AssertionError for an
+        # unknown checkpoint_impl and NotImplementedError for an unknown grouping; returns
+        # early if testing compiled FSDP with composable checkpoint.
         if checkpoint_impl not in ("composable", "utils", "wrapper"):
             raise AssertionError(f"Unexpected checkpoint_impl: {checkpoint_impl}")
         testing_compile = fully_shard != torch.distributed.fsdp.fully_shard
@@ -918,6 +1063,10 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_partial_group_forward_then_standalone(self):
+        # [FUNCTION DOC] Sweeps the chunked-loss helper over reshard setting, weight tying
+        # and mixed-precision mode (no activation checkpointing), then runs two extra
+        # targeted configurations: activation checkpointing enabled, and resharding to a
+        # smaller mesh (reshard_after_forward of 1).
         """Chunked-loss pattern: model forward skips one module in a grouped
         ``fully_shard([norm, head])``, then that module is called standalone
         per-chunk. Validates ``_force_complete_incomplete_states`` +
@@ -956,6 +1105,14 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         mp_policy_mode: str,
         ac: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Chunked-loss test. Runs the model forward skipping the head
+        # (grouped with norm in one fully_shard call), then calls the head standalone on
+        # four chunks of the detached hidden states, each with its own backward, and finally
+        # backpropagates the concatenated chunk grads through the hidden states. Mixed
+        # precision mode sets the expected hidden dtype. Compares the grouped model against
+        # an ungrouped sharded model (skipped when weight tying) and, in the none-policy
+        # case, against an unsharded reference with manual gradient averaging; 10 Adam steps,
+        # asserting losses, head grads, parameter grads and parameters match.
         dim, vocab_size, n_chunks = 32, 128, 4
 
         bf16_out = {"param_dtype": torch.float32, "output_dtype": torch.bfloat16}
@@ -978,6 +1135,12 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         fsdp_kwargs: dict = {"reshard_after_forward": reshard_after_forward}
 
         def _run_chunked(model: nn.Module, h_dtype: torch.dtype):
+            # [FUNCTION DOC] HELPER: Runs the chunked forward/backward on the given model
+            # using the shared tokens: asserts hidden and head output dtypes equal h_dtype,
+            # accumulates the summed loss, snapshots the head weight grad after each chunk and
+            # asserts every chunk after the first changes it, then backpropagates the
+            # collected chunk grads through the hidden states. Returns the total loss and the
+            # last head grad snapshot (taken before the hidden-state backward).
             """Returns (total_loss, snapshot of head.weight.grad after the
             chunk loop but before h.backward); the snapshot isolates chunk-
             accumulation failures from h.backward propagation."""
@@ -1009,6 +1172,9 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
             return total_loss, per_chunk_head_grads[-1]
 
         def _new_model() -> nn.Module:
+            # [FUNCTION DOC] HELPER: Creates a seeded ChunkedHeadModel on the device with
+            # parameters broadcast from rank 0 so all ranks agree; optionally applies
+            # composable checkpoint to its body.
             torch.manual_seed(42)
             m = ChunkedHeadModel(dim, vocab_size, weight_tying).to(device_type)
             with torch.no_grad():
@@ -1019,6 +1185,10 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
             return m
 
         def _shard(m: nn.Module, grouped: bool) -> torch.optim.Optimizer:
+            # [FUNCTION DOC] HELPER: Applies fully_shard to the model's submodules with the
+            # root/inner mixed precision policies; grouped puts norm and head (plus embed with
+            # weight tying) in one call, ungrouped shards them separately. Shards the root
+            # last and returns an Adam optimizer over its parameters.
             if grouped and weight_tying:
                 fully_shard(m.body, mp_policy=root_mp, **fsdp_kwargs)
                 fully_shard(
@@ -1107,6 +1277,10 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_grouped_module_cast_forward_inputs(self):
+        # [FUNCTION DOC] Groups two linears in one fully_shard call with bf16 param dtype and
+        # input casting, where the first linear's output is converted to fp32 inside the
+        # model. Asserts forward succeeds (inputs to the second member are cast), the output
+        # is bf16, and all parameters receive gradients.
         """``cast_forward_inputs`` applies to every module in a grouped
         ``fully_shard([a, b])``. Trigger: fp32 intermediate between ``a``
         and ``b`` would raise a dtype mismatch without the cast on ``b``.
@@ -1114,12 +1288,16 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         dim = 32
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Two bias-free linears a and b, with an fp32 conversion
+            # between them to require input casting on b.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linears a and b of the enclosing dim.
                 super().__init__()
                 self.a = nn.Linear(dim, dim, bias=False)
                 self.b = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies a, converts to float32, applies b.
                 # Intentional fp32 intermediate: if cast_forward_inputs does
                 # not fire on self.b, bf16 weight @ fp32 input would error.
                 return self.b(self.a(x).float())
@@ -1144,6 +1322,8 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_partial_group_forward_grad_accum_chunked(self):
+        # [FUNCTION DOC] Runs the chunked gradient-accumulation helper for
+        # reshard_after_forward True and False.
         """Chunked-loss + grad accumulation via set_requires_gradient_sync /
         set_is_last_backward: grouped [norm, head] and ungrouped variants
         produce identical accumulated grads."""
@@ -1155,10 +1335,18 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
     def _test_partial_group_forward_grad_accum_chunked(
         self, reshard_after_forward: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Runs three microbatches, each with a head-skipping forward,
+        # two chunked head backwards and a hidden-state backward, on an ungrouped and a
+        # grouped (norm and head in one call) sharded model. Gradient sync and the
+        # last-backward flag are enabled only on the final microbatch. Asserts the
+        # accumulated local gradients of every parameter are equal between the two models.
         dim, vocab_size, n_chunks, n_microbatches = 32, 128, 2, 3
         kwargs = {"reshard_after_forward": reshard_after_forward}
 
         def _setup(grouped: bool) -> nn.Module:
+            # [FUNCTION DOC] HELPER: Builds a seeded untied ChunkedHeadModel with parameters
+            # broadcast from rank 0, shards embed and body separately, shards norm and head
+            # together (grouped) or separately, then shards the root and returns the model.
             torch.manual_seed(42)
             m = ChunkedHeadModel(dim, vocab_size, tie=False).to(device_type)
             with torch.no_grad():
@@ -1203,6 +1391,8 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_partial_group_reshard_toggle(self):
+        # [FUNCTION DOC] Runs the reshard-toggle helper over weight tying and the initial
+        # reshard_after_forward setting of the grouped head modules.
         """Reshard-flag toggle pattern used by torchtitan's ``ChunkedCELoss``:
         disable reshard_after_forward/backward for the chunk loop, then
         restore + call ``head.reshard()`` explicitly. Exercises force-complete
@@ -1224,6 +1414,11 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
     def _test_partial_group_reshard_toggle(
         self, weight_tying: bool, initial_reshard: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: For 5 iterations, runs a head-skipping forward, disables
+        # reshard after forward/backward on the head module, and does four chunked head
+        # backwards while asserting the head's parameter group stays unsharded. Then restores
+        # the flags, calls reshard on the head and asserts the group is sharded, runs the
+        # hidden-state backward, asserts all parameters have grads, and steps Adam.
         dim, vocab_size, n_chunks = 32, 128, 4
         torch.manual_seed(42)
         model = ChunkedHeadModel(dim, vocab_size, weight_tying).to(device_type)
@@ -1277,18 +1472,26 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_reset_iter_state_after_exception(self):
+        # [FUNCTION DOC] Makes a head-skipping forward raise mid-way (via a wrapper around the
+        # body), then calls reset_iter_state and checks that a normal forward/backward
+        # afterwards completes with gradients on every parameter.
         """``reset_iter_state`` recovers after a mid-partial-forward exception
         (the case this PR's state-machine cleanup was designed for): the next
         forward-backward completes cleanly."""
         dim, vocab_size = 32, 128
 
         class _Raiser(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper that delegates to another module but raises a
+            # RuntimeError from forward while its armed flag is set.
             def __init__(self, wrapped: nn.Module) -> None:
+                # [FUNCTION DOC] HELPER: Stores the wrapped module and an unarmed flag.
                 super().__init__()
                 self.wrapped = wrapped
                 self.armed = False
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Raises RuntimeError "boom" if armed; otherwise
+                # returns the wrapped module's output.
                 if self.armed:
                     raise RuntimeError("boom")
                 return self.wrapped(x)
@@ -1319,6 +1522,8 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_double_forward_with_nested_fsdp_and_checkpoint(self):
+        # [FUNCTION DOC] Runs the double-forward helper for reshard_after_forward True/False
+        # and composable or utils activation checkpointing.
         """
         Tests that calling model.forward() twice before backward() works correctly
         when using nested FSDP with activation checkpointing.
@@ -1337,6 +1542,10 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         reshard_after_forward: bool,
         checkpoint_impl: str,
     ):
+        # [FUNCTION DOC] HELPER: Builds a 3-layer Transformer with the chosen activation
+        # checkpointing and nested FSDP (attention, feed-forward, layer, root). Calls forward
+        # twice on different inputs before one backward over a loss combining both outputs
+        # (a preference-training pattern) and asserts every trainable parameter gets a grad.
         torch.manual_seed(42)
         vocab_size = 1024
         with torch.device(device_type):
@@ -1379,6 +1588,10 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_double_partial_forward_then_backward(self):
+        # [FUNCTION DOC] Calls a head-skipping forward twice with different tokens before one
+        # backward over both hidden states. Completing without hanging shows the second
+        # forward registered its post-backward hook; also asserts embedding and norm grads are
+        # present and finite and the unused head weight grad is None.
         """Two back-to-back ``model(x, skip_head=True)`` calls before
         backward: both partial forwards must re-register their post_backward
         autograd node. ``_force_complete_incomplete_states`` resets the
@@ -1426,8 +1639,13 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
 
 
 class TestFullyShardShardPlacementFnMultiProcess(FSDPTest):
+    # [CLASS DOC] Multi-process test of the shard placement function option: trains a
+    # Transformer whose parameters are sharded on their largest dim and compares to a
+    # replicated reference.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns up to 8 ranks: 8 on CPU, otherwise the smaller of 8
+        # and the device count.
         min_world_size = 8
         if device_type.type == "cpu":
             return min_world_size
@@ -1435,6 +1653,9 @@ class TestFullyShardShardPlacementFnMultiProcess(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_parity_shard_placement_fn_shard_largest_dim(self):
+        # [FUNCTION DOC] Shards a 3-layer Transformer (layers plus root) with a function that
+        # shards each parameter on its largest dim, and checks training parity with a
+        # replicated AdamW reference.
         torch.manual_seed(42)
         model_args = ModelArgs(n_layers=3, dropout_p=0.0)
         model = Transformer(model_args)
@@ -1442,6 +1663,8 @@ class TestFullyShardShardPlacementFnMultiProcess(FSDPTest):
         ref_optim = torch.optim.AdamW(ref_model.parameters(), lr=1e-2)
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a shard placement on the index of the first
+            # largest dimension of the parameter's shape.
             return Shard(param.shape.index(max(param.shape)))
 
         for layer in model.layers:
@@ -1477,15 +1700,25 @@ class TestFullyShardShardPlacementFnMultiProcess(FSDPTest):
 
 
 class TestFullyShardShardPlacementFnMultiThread(FSDPTestMultiThread):
+    # [CLASS DOC] Multi-thread test (4 ranks) that a shard placement function sharding
+    # weights on dim 1 still yields contiguous parameters and gradients.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4 as the number of threads/ranks.
         return 4
 
     def test_shard_placement_fn_contiguous_params_grads(self):
+        # [FUNCTION DOC] Shards an MLP with a placement function (dim 1 for matrices, dim 0
+        # for vectors). Asserts parameters and their local shards are contiguous initially,
+        # that the unsharded parameters seen in each child's forward pre-hook are contiguous,
+        # and that after a backward the parameters, gradients and their local shards are
+        # all contiguous.
         dim = 4
         model = MLP(dim=dim)
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns shard on dim 1 for parameters with more than one
+            # dimension, otherwise shard on dim 0.
             if param.ndim > 1:
                 return Shard(1)
             return Shard(0)
@@ -1495,6 +1728,8 @@ class TestFullyShardShardPlacementFnMultiThread(FSDPTestMultiThread):
         fully_shard(model, shard_placement_fn=shard_placement_fn)
 
         def assert_contiguous_params(module: nn.Module, args: Any):
+            # [FUNCTION DOC] HELPER: Forward pre-hook that asserts every parameter of the
+            # module is contiguous at the time forward is about to run.
             for param in module.parameters():
                 self.assertTrue(param.is_contiguous())
 
@@ -1516,8 +1751,14 @@ class TestFullyShardShardPlacementFnMultiThread(FSDPTestMultiThread):
 
 
 class TestFullyShardSharedParams(FSDPTest):
+    # [CLASS DOC] Multi-process tests of tied/shared parameters under FSDP: training parity
+    # with weight tying, uneven sharding of tied weights, the error when tied modules are
+    # in separate FSDP groups, and no false duplicate-parameter error when sharding layer by
+    # layer with garbage collection.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4 ranks on CPU, otherwise the smaller of 4 and the
+        # device count.
         min_world_size = 4
         if device_type.type == "cpu":
             return min_world_size
@@ -1525,6 +1766,8 @@ class TestFullyShardSharedParams(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_parity_with_shared_params(self):
+        # [FUNCTION DOC] Runs the shared-parameter parity helper over reshard_after_forward
+        # False/True and activation checkpointing off/on.
         self.run_subtests(
             {
                 "reshard_after_forward": [False, True],
@@ -1538,6 +1781,9 @@ class TestFullyShardSharedParams(FSDPTest):
         reshard_after_forward: bool,
         use_activation_checkpointing: bool,
     ):
+        # [FUNCTION DOC] HELPER: Trains a 3-layer weight-tied Transformer, sharded per block
+        # plus the root (optionally with composable checkpoint on each block), for 10 Adam
+        # steps against a replicated reference and asserts losses match each step.
         torch.manual_seed(42)
         model_args = ModelArgs(n_layers=3, dropout_p=0.0, weight_tying=True)
         model = Transformer(model_args)
@@ -1570,6 +1816,8 @@ class TestFullyShardSharedParams(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_shared_params_uneven_shard(self):
+        # [FUNCTION DOC] Runs the uneven-shard tied-weight helper for reshard_after_forward
+        # True and False.
         """
         Test that FSDP2 correctly handles tied weights with uneven sharding
         when tied modules are placed in the same FSDP group.
@@ -1583,18 +1831,28 @@ class TestFullyShardSharedParams(FSDPTest):
         self,
         reshard_after_forward: bool,
     ):
+        # [FUNCTION DOC] HELPER: Shards an embedding and a tied output linear in one group
+        # with a vocab size not divisible by world size (so the last shard is padded). Trains
+        # 10 AdamW steps with a cross-entropy loss, then gathers the weight and asserts every
+        # row differs from its initial value, including rows in the padded last shard.
         hidden_size = 16
         # vocab_size not divisible by world_size to trigger uneven sharding
         vocab_size = self.world_size * 4 + 1
 
         class TiedModel(nn.Module):
+            # [CLASS DOC] HELPER: Embedding followed by an output projection whose weight is
+            # the same parameter as the embedding weight.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the embedding and bias-free output linear and
+                # ties their weights.
                 super().__init__()
                 self.tok_embeddings = nn.Embedding(vocab_size, hidden_size)
                 self.output = nn.Linear(hidden_size, vocab_size, bias=False)
                 self.output.weight = self.tok_embeddings.weight
 
             def forward(self, ids):
+                # [FUNCTION DOC] HELPER: Embeds the token ids and projects back to vocab
+                # logits.
                 return self.output(self.tok_embeddings(ids))
 
         torch.manual_seed(42)
@@ -1636,6 +1894,9 @@ class TestFullyShardSharedParams(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_shared_params_separate_fsdp_groups_error(self):
+        # [FUNCTION DOC] Shards two modules sharing a weight in separate fully_shard calls and
+        # asserts the first forward (lazy init) raises ValueError saying the parameter is
+        # already managed by another group.
         """
         Test that applying fully_shard to modules with shared parameters
         in separate calls raises an error at lazy init (first forward).
@@ -1644,13 +1905,19 @@ class TestFullyShardSharedParams(FSDPTest):
         vocab_size = 17
 
         class TiedModel(nn.Module):
+            # [CLASS DOC] HELPER: Embedding followed by an output projection whose weight is
+            # the same parameter as the embedding weight.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the embedding and bias-free output linear and
+                # ties their weights.
                 super().__init__()
                 self.tok_embeddings = nn.Embedding(vocab_size, hidden_size)
                 self.output = nn.Linear(hidden_size, vocab_size, bias=False)
                 self.output.weight = self.tok_embeddings.weight
 
             def forward(self, ids):
+                # [FUNCTION DOC] HELPER: Embeds the token ids and projects back to vocab
+                # logits.
                 return self.output(self.tok_embeddings(ids))
 
         model = TiedModel()
@@ -1663,6 +1930,9 @@ class TestFullyShardSharedParams(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_layer_by_layer_shard_no_false_positive(self):
+        # [FUNCTION DOC] Appends 8 blocks to a model one at a time, sharding each and forcing
+        # garbage collection after it, then shards the root. Verifies no false duplicate
+        # parameter error occurs from reused object ids and a forward/backward succeeds.
         """
         Test that layer-by-layer materialize+shard+GC does not trigger a
         false-positive duplicate parameter error from id() reuse.
@@ -1671,20 +1941,27 @@ class TestFullyShardSharedParams(FSDPTest):
         n_blocks = 8
 
         class SimpleBlock(nn.Module):
+            # [CLASS DOC] HELPER: Layer norm followed by a bias-free linear.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the norm and linear layers of width dim.
                 super().__init__()
                 self.norm = nn.LayerNorm(dim)
                 self.linear = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies norm then linear.
                 return self.linear(self.norm(x))
 
         class LayerByLayerModel(nn.Module):
+            # [CLASS DOC] HELPER: Container whose blocks list starts empty and is filled by
+            # the test; forward applies the blocks in order.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates an empty module list of blocks.
                 super().__init__()
                 self.blocks = nn.ModuleList()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Passes the input through each block in order.
                 for block in self.blocks:
                     x = block(x)
                 return x
@@ -1704,8 +1981,13 @@ class TestFullyShardSharedParams(FSDPTest):
 
 
 class TestFullyShardGradientAccumulation(FSDPTest):
+    # [CLASS DOC] Multi-process tests of gradient accumulation across microbatches with
+    # gradient sync and resharding turned off until the last microbatch, verifying parity
+    # and exact collective counts, plus an emulated 1F1B pipeline schedule.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4 ranks on CPU, otherwise the smaller of 4 and the
+        # device count.
         min_world_size = 4
         if device_type.type == "cpu":
             return min_world_size
@@ -1713,6 +1995,10 @@ class TestFullyShardGradientAccumulation(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_gradient_accumulation(self):
+        # [FUNCTION DOC] Builds a 1-D FSDP mesh (plus a 2x2 HSDP mesh when world size is 4)
+        # and runs the accumulation helper over meshes, reshard settings, which modules skip
+        # gradient reduction, reshard-after-backward, offload policy, and HSDP
+        # reduce-scatter-only mode.
         """
         Tests gradient accumulation with/without gradient reduction and
         with/without resharding after backward.
@@ -1758,6 +2044,14 @@ class TestFullyShardGradientAccumulation(FSDPTest):
         offload_policy: OffloadPolicy,
         reduce_scatter_only: bool,  # for HSDP
     ):
+        # [FUNCTION DOC] HELPER: Trains a linear plus three MLPs over 5 iterations of 3
+        # microbatches. In the chosen mode (all modules, only the root, or some MLPs) gradient
+        # sync (or only the HSDP all-reduce) and optionally reshard-after-backward are
+        # enabled only on the last microbatch. Records collective counts with a comm debug
+        # mode and asserts reduce-scatter, all-reduce and all-gather counts equal the
+        # expected values, losses match a reference, sharded parity holds, and steps both
+        # optimizers. Returns early for uncommon or inapplicable combinations and for pinned
+        # CPU offload on CPU.
         if (
             (
                 not reshard_after_backward
@@ -1801,12 +2095,19 @@ class TestFullyShardGradientAccumulation(FSDPTest):
         def set_grad_sync_flag(
             module: nn.Module, is_last_microbatch: bool, recurse: bool = True
         ):
+            # [FUNCTION DOC] HELPER: Sets whether the module (optionally recursing) performs
+            # only the all-reduce step (HSDP reduce-scatter-only mode) or full gradient sync,
+            # according to is_last_microbatch.
             if reduce_scatter_only:
                 module.set_requires_all_reduce(is_last_microbatch, recurse=recurse)
             else:
                 module.set_requires_gradient_sync(is_last_microbatch, recurse=recurse)
 
         def set_backward_flags(_model: nn.Module, is_last_microbatch: bool):
+            # [FUNCTION DOC] HELPER: Applies the gradient-sync flag (and, when not resharding
+            # after backward, the reshard-after-backward flag) to the modules selected by the
+            # mode: the whole model, only the first disabled MLPs, or only the root without
+            # recursion.
             if mode == "all":
                 set_grad_sync_flag(_model, is_last_microbatch)
                 if not reshard_after_backward:
@@ -1901,6 +2202,8 @@ class TestFullyShardGradientAccumulation(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_1f1b_microbatching(self):
+        # [FUNCTION DOC] Runs the 1F1B helper with and without explicit async unshard and with
+        # reshard-after-backward on/off.
         self.run_subtests(
             {
                 "use_explicit_unshard": [False, True],
@@ -1912,6 +2215,11 @@ class TestFullyShardGradientAccumulation(FSDPTest):
     def _test_1f1b_microbatching(
         self, use_explicit_unshard: bool, reshard_after_backward: bool
     ):
+        # [FUNCTION DOC] HELPER: Shards a Transformer without reshard-after-forward, optionally
+        # issues async unshards for all FSDP modules up front, then emulates a 1F1B schedule:
+        # three microbatches each doing forward and backward with gradient sync and the
+        # last-backward flag set only on the last. Compares per-microbatch losses with a
+        # reference, steps both AdamW optimizers and checks sharded parity.
         torch.manual_seed(42)
         model_args = ModelArgs(dropout_p=0.0)
         model = Transformer(model_args)
@@ -1969,14 +2277,22 @@ class TestFullyShardGradientAccumulation(FSDPTest):
 
 
 class TestFullyShardNDTraining(FSDPTest):
+    # [CLASS DOC] Multi-process tests of FSDP on N-D device meshes: FSDP combined with tensor
+    # parallelism on a pp/dp/tp mesh, and shard placement functions for expert and tensor
+    # parallel parameters with separate meshes for dense and expert groups.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns up to 8 ranks: 8 on CPU, otherwise the smaller of 8
+        # and the device count.
         min_world_size = 8
         if device_type.type == "cpu":
             return min_world_size
         return min(min_world_size, torch.get_device_module(device_type).device_count())
 
     def init_global_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Builds a 3-D mesh with dims pp, dp, tp: dp is 2 when world
+        # size exceeds 2 (else 1), pp is 2 when world size exceeds 4 (else 1), and tp takes
+        # the remaining ranks. Collective call; returns the mesh.
         # Prefer to test with >=8 GPUs, but for 2 GPUs, use 2-way TP
         dp_size = 2 if self.world_size > 2 else 1
         pp_size = 2 if self.world_size > 4 else 1
@@ -1989,6 +2305,9 @@ class TestFullyShardNDTraining(FSDPTest):
     @skip_if_lt_x_gpu(4, allow_cpu=True)
     @skip_if_rocm_arch_multiprocess(MI200_ARCH)
     def test_2d_mlp_with_nd_mesh(self):
+        # [FUNCTION DOC] Builds the global pp/dp/tp mesh and runs the 2-D (dp x tp) MLP
+        # helper over reshard setting, activation checkpointing and MLP widths (including
+        # ones not divisible by the mesh). Needs 4 GPUs (or CPU); skipped on ROCm MI200.
         global_mesh = self.init_global_mesh()
         self.run_subtests(
             {
@@ -2008,6 +2327,12 @@ class TestFullyShardNDTraining(FSDPTest):
         mlp_dim: int,
         foreach: bool,
     ):
+        # [FUNCTION DOC] HELPER: Trains an MLP stack parallelized with tensor parallelism on
+        # the tp mesh and FSDP on the dp mesh against a reference replicated over the dp
+        # group, 10 Adam steps with dp-rank-specific inputs, asserting equal losses. Finally
+        # asserts every parameter is a DTensor on a 2-D (dp, tp) mesh with two placements.
+        # KNOWN ISSUE: the global_mesh argument is immediately overwritten by a fresh call to
+        # the mesh initializer, so the mesh passed in by the caller is never used.
         global_mesh = self.init_global_mesh()
         _, dp_mesh, tp_mesh = (
             global_mesh["pp"],
@@ -2053,6 +2378,9 @@ class TestFullyShardNDTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(8)
     def test_shard_placement_fn_tp_ep(self):
+        # [FUNCTION DOC] Runs the tensor/expert-parallel placement helper over TP degree,
+        # data-parallel replicate degree and the reshard setting for non-layer modules.
+        # Requires at least 8 GPUs.
         self.run_subtests(
             {
                 "tp_degree": [1, 2],
@@ -2063,6 +2391,12 @@ class TestFullyShardNDTraining(FSDPTest):
         )
 
     def _init_parallel_meshes(self, tp_degree, dp_replicate, ep_degree):
+        # [FUNCTION DOC] HELPER: Derives data-parallel sizes from the world size and TP
+        # degree, returns None if the shard size is smaller than the expert-parallel degree,
+        # else builds the tp and dp meshes (with replicate dim when replicating, a flattened
+        # fsdp dim for plain FSDP), unflattens the shard dim into efsdp and ep dims, and
+        # returns the tp, dp, ep and efsdp meshes with FSDP (or HSDP when replicating) mesh
+        # info objects for the dense and expert groups. tp mesh is None when TP degree is 1.
         """Build the TP, DP, EP, and EFSDP meshes and mesh infos.
 
         Returns (tp_mesh, dp_mesh, ep_mesh, efsdp_mesh, dp_mesh_info,
@@ -2145,6 +2479,17 @@ class TestFullyShardNDTraining(FSDPTest):
     def _test_shard_placement_fn_tp_ep(
         self, tp_degree, dp_replicate, reshard_non_layer_modules
     ):
+        # [FUNCTION DOC] HELPER: With expert-parallel degree 2, builds the parallel meshes
+        # (returning early if invalid, or if an integer reshard value does not divide a
+        # group's shard mesh size). Builds a 2-layer 8-expert Transformer, keeps a reference
+        # copy, applies TP/EP parallelization, and shards each block with a placement
+        # function that puts expert parameters on the expert FSDP mesh and others on the dense
+        # mesh (both sharded on dim 0). Groups embeddings, norm and output together (tied
+        # weights), then the root; with TP the non-layer reshard setting is forced to True.
+        # Asserts gathered parameters equal the reference, then trains 5 Adam steps, reducing
+        # reference grads over the matching process groups (sum over expert-parallel group
+        # then average over expert FSDP and replicate groups for experts, average for the
+        # rest), asserting losses match each step.
         ep_degree = 2
         result = self._init_parallel_meshes(tp_degree, dp_replicate, ep_degree)
         if result is None:
@@ -2187,6 +2532,9 @@ class TestFullyShardNDTraining(FSDPTest):
                 param,
                 _expert_params=expert_params,
             ):
+                # [FUNCTION DOC] HELPER: Returns a placement result sharding on dim 0, using
+                # the expert FSDP mesh info for parameters in the block's expert set (bound
+                # at definition via a default argument) and the dense mesh info otherwise.
                 if param in _expert_params:
                     return ShardPlacementResult(
                         placement=Shard(0),
@@ -2269,14 +2617,19 @@ class TestFullyShardNDTraining(FSDPTest):
 
 
 class TestFullyShardHSDP3DTraining(FSDPTest):
+    # [CLASS DOC] Multi-process test of HSDP combined with tensor parallelism on a 3-D
+    # (dp_replicate, dp_shard, tp) mesh, requiring 8 ranks.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns up to 8 ranks: 8 on CPU, otherwise the smaller of 8
+        # and the device count.
         min_world_size = 8
         if device_type.type == "cpu":
             return min_world_size
         return min(min_world_size, torch.get_device_module(device_type).device_count())
 
     def init_global_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Returns a 2x2x2 device mesh named dp_replicate, dp_shard, tp.
         return init_device_mesh(
             device_type.type,
             (2, 2, 2),
@@ -2285,6 +2638,8 @@ class TestFullyShardHSDP3DTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(8, allow_cpu=True)
     def test_3d_mlp_with_nd_mesh(self):
+        # [FUNCTION DOC] Builds the 3-D mesh and runs the 3-D MLP helper over reshard
+        # setting, activation checkpointing and MLP widths. Needs 8 GPUs (or CPU).
         global_mesh = self.init_global_mesh()
         self.run_subtests(
             {
@@ -2304,6 +2659,13 @@ class TestFullyShardHSDP3DTraining(FSDPTest):
         mlp_dim: int,
         foreach: bool,
     ):
+        # [FUNCTION DOC] HELPER: Parallelizes an MLP stack with TP on the tp mesh and HSDP on
+        # the (dp_replicate, dp_shard) mesh, asserts the gathered parameters equal the
+        # reference (validating strided sharding), trains 10 Adam steps against a reference
+        # replicated over the flattened dp group asserting equal losses, and finally asserts
+        # every parameter is a DTensor on the 3-D mesh with three placements.
+        # KNOWN ISSUE: the global_mesh argument is overwritten by a new mesh from the
+        # initializer, so the caller-supplied mesh is unused.
         global_mesh = self.init_global_mesh()
         dp_mesh, tp_mesh = global_mesh["dp_replicate", "dp_shard"], global_mesh["tp"]
         dp_pg = dp_mesh._flatten().get_group()  # used for `replicate()`
@@ -2353,8 +2715,12 @@ class TestFullyShardHSDP3DTraining(FSDPTest):
 
 
 class TestFullyShardHSDPTraining(FSDPTest):
+    # [CLASS DOC] Multi-process test of hybrid sharded data parallel training parity on a 2-D
+    # (replicate, shard) mesh with CPU offload and microbatch gradient accumulation.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4 ranks on CPU, otherwise the smaller of 4 and the
+        # device count.
         min_world_size = 4
         if device_type.type == "cpu":
             return min_world_size
@@ -2362,6 +2728,10 @@ class TestFullyShardHSDPTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_train_parity_hsdp(self):
+        # [FUNCTION DOC] Builds an HSDP mesh with shard size 2 (1 if world size is 2) and the
+        # rest as replicate size, then runs the HSDP parity helper over reshard setting,
+        # activation checkpointing, MLP widths, whether gradients sync only on the last
+        # microbatch, and pinned/unpinned CPU offload.
         shard_size = 2 if self.world_size > 2 else 1
         replicate_size = self.world_size // shard_size
         global_mesh = init_device_mesh(
@@ -2392,6 +2762,11 @@ class TestFullyShardHSDPTraining(FSDPTest):
         sync_gradients_at_last_batch: bool,
         offload_policy: CPUOffloadPolicy,
     ):
+        # [FUNCTION DOC] HELPER: Shards a layer norm plus three MLPs (each optionally
+        # checkpointed) with the HSDP mesh and CPU offload, against a replicated reference.
+        # For 5 iterations of 3 microbatches (gradient sync only on the last when requested),
+        # asserts equal losses, and checks sharded parity before and after each optimizer
+        # step. Returns early for pinned memory on CPU.
         # pin_memory requires an accelerator, skip on CPU
         if device_type.type == "cpu" and offload_policy.pin_memory:
             return
@@ -2447,8 +2822,12 @@ class TestFullyShardHSDPTraining(FSDPTest):
 
 
 class TestFullyShardCustomForwardMethod(FSDPTest):
+    # [CLASS DOC] Multi-process test that a non-forward method can be registered as an FSDP
+    # forward method so unshard/reshard hooks run around it.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 ranks on CPU, otherwise the smaller of 2 and the
+        # device count.
         min_world_size = 2
         if device_type.type == "cpu":
             return min_world_size
@@ -2456,25 +2835,41 @@ class TestFullyShardCustomForwardMethod(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_register_fsdp_forward_method(self):
+        # [FUNCTION DOC] Shards a vision tower, projector and root, registers the tower's
+        # forward_features method as an FSDP forward method (the root calls it directly
+        # instead of forward), then checks the loss equals an unsharded reference, backward
+        # runs, and sharded parity holds after averaging reference grads across ranks.
         """Based on https://github.com/pytorch/pytorch/issues/109385"""
 
         class VisionTransformer(nn.Module):
+            # [CLASS DOC] HELPER: Convolutional patch projection with a custom
+            # forward_features method that forward wraps.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the 14x14 stride-14 patch convolution
+                # producing 1024 channels.
                 super().__init__()
                 self.patch_proj = nn.Conv2d(3, 1024, kernel_size=14, stride=14)
 
             def forward_features(self, imgs: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Projects images to patches and returns a batch by
+                # patches by channels tensor.
                 return self.patch_proj(imgs).flatten(2).transpose(1, 2)
 
             def forward(self, imgs: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Sums the patch features over the patch dimension.
                 return self.forward_features(imgs).sum(dim=1)
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Vision tower plus linear projector whose forward calls the
+            # tower's forward_features method directly, bypassing its forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the vision tower and a 1024 to 256 linear.
                 super().__init__()
                 self.vit, self.projector = VisionTransformer(), nn.Linear(1024, 256)
 
             def forward(self, imgs: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Calls the tower's forward_features (not forward)
+                # and applies the projector to the patch embeddings.
                 # Run `vit.forward_features`, which is not `forward`!
                 patch_embeddings = self.vit.forward_features(imgs)
                 return self.projector(patch_embeddings)
@@ -2500,8 +2895,12 @@ class TestFullyShardCustomForwardMethod(FSDPTest):
 
 
 class TestFullyShardShareCommContext(FSDPTest):
+    # [CLASS DOC] Multi-process test of sharing one communication context (streams and
+    # post-reduce events) across several separately sharded modules.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 ranks on CPU, otherwise the smaller of 2 and the
+        # device count.
         min_world_size = 2
         if device_type.type == "cpu":
             return min_world_size
@@ -2509,6 +2908,11 @@ class TestFullyShardShareCommContext(FSDPTest):
 
     @skip_if_lt_x_gpu(2, allow_cpu=True)
     def test_share_comm_context(self):
+        # [FUNCTION DOC] Shards three MLPs separately, eagerly initializes each state, and
+        # shares one comm context among them. Wraps the all-gather and reduce collectives to
+        # record the streams used, runs forward/backward, and asserts loss equality, exactly
+        # one all-gather stream and one reduce-scatter stream were used, the shared context has
+        # no leftover post-reduce events, and sharded parity holds.
         torch.manual_seed(42)
         n_layers = 3
         lin_dim = 16
@@ -2546,6 +2950,9 @@ class TestFullyShardShareCommContext(FSDPTest):
             device: torch.device,
             all_gather_comm: AllGather,
         ):
+            # [FUNCTION DOC] HELPER: Wrapper for the foreach all-gather: records the
+            # all-gather stream in the enclosing set, then calls the original with the same
+            # arguments and returns its result.
             nonlocal all_gather_streams
             all_gather_streams.add(all_gather_stream)
             return orig_foreach_all_gather(
@@ -2578,6 +2985,9 @@ class TestFullyShardShareCommContext(FSDPTest):
             all_reduce_hook: Callable[[torch.Tensor], None] | None,
             force_sum_reduction_for_comms: bool = False,
         ):
+            # [FUNCTION DOC] HELPER: Wrapper for the foreach reduce (run without grad): records
+            # the reduce-scatter stream in the enclosing set, then calls the original with the
+            # same arguments and returns its result.
             nonlocal reduce_scatter_streams
             reduce_scatter_streams.add(reduce_scatter_stream)
             return orig_foreach_reduce(
@@ -2615,11 +3025,16 @@ class TestFullyShardShareCommContext(FSDPTest):
 
 
 class TestFullyShardWorldSize1(FSDPTest):
+    # [CLASS DOC] Multi-process test with a single rank: training parity for one FSDP group
+    # with the added check that no collective communication happens at all.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 1 as the number of ranks.
         return 1
 
     def test_train_parity_single_worldsize1(self):
+        # [FUNCTION DOC] Runs this class's single-group helper over three linear shape pairs
+        # with default dim-0 sharding.
         """
         Tests train parity with DDP for a single FSDP group
         when sharding parameters on dim-0.
@@ -2639,6 +3054,10 @@ class TestFullyShardWorldSize1(FSDPTest):
     def _test_train_parity_single_group(
         self, lin_shapes: list[tuple[int, int]], use_shard_placement_fn: bool
     ):
+        # [FUNCTION DOC] HELPER: Same setup as the multi-rank single-group parity test but on
+        # one rank: trains 10 Adam steps on a reference replicated model and a sharded model,
+        # additionally asserting that the sharded model's forward/backward issues zero
+        # collectives (measured with a comm debug mode) and that losses are equal.
         torch.manual_seed(42)
         model = nn.Sequential(
             nn.Linear(*lin_shapes[0]), nn.ReLU(), nn.Linear(*lin_shapes[1])
@@ -2648,6 +3067,8 @@ class TestFullyShardWorldSize1(FSDPTest):
         ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-2)
 
         def _shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a shard placement on the index of the first
+            # largest dimension of the parameter's shape.
             return Shard(param.shape.index(max(param.shape)))
 
         shard_placement_fn = _shard_placement_fn if use_shard_placement_fn else None
@@ -2677,8 +3098,11 @@ class TestFullyShardWorldSize1(FSDPTest):
 
 
 class TestFullyShardCudaGraph(FSDPTest):
+    # [CLASS DOC] Multi-process (2 ranks) test that a fully sharded model's forward and
+    # backward can be captured in a CUDA graph and replayed with matching results.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2 as the number of ranks.
         return 2
 
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/173761")
@@ -2687,6 +3111,11 @@ class TestFullyShardCudaGraph(FSDPTest):
         not TEST_CUDA_GRAPH, "CUDA >= 11.0 or ROCM >= 5.3 required for graphs"
     )
     def test_two_layer_fully_shard_cudagraph(self):
+        # [FUNCTION DOC] Shards two linears and the root, warms up one forward/backward on a
+        # side stream, captures forward/backward into a CUDA graph with a static input, then
+        # twice compares a graph replay against an eager run on the same input, asserting
+        # outputs and gradients are exactly equal. Uses the CUDA stream/graph APIs directly;
+        # skipped on ROCm and when graphs are unsupported.
         if device_type.type == "cuda":
             torch.cuda.set_device(self.rank)
         device = torch.device(device_type.type, self.rank)

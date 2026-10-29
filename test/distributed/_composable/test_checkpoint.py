@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Unit tests for the composable activation checkpoint API
+# (torch.distributed._composable.checkpoint). Defines a memory-measuring context manager,
+# several small toy models, and one TestCheckpoint case that compares gradients and memory
+# between checkpointed and plain modules, and exercises error handling and keyword options.
+# Import-time side effect: computes the module-level device_type string from the current
+# accelerator (falls back to "cpu").
+
 import unittest
 from collections import deque, OrderedDict
 from contextlib import ContextDecorator, contextmanager, nullcontext
@@ -18,12 +25,19 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class MemoryDelta(ContextDecorator):
+    # [CLASS DOC] HELPER: Context manager/decorator that records the accelerator's currently
+    # active allocated bytes on entry and on exit, so delta() gives the net memory change
+    # across the block. Only cuda and xpu devices are measured; other devices always report 0.
     def __init__(self, device: torch.device):
+        # [FUNCTION DOC] HELPER: Stores the device to measure and zero-initializes the
+        # enter/exit byte counters.
         self.device: torch.device = device
         self.active_memory_enter: int = 0
         self.active_memory_exit: int = 0
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Records active allocator bytes on entry (0 for non-cuda/xpu
+        # devices) and returns self so the caller can query delta() afterwards.
         self.active_memory_enter = (
             torch.accelerator.memory_stats()["active_bytes.all.current"]
             if self.device.type == "cuda" or self.device.type == "xpu"
@@ -32,6 +46,8 @@ class MemoryDelta(ContextDecorator):
         return self
 
     def __exit__(self, *exc):
+        # [FUNCTION DOC] HELPER: Records active allocator bytes on exit (0 for non-cuda/xpu
+        # devices). Returns nothing, so exceptions from the block are not suppressed.
         self.active_memory_exit = (
             torch.accelerator.memory_stats()["active_bytes.all.current"]
             if self.device.type == "cuda" or self.device.type == "xpu"
@@ -39,11 +55,16 @@ class MemoryDelta(ContextDecorator):
         )
 
     def delta(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns exit minus enter active bytes, i.e. memory retained
+        # by the measured block (activations kept for backward). Valid after the block ends.
         return self.active_memory_exit - self.active_memory_enter
 
 
 class ToyModel(nn.Module):
+    # [CLASS DOC] HELPER: Small model with a linear layer l1 followed by a sequential block
+    # seq (ReLU, Linear, ReLU), all 100 wide. The tests checkpoint the seq submodule.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the l1 linear layer and the seq block.
         super().__init__()
         self.l1 = nn.Linear(100, 100)
         self.seq = nn.Sequential(
@@ -53,26 +74,38 @@ class ToyModel(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies l1 then seq to the input and returns the result.
         return self.seq(self.l1(x))
 
 
 class RandomModel(nn.Module):
+    # [CLASS DOC] HELPER: Model whose forward consumes random numbers, used to verify that
+    # checkpoint recomputation reproduces the same random state. Holds one 100x100 parameter p.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the randomly initialized parameter p.
         super().__init__()
         self.p = nn.Parameter(torch.randn(100, 100))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Multiplies p by a freshly drawn random matrix (on p's
+        # device) and then multiplies the input by that product. Non-deterministic across
+        # calls unless the RNG state is restored.
         y = torch.matmul(self.p, torch.randn(100, 100, device=self.p.device))
         return torch.matmul(x, y)
 
 
 class MultiOutputModel(nn.Module):
+    # [CLASS DOC] HELPER: Model with two 100x100 weights that returns a pair of tensors, so
+    # checkpointing it yields multiple backward inputs.
     def __init__(self, device: torch.device):
+        # [FUNCTION DOC] HELPER: Creates random parameters w1 and w2 on the given device.
         super().__init__()
         self.w1 = nn.Parameter(torch.randn((100, 100), device=device))
         self.w2 = nn.Parameter(torch.randn((100, 100), device=device))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Computes matmul with w1, ReLU, matmul with w2, then returns
+        # the elementwise sine and cosine of the result as a two-tensor tuple.
         z = x @ self.w1
         z = nn.functional.relu(z)
         z = z @ self.w2
@@ -80,11 +113,16 @@ class MultiOutputModel(nn.Module):
 
 
 class MultiInputModel(nn.Module):
+    # [CLASS DOC] HELPER: Model that takes a two-tensor tuple (the output of
+    # MultiOutputModel) and reduces it to a single tensor using one 100x100 weight w.
     def __init__(self, device: torch.device):
+        # [FUNCTION DOC] HELPER: Creates the random parameter w on the given device.
         super().__init__()
         self.w = nn.Parameter(torch.randn((100, 100), device=device))
 
     def forward(self, xs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Takes a tuple of exactly two tensors, adds them, multiplies
+        # by w and applies ReLU. Raises AssertionError if the tuple length is not 2.
         if len(xs) != 2:
             raise AssertionError(f"Expects 2 args but got {len(xs)}")
         x, y = xs
@@ -94,7 +132,13 @@ class MultiInputModel(nn.Module):
 
 
 class TestCheckpoint(TestCase):
+    # [CLASS DOC] Tests for the composable checkpoint API: gradient equality versus
+    # non-checkpointed models, memory savings on accelerators, RNG handling, multi-output
+    # modules, state cleanup after errors, and the supported keyword arguments.
     def _get_graph_size(self, out: torch.Tensor) -> int:
+        # [FUNCTION DOC] HELPER: Counts autograd graph nodes reachable from the output's
+        # grad_fn by traversing next_functions (nodes reached via several paths are counted
+        # once per path). Not used by the tests in this file.
         q = deque([out.grad_fn])
         num_functions = 0
         while len(q):
@@ -111,6 +155,11 @@ class TestCheckpoint(TestCase):
         net: nn.Module,
         x: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Runs the net twice on clones of x requiring grad: once
+        # plain, and once on a deep copy with its seq submodule wrapped by composable
+        # checkpoint, measuring memory retained by each forward. Asserts all parameter
+        # gradients match; on cuda/xpu also asserts the checkpointed forward retains less
+        # memory. Mutates the copy by applying checkpoint to it.
         x1 = x.clone()
         x2 = x.clone()
         x1.requires_grad = True
@@ -137,17 +186,23 @@ class TestCheckpoint(TestCase):
             self.assertEqual(p1.grad, p2.grad)
 
     def test_tensor_only_cpu(self):
+        # [FUNCTION DOC] Runs the tensor-only checkpoint comparison on CPU with a ToyModel.
         x = torch.randn(20, 100)
         net = ToyModel()
         self._test_tensor_only(net, x)
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "no cuda/xpu")
     def test_tensor_only_gpu(self):
+        # [FUNCTION DOC] Same comparison as the CPU test but on the first accelerator;
+        # skipped when neither CUDA nor XPU is available. Also checks memory savings.
         x = torch.randn(20, 100, device=f"{device_type}:0")
         net = ToyModel().to(f"{device_type}:0")
         self._test_tensor_only(net, x)
 
     def test_random_cpu(self):
+        # [FUNCTION DOC] Verifies checkpointing a random-consuming module reproduces the
+        # same gradients: runs a plain copy, resets the CPU RNG state to the saved value,
+        # then runs the checkpointed copy and compares parameter gradients.
         x1 = torch.randn(20, 100, requires_grad=True)
         x2 = x1.clone()
 
@@ -163,6 +218,9 @@ class TestCheckpoint(TestCase):
             self.assertEqual(p1.grad, p2.grad)
 
     def test_multi_args(self):
+        # [FUNCTION DOC] Checkpoints the first and third modules of a four-module
+        # sequential (multi-output then multi-input, twice) and checks the parameter
+        # gradients equal those of the unchecked copy.
         """
         Tests checkpoint for modules with multiple output args and hence
         multiple backward function input args.
@@ -185,14 +243,24 @@ class TestCheckpoint(TestCase):
             self.assertEqual(p1.grad, p2.grad)
 
     def test_clears_state_on_error_in_forward(self):
+        # [FUNCTION DOC] Checks the checkpoint state's internal generator is reset to None
+        # when the wrapped module raises, both during recomputation in backward and during
+        # the initial forward.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear wrapper that raises RuntimeError "foo" either on
+            # its second call (recomputation) or on its first call, depending on a flag.
             def __init__(self, raise_in_recomp):
+                # [FUNCTION DOC] HELPER: Stores the flag, a forward call counter, and a
+                # 2x2 linear layer.
                 super().__init__()
                 self.fwd_count = 0
                 self.raise_in_recomp = raise_in_recomp
                 self.a = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: If raising in recomputation, the first call
+                # succeeds (counter incremented) and the second raises RuntimeError. If not,
+                # the first call raises immediately. Otherwise applies the linear layer.
                 if self.raise_in_recomp and self.fwd_count == 1:
                     raise RuntimeError("foo")
                 else:
@@ -224,8 +292,18 @@ class TestCheckpoint(TestCase):
         self.assertEqual(None, checkpoint.state(m)._ac_generator)
 
     def test_checkpoint_kwargs(self):
+        # [FUNCTION DOC] Exercises checkpoint keyword arguments: use_reentrant=True raises
+        # NotImplementedError, an unknown keyword raises ValueError, custom context_fn
+        # context managers wrap forward and/or recomputation, determinism_check "none"
+        # versus "default" (CheckpointError on mismatch), and preserve_rng_state on/off
+        # affecting whether gradients match a non-checkpointed copy.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear wrapper with a call counter that can raise on the
+            # first call ("foo") and second call ("bar"), or mutate its input in place on
+            # the second call so recomputation differs from the original forward.
             def __init__(self, raise_exp: bool, change_shape_in_recomp: bool):
+                # [FUNCTION DOC] HELPER: Stores the two behavior flags, a call counter and
+                # a 2x2 linear layer.
                 super().__init__()
                 self.fwd_count = 0
                 self.raise_exp = raise_exp
@@ -233,6 +311,10 @@ class TestCheckpoint(TestCase):
                 self.a = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError "foo" on call 0 and "bar" on
+                # call 1 when raise_exp is set; on call 1 optionally applies in-place ReLU
+                # to the input. Then adds random noise, applies the linear layer,
+                # increments the counter and returns the result.
                 if self.raise_exp and self.fwd_count == 0:
                     raise RuntimeError("foo")
                 if self.raise_exp and self.fwd_count == 1:
@@ -264,6 +346,9 @@ class TestCheckpoint(TestCase):
 
         @contextmanager
         def fwd_ctx(mod: MyModel):
+            # [FUNCTION DOC] HELPER: Context manager for the original forward: disables the
+            # module's raise_exp flag inside, and on exit sets handled_fwd_exp and restores
+            # raise_exp to True.
             try:
                 mod.raise_exp = False
                 yield
@@ -274,6 +359,9 @@ class TestCheckpoint(TestCase):
 
         @contextmanager
         def recomp_ctx(mod: MyModel):
+            # [FUNCTION DOC] HELPER: Context manager for recomputation: disables the
+            # module's raise_exp flag inside, and on exit sets handled_recomp_exp and
+            # restores raise_exp to True.
             try:
                 mod.raise_exp = False
                 yield
