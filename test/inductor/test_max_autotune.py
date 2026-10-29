@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor max-autotune GEMM/convolution autotuning on GPU (and some CPU).
+# Covers Triton mm/addmm/baddbmm/bmm templates, persistent and TMA templates, decompose-K, choice
+# caching, subprocess/pipelined autotuning, epilogue/prologue fusion, benchmark request classes
+# and template config heuristics. Import-time side effects: when Triton on CUDA is available the
+# CUDA allocator is configured to disable expandable segments; module-level setup/teardown hooks
+# switch the float32 matmul precision for the whole module (highest on ROCm, high elsewhere) and
+# restore it afterwards. Also defines shared helpers and test classes.
 import contextlib
 import functools
 import inspect
@@ -125,6 +132,9 @@ _PRIOR_FP32_MATMUL_PRECISION: str | None = None
 
 
 def setUpModule():
+# [FUNCTION DOC] HELPER: unittest module-level fixture. Saves the current float32 matmul precision
+# in a module global, then sets it to highest on ROCm builds (TF32 accuracy issues) or high on
+# other builds, so generated Triton kernels are compared against a suitable reference.
     global _PRIOR_FP32_MATMUL_PRECISION
     _PRIOR_FP32_MATMUL_PRECISION = torch.get_float32_matmul_precision()
     if torch.version.hip:
@@ -137,6 +147,8 @@ def setUpModule():
 
 
 def tearDownModule():
+# [FUNCTION DOC] HELPER: unittest module-level fixture. If a precision was saved by setUpModule,
+# restores that float32 matmul precision and clears the saved global; otherwise does nothing.
     global _PRIOR_FP32_MATMUL_PRECISION
     if _PRIOR_FP32_MATMUL_PRECISION is not None:
         torch.set_float32_matmul_precision(_PRIOR_FP32_MATMUL_PRECISION)
@@ -150,6 +162,10 @@ _DECOMPOSE_K_PATCH_ROCM = (
 
 
 def benchmark_choice(choice, args, out, expected_out, timings):
+# [FUNCTION DOC] HELPER: benchmarks one autotune choice into a preallocated output tensor. Runs
+# the choice benchmark with the given args and out, optionally checks the output against
+# expected_out with assert_close (raises AssertionError on mismatch), and copies the returned
+# timing values into the timings tensor in place. Used as a subprocess/worker benchmark function.
     result = choice.benchmark(*args, out=out)
     if expected_out is not None:
         torch.testing.assert_close(out, expected_out)
@@ -158,7 +174,11 @@ def benchmark_choice(choice, args, out, expected_out, timings):
 
 
 class FailChoiceCaller(ChoiceCaller):
+    # [CLASS DOC] HELPER: test double for a choice caller whose benchmark always fails. Subclasses
+    # ChoiceCaller and adds no state; used to exercise error handling during autotuning.
     def benchmark(self, *args, out):
+        # [FUNCTION DOC] HELPER: always raises RuntimeError, ignoring its arguments, to simulate a
+        # benchmark failure for this choice.
         raise RuntimeError("This choice caller will always throw")
 
 
@@ -168,7 +188,15 @@ class FailChoiceCaller(ChoiceCaller):
 @config.patch(enable_caching_generated_triton_templates=True)
 @instantiate_parametrized_tests
 class TestMaxAutotune(TestCase):
+    # [CLASS DOC] Main max-autotune test suite. Patched so that the Triton template test cache is
+    # enabled and generated Triton template caching is on; parametrized tests are expanded by the
+    # class decorator. Tests compile small mm/addmm/baddbmm/conv/cat programs under max-autotune
+    # and check numerics, generated code (via FileCheck) or autotuning behavior and counters.
     def _make_matrices(self, M, K, N, *batch_dims, dtype, device, requires_grad):
+        # [FUNCTION DOC] HELPER: builds a pair of random matrices a (M by K) and b (K by N), each
+        # with optional leading batch dims, using the scaled-reduction-dim generator so that sums
+        # over K stay well scaled. dtype, device and requires_grad are keyword-only. Returns the
+        # tuple (a, b).
         make_matrix = functools.partial(
             random_matrix_with_scaled_reduction_dim,
             dtype=dtype,
@@ -182,12 +210,18 @@ class TestMaxAutotune(TestCase):
     @parametrize("dynamic", (False, True))
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_max_autotune_mm_plus_mm_zero_size_input(self, dynamic, search_space):
+        # [FUNCTION DOC] Regression test: compiling a mm_plus_mm function with zero-row
+        # inputs under max autotune must not crash. Parametrized over dynamic shapes and
+        # the DEFAULT/EXHAUSTIVE GEMM search spaces; only checks that compilation and
+        # execution complete.
         """
         Make sure autotuning mm_plus_mm with zero-size input works without crashes.
         """
         m, n, k = 0, 1536, 64
 
         def mm_plus_mm(a, b, c, d):
+            # [FUNCTION DOC] HELPER: the function under test, returns the sum of two
+            # matrix products.
             return a @ b + c @ d
 
         a = torch.randn(m, k).to(GPU_TYPE)
@@ -201,6 +235,10 @@ class TestMaxAutotune(TestCase):
             torch.compile(mm_plus_mm, dynamic=dynamic)(a, b, c, d)
 
     def test_max_autotune_includes_max_autotune_pointwise_configs(self):
+        # [FUNCTION DOC] Checks, using fake CUDA device properties and no real GPU, that the
+        # pointwise config generator with max_autotune set returns as many configs as with
+        # max_autotune_pointwise set, for 1D, 2D and 3D size hints. Fails with a message if the
+        # counts differ.
         """
         Verify that `max_autotune` includes all pointwise configs from
         `max_autotune_pointwise` for 1D, 2D, and 3D pointwise kernels.
@@ -266,7 +304,15 @@ class TestMaxAutotune(TestCase):
         dynamic: bool,
         tma_store: bool,
     ):
+        # [FUNCTION DOC] Compiles a mm (inputs repeated 8x per dim for 16-byte TMA alignment,
+        # optionally transposed) with max autotune restricted to the persistent TMA choice, with
+        # and without TMA store and dynamic shapes. Checks numerics against eager and uses
+        # FileCheck to confirm the generated kernel creates a TMA descriptor and uses the matching
+        # load/store API (stable or experimental Triton TMA API). Skipped without device TMA
+        # support or on datacenter Blackwell.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: repeats both inputs 8 times along each dim, optionally
+            # transposes them per the enclosing test parameters, and returns their matrix product.
             # TMA requires 16-byte alignment: here we repeat the dims
             # by the factor of 8, as float16 is 2-byte. All dims are
             # repeated due to the possible transpositions below.
@@ -329,6 +375,10 @@ class TestMaxAutotune(TestCase):
         torch.testing.assert_close(c_actual, c_expected, atol=1e-2, rtol=1e-2)
 
     def test_use_triton_tma_template_rejects_descriptor_shapes_exceeding_int32(self):
+        # [FUNCTION DOC] Uses mocked matrices and output layout (no real tensors) to check that
+        # the TMA template eligibility helper returns false when a descriptor dimension exceeds
+        # the int32 max, and true when the dimensions are exactly at the int32 max. TMA support is
+        # mocked as available.
         from torch._inductor.utils import use_triton_tma_template
 
         int32_max = torch.iinfo(torch.int32).max
@@ -359,6 +409,11 @@ class TestMaxAutotune(TestCase):
             )
 
     def test_descriptor_shape_fits_in_int32_uses_expected_guarding(self):
+        # [FUNCTION DOC] Checks guarding behavior of the int32 descriptor shape check on symbolic
+        # sizes under a graph lowering context. With guards disabled it must consult the static-
+        # truth query only, called once with the conjunction of bounds; with guards enabled it
+        # must consult the guard-or-false query only. Both are mocked to return true; call counts
+        # are asserted.
         from torch._inductor.utils import _descriptor_shape_fits_in_int32
 
         gm = make_fx(lambda: torch.zeros(2, 3))()
@@ -413,7 +468,13 @@ class TestMaxAutotune(TestCase):
         b_transposed: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] ROCm-only test: compiles a mm with the non-TMA persistent template
+        # forced via the choice name regex, across transposition and dynamic-shape parameters.
+        # Checks results against eager and that the generated kernel uses the NUM_SMS persistent-
+        # grid parameter.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: repeats inputs 8 times per dim, optionally transposes them
+            # per the enclosing test parameters, and returns their matrix product.
             a = a.repeat(8, 8)
             b = b.repeat(8, 8)
 
@@ -462,7 +523,12 @@ class TestMaxAutotune(TestCase):
         b_transposed: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] ROCm-only test: like the persistent mm test but for addmm with a 1D bias
+        # that is repeated 8x. Forces the non-TMA persistent choice, compares with eager, and
+        # checks the generated fused addmm kernel mentions the NUM_SMS persistent-grid parameter.
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: repeats bias and matrices 8x, optionally transposes the
+            # matrices per the enclosing test parameters, and returns the addmm result.
             x = x.repeat(8)
             a = a.repeat(8, 8)
             b = b.repeat(8, 8)
@@ -509,6 +575,12 @@ class TestMaxAutotune(TestCase):
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
     def test_max_autotune_persistent_tma_workspace_reuse(self):
+        # [FUNCTION DOC] Regression test for workspace naming in the persistent TMA template.
+        # Patches the TMA workspace-arg factory to hand every kernel the same WorkspaceArg object,
+        # restricts configs to a single TMA config (non-TMA mm configs emptied), and compiles
+        # three same-shape matmuls so template kernel rendering must give each kernel a unique
+        # workspace name. The original heuristic config lists are restored in a finally block.
+        # Passes if compilation succeeds.
         """
         Test that make_kernel_render creates unique workspace names.
 
@@ -521,6 +593,8 @@ class TestMaxAutotune(TestCase):
         from torch._inductor.codegen.common import WorkspaceZeroMode
 
         def three_same_shape_matmuls(a, b, c, d, e, f):
+            # [FUNCTION DOC] HELPER: computes three independent matrix products and returns them
+            # as a tuple.
             x = torch.mm(a, b)
             y = torch.mm(c, d)
             z = torch.mm(e, f)
@@ -546,6 +620,8 @@ class TestMaxAutotune(TestCase):
         )
 
         def mock_get_tma_workspace_arg(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: ignores all arguments and returns the one shared
+            # WorkspaceArg.
             return shared_workspace_arg
 
         try:
@@ -584,6 +660,11 @@ class TestMaxAutotune(TestCase):
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
     def test_workspace_size_bytes_accounts_for_dtype(self):
+        # [FUNCTION DOC] Checks that the workspace size passed to TritonBenchmarkRequest is in
+        # bytes (element count times dtype size). A fake float32 workspace arg is injected, the
+        # benchmark request constructor is wrapped to record its workspace_size keyword, a single
+        # TMA config is forced, and all non-None recorded sizes must equal the expected byte count
+        # (and at least one must exist). Heuristic config lists are restored in a finally block.
         """workspace_size passed to benchmark request must be in bytes, not elements."""
         import sympy
 
@@ -606,6 +687,9 @@ class TestMaxAutotune(TestCase):
         orig_init = TritonBenchmarkRequest.__init__
 
         def spy_init(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: wrapper for the benchmark request constructor that
+            # records the workspace_size keyword into the enclosing list and then calls the
+            # original constructor.
             captured_sizes.append(kwargs.get("workspace_size"))
             orig_init(self, *args, **kwargs)
 
@@ -666,7 +750,14 @@ class TestMaxAutotune(TestCase):
         b_transposed: bool,
         dynamic: bool,
     ):
+        # [FUNCTION DOC] Compiles a mm whose inputs are padded, non-contiguous (row stride rounded
+        # up to a multiple of 16) tensors, with the persistent TMA choice forced; the original-
+        # size inputs are repeated 8x in the compiled function. Checks numerics against eager and
+        # that the kernel uses a TMA descriptor (stable or experimental API string). Note b_stride
+        # is chosen from a_transposed rather than b_transposed, which looks unintended.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: repeats both inputs 8 times per dim, optionally transposes
+            # them per the enclosing test parameters, and returns their product.
             # TMA requires 16-byte alignment: here we repeat the dims
             # by the factor of 8, as float16 is 2-byte. All dims are
             # repeated due to the possible transpositions below.
@@ -680,6 +771,7 @@ class TestMaxAutotune(TestCase):
             return torch.mm(a, b)
 
         def next_multiple_16(a: int) -> int:
+            # [FUNCTION DOC] HELPER: rounds an integer up to the next multiple of 16.
             return ((a + 15) // 16) * 16
 
         M, N, K = 21, 31, 11
@@ -722,7 +814,12 @@ class TestMaxAutotune(TestCase):
     @skipIfXpu(msg="Covered by XPU TMA")
     @parametrize("dynamic", (False, True))
     def test_max_autotune_regular_mm_persistent_tma_illegal_alignment(self, dynamic):
+        # [FUNCTION DOC] Checks that when inputs have inner dims not 16-byte aligned, the
+        # persistent TMA template is skipped; with only that choice allowed, compilation must
+        # fail with a BackendCompilerFailed whose message mentions NoValidChoicesError.
+        # Parametrized on dynamic.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: plain matrix product of its two inputs.
             return torch.mm(a, b)
 
         M, N, K = 21, 31, 11
@@ -754,7 +851,13 @@ class TestMaxAutotune(TestCase):
     def test_max_autotune_regular_mm_persistent_tma_illegal_output_alignment(
         self, dynamic
     ):
+        # [FUNCTION DOC] Checks that the persistent TMA template with TMA store is rejected when
+        # the output tensor has strides that cannot satisfy TMA alignment; compilation with only
+        # that choice must raise BackendCompilerFailed mentioning NoValidChoicesError.
+        # Parametrized on dynamic.
         def mm(a, b, out):
+            # [FUNCTION DOC] HELPER: writes the matrix product into the supplied out tensor and
+            # returns it.
             torch.mm(a, b, out=out)
             return out
 
@@ -788,7 +891,12 @@ class TestMaxAutotune(TestCase):
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
     def test_max_autotune_regular_mm_tma_dynamic_outer_dim(self):
+        # [FUNCTION DOC] Compiles a mm whose first input has a dynamic outer dim under a
+        # forced TMA choice (Blackwell warp-specialized name on datacenter Blackwell, else the
+        # Hopper persistent TMA name) and compares the result with eager. Only checks numerics
+        # and no crash.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: plain matrix product of its two inputs.
             return torch.mm(a, b)
 
         M, N, K = 21, 31, 11
@@ -830,12 +938,18 @@ class TestMaxAutotune(TestCase):
         "Hopper-style mm_persistent_tma template is shadowed by the Blackwell warp-specialized TMA template on data-center Blackwell.",
     )
     def test_persistent_tma_epilogue_fusion_store_cache(self):
+        # [FUNCTION DOC] Regression test: with TMA store and epilogue fusion enabled, a mm
+        # followed by relu must compile (failing autotune kernels are disallowed) and match eager.
+        # Guards against a store cache not being updated, which would drop a buffer pointer from
+        # the kernel signature.
         # Regression test: when epilogue fusion runs with TMA store, the
         # store_cache must be updated so that a subsequent epilogue load from
         # the same buffer hits the cache. Otherwise remove_kernel_local_buffers
         # strips the buffer pointer from the kernel signature, causing a
         # NameError at Triton compile time.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: repeats both inputs 8x per dim, multiplies them, returns relu
+            # of result.
             a = a.repeat(8, 8)
             b = b.repeat(8, 8)
             mm = torch.mm(a, b)
@@ -863,11 +977,15 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("dynamic", (False, True))
     def test_max_autotune_regular_mm_zero_size_input(self, dynamic: bool):
+        # [FUNCTION DOC] Regression test: compiling a sin-then-matmul function with a zero-row
+        # input under max autotune must not crash; parametrized on dynamic shapes.
         """
         Make sure autotuning mm with zero-size input works without crashes.
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: applies sin to the first input and returns its product with
+            # the second.
             a = torch.sin(a)
             return a @ b
 
@@ -879,12 +997,19 @@ class TestMaxAutotune(TestCase):
 
     @fresh_cache()
     def test_addmm_1d_bias_no_reinterpret_tensor(self):
+        # [FUNCTION DOC] Checks that the ATen addmm choice receives the 1D bias directly rather
+        # than a reinterpreted view, so cuBLASLt can use its bias epilogue. Benchmarking is mocked
+        # to favor ATen, the extern benchmark request constructor is wrapped to record the first
+        # input shape, then the compiled result is compared with eager, the generated code must
+        # not wrap the bias in a reinterpret call and the recorded bias shape must be one-
+        # dimensional of size 100.
         """
         Verify that aten addmm with 1D bias does not wrap bias in reinterpret_tensor.
         This ensures cublasLt uses its optimized bias epilogue (requires dim==1).
         """
 
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(x, a, b)
 
         x = torch.randn(100).to(GPU_TYPE)
@@ -895,6 +1020,9 @@ class TestMaxAutotune(TestCase):
         original_bmreq_init = ExternKernelBenchmarkRequest.__init__
 
         def tracking_bmreq_init(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: wrapper for the extern benchmark request constructor; calls
+            # the original and records the sizes of the first input tensor meta into the
+            # enclosing variable.
             nonlocal extern_bias_shape
             original_bmreq_init(self, *args, **kwargs)
             extern_bias_shape = tuple(self.input_tensor_meta[0].sizes)
@@ -951,7 +1079,14 @@ class TestMaxAutotune(TestCase):
         dynamic: bool,
         tma_store: bool,
     ):
+        # [FUNCTION DOC] Compiles an addmm (bias repeated 8x, matrices repeated and optionally
+        # transposed) with the persistent TMA choice forced, with and without TMA store and
+        # dynamic shapes. Checks numerics and uses FileCheck to confirm the fused addmm kernel
+        # creates a TMA descriptor and uses the expected load/store API for the stable or
+        # experimental TMA API.
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: repeats bias and matrices 8x, optionally transposes the
+            # matrices per the enclosing test parameters, and returns the addmm result.
             # TMA requires 16-byte alignment: here we repeat the dims
             # by the factor of 8, as float16 is 2-byte. All dims are
             # repeated due to the possible transpositions below.
@@ -1023,7 +1158,11 @@ class TestMaxAutotune(TestCase):
     @skipIfXpu(msg="Covered by XPU TMA")
     @parametrize("dynamic", (False, True))
     def test_max_autotune_addmm_persistent_tma_illegal_alignment(self, dynamic):
+        # [FUNCTION DOC] Checks that an addmm with non-16-byte-aligned inner dims cannot use the
+        # persistent TMA template: compilation with only that choice must raise
+        # BackendCompilerFailed mentioning NoValidChoicesError. Parametrized on dynamic.
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(x, a, b)
 
         M, N, K = 21, 31, 11
@@ -1053,7 +1192,11 @@ class TestMaxAutotune(TestCase):
         not has_triton_tma_device(), "Need device-side TMA support in Triton"
     )
     def test_max_autotune_addmm_tma_dynamic_outer_dim(self):
+        # [FUNCTION DOC] Compiles an addmm whose matrix input has a dynamic outer dim under a
+        # forced TMA choice (Blackwell warp-specialized on datacenter Blackwell, else Hopper
+        # persistent TMA) and compares with eager; only checks numerics and no crash.
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(x, a, b)
 
         M, N, K = 21, 31, 11
@@ -1102,7 +1245,13 @@ class TestMaxAutotune(TestCase):
     @parametrize("carveout", (None, 0, 27))
     @parametrize("op", ("mm", "scaled_mm"))
     def test_honor_sm_carveout_with_triton_tma(self, carveout, op: str):
+        # [FUNCTION DOC] Checks that the SM carveout setting is honored by persistent TMA kernels.
+        # Sets the experimental carveout (none, 0 or 27), compiles mm or scaled mm (float8 inputs)
+        # with the TMA choice, profiles one run, and requires exactly one Triton template kernel
+        # event whose grid size equals the device multiprocessor count minus the carveout (zero
+        # when none). Side effect: leaves the global SM carveout set after the test.
         def mm_func(a, b):
+            # [FUNCTION DOC] HELPER: plain matrix product of the two inputs.
             return torch.mm(a, b)
 
         def scaled_mm(
@@ -1111,6 +1260,8 @@ class TestMaxAutotune(TestCase):
             scale_a,
             scale_b,
         ):
+            # [FUNCTION DOC] HELPER: scaled matrix multiplication of the first two inputs using
+            # the given scale tensors, producing a bfloat16 result.
             return torch._scaled_mm(a, b, scale_a, scale_b, out_dtype=torch.bfloat16)
 
         # Create large matrices to ensure we use all possible sms
@@ -1197,11 +1348,14 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("dynamic", (False, True))
     def test_max_autotune_addmm_zero_size_input(self, dynamic):
+        # [FUNCTION DOC] Regression test: compiling an addmm with a zero-row matrix input under
+        # max autotune must not crash; parametrized on dynamic shapes.
         """
         Make sure autotuning addmm with zero-size input works without crashes.
         """
 
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(x, a, b)
 
         x = torch.randn(100).to(GPU_TYPE)
@@ -1212,12 +1366,17 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("dynamic", (False, True))
     def test_max_autotune_addmm_unrealized_view_bias(self, dynamic):
+        # [FUNCTION DOC] Regression test: compiling an addmm whose bias is an unrealized
+        # permuted view of a pointwise result under max autotune must not crash; parametrized on
+        # dynamic shapes.
         """
         Make sure autotuning addmm with an unrealized view-class bias
         (here a PermuteView over a fused Pointwise) works without crashes.
         """
 
         def fn(x, a, b):
+            # [FUNCTION DOC] HELPER: doubles the first input, transposes it and uses it as bias
+            # for addmm.
             return torch.addmm((x * 2.0).transpose(0, 1), a, b)
 
         x = torch.randn(8, 8).to(GPU_TYPE)
@@ -1228,6 +1387,10 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_autotune_conv1x1(self, search_space):
+        # [FUNCTION DOC] Compiles a 1x1 convolution on a channels-last input with Triton as the
+        # only GEMM and conv backend, for both search spaces, under no_grad. Checks the generated
+        # code has no extern convolution call and that the output matches eager within a loose
+        # absolute tolerance.
         # Assuming input has 3 channels and we want to produce 16 channels as output
         conv1x1 = (
             torch.nn.Conv2d(in_channels=3, out_channels=16, kernel_size=1)
@@ -1254,6 +1417,7 @@ class TestMaxAutotune(TestCase):
 
             @torch.compile()
             def foo(mod, x):
+                # [FUNCTION DOC] HELPER: applies the given module to the input.
                 return mod(x)
 
             with torch.no_grad():
@@ -1265,6 +1429,10 @@ class TestMaxAutotune(TestCase):
     @fresh_cache()
     @config.patch(max_autotune=True, max_fusion_size=2)
     def test_jit_fusion_matches_aot_fusion(self):
+        # [FUNCTION DOC] Compiles via AOT export a function mixing pointwise ops, a scalar item
+        # and a matmul, with max autotune and a fusion size limit of two, to check that the AOT
+        # compile path fuses the same nodes as the JIT path. Only verifies that compilation does
+        # not raise.
         # In this example, AOTInductor's JIT-compile will fuse(buf1, buf2) due
         # to proximity, we want to make sure AOT-compile pass does the same.
         # AOT could do fuse(buf2, buf4) instead if buf3 was pushed to the end
@@ -1272,6 +1440,8 @@ class TestMaxAutotune(TestCase):
         # better proximity score than fuse(buf1, buf2). This scenario is possible
         # since finalizing MultiTemplateBuffers needs to replace buffers.
         def fn(x, number):
+            # [FUNCTION DOC] HELPER: returns several pointwise results, an item scalar and a
+            # matmul result.
             buf0 = x + x
             buf1 = number.item()
             buf2 = x * x
@@ -1286,7 +1456,11 @@ class TestMaxAutotune(TestCase):
         torch._export.aot_compile(fn, args=inputs)
 
     def test_cat_addmm(self):
+        # [FUNCTION DOC] Compiles a function concatenating two addmm results along dim 1 with the
+        # Triton-only GEMM backend and compares against eager within loose tolerance.
         def fn(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
+            # [FUNCTION DOC] HELPER: concatenates addmm of the three inputs in two
+            # argument orders.
             return torch.cat(
                 [
                     torch.addmm(a, b, c),
@@ -1317,12 +1491,18 @@ class TestMaxAutotune(TestCase):
     )
     @parametrize("device", ("cpu", GPU_TYPE))
     def test_matmul_dropout(self, device):
+        # [FUNCTION DOC] Compiles a forward and backward pass of matmul followed by dropout on cpu
+        # and GPU with fallback random enabled, resets the RNG state before each run, and compares
+        # the input gradient with eager within loose tolerance.
         def fwd(a, b):
+            # [FUNCTION DOC] HELPER: matrix product followed by dropout with probability 0.1.
             x = a @ b
             x = torch.nn.functional.dropout(x, 0.1)
             return x
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: runs forward, sums, backpropagates and returns the gradient
+            # of a.
             x = fwd(a, b).sum()
             x.backward()
             return a.grad
@@ -1349,10 +1529,14 @@ class TestMaxAutotune(TestCase):
         "Need at least 2 devices for this test",
     )
     def test_autotune_device_guard(self):
+        # [FUNCTION DOC] Needs at least two devices. Compiles a matmul on tensors that live on the
+        # second device while the current device is the default, in a fresh cache, and compares
+        # with eager.
         x = torch.randn(1024, 1024, device=f"{GPU_TYPE}:1")
         y = torch.randn(1024, 1024, device=f"{GPU_TYPE}:1")
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         with fresh_cache():
@@ -1365,10 +1549,15 @@ class TestMaxAutotune(TestCase):
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     @parametrize("kernel_size", (1, 3))
     def test_empty_conv_input(self, search_space, kernel_size):
+        # [FUNCTION DOC] Compiles a convolution with a zero-sized batch under max autotune
+        # for both search spaces and kernel sizes 1 and 3, and compares against eager
+        # within tolerance.
         x = torch.randn(0, 256, 14, 14, device=GPU_TYPE)
         weight = torch.randn(256, 256, kernel_size, kernel_size, device=GPU_TYPE)
 
         def f(x, weight):
+            # [FUNCTION DOC] HELPER: generic convolution with unit stride/dilation, no padding
+            # or bias.
             return torch.convolution(
                 x,
                 weight,
@@ -1390,8 +1579,15 @@ class TestMaxAutotune(TestCase):
     @config.patch(max_autotune_gemm_backends="TRITON")
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_baddmm(self, search_space):
+        # [FUNCTION DOC] Compiles a module computing baddbmm (float16 bias and weights) with
+        # the Triton-only GEMM backend in max-autotune mode, for both search spaces. Compares
+        # with eager and, unless native matmul is enabled, expects a fused Triton baddbmm
+        # template kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: tiny module holding a float16 weight parameter and a bias
+            # parameter and computing a batched add-matmul of the input with them.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the random float16 weight and bias parameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.randn(64, 64, 192, dtype=torch.float16)
@@ -1401,6 +1597,7 @@ class TestMaxAutotune(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the baddbmm of bias, input and weight.
                 return torch.ops.aten.baddbmm.default(self.bias, x, self.weight)
 
         x = torch.randn(
@@ -1418,6 +1615,9 @@ class TestMaxAutotune(TestCase):
 
     @config.patch(max_autotune=True)
     def test_conv1x1_with_free_symbols(self):
+        # [FUNCTION DOC] Checks that max autotune handles a 1x1 convolution whose input size
+        # depends on data-dependent (nonzero) sizes without raising due to free symbols.
+        # Runs twice.
         """
         Make sure there is no exception due to free symbols.
         """
@@ -1427,6 +1627,8 @@ class TestMaxAutotune(TestCase):
 
         @torch.compile
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: slices the input by nonzero counts of two other tensors and
+            # applies the enclosing convolution.
             h = y.nonzero().size(0)
             w = z.nonzero().size(0)
             x = x[:, :, :h, :w]
@@ -1442,7 +1644,13 @@ class TestMaxAutotune(TestCase):
             f(x, y, z)
 
     def _test_cat_max_autotune_impl(self, using_triton_mm):
+        # [FUNCTION DOC] HELPER: shared body for cat tests, with using_triton_mm telling whether
+        # the mm is a Triton kernel. Compiles three functions in max-autotune-no-cudagraphs mode
+        # and checks numerics; for the first two checks exact kernel launch counts (mm plus cos
+        # kernels; the second case with a multi-consumer mm gets one extra launch). The third only
+        # checks numerics.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: cos of y, matmul of x, concatenated along dim 0.
             y = torch.cos(y)
             x = torch.mm(x, x)
             return torch.cat([x, y])
@@ -1462,6 +1670,7 @@ class TestMaxAutotune(TestCase):
         ).run(code[0])
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: like the previous variant but also returns x plus one.
             y = torch.cos(y)
             x = torch.mm(x, x)
             out = torch.cat([x, y])
@@ -1479,6 +1688,8 @@ class TestMaxAutotune(TestCase):
         ).run(code[0])
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns two concatenations of the mm result and cos in
+            # both orders.
             y = torch.cos(y)
             x = torch.mm(x, x)
             return torch.cat([x, y]), torch.cat([y, x])
@@ -1490,9 +1701,18 @@ class TestMaxAutotune(TestCase):
     @config.patch({"test_configs.force_extern_kernel_in_multi_template": True})
     @config.patch("triton.native_matmul", False)
     def test_mutation_rename(self):
+        # [FUNCTION DOC] Checks that dependency normalization of a mutated buffer is the same
+        # before and after finalizing a multi-template buffer. Enables IR trace logging into a
+        # temporary debug directory, compiles a function that mutates a diagonal view then does mm
+        # and an in-place add (extern kernel forced in the multi-template), captures the pre-
+        # fusion and post-fusion IR logs and uses FileCheck to require an unmet dependency on buf1
+        # in each. Resets logging at the end.
         torch._logging.set_logs(ir_post_fusion=True)
 
         def f(x, y, z, other):
+            # [FUNCTION DOC] HELPER: multiplies x and y, copies other into the diagonal of the
+            # product, matmuls with z, then adds one in place to the diagonal of the result and
+            # returns that view.
             mul = x * y
             diag = torch.diagonal(mul)
             diag.copy_(other)
@@ -1541,6 +1761,8 @@ class TestMaxAutotune(TestCase):
 
     @config.patch({"test_configs.force_extern_kernel_in_multi_template": True})
     def test_cat_max_autotune_extern(self):
+        # [FUNCTION DOC] Runs the shared cat/max-autotune checks with an ATen extern kernel forced
+        # in the multi-template, so the mm is not a Triton kernel.
         self._test_cat_max_autotune_impl(using_triton_mm=False)
 
     @config.patch(
@@ -1550,18 +1772,30 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_cat_max_autotune_triton(self):
+        # [FUNCTION DOC] Runs the shared cat/max-autotune checks with the Triton-only GEMM backend
+        # and epilogue-fusion benchmarking disabled, so the mm is a Triton template kernel.
         self._test_cat_max_autotune_impl(using_triton_mm=True)
 
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_conv_cat(self, search_space):
+        # [FUNCTION DOC] Compiles a conv followed by concatenation of its output with output plus
+        # one under no_grad in max-autotune-no-cudagraphs mode, for both search spaces. Checks the
+        # output equals the module on the same input and, off ROCm, that a fused pointwise add/cat
+        # kernel exists.
         class ToyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: tiny module with one bias-free 3x3 convolution (3 to 64
+            # channels) whose forward concatenates the convolution output with that output plus
+            # one along dim 0.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the convolution layer.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     3, 64, kernel_size=3, stride=1, padding=1, bias=False
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies the convolution and returns the concatenation of
+                # the result with the result plus one.
                 x = self.conv(x)
                 return torch.cat((x, x + 1))
 
@@ -1580,6 +1814,8 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     def test_conv3d(self, search_space):
+        # [FUNCTION DOC] Compiles the functional 3D convolution on random CPU tensors with max
+        # autotune for both search spaces and compares with eager within small tolerances.
         fn = torch.nn.functional.conv3d
         image = torch.randn([1, 3, 8, 16, 32])
         filt = torch.randn([3, 3, 7, 7, 7])
@@ -1595,6 +1831,9 @@ class TestMaxAutotune(TestCase):
         max_autotune=True, max_autotune_conv_backends="", layout_optimization=False
     )
     def test_conv_backend(self):
+        # [FUNCTION DOC] With the conv backend list empty, layout optimization off and max
+        # autotune on, compiling a 1x1 convolution must fail with BackendCompilerFailed
+        # mentioning NoValidChoicesError.
         m = torch.nn.Sequential(
             torch.nn.Conv2d(3, 3, 1, 1),
         ).to(GPU_TYPE)
@@ -1606,6 +1845,9 @@ class TestMaxAutotune(TestCase):
         self.assertIn("NoValidChoicesError", str(context.exception))
 
     def test_non_contiguous_input_mm(self):
+        # [FUNCTION DOC] Regression test (issue 125437): compiling a matmul under max-autotune
+        # with a non-contiguous bfloat16 first input (column-major, large) must not crash and must
+        # match eager.
         """
         Make sure the triton template can work with non-contiguous inputs without crash.
         Check https://github.com/pytorch/pytorch/issues/125437 for more details.
@@ -1617,6 +1859,7 @@ class TestMaxAutotune(TestCase):
 
         @torch.compile(mode="max-autotune")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         ref = x @ y
@@ -1624,6 +1867,8 @@ class TestMaxAutotune(TestCase):
         torch.testing.assert_close(act, ref, atol=2e-2, rtol=1e-2)
 
     def test_non_contiguous_input_addmm(self):
+        # [FUNCTION DOC] Like the non-contiguous mm test but for addmm with a closed-over bias:
+        # compiles under max-autotune with a column-major first matrix and compares with eager.
         b = torch.randn((768), dtype=torch.bfloat16, device=GPU_TYPE)
         x = rand_strided(
             (50257, 2048), (1, 50304), dtype=torch.bfloat16, device=GPU_TYPE
@@ -1632,6 +1877,7 @@ class TestMaxAutotune(TestCase):
 
         @torch.compile(mode="max-autotune")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: addmm using the enclosing bias with the two inputs.
             return torch.addmm(b, x, y)
 
         ref = torch.addmm(b, x, y)
@@ -1639,6 +1885,9 @@ class TestMaxAutotune(TestCase):
         torch.testing.assert_close(act, ref, atol=2e-2, rtol=1e-2)
 
     def test_non_contiguous_input_bmm(self):
+        # [FUNCTION DOC] Like the non-contiguous mm test but for bmm with a broadcast batch
+        # of one: compiles under max-autotune with a non-contiguous first input and compares
+        # with eager.
         x = rand_strided(
             (1, 50257, 2048), (0, 1, 50304), dtype=torch.bfloat16, device=GPU_TYPE
         )
@@ -1648,6 +1897,7 @@ class TestMaxAutotune(TestCase):
 
         @torch.compile(mode="max-autotune")
         def f(x, y):
+            # [FUNCTION DOC] HELPER: batched matrix product of the two inputs.
             return torch.bmm(x, y)
 
         ref = torch.bmm(x, y)
@@ -1659,6 +1909,9 @@ class TestMaxAutotune(TestCase):
         "native matmul and Triton template both have accuracy fail (2.2%)",
     )
     def test_non_contiguous_input_mm_plus_mm(self):
+        # [FUNCTION DOC] Compiles a sum of two matmuls with non-contiguous first operands
+        # under max-autotune and compares with eager (loose tolerance). Skipped for native
+        # matmul codegen.
         x1 = rand_strided((50257, 2048), (1, 50304), device=GPU_TYPE)
         y1 = rand_strided((2048, 768), (768, 1), device=GPU_TYPE)
 
@@ -1667,6 +1920,7 @@ class TestMaxAutotune(TestCase):
 
         @torch.compile(mode="max-autotune")
         def f(x1, y1, x2, y2):
+            # [FUNCTION DOC] HELPER: returns the sum of two matrix products.
             return x1 @ y1 + x2 @ y2
 
         ref = x1 @ y1 + x2 @ y2
@@ -1681,6 +1935,8 @@ class TestMaxAutotune(TestCase):
         config.triton.native_matmul, "native matmul generates when size >=2"
     )
     def test_no_valid_choices(self):
+        # [FUNCTION DOC] With an empty GEMM backend list, compiling a small matmul must raise
+        # BackendCompilerFailed mentioning NoValidChoicesError. Skipped for native matmul.
         a = torch.zeros([2, 2], device=GPU_TYPE)
         b = torch.zeros([2, 2], device=GPU_TYPE)
         with self.assertRaises(BackendCompilerFailed) as context:
@@ -1696,9 +1952,15 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_inf_timing(self, multi_template):
+        # [FUNCTION DOC] Checks that when every candidate timing is infinite the compile fails
+        # with BackendCompilerFailed mentioning NoValidChoicesError. The selector lookup is
+        # patched to map each timing to infinity; parametrized on whether epilogue fusion
+        # benchmarking (multi-template) is enabled.
         lookup = AlgorithmSelectorCache.lookup
 
         def mock_lookup(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls the original selector lookup and returns a mapping from
+            # each choice to infinite time.
             timings = lookup(self, *args, **kwargs)
             return {choice: float("inf") for choice in timings}
 
@@ -1714,6 +1976,11 @@ class TestMaxAutotune(TestCase):
 
     @config.patch(force_shape_pad=True, max_autotune=True)
     def test_linear_and_cel(self):
+        # [FUNCTION DOC] Simulates a GPU that is not big (is_big_gpu patched to false) with shape
+        # padding forced and max autotune enabled, so the multi-template holds only extern
+        # kernels. Trains a linear layer plus cross-entropy step both eager and compiled and
+        # requires that loss and gradients agree within tolerance, raising AssertionError with
+        # both otherwise.
         """
         Similate a GPU without enough SMs. Make sure max-autotune still
         works even when the MultiTritonTemplate encapsulates just extern
@@ -1721,6 +1988,7 @@ class TestMaxAutotune(TestCase):
         """
 
         def mock_is_big_gpu(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: ignores its arguments and reports that the GPU is not big.
             return False
 
         B, T, C, V = 32, 1024, 768, 50257
@@ -1729,6 +1997,8 @@ class TestMaxAutotune(TestCase):
         ce = torch.nn.CrossEntropyLoss()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: clears gradients of input and linear parameters, computes
+            # cross-entropy of the linear layer output, runs backward and returns the loss.
             x.grad = None
             linear.weight.grad = None
             linear.bias.grad = None
@@ -1768,6 +2038,13 @@ class TestMaxAutotune(TestCase):
         shape_padding=False,
     )
     def test_max_autotune_decompose_k(self, sizes, dtype, dynamic):
+        # [FUNCTION DOC] Checks decompose-K matmul with large K (float16 or bfloat16, three size
+        # configs, static or dynamic). Reduced-precision reductions are disabled for the test
+        # and the original settings restored at the end. Static case requires a batched matmul
+        # extern kernel and a decompose_k Triton kernel whose name carries a valid split
+        # divisor, plus numeric match with eager; dynamic case requires neither. Repeated with
+        # relu epilogue and a transposed input. Note the restore of settings is skipped if an
+        # assertion fails earlier.
         # UT specific change to force testing decompose K feature on ROCm until
         # enabled by default, same strategy as #169948
         with config.patch(_DECOMPOSE_K_PATCH_ROCM):
@@ -1800,6 +2077,9 @@ class TestMaxAutotune(TestCase):
             divisors = {split for split in possible_splits if K % split == 0}
 
             def check_divisors(code):
+            # [FUNCTION DOC] HELPER: for each generated kernel source whose text mentions
+            # decompose_k, asserts that it contains one of the valid split divisors of K (each
+            # between 2 and the min of K over M and K over N) in its name.
                 for kernel in code:
                     if "decompose_k" in kernel:
                         divisor_found = False
@@ -1886,11 +2166,17 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_max_autotune_decompose_k_dynamic_input(self):
+        # [FUNCTION DOC] Decompose-K with a dynamic leading dim: stacks the input with itself then
+        # matmul and relu. The decompose-K choice helper is mocked to accept only default
+        # threshold multiples. Requires batched matmul extern kernel, decompose_k kernel and
+        # symbolic size expressions in the generated code, and numeric match with eager.
         # UT specific change to force testing decompose K feature on ROCm until
         # enabled by default, same strategy as #169948
         with config.patch(_DECOMPOSE_K_PATCH_ROCM):
 
             def f(a, b):
+            # [FUNCTION DOC] HELPER: stacks a twice along a new first dim, matmuls with b and
+            # applies relu.
                 a_in = torch.stack((a, a), dim=0)
                 return (a_in @ b).relu()
 
@@ -1939,11 +2225,17 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_max_autotune_decompose_k_dynamic_input_bwd(self):
+        # [FUNCTION DOC] Decompose-K in a forward plus backward pass with a dynamic leading dim.
+        # Compiles and runs once, then with the decompose-K choice mocked, resets dynamo and uses
+        # a fresh cache, so the backward is recompiled inside the mock. Checks the backward graph
+        # code (second entry) for batched matmul, decompose_k and symbolic size expressions.
         # UT specific change to force testing decompose K feature on ROCm until
         # enabled by default, same strategy as #169948
         with config.patch(_DECOMPOSE_K_PATCH_ROCM):
 
             def f(a, b):
+            # [FUNCTION DOC] HELPER: concatenates 256 copies of a along dim 0, matmuls with b,
+            # relu and sums.
                 # 256 * s0
                 a_in = torch.cat([a for _ in range(256)], dim=0)
                 return (a_in @ b).relu().sum()
@@ -1971,6 +2263,8 @@ class TestMaxAutotune(TestCase):
                 )
 
                 def fwd_bwd():
+                # [FUNCTION DOC] HELPER: runs the compiled function, calls backward on the output
+                # and returns it.
                     out = compiled_func(a, b)
                     out.backward()
                     return out
@@ -2005,11 +2299,18 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_max_autotune_decompose_k_output_stride(self):
+        # [FUNCTION DOC] Checks that decompose-K honors the output stride of the original graph.
+        # Forces only the decompose-K choice via template heuristic override and a mocked
+        # eligibility check, compiles a matmul of a transposed input with a column-sliced input,
+        # then requires the output stride to be that of the slice width, and the generated code
+        # allocates the matching shape.
         # UT specific change to force testing decompose K feature on ROCm until
         # enabled by default, same strategy as #169948
         with config.patch(_DECOMPOSE_K_PATCH_ROCM):
 
             def f(a, b):
+            # [FUNCTION DOC] HELPER: transposes the first input and returns its matrix product
+            # with b.
                 a = a.transpose(0, 1)
                 return a @ b
 
@@ -2051,6 +2352,9 @@ class TestMaxAutotune(TestCase):
         max_autotune=True,
     )
     def test_max_autotune_contiguous_transform_mm(self, sizes, dtype):
+        # [FUNCTION DOC] ROCm-only: with the contiguous-use check mocked true, compiles a matmul
+        # of a with the transpose of b and checks the result against a float64 baseline cast to
+        # the test dtype, and that the generated code mentions the contiguous mm choice.
         """
         Test the contiguous subgraph transform with A * transpose(B) pattern.
         This transform makes the second matrix contiguous before the matmul.
@@ -2058,6 +2362,7 @@ class TestMaxAutotune(TestCase):
         M, N, K = sizes
 
         def mm_transpose(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of a with the transpose of b.
             return a @ b.transpose(0, 1)
 
         a = torch.randn(M, K, dtype=dtype, device=GPU_TYPE, requires_grad=True)
@@ -2094,12 +2399,17 @@ class TestMaxAutotune(TestCase):
         max_autotune=True,
     )
     def test_max_autotune_contiguous_transform_addmm(self, sizes, dtype):
+        # [FUNCTION DOC] ROCm-only: the addmm variant of the contiguous transform test. With the
+        # contiguous check mocked true, compiles an addmm with a transposed second matrix,
+        # compares with a float64 baseline, and requires the generated code mention the contiguous
+        # addmm choice.
         """
         Test the contiguous subgraph transform for addmm with non-contiguous second matrix.
         """
         M, N, K = sizes
 
         def addmm_transpose(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the input with a and the transpose of b.
             return torch.addmm(inp, a, b.transpose(0, 1))
 
         inp = torch.randn(M, N, dtype=dtype, device=GPU_TYPE, requires_grad=True)
@@ -2136,12 +2446,17 @@ class TestMaxAutotune(TestCase):
     def test_max_autotune_contiguous_transform_non_contiguous_second_matrix(
         self, dynamic
     ):
+        # [FUNCTION DOC] ROCm-only: with a contiguous second matrix the generated code must NOT
+        # contain the contiguous mm choice (a FileCheck failure is expected and a test failure
+        # raised otherwise); with a non-contiguous second matrix and the check mocked true it
+        # must. Both outputs are compared against float64 baselines.
         """
         Test that contiguous transform is only applied when the second matrix is non-contiguous.
         """
         M, N, K = 64, 128, 64
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return a @ b
 
         a = torch.randn(M, K, dtype=torch.float32, device=GPU_TYPE)
@@ -2204,12 +2519,17 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_max_autotune_contiguous_transform_with_epilogue(self):
+        # [FUNCTION DOC] ROCm-only: contiguous transform with a relu epilogue. With the
+        # contiguous check mocked true, compiles a matmul against a transposed operand followed
+        # by relu, compares with a float64 baseline and requires the contiguous mm choice in the
+        # generated code.
         """
         Test contiguous transform with epilogue operations like relu.
         """
         M, N, K = 128, 256, 512
 
         def mm_transpose_relu(a, b):
+            # [FUNCTION DOC] HELPER: matmul of a with the transpose of b followed by relu.
             return (a @ b.transpose(0, 1)).relu()
 
         a = torch.randn(M, K, dtype=torch.float32, device=GPU_TYPE)
@@ -2244,6 +2564,12 @@ class TestMaxAutotune(TestCase):
         max_autotune_gemm_backends="TRITON",
     )
     def test_override_template_heuristics_with_custom_class(self):
+        # [FUNCTION DOC] Checks the template heuristic override mechanism with a custom class.
+        # Builds IR buffers of a 64 by 64 mm under a graph lowering context, subclasses the
+        # registered mm heuristic so that it yields exactly the first config of the original,
+        # installs it with override_template_heuristics, and verifies the registry returns an
+        # instance of the custom class (also of the base class) producing a single config equal to
+        # the expected one.
         """
         Test that override_template_heuristics works with a custom heuristic class.
         Verifies that get_template_heuristic returns an instance of our custom class
@@ -2296,7 +2622,11 @@ class TestMaxAutotune(TestCase):
 
             # Create a custom heuristic class that only yields the single expected config
             class CustomMMHeuristic(base_heuristic_class):
+            # [CLASS DOC] HELPER: subclass of the registered base heuristic class that restricts
+            # its template configs to the single captured expected config.
                 def get_template_configs(self, kernel_inputs, op_name):
+                # [FUNCTION DOC] HELPER: generator ignoring its arguments that yields only the
+                # captured config.
                     yield expected_config
 
             with override_template_heuristics(
@@ -2316,7 +2646,11 @@ class TestMaxAutotune(TestCase):
 
     @unittest.skipIf(config.cpp_wrapper, "out_dtype override not supported for AOTI")
     def test_bmm_out_dtype(self):
+        # [FUNCTION DOC] Compiles a batched matmul with float32 out_dtype of float16 inputs using
+        # the ATen backend (no max autotune) and checks the code calls the dtype-aware batched
+        # matmul extern and the result matches the float32 reference. Skipped for the C++ wrapper.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: batched matmul with float32 output dtype.
             return torch.bmm(a, b, out_dtype=torch.float32)
 
         a = torch.randn(2, 3, 4, device=GPU_TYPE, dtype=torch.float16)
@@ -2333,7 +2667,13 @@ class TestMaxAutotune(TestCase):
 
     @unittest.skipIf(config.cpp_wrapper, "out_dtype override not supported for AOTI")
     def test_triton_bmm_out_dtype(self):
+        # [FUNCTION DOC] Like the ATen out_dtype bmm test but with max autotune and the Triton-
+        # only backend: out_dtype is passed as a call argument and the code must contain a
+        # Triton fused bmm template kernel; result compared with the float32 reference. Skipped
+        # for C++ wrapper.
         def f(a, b, out_dtype=torch.float32):
+            # [FUNCTION DOC] HELPER: batched matmul with a configurable output dtype defaulting
+            # to float32.
             return torch.bmm(a, b, out_dtype=out_dtype)
 
         a = torch.randn(2, 3, 4, device=GPU_TYPE, dtype=torch.float16)
@@ -2349,6 +2689,11 @@ class TestMaxAutotune(TestCase):
             self.assertEqual(out, expected, atol=1e-3, rtol=1e-3)
 
     def test_triton_template_generated_code_cache_key(self):
+        # [FUNCTION DOC] Guard test on the template code cache key: counts parameters of the
+        # template generate_and_load method and of the cache make_key method, requires make_key
+        # to take exactly one fewer (the caching flag) and requires generate_and_load to have
+        # exactly 21 parameters. Fails when a parameter is added, as a reminder to include it in
+        # the cache key.
         generate_and_load_args = len(
             inspect.signature(
                 torch._inductor.select_algorithm.TritonTemplate.generate_and_load
@@ -2375,7 +2720,12 @@ class TestMaxAutotune(TestCase):
     )
     @unittest.skipIf(config.triton.native_matmul, "only test on template-based matmul")
     def test_triton_template_generated_code_cache_strategy(self):
+        # [FUNCTION DOC] Verifies the self-check of the generated-code cache. The template kernel
+        # method that supplies input-dependent preserved state is patched to always return the
+        # same string (simulating a bad cache hit), and compiling two matmuls must then raise
+        # InductorError whose message says the generated code cache results in wrong output.
         def func_test1(x, y, z, m):
+            # [FUNCTION DOC] HELPER: returns two independent matrix products as a tuple.
             a = torch.matmul(x, y)
             b = torch.matmul(z, m)
             return a, b
@@ -2402,30 +2752,45 @@ class TestMaxAutotune(TestCase):
     )
     @unittest.skipIf(config.triton.native_matmul, "only test on template-based matmul")
     def test_triton_template_generated_code_caching(self):
+        # [FUNCTION DOC] Checks hit/miss counters and cache keys of the Triton template generated-
+        # code cache using the mm template with four configs. Static shapes give 4 hits and 4
+        # misses and (off ROCm) a specific cache key and recorded events; dynamic shapes with
+        # distinct symbols give 0 hits and 8 misses with symbolic key and size events; duck-typed
+        # equal sizes give 4 and 4; a ten-step matmul loop gives 36 hits and 4 misses both static
+        # and dynamic; a function with symbolic expressions from concatenation gives 0 hits and 7
+        # misses. Each case uses a fresh cache. Note the symbolic-shape case asserts the same
+        # events string twice with different formatting.
         def reset_counters():
+            # [FUNCTION DOC] HELPER: clears all dynamo counters.
             torch._dynamo.utils.counters.clear()
 
         def hits():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache hit counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_hit"
             ]
 
         def misses():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache miss counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_miss"
             ]
 
         # remove white space from x.
         def remove_white_space(x: str) -> str:
+            # [FUNCTION DOC] HELPER: returns the input string with all whitespace removed.
             return re.sub(r"\s+", "", x)
 
         def get_cache_key_and_events() -> tuple[str, str]:
+            # [FUNCTION DOC] HELPER: takes the first key of the mm template generated code cache
+            # and returns it together with the string form of the recorded events for that entry.
             cache = TritonTemplate.all_templates["mm"]._generated_code_cache._cache
             cache_key = next(iter(cache))
             events = str(cache[cache_key].events)
             return cache_key, events
 
         def func_test1(x, y, z, m):
+            # [FUNCTION DOC] HELPER: returns two independent matrix products as a tuple.
             a = torch.matmul(x, y)
             b = torch.matmul(z, m)
             return a, b
@@ -2534,6 +2899,7 @@ class TestMaxAutotune(TestCase):
 
         # Test loop.
         def test_func2(x):
+        # [FUNCTION DOC] HELPER: squares the input matrix ten times in a loop by repeated matmul.
             for _ in range(10):
                 x = torch.matmul(x, x)
             return x
@@ -2564,6 +2930,8 @@ class TestMaxAutotune(TestCase):
         reset_counters()
 
         def test_func3(x, y, z, m, l):
+        # [FUNCTION DOC] HELPER: returns a matmul and a second matmul on concatenated operands,
+        # which produce symbolic size expressions that cannot share cache entries.
             a = torch.matmul(x, y)
             b = torch.matmul(torch.cat([x, z], 1), torch.cat([y, m, l], 0))
             return a, b
@@ -2591,7 +2959,11 @@ class TestMaxAutotune(TestCase):
     )
     @unittest.skipIf(config.triton.native_matmul, "only test on template-based matmul")
     def test_triton_template_generated_code_caching_bmm(self):
+        # [FUNCTION DOC] Checks the generated-code cache for the bmm template: two batched
+        # matmuls with identical shapes under static compilation give 4 cache hits and 4 misses
+        # and match eager.
         def func_test1(x, y, z, m):
+            # [FUNCTION DOC] HELPER: returns two independent batched matrix products as a tuple.
             a = torch.bmm(x, y)
             b = torch.bmm(z, m)
             return a, b
@@ -2600,11 +2972,13 @@ class TestMaxAutotune(TestCase):
         b = torch.rand(10, 22, 30, device=GPU_TYPE)
 
         def hits():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache hit counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_hit"
             ]
 
         def misses():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache miss counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_miss"
             ]
@@ -2627,7 +3001,11 @@ class TestMaxAutotune(TestCase):
     )
     @unittest.skipIf(config.triton.native_matmul, "only test on template-based matmul")
     def test_triton_template_generated_code_caching_mm_plus_mm(self):
+        # [FUNCTION DOC] Checks the generated-code cache with ATen and Triton backends for two
+        # identical sums of matmul pairs under static compilation: 4 hits and 4 misses, results
+        # match eager.
         def func_test1(x, y, z, m):
+            # [FUNCTION DOC] HELPER: returns two identical sums of two matmuls as a tuple.
             a = torch.mm(x, y)
             b = torch.mm(z, m)
             sum1 = a + b
@@ -2641,11 +3019,13 @@ class TestMaxAutotune(TestCase):
         b = torch.rand(40, 30, device=GPU_TYPE)
 
         def hits():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache hit counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_hit"
             ]
 
         def misses():
+            # [FUNCTION DOC] HELPER: returns the inductor generated module cache miss counter.
             return torch._dynamo.utils.counters["inductor"][
                 "generated_module_cache_miss"
             ]
@@ -2677,6 +3057,11 @@ class TestMaxAutotune(TestCase):
     def test_max_autotune_decompose_k_envvars(
         self, num_decompose_k_splits, decompose_k_threshold
     ):
+        # [FUNCTION DOC] Checks the decompose-K configuration options for splits and threshold.
+        # For a large-K and a small-K shape, clears the cached split and eligibility helpers,
+        # compiles a matmul and counts generated sources that mention the decompose-K benchmark.
+        # Expects none when K over M or N is below the threshold or the split count is zero;
+        # otherwise expects at least one and at most the configured number of splits.
         shapes = [(32, 32, 32768), (32, 32, 256)]
         for M, N, K in shapes:
             get_k_splits.cache_clear()
@@ -2714,7 +3099,13 @@ class TestMaxAutotune(TestCase):
     )
     @config.patch(max_autotune=True, max_autotune_gemm_search_space="EXHAUSTIVE")
     def test_max_autotune_exhaustive(self):
+        # [FUNCTION DOC] Checks the exhaustive search space benchmarks only two choices. The
+        # template heuristic lookup is mocked to return the device-appropriate mm heuristic whose
+        # exhaustive config list is replaced by a single config; after compiling a 1024-cubed fp16
+        # matmul every benchmark_gpu counter in the inductor counters must equal 2 (ATen plus the
+        # one Triton config).
         def f(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return a @ b
 
         M, N, K = (1024, 1024, 1024)
@@ -2760,7 +3151,10 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_mm_k_1(self):
+        # [FUNCTION DOC] Compiles a matmul with inner dimension one, for sizes 90 to 99, using the
+        # Triton-only backend, resetting dynamo between sizes and comparing with eager.
         def mm(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         for i in range(90, 100):
@@ -2782,7 +3176,14 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_autotune_gemm_choice_validation(self, op, max_autotune):
+        # [FUNCTION DOC] Registers a preprocessing hook recording the types of all autotune
+        # choices seen while compiling mm, addmm, bmm, baddbmm or mm_plus_mm with ATen and Triton
+        # backends. With max autotune the extern and Triton choice types must both be seen;
+        # without it only the extern type. The hook is removed in a finally block.
         def generate_inputs_and_func(op_name):
+            # [FUNCTION DOC] HELPER: builds example inputs and the callable for the named op,
+            # using extra bias for addmm and baddbmm, batch dims for bmm ops and a second pair for
+            # mm_plus_mm. Raises ValueError for unsupported op names.
             # Base config with just x and w
             base_inputs = [
                 torch.randn(128, 256, device=GPU_TYPE),
@@ -2815,6 +3216,7 @@ class TestMaxAutotune(TestCase):
                 ]
 
                 def mmpmm(x, w, x2, w2):
+                # [FUNCTION DOC] HELPER: sum of two matrix products.
                     return torch.mm(x, w) + torch.mm(x2, w2)
 
                 func = mmpmm
@@ -2825,6 +3227,8 @@ class TestMaxAutotune(TestCase):
         choice_types_seen = set()
 
         def choice_validator(choices):
+            # [FUNCTION DOC] HELPER: preprocessing hook which records the type of each choice into
+            # the enclosing set and returns the choices unchanged.
             for choice in choices:
                 choice_types_seen.add(type(choice))
             return choices
@@ -2851,12 +3255,19 @@ class TestMaxAutotune(TestCase):
     )
     @parametrize("max_autotune_enabled", (True, False))
     def test_autotune_layout_optimization(self, max_autotune_enabled):
+        # [FUNCTION DOC] Checks layout flexibility of addmm choices. A preprocessing hook asserts
+        # that every choice has a fixed layout when max autotune is on and a flexible layout when
+        # off (all choices extern kernels). The hook is registered for the test and the non-
+        # default hooks are cleared in a finally block.
         """Test that layouts are flexible when every choice is ExternKernelChoice"""
 
         # we use a proxy here of bias_addmm and max-autotune because this enables us to see
         # multiple choices in both scenarios (bias_addmm, addmm, triton (max-autotune only))
         # and both bias_addmm and addmm are extern kernel choices
         def layout_checker(choices):
+            # [FUNCTION DOC] HELPER: preprocessing hook; for each non-empty list of choices
+            # asserts the layout class matches the enclosing max autotune setting, and returns
+            # the choices.
             if choices:
                 expected_layout = (
                     FixedLayout if max_autotune_enabled else FlexibleLayout
@@ -2886,6 +3297,10 @@ class TestMaxAutotune(TestCase):
         {"test_configs.max_mm_configs": 4, "max_autotune_gemm_backends": "TRITON"}
     )
     def test_fixed_layout_at_lowering(self):
+        # [FUNCTION DOC] Checks padding and output strides for mm, addmm, bmm and mm_plus_mm with
+        # a transposed bfloat16 first operand and a float32 second operand of width 1490 that is
+        # cast inside the function. In max-autotune-no-cudagraphs mode the generated code must
+        # show the second matrix stride padded to 1536.
         """
         Test that max-autotune with addmm/bmm/mm_plus_mm correctly handles
         padding and maintains correct output strides. Specifically, when matrix
@@ -2893,6 +3308,8 @@ class TestMaxAutotune(TestCase):
         """
 
         def mm_func(a, b) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: permutes a, casts both operands to bfloat16, matmuls and
+            # casts to float32.
             a_t = torch.permute(a, [1, 0]).to(torch.bfloat16)
             b_dtype = b.to(torch.bfloat16)
             # Add .to() to make sure that mm could be potentially padded
@@ -2900,17 +3317,21 @@ class TestMaxAutotune(TestCase):
             return (a_t @ b_dtype).to(torch.float32)
 
         def addmm_func(a, b, bias) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: like the mm variant but using addmm with a bfloat16 bias.
             a_t = torch.permute(a, [1, 0]).to(torch.bfloat16)
             b_dtype = b.to(torch.bfloat16)
             bias_dtype = bias.to(torch.bfloat16)
             return torch.addmm(bias_dtype, a_t, b_dtype).to(torch.float32)
 
         def bmm_func(a, b) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: permutes a to batch-first, casts operands to bfloat16, bmm,
+            # cast to float32.
             a_t = torch.permute(a, [2, 0, 1]).to(torch.bfloat16)
             b_dtype = b.to(torch.bfloat16)
             return torch.bmm(a_t, b_dtype).to(torch.float32)
 
         def mm_plus_mm_func(a1, b1, a2, b2) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: sum of two such transposed bfloat16 matmuls, cast to float32.
             a1_t = torch.permute(a1, [1, 0]).to(torch.bfloat16)
             b1_dtype = b1.to(torch.bfloat16)
             a2_t = torch.permute(a2, [1, 0]).to(torch.bfloat16)
@@ -2945,6 +3366,10 @@ class TestMaxAutotune(TestCase):
     @parametrize("k", (15, 16))
     @parametrize("dynamic", (False, True))
     def test_even_k(self, k: int, dynamic: bool):
+        # [FUNCTION DOC] Compiles torch.mm for a 21 by k times k by 31 float16 problem with k of
+        # 15 or 16, static or dynamic, under max autotune and a fresh cache. Then inspects the
+        # first key of the mm template cache and checks that it records the even-K flag as true
+        # exactly when k is 16 and the shapes are static.
         M, N = 21, 31
         a = torch.randn((M, k), dtype=torch.float16, device=GPU_TYPE)
         b = torch.randn((k, N), dtype=torch.float16, device=GPU_TYPE)
@@ -2970,7 +3395,14 @@ class TestMaxAutotune(TestCase):
     )
     @parametrize("epilogue", (True, False))
     def test_deferred_layout_constraint_cat_fusion(self, epilogue):
+        # [FUNCTION DOC] Checks that with pointwise cat forced, a concatenation feeding a bmm,
+        # whose layout constraint conflicts with padding after fusion, falls back to the ATen bmm
+        # even though Triton is mocked 10x faster. The generated code must contain no Triton
+        # template kernel. Parametrized on whether an extra float32 epilogue output exists.
         def mm_with_cat(a, b1, b2, d):
+            # [FUNCTION DOC] HELPER: concatenates b1 and b2, adds one, casts to bfloat16, runs bmm
+            # with a (cast) and returns it (with a float32 copy when the enclosing epilogue flag
+            # is set) plus a fused subtraction of d.
             catted_b = torch.cat([b1, b2], dim=1)
             catted_b_add = catted_b + 1.0
 
@@ -3014,6 +3446,12 @@ class TestMaxAutotune(TestCase):
 
     @parametrize("always_freeze", [True, False])
     def test_mm_layout_freezing_behavior(self, always_freeze):
+        # [FUNCTION DOC] Checks the always-freeze-layout flag of the mm template. The kernel
+        # method that reads a stride and may freeze the layout is wrapped to assert the layout is
+        # fixed (flag on) or still flexible (flag off) after the call, and to record that a
+        # flexible layout was seen. The flag is set on the template and restored in a finally
+        # block; the test requires a flexible layout was seen. Raises AssertionError inside the
+        # wrapper on violation.
         """Test that mm layout freezing behavior depends on always_freeze_layout.
 
         When always_freeze_layout=True, FlexibleLayout should be frozen to FixedLayout.
@@ -3028,6 +3466,10 @@ class TestMaxAutotune(TestCase):
         orig_stride_call = TritonTemplateKernel.get_stride_and_maybe_freeze_layout
 
         def tracking_get_stride(self, node):
+            # [FUNCTION DOC] HELPER: replacement for the stride lookup; records whether the node
+            # layout was flexible before, calls the original, and if it was flexible validates the
+            # resulting layout class against the always_freeze parameter (raising AssertionError),
+            # then returns the result.
             nonlocal flexible_layout_called
             flexible_layout = isinstance(node.data.layout, ir.FlexibleLayout)
             result = orig_stride_call(self, node)
@@ -3046,6 +3488,8 @@ class TestMaxAutotune(TestCase):
             return result
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: adds one to x to create a flexible layout buffer, then
+            # matmuls with y.
             # Add intermediate computation to create FlexibleLayout buffer
             x = x + 1
             return torch.mm(x, y)
@@ -3086,6 +3530,10 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_deffered_layout_constraint_reintepret(self):
+        # [FUNCTION DOC] Regression test (formerly a CUDA illegal memory access): two bmms consume
+        # a padded-stride input, one directly after a pointwise op and one through a permute. With
+        # Triton mocked faster and one config, the compile must succeed and produce a Triton
+        # template kernel.
         batch, m, k, n = 4608, 40, 112, 1119
 
         # Shape: batch x m x k (contiguous)
@@ -3102,6 +3550,8 @@ class TestMaxAutotune(TestCase):
         c = torch.randn(batch, k, m, dtype=torch.bfloat16, device=GPU_TYPE)
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: bmm of a with b plus zero, b plus one, and bmm of the
+            # permuted b-plus-zero with c; the bmm outputs are cast to float32.
             # Apply a pointwise op to b to make it FlexibleLayout in Inductor
             # This ensures Inductor doesn't treat it as a fixed/external layout
             # Ends up double padding
@@ -3136,7 +3586,12 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_deffered_layout_constraint_mm_cat_mm(self):
+        # [FUNCTION DOC] Compiles a matmul / cat / matmul graph sharing one pointwise result,
+        # with max autotune on, to check that deferred layout constraints do not crash; no
+        # output assertions.
         def mm_cat_mm(t1, t2, t3, t4):
+            # [FUNCTION DOC] HELPER: adds one to t2, then returns matmul with t1, a concatenation
+            # with t3 and a matmul with t4.
             add = t2 + 1
             matmul1 = torch.matmul(t1, add)
             cat = torch.cat((t3, add), dim=1)
@@ -3167,6 +3622,10 @@ class TestMaxAutotune(TestCase):
     )
     @largeTensorTest("10 GB", device=GPU_TYPE)
     def test_max_autotune_mm_large_input_tensor_int64_indexing(self):
+        # [FUNCTION DOC] Regression test (issue 171389): matmul with a second operand over 2^31
+        # elements must index with 64-bit arange values. Asserts the size precondition, compiles
+        # with the Triton-only backend restricted to the mm template choices and compares with
+        # eager. Requires CUDA SM90+ and 10 GB; skipped on XPU and ROCm.
         """
         Test mm with input tensor exceeding 2^31 elements.
         Regression test for https://github.com/pytorch/pytorch/issues/171389
@@ -3175,6 +3634,7 @@ class TestMaxAutotune(TestCase):
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return torch.mm(a, b)
 
         M, K, N = 1280, 65536, 65536
@@ -3202,6 +3662,10 @@ class TestMaxAutotune(TestCase):
     @unittest.skipIf(TEST_WITH_ROCM, "Test requires CUDA")
     @largeTensorTest("6 GB", device=GPU_TYPE)
     def test_max_autotune_mm_large_storage_offset_i64_indexing(self):
+        # [FUNCTION DOC] Regression test: matmul of a dynamic-shape input sliced with an offset
+        # above the 32-bit range must pass the symbolic size argument as 64-bit. Asserts the
+        # offset precondition, marks dim 0 dynamic, compiles with Triton-only mm templates and
+        # compares with the eager result. Needs 6 GB; skipped on XPU and ROCm.
         """
         Test mm with input having dynamic storage offset exceeding i32 range.
         When a dynamic-shaped input is a slice with offset proportional to
@@ -3211,6 +3675,8 @@ class TestMaxAutotune(TestCase):
         """
 
         def mm(x, w):
+            # [FUNCTION DOC] HELPER: slices the last eighth of rows from x using the dynamic batch
+            # size and matmuls it with w.
             batch = x.shape[0] // 8
             a = x[7 * batch :]
             return torch.mm(a, w)
@@ -3248,6 +3714,10 @@ class TestMaxAutotune(TestCase):
     )
     @largeTensorTest("10 GB", device=GPU_TYPE)
     def test_max_autotune_mm_large_output_tensor_int32_overflow(self):
+        # [FUNCTION DOC] Regression test (issue 171389): matmul whose output has at least 2^32
+        # elements must not take the zero-size early exit due to 32-bit overflow. Asserts the size
+        # precondition, compiles with Triton-only mm templates and compares with eager. Needs
+        # SM90+ and 10 GB.
         """
         Test mm with output tensor exceeding 2^32 elements.
         Regression test for https://github.com/pytorch/pytorch/issues/171389
@@ -3257,6 +3727,7 @@ class TestMaxAutotune(TestCase):
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return torch.mm(a, b)
 
         M, K, N = 65536, 32, 65536
@@ -3291,6 +3762,10 @@ class TestMaxAutotune(TestCase):
     )
     @largeTensorTest("10 GB", device=GPU_TYPE)
     def test_max_autotune_mm_persistent_tma_large_input_tensor_int64_indexing(self):
+        # [FUNCTION DOC] Regression test (issue 171389): persistent TMA matmul with a second
+        # operand over 2^31 elements. Asserts the size precondition, compiles with the Triton-only
+        # backend and the persistent TMA choice forced, and compares with eager. Needs SM90+ and
+        # 10 GB; skipped on XPU, ROCm and datacenter Blackwell.
         """
         Test persistent TMA mm with input tensor exceeding 2^31 elements.
         Regression test for https://github.com/pytorch/pytorch/issues/171389.
@@ -3299,6 +3774,7 @@ class TestMaxAutotune(TestCase):
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return torch.mm(a, b)
 
         M, K, N = 1280, 65536, 65536
@@ -3331,6 +3807,11 @@ class TestMaxAutotune(TestCase):
         }
     )
     def test_deferred_layout_constraint_reinterpret_3d(self):
+        # [FUNCTION DOC] Regression test for deferred layout constraints through a rank-2 to
+        # rank-3 view: the function adds zero to a padded-stride 2D input, applies an index_put to
+        # force realization, views the result as 3D and uses it in two bmms and a pointwise add.
+        # Benchmarking is mocked to favor Triton with one config; the compile must succeed and
+        # yield a Triton template.
         batch, m, k, n = 32, 40, 1053, 40
         batch_stride = 42176
 
@@ -3348,6 +3829,9 @@ class TestMaxAutotune(TestCase):
         value = torch.zeros(1, dtype=torch.bfloat16, device=GPU_TYPE)
 
         def fn(a, b, c, idx0, idx1, value):
+            # [FUNCTION DOC] HELPER: builds a flexible-layout copy of b, scatters value at the
+            # index pair, views it as 3D and returns two float32 bmm results and the 2D buffer
+            # plus one.
             # Mirror the 2D regression first: a simple pointwise op gives us a
             # rank-2 FlexibleLayout. Then force that 2D value to realize before
             # reinterpreting it as the rank-3 view from the original repro.
@@ -3379,6 +3863,12 @@ class TestMaxAutotune(TestCase):
     @parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
     @parametrize("use_addmm", (False, True))
     def test_triton_gemm_epilogue_fusion_truncates_accumulator(self, dtype, use_addmm):
+        # [FUNCTION DOC] Verifies that Triton GEMM epilogue fusion truncates the float32
+        # accumulator to the output dtype before epilogue ops for fp16/bf16 (down cast followed by
+        # up cast; for addmm truncation must follow the bias add, not apply to the accumulator
+        # directly) and applies no truncation for float32. Also compiles with epilogue fusion off
+        # and requires the fused kernel name be absent there and the outputs equal (loose
+        # tolerance on XPU fp16).
         """
         Verify that Triton GEMM epilogue fusion properly truncates the fp32
         accumulator to the output dtype before performing epilogue operations.
@@ -3396,10 +3886,12 @@ class TestMaxAutotune(TestCase):
         if use_addmm:
 
             def fn(x, bias):
+                # [FUNCTION DOC] HELPER: addmm of bias with x times x, then relu, minus one.
                 return torch.addmm(bias, x, x).relu() - 1.0
         else:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: x times x, then relu, minus one.
                 return (x @ x).relu() - 1.0
 
         x = torch.randn(128, 128, dtype=dtype, device=GPU_TYPE)
@@ -3475,6 +3967,9 @@ class TestMaxAutotune(TestCase):
     @parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
     @parametrize("use_addmm", (False, True))
     def test_triton_gemm_no_epilogue_no_truncation_casts(self, dtype, use_addmm):
+        # [FUNCTION DOC] Verifies that a Triton GEMM with no fused epilogue ops (mm or addmm;
+        # fp16, bf16, fp32) compiles to a Triton template kernel and matches eager, and that its
+        # code contains no accumulator down-cast to fp16 or bf16.
         """
         Verify that Triton GEMM without epilogue fusion does not have
         truncation casts in the epilogue.
@@ -3485,11 +3980,13 @@ class TestMaxAutotune(TestCase):
         if use_addmm:
 
             def fn(x, bias):
+                # [FUNCTION DOC] HELPER: addmm of bias with x times x.
                 return torch.addmm(bias, x, x)
 
         else:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: matrix product of x with itself.
                 return x @ x
 
         x = torch.randn(128, 128, dtype=dtype, device=GPU_TYPE)
@@ -3525,10 +4022,19 @@ class TestMaxAutotune(TestCase):
 
 @instantiate_parametrized_tests
 class TestTemplateConfigPruning(TestCase):
+    # [CLASS DOC] Tests for pruning GEMM configs by estimated shared memory. Class-level state
+    # holds CUDA addmm and mm heuristics (plain and persistent TMA, Blackwell variants on
+    # datacenter Blackwell) and a list of candidate GEMM configs built from block sizes, with sums
+    # of block dims in an intermediate range. setUp saves each heuristic's config list and
+    # tearDown restores them, because tests overwrite them.
     """Test class for pruning logic in GEMM autotuning."""
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture: creates the shared heuristic objects and the candidate
+        # config list (all combinations of block sizes 64, 128, 256 and two stage counts, keeping
+        # those whose block size sum is above 192 and below 512). Uses Blackwell config class and
+        # extra options (epilogue subtile, warp specialization, flatten) on datacenter Blackwell.
         super().setUpClass()
         # Initialize heuristics once for all tests
         cls.addmm_heuristic = CUDAAddMMTemplateConfigHeuristic()
@@ -3567,6 +4073,7 @@ class TestTemplateConfigPruning(TestCase):
         ]
 
     def setUp(self):
+        # [FUNCTION DOC] Saves the current config lists of the four heuristics for restoration.
         super().setUp()
         # Save original configs to restore in tearDown
         self.original_tma_mm_configs = self.mm_tma_heuristic.mm_configs
@@ -3575,6 +4082,8 @@ class TestTemplateConfigPruning(TestCase):
         self.original_addmm_configs = self.addmm_heuristic.mm_configs
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved config lists on the four heuristics, then calls
+        # the parent.
         # Restore original configs
         self.addmm_tma_heuristic.mm_configs = self.original_addmm_tma_configs
         self.addmm_heuristic.mm_configs = self.original_addmm_configs
@@ -3584,6 +4093,9 @@ class TestTemplateConfigPruning(TestCase):
 
     @contextlib.contextmanager
     def pruning_config_context(self):
+        # [FUNCTION DOC] HELPER: context manager that disables shared-memory based choice pruning,
+        # enables persistent TMA matmul, sets autotune warmup to 0 and repetitions to 1 and uses a
+        # fresh cache for its duration.
         """Context manager for shared memory pruning configuration."""
         with (
             config.patch(
@@ -3608,6 +4120,9 @@ class TestTemplateConfigPruning(TestCase):
         mat1_transposed=False,
         mat2_transposed=False,
     ):
+        # [FUNCTION DOC] HELPER: creates GPU tensors for an M by K and K by N matmul, optionally
+        # stored transposed (created transposed then viewed back). With include_bias returns a 1D
+        # bias of length N followed by the two matrices, otherwise only the two matrices.
         if mat1_transposed:
             mat1 = torch.randn(K, M, dtype=dtype, device=GPU_TYPE).t()
         else:
@@ -3624,7 +4139,11 @@ class TestTemplateConfigPruning(TestCase):
         return mat1, mat2
 
     def test_max_autotune_prune_choices(self):
+        # [FUNCTION DOC] Compiles a 3 by 3 float32 matmul in max-autotune mode and requires the
+        # counter of precompilation exceptions during algorithm selection to be zero (small sizes
+        # must not break choice pruning).
         def mm(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         M, K, N = (3, 3, 3)
@@ -3651,12 +4170,17 @@ class TestTemplateConfigPruning(TestCase):
         mat2_transposed: bool,
         use_tma: bool,
     ):
+        # [FUNCTION DOC] Shared memory pruning check for addmm, over dtype, operand transposition
+        # and TMA vs non-TMA heuristic. Returns early for TMA with float32 or without device TMA
+        # support. Empties the config list of the unused heuristic, builds a limits dict for addmm
+        # and delegates to the shared checker with the selected heuristic.
         """Test shared memory pruning for addmm operation."""
 
         if use_tma and (dtype == torch.float32 or not has_triton_tma_device()):
             return
 
         def addmm_op(bias, mat1, mat2):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(bias, mat1, mat2)
 
         M, K, N = 512, 512, 512
@@ -3700,10 +4224,15 @@ class TestTemplateConfigPruning(TestCase):
         mat2_transposed: bool,
         use_tma: bool,
     ):
+        # [FUNCTION DOC] Shared memory pruning check for mm, over dtype, operand transposition
+        # and TMA vs non-TMA heuristic. Mirrors the addmm test without bias: returns early for
+        # unsupported TMA cases, empties the other heuristic's configs and delegates to the
+        # shared checker.
         if use_tma and (dtype == torch.float32 or not has_triton_tma_device()):
             return
 
         def mm_op(mat1, mat2):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return mat1 @ mat2
 
         M, K, N = 512, 512, 512
@@ -3734,6 +4263,13 @@ class TestTemplateConfigPruning(TestCase):
     def run_op_shared_mem_pruning_check(
         self, heuristic, op, inputs, dtype_size, shared_memory_checker_opts
     ):
+        # [FUNCTION DOC] HELPER: for every candidate config, restricts the heuristic to that
+        # config, computes its estimated shared memory and the predicted over-limit flag, compiles
+        # the op in max-autotune mode with precompile and autotune wrapped to capture the kernel's
+        # real shared memory and whether any Triton choice got a finite time. If compilation
+        # failed for all Triton choices the checker must have predicted exceeding; otherwise the
+        # actual shared memory must not exceed the estimate. Skips the test when the device cannot
+        # report shared memory.
         exceeds_checker = heuristic._get_exceeding_shared_memory_checker(
             **shared_memory_checker_opts
         )
@@ -3754,6 +4290,9 @@ class TestTemplateConfigPruning(TestCase):
             triton_compilation_fails = True
 
             def mock_precompile(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: wraps the autotuner precompile; runs the original and
+                # then records the shared memory size from the last compiled kernel result into
+                # the enclosing variable.
                 original_precompile(self, *args, **kwargs)
                 # Access compile_results after precompilation
                 for result in self.compile_results:
@@ -3768,6 +4307,9 @@ class TestTemplateConfigPruning(TestCase):
                     captured_smem = shared_mem
 
             def mock_autotune(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: wraps algorithm selection autotune; runs the original,
+                # marks the enclosing flag false if any Triton template caller got a finite
+                # timing, and returns timings.
                 timings = original_autotune(self, *args, **kwargs)
                 nonlocal triton_compilation_fails
                 for caller, t in timings.items():
@@ -3799,29 +4341,46 @@ class TestTemplateConfigPruning(TestCase):
 
 
 class TestMaxAutotunePrecompile(TestCase):
+    # [CLASS DOC] Tests for precompilation behavior in algorithm selection, using fake choice
+    # callers and compile-count counters. Has no shared state.
     def test_precompilation_threads(self):
+        # [FUNCTION DOC] Checks that algorithm selection precompiles choices on worker threads.
+        # Ten fake choice callers record the thread id of their precompile call; lookup is
+        # replaced to just run the benchmark function and compile_threads equals the number of
+        # choices. After selection all precompile calls must have happened and none on the main
+        # thread (AssertionError otherwise). The debug handler is replaced during the test and
+        # restored in a finally block.
         import threading
         from typing import Any
         from unittest.mock import Mock
 
         class FakeChoiceCaller(ChoiceCaller):
+            # [CLASS DOC] HELPER: fake choice caller whose precompile records the calling thread
+            # id; the other abstract methods return None or a hash of the object.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: initializes with dummy name, no inputs and a mock layout;
+                # thread id unset.
                 super().__init__("none", [], Mock(), description="")
                 self.thread_id = None
 
             def precompile(self):
+                # [FUNCTION DOC] HELPER: records the id of the calling thread.
                 self.thread_id = threading.get_ident()
 
             def call_name(self) -> str:
+                # [FUNCTION DOC] HELPER: returns None.
                 return None
 
             def to_callable(self):
+                # [FUNCTION DOC] HELPER: returns None.
                 return None
 
             def hash_key(self) -> str:
+                # [FUNCTION DOC] HELPER: returns a string of this object's hash.
                 return str(hash(self))
 
             def output_node(self) -> "TensorBox":  # noqa: F821
+                # [FUNCTION DOC] HELPER: returns None.
                 return None
 
         fake_choices = [FakeChoiceCaller() for i in range(10)]
@@ -3834,12 +4393,16 @@ class TestMaxAutotunePrecompile(TestCase):
             benchmark: Callable[[Any], dict[ChoiceCaller, float]],
             hint_override: int | None = None,
         ) -> dict[ChoiceCaller, float] | None:
+            # [FUNCTION DOC] HELPER: stand-in for the cache lookup; if a benchmark callable is
+            # given runs it on the choices and returns its timings, otherwise returns None.
             if benchmark is not None:
                 return benchmark(choices)
 
         asc = AlgorithmSelectorCache()
 
         def fake_benchmark_fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: ignores arguments and returns the fixed mapping of fake
+            # choices to timings.
             return fake_lookup_result
 
         main_thread_id = threading.get_ident()
@@ -3871,7 +4434,13 @@ class TestMaxAutotunePrecompile(TestCase):
             V.set_debug_handler(old_debug_handler)
 
     def test_filled_cache_precompile(self):
+        # [FUNCTION DOC] Compiles a two-stage matmul chain (float32 then float16) in max-
+        # autotune mode and checks it matches eager. Then resets dynamo and counters and
+        # compiles again, requiring the precompile counter to be zero (note the second compiled
+        # function is never called).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: chained matmul in float32, then cast to float16 and chained
+            # matmul again.
             a = (a @ b) @ c
             a, b, c = (t.to(torch.float16) for t in [a, b, c])
             return (a @ b) @ c
@@ -3891,7 +4460,12 @@ class TestMaxAutotunePrecompile(TestCase):
     @config.patch(autotune_local_cache=False, autotune_remote_cache=False)
     @unittest.skipIf(config.triton.native_matmul, "native matmul has counter 0")
     def test_precompilations(self):
+        # [FUNCTION DOC] With local and remote autotune caches disabled, compiles a matmul chain
+        # in float32 and float16 with small inputs, checks numerics and that the precompile
+        # counter equals two. Skipped for native matmul.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: chained matmul in float32, then cast to float16 and chained
+            # matmul again.
             a = (a @ b) @ c
             a, b, c = (t.to(torch.float16) for t in [a, b, c])
             return (a @ b) @ c
@@ -3910,7 +4484,11 @@ class TestMaxAutotunePrecompile(TestCase):
 
 @instantiate_parametrized_tests
 class TestMaxAutotuneSubproc(TestCase):
+    # [CLASS DOC] Tests for benchmarking and autotuning in subprocesses, including spawning a
+    # child process to benchmark choices. Holds no state beyond a helper to create IR buffers.
     def _create_buffer(self, name, shape):
+        # [FUNCTION DOC] HELPER: creates an IR buffer with the given name and a fixed float32
+        # layout on the first GPU device with the given shape.
         return Buffer(
             name=name,
             layout=FixedLayout(
@@ -3920,6 +4498,10 @@ class TestMaxAutotuneSubproc(TestCase):
 
     @skipIfXpu(msg="XPU not support multiprocessing tensor reduction")
     def test_benchmark_choice_in_subproc(self):
+        # [FUNCTION DOC] Builds example values for four buffers and a layout under a dummy graph,
+        # binds the ATen mm plus mm choice, then starts a spawned child process that benchmarks
+        # the choice and writes timings into a shared tensor. The child must exit with code zero.
+        # Skipped on XPU.
         gm = make_fx(
             lambda: torch.zeros(2, 3)
         )()  # a dummy graph to construct the GraphLowering
@@ -3959,6 +4541,9 @@ class TestMaxAutotuneSubproc(TestCase):
 
     @skipIfXpu(msg="XPU not support multiprocessing tensor reduction")
     def test_benchmark_choice_fail_in_subproc(self):
+        # [FUNCTION DOC] Like the subprocess benchmark test but with a choice caller that always
+        # raises and an expected output given; the spawned child process must exit with a nonzero
+        # code. Skipped on XPU.
         gm = make_fx(
             lambda: torch.zeros(2, 3)
         )()  # a dummy graph to construct the GraphLowering
@@ -3997,6 +4582,9 @@ class TestMaxAutotuneSubproc(TestCase):
     @parametrize("autotune_in_subproc", (True, False))
     @parametrize("autotune_multi_device", (True, False))
     def test_max_autotune_mm_plus_mm(self, autotune_in_subproc, autotune_multi_device):
+        # [FUNCTION DOC] Regression test for mm plus mm autotuning, which once crashed from a
+        # Triton issue: compiles a sum of two matmuls with max autotune over all combinations of
+        # autotuning in subprocess and multi-device autotuning; only checks that nothing crashes.
         """
         This crash previously due to a triton issue: https://github.com/triton-lang/triton/issues/1298 .
         With autotuning in subprocess, we don't crash anymore.
@@ -4004,6 +4592,7 @@ class TestMaxAutotuneSubproc(TestCase):
         m, n, k = 2048, 1536, 64
 
         def mm_plus_mm(a, b, c, d):
+            # [FUNCTION DOC] HELPER: sum of two matrix products.
             return a @ b + c @ d
 
         a = torch.randn(m, k).to(GPU_TYPE)
@@ -4022,11 +4611,14 @@ class TestMaxAutotuneSubproc(TestCase):
 
     @parametrize("dynamic", (False, True))
     def test_max_autotune_regular_mm(self, dynamic: bool):
+        # [FUNCTION DOC] Compiles sin followed by matmul with autotuning in subprocesses, static
+        # and dynamic shapes; only checks it does not crash.
         """
         Make sure autotuning mm in sub processes work without crashes.
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: sin of a then matrix product with b.
             a = torch.sin(a)
             return a @ b
 
@@ -4037,6 +4629,9 @@ class TestMaxAutotuneSubproc(TestCase):
             torch.compile(mm, dynamic=dynamic)(a, b)
 
     def test_max_autotune_profiler_benchmarker_smoke(self):
+        # [FUNCTION DOC] Smoke test: compiles a small matmul with max autotune and the torch
+        # profiler benchmarker enabled, with GPU benchmarking wrapped to record each timing.
+        # Requires at least one finite timing and the smallest finite timing to be above zero.
         """
         Smoke test that a simple max-autotune matmul runs with profiler
         benchmarker selection enabled through config patching, and records
@@ -4044,6 +4639,7 @@ class TestMaxAutotuneSubproc(TestCase):
         """
 
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return a @ b
 
         a = torch.randn(64, 32).to(GPU_TYPE)
@@ -4055,6 +4651,8 @@ class TestMaxAutotuneSubproc(TestCase):
         original_benchmark_gpu = inductor_benchmarking.benchmarker.benchmark_gpu
 
         def benchmark_gpu_with_capture(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls the original GPU benchmark, appends its result to the
+            # enclosing list and returns it.
             timing_ms = original_benchmark_gpu(*args, **kwargs)
             benchmark_timings_ms.append(timing_ms)
             return timing_ms
@@ -4084,6 +4682,9 @@ class TestMaxAutotuneSubproc(TestCase):
     @parametrize("search_space", ("DEFAULT", "EXHAUSTIVE"))
     @parametrize("dynamic", (False, True))
     def test_max_autotune_addmm(self, search_space, dynamic=False):
+        # [FUNCTION DOC] Compiles an addmm with autotuning in subprocesses for both search spaces
+        # (dynamic flag, default false) and compares with eager. Side effect: disables fp16
+        # reduced precision reduction globally and does not restore it.
         """
         Make sure autotuning addmm in sub processes work without crashes.
         """
@@ -4091,6 +4692,7 @@ class TestMaxAutotuneSubproc(TestCase):
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
         def addmm(x, a, b):
+            # [FUNCTION DOC] HELPER: addmm of the three inputs.
             return torch.addmm(x, a, b)
 
         x = torch.randn(100).to(GPU_TYPE)
@@ -4108,9 +4710,14 @@ class TestMaxAutotuneSubproc(TestCase):
             torch.testing.assert_close(Y_compiled, Y, atol=1e-2, rtol=1e-2)
 
     def test_triton_template_with_epilogues_and_dynamic_shape(self):
+        # [FUNCTION DOC] Compiles, with subprocess autotuning, the Triton-only backend and full
+        # graph with dynamic shapes, a transposed matmul with bias, relu and multiply, and runs it
+        # with two different second sizes, comparing each result with eager.
         def fn(
             x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, mul: torch.Tensor
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: relu of the matmul of transposed x and transposed w plus
+            # bias, multiplied by mul.
             return (
                 torch.nn.functional.relu(
                     torch.matmul(torch.transpose(x, 0, 1), torch.transpose(w, 0, 1))
@@ -4152,11 +4759,15 @@ class TestMaxAutotuneSubproc(TestCase):
 
 @instantiate_parametrized_tests
 class TestMaxAutotuneRemoteCache(TestCase):
+    # [CLASS DOC] Tests for remote caching of autotune results using the mock cache classes. Test
+    # setUp activates the cache patches and tearDown deactivates them.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and installs the mock cache patches.
         super().setUp()
         PatchCaches.setUp()
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and removes the mock cache patches.
         super().tearDown()
         PatchCaches.tearDown()
 
@@ -4165,7 +4776,15 @@ class TestMaxAutotuneRemoteCache(TestCase):
         {"compile_threads": 1, "prologue_fusion": False}
     )  # Worker processes do not register PatchCaches() properly
     def test_max_autotune_remote_caching(self, dynamic: bool):
+        # [FUNCTION DOC] Checks the autotune remote cache hit/miss/put statistics with mock
+        # caches. Local autotune cache is disabled and remote enabled; the Triton cache manager
+        # variable is removed from the environment. Compiles the same sin-then-matmul function
+        # four times (each with a fresh cache and dynamo reset) plus once with a different cache
+        # key tag, and requires the autotune remote stats to equal the expected triple of hits,
+        # misses and puts. Then resets stats, repeats with a function with no GEMM (an add inside
+        # a module) and requires the same stats.
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: sin of a then matrix product with b.
             a = torch.sin(a)
             return a @ b
 
@@ -4173,10 +4792,13 @@ class TestMaxAutotuneRemoteCache(TestCase):
         b = torch.randn(10, 100).to(GPU_TYPE)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: tiny module whose forward adds its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns the sum of the two inputs.
                 return x + y
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: builds a Model and returns the sum of the inputs through it.
             return Model()(x, y)
 
         x = torch.randn(100, 100).to(GPU_TYPE)
@@ -4221,21 +4843,34 @@ class TestMaxAutotuneRemoteCache(TestCase):
 
 
 class _TestTritonTemplateCaller(TritonTemplateCaller):
+    # [CLASS DOC] HELPER: minimal template caller for tuning pool tests. It bypasses the parent
+    # constructor, stores only a benchmark request in the bmreq attribute and prints as a fixed
+    # string, which is enough for the pool to benchmark it.
     def __init__(self, bmreq: _TestBenchmarkRequest):
+        # [FUNCTION DOC] HELPER: stores the benchmark request; intentionally skips
+        # parent initialization.
         self.bmreq = bmreq
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: returns the fixed string used as a stand-in name.
         return "test"
 
 
 class TestTuningProcess(TestCase):
+    # [CLASS DOC] Tests for a single TuningProcess subprocess: timeout, exceptions, crashes, being
+    # killed and device visibility. Each test creates its own process and shuts it down.
     def check_healthy(self, p: TuningProcess, device: int | None = None):
+        # [FUNCTION DOC] HELPER: sends a benchmark request returning a random number to process p
+        # (optionally pinned to a device) and asserts the value received back equals it.
         result = random.random()
         bmreq = _TestBenchmarkRequest(result, device=device)
         p.put(bmreq.benchmark)
         self.assertEqual(p.get(), result)
 
     def test_tuning_subproc_timeout(self):
+        # [FUNCTION DOC] A request that sleeps 120s must make getting a result with a one
+        # second timeout raise TimeoutError, and the process must still serve a healthy
+        # request afterwards.
         p = TuningProcess(None)
 
         bmreq = _TestBenchmarkRequest(0, sleep=120)
@@ -4248,6 +4883,8 @@ class TestTuningProcess(TestCase):
         p.shutdown()
 
     def test_tuning_subproc_exception(self):
+        # [FUNCTION DOC] A request that raises RuntimeError must surface the error from getting
+        # its result, and the process must still serve a healthy request afterwards.
         p = TuningProcess(None)
 
         bmreq = _TestBenchmarkRequest(0, exc=RuntimeError("Fail"))
@@ -4260,6 +4897,8 @@ class TestTuningProcess(TestCase):
         p.shutdown()
 
     def test_tuning_subproc_crash(self):
+        # [FUNCTION DOC] A request that makes the subprocess exit must cause EOFError when getting
+        # the result, and the process must be usable (restarted) for a healthy request afterwards.
         p = TuningProcess(None)
 
         bmreq = _TestBenchmarkRequest(0, crash=True)
@@ -4272,12 +4911,16 @@ class TestTuningProcess(TestCase):
         p.shutdown()
 
     def test_tuning_subproc_killed(self):
+        # [FUNCTION DOC] Kills the process and checks that a new healthy request still succeeds,
+        # i.e. the process restarts lazily.
         p = TuningProcess(None)
         p.kill()
         self.check_healthy(p)
         p.shutdown()
 
     def test_visible_devices(self):
+        # [FUNCTION DOC] For every device in the pool device list, starts a process bound to it
+        # and checks a healthy request (which verifies the visible-devices variable in the child).
         device_list = TuningProcessPool.get_device_list()
         for device in device_list:
             p = TuningProcess(device)
@@ -4286,9 +4929,15 @@ class TestTuningProcess(TestCase):
 
 
 class TestTuningProcessPool(TestCase):
+    # [CLASS DOC] Tests for the process pools that run autotune benchmarks: environment and
+    # code cache resets between requests, crash and timeout recovery, device selection and
+    # affinity masks, and feedback-saver registration. Uses a single device where restart
+    # behavior is tested.
     # Use only one device/subprocess so we test the process restarts
     # and is usable after a crash.
     def assert_path_in_dir(self, path, expected_dir):
+        # [FUNCTION DOC] HELPER: asserts that path lies inside expected_dir by comparing the
+        # common path.
         self.assertEqual(
             os.path.commonpath([path, expected_dir]),
             expected_dir,
@@ -4296,6 +4945,10 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"autotune_multi_device": False})
     def test_tuning_pool_cache_env_resets(self):
+        # [FUNCTION DOC] Checks the tuning pool reapplies the parent cache directory variable per
+        # request. A request sent with a stale value in extra environment reports that value, the
+        # parent environment remains unset, and a normal pool target call then reports none. Pool
+        # is shut down.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TRITON_CACHE_DIR", None)
             tuning_pool = TuningProcessPool()
@@ -4321,6 +4974,9 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"autotune_multi_device": False})
     def test_tuning_pool_cache_env_clears_codecache(self):
+        # [FUNCTION DOC] Checks that the tuning pool clears in-subprocess code caches when the
+        # Inductor cache directory changes: two successive requests with different directories
+        # must return file paths inside the respective directories, and the paths must differ.
         with (
             mock.patch.dict(os.environ, {}, clear=False),
             tempfile.TemporaryDirectory() as cache_dir_1,
@@ -4343,6 +4999,9 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"pipeline_max_autotune_gemm": True})
     def test_autotune_process_pool_cache_env_resets(self):
+        # [FUNCTION DOC] Same environment-reset check for the pipelined autotune process pool: a
+        # task run with a stale cache dir variable reports it; after the variable is removed the
+        # next task must report none. The pool is shut down in a finally block.
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TRITON_CACHE_DIR", None)
             autotune_pool = AutotuneProcessPool()
@@ -4373,6 +5032,9 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"pipeline_max_autotune_gemm": True})
     def test_autotune_process_pool_cache_env_clears_codecache(self):
+        # [FUNCTION DOC] Same code cache reset check for the pipelined autotune process pool:
+        # tasks with two different Inductor cache directories must return file paths inside each
+        # directory and the two paths must differ.
         with (
             mock.patch.dict(os.environ, {}, clear=False),
             tempfile.TemporaryDirectory() as cache_dir_1,
@@ -4401,6 +5063,9 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"autotune_multi_device": False})
     def test_tuning_pool_crash(self):
+        # [FUNCTION DOC] A crashing request must give infinite time for its choice, then
+        # a following healthy request must yield its real result, showing the pool
+        # process restarted.
         tuning_pool = TuningProcessPool()
 
         # First force the tuning process to crash.
@@ -4424,6 +5089,8 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"autotune_multi_device": False})
     def test_tuning_pool_timeout(self):
+        # [FUNCTION DOC] A request sleeping past a one second result timeout must give infinite
+        # time for its choice, then a following healthy request must yield its real result.
         tuning_pool = TuningProcessPool()
 
         # First force the tuning process to timeout.
@@ -4448,6 +5115,9 @@ class TestTuningProcessPool(TestCase):
 
     @config.patch({"autotune_multi_device": True})
     def test_tuning_pool_multiple_devices(self):
+        # [FUNCTION DOC] Restricts the visible devices variable to the last two available devices
+        # while creating a multi-device pool, then benchmarks two choices and checks each returns
+        # its own result.
         # Adapt the test to the available devices (and whether the backend-specific
         # visible devices env var
         # is already set in the environment); use a subset of the available devices
@@ -4475,11 +5145,14 @@ class TestTuningProcessPool(TestCase):
         tuning_pool.shutdown()
 
     def test_get_visible_devices_env_var(self):
+        # [FUNCTION DOC] Checks the visible-devices variable name for cuda and xpu backends.
         self.assertEqual(get_visible_devices_env_var("cuda"), "CUDA_VISIBLE_DEVICES")
         self.assertEqual(get_visible_devices_env_var("xpu"), "ZE_AFFINITY_MASK")
 
     @config.patch({"autotune_multi_device": True})
     def test_get_device_list_with_affinity_mask(self):
+        # [FUNCTION DOC] With the XPU/CUDA affinity variable set to devices 1 and 3 and four
+        # devices reported, checks the pool device list is exactly those two device indices.
         env_var = get_visible_devices_env_var(GPU_TYPE)
         env_value = "1,3"
 
@@ -4493,6 +5166,9 @@ class TestTuningProcessPool(TestCase):
             self.assertEqual(TuningProcessPool.get_device_list(), [1, 3])
 
     def test_add_feedback_saver(self):
+        # [FUNCTION DOC] Clears feedback savers, adds one saver and checks the global algorithm
+        # selector cache holds exactly that function; adds a second and checks two are stored.
+        # Clears at the end.
         """Test that add_feedback_saver correctly adds feedback functions."""
         from torch._inductor.select_algorithm import get_algorithm_selector_cache
 
@@ -4505,6 +5181,8 @@ class TestTuningProcessPool(TestCase):
         def simple_feedback_saver(
             timings, name, input_nodes, choices, profiled_time, precompile_times
         ):
+            # [FUNCTION DOC] HELPER: feedback saver appending a record of name, choice count,
+            # timing count and whether profiled time was given to the enclosing list.
             feedback_calls.append(
                 {
                     "name": name,
@@ -4526,6 +5204,7 @@ class TestTuningProcessPool(TestCase):
         def another_feedback_saver(
             timings, name, input_nodes, choices, profiled_time, precompile_times
         ):
+            # [FUNCTION DOC] HELPER: feedback saver that does nothing.
             pass
 
         add_feedback_saver(another_feedback_saver)
@@ -4535,6 +5214,8 @@ class TestTuningProcessPool(TestCase):
         clear_feedback_savers()
 
     def test_clear_feedback_savers(self):
+        # [FUNCTION DOC] Adds two feedback savers, checks the cache holds two, clears them and
+        # checks none remain.
         """Test that clear_feedback_savers removes all feedback functions."""
         from torch._inductor.select_algorithm import get_algorithm_selector_cache
 
@@ -4542,11 +5223,13 @@ class TestTuningProcessPool(TestCase):
         def feedback_saver1(
             timings, name, input_nodes, choices, profiled_time, precompile_times
         ):
+            # [FUNCTION DOC] HELPER: feedback saver that does nothing.
             pass
 
         def feedback_saver2(
             timings, name, input_nodes, choices, profiled_time, precompile_times
         ):
+            # [FUNCTION DOC] HELPER: feedback saver that does nothing.
             pass
 
         add_feedback_saver(feedback_saver1)
@@ -4563,6 +5246,9 @@ class TestTuningProcessPool(TestCase):
         self.assertEqual(len(cache.feedback_saver_fns), 0)
 
     def test_feedback_saver_integration(self):
+        # [FUNCTION DOC] Registers a saver, compiles a matmul with Triton-only max autotune and
+        # checks the saver was called with a record having the expected keys, a positive choice
+        # count and two input nodes. Saver list is cleared at start and end.
         """Test that feedback savers are actually called during autotuning."""
         # Clear any existing feedback savers
         clear_feedback_savers()
@@ -4572,6 +5258,8 @@ class TestTuningProcessPool(TestCase):
         def test_feedback_saver(
             timings, name, input_nodes, choices, profiled_time, precompile_times
         ):
+            # [FUNCTION DOC] HELPER: feedback saver appending name, choice count, timing count and
+            # input node count to the enclosing list.
             # Store information about the call for verification
             feedback_calls.append(
                 {
@@ -4587,6 +5275,7 @@ class TestTuningProcessPool(TestCase):
 
         # Create a simple matrix multiplication that will trigger autotuning
         def mm(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return a @ b
 
         a = torch.randn(32, 32, device=GPU_TYPE)
@@ -4621,8 +5310,15 @@ class TestTuningProcessPool(TestCase):
 
 @instantiate_parametrized_tests
 class TestPrologueFusion(TestCase):
+    # [CLASS DOC] Tests for prologue fusion into Triton GEMM templates. Class-level config
+    # enables max autotune, prologue fusion, Triton-only backend, no shape padding and 4 mm
+    # configs (kept active via an exit stack closed in tearDownClass). Tests compile small graphs
+    # and check kernel launch, allocation and deallocation counts and the generated masks and
+    # dtype handling.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture: enters a config patch into a shared exit stack for the
+        # whole class.
         super().setUpClass()
         cls._stack = contextlib.ExitStack()
         cls._stack.enter_context(
@@ -4640,10 +5336,16 @@ class TestPrologueFusion(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class fixture: closes the exit stack, undoing the config patch, then
+        # the parent.
         cls._stack.close()
         super().tearDownClass()
 
     def check_code(self, code_str, num_kernels, num_allocs, num_deallocs):
+        # [FUNCTION DOC] HELPER: asserts via FileCheck on code_str that the call function launches
+        # exactly num_kernels kernels; if num_allocs is not None, exactly that many strided
+        # allocations; and if num_deallocs is not None and the C++ wrapper is not in use, exactly
+        # that many deletions.
         FileCheck().check(get_func_call()).check_count(
             get_kernel_launch(),
             num_kernels,
@@ -4664,12 +5366,17 @@ class TestPrologueFusion(TestCase):
 
     @parametrize("sizes", ((64, 128, 256), (128, 128, 128), (63, 120, 250)))
     def test_upcast(self, sizes):
+        # [FUNCTION DOC] Compiles a matmul with an fp16 first operand cast to float32; checks
+        # numerics and one kernel, one allocation, two deletions. With native matmul the zero mask
+        # is kept so a where appears before the dot; otherwise the upcast preserves zeros and no
+        # where appears.
         M, K, N = sizes
 
         x = torch.rand([M, K], dtype=torch.float16, device=GPU_TYPE)
         y = torch.rand([K, N], dtype=torch.float, device=GPU_TYPE)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: casts x to the dtype of y and matmuls with y.
             return x.to(y.dtype) @ y
 
         out, code = run_and_get_code(torch.compile(foo), x, y)
@@ -4684,6 +5391,8 @@ class TestPrologueFusion(TestCase):
 
     @unittest.skip("Triton bug in compilation")
     def test_gather_fusion(self):
+        # [FUNCTION DOC] Skipped due to a Triton compilation bug. Intended: a gathered (indexed)
+        # first operand fused as prologue into one kernel with low-precision loads before the dot.
         M, K, N = (64, 128, 256)
         x = torch.rand([M, K], dtype=torch.float16, device=GPU_TYPE)
         y = torch.rand([K, N], dtype=torch.float16, device=GPU_TYPE)
@@ -4691,6 +5400,7 @@ class TestPrologueFusion(TestCase):
         index = torch.randperm(M, device=GPU_TYPE)
 
         def foo(x, y, index):
+            # [FUNCTION DOC] HELPER: matmul of the index-selected rows of x with y.
             return (x[index]) @ y
 
         out, code = run_and_get_code(torch.compile(foo), x, y, index)
@@ -4712,12 +5422,17 @@ class TestPrologueFusion(TestCase):
     )
     @config.patch({"triton.native_matmul": False})
     def test_low_precision(self):
+        # [FUNCTION DOC] Needs FP8 support. A float8 operand cast to bfloat16 and matmul
+        # should fuse into one kernel with no float32 conversion in the loop; adding one after
+        # the cast must not fuse (two kernels, two allocations, three deletions). Native
+        # matmul is disabled.
         M = K = N = 128
 
         x = torch.rand([M, K], device=GPU_TYPE).to(torch.float8_e4m3fn)
         y = torch.rand([K, N], dtype=torch.bfloat16, device=GPU_TYPE)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: casts x to the dtype of y and matmuls with y.
             return x.to(y.dtype) @ y
 
         out, code = run_and_get_code(torch.compile(foo), x, y)
@@ -4734,6 +5449,7 @@ class TestPrologueFusion(TestCase):
         )
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: casts x to the dtype of y, adds one, and matmuls with y.
             return (x.to(y.dtype) + 1) @ y
 
         out, code = run_and_get_code(torch.compile(foo), x, y)
@@ -4747,12 +5463,16 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_downcast(self):
+        # [FUNCTION DOC] Checks that a float32 to float16 downcast prologue is not fused into
+        # the matmul by heuristics: two kernels, two allocations, three deletions. Skipped for
+        # native matmul.
         # per heuristics, dont fuse a downcast into a mm because it would lead to more reads inside kernel
         M, K, N = (64, 128, 256)
         x = torch.rand([M, K], dtype=torch.float, device=GPU_TYPE)
         y = torch.rand([K, N], dtype=torch.float16, device=GPU_TYPE)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: casts x to the dtype of y and matmuls with y.
             return x.to(y.dtype) @ y
 
         out, code = run_and_get_code(torch.compile(foo), x, y)
@@ -4766,9 +5486,14 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_multiple_fusions(self, sizes, use_async_compile: bool):
+        # [FUNCTION DOC] Compiles a matmul with prologue subtractions and an epilogue multiply,
+        # with or without waiting for the async compile pool, over three sizes. Checks numerics, a
+        # single kernel, and that the constant 1.1 is materialized exactly three times in the
+        # kernel (no common subexpression sharing between prologues and epilogue).
         M, K, N = sizes
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: matmul of (x minus 1.1) and (y plus 1.1), multiplied by 1.1.
             return ((x - 1.1) @ (y + 1.1)) * 1.1
 
         if use_async_compile:
@@ -4796,7 +5521,12 @@ class TestPrologueFusion(TestCase):
     )
     @parametrize("use_async_compile", (True, False))
     def test_pending_fusions_multiple(self, use_async_compile: bool):
+        # [FUNCTION DOC] With mocked fusion benchmarks and benchmark epilogue fusion on (3
+        # choices), checks the scheduler handles several pending fusions. A product of two
+        # transposed-self matmuls must launch exactly two kernels; a matmul followed by relu must
+        # launch one. Skipped on ROCm.
         def multi_use(x, y):
+            # [FUNCTION DOC] HELPER: product of x times its transpose and y times its transpose.
             return (x @ x.T) * (y @ y.T)
 
         if use_async_compile:
@@ -4832,6 +5562,7 @@ class TestPrologueFusion(TestCase):
             self.assertEqual(out, multi_use(x, y), atol=0.05, rtol=0.05)
 
             def resolve_pending(x):
+                # [FUNCTION DOC] HELPER: matmul of x with itself followed by relu.
                 return (x @ x).relu()
 
             x = torch.rand([128, 128], device=GPU_TYPE)
@@ -4850,7 +5581,11 @@ class TestPrologueFusion(TestCase):
     )
     @parametrize("use_async_compile", (True, False))
     def test_pending_fusion_pro_and_epi(self, use_async_compile: bool):
+        # [FUNCTION DOC] With epilogue fusion benchmarking enabled (3 choices), checks a float16
+        # to float32 cast prologue and relu epilogue around a matmul fuse into a single kernel and
+        # match eager.
         def test_multiple_fusions(x):
+            # [FUNCTION DOC] HELPER: casts x to float32, matmuls it with itself and applies relu.
             y = x.to(torch.float)
             return (y @ y).relu()
 
@@ -4867,9 +5602,13 @@ class TestPrologueFusion(TestCase):
     @parametrize("sizes", ((64, 128, 256), (128, 128, 128), (63, 120, 250)))
     @parametrize("use_async_compile", (True, False))
     def test_multiple_inputs(self, sizes, use_async_compile: bool):
+        # [FUNCTION DOC] Checks a prologue combining two fp16 inputs by addition, cast to float32
+        # and matmul with a third input: results match eager within tolerance with one kernel, one
+        # allocation and three deletions. Over three sizes and with or without async pool.
         M, K, N = sizes
 
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: adds x and y, casts to float32, matmuls with z.
             return (x + y).to(torch.float) @ z
 
         if use_async_compile:
@@ -4884,7 +5623,12 @@ class TestPrologueFusion(TestCase):
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=3)
 
     def test_storage_offset_prologue(self):
+        # [FUNCTION DOC] Checks prologue fusion with sliced inputs having storage offsets: two
+        # row-halves of one tensor are shifted and matmul'd; result matches eager with one kernel,
+        # one allocation, one deletion.
         def foo(a):
+            # [FUNCTION DOC] HELPER: splits a into top and bottom halves, adds 2 to the top,
+            # subtracts 2 from the bottom and matmuls them.
             q = a[:64, :]
             k = a[64:, :]
             return torch.mm(q + 2, k - 2)
@@ -4902,9 +5646,13 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_prologue_multiple_nodes(self, sizes, use_async_compile: bool):
+        # [FUNCTION DOC] With low realization thresholds, checks a chain of several pointwise
+        # prologue ops on both operands fused into one kernel with an epilogue multiply; numerics
+        # match eager and one kernel, one allocation, two deletions. Skipped for native matmul.
         M, K, N = sizes
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: matmul of an affine transform of x and a scaled y, times 3.
             return ((((x * 2) - 1) / 2) @ (y * 4)) * 3.0
 
         if use_async_compile:
@@ -4919,7 +5667,12 @@ class TestPrologueFusion(TestCase):
 
     @parametrize("K", (63, 64))
     def test_broadcast_x(self, K):
+        # [FUNCTION DOC] Compiles dynamically a matmul whose first operand is a broadcast scalar-
+        # like tensor expanded to the row count of y, plus one, for K of 63 and 64; checks
+        # numerics and one kernel, one allocation and two deletions.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: expands x to a row of the first dim of y, adds one and
+            # matmuls with y.
             return (x.expand([1, y.shape[0]]) + 1) @ y
 
         x = torch.rand([1, 1], dtype=torch.float, device=GPU_TYPE)
@@ -4930,7 +5683,10 @@ class TestPrologueFusion(TestCase):
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
 
     def test_broadcast_y(self):
+        # [FUNCTION DOC] Compiles dynamically (first dim of x marked dynamic) a matmul with K and
+        # N equal to one; checks numerics and one kernel, one allocation, two deletions.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         M = 20
@@ -4948,6 +5704,10 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_preserves_zero_analysis(self):
+        # [FUNCTION DOC] Checks the zero-preservation analysis used for prologue masking: relu
+        # preserves zero so no where mask appears in the K loop, while adding one and an unhandled
+        # hypot op produce a masked where before the dot. Numerics match eager and counts are one
+        # kernel, one allocation, two deletions. Skipped for native matmul.
         fns = (
             (lambda x: x.relu(), False),  # preserves zero
             (lambda x: x + 1, True),  # does not
@@ -4958,6 +5718,7 @@ class TestPrologueFusion(TestCase):
         )
 
         def foo(x, y, fn):
+            # [FUNCTION DOC] HELPER: applies the given function to x and matmuls with y.
             return fn(x) @ y
 
         for fn, should_mask in fns:
@@ -4980,12 +5741,17 @@ class TestPrologueFusion(TestCase):
     def test_prologue_read_into_both_inputs(
         self, benchmark_fusion, use_async_compile: bool
     ):
+        # [FUNCTION DOC] With low realization thresholds, checks a graph where one pointwise
+        # result is read as both matmul inputs (unsupported for fusion). Output must match
+        # eager; when epilogue benchmarking is off, it requires exactly two kernels without
+        # checking allocations.
         M = K = 256
 
         # not supported today. it could be, but typically the pointwise nodes would get
         # inlined into separate nodes.
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: computes y from x, then matmuls y with y minus two.
             y = (x + 1) * 2
             return y @ (y - 2)
 
@@ -5010,7 +5776,11 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_mismatched_prologue_group(self):
+        # [FUNCTION DOC] With buffer reuse disabled and low realization thresholds, checks a
+        # prologue with mismatched groups: two kernels, two allocations and four deletions (one
+        # more than expected, noted in a comment as a reuse artifact). Skipped for native matmul.
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: scales and multiplies pointwise inputs, then matmuls with z.
             a = (x + 2) * 2
             b = a * y
             return b @ z
@@ -5040,6 +5810,11 @@ class TestPrologueFusion(TestCase):
     )
     @parametrize("use_async_compile", (True, False))
     def test_lazy_template_fusion_multiple_candidates(self, use_async_compile: bool):
+        # [FUNCTION DOC] Tests lazy fusion with two matmuls with cast and arithmetic prologues and
+        # a shared epilogue combining both (relu and tanh). Fusion benchmarks are mocked to fixed
+        # numbers; the generated code must contain the template kernel for the first matmul with
+        # its prologue and the second with its prologue and epilogue chain. Skipped on XPU and
+        # native matmul.
         """
         Test lazy evaluation of template fusions with multiple templates,
         multiple potential prologues, and a shared epilogue.
@@ -5057,6 +5832,8 @@ class TestPrologueFusion(TestCase):
         """
 
         def foo(a, b, c, d):
+            # [FUNCTION DOC] HELPER: computes two matmuls of transformed bfloat16 inputs and
+            # applies a chain of multiply, scale, relu and tanh to their product.
             # Prologues for first matmul: transform inputs a and b
             a_transformed = a.to(torch.float) + 1.0
             b_transformed = b.to(torch.float) * 2.0
@@ -5113,9 +5890,15 @@ class TestPrologueFusion(TestCase):
         "generated code is different in native matmul",
     )
     def test_prologue_masked_load(self, sizes):
+        # [FUNCTION DOC] With shape padding forced, checks that no prologue fusion makes an
+        # aligned load unaligned: matmul output matches eager and the code has three kernels,
+        # three allocations, four deletions. KNOWN ISSUE: the sizes parameter is unpacked but
+        # unused; inputs always have fixed sizes 250 by 245 and 245 by 128, so all
+        # parametrizations are the same.
         M, K, N = sizes
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return x @ y
 
         x = torch.rand([250, 245], device=GPU_TYPE)
@@ -5129,7 +5912,11 @@ class TestPrologueFusion(TestCase):
 
 
 def autotune_select_algorithm_wrapper_return_multi():
+    # [FUNCTION DOC] HELPER: returns a wrapper around the autotune selection function which always
+    # sets the flag that returns a multi-template buffer.
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: forces the multi-template return flag in the keyword args and
+        # forwards to the real autotune selection function, returning its result.
         kwargs["return_multi_template"] = True
         return autotune_select_algorithm(*args, **kwargs)
 
@@ -5137,6 +5924,9 @@ def autotune_select_algorithm_wrapper_return_multi():
 
 
 def benchmark_choice_override_timings(benchmark_request, *args, aten_time, triton_time):
+    # [FUNCTION DOC] HELPER: fake benchmark function returning a preset time by request type: the
+    # aten time for extern kernel requests or callers, the triton time for Triton requests or
+    # callers, and infinity for any other type. Extra positional args are ignored.
     if isinstance(
         benchmark_request, (ExternKernelBenchmarkRequest, ExternKernelCaller)
     ):
@@ -5148,6 +5938,8 @@ def benchmark_choice_override_timings(benchmark_request, *args, aten_time, trito
 
 
 def mock_benchmark_choice_wrapper(aten_time, triton_time):
+    # [FUNCTION DOC] HELPER: returns a partial application of the timing override function with
+    # the given ATen and Triton times, suitable to patch a benchmark function.
     return functools.partial(
         benchmark_choice_override_timings, aten_time=aten_time, triton_time=triton_time
     )
@@ -5155,8 +5947,15 @@ def mock_benchmark_choice_wrapper(aten_time, triton_time):
 
 @instantiate_parametrized_tests
 class TestEpilogueFusionStaticAnalysis(TestCase):
+    # [CLASS DOC] Tests of the scheduler's static analysis for fusing epilogues into Triton
+    # matmul templates without benchmarking (spills, relative timings, register occupancy,
+    # memory-bound epilogues). A class-level config patch (kept in an exit stack until
+    # tearDownClass) enables max autotune, disables ATen fallback, epilogue benchmarking and
+    # prologue fusion. Fusion decisions are steered by patching benchmark timings, register and
+    # spill counts and estimated runtimes.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture: enters the class-wide config patch into an exit stack.
         super().setUpClass()
         cls._stack = contextlib.ExitStack()
         cls._stack.enter_context(
@@ -5172,6 +5971,8 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class fixture: closes the exit stack, undoing the config patch, then
+        # the parent.
         cls._stack.close()
         super().tearDownClass()
 
@@ -5188,6 +5989,15 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
         mock_unfused_n_regs: int | None = None,
         epilogue_runtime: float | None = None,
     ):
+        # [FUNCTION DOC] HELPER: context manager applying the patches shared by these tests. It
+        # always sets persistent TMA and the compile thread count (one thread when async compile
+        # is off), makes the mm lowering return multi-template buffers, and uses a fresh cache.
+        # When both times are given it also mocks choice benchmarking (in process and subprocess).
+        # When spill or fused register counts are given, wraps the autotuner precompile to
+        # overwrite each launcher's spills and registers. When an unfused register count is given,
+        # wraps benchmark request precompile to set its register count. When an epilogue runtime
+        # is given, forces the scheduler node runtime estimate. All patches are entered through an
+        # exit stack for the with-block duration.
         from torch._inductor.autotune_process import TritonBenchmarkRequest
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
         from torch._inductor.scheduler import BaseSchedulerNode
@@ -5227,6 +6037,9 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
             original_precompile = CachingAutotuner.precompile
 
             def mock_precompile(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: wraps the autotuner precompile; runs the original,
+                # then overwrites the spill count and fused register count (when set) on
+                # every launcher.
                 original_precompile(self, *args, **kwargs)
                 for launcher in self.launchers:
                     if mock_n_spills is not None:
@@ -5242,6 +6055,8 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
             original_bmreq_precompile = TritonBenchmarkRequest.precompile
 
             def mock_bmreq_precompile(self):
+                # [FUNCTION DOC] HELPER: wraps the benchmark request precompile; runs the
+                # original, then overwrites the register count with the mocked unfused value.
                 original_bmreq_precompile(self)
                 self.n_regs = mock_unfused_n_regs
 
@@ -5267,21 +6082,29 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
             yield
 
     def _get_mm_inputs(self):
+        # [FUNCTION DOC] HELPER: returns two random bfloat16 GPU matrices of shapes 512 by 1024
+        # and 1024 by 2048.
         """Common matmul inputs for epilogue fusion tests."""
         a = torch.randn(512, 1024, device=GPU_TYPE, dtype=torch.bfloat16)
         b = torch.randn(1024, 2048, device=GPU_TYPE, dtype=torch.bfloat16)
         return a, b
 
     def _get_mm_with_epilogue_fn(self):
+        # [FUNCTION DOC] HELPER: returns a function that matmuls two inputs, casts the result to
+        # float32 and adds one.
         """Common function: matmul with type cast and add epilogue."""
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: matmul of a and b, cast to float32, plus one.
             return (a @ b).to(torch.float32) + 1.0
 
         return f
 
     @contextlib.contextmanager
     def _setup_mm_heuristic(self, use_async_compile: bool):
+        # [FUNCTION DOC] HELPER: context manager that replaces the CUDA mm heuristic configs with
+        # a single 64 by 64 by 32 config, optionally waits for the async compile pool, and
+        # restores the original configs afterwards (in a finally block).
         """Setup MM heuristic with single GemmConfig and handle cleanup."""
         mm_heuristic = CUDAMMTemplateConfigHeuristic()
         original_mm_configs = mm_heuristic.mm_configs
@@ -5303,7 +6126,15 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     )
     @parametrize("use_async_compile", (True, False))
     def test_template_bad_epilogue_fusion(self, use_async_compile: bool):
+        # [FUNCTION DOC] Checks that a failure to compile a fused template-plus-epilogue kernel
+        # falls back to unfused kernels safely. Uses the persistent TMA template with one good
+        # config, forces the Triton choice to win, and in the failing case wraps the scheduler
+        # kernel compile so a multi-node kernel yields a future or module whose compile raises.
+        # With simulated failure the code must contain separate mm and pointwise cast kernels;
+        # otherwise a fused kernel. Numerics are compared with eager; heuristic configs are
+        # restored. Skipped without TMA, on XPU and C++ wrapper.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: matmul of a and b, cast to float32.
             return (a @ b).to(torch.float32)
 
         a = torch.randn(512, 1152, device=GPU_TYPE, dtype=torch.bfloat16)
@@ -5333,12 +6164,18 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
             mm_heuristic.mm_configs = []
 
             def mock_compile_kernel_fail_fusion(self, nodes, hint_override=None):
+                # [FUNCTION DOC] HELPER: replacement for the scheduler compile-kernel method.
+                # Calls the original; when failure is simulated and the node group has more than
+                # one node, returns a failing result: a lambda-future wrapper whose result raises
+                # RuntimeError if there was a future, else a module whose Triton attribute is an
+                # object whose precompile raises. Otherwise returns the original pair.
                 fut, mod = original_compile_kernel(self, nodes, hint_override)
 
                 if simulate_fusion_failure and len(nodes) > 1:
                     if fut is not None:
 
                         def failing_result_fn():
+                            # [FUNCTION DOC] HELPER: always raises RuntimeError.
                             raise RuntimeError
 
                         return torch._inductor.codecache.LambdaFuture(
@@ -5347,7 +6184,10 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
                     else:
 
                         class FailingPrecompile:
+                            # [CLASS DOC] HELPER: stand-in for a compiled Triton kernel whose
+                            # precompile always fails.
                             def precompile(self):
+                                # [FUNCTION DOC] HELPER: always raises RuntimeError.
                                 raise RuntimeError
 
                         mod.triton_ = FailingPrecompile()
@@ -5421,6 +6261,12 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     def test_template_epilogue_fusion_static_analysis(
         self, test_case: str, use_async_compile: bool
     ):
+        # [FUNCTION DOC] Parametrized static analysis fusion cases using mocked timings and
+        # spills: heavy spills reject fusion (separate mm and cast kernels), a much slower Triton
+        # choice rejects fusion, a faster Triton choice or one only slightly slower than ATen
+        # accepts fusion (fused kernel name). Compiles a matmul with cast-and-add epilogue with
+        # one fixed mm config and checks the code accordingly. Raises RuntimeError for an unknown
+        # case name. CUDA only.
         """
         Test static analysis decisions for matmul epilogue fusions.
 
@@ -5489,9 +6335,15 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     def test_template_epilogue_fusion_extra_reads(
         self, fuse_epilogue: bool, use_async_compile: bool
     ):
+        # [FUNCTION DOC] Checks epilogue fusion that adds extra reads (scale and bias tensors).
+        # Chooses a mocked Triton time slightly below or above the break-even point derived from
+        # ATen time, epilogue runtime and the extra read fraction, then requires a fused kernel
+        # when fusion should be accepted and otherwise no template kernel in the code but an
+        # unfused pointwise kernel. Skipped on ROCm and C++ wrapper.
         """Test epilogue fusion with extra reads (bias and scale tensors)."""
 
         def fn(x, w, bias, scale):
+            # [FUNCTION DOC] HELPER: matmul of x and w, multiplied by scale and added with bias.
             out = torch.mm(x, w)
             return out * scale + bias
 
@@ -5555,6 +6407,11 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     def test_template_epilogue_fusion_occupancy_ratio(
         self, test_case: str, use_async_compile: bool
     ):
+        # [FUNCTION DOC] Tests the register occupancy branch of the epilogue fusion decision. With
+        # mocked unfused and fused register counts and times, fusion is accepted when the fused to
+        # unfused occupancy ratio is above one half (even if ATen is slightly faster) and rejected
+        # when below, checked by the fused or separate kernel names in the code. Raises
+        # RuntimeError for an unknown case name. Skipped on ROCm and C++ wrapper.
         """
         Test occupancy ratio branch of _fuse_epilogue.
 
@@ -5623,6 +6480,11 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     def test_template_epilogue_fusion_dominating_epilogue(
         self, test_case: str, use_async_compile: bool
     ):
+        # [FUNCTION DOC] Tests the memory-bound epilogue branch of the fusion decision. When
+        # occupancy checks fail, fusion is still accepted if the epilogue runtime exceeds twice
+        # the template time and more than one block fits per multiprocessor (mocked via register
+        # counts); with only one block fits it is rejected. Verified via kernel names in the code.
+        # Raises RuntimeError for an unknown case name. Skipped on ROCm and C++ wrapper.
         """
         Test memory-bound epilogue branch of _fuse_epilogue (Branch C).
 
@@ -5676,7 +6538,12 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
     )
     @parametrize("use_async_compile", (True, False))
     def test_epilogue_prologue_fusion_cache_preserved(self, use_async_compile: bool):
+        # [FUNCTION DOC] Regression test: with both prologue and epilogue fusion possible and
+        # prologue heuristics bypassed, compiling a matmul with pointwise ops before and after
+        # must not fail with an error from taking the minimum of an empty sequence while choosing
+        # a template choice. Only checks compilation succeeds; float32 inputs, ATen time infinite.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: adds one to a, matmuls with b and adds two.
             # Prologue: pointwise operation on input 'a' before matmul
             a_transformed = a + 1.0
             # Matmul
@@ -5696,6 +6563,7 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
 
         # Always allow prologue fusion heuristics
         def always_allow_prologue(*args):
+            # [FUNCTION DOC] HELPER: stand-in prologue heuristic check that always returns true.
             return True
 
         with self._setup_mm_heuristic(use_async_compile):
@@ -5723,10 +6591,16 @@ class TestEpilogueFusionStaticAnalysis(TestCase):
 
 
 def simple_fn():
+    # [FUNCTION DOC] HELPER: trivial picklable function returning 42, submitted to worker pools.
     return 42
 
 
 class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAnalysis):
+    # [CLASS DOC] Re-runs all max autotune and epilogue fusion static analysis tests with
+    # pipelined asynchronous autotuning turned on (single mm config, no epilogue benchmarking).
+    # Inherits both test classes. SKIP_TESTS maps test name fragments to skip reasons. Adds tests
+    # of the pool shutdown on inactivity and error fallback. Class fixtures enter/exit the config
+    # patch; setUp and tearDown reset the process pool and the async autotuner future cache.
     """Tests for AsyncPipelinedAutotuning path."""
 
     SKIP_TESTS = {
@@ -5739,6 +6613,9 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture: calls the parent fixture, then enters a config patch
+        # enabling pipelined GEMM autotuning, disabling epilogue benchmarking and limiting mm
+        # configs to 1. The patch object is stored on the class for exit later.
         super().setUpClass()
         cls._async_config = config.patch(
             {
@@ -5751,10 +6628,18 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class fixture: exits the pipelined autotune config patch, then calls
+        # the parent.
         cls._async_config.__exit__(None, None, None)
         super().tearDownClass()
 
     def setUp(self):
+        # [FUNCTION DOC] Resets the pool inactivity-shutdown flag, then skips the test if any
+        # name in SKIP_TESTS is a substring of this test's name, or if running on XPU or with the
+        # C++ wrapper.
+        # KNOWN ISSUE: the XPU and C++ wrapper conditions are inside the loop over skip names,
+        #   so they skip every test with the reason of the first listed entry rather than a
+        #   matching one.
         super().setUp()
         AutotuneProcessPool._shutdown_for_inactivity = False
         test_name = self._testMethodName
@@ -5763,6 +6648,9 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
                 self.skipTest(self.SKIP_TESTS[skip_test_name])
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown, shuts down the autotune process pool
+        # singleton, clears the inactivity flag and the future cache of the async autotuner to
+        # avoid cross-test leaks.
         super().tearDown()
         AutotuneProcessPool.shutdown_instance()
         AutotuneProcessPool._shutdown_for_inactivity = False
@@ -5771,10 +6659,16 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
 
     @config.patch(max_autotune_gemm=True)
     def test_async_autotuner_cache_same_inputs(self):
+        # [FUNCTION DOC] Compiles three matmuls, two with identical shapes and one different, and
+        # compares with eager. Then requires the async autotuner future cache to have exactly four
+        # entries. KNOWN ISSUE: the failure message says two entries but the assertion expects
+        # four (one ATen and one Triton choice per unique shape).
         M, K, N = 128, 64, 256
         M2, K2, N2 = 256, 128, 64
 
         def three_matmuls(a1, b1, a2, b2, a3, b3):
+            # [FUNCTION DOC] HELPER: returns the three matrix products of the pairs of inputs as
+            # a tuple.
             return torch.mm(a1, b1), torch.mm(a2, b2), torch.mm(a3, b3)
 
         # Same shapes for first two matmuls
@@ -5808,6 +6702,10 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
         2,
     )
     def test_autotune_process_pool_inactivity_shutdown(self):
+        # [FUNCTION DOC] With the inactivity timeout patched to 2 seconds, gets the pool
+        # singleton, warms it up, submits a trivial task and checks its result; then sleeps 5
+        # seconds and requires the internal worker pool and timer be released and the inactivity
+        # flag be set.
         AutotuneProcessPool.shutdown_instance()
         AutotuneProcessPool._shutdown_for_inactivity = False
 
@@ -5830,6 +6728,9 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
         2,
     )
     def test_autotune_process_pool_inactivity_shutdown_warmup_only(self):
+        # [FUNCTION DOC] Like the inactivity shutdown test but only warms up the pool (waiting
+        # for the warmup future); after 5 seconds the pool and timer must be released and the
+        # flag set.
         """Test that the pool shuts down from inactivity even when only warmup is called."""
         AutotuneProcessPool.shutdown_instance()
         AutotuneProcessPool._shutdown_for_inactivity = False
@@ -5852,6 +6753,11 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
     )
     @config.patch(max_autotune=True)
     def test_compilation_after_inactivity(self):
+        # [FUNCTION DOC] With a short inactivity timeout and max autotune on, resets state,
+        # compiles a matmul and checks the pipelined path filled the future cache; after waiting
+        # 5 seconds the pool must have shut down so pipelined autotuning is disabled; then
+        # compiling another matmul with a cleared cache must leave the future cache empty
+        # (synchronous path).
         """Test that compilation after pool inactivity shutdown uses synchronous path."""
 
         # Reset state
@@ -5864,6 +6770,7 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
         self.assertTrue(use_pipelined_autotuning())
 
         def matmul_fn(a, b):
+            # [FUNCTION DOC] HELPER: matrix product of the two inputs.
             return torch.mm(a, b)
 
         a1 = torch.randn(64, 32, device=GPU_TYPE, dtype=torch.bfloat16)
@@ -5895,24 +6802,34 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
 
     @config.patch(max_autotune_gemm=True)
     def test_triton_error_precompilation_and_autotuning(self):
+        # [FUNCTION DOC] Checks fallback to extern kernels when Triton autotuning fails. First
+        # patches the autotuning step to raise NoValidChoicesError; compiling mm with and without
+        # a pointwise epilogue must yield code with no Triton template kernel. Then patches the
+        # async autotuner start to give every Triton choice a benchmark request that raises in the
+        # subprocess, and repeats the check.
         """
         Test error handling when do_autotuning throws NoValidChoicesError
         for Triton choices. The fallback to extern kernels should still work.
         """
 
         def mock_do_autotuning(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: ignores arguments and raises NoValidChoicesError.
             raise NoValidChoicesError("Simulated: all Triton choices failed")
 
         a = torch.randn(64, 32, device=GPU_TYPE, dtype=torch.bfloat16)
         b = torch.randn(32, 64, device=GPU_TYPE, dtype=torch.bfloat16)
 
         def mm_func(a, b, epilogue):
+            # [FUNCTION DOC] HELPER: matrix product of a and b, plus one when the epilogue flag
+            # is true.
             if epilogue:
                 return torch.mm(a, b) + 1.0
             else:
                 return torch.mm(a, b)
 
         def test_aten_chosen():
+            # [FUNCTION DOC] HELPER: for each epilogue setting, resets dynamo, compiles the mm
+            # function and checks the generated code contains no Triton template kernel.
             for epilogue in (True, False):
                 torch._dynamo.reset()
                 compiled_fn = torch.compile(mm_func)
@@ -5931,6 +6848,9 @@ class TestMaxAutotuneAsyncPipelined(TestMaxAutotune, TestEpilogueFusionStaticAna
         bmreq.module_cache_key = ""
 
         def mock_start(choices, inputs_key):
+            # [FUNCTION DOC] HELPER: wrapper for the async autotuner start function; attaches
+            # the failing benchmark request to every Triton template caller, then calls the
+            # original start.
             for choice in choices:
                 if isinstance(choice, TritonTemplateCaller):
                     choice.bmreq = bmreq
