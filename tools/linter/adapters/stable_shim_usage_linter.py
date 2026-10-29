@@ -6,6 +6,14 @@ TORCH_FEATURE_VERSION macros corresponding to the version when those
 functions were introduced.
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that checks that calls to versioned shim functions are inside
+# TORCH_FEATURE_VERSION guards at least as new as the version that introduced them.
+# Main contents: discovery of versioned shim functions from the shim headers, regeneration of
+# the shim function versions text file, and the per-file check.
+# Import-time side effect: inserts the repository root at the front of sys.path to import the
+# shared _stable_shim_utils helpers. As a script it rewrites the versions file, lints the
+# given files and prints one JSON message per line.
 from __future__ import annotations
 
 import argparse
@@ -35,6 +43,12 @@ LINTER_CODE = "STABLE_SHIM_USAGE"
 def get_shim_functions(
     shim_files: list[Path | str] | None = None,
 ) -> dict[str, tuple[int, int, int]]:
+    # [FUNCTION DOC] Scans shim headers (a default list of stable and AOTI shim headers when
+    # none are given) line by line with a preprocessor tracker and records, for each
+    # identifier found inside a version guard, the guard version. Returns a mapping from name
+    # to version triple (major, minor, patch). Raises RuntimeError if any listed file is
+    # missing or if no versioned identifier is found at all.
+    # KNOWN ISSUE: docstring says (major, minor) tuples but values are three-element tuples.
     """
     Extract function names from shim header files and their required version.
     Returns a dict mapping function name to (major, minor) version tuple.
@@ -101,6 +115,11 @@ def write_shim_function_versions(
     functions: dict[str, tuple[int, int, int]],
     output_file: Path | str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Overwrites the versions text file with an auto-generated header followed
+    # by one line per function giving its minimum version macro name, sorted by version and
+    # then by name. Side effect: file write (default path is under the repository root).
+    # Returns nothing; raises OSError if the file cannot be written.
+    # KNOWN ISSUE: docstring says (major, minor) tuples but values are three-element tuples.
     """
     Write the shim function versions to a text file.
 
@@ -141,6 +160,12 @@ def write_shim_function_versions(
 def check_file(
     filename: str, shim_functions: dict[str, tuple[int, int, int]]
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Reads the file and tracks preprocessor version guards while searching each
+    # line for any known shim function name (or dynamic version call). For every use of a
+    # versioned function it emits an error message: unversioned-shim-call when outside any
+    # guard, or insufficient-version-for-shim-call when the enclosing guard version is lower
+    # than required. Lines that are comments or directives are skipped. Returns the list of
+    # LintMessage; raises OSError if the file cannot be read.
     """
     Check the input file for proper usage of versioned shim functions.
 

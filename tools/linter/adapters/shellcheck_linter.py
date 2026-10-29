@@ -4,6 +4,13 @@
 #   "shellcheck-py==0.7.2.1; platform_machine == 'x86_64'",
 # ]
 # ///
+# [MODULE DOC]
+# Lintrunner adapter that runs the shellcheck executable (found on PATH) over shell scripts
+# and prints one JSON lint message per line on stdout. Main contents: LintSeverity and
+# LintMessage types, the PATH lookup, the subprocess wrapper and check_files.
+# As a script: exits silently on non-x86_64 machines when shellcheck is missing, otherwise
+# emits a command-failed error message asking to run lintrunner init. No import-time side
+# effects.
 from __future__ import annotations
 
 import argparse
@@ -22,6 +29,8 @@ LINTER_CODE = "SHELLCHECK"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -29,6 +38,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -43,6 +55,9 @@ class LintMessage(NamedTuple):
 def run_command(
     args: list[str],
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Runs the given argument list as a subprocess, capturing stdout and
+    # stderr, and returns the completed process (no check on exit status). Logs the command
+    # and its elapsed time at debug level. Raises OSError if the program cannot be started.
     logging.debug("$ %s", " ".join(args))
     start_time = time.monotonic()
     try:
@@ -56,10 +71,14 @@ def run_command(
 
 
 def _is_x86_64() -> bool:
+    # [FUNCTION DOC] HELPER: Returns True when the host machine architecture is x86_64.
     return platform.machine() == "x86_64"
 
 
 def _shellcheck_candidates() -> list[str]:
+    # [FUNCTION DOC] HELPER: Scans the directories of the PATH environment variable in order,
+    # skipping empty entries, and returns the full paths of every executable regular file
+    # named shellcheck. Returns an empty list if none is found. Reads environment only.
     path_env = os.environ.get("PATH", "")
     candidates: list[str] = []
     for directory in path_env.split(os.pathsep):
@@ -74,6 +93,12 @@ def _shellcheck_candidates() -> list[str]:
 def check_files(
     files: list[str],
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Runs shellcheck (external sources enabled, JSON output) on the given
+    # files using the first PATH candidate that can be started, and converts each reported
+    # comment into an error-severity LintMessage named after the shellcheck code.
+    # Returns an empty list if no candidate could run because of an exec format error (errno 8)
+    # or the machine is not x86_64; otherwise returns a single command-failed message when no
+    # usable executable exists. Raises on malformed JSON output.
     args = ["--external-sources", "--format=json1"] + files
 
     proc: subprocess.CompletedProcess[bytes] | None = None

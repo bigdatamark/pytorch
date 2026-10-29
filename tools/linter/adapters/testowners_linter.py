@@ -16,6 +16,13 @@ upstream. Refresh it with:
       --output-file tools/linter/adapters/pytorch_labels.json
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that checks that each test file has an ownership comment header listing
+# owner labels, that every label exists in the checked-in label snapshot, and that it is a
+# module or oncall label or an accepted exception.
+# Main contents: LintSeverity/LintMessage types, check_labels, check_file and main.
+# Import-time side effect: reads and parses pytorch_labels.json next to this file into the
+# PYTORCH_LABELS set (raises if the file is missing or invalid).
 from __future__ import annotations
 
 import argparse
@@ -29,6 +36,8 @@ LINTER_CODE = "TESTOWNERS"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -36,6 +45,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -58,6 +70,12 @@ GLOB_EXCEPTIONS = ["**/test/run_test.py"]
 def check_labels(
     labels: list[str], filename: str, line_number: int
 ) -> list[LintMessage]:
+    # [FUNCTION DOC] Validates the owner labels found on one header line. Emits an
+    # invalid-label error for each label missing from the snapshot, and an invalid-owner error
+    # for each label that neither starts with a module or oncall prefix nor is in the
+    # acceptable list. Returns the messages tagged with the file name and line number.
+    # KNOWN ISSUE: the invalid-owner text names ACCEPTABLE_OWNERS_LABELS and a tools/linters
+    # path, but the constant is ACCEPTABLE_OWNER_LABELS and the directory is tools/linter.
     lint_messages = []
     for label in labels:
         if label not in PYTORCH_LABELS:
@@ -105,6 +123,10 @@ def check_labels(
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Scans the file line by line for lines starting with the owners prefix,
+    # decodes each remainder as a JSON list of labels and validates it. If no such line exists,
+    # adds a no-owner-info error. Returns all messages. Raises OSError if unreadable and a JSON
+    # error if an owners line is not valid JSON.
     lint_messages = []
     has_ownership_info = False
 
@@ -136,6 +158,9 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses the list of file paths, checks them one
+    # by one in this process and prints each message as a JSON line on standard output.
+    # KNOWN ISSUE: GLOB_EXCEPTIONS is defined but never used in this file.
     parser = argparse.ArgumentParser(
         description="test ownership linter",
         fromfile_prefix_chars="@",

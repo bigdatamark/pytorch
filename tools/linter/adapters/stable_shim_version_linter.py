@@ -5,6 +5,13 @@ are properly wrapped in TORCH_FEATURE_VERSION macros corresponding to the
 current TORCH_ABI_VERSION.
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that checks function declarations in the stable C shim header (and new
+# declarations in the manual AOTI shim headers) are wrapped in TORCH_FEATURE_VERSION guards,
+# and that newly added declarations use the current ABI version macro.
+# Main contents: git-diff based discovery of added lines and the per-file check.
+# Import-time side effect: inserts the repository root at the front of sys.path. As a script
+# it lints the given files and prints one JSON message per line.
 from __future__ import annotations
 
 import argparse
@@ -35,6 +42,10 @@ LINTER_CODE = "STABLE_SHIM_VERSION"
 
 
 def get_added_lines(filename: str) -> set[int]:
+    # [FUNCTION DOC] Collects 1-indexed line numbers of lines added to the file, both in the
+    # uncommitted working tree (diff against HEAD) and in commits since the merge base with
+    # main. Runs git as a subprocess in the repository root (the first call has a 5 second
+    # timeout and its result is used only on success). Raises RuntimeError wrapping any failure.
     """
     Get the line numbers of added lines in:
     1. Current uncommitted changes (git diff HEAD)
@@ -50,6 +61,9 @@ def get_added_lines(filename: str) -> set[int]:
     added_lines = set()
 
     def parse_diff(diff_output: str) -> set[int]:
+        # [FUNCTION DOC] HELPER: Parses unified diff text, tracking the new-file line counter from
+        # each hunk header, and returns the set of line numbers of added lines (ignoring
+        # file header lines and removed lines).
         """Parse git diff output and return line numbers of added lines."""
         lines = set()
         current_line = 0
@@ -95,6 +109,14 @@ def get_added_lines(filename: str) -> set[int]:
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Walks the header line by line, tracking preprocessor guards and whether
+    # the position is inside an extern "C" block. For each identifier declared inside that
+    # block it emits an error: unversioned-function-declaration when outside any guard
+    # (ignored for old lines of manual AOTI shims), or wrong-version-for-new-function when a
+    # newly added line sits under a guard other than the current version macro. Reads the file
+    # and git state; returns the list of LintMessage.
+    # KNOWN ISSUE: the guard macro name for the block is built with a patch of 0 regardless of
+    # the real patch, and the current version patch is compared against it.
     """
     Parse the stable/c/shim.h file and check that:
     1. All function declarations are within TORCH_FEATURE_VERSION blocks

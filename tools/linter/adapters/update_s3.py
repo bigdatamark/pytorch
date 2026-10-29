@@ -5,6 +5,10 @@ https://boto3.amazonaws.com/v1/documentation/api/latest/guide/quickstart.html#co
 for how to configure them.
 """
 
+# [MODULE DOC]
+# Command line tool that uploads a prebuilt linter binary to an S3 bucket and records the
+# binary SHA256 hash in a linter configuration JSON file. Main contents: compute_file_sha256
+# and main. Import-time dependency on boto3; no other import-time side effects.
 import argparse
 import hashlib
 import json
@@ -15,6 +19,8 @@ import boto3  # type: ignore[import]
 
 
 def compute_file_sha256(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the SHA256 digest of the file contents as a hex string,
+    # reading it in binary line chunks. Returns an empty string if the path does not exist.
     """Compute the SHA256 hash of a file and return it as a hex string."""
     # If the file doesn't exist, return an empty string.
     if not os.path.exists(path):
@@ -32,6 +38,13 @@ def compute_file_sha256(path: str) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Arguments: config JSON path, linter name,
+    # platform, file to upload and an optional dry-run flag. Looks up the bucket and object name
+    # for the linter and platform in the config, uploads the file to S3 (skipped on dry run),
+    # stores the new file hash in the config entry and rewrites the config file (skipped on
+    # dry run). Logs progress at info level. Raises KeyError for an unknown linter or platform,
+    # OSError for file problems and boto3 errors on upload failure.
+    # KNOWN ISSUE: if the file to upload does not exist, the stored hash becomes an empty string.
     parser = argparse.ArgumentParser(
         description="s3 binary updater",
         fromfile_prefix_chars="@",

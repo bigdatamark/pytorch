@@ -7,6 +7,10 @@ project root.
 Called by cmake/PostBuildSteps.cmake as a build-time custom command.
 """
 
+# [MODULE DOC]
+# Build-time script that merges the compile_commands.json files from a CMake build directory
+# into a single compile_commands.json in the project source directory. Main content: main.
+# No import-time side effects.
 import argparse
 import itertools
 import json
@@ -14,6 +18,12 @@ import pathlib
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point taking the build directory and source directory.
+    # Reads compile command files matching the compile commands pattern in the build directory
+    # and in subdirectories of the torch lib build folder, concatenates all entries, rewrites
+    # commands starting with gcc to use g++, and writes the merged JSON (indent 2) to the source
+    # directory only if the file is missing or its content differs. Raises OSError or a JSON
+    # error on bad input.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", type=pathlib.Path, help="CMake binary directory")
     parser.add_argument(

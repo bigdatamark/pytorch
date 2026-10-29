@@ -6,6 +6,13 @@ This lint verifies that every Python test file (file that matches test_*.py or
 to ensure that the test not fail on other GPU devices.
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that parses test files with the ast module and reports hard-coded GPU
+# device names (cuda, xpu, mps) in functions decorated with requires_gpu or requires_triton,
+# or in every function of a file whose main section is guarded by a GPU flag.
+# Main contents: LintSeverity/LintMessage types, the main-guard detector, the AST visitor
+# DeviceBiasVisitor, check_file and main (parallel over files with 8 worker processes,
+# printing JSON lines). No import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -20,6 +27,8 @@ LINTER_CODE = "TEST_DEVICE_BIAS"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -27,6 +36,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -43,7 +55,14 @@ GPU_RELATED_DECORATORS = {"requires_gpu", "requires_triton"}
 
 
 def is_main_has_gpu(tree: ast.AST) -> bool:
+    # [FUNCTION DOC] Returns True if the module has a top-level-style main guard (comparison of
+    # the module name with the main string) whose body directly contains a conditional that
+    # tests the HAS_GPU or RUN_GPU flag, i.e. the test suite is shared across GPU devices.
+    # Walks the whole tree; pure function, no side effects.
     def _contains_has_gpu(node: ast.AST) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if the expression is, or recursively contains
+        # through boolean operations, unary operations and comparisons, a name equal to
+        # HAS_GPU or RUN_GPU. Conditional expressions and calls count as False.
         if isinstance(node, ast.Name) and node.id in ["HAS_GPU", "RUN_GPU"]:
             return True
         elif isinstance(node, ast.BoolOp):
@@ -79,12 +98,19 @@ def is_main_has_gpu(tree: ast.AST) -> bool:
 
 
 class DeviceBiasVisitor(ast.NodeVisitor):
+    # [CLASS DOC] AST visitor that collects device-bias lint messages for one file.
+    # State: filename, the accumulating lint_messages list, and is_gpu_test_suite (whether the
+    # main section is GPU guarded, which makes every function checked). Function definitions
+    # are checked when decorated with a GPU decorator or when the file is a GPU test suite.
     def __init__(self, filename: str, is_gpu_test_suite: bool) -> None:
+        # [FUNCTION DOC] Stores the file name and suite flag and starts with no messages.
         self.filename = filename
         self.lint_messages: list[LintMessage] = []
         self.is_gpu_test_suite = is_gpu_test_suite
 
     def _has_proper_decorator(self, node: ast.FunctionDef) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if any decorator of the function, either bare or
+        # called, is named requires_gpu or requires_triton.
         for d in node.decorator_list:
             if isinstance(d, ast.Name) and d.id in GPU_RELATED_DECORATORS:
                 return True
@@ -98,6 +124,11 @@ class DeviceBiasVisitor(ast.NodeVisitor):
 
     # check device = "cuda" or torch.device("cuda")
     def _check_keyword_device(self, subnode: ast.keyword, msg_prefix: str) -> None:
+        # [FUNCTION DOC] HELPER: For a keyword argument named device, records a message if its
+        # value is a string constant containing a biased device name, or a call to a device
+        # attribute whose first argument is such a string. Other keywords are ignored.
+        # KNOWN ISSUE: assumes a constant value supports substring tests; a non-string
+        # constant (for example a number) would raise a TypeError.
         if subnode.arg != "device":
             return
         val = subnode.value
@@ -126,6 +157,11 @@ class DeviceBiasVisitor(ast.NodeVisitor):
 
     # check .cuda() or .to("cuda")
     def _check_device_methods(self, subnode: ast.Call, msg_prefix: str) -> None:
+        # [FUNCTION DOC] HELPER: For a method call, records a message when the method name is
+        # one of the biased device names (cuda, xpu, mps) or when it is the to method with a
+        # first string-constant argument containing such a name.
+        # KNOWN ISSUE: a non-string constant first argument to the to method would raise a
+        # TypeError on the substring test.
         func = subnode.func
         if not isinstance(func, ast.Attribute):
             return
@@ -148,6 +184,8 @@ class DeviceBiasVisitor(ast.NodeVisitor):
                 )
 
     def _check_with_statement(self, node: ast.With, msg_prefix: str) -> None:
+        # [FUNCTION DOC] HELPER: Records a message for each context manager item that is a call
+        # to torch device with a first string-constant argument containing a biased name.
         for item in node.items:
             ctx_expr = item.context_expr
             if isinstance(ctx_expr, ast.Call):
@@ -168,6 +206,9 @@ class DeviceBiasVisitor(ast.NodeVisitor):
                     )
 
     def _check_node(self, node: ast.AST, msg_prefix: str) -> None:
+        # [FUNCTION DOC] HELPER: Walks every descendant of the node and dispatches keyword
+        # arguments, attribute calls and with statements to the matching device checks,
+        # prefixing messages with msg_prefix.
         for subnode in ast.walk(node):
             if isinstance(subnode, ast.keyword):
                 self._check_keyword_device(subnode, msg_prefix)
@@ -179,6 +220,10 @@ class DeviceBiasVisitor(ast.NodeVisitor):
                 self._check_with_statement(subnode, msg_prefix)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # [FUNCTION DOC] Visitor hook for function definitions. Checks the function body with a
+        # decorator-specific message prefix if it has a GPU decorator, otherwise with a
+        # shared-suite prefix if the file is a GPU test suite. Then continues into nested nodes.
+        # KNOWN ISSUE: async function definitions are not visited by this hook.
         if self._has_proper_decorator(node):
             msg_prefix = (
                 "`@requires_gpu` or `@requires_triton` function should not hardcode"
@@ -191,6 +236,8 @@ class DeviceBiasVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def record(self, node: ast.AST, message: str) -> None:
+        # [FUNCTION DOC] Appends an error-severity device-bias LintMessage to the list, using the
+        # node line number (None if the node has none) and the given description.
         self.lint_messages.append(
             LintMessage(
                 path=self.filename,
@@ -207,6 +254,9 @@ class DeviceBiasVisitor(ast.NodeVisitor):
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Reads and parses one Python file, determines whether its main section is
+    # GPU guarded, runs the device-bias visitor and returns its messages. Raises OSError if
+    # the file cannot be read and SyntaxError if it cannot be parsed.
     with open(filename) as f:
         source = f.read()
         tree = ast.parse(source, filename=filename)
@@ -217,6 +267,9 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses the list of file paths, checks them in a
+    # pool of 8 processes, flattens the results and prints each message as a JSON line on
+    # standard output.
     parser = argparse.ArgumentParser(
         description="Detect Device bias in functions decorated with requires_gpu/requires_triton"
         " or guarded by HAS_GPU block in main() that may break other GPU devices.",

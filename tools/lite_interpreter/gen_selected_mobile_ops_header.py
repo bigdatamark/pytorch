@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Generates the selected_mobile_ops.h C++ header used by selective (mobile) builds: an operator
+# allowlist macro, optional custom class and build feature allowlists, and an inline function
+# that decides whether a kernel dtype is included. Main contents: code templates, helpers that
+# render the dtype check and write the header, and a command line main that reads a YAML list of
+# root operators. Import-time side effect: builds the code templates and picks the YAML loader.
 from __future__ import annotations
 
 import argparse
@@ -50,6 +56,8 @@ selected_mobile_ops_preamble = """#pragma once
 
 
 def extract_root_operators(selective_builder: SelectiveBuilder) -> set[str]:
+    # [FUNCTION DOC] Returns the set of names of operators in the selective builder that are
+    # marked as root operators.
     ops = []
     for op_name, op in selective_builder.operators.items():
         if op.is_root_operator:
@@ -60,6 +68,11 @@ def extract_root_operators(selective_builder: SelectiveBuilder) -> set[str]:
 def get_selected_kernel_dtypes_code(
     selective_builder: SelectiveBuilder,
 ) -> str:
+    # [FUNCTION DOC] Renders the C++ source of the inline function that tells whether a kernel
+    # dtype is selected. By default the body always returns true. When the builder neither
+    # includes all operators nor all non-operator selectives, the body instead has one branch
+    # per kernel tag that compares the scalar type against that tag's selected dtypes (joined by
+    # logical or), falling through to false. Returns the full header text; pure function.
     # See https://www.internalfb.com/intern/paste/P153411698/ for an example of the
     # generated code in case all kernel dtypes are selected and in case some kernel
     # dtypes are selected (i.e. both cases).
@@ -91,6 +104,11 @@ def write_selected_mobile_ops(
     output_file_path: str,
     selective_builder: SelectiveBuilder,
 ) -> None:
+    # [FUNCTION DOC] Writes the selected_mobile_ops.h header to the given path (overwriting it),
+    # as UTF-8 bytes. Content: preamble; if not all operators are included, an operator
+    # allowlist macro of sorted root operators, and when the builder is tracing based (not all
+    # non-operator selectives) also sorted custom class and build feature allowlist macros;
+    # finally the kernel dtype check code. Raises OSError if the file cannot be written.
     root_ops = extract_root_operators(selective_builder)
     custom_classes = selective_builder.custom_classes
     build_features = selective_builder.build_features
@@ -130,6 +148,9 @@ def write_selected_mobile_ops_with_all_dtypes(
     output_file_path: str,
     root_ops: set[str],
 ) -> None:
+    # [FUNCTION DOC] Writes the selected_mobile_ops.h header to the given path (overwriting it)
+    # with the sorted root operator allowlist macro from the given set and a kernel dtype check
+    # that accepts every dtype (built from a no-op selector). Raises OSError on write failure.
     with open(output_file_path, "wb") as out_file:
         body_parts = [selected_mobile_ops_preamble]
         body_parts.append(
@@ -144,6 +165,12 @@ def write_selected_mobile_ops_with_all_dtypes(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Takes a YAML file path and an output directory,
+    # loads the YAML (whose top level is treated as a collection of root operator names), prints
+    # progress, and writes selected_mobile_ops.h into the output directory with all dtypes
+    # selected. Raises OSError or a YAML error on bad input.
+    # KNOWN ISSUE: the help text calls the output option a destination folder, and the
+    # initial empty mapping assigned to the loaded model is immediately overwritten.
     parser = argparse.ArgumentParser(
         description="Generate selected_mobile_ops.h for selective build."
     )

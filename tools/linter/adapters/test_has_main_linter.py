@@ -4,6 +4,11 @@
 #   "libcst",
 # ]
 # ///
+# [MODULE DOC]
+# Lintrunner adapter (uses libcst) that verifies each test file has a main guard block that
+# calls run_tests or run_rank or raises an exception, so the tests run in OSS CI.
+# Main contents: HasMainVisiter, LintSeverity/LintMessage types, check_file and main (parallel
+# over files with 8 worker processes, printing JSON lines). No import-time side effects.
 """
 This lint verifies that every Python test file (file that matches test_*.py or
 *_test.py in the test folder) has a main block which raises an exception or
@@ -28,11 +33,18 @@ LINTER_CODE = "TEST_HAS_MAIN"
 
 
 class HasMainVisiter(cst.CSTVisitor):
+    # [CLASS DOC] CST visitor that sets the found flag when a module has a main guard (name
+    # compared for equality with the main string in either order) whose body contains a call
+    # to run_tests or run_rank (plain or as attribute) or a raise statement.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the visitor with found set to false.
         super().__init__()
         self.found = False
 
     def visit_Module(self, node: cst.Module) -> bool:
+        # [FUNCTION DOC] Inspects only the direct children of the module for a matching main
+        # guard conditional and sets found on the first match. Returns False so the visitor
+        # does not descend further.
         name = m.Name("__name__")
         main = m.SimpleString('"__main__"') | m.SimpleString("'__main__'")
         run_test_call = m.Call(
@@ -64,6 +76,8 @@ class HasMainVisiter(cst.CSTVisitor):
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -71,6 +85,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -83,6 +100,10 @@ class LintMessage(NamedTuple):
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Parses the file with libcst and runs the main-guard visitor. Returns a
+    # single error message named no-main (without a line number) if no suitable main block was
+    # found, else an empty list. Raises OSError if unreadable and a libcst parse error if the
+    # source is invalid.
     lint_messages = []
 
     with open(filename) as f:
@@ -112,6 +133,9 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses the list of file paths, checks them in a
+    # pool of 8 processes, flattens the results and prints each message as a JSON line on
+    # standard output.
     parser = argparse.ArgumentParser(
         description="test files should have main block linter",
         fromfile_prefix_chars="@",

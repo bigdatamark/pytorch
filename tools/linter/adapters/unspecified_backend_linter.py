@@ -12,6 +12,12 @@ tests down and couples them to codegen flakiness.  This linter forces every
 Suppress a deliberate use with a trailing ``# noqa: UNSPECIFIED_BACKEND``.
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that reports calls and decorator uses of torch.compile that do not pass
+# an explicit backend argument in Dynamo tests, unless the line carries the suppression
+# comment for this linter. Main contents: LintSeverity/LintMessage types, helpers that
+# recognize torch.compile and check suppression, check_file and main (parallel over files with
+# 8 worker processes, printing JSON lines). No import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -26,6 +32,8 @@ LINTER_CODE = "UNSPECIFIED_BACKEND"
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -33,6 +41,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -45,6 +56,8 @@ class LintMessage(NamedTuple):
 
 
 def _is_torch_compile(func: ast.expr) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the expression is an attribute access named
+    # compile on the name torch.
     # Matches ``torch.compile`` (the attribute access), whether called or used
     # bare as a decorator.
     return (
@@ -56,10 +69,13 @@ def _is_torch_compile(func: ast.expr) -> bool:
 
 
 def _has_backend_kwarg(call: ast.Call) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the call passes a keyword argument named backend.
     return any(kw.arg == "backend" for kw in call.keywords)
 
 
 def _suppressed(source_lines: list[str], start: int, end: int) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any source line in the inclusive 1-based range
+    # contains the noqa marker for this linter code.
     # start/end are 1-based inclusive line numbers spanning the call.
     for lineno in range(start, end + 1):
         if f"noqa: {LINTER_CODE}" in source_lines[lineno - 1]:
@@ -68,6 +84,10 @@ def _suppressed(source_lines: list[str], start: int, end: int) -> bool:
 
 
 def check_file(filename: str) -> list[LintMessage]:
+    # [FUNCTION DOC] Parses the file and collects torch.compile calls without a backend keyword
+    # plus bare torch.compile decorators, skipping those whose line span has the suppression
+    # comment. Returns an implicit-inductor-backend error per offender (with 1-based column), or
+    # a single syntax-error message if the file cannot be parsed. Raises OSError if unreadable.
     with open(filename) as f:
         source = f.read()
     source_lines = source.splitlines()
@@ -138,6 +158,8 @@ def check_file(filename: str) -> list[LintMessage]:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses the list of file paths, checks them in a
+    # pool of 8 processes and prints each message as a JSON line on standard output.
     parser = argparse.ArgumentParser(
         description="Dynamo test torch.compile backend linter",
         fromfile_prefix_chars="@",

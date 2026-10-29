@@ -9,6 +9,12 @@ the env vars above can legitimately differ between the sdist build and a
 wheel built from it (e.g. CUDA nightly wheels).
 """
 
+# [MODULE DOC]
+# scikit-build-core dynamic metadata provider for the dependencies field. Exports
+# dynamic_metadata (builds the dependency list from a base list plus environment variables)
+# and dynamic_wheel (marks the field dynamic for wheels built from an sdist). Defines
+# BASE_DEPENDENCIES. Imports the sibling _common module at top level. No other import-time
+# side effects.
 from __future__ import annotations
 
 import os
@@ -36,6 +42,8 @@ BASE_DEPENDENCIES = [
 
 
 def _is_truthy(val: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the value is set and, uppercased, is one of ON, 1,
+    # YES, TRUE or Y; False for None or anything else.
     return val is not None and val.upper() in ("ON", "1", "YES", "TRUE", "Y")
 
 
@@ -43,6 +51,12 @@ def dynamic_metadata(
     settings: Mapping[str, Any],
     project: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Provider hook returning a mapping with the dependencies list. Starts from
+    # the base dependencies; if BUILD_PYTHON_ONLY is truthy, appends the libtorch wheel package
+    # (name from LIBTORCH_PACKAGE_NAME, default torch_no_python) pinned to the torch version;
+    # then appends the pipe-separated entries of PYTORCH_EXTRA_INSTALL_REQUIREMENTS, stripped
+    # and skipping empty ones. Raises RuntimeError if any settings are passed. The project
+    # argument is unused. Reads environment only.
     if settings:
         msg = f"This provider takes no settings, got {sorted(settings)}"
         raise RuntimeError(msg)
@@ -64,4 +78,7 @@ def dynamic_metadata(
 
 
 def dynamic_wheel(settings: Mapping[str, Any]) -> dict[str, bool]:
+    # [FUNCTION DOC] Provider hook declaring that the dependencies field is dynamic in the
+    # wheel metadata (it may differ from the sdist). Always returns a mapping with that field
+    # set true; settings are ignored.
     return {"dependencies": True}

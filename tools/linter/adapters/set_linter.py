@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Lintrunner adapter that flags uses of the builtin set type (calls and braced set literals)
+# and proposes autofix replacements using OrderedSet from torch.utils._ordered_set.
+# Main content: SetLinter, a FileLinter subclass, plus the message/description constants.
+# Import-time side effect: picks the relative or absolute import of the shared _linter module
+# depending on whether this directory is already on sys.path. Run as a script, it invokes
+# SetLinter.run().
 from __future__ import annotations
 
 import sys
@@ -70,12 +77,22 @@ tuple is more time-efficient than an OrderedSet and also has less visual clutter
 
 
 class SetLinter(_linter.FileLinter):
+    # [CLASS DOC]
+    # File linter that reports every use of the builtin set and every braced set literal.
+    # It is stateless apart from class attributes (linter name, description, epilog) and
+    # reports column numbers. The only overridden hook is _lint.
     linter_name = "set_linter"
     description = DESCRIPTION
     epilog = EPILOG
     report_column_numbers = True
 
     def _lint(self, pf: _linter.PythonFile) -> Iterator[_linter.LintResult]:
+        # [FUNCTION DOC] HELPER: Generator of lint results for one parsed Python file.
+        # If the file has any set usage and an import insertion point is known, first yields
+        # a result adding the OrderedSet import line. Then for each braced set yields two
+        # results rewriting the opening token to the start of an OrderedSet list call and the
+        # closing token to the end of it, and for each use of the set name yields a rename to
+        # OrderedSet. Does not mutate the file; no exceptions raised here.
         if (pf.sets or pf.braced_sets) and (ins := pf.insert_import_line) is not None:
             yield _linter.LintResult(
                 "Add import for OrderedSet", ins, 0, IMPORT_LINE, 0

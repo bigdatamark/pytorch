@@ -9,6 +9,13 @@
 Any job with a specific `sync-tag` must match all other jobs with the same `sync-tag`.
 """
 
+# [MODULE DOC]
+# Lintrunner adapter that checks that GitHub workflow jobs sharing a sync-tag value are
+# identical (after normalizing fields that are allowed to differ). Main contents: YAML loading
+# helpers, get_jobs_with_sync_tag, print_lint_message and a script section.
+# Run as a script: loads every workflow under .github/workflows, groups jobs by sync-tag, then
+# compares jobs of the files passed on the command line against that group and prints JSON
+# lint messages. Import-time side effect: none beyond imports and choosing the YAML loader.
 from __future__ import annotations
 
 import argparse
@@ -37,6 +44,8 @@ except ImportError:
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] HELPER: String-valued enumeration of lint severities (error, warning,
+    # advice, disabled) serialized into the JSON output consumed by lintrunner.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -44,6 +53,9 @@ class LintSeverity(str, Enum):
 
 
 class LintMessage(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of one lint finding in the lintrunner JSON format:
+    # path, line and char (each optional), linter code, severity, short name, optional
+    # original and replacement text (for autofix), and an optional description.
     path: str | None
     line: int | None
     char: int | None
@@ -56,15 +68,21 @@ class LintMessage(NamedTuple):
 
 
 def glob_yamls(path: Path) -> Iterable[Path]:
+    # [FUNCTION DOC] HELPER: Returns a lazy iterable of all yml and yaml files found
+    # recursively under the given directory.
+    # KNOWN ISSUE: not used anywhere in this file.
     return itertools.chain(path.glob("**/*.yml"), path.glob("**/*.yaml"))
 
 
 def load_yaml(path: Path) -> Any:
+    # [FUNCTION DOC] HELPER: Opens the file and returns its parsed YAML content using the
+    # safe loader (the C implementation when available). Raises OSError or a YAML error.
     with open(path) as f:
         return load(f, Loader)
 
 
 def is_workflow(yaml: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the parsed YAML mapping has a jobs entry.
     return yaml.get("jobs") is not None
 
 
@@ -75,6 +93,12 @@ def print_lint_message(
     baseline_path: Path,
     baseline_job_id: str,
 ) -> None:
+    # [FUNCTION DOC] Prints one JSON workflow-inconsistency error for a job that differs from
+    # the baseline job with the same sync-tag. Reads the workflow file and uses the line of the
+    # last line containing the first key of the job dictionary followed by a colon as the
+    # location. Side effect: prints to standard output.
+    # KNOWN ISSUE: the first key of the job dictionary is not the job id (the dictionary holds
+    # job fields), and line number is unbound (NameError) if no line matches.
     job_id = next(iter(job.keys()))
     with open(path) as f:
         lines = f.readlines()
@@ -100,6 +124,13 @@ def print_lint_message(
 def get_jobs_with_sync_tag(
     job: dict[str, Any],
 ) -> tuple[str, str, dict[str, Any]] | None:
+    # [FUNCTION DOC] Returns None if the job has no sync-tag in its with section. Otherwise
+    # mutates the job in place to drop fields allowed to differ (the if condition, test-matrix,
+    # tests-to-include, ROCm build-environment and ROCm job name) and to normalize needs by
+    # removing the job-filter dependency (single entry collapses to a string). Returns a tuple
+    # of sync tag, job id and the job mapping.
+    # KNOWN ISSUE: the job id is read from a name not defined in this function; it only works
+    # because the script section defines a module-level loop variable of that name.
     sync_tag = job.get("with", {}).get("sync-tag")
     if sync_tag is None:
         return None

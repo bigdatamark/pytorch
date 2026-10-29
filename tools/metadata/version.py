@@ -7,6 +7,10 @@ Delegates to tools/generate_torch_version.py which resolves the version from
   3. version.txt + git SHA (local dev builds)
 """
 
+# [MODULE DOC]
+# scikit-build-core dynamic metadata provider for the version field. Exports dynamic_metadata,
+# which returns the torch version from the shared helper. Imports the sibling _common module
+# at top level. No other import-time side effects.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -26,6 +30,9 @@ def dynamic_metadata(
     settings: Mapping[str, Any],
     project: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Provider hook returning a mapping with the version field set to the
+    # resolved torch version string. Raises RuntimeError if any settings are passed. The
+    # project argument is unused.
     if settings:
         msg = f"This provider takes no settings, got {sorted(settings)}"
         raise RuntimeError(msg)
