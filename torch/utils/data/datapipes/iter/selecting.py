@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Iterable DataPipe that selects elements: FilterIterDataPipe (functional name filter) keeps
+# only elements for which a user predicate returns true. Registered at import time through
+# the functional_datapipe decorator.
 from collections.abc import Callable, Iterator
 from typing import TypeVar
 
@@ -21,6 +25,11 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 @functional_datapipe("filter")
 class FilterIterDataPipe(IterDataPipe[_T_co]):
+    # [CLASS DOC]
+    # Iterable DataPipe that yields only source elements accepted by filter_fn. State: the
+    # source datapipe, the predicate, and input_col which selects the part of each element
+    # (index, key, or several of them) passed to the predicate. Also supports DataFrame
+    # elements via a mask column. Rejected elements have their streams closed.
     r"""
     Filters out elements from the source datapipe according to input ``filter_fn`` (functional name: ``filter``).
 
@@ -53,6 +62,10 @@ class FilterIterDataPipe(IterDataPipe[_T_co]):
         filter_fn: Callable,
         input_col=None,
     ) -> None:
+        # [FUNCTION DOC] Stores the source and predicate and the input column selector.
+        # Raises if the predicate is not picklable (lambda or nested function) or if
+        # validate_input_col finds the column selector inconsistent with the predicate's
+        # arguments.
         super().__init__()
         self.datapipe = datapipe
 
@@ -63,6 +76,9 @@ class FilterIterDataPipe(IterDataPipe[_T_co]):
         validate_input_col(filter_fn, input_col)
 
     def _apply_filter_fn(self, data) -> bool:
+        # [FUNCTION DOC] HELPER: Calls the predicate on the whole element when input_col is
+        # unset, on the several selected items as separate arguments when input_col is a
+        # list or tuple, or on the single selected item otherwise. Returns its result.
         if self.input_col is None:
             return self.filter_fn(data)
         elif isinstance(self.input_col, (list, tuple)):
@@ -72,6 +88,8 @@ class FilterIterDataPipe(IterDataPipe[_T_co]):
             return self.filter_fn(data[self.input_col])
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Yields each source element (or the filtered DataFrame rows) that
+        # passes the predicate; for rejected elements closes any stream objects they hold.
         for data in self.datapipe:
             condition, filtered = self._returnIfTrue(data)
             if condition:
@@ -80,6 +98,10 @@ class FilterIterDataPipe(IterDataPipe[_T_co]):
                 StreamWrapper.close_streams(data)
 
     def _returnIfTrue(self, data: _T) -> tuple[bool, _T]:
+        # [FUNCTION DOC] HELPER: Evaluates the predicate and returns a pair of (accepted,
+        # data). For a DataFrame mask column, returns the concatenation of the selected rows
+        # (or rejection with no data if none are selected). Raises ValueError when a
+        # non-DataFrame predicate result is not a bool.
         condition = self._apply_filter_fn(data)
 
         if df_wrapper.is_column(condition):

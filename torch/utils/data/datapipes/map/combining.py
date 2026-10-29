@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Map DataPipes that combine several Map DataPipes: ConcaterMapDataPipe (concat, indexes
+# run through the sources one after another) and ZipperMapDataPipe (zip, same index from
+# every source as a tuple). Registers functional names at import time.
 from collections.abc import Sized
 from typing import TypeVar
 
@@ -13,6 +17,9 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 @functional_datapipe("concat")
 class ConcaterMapDataPipe(MapDataPipe):
+    # [CLASS DOC]
+    # MapDataPipe presenting several sized Map DataPipes as one sequence; length is the sum
+    # of source lengths. State: tuple of source datapipes.
     r"""
     Concatenate multiple Map DataPipes (functional name: ``concat``).
 
@@ -38,6 +45,8 @@ class ConcaterMapDataPipe(MapDataPipe):
     datapipes: tuple[MapDataPipe]
 
     def __init__(self, *datapipes: MapDataPipe) -> None:
+        # [FUNCTION DOC] Stores the source datapipes. Raises ValueError if none are given and
+        # TypeError if any is not a MapDataPipe or has no length.
         if len(datapipes) == 0:
             raise ValueError("Expected at least one DataPipe, but got nothing")
         if not all(isinstance(dp, MapDataPipe) for dp in datapipes):
@@ -48,6 +57,9 @@ class ConcaterMapDataPipe(MapDataPipe):
         self.datapipes = datapipes  # type: ignore[assignment]
 
     def __getitem__(self, index) -> _T_co:  # type: ignore[type-var]
+        # [FUNCTION DOC] Walks the sources in order, subtracting each source's length, and
+        # returns the item from the first source whose range contains the index. Raises
+        # IndexError if the index is beyond all sources.
         offset = 0
         for dp in self.datapipes:
             # pyrefly: ignore [bad-argument-type]
@@ -59,12 +71,16 @@ class ConcaterMapDataPipe(MapDataPipe):
         raise IndexError(f"Index {index} is out of range.")
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Sum of the lengths of all source datapipes.
         # pyrefly: ignore [bad-argument-type]
         return sum(len(dp) for dp in self.datapipes)
 
 
 @functional_datapipe("zip")
 class ZipperMapDataPipe(MapDataPipe[tuple[_T_co, ...]]):
+    # [CLASS DOC]
+    # MapDataPipe whose item at an index is the tuple of the same-index items of all source
+    # datapipes; length is the shortest source length. State: tuple of sources.
     r"""
     Aggregates elements into a tuple from each of the input DataPipes (functional name: ``zip``).
 
@@ -86,6 +102,8 @@ class ZipperMapDataPipe(MapDataPipe[tuple[_T_co, ...]]):
     datapipes: tuple[MapDataPipe[_T_co], ...]
 
     def __init__(self, *datapipes: MapDataPipe[_T_co]) -> None:
+        # [FUNCTION DOC] Stores the source datapipes. Raises ValueError if none are given and
+        # TypeError if any is not a MapDataPipe or has no length.
         if len(datapipes) == 0:
             raise ValueError("Expected at least one DataPipe, but got nothing")
         if not all(isinstance(dp, MapDataPipe) for dp in datapipes):
@@ -96,6 +114,8 @@ class ZipperMapDataPipe(MapDataPipe[tuple[_T_co, ...]]):
         self.datapipes = datapipes
 
     def __getitem__(self, index) -> tuple[_T_co, ...]:
+        # [FUNCTION DOC] Collects the item at the index from every source and returns them as
+        # a tuple. Raises IndexError (chained to the original) if any source lacks the index.
         res = []
         for dp in self.datapipes:
             try:
@@ -107,5 +127,6 @@ class ZipperMapDataPipe(MapDataPipe[tuple[_T_co, ...]]):
         return tuple(res)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Smallest length among the source datapipes.
         # pyrefly: ignore [bad-argument-type]
         return min(len(dp) for dp in self.datapipes)

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# SequenceWrapperMapDataPipe: wraps a sequence or mapping as a MapDataPipe, optionally
+# deep-copying it at construction.
 import copy
 import warnings
 from collections.abc import Mapping, Sequence
@@ -12,6 +15,9 @@ __all__ = ["SequenceWrapperMapDataPipe"]
 
 
 class SequenceWrapperMapDataPipe(MapDataPipe[_T]):
+    # [CLASS DOC]
+    # MapDataPipe backed by a sequence or mapping held in the sequence attribute; item
+    # access and length delegate to it.
     r"""
     Wraps a sequence object into a MapDataPipe.
 
@@ -41,6 +47,9 @@ class SequenceWrapperMapDataPipe(MapDataPipe[_T]):
     def __init__(
         self, sequence: Sequence[_T] | Mapping[Any, _T], deepcopy: bool = True
     ) -> None:
+        # [FUNCTION DOC] Stores the sequence, as a deep copy when deepcopy is set. If copying
+        # raises TypeError, emits a warning and keeps the original object. Does not call the
+        # parent initializer.
         if deepcopy:
             try:
                 self.sequence = copy.deepcopy(sequence)
@@ -55,7 +64,10 @@ class SequenceWrapperMapDataPipe(MapDataPipe[_T]):
             self.sequence = sequence
 
     def __getitem__(self, index: int) -> _T:
+        # [FUNCTION DOC] Returns the wrapped sequence's item for the index or key; errors
+        # from the underlying object propagate.
         return self.sequence[index]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the length of the wrapped sequence or mapping.
         return len(self.sequence)

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Samplers that decide the order of dataset indices for a data loader: the Sampler base
+# class, SequentialSampler, RandomSampler, SubsetRandomSampler, WeightedRandomSampler and
+# BatchSampler (groups indices into lists). No import-time side effects.
 import itertools
 from collections.abc import Iterable, Iterator, Sequence, Sized
 from typing import Generic, TypeVar
@@ -26,6 +30,10 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 
 class Sampler(Generic[_T_co]):
+    # [CLASS DOC]
+    # Abstract base for samplers: subclasses implement __iter__ to yield dataset indices (or
+    # lists of indices) and may implement __len__. Deliberately has no default __len__ (see
+    # the note below). Holds no state.
     r"""Base class for all Samplers.
 
     Every Sampler subclass has to provide an :meth:`__iter__` method, providing a
@@ -64,6 +72,8 @@ class Sampler(Generic[_T_co]):
     """
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Abstract: always raises NotImplementedError; subclasses return an
+        # iterator over indices.
         raise NotImplementedError
 
     # NOTE [ Lack of Default `__len__` in Python Abstract Base Classes ]
@@ -95,6 +105,9 @@ class Sampler(Generic[_T_co]):
 
 
 class SequentialSampler(Sampler[int]):
+    # [CLASS DOC]
+    # Sampler yielding 0 up to len(data_source)-1 in order. State: the sized data source;
+    # length is evaluated on use, so it follows later changes of the source.
     r"""Samples elements sequentially, always in the same order.
 
     Args:
@@ -104,16 +117,25 @@ class SequentialSampler(Sampler[int]):
     data_source: Sized
 
     def __init__(self, data_source: Sized) -> None:
+        # [FUNCTION DOC] Stores the data source.
         self.data_source = data_source
 
     def __iter__(self) -> Iterator[int]:
+        # [FUNCTION DOC] Returns an iterator over the integers from zero to the source length
+        # minus one.
         return iter(range(len(self.data_source)))
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Length of the data source.
         return len(self.data_source)
 
 
 class RandomSampler(Sampler[int]):
+    # [CLASS DOC]
+    # Sampler yielding random indices in the range of the data source, either shuffled passes
+    # without replacement or independent draws with replacement. State: data source,
+    # replacement flag, optional requested sample count (default is the source length,
+    # re-read each time) and optional generator. Each iteration draws fresh randomness.
     r"""Samples elements randomly. If without replacement, then sample from a shuffled dataset.
 
     If with replacement, then user can specify :attr:`num_samples` to draw.
@@ -135,6 +157,9 @@ class RandomSampler(Sampler[int]):
         num_samples: int | None = None,
         generator=None,
     ) -> None:
+        # [FUNCTION DOC] Stores the options. Raises TypeError if replacement is not a bool and
+        # ValueError if the sample count is not a positive integer (this reads the length of
+        # the source when no count was given).
         self.data_source = data_source
         self.replacement = replacement
         self._num_samples = num_samples
@@ -152,12 +177,18 @@ class RandomSampler(Sampler[int]):
 
     @property
     def num_samples(self) -> int:
+        # [FUNCTION DOC] Property: the requested sample count, or the current source length
+        # if none was requested.
         # dataset size might change at runtime
         if self._num_samples is None:
             return len(self.data_source)
         return self._num_samples
 
     def __iter__(self) -> Iterator[int]:
+        # [FUNCTION DOC] Generator of num_samples indices. Without a generator, seeds a new one
+        # from the global torch RNG (consuming it). With replacement, draws random integers in
+        # blocks of 32 plus a remainder block. Without replacement, yields whole random
+        # permutations, then a prefix of one more for the remainder.
         n = len(self.data_source)
         if self.generator is None:
             seed = int(torch.empty((), dtype=torch.int64).random_().item())
@@ -185,10 +216,14 @@ class RandomSampler(Sampler[int]):
             ]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] The number of samples that iteration yields.
         return self.num_samples
 
 
 class SubsetRandomSampler(Sampler[int]):
+    # [CLASS DOC]
+    # Sampler yielding the entries of a given index sequence in random order, each once per
+    # pass. State: the index sequence and an optional generator.
     r"""Samples elements randomly from a given list of indices, without replacement.
 
     Args:
@@ -199,18 +234,26 @@ class SubsetRandomSampler(Sampler[int]):
     indices: Sequence[int]
 
     def __init__(self, indices: Sequence[int], generator=None) -> None:
+        # [FUNCTION DOC] Stores the index sequence and the optional generator.
         self.indices = indices
         self.generator = generator
 
     def __iter__(self) -> Iterator[int]:
+        # [FUNCTION DOC] Draws a random permutation of positions (using the generator if set,
+        # else the global RNG) and yields the index sequence entries in that order.
         for i in torch.randperm(len(self.indices), generator=self.generator).tolist():
             yield self.indices[i]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of indices in the sequence.
         return len(self.indices)
 
 
 class WeightedRandomSampler(Sampler[int]):
+    # [CLASS DOC]
+    # Sampler drawing indices into a weight list with probability proportional to the weights
+    # (which need not sum to one), using multinomial sampling. State: weights as a 1-D double
+    # tensor, number of samples, replacement flag and optional generator.
     r"""Samples elements from ``[0,..,len(weights)-1]`` with given probabilities (weights).
 
     Args:
@@ -248,6 +291,9 @@ class WeightedRandomSampler(Sampler[int]):
         replacement: bool = True,
         generator=None,
     ) -> None:
+        # [FUNCTION DOC] Validates and stores the options; converts the weights to a double
+        # tensor. Raises ValueError if num_samples is not a positive non-bool integer, if
+        # replacement is not a bool, or if the weights are not 1-D.
         if (
             not isinstance(num_samples, int)
             or isinstance(num_samples, bool)
@@ -274,16 +320,24 @@ class WeightedRandomSampler(Sampler[int]):
         self.generator = generator
 
     def __iter__(self) -> Iterator[int]:
+        # [FUNCTION DOC] Draws num_samples indices in one multinomial call (with or without
+        # replacement, using the generator if set) and yields them as integers. Errors from
+        # the multinomial call (for example too many samples without replacement) propagate.
         rand_tensor = torch.multinomial(
             self.weights, self.num_samples, self.replacement, generator=self.generator
         )
         yield from iter(rand_tensor.tolist())
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] The configured number of samples.
         return self.num_samples
 
 
 class BatchSampler(Sampler[list[int]]):
+    # [CLASS DOC]
+    # Sampler that groups the indices of another sampler or iterable into lists of batch_size.
+    # State: the wrapped sampler, batch size and drop_last. A shorter final batch is yielded
+    # unless drop_last is set. Length needs the wrapped sampler to have one.
     r"""Wraps another sampler to yield a mini-batch of indices.
 
     Args:
@@ -311,6 +365,8 @@ class BatchSampler(Sampler[list[int]]):
         batch_size: int,
         drop_last: bool,
     ) -> None:
+        # [FUNCTION DOC] Stores the sampler, batch size and drop_last flag. Raises ValueError if
+        # batch_size is not a positive non-bool integer or drop_last is not a bool.
         # Since collections.abc.Iterable does not check for `__getitem__`, which
         # is one way for an object to be an iterable, we don't do an `isinstance`
         # check here.
@@ -331,6 +387,9 @@ class BatchSampler(Sampler[list[int]]):
         self.drop_last = drop_last
 
     def __iter__(self) -> Iterator[list[int]]:
+        # [FUNCTION DOC] Pulls indices from one iterator over the wrapped sampler and yields
+        # lists of batch_size. With drop_last, stops at the first incomplete batch (using
+        # grouped pulls from the same iterator); otherwise yields the smaller last batch.
         sampler_iter = iter(self.sampler)
         if self.drop_last:
             # Create multiple references to the same iterator
@@ -344,6 +403,9 @@ class BatchSampler(Sampler[list[int]]):
                 batch = [*itertools.islice(sampler_iter, self.batch_size)]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of batches: floor of wrapped length over batch_size with
+        # drop_last, otherwise the ceiling. Raises TypeError if the wrapped sampler has no
+        # length.
         # Can only be called if self.sampler has __len__ implemented
         # We cannot enforce this condition, so we turn off typechecking for the
         # implementation below.

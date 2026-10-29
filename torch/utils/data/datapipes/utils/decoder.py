@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Decoding of raw bytes into Python objects by file extension, used by the routed decoder
+# DataPipe. Provides handler functions (basic types, images, video, audio, mat files), the
+# Decoder class that tries a list of handlers in order, and the extension extraction helper.
+# Optional dependencies (numpy, PIL, torchvision, torchaudio, scipy) are imported lazily only
+# when a handler needs them.
 # This file takes partial of the implementation from NVIDIA's webdataset at here:
 # https://github.com/tmbdev/webdataset/blob/master/webdataset/autodecode.py
 
@@ -30,6 +36,13 @@ __all__ = [
 # handle basic datatypes
 ################################################################
 def basichandlers(extension: str, data):
+    # [FUNCTION DOC] Decodes bytes by extension: text decoded as utf-8; integer-like
+    # extensions parsed as int (None if parsing fails); json parsed; pickle loaded; "pt"
+    # loaded with torch.load from an in-memory buffer. Returns None for unknown extensions.
+    # Side effects: unpickling and torch.load can execute arbitrary code from untrusted data.
+    # KNOWN ISSUE: the text and json checks test substring membership in a space-separated
+    # string, so partial names (for example "t" or "js") also match; the docstring example
+    # uses an extension not handled as shown.
     """Transforms raw data (byte stream) into python objects.
 
     Looks at the extension and loads the data into a python object supporting
@@ -113,6 +126,11 @@ imagespecs = {
 
 
 def handle_extension(extensions, f):
+    # [FUNCTION DOC] Builds a handler taking (key, data) that calls f on the data when the
+    # key's trailing dotted components match an extension from the space-separated,
+    # case-insensitive list; otherwise the handler returns None.
+    # KNOWN ISSUE: the inner handler returns None after testing only the first listed
+    # extension (the early return sits inside the loop), so later extensions never match.
     """
     Return a decoder handler function for the list of extensions.
 
@@ -127,6 +145,9 @@ def handle_extension(extensions, f):
     extensions = extensions.lower().split()
 
     def g(key, data):
+        # [FUNCTION DOC] HELPER: Handler closure returned by handle_extension; splits the key
+        # on dots, compares its tail with the first target extension and returns f of the data
+        # on a match, else None.
         extension = key.lower().split(".")
 
         for target in extensions:
@@ -142,6 +163,10 @@ def handle_extension(extensions, f):
 
 
 class ImageHandler:
+    # [CLASS DOC]
+    # Callable decoder handler for image bytes. State: the lower-cased imagespec naming the
+    # output kind (numpy, torch or PIL), element type and color mode, looked up in the
+    # imagespecs table. Calling it with (extension, data) returns a decoded image or None.
     """
     Decode image data using the given `imagespec`.
 
@@ -169,11 +194,22 @@ class ImageHandler:
     """
 
     def __init__(self, imagespec) -> None:
+        # [FUNCTION DOC] Validates the image spec against the known table and stores it in
+        # lower case. Raises AssertionError for an unknown spec.
+        # KNOWN ISSUE: the membership check is case-sensitive, so the later lower-casing
+        # never matters.
         if imagespec not in list(imagespecs.keys()):
             raise AssertionError(f"unknown image specification: {imagespec}")
         self.imagespec = imagespec.lower()
 
     def __call__(self, extension, data):
+        # [FUNCTION DOC] Returns None for non-image extensions. Otherwise imports numpy and
+        # PIL (raising ModuleNotFoundError with an install hint if missing), decodes the bytes,
+        # converts to the spec's color mode and returns a PIL image, a numpy array, or a torch
+        # tensor (channels first), as uint8 or scaled to float in [0, 1]. Raises
+        # AssertionError if the decoded numpy array is not uint8.
+        # KNOWN ISSUE: the torch path transposes three axes, which fails for single-channel
+        # (2-D) images from the grayscale specs.
         if extension.lower() not in ["jpg", "jpeg", "png", "ppm", "pgm", "pbm", "pnm"]:
             return None
 
@@ -229,6 +265,7 @@ class ImageHandler:
 
 
 def imagehandler(imagespec):
+    # [FUNCTION DOC] Factory returning an ImageHandler for the given image spec.
     return ImageHandler(imagespec)
 
 
@@ -236,6 +273,10 @@ def imagehandler(imagespec):
 # torch video
 ################################################################
 def videohandler(extension, data):
+    # [FUNCTION DOC] For video extensions, writes the bytes to a temporary file and returns
+    # what torchvision's video reader gives for it (the temporary directory is removed
+    # afterwards); returns None for other extensions. Raises ModuleNotFoundError if
+    # torchvision cannot be imported.
     if extension not in [
         "mp4",
         "ogv",
@@ -269,6 +310,9 @@ def videohandler(extension, data):
 # torchaudio
 ################################################################
 def audiohandler(extension, data):
+    # [FUNCTION DOC] For audio extensions, writes the bytes to a temporary file and returns
+    # what torchaudio loads from it (the temporary directory is removed afterwards); returns
+    # None for other extensions. Raises ModuleNotFoundError if torchaudio cannot be imported.
     if extension not in ["flac", "mp3", "sox", "wav", "m4a", "ogg", "wma"]:
         return None
 
@@ -292,7 +336,13 @@ def audiohandler(extension, data):
 # mat
 ################################################################
 class MatHandler:
+    # [CLASS DOC]
+    # Callable decoder handler for MATLAB "mat" files. State: the scipy.io module and the
+    # keyword arguments forwarded to its loader. Calling it returns the loaded contents for
+    # the "mat" extension, else None.
     def __init__(self, **loadmat_kwargs) -> None:
+        # [FUNCTION DOC] Imports scipy.io (raising ModuleNotFoundError with an install hint
+        # if missing) and stores the keyword arguments for later loading.
         try:
             import scipy.io as sio
         except ImportError as e:
@@ -305,6 +355,8 @@ class MatHandler:
         self.loadmat_kwargs = loadmat_kwargs
 
     def __call__(self, extension, data):
+        # [FUNCTION DOC] Returns None unless the extension is "mat"; otherwise loads the bytes
+        # from an in-memory buffer using the scipy loader and the stored keyword arguments.
         if extension != "mat":
             return None
         with io.BytesIO(data) as stream:
@@ -312,6 +364,7 @@ class MatHandler:
 
 
 def mathandler(**loadmat_kwargs):
+    # [FUNCTION DOC] Factory returning a MatHandler built with the given keyword arguments.
     return MatHandler(**loadmat_kwargs)
 
 
@@ -320,6 +373,8 @@ def mathandler(**loadmat_kwargs):
 ################################################################
 # Extract extension from pathname
 def extension_extract_fn(pathname):
+    # [FUNCTION DOC] Returns the file extension of the pathname without the leading dot
+    # (empty string if there is none).
     ext = os.path.splitext(pathname)[1]
     # Remove dot
     if ext:
@@ -328,6 +383,11 @@ def extension_extract_fn(pathname):
 
 
 class Decoder:
+    # [CLASS DOC]
+    # Applies an ordered list of handlers to (key, data) pairs; the first handler returning
+    # a non-None result wins, otherwise the data is returned unchanged. State: the handler
+    # list (earlier means higher priority) and key_fn that maps a pathname to the key
+    # given to handlers (default: file extension).
     """
     Decode key/data sets using a list of handlers.
 
@@ -336,22 +396,31 @@ class Decoder:
     """
 
     def __init__(self, *handler, key_fn=extension_extract_fn) -> None:
+        # [FUNCTION DOC] Stores the handlers as a list (empty if none) and the key function.
         self.handlers = list(handler) if handler else []
         self.key_fn = key_fn
 
     # Insert new handler from the beginning of handlers list to make sure the new
     # handler having the highest priority
     def add_handler(self, *handler) -> None:
+        # [FUNCTION DOC] Prepends the given handlers (keeping their order) to the handler list
+        # so they take priority; does nothing if none are given.
         if not handler:
             return
         self.handlers = list(handler) + self.handlers
 
     @staticmethod
     def _is_stream_handle(data):
+        # [FUNCTION DOC] HELPER: True if data (or the object inside a StreamWrapper) is a
+        # buffered or raw binary IO stream.
         obj_to_check = data.file_obj if isinstance(data, StreamWrapper) else data
         return isinstance(obj_to_check, (io.BufferedIOBase, io.RawIOBase))
 
     def decode1(self, key, data):
+        # [FUNCTION DOC] Decodes one item. Falsy data is returned as is. A stream is fully
+        # read into bytes and closed (side effect). Then each handler is called with (key,
+        # data) in order and the first non-None result is returned; if none match, returns
+        # the (possibly read) data.
         if not data:
             return data
 
@@ -369,6 +438,12 @@ class Decoder:
         return data
 
     def decode(self, data):
+        # [FUNCTION DOC] Decodes a (pathname, stream) tuple or an iterable of such pairs into
+        # a mapping from pathname to decoded value (empty for None). Pathnames starting with
+        # an underscore keep bytes values as utf-8 text without handler decoding; others go
+        # through decode1 with the key from key_fn.
+        # KNOWN ISSUE: an empty pathname raises IndexError; underscore keys with non-bytes
+        # values are still decoded normally.
         result = {}
         # single data tuple(pathname, data stream)
         if isinstance(data, tuple):
@@ -386,4 +461,5 @@ class Decoder:
         return result
 
     def __call__(self, data):
+        # [FUNCTION DOC] Same as decode.
         return self.decode(data)

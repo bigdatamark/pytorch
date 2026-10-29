@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Iterable DataPipe (routed_decode) that decodes (pathname, binary stream) pairs with a
+# Decoder and yields (pathname, decoded data). Deprecated: constructing it emits a
+# deprecation warning.
 from collections.abc import Callable, Iterable, Iterator, Sized
 from io import BufferedIOBase
 from typing import Any
@@ -18,6 +22,10 @@ __all__ = ["RoutedDecoderIterDataPipe"]
 
 @functional_datapipe("routed_decode")
 class RoutedDecoderIterDataPipe(IterDataPipe[tuple[str, Any]]):
+    # [CLASS DOC]
+    # Iterable DataPipe wrapping a Decoder: for each (pathname, stream) item from the
+    # source it yields (pathname, decoded value). State: the source datapipe and a Decoder
+    # built from the handlers and key function. Deprecated since 1.12.
     r"""
     Decodes binary streams from input DataPipe, yields pathname and decoded data in a tuple.
 
@@ -43,6 +51,9 @@ class RoutedDecoderIterDataPipe(IterDataPipe[tuple[str, Any]]):
         *handlers: Callable,
         key_fn: Callable = extension_extract_fn,
     ) -> None:
+        # [FUNCTION DOC] Stores the source and builds a Decoder from the given handlers (the
+        # basic handlers plus a torch image handler when none are given) and key_fn.
+        # Side effect: emits a deprecation warning for this class.
         super().__init__()
         self.datapipe: Iterable[tuple[str, BufferedIOBase]] = datapipe
         if not handlers:
@@ -56,15 +67,19 @@ class RoutedDecoderIterDataPipe(IterDataPipe[tuple[str, Any]]):
         )
 
     def add_handler(self, *handler: Callable) -> None:
+        # [FUNCTION DOC] Registers additional decoder handlers on the underlying Decoder.
         self.decoder.add_handler(*handler)
 
     def __iter__(self) -> Iterator[tuple[str, Any]]:
+        # [FUNCTION DOC] For each source item, runs the decoder on it and yields the
+        # pathname (first element) with the decoded value stored under that pathname.
         for data in self.datapipe:
             pathname = data[0]
             result = self.decoder(data)
             yield (pathname, result[pathname])
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Length of the source datapipe; raises TypeError if it has none.
         if isinstance(self.datapipe, Sized):
             return len(self.datapipe)
         raise TypeError(f"{type(self).__name__} instance doesn't have valid length")

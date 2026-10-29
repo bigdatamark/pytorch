@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Provides IterableWrapperIterDataPipe, which turns any iterable object into an iterable
+# DataPipe, optionally deep-copying the iterable on every iteration.
 import copy
 import warnings
 from collections.abc import Iterable, Iterator, Sized
@@ -12,6 +15,10 @@ __all__ = ["IterableWrapperIterDataPipe"]
 
 
 class IterableWrapperIterDataPipe(IterDataPipe[_T]):
+    # [CLASS DOC]
+    # Iterable DataPipe wrapping an arbitrary iterable. State: the wrapped iterable and a
+    # deepcopy flag; when set, each iteration works on a fresh deep copy so in-place edits
+    # do not leak across iterations.
     r"""
     Wraps an iterable object to create an IterDataPipe.
 
@@ -34,10 +41,15 @@ class IterableWrapperIterDataPipe(IterDataPipe[_T]):
     """
 
     def __init__(self, iterable: Iterable[_T], deepcopy: bool = True) -> None:
+        # [FUNCTION DOC] Stores the iterable and the deepcopy flag. Does not call the parent
+        # initializer.
         self.iterable = iterable
         self.deepcopy = deepcopy
 
     def __iter__(self) -> Iterator[_T]:
+        # [FUNCTION DOC] Yields all items of the iterable, taken from a deep copy when
+        # deepcopy is set. If copying fails with a TypeError, emits a warning and iterates
+        # the original object instead.
         source_data = self.iterable
         if self.deepcopy:
             try:
@@ -55,6 +67,7 @@ class IterableWrapperIterDataPipe(IterDataPipe[_T]):
         yield from source_data
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Length of the wrapped iterable; raises TypeError if it has none.
         if isinstance(self.iterable, Sized):
             return len(self.iterable)
         raise TypeError(f"{type(self).__name__} instance doesn't have valid length")

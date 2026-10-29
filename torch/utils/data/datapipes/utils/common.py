@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Shared helpers for DataPipes: validation of callables and pathname/stream data, glob-style
+# file listing and opening, the deprecation-warning builder, and StreamWrapper which wraps
+# file objects so they get closed deterministically. Import-time side effect: records
+# whether the optional dill package is available (DILL_AVAILABLE) and creates the registries
+# of deprecated functional names.
 import fnmatch
 import functools
 import inspect
@@ -26,6 +32,12 @@ DILL_AVAILABLE = dill_available()
 
 
 def validate_input_col(fn: Callable, input_col: int | tuple | list | None) -> None:
+    # [FUNCTION DOC] Inspects the callable's signature and checks it can accept the number
+    # of arguments implied by input_col (the list/tuple length, or one for a single index or
+    # key). Returns nothing and skips the check when the signature cannot be inspected.
+    # Raises ValueError for non-default keyword-only parameters, too few parameters, extra
+    # required positional parameters, or too few positional ones without a variadic.
+    # KNOWN ISSUE: the docstring examples assert on the return value, but it is None.
     """
     Check that function used in a callable datapipe works with the input column.
 
@@ -118,6 +130,10 @@ def validate_input_col(fn: Callable, input_col: int | tuple | list | None) -> No
 
 
 def _is_local_fn(fn):
+    # [FUNCTION DOC] HELPER: Reports whether a callable is defined inside another function.
+    # Uses the nested flag of the code object for functions and methods, else looks for the
+    # local-scope marker in the qualified name of the object or its type. Returns a truthy
+    # value (a flag integer for functions, a bool otherwise), or False if undetermined.
     # Functions or Methods
     if hasattr(fn, "__code__"):
         return fn.__code__.co_flags & inspect.CO_NESTED
@@ -132,6 +148,11 @@ def _is_local_fn(fn):
 
 
 def _check_unpickable_fn(fn: Callable) -> None:
+    # [FUNCTION DOC] HELPER: Validates a function passed to a DataPipe. Raises TypeError if it
+    # is not callable. For a partial object, checks the underlying function. Emits a warning
+    # (not an error) when it is a local function or a lambda and dill is unavailable.
+    # KNOWN ISSUE: the docstring says a UserWarning is raised; it is a plain warning issued
+    # only when dill is missing.
     """
     Check function is pickable or not.
 
@@ -165,6 +186,8 @@ def _check_unpickable_fn(fn: Callable) -> None:
 
 
 def match_masks(name: str, masks: str | list[str]) -> bool:
+    # [FUNCTION DOC] Returns True if the name matches the glob pattern, or any pattern in the
+    # list. An empty mask (empty string or list) matches every name.
     # empty mask matches any input name
     if not masks:
         return True
@@ -185,8 +208,15 @@ def get_file_pathnames_from_root(
     abspath: bool = False,
     non_deterministic: bool = False,
 ) -> Iterable[str]:
+    # [FUNCTION DOC] Generator of file paths under root whose base names match the masks. If
+    # root is a file, yields it (when it matches). Otherwise walks the directory tree, only
+    # the top level unless recursive, and yields joined paths (made absolute if abspath).
+    # Unless non_deterministic, files and directories are sorted for a stable order. Walk
+    # errors emit a warning and are re-raised as the original OSError.
     # print out an error message and raise the error out
     def onerror(err: OSError) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Directory-walk error handler; warns with the file name and
+        # reason, then re-raises the given OSError.
         warnings.warn(err.filename + " : " + err.strerror, stacklevel=2)
         raise err
 
@@ -218,6 +248,11 @@ def get_file_pathnames_from_root(
 def get_file_binaries_from_pathnames(
     pathnames: Iterable, mode: str, encoding: str | None = None
 ):
+    # [FUNCTION DOC] Generator that opens each pathname and yields (pathname, StreamWrapper
+    # around the open file). Mode "b" or "t" is read mode with that suffix. Side effect:
+    # opens files, which the consumer must close. Raises TypeError for a non-string pathname.
+    # KNOWN ISSUE: a plain string is itself iterable, so the single-pathname wrapping never
+    # applies to strings and each character is treated as a pathname.
     if not isinstance(pathnames, Iterable):
         pathnames = [
             pathnames,
@@ -235,6 +270,9 @@ def get_file_binaries_from_pathnames(
 
 
 def validate_pathname_binary_tuple(data: tuple[str, IOBase]) -> None:
+    # [FUNCTION DOC] Checks that data is a 2-tuple of a string pathname and an IOBase or
+    # StreamWrapper stream; otherwise raises TypeError describing the first violation.
+    # KNOWN ISSUE: the last error message is missing a space between its two sentence parts.
     if not isinstance(data, tuple):
         raise TypeError(
             f"pathname binary data should be tuple type, but it is type {type(data)}"
@@ -271,6 +309,11 @@ def _deprecation_warning(
     new_argument_name: str = "",
     deprecate_functional_name_only: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Builds and emits a FutureWarning announcing that a DataPipe
+    # class, its functional name, or one of its arguments is deprecated since one version
+    # and removed in another, with optional replacement names. Raises ValueError if a new
+    # functional or argument name is given without the old one, or if both an old
+    # functional name and an old argument name are given.
     if new_functional_name and not old_functional_name:
         raise ValueError(
             "Old functional API needs to be specified for the deprecation warning."
@@ -316,6 +359,11 @@ def _deprecation_warning(
 
 
 class StreamWrapper:
+    # [CLASS DOC]
+    # Proxy around a file-like object that forwards unknown attributes to it and guarantees
+    # closing. State: the wrapped object, an optional parent StreamWrapper with a child
+    # counter (a parent set to auto-close is closed with its last child), a closed flag, an
+    # optional name, and class-level debug tracking of unclosed streams. Closed on deletion.
     """
     StreamWrapper is introduced to wrap file handler generated by DataPipe operation like `FileOpener`.
 
@@ -326,6 +374,9 @@ class StreamWrapper:
     debug_unclosed_streams: bool = False
 
     def __init__(self, file_obj, parent_stream=None, name=None) -> None:
+        # [FUNCTION DOC] Wraps file_obj. If a parent stream is given it must be a
+        # StreamWrapper (otherwise raises RuntimeError) and its child counter is incremented.
+        # When debug tracking is on, registers this stream in the class-level session map.
         self.file_obj = file_obj
         self.child_counter = 0
         self.parent_stream = parent_stream
@@ -344,6 +395,8 @@ class StreamWrapper:
 
     @classmethod
     def close_streams(cls, v, depth=0) -> None:
+        # [FUNCTION DOC] Closes v if it is a StreamWrapper; otherwise recurses through the
+        # values of a dict or the items of a list or tuple, down to nesting depth 10.
         """Traverse structure and attempts to close all found StreamWrappers on best effort basis."""
         if depth > 10:
             return
@@ -359,10 +412,18 @@ class StreamWrapper:
                     cls.close_streams(vv, depth=depth + 1)
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Forwards lookup of any attribute not found on the wrapper to the
+        # wrapped object (read directly from the instance dictionary to avoid recursion).
         file_obj = self.__dict__["file_obj"]
         return getattr(file_obj, name)
 
     def close(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Idempotent close: unregisters from debug tracking, decrements the
+        # parent's child counter (closing the parent if it is set to auto-close and this was
+        # its last child), closes the wrapped object with the given arguments (ignoring
+        # AttributeError if it has no close), and marks this wrapper closed.
+        # KNOWN ISSUE: with debug tracking on, a stream created before tracking was enabled
+        # is missing from the session map and raises KeyError here.
         if self.closed:
             return
         if StreamWrapper.debug_unclosed_streams:
@@ -381,34 +442,46 @@ class StreamWrapper:
         self.closed = True
 
     def autoclose(self) -> None:
+        # [FUNCTION DOC] Marks the stream to close when its last child closes; closes it right
+        # away if it has no children.
         """Automatically close stream when all child streams are closed or if there are none."""
         self.close_on_last_child = True
         if self.child_counter == 0:
             self.close()
 
     def __dir__(self):
+        # [FUNCTION DOC] Returns the unique attribute names of this wrapper, its class and the
+        # wrapped object.
         attrs = list(self.__dict__.keys()) + list(StreamWrapper.__dict__.keys())
         attrs += dir(self.file_obj)
         return list(set(attrs))
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: closes the stream if it has not been closed yet.
         if not self.closed:
             self.close()
 
     def __iter__(self):
+        # [FUNCTION DOC] Iterates over the wrapped object.
         yield from self.file_obj
 
     def __next__(self):
+        # [FUNCTION DOC] Returns the next item of the wrapped object.
         return next(self.file_obj)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form showing the optional name and the wrapped object.
         if self.name is None:
             return f"StreamWrapper<{self.file_obj!r}>"
         else:
             return f"StreamWrapper<{self.name},{self.file_obj!r}>"
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickling support: the state is just the wrapped object.
         return self.file_obj
 
     def __setstate__(self, obj):
+        # [FUNCTION DOC] Restores only the wrapped object.
+        # KNOWN ISSUE: the other fields (closed, parent, counters, name) are not restored, so
+        # attribute lookups for them fall through to the wrapped object.
         self.file_obj = obj

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# BatcherMapDataPipe (functional name batch): a MapDataPipe whose items are fixed-size
+# batches of consecutive source items. Registers the functional name at import time.
 from collections.abc import Sized
 from typing import TypeVar
 
@@ -14,6 +17,10 @@ _T = TypeVar("_T")
 
 @functional_datapipe("batch")
 class BatcherMapDataPipe(MapDataPipe[DataChunk]):
+    # [CLASS DOC]
+    # MapDataPipe where index i yields the wrapped list of source items
+    # i*batch_size .. (i+1)*batch_size-1. State: source, batch_size, drop_last and the
+    # wrapper class. A short final batch is returned unless drop_last is set.
     r"""
     Create mini-batches of data (functional name: ``batch``).
 
@@ -45,6 +52,8 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
         drop_last: bool = False,
         wrapper_class: type[DataChunk] = DataChunk,
     ) -> None:
+        # [FUNCTION DOC] Stores the source, batch size, drop_last flag and wrapper class.
+        # Raises AssertionError if batch_size is not larger than 0.
         if batch_size <= 0:
             raise AssertionError("Batch size is required to be larger than 0!")
         super().__init__()
@@ -54,6 +63,9 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
         self.wrapper_class = wrapper_class
 
     def __getitem__(self, index) -> DataChunk:
+        # [FUNCTION DOC] Reads the source items for the index's batch range and returns them
+        # wrapped. If the source runs out mid-batch, returns the partial batch unless
+        # drop_last is set or it is empty, in which case raises IndexError.
         batch: list = []
         indices = range(index * self.batch_size, (index + 1) * self.batch_size)
         try:
@@ -66,6 +78,9 @@ class BatcherMapDataPipe(MapDataPipe[DataChunk]):
                 raise IndexError(f"Index {index} is out of bound.") from e
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of batches: floor of source length over batch_size when
+        # drop_last is set, otherwise the ceiling. Raises TypeError if the source has no
+        # length.
         # pyrefly: ignore [unsafe-overlap]
         if isinstance(self.datapipe, Sized):
             if self.drop_last:

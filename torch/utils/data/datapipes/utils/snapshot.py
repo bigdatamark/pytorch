@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Snapshot restoration for DataPipes: a helper that fast-forwards a DataPipe graph by
+# replaying iterations so an interrupted pipeline can resume. No import-time side effects.
 from torch.utils.data.datapipes._hook_iterator import _SnapshotState
 from torch.utils.data.datapipes.datapipe import IterDataPipe
 from torch.utils.data.graph_settings import apply_random_seed
@@ -11,6 +14,12 @@ from torch.utils.data.graph_settings import apply_random_seed
 def _simple_graph_snapshot_restoration(
     datapipe: IterDataPipe, n_iterations: int, rng=None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Restores a DataPipe to the state after n_iterations samples by
+    # resetting it, seeding random DataPipes in its graph from rng, and consuming that many
+    # items from a fresh iterator. The iterator is stored on the DataPipe as its fast-forward
+    # iterator and its snapshot state is marked Restored, so the next iteration continues from
+    # there. Raises RuntimeError if already restored or if the source has fewer samples.
+    # KNOWN ISSUE: the inline comment mentions calling reset twice, but only one call is made.
     r"""
     Fast-forward the given DataPipe and its parents by ``n_iterations``, re-doing computations to restore a snapshot.
 

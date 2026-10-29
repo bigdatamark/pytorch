@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# DistributedSampler: a Sampler that gives each process in a distributed group its own
+# disjoint, equally sized share of a dataset's indices, with deterministic per-epoch shuffling.
 import math
 from collections.abc import Iterator
 from typing import TypeVar
@@ -15,6 +18,12 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 
 class DistributedSampler(Sampler[_T_co]):
+    # [CLASS DOC]
+    # Sampler yielding the indices that belong to one rank. State: dataset, replica count,
+    # rank, epoch, shuffle flag, seed, drop_last, per-rank sample count and padded total size.
+    # Every rank sees the same permutation (seeded by seed plus epoch) and takes every
+    # num_replicas-th index starting at its rank. set_epoch must be called each epoch to get
+    # a new ordering.
     r"""Sampler that restricts data loading to a subset of the dataset.
 
     It is especially useful in conjunction with
@@ -72,6 +81,12 @@ class DistributedSampler(Sampler[_T_co]):
         seed: int = 0,
         drop_last: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Resolves replica count and rank from the default distributed group
+        # when not given (raising RuntimeError if the distributed package is unavailable) and
+        # validates the rank (ValueError unless in 0..num_replicas-1). Computes the per-rank
+        # sample count: rounded up from the dataset length (padding is added later), or, with
+        # drop_last and an uneven length, rounded down to an evenly divisible size. Total size
+        # is samples times replicas.
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -105,6 +120,11 @@ class DistributedSampler(Sampler[_T_co]):
         self.seed = seed
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Builds the full index list (a random permutation from a generator
+        # seeded with seed plus epoch when shuffling, else in order). Without drop_last it
+        # repeats leading indices to reach the total size; with drop_last it truncates to it.
+        # Then keeps this rank's strided share and returns an iterator over it. Raises
+        # AssertionError if the sizes are inconsistent.
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
             g = torch.Generator()
@@ -141,9 +161,12 @@ class DistributedSampler(Sampler[_T_co]):
         return iter(indices)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of indices yielded for this rank.
         return self.num_samples
 
     def set_epoch(self, epoch: int) -> None:
+        # [FUNCTION DOC] Stores the epoch number used (with the seed) to seed the shuffle on
+        # the next iteration. Call before creating each epoch's iterator.
         r"""
         Set the epoch for this sampler.
 

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# MapDataPipe that applies a function lazily to each item of a source MapDataPipe
+# (functional name map), plus the picklable identity function default_fn.
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -17,11 +20,16 @@ _T_co = TypeVar("_T_co", covariant=True)
 # In order to keep datapipe picklable, eliminates the usage
 # of python lambda function
 def default_fn(data):
+    # [FUNCTION DOC] Identity function: returns its argument unchanged. Used as the default
+    # mapper so the DataPipe stays picklable.
     return data
 
 
 @functional_datapipe("map")
 class MapperMapDataPipe(MapDataPipe[_T_co]):
+    # [CLASS DOC]
+    # MapDataPipe whose item at an index is fn applied to the source's item at that index.
+    # State: source datapipe and fn. Length equals the source length; nothing is cached.
     r"""
     Apply the input function over each item from the source DataPipe (functional name: ``map``).
 
@@ -54,14 +62,19 @@ class MapperMapDataPipe(MapDataPipe[_T_co]):
         datapipe: MapDataPipe,
         fn: Callable = default_fn,
     ) -> None:
+        # [FUNCTION DOC] Stores the source and the function (identity by default). Raises if
+        # the function is not picklable (e.g. a lambda), as checked by _check_unpickable_fn.
         super().__init__()
         self.datapipe = datapipe
         _check_unpickable_fn(fn)
         self.fn = fn  # type: ignore[assignment]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the length of the source datapipe.
         # pyrefly: ignore [bad-argument-type]
         return len(self.datapipe)
 
     def __getitem__(self, index) -> _T_co:
+        # [FUNCTION DOC] Returns fn applied to the source item at the given index; errors
+        # from the source or fn propagate.
         return self.fn(self.datapipe[index])

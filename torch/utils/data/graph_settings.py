@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Helpers that configure a whole DataPipe graph: apply sharding to sharding DataPipes,
+# toggle shuffling, and seed random DataPipes. Graphs come from traverse_dps. Exports
+# apply_sharding, apply_shuffle_settings, apply_shuffle_seed (deprecated),
+# apply_random_seed and get_all_graph_pipes.
 import inspect
 import warnings
 from typing import Any
@@ -22,12 +27,16 @@ __all__ = [
 
 
 def get_all_graph_pipes(graph: DataPipeGraph) -> list[DataPipe]:
+    # [FUNCTION DOC] Returns a flat list of every DataPipe in the graph, depth first, each
+    # distinct DataPipe (by id) listed once.
     return _get_all_graph_pipes_helper(graph, set())
 
 
 def _get_all_graph_pipes_helper(
     graph: DataPipeGraph, id_cache: set[int]
 ) -> list[DataPipe]:
+    # [FUNCTION DOC] HELPER: Recursive part of get_all_graph_pipes; skips ids already in the
+    # shared cache, records new ids, and returns the DataPipe followed by its subgraph's.
     results: list[DataPipe] = []
     for dp_id, (datapipe, sub_graph) in graph.items():
         if dp_id in id_cache:
@@ -39,6 +48,8 @@ def _get_all_graph_pipes_helper(
 
 
 def _is_sharding_datapipe(datapipe: DataPipe) -> bool:
+    # [FUNCTION DOC] HELPER: True if the DataPipe is a sharding base-class instance or has a
+    # bound method named apply_sharding.
     return isinstance(datapipe, _ShardingIterDataPipe) or (
         hasattr(datapipe, "apply_sharding")
         and inspect.ismethod(datapipe.apply_sharding)
@@ -51,6 +62,11 @@ def apply_sharding(
     instance_id: int,
     sharding_group=SHARDING_PRIORITIES.DEFAULT,
 ) -> DataPipe:
+    # [FUNCTION DOC] Walks the graph and calls apply_sharding on each sharding DataPipe with
+    # the instance count, instance id and group (the group is passed only if the method
+    # accepts three parameters, for backward compatibility). Mutates the DataPipes and
+    # returns the same input DataPipe. Raises RuntimeError if two sharding DataPipes lie on
+    # one branch.
     r"""
     Apply dynamic sharding over the ``sharding_filter`` DataPipe that has a method ``apply_sharding``.
 
@@ -59,6 +75,9 @@ def apply_sharding(
     graph = traverse_dps(datapipe)
 
     def _helper(graph, prev_applied=None) -> None:
+        # [FUNCTION DOC] HELPER: Recursive walk carrying the sharding DataPipe applied higher in
+        # the branch; applies sharding to each sharding DataPipe found and raises RuntimeError
+        # if one was already applied on the path.
         for dp, sub_graph in graph.values():
             applied = None
             if _is_sharding_datapipe(dp):
@@ -86,6 +105,7 @@ def apply_sharding(
 
 
 def _is_shuffle_datapipe(datapipe: DataPipe) -> bool:
+    # [FUNCTION DOC] HELPER: True if the DataPipe has bound methods set_shuffle and set_seed.
     return (
         hasattr(datapipe, "set_shuffle")
         and hasattr(datapipe, "set_seed")
@@ -95,6 +115,10 @@ def _is_shuffle_datapipe(datapipe: DataPipe) -> bool:
 
 
 def apply_shuffle_settings(datapipe: DataPipe, shuffle: bool | None = None) -> DataPipe:
+    # [FUNCTION DOC] With shuffle None, returns the input unchanged. Otherwise calls
+    # set_shuffle on every shuffle-capable DataPipe in the graph. If shuffling is requested
+    # and none exist, warns and appends a shuffle step to the end of the pipeline, returning
+    # that new DataPipe. Mutates the DataPipes.
     r"""
     Traverse the graph of ``DataPipes`` to find and set shuffle attribute.
 
@@ -134,14 +158,19 @@ def apply_shuffle_settings(datapipe: DataPipe, shuffle: bool | None = None) -> D
     category=FutureWarning,
 )
 def apply_shuffle_seed(datapipe: DataPipe, rng: Any) -> DataPipe:
+    # [FUNCTION DOC] Deprecated alias of apply_random_seed (emits a FutureWarning when called).
     return apply_random_seed(datapipe, rng)
 
 
 def _is_random_datapipe(datapipe: DataPipe) -> bool:
+    # [FUNCTION DOC] HELPER: True if the DataPipe has a bound method set_seed.
     return hasattr(datapipe, "set_seed") and inspect.ismethod(datapipe.set_seed)
 
 
 def apply_random_seed(datapipe: DataPipe, rng: torch.Generator) -> DataPipe:
+    # [FUNCTION DOC] Finds each distinct DataPipe in the graph that has set_seed and calls it
+    # with a fresh 64-bit integer drawn from the given generator (advancing it; a None
+    # generator uses the global torch RNG). Returns the same input DataPipe.
     r"""
     Traverse the graph of ``DataPipes`` to find random ``DataPipe`` with an API of ``set_seed``.
 

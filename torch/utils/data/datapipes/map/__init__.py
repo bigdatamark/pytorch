@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Map-style DataPipes (index to item). Re-exports Batcher, Concater, Mapper,
+# SequenceWrapper, Shuffler and Zipper under short names via __all__. Importing it also
+# registers their functional names. Raises AssertionError at import time if __all__ is not
+# sorted.
 # Functional DataPipe
 from torch.utils.data.datapipes.map.callable import MapperMapDataPipe as Mapper
 from torch.utils.data.datapipes.map.combinatorics import (

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Extracts the DataPipe graph (which DataPipes feed which) by pickling a DataPipe with hooks
+# that capture the DataPipe objects referenced by its state. Exports traverse_dps and the
+# deprecated traverse; the result is a nested mapping from object id to (DataPipe, subgraph).
+# Defines the DataPipe and DataPipeGraph type aliases.
 import io
 import pickle
 import warnings
@@ -16,6 +21,8 @@ DataPipeGraph = dict[int, tuple[DataPipe, "DataPipeGraph"]]
 
 
 def _stub_unpickler() -> str:
+    # [FUNCTION DOC] HELPER: Placeholder reconstructor used while pickling; returns a fixed
+    # marker string in place of a captured DataPipe.
     return "STUB"
 
 
@@ -23,6 +30,12 @@ def _stub_unpickler() -> str:
 def _list_connected_datapipes(
     scan_obj: DataPipe, only_datapipe: bool, cache: set[int]
 ) -> list[DataPipe]:
+    # [FUNCTION DOC] HELPER: Finds the DataPipes directly referenced by scan_obj. Temporarily
+    # installs reduce (and, if only_datapipe, getstate) hooks on both DataPipe base classes,
+    # then pickles scan_obj to an in-memory buffer (falling back to dill on pickling errors
+    # when available, else re-raising). The hook records each referenced DataPipe not already
+    # in the id cache (adding its id to it) and substitutes a stub. Hooks are always removed
+    # afterwards and the dill dispatch table change is undone. Returns the captured list.
     f = io.BytesIO()
     p = pickle.Pickler(
         f
@@ -37,6 +50,9 @@ def _list_connected_datapipes(
     captured_connections = []
 
     def getstate_hook(ori_state):
+        # [FUNCTION DOC] HELPER: Filters a DataPipe's state so only values that are DataPipes or
+        # collections remain (for a mapping, tuple/list, or a single object); returns None for
+        # other state types.
         state = None
         if isinstance(ori_state, dict):
             state = {}
@@ -53,6 +69,10 @@ def _list_connected_datapipes(
         return state
 
     def reduce_hook(obj):
+        # [FUNCTION DOC] HELPER: Pickle reduce hook. Raises NotImplementedError (so normal
+        # reduction proceeds) for the scanned object itself or one already seen; otherwise
+        # records obj as a connection, remembers its id, and returns the stub reconstructor
+        # with no arguments.
         if obj == scan_obj or id(obj) in cache:
             raise NotImplementedError
         else:
@@ -89,6 +109,9 @@ def _list_connected_datapipes(
 
 
 def traverse_dps(datapipe: DataPipe) -> DataPipeGraph:
+    # [FUNCTION DOC] Builds the DataPipe graph ending at the given DataPipe, following only
+    # DataPipe and collection attributes, and returns a nested mapping from DataPipe id to
+    # (DataPipe, subgraph). Raises RuntimeError if the input is not a DataPipe.
     r"""
     Traverse the DataPipes and their attributes to extract the DataPipe graph.
 
@@ -107,6 +130,10 @@ def traverse_dps(datapipe: DataPipe) -> DataPipeGraph:
 
 
 def traverse(datapipe: DataPipe, only_datapipe: bool | None = None) -> DataPipeGraph:
+    # [FUNCTION DOC] Deprecated variant of traverse_dps. Emits a FutureWarning, treats an
+    # unset only_datapipe as False (all attributes inspected), and returns the same nested
+    # graph mapping. Raises RuntimeError if the input is not a DataPipe.
+    # KNOWN ISSUE: the docstring mentions only_dataPipe (typo) in its description.
     r"""
     Traverse the DataPipes and their attributes to extract the DataPipe graph.
 
@@ -143,6 +170,11 @@ def traverse(datapipe: DataPipe, only_datapipe: bool | None = None) -> DataPipeG
 def _traverse_helper(
     datapipe: DataPipe, only_datapipe: bool, cache: set[int]
 ) -> DataPipeGraph:
+    # [FUNCTION DOC] HELPER: Recursive graph builder. Raises RuntimeError for a non-DataPipe.
+    # Returns an empty mapping for a DataPipe already on the current path (cycle guard);
+    # otherwise lists its connected DataPipes and returns a mapping with this DataPipe's id
+    # to (DataPipe, merged subgraphs of its connections). Each branch gets its own copy of
+    # the id cache, so a shared DataPipe appears under every path that reaches it.
     if not isinstance(datapipe, (IterDataPipe, MapDataPipe)):
         raise RuntimeError(
             f"Expected `IterDataPipe` or `MapDataPipe`, but {type(datapipe)} is found"

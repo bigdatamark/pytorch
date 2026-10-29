@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Dataset abstractions for the data loading API: the map-style Dataset base, IterableDataset,
+# and concrete datasets TensorDataset, StackDataset, ConcatDataset, ChainDataset and Subset,
+# plus random_split. No import-time side effects beyond defining the classes and type
+# variables.
 import bisect
 import itertools
 import math
@@ -37,6 +42,11 @@ _T_stack = TypeVar("_T_stack", _T_tuple, _T_dict)
 
 
 class Dataset(Generic[_T_co]):
+    # [CLASS DOC]
+    # Abstract base for map-style datasets (key to sample). Subclasses implement
+    # __getitem__ and usually __len__; an optional __getitems__ may fetch a whole batch of
+    # indices at once. Has no state of its own and no default length. Adding two datasets
+    # gives a ConcatDataset.
     r"""An abstract class representing a :class:`Dataset`.
 
     All datasets that represent a map from keys to data samples should subclass
@@ -56,6 +66,8 @@ class Dataset(Generic[_T_co]):
     """
 
     def __getitem__(self, index) -> _T_co:
+        # [FUNCTION DOC] Abstract: subclasses return the sample for a key. This base version
+        # always raises NotImplementedError.
         raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
 
     # def __getitems__(self, indices: List) -> List[_T_co]:
@@ -63,6 +75,7 @@ class Dataset(Generic[_T_co]):
     # torch.utils.data._utils.fetch._MapDatasetFetcher
 
     def __add__(self, other: "Dataset[_T_co]") -> "ConcatDataset[_T_co]":
+        # [FUNCTION DOC] Returns a ConcatDataset of this dataset followed by the other.
         return ConcatDataset([self, other])
 
     # No `def __len__(self)` default?
@@ -71,6 +84,11 @@ class Dataset(Generic[_T_co]):
 
 
 class IterableDataset(Dataset[_T_co], Iterable[_T_co]):
+    # [CLASS DOC]
+    # Abstract base for stream-style datasets: subclasses implement __iter__ to return an
+    # iterator of samples. With multiple loader workers each worker holds its own copy, so
+    # subclasses must split work themselves. No default length. Adding two gives a
+    # ChainDataset.
     r"""An iterable Dataset.
 
     All datasets that represent an iterable of data samples should subclass it.
@@ -180,6 +198,7 @@ class IterableDataset(Dataset[_T_co], Iterable[_T_co]):
     """
 
     def __add__(self, other: Dataset[_T_co]):
+        # [FUNCTION DOC] Returns a ChainDataset that streams this dataset and then the other.
         return ChainDataset([self, other])
 
     # No `def __len__(self)` default? Subclasses raise `TypeError` when needed.
@@ -187,6 +206,10 @@ class IterableDataset(Dataset[_T_co], Iterable[_T_co]):
 
 
 class TensorDataset(Dataset[tuple[Tensor, ...]]):
+    # [CLASS DOC]
+    # Map-style dataset over tensors sharing the same first dimension. State: tuple of
+    # tensors. A sample is the tuple of each tensor indexed at the same position; length is
+    # the first dimension size.
     r"""Dataset wrapping tensors.
 
     Each sample will be retrieved by indexing tensors along the first dimension.
@@ -198,18 +221,27 @@ class TensorDataset(Dataset[tuple[Tensor, ...]]):
     tensors: tuple[Tensor, ...]
 
     def __init__(self, *tensors: Tensor) -> None:
+        # [FUNCTION DOC] Stores the tensors. Raises AssertionError if any tensor's first
+        # dimension differs from the first tensor's (an IndexError occurs if none are given).
         if any(tensors[0].size(0) != tensor.size(0) for tensor in tensors):
             raise AssertionError("Size mismatch between tensors")
         self.tensors = tensors
 
     def __getitem__(self, index):
+        # [FUNCTION DOC] Returns a tuple with every tensor indexed at the given index.
         return tuple(tensor[index] for tensor in self.tensors)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Size of the first dimension of the first tensor.
         return self.tensors[0].size(0)
 
 
 class StackDataset(Dataset[_T_stack]):
+    # [CLASS DOC]
+    # Map-style dataset combining several equally long datasets given either positionally
+    # (samples are tuples) or by keyword (samples are dicts keyed by the names). State: the
+    # datasets container and the common length. Supports batched fetch via __getitems__,
+    # using the nested datasets' own batched fetch when available.
     r"""Dataset as a stacking of multiple datasets.
 
     This class is useful to assemble different parts of complex input data, given as datasets.
@@ -231,6 +263,10 @@ class StackDataset(Dataset[_T_stack]):
     datasets: tuple | dict
 
     def __init__(self, *args: Dataset[_T_co], **kwargs: Dataset[_T_co]) -> None:
+        # [FUNCTION DOC] Accepts datasets positionally or by keyword, stores them and the common
+        # length. Raises ValueError if both styles are mixed, if none are given, or if lengths
+        # differ.
+        # KNOWN ISSUE: the mixed-style error message joins two sentence parts with no space.
         if args:
             if kwargs:
                 raise ValueError(
@@ -251,11 +287,17 @@ class StackDataset(Dataset[_T_stack]):
             raise ValueError("At least one dataset should be passed")
 
     def __getitem__(self, index):
+        # [FUNCTION DOC] Returns the sample at the index from every dataset, as a dict keyed by
+        # name for keyword input or a tuple for positional input.
         if isinstance(self.datasets, dict):
             return {k: dataset[index] for k, dataset in self.datasets.items()}
         return tuple(dataset[index] for dataset in self.datasets)
 
     def __getitems__(self, indices: list):
+        # [FUNCTION DOC] Batched fetch for a list of indices. For each nested dataset, uses its
+        # own batched fetch when it has one (raising ValueError if it returns a different
+        # number of items than indices), otherwise reads item by item. Returns a list of dicts
+        # or a list of tuples, one per index.
         # add batched sampling support when parent datasets supports it.
         if isinstance(self.datasets, dict):
             dict_batch: list[_T_dict] = [{} for _ in indices]
@@ -293,10 +335,15 @@ class StackDataset(Dataset[_T_stack]):
         return tuple_batch
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] The common length of the stacked datasets.
         return self._length
 
 
 class ConcatDataset(Dataset[_T_co]):
+    # [CLASS DOC]
+    # Map-style dataset that joins several map-style datasets end to end. State: the list of
+    # datasets and the running totals of their lengths (cumulative_sizes), used to locate
+    # which dataset holds a global index. Iterable datasets are rejected.
     r"""Dataset as a concatenation of multiple datasets.
 
     This class is useful to assemble different existing datasets.
@@ -310,6 +357,8 @@ class ConcatDataset(Dataset[_T_co]):
 
     @staticmethod
     def cumsum(sequence):
+        # [FUNCTION DOC] HELPER: Returns the running totals of the lengths of the given
+        # sized objects, as a list.
         r, s = [], 0
         for e in sequence:
             l = len(e)
@@ -318,6 +367,8 @@ class ConcatDataset(Dataset[_T_co]):
         return r
 
     def __init__(self, datasets: Iterable[Dataset]) -> None:
+        # [FUNCTION DOC] Materializes the datasets into a list and computes cumulative sizes.
+        # Raises AssertionError if the collection is empty or contains an IterableDataset.
         super().__init__()
         self.datasets = list(datasets)
         if len(self.datasets) == 0:
@@ -328,9 +379,14 @@ class ConcatDataset(Dataset[_T_co]):
         self.cumulative_sizes = self.cumsum(self.datasets)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Total number of samples across all datasets.
         return self.cumulative_sizes[-1]
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC] Maps a global index to a dataset and local index by binary search over
+        # the cumulative sizes and returns that dataset's sample. A negative index counts from
+        # the end; raises ValueError if its magnitude exceeds the total length. Too-large
+        # indices surface as an error from the last dataset or the list lookup.
         if idx < 0:
             if -idx > len(self):
                 raise ValueError(
@@ -350,10 +406,16 @@ class ConcatDataset(Dataset[_T_co]):
         category=FutureWarning,
     )
     def cummulative_sizes(self):
+        # [FUNCTION DOC] Deprecated misspelled alias property for cumulative_sizes; emits a
+        # FutureWarning and returns the same list.
         return self.cumulative_sizes
 
 
 class ChainDataset(IterableDataset):
+    # [CLASS DOC]
+    # Iterable dataset that streams several IterableDatasets one after another. State: the
+    # given collection of datasets (not copied). Elements are validated lazily at iteration
+    # and length time.
     r"""Dataset for chaining multiple :class:`IterableDataset` s.
 
     This class is useful to assemble different existing dataset streams. The
@@ -365,16 +427,21 @@ class ChainDataset(IterableDataset):
     """
 
     def __init__(self, datasets: Iterable[Dataset]) -> None:
+        # [FUNCTION DOC] Stores the collection of datasets as given (no validation here).
         super().__init__()
         self.datasets = datasets
 
     def __iter__(self):
+        # [FUNCTION DOC] Yields all samples of each dataset in order. Raises AssertionError on
+        # reaching an element that is not an IterableDataset.
         for d in self.datasets:
             if not isinstance(d, IterableDataset):
                 raise AssertionError("ChainDataset only supports IterableDataset")
             yield from d
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Sum of the lengths of the chained datasets. Raises AssertionError for a
+        # non-IterableDataset element, and TypeError if a dataset has no length.
         total = 0
         for d in self.datasets:
             if not isinstance(d, IterableDataset):
@@ -384,6 +451,11 @@ class ChainDataset(IterableDataset):
 
 
 class Subset(Dataset[_T_co]):
+    # [CLASS DOC]
+    # View of a dataset restricted to a sequence of indices; position i maps to
+    # dataset index indices[i]. State: the wrapped dataset and the index sequence. Supports
+    # batched fetch, delegating to the parent's batched fetch when it has one. Subclasses that
+    # override __getitem__ must also override __getitems__.
     r"""
     Subset of a dataset at specified indices.
 
@@ -412,6 +484,8 @@ class Subset(Dataset[_T_co]):
     indices: Sequence[int]
 
     def __init__(self, dataset: Dataset[_T_co], indices: Sequence[int]) -> None:
+        # [FUNCTION DOC] Stores the dataset and indices. Raises NotImplementedError if a
+        # subclass overrides __getitem__ without overriding __getitems__.
         self.dataset = dataset
         self.indices = indices
 
@@ -430,11 +504,17 @@ class Subset(Dataset[_T_co]):
             )
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC] For a list of positions, maps each through the index sequence and
+        # indexes the parent dataset with the resulting list; for a single position, returns
+        # the parent's sample at the mapped index.
         if isinstance(idx, list):
             return self.dataset[[self.indices[i] for i in idx]]
         return self.dataset[self.indices[idx]]
 
     def __getitems__(self, indices: list[int]) -> list[_T_co]:
+        # [FUNCTION DOC] Batched fetch: maps positions through the index sequence and returns
+        # a list of samples, using the parent's batched fetch when it has one, else reading
+        # item by item.
         # add batched sampling support when parent dataset supports it.
         # see torch.utils.data._utils.fetch._MapDatasetFetcher
         if callable(getattr(self.dataset, "__getitems__", None)):
@@ -443,6 +523,7 @@ class Subset(Dataset[_T_co]):
             return [self.dataset[self.indices[idx]] for idx in indices]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Number of selected indices.
         return len(self.indices)
 
 
@@ -451,6 +532,11 @@ def random_split(
     lengths: Sequence[int | float],
     generator: Generator | None = default_generator,
 ) -> list[Subset[_T]]:
+    # [FUNCTION DOC] Splits a dataset into Subsets of the given sizes over a random
+    # permutation of positions drawn from the generator (advancing it). If lengths are
+    # fractions summing to one, converts them to integer sizes (floor, remainder handed out
+    # one by one round-robin) and warns about zero-sized splits. Raises ValueError for a
+    # fraction outside 0..1 or if the sizes do not sum to the dataset length.
     r"""
     Randomly split a dataset into non-overlapping new datasets of given lengths.
 
