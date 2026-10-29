@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Codegen logic that synthesizes NativeFunctions missing from native_functions.yaml. For each
+# group of "similar" operators (functional, inplace, mutable, out= variants) it generates the
+# missing out= and functional variants so groups can be formed, and it emits C++ composite
+# kernels that implement generated functional/out= ops in terms of non-generated ones.
+# Also holds allow-lists of ops that cannot be grouped or cannot get an out= variant.
+# No import-time side effects besides defining constants and functions.
 from __future__ import annotations
 
 import string
@@ -112,6 +119,10 @@ INPLACE_OPS_THAT_DONT_GET_GROUPED_PROPERLY = [
 def pre_group_native_functions(
     native_functions: Sequence[NativeFunction],
 ) -> dict[FunctionSchema, dict[SchemaKind, NativeFunction]]:
+    # [FUNCTION DOC]
+    # Groups native functions by their signature schema (the schema ignoring kind-specific
+    # parts), producing a mapping from signature to a mapping from SchemaKind to function.
+    # Raises AssertionError if two functions with the same signature share a SchemaKind.
     pre_grouped_native_functions: dict[
         FunctionSchema, dict[SchemaKind, NativeFunction]
     ] = defaultdict(dict)
@@ -125,6 +136,9 @@ def pre_group_native_functions(
 
 # Returns the out variant overload name given a base function overload name
 def get_expected_out_variant_overload_name(overload_name: str | None) -> str:
+    # [FUNCTION DOC]
+    # Returns "out" when the base overload name is empty or None, otherwise the base overload
+    # name with the suffix "_out" appended.
     return "out" if not overload_name else f"{overload_name}_out"
 
 
@@ -134,6 +148,11 @@ def get_expected_out_variant_overload_name(overload_name: str | None) -> str:
 # Example after:
 #   _add_relu.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out)
 def self_to_out_signature(func: FunctionSchema) -> FunctionSchema:
+    # [FUNCTION DOC]
+    # Builds the out= schema for an inplace schema: drops the inplace marker from the name,
+    # uses the out overload name, strips the alias annotation from self and appends a keyword
+    # out argument carrying self's type and annotation. Returns are kept unchanged.
+    # Raises AssertionError if the schema is not inplace or has no self argument.
     # Generating an out= schema from an inplace schema.
     if func.kind() != SchemaKind.inplace:
         raise AssertionError(f"Expected inplace schema, got {func.kind()}")
@@ -169,6 +188,11 @@ def self_to_out_signature(func: FunctionSchema) -> FunctionSchema:
 #   _to_copy._out(Tensor self, *, bool non_blocking=False, MemoryFormat? memory_format=None,
 #       Tensor(a!) out) -> Tensor(a!)
 def functional_to_out_signature(func: FunctionSchema) -> FunctionSchema:
+    # [FUNCTION DOC]
+    # Builds the out= schema for a functional schema: the name gets the out overload name,
+    # the arguments are the signature arguments plus new out arguments, and the returns are
+    # those computed by generate_out_args_from_schema.
+    # Raises AssertionError if the schema is not functional.
     # Generating an out= schema from a functional schema.
     if func.kind() != SchemaKind.functional:
         raise AssertionError(f"Expected functional schema, got {func.kind()}")
@@ -193,6 +217,13 @@ def functional_to_out_signature(func: FunctionSchema) -> FunctionSchema:
 def generate_out_args_from_schema(
     func: FunctionSchema,
 ) -> tuple[list[Return], list[Argument]]:
+    # [FUNCTION DOC]
+    # Creates one mutable out argument (alias annotation chosen from unused letters) for each
+    # tensor-like return, named out for a single return or out0, out1, ... otherwise.
+    # Returns a pair (new returns, new out arguments). If every return is a plain Tensor the
+    # new returns are the out arguments' aliased types; otherwise tensor-like returns are
+    # dropped and only the non-tensor-like returns are kept.
+    # Raises AssertionError if any return is already a write alias or none is tensor-like.
     # More of a sanity check - our existing restrictions on schemas should enforce that
     # mutable schema kinds never return their mutable arguments.
     if any(r.annotation is not None and r.annotation.is_write for r in func.returns):
@@ -242,6 +273,11 @@ def generate_out_args_from_schema(
 # Example after:
 #   _fused_moving_avg_obs_fq_helper._out(Tensor self, Tensor observer_on, Tensor fake_quant_on, Tensor(a!) running_min, Tensor(b!) running_max, Tensor(c!) scale, Tensor(d!) zero_point, float averaging_const, int quant_min, int quant_max, int ch_axis, bool per_row_fake_quant=False, bool symmetric_quant=False, *, Tensor(e!) out0, Tensor(f!) out1) -> (Tensor(e!), Tensor(f!))
 def mutable_to_out_signature(func: FunctionSchema) -> FunctionSchema:
+    # [FUNCTION DOC]
+    # Builds the out= schema for a mutable schema: keeps the existing (mutable) arguments,
+    # adds out arguments for tensor-like returns via generate_out_args_from_schema and uses
+    # the out overload name.
+    # Raises AssertionError if the schema is not mutable or has no tensor-like return.
     # Generating an out= schema from a mutable schema.
     if func.kind() != SchemaKind.mutable:
         raise AssertionError(f"Expected mutable schema, got {func.kind()}")
@@ -280,6 +316,15 @@ def mutable_to_out_signature(func: FunctionSchema) -> FunctionSchema:
 def generate_function(
     f: NativeFunction, k: SchemaKind
 ) -> tuple[NativeFunction, dict[DispatchKey, dict[OperatorName, BackendMetadata]]]:
+    # [FUNCTION DOC]
+    # Generates a NativeFunction of target kind k (functional or out) from function f.
+    # The new function is function-variant only, unstructured, tagged "generated" (plus
+    # selected tags copied from f, and "out"/"inplace" as applicable), and gets a
+    # CompositeExplicitAutograd kernel name (unambiguous name for out, cpp name otherwise,
+    # with a _symint suffix when f uses symints).
+    # Returns the new function and a mapping from dispatch key to operator metadata.
+    # Raises AssertionError for a functional request on a functional f, an out request from
+    # a kind other than inplace/mutable/functional, or any other target kind.
     from torchgen.api import cpp
 
     if k == SchemaKind.functional:
@@ -396,6 +441,15 @@ def add_generated_native_functions(
     rs: list[NativeFunction],
     indices: dict[DispatchKey, dict[OperatorName, BackendMetadata]],
 ) -> None:
+    # [FUNCTION DOC]
+    # Adds missing out= and functional variants to the list rs and registers their backend
+    # metadata in indices, mutating both in place. Operators that are manual, views, or
+    # non-core composite-implicit are skipped, as are allow-listed ungroupable ops. An out=
+    # variant is generated only when the base function has an autogen entry mentioning out
+    # and tensor-like returns (or is inplace); a functional variant is generated only if the
+    # op has or just got an out= variant.
+    # Raises AssertionError for a lone out= op not in the allow-list, or for an op that
+    # cannot get an out= variant and is not in the allow-lists.
     # The main code for generating new NativeFunctions
     # First we group of NativeFunctions by schema kind,
     # then we detect which ones are missing and generate them.
@@ -517,6 +571,9 @@ out= variant is not needed, please add the function name into FUNCTIONAL_OPS_THA
 
 
 def return_str(rets: tuple[Return, ...], names: list[str]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a C++ return statement for the given variable names:
+    # empty string for no returns, a plain return for one, and a return constructing the
+    # dispatcher tuple type for several. Raises AssertionError if the counts differ.
     if len(rets) != len(names):
         raise AssertionError(
             f"Returns and names length mismatch: {len(rets)} vs {len(names)}"
@@ -532,6 +589,9 @@ def return_str(rets: tuple[Return, ...], names: list[str]) -> str:
 # Given a function, and the name of a variable corresponding to the output of that function,
 # gather up all of the individual returns that are not aliased
 def gather_nonaliased_inner_rets(func: FunctionSchema, out_var: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns C++ expressions for each return of func that does not
+    # alias an input: the variable itself for a single return, or a tuple element access
+    # by position when there are several returns.
     aliased_rets = func.aliased_return_names()
     non_aliased_names = []
     is_out_var_a_tuple = len(func.returns) > 1
@@ -547,6 +607,11 @@ def gather_nonaliased_inner_rets(func: FunctionSchema, out_var: str) -> list[str
 # We only do this for "generated" NativeFunctions
 @with_native_function
 def gen_composite_functional_kernel(g: NativeFunctionsGroup) -> str | None:
+    # [FUNCTION DOC]
+    # Returns C++ source for a generated functional op's kernel, or None if the functional
+    # op is not tagged "generated". The kernel clones every argument the inner inplace or
+    # mutable op mutates, calls that op, and returns its non-aliased results followed by the
+    # clones. Raises AssertionError if the group has no non-generated inplace/mutable op.
     # We should only be generating these for code-generated NativeFunctions
     if "generated" not in g.functional.tags:
         return None
@@ -610,6 +675,11 @@ def gen_composite_functional_kernel(g: NativeFunctionsGroup) -> str | None:
 # We only do this for "generated" NativeFunctions
 @with_native_function
 def gen_composite_out_kernel(g: NativeFunctionsGroup) -> str | None:
+    # [FUNCTION DOC]
+    # Returns C++ source for a generated out= op's kernel, or None if the out op is not
+    # tagged "generated". The kernel calls the functional op, resizes and copies each result
+    # into the matching out argument, and returns aliased inputs or functional results as
+    # dictated by the out schema's returns.
     # We should only be generating these for code-generated NativeFunctions
     if "generated" not in g.out.tags:
         return None

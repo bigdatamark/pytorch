@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Defines SelectiveBuilder, the in-memory form of a selective build YAML specification, which
+# answers whether operators, native functions and kernel dtypes are selected, whether they
+# are root or training operators, and serializes back to a dictionary. Also provides helpers
+# to merge builders and kernel metadata and to compute an operator name from a NativeFunction.
+# Imports yaml; no other import-time side effects.
 from __future__ import annotations
 
 from collections import defaultdict
@@ -28,6 +34,14 @@ if TYPE_CHECKING:
 #
 @dataclass(frozen=True)
 class SelectiveBuilder:
+    # [CLASS DOC]
+    # Immutable description of a selective build. State: include_all_operators (build is not
+    # selective), private debug info tuple, operators (mapping of name to
+    # SelectiveBuildOperator), kernel_metadata (kernel tag to dtype list),
+    # et_kernel_metadata (ExecuTorch kernel tag to list of dtype/dim-order keys),
+    # custom_classes and build_features (sets), and include_all_non_op_selectives (keep all
+    # dtypes and classes). Key methods: constructors from YAML, the is_*_selected queries and
+    # to_dict.
     # If true, then the build is not selective, and includes all
     # operators.
     include_all_operators: bool
@@ -69,10 +83,20 @@ class SelectiveBuilder:
 
     @staticmethod
     def get_nop_selector() -> SelectiveBuilder:
+        # [FUNCTION DOC]
+        # Returns a builder that is not selective: it includes all operators.
         return SelectiveBuilder.from_yaml_dict({"include_all_operators": True})
 
     @staticmethod
     def from_yaml_dict(data: dict[str, object]) -> SelectiveBuilder:
+        # [FUNCTION DOC]
+        # Builds a SelectiveBuilder from a parsed YAML mapping. All keys are optional; the
+        # two include_all flags default to false, debug_info becomes a tuple of strings,
+        # operators are parsed into SelectiveBuildOperator records, kernel_metadata values
+        # are stringified, and custom_classes/build_features become sets. Raises a generic
+        # Exception on unknown top level keys and AssertionError on wrong value types.
+        # KNOWN ISSUE: et_kernel_metadata is only type-checked as a mapping; its values are
+        # not validated or converted.
         valid_top_level_keys = {
             "include_all_non_op_selectives",
             "include_all_operators",
@@ -166,11 +190,16 @@ class SelectiveBuilder:
 
     @staticmethod
     def from_yaml_str(config_contents: str) -> SelectiveBuilder:
+        # [FUNCTION DOC]
+        # Parses YAML text with the safe loader and builds a SelectiveBuilder from it.
         contents = yaml.safe_load(config_contents)
         return SelectiveBuilder.from_yaml_dict(contents)
 
     @staticmethod
     def from_yaml_path(config_path: str) -> SelectiveBuilder:
+        # [FUNCTION DOC]
+        # Reads the YAML file at config_path (I/O) and builds a SelectiveBuilder from it.
+        # Raises the usual file errors if the file cannot be opened.
         with open(config_path) as f:
             contents = yaml.safe_load(f)
             return SelectiveBuilder.from_yaml_dict(contents)
@@ -179,6 +208,10 @@ class SelectiveBuilder:
     def from_legacy_op_registration_allow_list(
         allow_list: set[str], is_root_operator: bool, is_used_for_training: bool
     ) -> SelectiveBuilder:
+        # [FUNCTION DOC]
+        # Builds a SelectiveBuilder from a legacy set of operator names: every operator gets
+        # the given root and training flags and covers all overloads, and all non-operator
+        # selectives are included.
         operators = {}
         for op in allow_list:
             operators[op] = {
@@ -195,6 +228,9 @@ class SelectiveBuilder:
         )
 
     def is_operator_selected(self, name: str) -> bool:
+        # [FUNCTION DOC]
+        # True if the build includes all operators, the exact name is listed, or the name
+        # without overload is listed with include_all_overloads set.
         if self.include_all_operators:
             return True
 
@@ -204,10 +240,16 @@ class SelectiveBuilder:
         return name in self.operators and self.operators[name].include_all_overloads
 
     def is_native_function_selected(self, func: NativeFunction) -> bool:
+        # [FUNCTION DOC]
+        # Checks selection of a native function by its namespaced operator name.
         op_name = op_name_from_native_function(func)
         return self.is_operator_selected(op_name)
 
     def is_operator_selected_for_training(self, name: str) -> bool:
+        # [FUNCTION DOC]
+        # True if the operator is selected and either all operators are included, the exact
+        # entry is used for training, or the base-name entry covers all overloads and is used
+        # for training. Unlisted entries count as not used for training.
         if not self.is_operator_selected(name):
             return False
         if self.include_all_operators:
@@ -234,10 +276,16 @@ class SelectiveBuilder:
         )
 
     def is_native_function_selected_for_training(self, func: NativeFunction) -> bool:
+        # [FUNCTION DOC]
+        # Training-selection check for a native function by its namespaced operator name.
         op_name = op_name_from_native_function(func)
         return self.is_operator_selected_for_training(op_name)
 
     def is_root_operator(self, name: str) -> bool:
+        # [FUNCTION DOC]
+        # True if the operator is selected and is a root operator: always true when all
+        # operators are included; otherwise taken from the exact entry, or from the base-name
+        # entry when it covers all overloads.
         if not self.is_operator_selected(name):
             return False
         if self.include_all_operators:
@@ -253,6 +301,9 @@ class SelectiveBuilder:
         return base_op.include_all_overloads and base_op.is_root_operator
 
     def is_kernel_dtype_selected(self, kernel_tag: str, dtype: str) -> bool:
+        # [FUNCTION DOC]
+        # True if all operators or all non-operator selectives are included, or the dtype is
+        # listed under the kernel tag in kernel_metadata.
         if self.include_all_operators or self.include_all_non_op_selectives:
             return True
 
@@ -262,6 +313,13 @@ class SelectiveBuilder:
         )
 
     def et_get_selected_kernels(self, op_name: str, kernel_key: list[str]) -> list[str]:
+        # [FUNCTION DOC]
+        # ExecuTorch only. Chooses which of the candidate kernel keys cover the models using
+        # op_name. Without metadata for the op it returns all keys if all operators are
+        # included, else an empty list. Otherwise each model key is matched to a candidate
+        # with the same second path segment (version ignored), falling back to "default".
+        # Raises a generic Exception if no match and no default exists. Result order is
+        # unspecified.
         """
         Return a list of kernel keys that cover the used ops
         """
@@ -292,6 +350,10 @@ class SelectiveBuilder:
         return list(result_set)
 
     def to_dict(self) -> dict[str, object]:
+        # [FUNCTION DOC]
+        # Serializes to a mapping: both include flags, operators as dictionaries, sorted
+        # debug info when present, kernel metadata with sorted dtype lists, the ExecuTorch
+        # metadata as stored, and sorted custom classes and build features.
         ret: dict[str, object] = {
             "include_all_non_op_selectives": self.include_all_non_op_selectives,
             "include_all_operators": self.include_all_operators,
@@ -321,6 +383,8 @@ def merge_kernel_metadata(
     lhs: dict[str, list[str]],
     rhs: dict[str, list[str]],
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Returns a new mapping of kernel tag to the de-duplicated union of
+    # dtypes from both inputs; list order is unspecified.
     kernel_metadata: dict[str, list[str]] = {}
     for tag_name, dtypes in list(lhs.items()) + list(rhs.items()):
         dtypes_copy = set(dtypes)
@@ -336,6 +400,8 @@ def merge_et_kernel_metadata(
     lhs: dict[str, list[str]],
     rhs: dict[str, list[str]],
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Returns a new mapping of op name to the sorted union of kernel
+    # keys from both inputs.
     merge_et_kernel_metadata: dict[str, set[str]] = defaultdict(set)
     for op in list(lhs.keys()) + list(rhs.keys()):
         merge_et_kernel_metadata[op].update(lhs.get(op, []))
@@ -347,6 +413,9 @@ def merge_et_kernel_metadata(
 def combine_selective_builders(
     lhs: SelectiveBuilder, rhs: SelectiveBuilder
 ) -> SelectiveBuilder:
+    # [FUNCTION DOC]
+    # Merges two builders into a new one: flags are or-ed, and debug info, operators, kernel
+    # metadata, ExecuTorch metadata, custom classes and build features are unioned/merged.
     include_all_operators = lhs.include_all_operators or rhs.include_all_operators
     debug_info = merge_debug_info(lhs._debug_info, rhs._debug_info)
     operators = merge_operator_dicts(lhs.operators, rhs.operators)
@@ -372,6 +441,8 @@ def combine_selective_builders(
 
 
 def op_name_from_native_function(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns the operator name as namespace, a double colon, then the
+    # function's full name including overload.
     # This was originally read from the 'operator_name_with_overload' field in the
     # declaration dict, which was the part before the first '(' in 'schema_string'.
     return f"{f.namespace}::{f.func.name}"

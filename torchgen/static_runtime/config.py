@@ -1,9 +1,17 @@
+# [MODULE DOC]
+# Configuration for Static Runtime operator code generation: a helper to get an operator's
+# base name from a native function group, the set of operators with hand-written Static
+# Runtime implementations (is_hand_written_ops_), a predicate over it, and a function that
+# overrides generated C++ test argument expressions for operators needing special inputs.
+# No import-time side effects besides defining the constant set.
 from __future__ import annotations
 
 from torchgen.model import NativeFunctionsGroup, NativeFunctionsViewGroup
 
 
 def func_name_base_str(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> str:
+    # [FUNCTION DOC] HELPER: Returns the base operator name as text: the functional variant's
+    # base name for a regular group, or the root name for a view group.
     if isinstance(g, NativeFunctionsGroup):
         return str(g.functional.func.name.name.base)
     else:
@@ -56,11 +64,23 @@ is_hand_written_ops_ = frozenset(
 
 
 def is_hand_written(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> bool:
+    # [FUNCTION DOC]
+    # True if the group's base operator name is in the hand-written operator set, meaning no
+    # code is generated for it.
     name_base = func_name_base_str(g)
     return name_base in is_hand_written_ops_
 
 
 def override_test_values(arg_map: dict[str, str], op_name: str, index: int) -> None:
+    # [FUNCTION DOC]
+    # Mutates arg_map (argument name to C++ expression text) in place, replacing or adding
+    # test inputs for operators that need valid special values (shapes, index ranges, string
+    # options, dims). Index 0 selects the small test input set and index 1 the larger one;
+    # operators not special-cased leave the mapping unchanged. Raises AssertionError if the
+    # index is not 0 or 1.
+    # KNOWN ISSUE: for ops listed without a branch on index (fft variants, diagonal), the
+    # same values are used for both sets; the scatter family sets a reduce value only if the
+    # key already exists.
     if index not in (0, 1):
         raise AssertionError(f"index must be 0 or 1, got {index}")
     if op_name == "addr":

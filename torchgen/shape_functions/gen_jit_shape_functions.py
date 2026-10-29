@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Script that generates torch/csrc/jit/runtime/serialized_shape_function_registry.cpp, a C++
+# file embedding the serialized TorchScript shape (and bounded shape) functions and the
+# mappings from operator schemas to their function names. At import time it loads
+# torch/jit/_shape_functions.py from the current working directory (without importing torch),
+# registers it in sys.modules, and raises an Exception if the file is not found, so it must
+# run from the repository root.
 import os
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -77,6 +84,14 @@ SERIALIZED_SHAPE_UTIL_FILE_NAME = "serialized_shape_function_registry.cpp"
 
 
 def gen_serialized_decompisitions() -> str:
+    # [FUNCTION DOC]
+    # Collects the unique scripted shape functions (by name, from both the plain and bounded
+    # mappings), packs their code into chunks of at most about 2000 characters, and returns
+    # C++ text concatenating each chunk as a raw string literal wrapped in a string
+    # constructor, terminated by a semicolon.
+    # KNOWN ISSUE: a function that starts a new chunk is added without the leading newline
+    # that other functions get, and a single function longer than the limit still forms an
+    # oversized chunk.
     already_serialized_names = set()
     unique_funcs = []
     all_funcs = chain(
@@ -129,6 +144,9 @@ SHAPE_SCHEMA_END = r"""
 
 
 def gen_shape_mappings() -> str:
+    # [FUNCTION DOC]
+    # Returns C++ source for a function returning an operator map from each schema string to
+    # the name of its shape function, built from shape_compute_graph_mapping.
     shape_mappings = []
     for schema, scripted_func in shape_compute_graph_mapping.items():
         shape_mappings.append('    {"' + schema + '", "' + scripted_func.name + '"},')
@@ -142,6 +160,10 @@ const OperatorMap<std::pair<std::string, std::string>>& GetBoundedShapeMappings(
 
 
 def gen_bounded_mappings() -> str:
+    # [FUNCTION DOC]
+    # Returns C++ source for a function returning an operator map from each schema string to
+    # a pair of (lower bound function name, upper bound function name), built from
+    # bounded_compute_graph_mapping.
     bounded_mappings = []
     for schema, (lower_func, upper_func) in bounded_compute_graph_mapping.items():
         map_str = (
@@ -158,6 +180,10 @@ def gen_bounded_mappings() -> str:
 
 
 def write_decomposition_util_file(path: str) -> None:
+    # [FUNCTION DOC]
+    # Assembles the header, serialized functions, accessor functions, mappings and footer and
+    # writes them as UTF-8 to serialized_shape_function_registry.cpp inside directory path,
+    # overwriting it. Prints the target path.
     decomposition_str = gen_serialized_decompisitions()
     shape_mappings = gen_shape_mappings()
     bounded_mappings = gen_bounded_mappings()
@@ -176,6 +202,9 @@ def write_decomposition_util_file(path: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: writes the generated registry file into torch/csrc/jit/runtime under the
+    # repository root (two levels above this file).
     pytorch_dir = Path(__file__).resolve().parents[2]
     upgrader_path = pytorch_dir / "torch" / "csrc" / "jit" / "runtime"
     write_decomposition_util_file(str(upgrader_path))

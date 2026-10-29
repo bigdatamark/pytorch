@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Command line script that generates the Static Runtime generated operator dispatcher C++
+# source and its gtest source from native_functions.yaml, using generator.GenOpDispatcher and
+# generator.GenOpTestCase for out-variant groups and view groups, then formats the outputs
+# with clang-format. Import-time dependency on the Meta-internal libfb logging module.
+# KNOWN ISSUE: importing libfb makes this module unusable outside Meta's internal environment.
 from __future__ import annotations
 
 import argparse
@@ -30,11 +36,17 @@ NativeGroupT = TypeVar(
 def group_functions_by_op_name(
     grouped_native_functions: Sequence[NativeGroupT],
 ) -> Sequence[Sequence[NativeGroupT]]:
+    # [FUNCTION DOC]
+    # Filters the input groups (assumed sorted by op name) to those the generator supports,
+    # then returns a list of lists where consecutive groups sharing a base name are bundled
+    # together (for example mean and mean.dim). Returns an empty list for empty input.
     if not grouped_native_functions:
         return []
     groups = []
 
     def is_supported(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> bool:
+        # [FUNCTION DOC] HELPER: Asks generator.is_supported about the group while the
+        # group's native function context is active.
         with native_function_manager(g):
             return generator.is_supported(g)
 
@@ -53,12 +65,18 @@ def group_functions_by_op_name(
 
 
 def clang_format(cpp_file_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Runs the clang-format tool in place on the given file. Raises
+    # CalledProcessError on failure or an OS error if the tool is missing.
     import subprocess
 
     subprocess.check_call(["clang-format", "-i", cpp_file_path])
 
 
 def write_cpp(cpp_ops: Sequence[str], file_path: str) -> None:
+    # [FUNCTION DOC]
+    # Joins the generated op code snippets with newlines, wraps them in the generated-file
+    # header with its includes and the torch::jit namespace, writes the result to file_path
+    # (overwriting) and formats it with clang-format.
     code = "\n".join(cpp_ops)
     generated = f"""// @lint-ignore-every CLANGTIDY HOWTOEVEN
 // AUTO-GENERATED FROM: torchgen/static_runtime/gen_static_runtime_ops.py
@@ -112,6 +130,10 @@ namespace jit {{
 
 
 def write_test_cpp(cpp_ops: Sequence[str], file_path: str) -> None:
+    # [FUNCTION DOC]
+    # Joins the generated test snippets with newlines, prepends the gtest header and using
+    # declarations, writes the result to file_path (overwriting) and formats it with
+    # clang-format.
     code = "\n".join(cpp_ops)
     generated = f"""// @lint-ignore-every CLANGTIDY HOWTOEVEN
 // AUTO-GENERATED FROM: torchgen/static_runtime/gen_static_runtime_ops.py
@@ -136,6 +158,13 @@ using c10::IValue;
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point. Parses options (ATen source path, output paths for the generated ops and
+    # test files), parses native_functions.yaml and tags.yaml, builds the out-variant and view
+    # groups, generates dispatcher and test code for the supported ones, writes both files and
+    # prints summary counts.
+    # KNOWN ISSUE: the help text of the test output option duplicates the ops file's text
+    # and says op dispatcher .cpp file instead of the test file.
     parser = argparse.ArgumentParser(description="Generate ATen source files")
     parser.add_argument(
         "-s",

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Code generators for Static Runtime operators. Decides which native function groups are
+# supported (is_supported, using the BLOCKED_OPS list and the hand-written list in config),
+# maps argument types to IValue conversion methods and to test value expressions, and provides
+# GenOpDispatcher (emits operator functor registration C++ for out-variant and view ops) and
+# GenOpTestCase (emits gtest C++ cases). Import-time side effects: creates a root logger
+# reference and parses a small JSON string of test tensor shapes.
 from __future__ import annotations
 
 import json
@@ -33,6 +40,8 @@ logger: logging.Logger = logging.getLogger()
 def has_alias(
     arguments: Sequence[Argument | SelfArgument | TensorOptionsArguments],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if any argument carries an annotation with a non-empty
+    # alias set. Arguments without an annotation attribute are ignored.
     for arg in arguments:
         annotation = getattr(arg, "annotation", None)
         if not annotation:
@@ -244,6 +253,13 @@ BLOCKED_OPS = frozenset(
 
 
 def is_supported(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> bool:
+    # [FUNCTION DOC]
+    # Decides whether Static Runtime code can be generated for a group. Rejects hand-written
+    # and blocked ops, ops with arguments whose type has no IValue conversion, and (logging
+    # the reason at info level) other cases. View groups must return a plain Tensor. For
+    # out-variant groups the out schema must return a Tensor reference, must not have
+    # inputs that alias, and unstructured ops must have an out overload whose schema ends with
+    # a single trailing out Tensor argument. Returns True or False; no exceptions expected.
     base_op_name = ""
     func = None
     if isinstance(g, NativeFunctionsViewGroup):
@@ -306,6 +322,12 @@ def is_supported(g: NativeFunctionsGroup | NativeFunctionsViewGroup) -> bool:
 def ivalue_type_conversion_method(
     arg_type: BaseType | OptionalType | Type,
 ) -> tuple[bool, str] | None:
+    # [FUNCTION DOC] HELPER: Returns a pair (is_reference, conversion call text) describing
+    # how to read a value of the given type out of an IValue, or None if the type is not
+    # supported. Supported are Tensor, int, bool, Scalar, ScalarType and str, either plain or
+    # optional; list types and other types give None. The call text has no leading dot.
+    # KNOWN ISSUE: the docstring claims the result is a string starting with a dot; it is
+    # actually a tuple, and the third str optional entry (std string view) is never used.
     """
     Return the method call expression of `c10::ivalue' to convert its contained value to
     the expected value of `arg_type` type. For example, for `arg_type` == BaseTy.Tensor,
@@ -367,10 +389,14 @@ should_use_complex_tensor_ops_ = frozenset(("view_as_real", "imag", "_conj"))
 
 
 def should_use_int_tensor(op_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if tests for this op need integer tensors (membership in the
+    # int-tensor op set).
     return op_name in should_use_int_tensor_ops_
 
 
 def should_use_complex_tensor(op_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if tests for this op need complex tensors (membership in
+    # the complex-tensor op set).
     return op_name in should_use_complex_tensor_ops_
 
 
@@ -393,6 +419,8 @@ test_tensor_dim_ops_2_ = frozenset(
 
 
 def test_tensor_dim(op_name: str) -> int:
+    # [FUNCTION DOC] HELPER: Number of dimensions for generated test tensors: 1 or 2 for ops
+    # in the corresponding sets, otherwise 3.
     if op_name in test_tensor_dim_ops_1_:
         return 1
     if op_name in test_tensor_dim_ops_2_:
@@ -405,6 +433,8 @@ test_tensor_shape_json: dict[str, str] = json.loads(test_tensor_shapes_string)
 
 
 def test_tensor_shape(op_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the fixed C++ shape text configured for the op, or an
+    # empty string if none.
     if op_name in test_tensor_shape_json:
         return test_tensor_shape_json[op_name]
     else:
@@ -414,6 +444,12 @@ def test_tensor_shape(op_name: str) -> str:
 def test_value_expression(
     arg_type: BaseType | OptionalType | Type, index: int, op_name: str
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns a C++ expression for a test value of the given argument
+    # type. Index 0 targets about 16 elements and any other index about 64, spread over the
+    # op's test dimensions with an even size per dim, unless a fixed shape is configured.
+    # Tensors are random float (or int / complex per op sets); other types use constants.
+    # Raises AssertionError for unsupported types (anything except plain or optional
+    # Tensor, int, bool, Scalar, ScalarType, str).
     tensor_size_ex = test_tensor_shape(op_name)
     if tensor_size_ex == "":
         num_tensors = 16 if index == 0 else 64
@@ -455,6 +491,10 @@ def test_value_expression(
 
 
 def generate_test_value_definitions(schema: FunctionSchema, index: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ statements declaring a variable per argument of a
+    # non-out schema, named with the argument name plus the index suffix, initialized from
+    # test_value_expression and then adjusted by config.override_test_values. Raises
+    # AssertionError for an out schema.
     if schema.is_out_fn():
         raise AssertionError(f"Expected non-out function, got {schema}")
     schema_name = schema.name.name.base
@@ -470,6 +510,9 @@ def generate_test_value_definitions(schema: FunctionSchema, index: int) -> str:
 
 
 def generate_test_value_names(schema: FunctionSchema, index: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the comma separated variable names (argument name plus
+    # index suffix) matching generate_test_value_definitions. Raises AssertionError for an out
+    # schema.
     if schema.is_out_fn():
         raise AssertionError(f"Expected non-out function, got {schema}")
     return ",".join(f"{arg.name}{index}" for arg in schema.schema_order_arguments())
@@ -489,7 +532,12 @@ generate_test_ir_arguments_base_ty_to_type_str_ = {
 def generate_test_ir_arguments(
     schema: FunctionSchema,
 ) -> list[tuple[str, str | None]]:
+    # [FUNCTION DOC] HELPER: Returns, for each schema-order argument, a pair of the IR value
+    # name (percent sign plus argument name) and its TorchScript IR type text, or None for the
+    # type text when the type has no mapping. Optional types get a question mark suffix.
+    # Raises AssertionError if an argument is not a plain or optional base type.
     def ir_argument(arg: Argument) -> tuple[str, str | None]:
+        # [FUNCTION DOC] HELPER: Builds the (IR name, IR type text) pair for one argument.
         t = arg.type
         add_optional = False
         if isinstance(t, OptionalType):
@@ -508,6 +556,10 @@ def generate_test_ir_arguments(
 
 
 def generate_arg_extraction(schema: FunctionSchema) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ statements that read each schema-order argument from
+    # the processed node's inputs by position into a const variable (a reference for
+    # tensors), using ivalue_type_conversion_method. Raises AssertionError if an argument type
+    # has no conversion.
     arg_populations = []
     for i, arg in enumerate(schema.schema_order_arguments()):
         maybe_method = ivalue_type_conversion_method(arg.type)
@@ -524,6 +576,8 @@ def generate_arg_extraction(schema: FunctionSchema) -> str:
 
 
 def get_kernel_name(g: NativeFunctionsGroup, backend_index: BackendIndex) -> str:
+    # [FUNCTION DOC] HELPER: Name of the C++ kernel for the group's functional variant: the
+    # cpp name for structured ops or when no kernel is registered, else the registered kernel.
     kernel = backend_index.get_kernel(g.functional)
     if g.structured or kernel is None:
         return cpp.name(g.functional.func)
@@ -531,6 +585,7 @@ def get_kernel_name(g: NativeFunctionsGroup, backend_index: BackendIndex) -> str
 
 
 def get_out_kernel_name(g: NativeFunctionsGroup, backend_index: BackendIndex) -> str:
+    # [FUNCTION DOC] HELPER: Same as get_kernel_name but for the group's out variant.
     kernel = backend_index.get_kernel(g.out)
     if g.structured or kernel is None:
         return cpp.name(g.out.func)
@@ -540,6 +595,9 @@ def get_out_kernel_name(g: NativeFunctionsGroup, backend_index: BackendIndex) ->
 def generate_non_out_variant_call(
     g: NativeFunctionsGroup, backend_index: BackendIndex
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ text calling the functional variant's kernel with its
+    # schema-order argument names, in the cpu namespace for structured ops and the native
+    # namespace otherwise. Raises AssertionError if the functional schema is an out schema.
     schema = g.functional.func
     if schema.is_out_fn():
         raise AssertionError(f"Expected non-out function, got {schema}")
@@ -552,6 +610,8 @@ def generate_non_out_variant_call(
 def generate_call_to_view_ops(
     g: NativeFunctionsViewGroup, backend_index: BackendIndex
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ text calling the view op's kernel (registered kernel
+    # name if any, else the cpp name) in the native namespace with its argument names.
     schema = g.view.func
     kernel_name = cpp.name(schema)
     kernel = backend_index.get_kernel(g.view)
@@ -565,6 +625,10 @@ def generate_call_to_view_ops(
 def generate_out_variant_call(
     g: NativeFunctionsGroup, backend_index: BackendIndex
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ text calling the out variant's kernel. Structured ops
+    # take the out argument first and live in the cpu namespace; unstructured ops take their
+    # single out argument last and live in the native namespace. Raises AssertionError if the
+    # schema is not an out schema or an unstructured op does not have exactly one out argument.
     schema = g.out.func
     if not schema.is_out_fn():
         raise AssertionError(f"Expected out function, got {schema}")
@@ -612,19 +676,32 @@ no_memory_resize_ops = frozenset(
 
 
 def should_check_resize(schema: FunctionSchema) -> bool:
+    # [FUNCTION DOC] HELPER: False for ops (by name with overload) listed as not resizing
+    # their outputs in the memory-resize test check, True otherwise.
     schema_str = str(schema)
     type_variant_op_name = schema_str[: schema_str.find("(")]
     return type_variant_op_name not in no_memory_resize_ops
 
 
 def op_name_from_group(g: NativeFunctionsGroup) -> str:
+    # [FUNCTION DOC] HELPER: Base operator name of the group's functional variant.
     return g.functional.func.name.name.base
 
 
 class GenOpDispatcher:
+    # [CLASS DOC]
+    # Stateless generator of C++ operator registration code for Static Runtime. out_variant
+    # and view build a registration macro invocation for one op name covering all its
+    # overload groups; out_variant_op_generator and view_op_generator build the per-overload
+    # schema-matching branch that returns the node's execution lambda.
     def out_variant(
         self, groups: Sequence[NativeFunctionsGroup], backend_index: BackendIndex
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ registration text (an operator functor macro) for a non-empty list of
+        # out-variant groups sharing a base name, or an empty string for an empty list. Each
+        # group is checked inside its function context. Raises AssertionError if a group is
+        # unsupported or not a NativeFunctionsGroup.
         if not groups:
             return ""
         generated_type_variants = []
@@ -655,6 +732,10 @@ REGISTER_OPERATOR_FUNCTOR(
     def view(
         self, groups: Sequence[NativeFunctionsViewGroup], backend_index: BackendIndex
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns C++ registration text (a native operator functor macro) for a non-empty list
+        # of view groups sharing a base name, or an empty string for an empty list. Raises
+        # AssertionError if a group is unsupported or not a NativeFunctionsViewGroup.
         if not groups:
             return ""
         generated_type_variants = []
@@ -685,6 +766,12 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
     def out_variant_op_generator(
         self, g: NativeFunctionsGroup, backend_index: BackendIndex
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ branch for one out-variant overload: if the node matches the
+        # functional schema, return a lambda that extracts inputs, and either assigns the
+        # functional kernel's result when the output is unset, or resizes the existing output
+        # tensor to zero and calls the out kernel. Raises AssertionError unless the out schema
+        # has exactly one out argument.
         functional = g.functional
         schema = str(functional.func)
         populated_argument = generate_arg_extraction(g.functional.func)
@@ -713,6 +800,10 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
     def view_op_generator(
         self, g: NativeFunctionsViewGroup, backend_index: BackendIndex
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns the C++ branch for one view overload: if the node matches the view schema,
+        # return a lambda that extracts inputs and assigns the view kernel's result as the
+        # output.
         schema = str(g.view.func)
         populated_argument = generate_arg_extraction(g.view.func)
         functional_variant_call = generate_call_to_view_ops(g, backend_index)
@@ -727,7 +818,15 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
 
 
 class GenOpTestCase:
+    # [CLASS DOC]
+    # Stateless generator of C++ gtest cases for Static Runtime generated ops. out_variant and
+    # view concatenate one test per supported group; the *_test_case_generator methods build
+    # a single test running a TorchScript graph through the Static Runtime test harness.
     def out_variant(self, groups: Sequence[NativeFunctionsGroup]) -> str:
+        # [FUNCTION DOC]
+        # Returns newline joined test case text for the out-variant groups, or an empty string
+        # for an empty list. Raises AssertionError if a group is unsupported or of the wrong
+        # type.
         if not groups:
             return ""
         generated_type_variants = []
@@ -744,6 +843,9 @@ class GenOpTestCase:
         return "\n".join(generated_type_variants)
 
     def view(self, groups: Sequence[NativeFunctionsViewGroup]) -> str:
+        # [FUNCTION DOC]
+        # Returns newline joined test case text for the view groups, or an empty string for an
+        # empty list. Raises AssertionError if a group is unsupported or of the wrong type.
         if not groups:
             return ""
         generated_type_variants = []
@@ -760,6 +862,12 @@ class GenOpTestCase:
         return "\n".join(generated_type_variants)
 
     def out_variant_op_test_case_generator(self, g: NativeFunctionsGroup) -> str:
+        # [FUNCTION DOC]
+        # Returns a C++ test for one out-variant group. The test builds a TorchScript graph
+        # calling the op then cloning its result, runs it with two sets of generated inputs
+        # (small then larger) and a resize check unless the op is excluded. Raises
+        # AssertionError for a malformed schema string, a name not starting with the op's
+        # base name, or a functional schema that does not return a single Tensor.
         schema = g.functional.func
         schema_str = str(schema)
         if schema_str.find("(") <= 0:
@@ -813,6 +921,11 @@ TEST(StaticRuntime, autogen_{type_variant_op_name}) {{
         return generated
 
     def view_op_test_case_generator(self, g: NativeFunctionsViewGroup) -> str:
+        # [FUNCTION DOC]
+        # Returns a C++ test for one view group: builds a TorchScript graph calling the view
+        # op then cloning its result and runs it once with generated inputs. Raises
+        # AssertionError for a malformed schema string, a name not starting with the root
+        # name, or a schema that does not return a single Tensor.
         schema = g.view.func
         schema_str = str(schema)
         if schema_str.find("(") <= 0:

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines SelectiveBuildOperator, the per-operator record used to decide what gets registered
+# in a selective (custom) PyTorch build, plus helpers to merge records and operator mappings
+# and to strip overload names. Pure data handling; no import-time side effects.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +15,12 @@ from dataclasses import dataclass
 #
 @dataclass(frozen=True)
 class SelectiveBuildOperator:
+    # [CLASS DOC]
+    # Immutable record describing one operator in a selective build. Fields: name (with
+    # aten:: style prefix, with or without overload), is_root_operator (called directly by
+    # some model), is_used_for_training, include_all_overloads (the entry stands for every
+    # overload of the base name), and private optional debug info as a tuple of strings.
+    # Key methods: from_yaml_dict, from_legacy_operator_name_without_overload, to_dict.
     # The name of the operator. This includes the aten::, etc... prefix
     # The operator name may or may not have the overload name. If this
     # operator name does not specify an overload name, the way to determine
@@ -53,6 +63,11 @@ class SelectiveBuildOperator:
     def from_yaml_dict(
         op_name: str, op_info: dict[str, object]
     ) -> SelectiveBuildOperator:
+        # [FUNCTION DOC]
+        # Builds an operator record from a YAML-style mapping for operator op_name. Missing
+        # boolean flags default to true; debug_info, if present, must be a list and is stored
+        # as a tuple of strings. Raises a generic Exception for unexpected keys, and
+        # AssertionError if a stored name differs from op_name or a field has the wrong type.
         allowed_keys = {
             "name",
             "is_root_operator",
@@ -113,6 +128,9 @@ class SelectiveBuildOperator:
     def from_legacy_operator_name_without_overload(
         name: str,
     ) -> SelectiveBuildOperator:
+        # [FUNCTION DOC]
+        # Creates a record for a legacy operator name: root, used for training, covering all
+        # overloads, and with no debug info.
         return SelectiveBuildOperator(
             name=name,
             is_root_operator=True,
@@ -122,6 +140,10 @@ class SelectiveBuildOperator:
         )
 
     def to_dict(self) -> dict[str, object]:
+        # [FUNCTION DOC]
+        # Returns a mapping with the three flags, plus debug_info (as the stored tuple) when
+        # it is not None. The name is not included since it is the key in the enclosing
+        # mapping.
         ret: dict[str, object] = {
             "is_root_operator": self.is_root_operator,
             "is_used_for_training": self.is_used_for_training,
@@ -137,6 +159,8 @@ def merge_debug_info(
     lhs: tuple[str, ...] | None,
     rhs: tuple[str, ...] | None,
 ) -> tuple[str, ...] | None:
+    # [FUNCTION DOC] HELPER: Merges two optional debug info tuples into a de-duplicated tuple,
+    # or None when both are None. The order of the result is unspecified (built from a set).
     # Ensure that when merging, each entry shows up just once.
     if lhs is None and rhs is None:
         return None
@@ -147,6 +171,9 @@ def merge_debug_info(
 def combine_operators(
     lhs: SelectiveBuildOperator, rhs: SelectiveBuildOperator
 ) -> SelectiveBuildOperator:
+    # [FUNCTION DOC]
+    # Merges two records of the same operator: each flag is the logical or of the inputs and
+    # debug info is merged. Raises a generic Exception if the names differ.
     if str(lhs.name) != str(rhs.name):
         raise Exception(  # noqa: TRY002
             f"Expected both arguments to have the same name, but got '{str(lhs.name)}' and '{str(rhs.name)}' instead"
@@ -171,6 +198,9 @@ def merge_operator_dicts(
     lhs: dict[str, SelectiveBuildOperator],
     rhs: dict[str, SelectiveBuildOperator],
 ) -> dict[str, SelectiveBuildOperator]:
+    # [FUNCTION DOC]
+    # Returns a new mapping holding every operator from both inputs; operators present in
+    # both are combined with combine_operators. Inputs are not mutated.
     operators: dict[str, SelectiveBuildOperator] = {}
     for op_name, op in list(lhs.items()) + list(rhs.items()):
         new_op = op
@@ -183,4 +213,6 @@ def merge_operator_dicts(
 
 
 def strip_operator_overload_name(op_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the part of the operator name before the first period,
+    # i.e. the name without its overload.
     return op_name.split(".", maxsplit=1)[0]

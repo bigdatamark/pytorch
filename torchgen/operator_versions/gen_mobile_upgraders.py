@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC]
+# Script that generates torch/csrc/jit/mobile/upgrader_mobile.cpp, the C++ source holding the
+# mobile bytecode of operator upgraders and the operator-to-upgrader version map. It takes the
+# upgrader bytecode from torch.jit.generate_bytecode and the version map from torch._C, renders
+# them with CodeTemplate templates, and writes the file. Importing torch has a heavy
+# import-time cost; running as a script calls main, which prints progress and writes the file.
 from __future__ import annotations
 
 import os
@@ -17,6 +23,9 @@ from torchgen.operator_versions.gen_mobile_upgraders_constant import (
 
 
 class ByteCode(Enum):
+    # [CLASS DOC] HELPER: Enumeration of the bytecode table names found in an upgrader's
+    # bytecode mapping (instructions, constants, types, operators, register_size). Members
+    # are looked up by name to choose which construct_* renderer handles a table.
     instructions = 1
     constants = 2
     types = 3
@@ -186,6 +195,8 @@ PER_OPERATOR_UPGRADER_LIST = CodeTemplate(
 
 
 def construct_instruction(instruction_list_from_yaml: list[Any]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a C++ instruction vector from a list of
+    # (opcode name, X, N) triples and returns the source text.
     instruction_list_part = [
         ONE_INSTRUCTION.substitute(
             operator_name=instruction[0],
@@ -200,6 +211,9 @@ def construct_instruction(instruction_list_from_yaml: list[Any]) -> str:
 
 
 def construct_constants(constants_list_from_yaml: list[Any]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a C++ vector of IValue constants. Strings are quoted,
+    # booleans become true/false, None becomes an empty expression and ints are printed;
+    # an empty list yields the empty-vector text. Raises ValueError for any other type.
     constants_list_part = []
     for constant_from_yaml in constants_list_from_yaml:
         convert_constant = None
@@ -226,6 +240,8 @@ def construct_constants(constants_list_from_yaml: list[Any]) -> str:
 
 
 def construct_operators(operator_list_from_yaml: list[Any]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a C++ vector of OperatorString entries from a list of
+    # (name, overload name, number of args) triples and returns the source text.
     operator_list_part = [
         ONE_OPERATOTR_STRING.substitute(
             operator_name=operator[0],
@@ -240,6 +256,8 @@ def construct_operators(operator_list_from_yaml: list[Any]) -> str:
 
 
 def construct_types(types_tr_list_from_yaml: list[Any]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a C++ vector of parsed type pointers from a list of type
+    # strings; an empty list yields the empty-vector text.
     types_tr_list_part = [
         ONE_TYPE.substitute(type_str=types_tr) for types_tr in types_tr_list_from_yaml
     ]
@@ -249,6 +267,10 @@ def construct_types(types_tr_list_from_yaml: list[Any]) -> str:
 
 
 def construct_register_size(register_size_from_yaml: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the register size as decimal text. Raises ValueError if
+    # the input is not an int.
+    # KNOWN ISSUE: the second part of the error message lacks an f-string prefix, so the type
+    # placeholder is printed literally, and there is no space before "it's".
     if not isinstance(register_size_from_yaml, int):
         raise ValueError(
             f"Input register size is {register_size_from_yaml} and"
@@ -260,6 +282,12 @@ def construct_register_size(register_size_from_yaml: int) -> str:
 def construct_version_maps(
     upgrader_bytecode_function_to_index_map: dict[str, Any],
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the C++ operator version map source. Reads the operator
+    # version map and upgrader ranges from torch._C, visits operators in sorted name order
+    # (skipping EXCLUDED_OP_SET) and emits an Upgrader entry per upgrader with its version
+    # range and bytecode function index taken from the given name-to-index mapping.
+    # Raises AssertionError if ranges and entries differ in length; KeyError for an unknown
+    # upgrader name.
     version_map = torch._C._get_operator_version_map()
     sorted_version_map_ = sorted(version_map.items(), key=itemgetter(0))  # type: ignore[no-any-return]
     sorted_version_map = dict(sorted_version_map_)
@@ -306,6 +334,9 @@ def construct_version_maps(
 def get_upgrader_bytecode_function_to_index_map(
     upgrader_dict: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Assigns consecutive indices, in input order starting at zero, to
+    # the upgrader names across all mappings in the list, skipping names in
+    # EXCLUE_UPGRADER_SET. Returns the name-to-index mapping.
     upgrader_bytecode_function_to_index_map = {}
     index = 0
     for upgrader_bytecode in upgrader_dict:
@@ -318,6 +349,12 @@ def get_upgrader_bytecode_function_to_index_map(
 
 
 def write_cpp(cpp_path: str, upgrader_dict: list[dict[str, Any]]) -> None:
+    # [FUNCTION DOC]
+    # Renders the full upgrader_mobile.cpp text from the list of upgrader bytecode mappings
+    # (version map plus one bytecode function per non-excluded upgrader) and writes it as
+    # UTF-8 into the directory cpp_path, overwriting any existing file. Prints the target path.
+    # Raises KeyError if a bytecode table name is not a ByteCode member, plus errors from the
+    # construct_* helpers.
     upgrader_bytecode_function_to_index_map = (
         get_upgrader_bytecode_function_to_index_map(upgrader_dict)
     )
@@ -369,6 +406,8 @@ def write_cpp(cpp_path: str, upgrader_dict: list[dict[str, Any]]) -> None:
 
 
 def sort_upgrader(upgrader_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Returns a new list of the upgrader mappings sorted by the first
+    # key (upgrader name) of each mapping.
     sorted_upgrader_list = sorted(
         upgrader_list, key=lambda one_upgrader: next(iter(one_upgrader))
     )
@@ -376,6 +415,10 @@ def sort_upgrader(upgrader_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: generates upgrader bytecode, sorts it by name, prints the order, and writes
+    # upgrader_mobile.cpp into torch/csrc/jit/mobile under the repository root (two levels
+    # above this file). Side effects: console output and overwriting that source file.
     upgrader_list = generate_upgraders_bytecode()
     sorted_upgrader_list = sort_upgrader(upgrader_list)
     for up in sorted_upgrader_list:
