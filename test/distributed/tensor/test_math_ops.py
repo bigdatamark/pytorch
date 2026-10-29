@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-rank DTensor tests for math, reduction, normalization and linear-algebra
+# ops: reductions (sum, max, norm, std, logsumexp, ...), softmax, nll_loss/cross_entropy,
+# layer norm / RMSNorm, topk, svd, foreach ops, cumulative scans, median, histc, pooling,
+# interpolation and linalg ops. Tests compare DTensor results, output placements and
+# collective counts (via CommDebugMode) against plain tensor results. Import-time side
+# effects: defines the alias funcol and creates DistMathOpsTestWithLocalTensor at the end;
+# run_tests is invoked when run as a script.
 
 import copy
 import itertools
@@ -41,7 +48,15 @@ funcol = torch.ops.c10d_functional
 
 
 class DistMathOpsTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case covering math, reduction, normalization and
+    # linalg ops on device meshes built per test. Keeps no state of its own beyond two helper
+    # methods (_check_module, linear_op_reductions) shared by tests; most tests use with_comms
+    # and some require GPUs.
     def _check_module(self, m1, m2, check_grad=False):
+        # [FUNCTION DOC] HELPER: for every named parameter of m2, asserts a parameter of the
+        # same name exists in m1 and that the values are equal. With check_grad the .grad
+        # tensors are compared instead. DTensor values from m2 are redistributed to Replicate
+        # and converted to local tensors first.
         named_parameters = dict(m1.named_parameters())
         for name, param_m2 in m2.named_parameters():
             self.assertTrue(name in named_parameters)
@@ -57,6 +72,11 @@ class DistMathOpsTest(DTensorTestBase):
             self.assertEqual(param_m2, param_m1)
 
     def linear_op_reductions(self, op_str):
+        # [FUNCTION DOC] HELPER (not itself a test): applies the tensor method named op_str to
+        # a random 12x8x8 tensor and to its Shard(0) DTensor, reducing over each dim with
+        # keepdim True, False and unspecified, then over all elements. For any/all the tensor
+        # is first made boolean. For max/min only the values of the (values, indices) tuple
+        # are compared. Asserts every gathered DTensor result equals the local one.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -90,6 +110,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_linear_op_reductions(self):
+        # [FUNCTION DOC] Runs linear_op_reductions for all, sum, prod, max, min, any, amax,
+        # amin, var, std and nansum.
         for op_str in (
             "all",
             "sum",
@@ -107,6 +129,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_nansum_with_nan(self):
+        # [FUNCTION DOC] nansum on a 2x3 tensor containing NaNs sharded on dim 0. Asserts the
+        # gathered result matches local nansum, and the placement is Partial(sum) for a full
+        # reduction and for reduction along dim 0, but stays Shard(0) for reduction along dim 1.
         device_mesh = self.build_device_mesh()
         # Tensor with NaN values sharded across the reduction dim
         tensor = torch.tensor(
@@ -132,6 +157,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_prims_amax_amin(self):
+        # [FUNCTION DOC] For prims amax and amin on a Shard(0) DTensor: reducing the sharded
+        # dim or all dims yields a partial placement; reducing a non-sharded dim keeps Shard(0).
+        # All gathered results are compared with the local prim results.
         device_mesh = self.build_device_mesh()
         tensor = torch.randn(12, 8, 8, device=self.device_type)
         dtensor = distribute_tensor(tensor, device_mesh, [Shard(0)])
@@ -156,11 +184,16 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_mean(self):
+        # [FUNCTION DOC] GPU-only; runs linear_op_reductions for mean.
         self.linear_op_reductions("mean")
 
     # TODO: forward test can be removed once test_softmax_with_bwd passes on CPU
     @with_comms
     def test_softmax_fwd(self):
+        # [FUNCTION DOC] Forward softmax (float32 output dtype) over every softmax dim and
+        # shard dim in {-1, 0, 1, 2} on an 8x12x16 tensor. If the shard dim equals the softmax
+        # dim the output must be Replicate and the local tensor equal the local result;
+        # otherwise the output stays sharded on the same dim and the gathered tensor matches.
         device_mesh = self.build_device_mesh()
 
         x = torch.rand(8, 12, 16, device=self.device_type)
@@ -191,6 +224,12 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_softmax_with_bwd(self):
+        # [FUNCTION DOC] GPU-only. For every softmax dim and shard dim in {-1, 0, 1, 2}:
+        # computes sum of softmax with backward locally and on a sharded DTensor, asserting
+        # output and summed-loss placements (Replicate when softmax dim is sharded, else Shard
+        # then Partial which is redistributed to Replicate), loss equality, that the grad is
+        # None before backward, and that the gathered input grad matches with Replicate
+        # or Shard placement as appropriate.
         device_mesh = self.build_device_mesh()
 
         dims = range(3)  # used to convert -1 to the actual dim
@@ -234,6 +273,12 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_nll_loss_and_cross_entropy(self):
+        # [FUNCTION DOC] GPU-only. For 2D and 3D class-logit inputs, every shard dim, every
+        # reduction (none, mean, sum) and both nll_loss and cross_entropy, runs forward and
+        # backward on local and DTensor inputs (replicated target). Asserts: sharding the
+        # channel dim or using mean costs exactly one all-gather and gives a Replicate result;
+        # otherwise no communication, with a Shard (none) or Partial (sum) result; gradients
+        # are Replicate for channel-dim sharding, else sharded on the same dim, and match local.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -304,6 +349,10 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_nll_loss_weighted_mean_with_even_target_counts(self):
+        # [FUNCTION DOC] GPU-only; skipped if fewer than 2 ranks. Builds a batch where each
+        # rank's two samples share one class (alternating by rank parity) with distinct
+        # losses, shards it on dim 0 and checks weighted-mean nll_loss with class weights
+        # (1, 10) gives a Replicate result equal to the local weighted mean.
         if self.world_size < 2:
             self.skipTest("requires at least 2 ranks")
 
@@ -342,6 +391,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_shard_math_ops(self):
+        # [FUNCTION DOC] On a 2D mesh (2 x world_size/2) shards a 4x4 ones tensor as
+        # (Shard 0, Shard 0) and (Shard 0, Shard 1), applies add, sub, mul and div with the
+        # scalar 2 and asserts the gathered results equal the local ones.
         mesh_shape = (2, self.world_size // 2)
         mesh = DeviceMesh(
             self.device_type,
@@ -366,6 +418,11 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_layer_norm_fwd(self):
+        # [FUNCTION DOC] Forward LayerNorm (and RMSNorm on cuda) over a 20x5x10 input for
+        # every shard dim, normalized-shape suffix and elementwise_affine setting, with
+        # parameters replicated via distribute_module. Asserts at most one collective in the
+        # forward (a TODO says it should be zero), that the output TensorMeta shape equals the
+        # local output shape, and that the gathered output equals the local output.
         device_mesh = self.build_device_mesh()
 
         # NLP example from pytorch docs
@@ -398,6 +455,9 @@ class DistMathOpsTest(DTensorTestBase):
             layer_norm_local = copy.deepcopy(layer_norm).to(self.device_type)
 
             def _replicate_fn(name, module, device_mesh):
+                # [FUNCTION DOC] HELPER: distribute_module partition function; replaces each
+                # parameter named weight or bias of the module by a Parameter holding a
+                # Replicate DTensor on device_mesh. The name argument is shadowed by the loop.
                 for name, param in module.named_parameters():
                     # RMSNorm only has weight, LayerNorm has both weight and bias
                     if name in ["weight", "bias"]:
@@ -435,6 +495,12 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_layer_norm_bwd(self):
+        # [FUNCTION DOC] Forward and backward LayerNorm (and RMSNorm on cuda) over a 20x5x10
+        # input for shard dims 0-2, every normalized-shape suffix and elementwise_affine
+        # setting. Asserts forward and backward each use 0 collectives if the shard dim is
+        # outside the normalized dims, else 1; outputs match; weight/bias grads are Partial
+        # exactly when an outer (non-normalized) dim is sharded; and weight, bias and
+        # input grads equal the local ones.
         device_mesh = self.build_device_mesh()
 
         # NLP example from pytorch docs
@@ -473,6 +539,9 @@ class DistMathOpsTest(DTensorTestBase):
             layer_norm_local = copy.deepcopy(layer_norm).to(self.device_type)
 
             def _replicate_fn(name, module, device_mesh):
+                # [FUNCTION DOC] HELPER: distribute_module partition function; replaces each
+                # parameter named weight or bias of the module by a Parameter holding a
+                # Replicate DTensor on device_mesh. The name argument is shadowed by the loop.
                 for name, param in module.named_parameters():
                     if name in ["weight", "bias"]:
                         param_dist = torch.nn.Parameter(
@@ -557,6 +626,13 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_layer_norm_bwd_req_grad(self):
+        # [FUNCTION DOC] For each valid combination of norm type, multi-dim norm, affine,
+        # and requires_grad flags for embedding, norm and output-linear layers, builds an
+        # embedding -> norm -> linear model, parallelizes it with row-wise / sequence /
+        # column-wise parallel plans, and compares against a local copy. Checks forward
+        # output and collective counts, backward parameter grads and the expected backward
+        # collective counts per pattern. Failures are collected per config and raised
+        # together as one AssertionError at the end.
         device_mesh = self.build_device_mesh()
         batch, seq_len, embedding_dim, vocab_size = 8, 8, 10, 32
 
@@ -567,6 +643,9 @@ class DistMathOpsTest(DTensorTestBase):
 
         # build our subtest configurations and filter out invalid ones
         class SubTest(NamedTuple):
+            # [CLASS DOC] HELPER: named tuple describing one subtest configuration (norm type
+            # and five boolean flags: multidim_norm, elementwise_affine, and requires_grad of
+            # the embedding, layer norm and output linear layers).
             norm_type: type
             multidim_norm: bool
             elementwise_affine: bool
@@ -577,6 +656,8 @@ class DistMathOpsTest(DTensorTestBase):
         subtest_fails = {}
 
         def valid_filter(cfg):
+            # [FUNCTION DOC] HELPER: returns True for configs that are runnable: layer norm
+            # requires grad only if affine, and at least one of the three layers requires grad.
             return not (cfg.ln_req_grad and not cfg.elementwise_affine) and any(cfg[3:])
 
         subtest_cfgs = list(
@@ -606,7 +687,12 @@ class DistMathOpsTest(DTensorTestBase):
 
                 # configure our local and parallelized models for this subtest
                 class LnTpBlock(torch.nn.Module):
+                    # [CLASS DOC] HELPER: small model of an embedding, a norm layer (using
+                    # the enclosing subtest's norm type, shape and affine setting) and a
+                    # square linear layer, applied in sequence to token ids.
                     def __init__(self):
+                        # [FUNCTION DOC] HELPER: creates the embedding, norm and linear
+                        # submodules from variables of the enclosing test.
                         super().__init__()
                         self.preln_embeddings = torch.nn.Embedding(
                             vocab_size, embedding_dim
@@ -619,6 +705,8 @@ class DistMathOpsTest(DTensorTestBase):
                         )
 
                     def forward(self, tokens):
+                        # [FUNCTION DOC] HELPER: embeds the token ids, normalizes, applies
+                        # the linear layer and returns the result.
                         h = self.preln_embeddings(tokens)
                         h = self.layer_norm(h)
                         output = self.postln_linear(h)
@@ -729,6 +817,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_topk(self):
+        # [FUNCTION DOC] topk (k=3, dim 0) on a 12x8x8 tensor for placements Shard(0..2) and
+        # Replicate. When sharded on the topk dim it asserts exactly one all-gather; for all
+        # placements the gathered values equal the local topk values.
         device_mesh = self.build_device_mesh()
         placement_combs = [Shard(0), Shard(1), Shard(2), Replicate()]
 
@@ -752,6 +843,10 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_topk_backward(self):
+        # [FUNCTION DOC] For topk dims 0, 1, -1 and shard dims 0-2, backpropagates the sum of
+        # topk values locally and through a sharded DTensor, asserting the DTensor grad exists
+        # and its gathered value equals the local grad (guards that the zeros built in
+        # backward are dispatched through DTensor). Local grads are zeroed per iteration.
         device_mesh = self.build_device_mesh()
         # Test backward for topk with various shard_dim / topk_dim combinations.
         # The fix in value_selecting_reduction_backward ensures that the zeros
@@ -788,6 +883,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_shard0_svd(self):
+        # [FUNCTION DOC] Computes reduced SVD of an 8x8 matrix sharded on dim 0 (seeded) under
+        # CommDebugMode. Asserts U, S, V local tensors equal the reference SVD of the full
+        # matrix and that the only collective is a single all-gather.
         device_mesh = self.build_device_mesh()
         torch.manual_seed(42)
         replicated_x = torch.randn((8, 8), device=self.device_type)
@@ -804,6 +902,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_vector_norm(self):
+        # [FUNCTION DOC] Asserts the 2-norm of a Shard(0) DTensor via aten linalg_vector_norm
+        # has a gathered value equal to the local 2-norm.
         device_mesh = self.build_device_mesh()
 
         grad = torch.randn(12, 8)
@@ -820,6 +920,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_vector_norm_partial(self):
+        # [FUNCTION DOC] Each rank holds the local vector (rank, 1) wrapped as a Partial
+        # DTensor; asserts the 2-norm via linalg_vector_norm gathers to the norm of the
+        # summed vector (sum of ranks, world_size).
         device_mesh = self.build_device_mesh()
 
         all_ranks = list(range(self.world_size))
@@ -840,6 +943,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_norm(self):
+        # [FUNCTION DOC] Computes aten _foreach_norm (2-norm) of two Shard(0) DTensors and
+        # asserts each gathered result equals the local norm.
         device_mesh = self.build_device_mesh()
 
         grad0 = torch.randn(12, 8)
@@ -859,6 +964,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_max_sharded(self):
+        # [FUNCTION DOC] _foreach_max over two Shard(0) DTensors: asserts each result has
+        # placement Partial(max) and its gathered value equals the local max.
         device_mesh = self.build_device_mesh()
 
         torch.manual_seed(42)
@@ -879,6 +986,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_norm_partial(self):
+        # [FUNCTION DOC] Wraps per-rank local vectors as two Partial DTensors and asserts
+        # _foreach_norm (2-norm) gathers to the norms of the summed vectors.
         device_mesh = self.build_device_mesh()
 
         all_ranks = list(range(self.world_size))
@@ -909,6 +1018,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_powsum_sharded(self):
+        # [FUNCTION DOC] For ord 1, 2, 3 asserts aten linalg__powsum of a Shard(0) DTensor
+        # has placement Partial(sum) and gathers to the sum of absolute values to the ord
+        # power (no root).
         """Test that linalg__powsum produces Partial(sum) placement for sharded input."""
         device_mesh = self.build_device_mesh()
 
@@ -930,6 +1042,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_vector_norm_special_norms_placement(self):
+        # [FUNCTION DOC] On a Shard(0) positive tensor asserts linalg_vector_norm gives a
+        # Partial output with reduce op max for inf, min for -inf, and sum for ord 1 and 0,
+        # with gathered values equal to max, min, sum of absolute values and the nonzero count.
         """Test that inf/-inf/0/1 norms produce correct Partial placements."""
         device_mesh = self.build_device_mesh()
 
@@ -963,6 +1078,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_powsum_sharded(self):
+        # [FUNCTION DOC] For ord 1, 2, 3 asserts _foreach_powsum on two Shard(0) DTensors
+        # returns Partial(sum) outputs whose gathered values equal the local sums of
+        # absolute values to the ord power.
         """Test that _foreach_powsum produces correct values and placements for sharded input."""
         device_mesh = self.build_device_mesh()
 
@@ -992,6 +1110,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_norm_different_mesh(self):
+        # [FUNCTION DOC] Builds a 2D mesh (2 x world_size/2) with named dims and slices out
+        # submeshes x and y. _foreach_norm over two Replicate DTensors, one per submesh, must
+        # succeed and each output keeps its own input's device mesh.
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("x", "y")
@@ -1018,6 +1139,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_norm_0_on_psum(self):
+        # [FUNCTION DOC] The 0-norm of a Partial(sum) DTensor must not stay Partial (the
+        # input is redistributed first): asserts the result placement is Replicate and its
+        # value is 3.0, the number of nonzero entries of the original tensor.
         # L0 norm on P(sum) should not propagate -> P(sum), should replicate
         device_mesh = self.build_device_mesh()
         t = torch.tensor([0, 1, 0, 3, 0, 5], device=self.device_type).float()
@@ -1028,6 +1152,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_max_min_dim_sharded(self):
+        # [FUNCTION DOC] For torch max and min along dim 1 of a 128x64 tensor, with the input
+        # as Shard(0), Shard(1) or Partial, asserts the gathered values and indices equal the
+        # local results.
         """max.dim/min.dim on sharded tensors produce correct values and indices."""
         device_mesh = self.build_device_mesh()
         t = torch.randn(128, 64, device=self.device_type)
@@ -1056,6 +1183,10 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_foreach_add_different_mesh(self):
+        # [FUNCTION DOC] Requires at least 4 GPUs. Zipped _foreach_add of DTensor pairs living
+        # on different submeshes (x and y of a 2D mesh) succeeds and each output keeps its
+        # pair's mesh; adding pairs whose meshes mismatch raises a RuntimeError containing
+        # "Sharding propagation failed".
         mesh_shape = (2, self.world_size // 2)
         mesh_2d = init_device_mesh(
             self.device_type, mesh_shape, mesh_dim_names=("x", "y")
@@ -1090,6 +1221,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_foreach_compose(self):
+        # [FUNCTION DOC] Applies _foreach_abs then _foreach_max to three Shard(0) DTensors and
+        # asserts each gathered result equals the same local computation.
         """Test composing multiple foreach operations."""
         device_mesh = self.build_device_mesh()
         local_shards = tuple(torch.randn(4, 8) for _ in range(3))
@@ -1107,6 +1240,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_linalg_eigh(self):
+        # [FUNCTION DOC] Makes a replicated symmetric 2x2 float64 DTensor, runs eigh, converts
+        # A, eigenvalues and eigenvectors to local tensors (no strategy for dist yet, per the
+        # TODO) and asserts the reconstruction distance from A is exactly 0.0.
         A = torch.randn(2, 2, dtype=torch.float64)
         mesh = self.build_device_mesh()
         dtensor_A = distribute_tensor(A, device_mesh=mesh, placements=[Replicate()])
@@ -1125,6 +1261,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_upsampling(self):
+        # [FUNCTION DOC] Applies bilinear, nearest and bicubic 2x upsampling modules to a
+        # 1x1x2x2 input and its Shard(0) DTensor; asserts the gathered result equals the
+        # local result.
         input = torch.arange(1, 5, dtype=torch.float32).view(1, 1, 2, 2)
         mesh = self.build_device_mesh()
         input_dtensor = distribute_tensor(
@@ -1143,6 +1282,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_cumsum(self):
+        # [FUNCTION DOC] cumsum along dim 0 and 1 of a 3x5 tensor sharded on dim 0. Along the
+        # sharded dim asserts one all-gather and a Replicate output; along the other dim no
+        # communication and Shard(0). Gathered results equal the local cumsum.
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
         inp = torch.rand(3, 5, device=self.device_type)
@@ -1171,6 +1313,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_scan_ops(self):
+        # [FUNCTION DOC] cumprod and logcumsumexp along dim 0 and 1 of a 3x5 tensor sharded on
+        # dim 0: asserts a Replicate output along the sharded dim, Shard(0) along the other,
+        # and gathered values equal to local results (collective counts are not asserted).
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
         inp = torch.rand(3, 5, device=self.device_type)
@@ -1193,6 +1338,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_scan_ops_backward(self):
+        # [FUNCTION DOC] Subtests over cumprod and logcumsumexp, placements Shard(0), Shard(1),
+        # Replicate and dims 0 and 1 (cumprod also with a zero row/column injected). Compares
+        # forward output and the input gradient of the summed output with local autograd.
         device_mesh = self.build_device_mesh()
 
         for op, placements in itertools.product(
@@ -1228,6 +1376,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_cumprod_backward_higher_order(self):
+        # [FUNCTION DOC] Double backward for cumprod along dim 0 of a Shard(0) tensor with a
+        # zero row: asserts output, first-order grad (computed with create_graph) and the
+        # grad accumulated from backpropagating through it match local autograd.
         device_mesh = self.build_device_mesh()
         dim = 0
         x = torch.rand(4, 3, device=self.device_type).add_(0.1)
@@ -1253,6 +1404,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_masked_cumprod_backward(self):
+        # [FUNCTION DOC] Subtests of torch.masked.cumprod with a checkerboard mask (replicated)
+        # over placements Shard(0), Shard(1), Replicate and dims 0 and 1; compares output and
+        # input gradient with local autograd.
         device_mesh = self.build_device_mesh()
         row_idx = torch.arange(12, device=self.device_type).unsqueeze(1)
         col_idx = torch.arange(8, device=self.device_type).unsqueeze(0)
@@ -1282,6 +1436,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_scan_ops_with_indices(self):
+        # [FUNCTION DOC] cummax and cummin along dim 0 and 1 of a 12x8 tensor sharded on dim 0:
+        # asserts the values output is Replicate along the sharded dim, else Shard(0), and
+        # equals the local values. Indices are computed but not compared.
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
         inp = torch.rand(12, 8, device=self.device_type)
@@ -1304,6 +1461,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_scan_ops_with_indices_backward(self):
+        # [FUNCTION DOC] Subtests for cummax and cummin over placements Shard(0), Shard(1),
+        # Replicate and dims 0 and 1: compares values, indices and the input gradient of the
+        # summed values with local autograd.
         device_mesh = self.build_device_mesh()
 
         for op, placements in itertools.product(
@@ -1330,6 +1490,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_median(self):
+        # [FUNCTION DOC] Asserts global median and nanmedian of a Shard(0) DTensor gather to
+        # the local results.
         device_mesh = self.build_device_mesh()
         tensor = torch.randn(12, 8, device=self.device_type)
         dtensor = distribute_tensor(tensor, device_mesh, [Shard(0)])
@@ -1344,6 +1506,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_dim_reductions_with_indices(self):
+        # [FUNCTION DOC] For nanmedian, kthvalue (k=3) and mode reduced along each dim of a
+        # 12x8 tensor sharded on dim 0: asserts gathered values and indices equal the local
+        # results, and the values placement is Replicate for the sharded dim, else Shard(0).
         device_mesh = self.build_device_mesh()
         tensor = torch.randn(12, 8, device=self.device_type)
         shard_dim = 0
@@ -1384,6 +1549,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_conj_complex_dtensor(self):
+        # [FUNCTION DOC] conj then add 1 on a replicated complex64 DTensor: asserts no
+        # collectives and that the gathered result equals the local computation.
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -1403,10 +1570,16 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_rotary_embedding_complex_ops(self):
+        # [FUNCTION DOC] Runs a rotary-embedding style computation (view real as complex,
+        # multiply by complex frequencies, view back as real) with replicated DTensors,
+        # plus backward of the summed output. Asserts no collectives and that the xq grad
+        # equals the grad from the same computation on plain tensors.
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
         def apply_rotary_emb(xq, freqs_cis):
+            # [FUNCTION DOC] HELPER: interprets the last dim of xq as complex, multiplies by
+            # freqs_cis, and returns the product viewed back as real values.
             xq_ = torch.view_as_complex(xq)
             xq_out = torch.view_as_real(xq_ * freqs_cis)
             return xq_out
@@ -1436,6 +1609,10 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_histc(self):
+        # [FUNCTION DOC] histc with and without explicit min/max over a 12x8x8 tensor for
+        # placements Shard(0..2) and Replicate. Asserts one all-gather for sharded input
+        # without explicit min/max and no communication otherwise; the gathered histogram
+        # equals the local one.
         # TODO - nicer to use parametrize here so its easy to run one sub-test by name,
         # but its too slow (10sec per process-group init) -> switch to MultiProcessContinuousTest
         device_mesh = self.build_device_mesh()
@@ -1472,6 +1649,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_logsumexp(self):
+        # [FUNCTION DOC] logsumexp along dim 0 and 1 of a 3x5 tensor sharded on dim 0. Along
+        # the sharded dim asserts one all-gather and a Replicate output; along the other dim
+        # no communication and Shard(0). Gathered results equal the local ones.
         mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
         inp = torch.rand(3, 5, device=self.device_type)
@@ -1500,6 +1680,10 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_partial_reduction_ops(self):
+        # [FUNCTION DOC] For norm, max and min, takes a Partial(sum) DTensor of per-rank random
+        # values and asserts that reducing it directly gives the same gathered result as
+        # first redistributing it to Replicate and then reducing. The first draw is seeded
+        # by rank; later draws continue that generator.
         mesh = self.build_device_mesh()
         rank = dist.get_rank()
 
@@ -1545,6 +1729,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_matching_partial_reduction_ops(self):
+        # [FUNCTION DOC] max of a Partial(max) DTensor stays Partial while max of the
+        # Replicate-redistributed tensor is Replicate; asserts those placements and that
+        # both gather to the same value.
         mesh = self.build_device_mesh()
         rank = dist.get_rank()
 
@@ -1567,6 +1754,9 @@ class DistMathOpsTest(DTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @with_comms
     def test_std(self):
+        # [FUNCTION DOC] Requires 4 GPUs. Shards a fixed 2x4 tensor on a 2x2 mesh as
+        # (Shard 0, Shard 1) and takes std along dim 1 under CommDebugMode. Asserts exactly
+        # one all-gather, placements (Shard 0, Replicate) and values 9.0 and 11.0.
         mesh = DeviceMesh(self.device_type, torch.arange(4).reshape(2, 2))
         rank = self.rank
         comm_mode = CommDebugMode()
@@ -1591,6 +1781,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_prims_pointwise_ops(self):
+        # [FUNCTION DOC] Unary special-function prims (bessel, erfcx, ndtri, ...) on a clamped
+        # Shard(0) tensor must keep Shard(0) and match local results; binary ops (prims div,
+        # gcd, ne and aten ne, gcd; gcd on integer casts) must match local results.
         device_mesh = self.build_device_mesh()
         x = torch.randn(12, 8)
         y = torch.randn(12, 8)
@@ -1630,6 +1823,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_prims_fma(self):
+        # [FUNCTION DOC] Checks the inductor fma prim on Shard(0) DTensors (all tensors, then a
+        # scalar-tensor middle argument) and on Replicate DTensors with a scalar tensor:
+        # results match local fma and keep Shard(0) or Replicate placement respectively.
         from torch._inductor import inductor_prims
 
         device_mesh = self.build_device_mesh()
@@ -1663,6 +1859,8 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_prims_view_of(self):
+        # [FUNCTION DOC] Asserts prims view_of on a Shard(0) DTensor keeps Shard(0) and the
+        # gathered value equals the original tensor.
         device_mesh = self.build_device_mesh()
         x = torch.randn(12, 8)
         dtensor = distribute_tensor(x, device_mesh, [Shard(0)])
@@ -1673,6 +1871,9 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_pooling_ops(self):
+        # [FUNCTION DOC] On batch-sharded inputs, checks avg_pool2d, adaptive_avg_pool2d,
+        # adaptive_max_pool2d (values, with indices returned) and avg_pool3d: gathered
+        # results equal local ones and the output stays Shard(0). Indices are not compared.
         device_mesh = self.build_device_mesh()
 
         # Single-output pooling
@@ -1713,6 +1914,10 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_nll_loss_backward_comm_counts(self):
+        # [FUNCTION DOC] GPU-only. For cross_entropy with reductions sum, none and mean on
+        # Shard(0) logits and targets, runs backward under CommDebugMode and asserts the
+        # number of all-reduces is 0 in each case (the dict of expected counts is all zeros),
+        # then compares the DTensor input grad to the local grad.
         """Test backward comm counts for nll_loss/cross_entropy with Shard(0) inputs.
 
         When inputs are Shard(0), nll_loss_forward produces total_weight as
@@ -1771,6 +1976,9 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_linalg_ops(self):
+        # [FUNCTION DOC] GPU-only. On batch-sharded (Shard 0) 8x4x4 matrices checks cholesky,
+        # inv, lu_factor, eig and solve: gathered primary outputs match local results and
+        # remain Shard(0). Secondary outputs (pivots, eigenvectors) are not compared.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         # Batched positive-definite matrix for ops that require it (cholesky, inv)
@@ -1815,6 +2023,8 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_linalg_cross(self):
+        # [FUNCTION DOC] GPU-only. linalg.cross of two 8x4x3 tensors sharded on dim 0 and on
+        # dim 1 (cross dim is the last): results match local cross and keep the shard dim.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         a = torch.randn(8, 4, 3, device=self.device_type)
         b = torch.randn(8, 4, 3, device=self.device_type)
@@ -1837,6 +2047,8 @@ class DistMathOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_linalg_solve_partial(self):
+        # [FUNCTION DOC] GPU-only. linalg.solve with a replicated SPD float64 matrix and a
+        # Partial right-hand side; asserts the gathered result equals the local solve.
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         A = torch.randn(4, 4, device=self.device_type, dtype=torch.float64)
         A = A @ A.mT + 4 * torch.eye(4, device=self.device_type, dtype=torch.float64)
@@ -1850,6 +2062,12 @@ class DistMathOpsTest(DTensorTestBase):
 
     @with_comms
     def test_interpolation_upsample_ops(self):
+        # [FUNCTION DOC] Subtests of F.interpolate (linear, nearest, bilinear, bicubic,
+        # antialias variants, trilinear, plus lanczos on CPU) for Shard(0), Shard(1) and
+        # Replicate inputs. Each runs forward and backward under CommDebugMode, asserting
+        # zero collectives, output equal to local with the same placements, and input grad
+        # equal to local. Then checks area-mode interpolate and adaptive_avg_pool2d forward
+        # on a batch-sharded input (values and Shard(0) placement).
         """Test forward and backward for F.interpolate with DTensor.
 
         Verifies output and gradient correctness for all interpolation modes
@@ -1933,6 +2151,11 @@ class DistMathOpsTest(DTensorTestBase):
     @skipIfRocm
     @with_comms
     def test_normalization_ops(self):
+        # [FUNCTION DOC] Skipped on ROCm. Checks eval-mode batch_norm on a batch-sharded input
+        # (output Replicate, equals local); training batch_norm with channel-sharded input,
+        # weights and running stats, forward and backward with zero collectives and grads
+        # matching local with unchanged placements; and group_norm with and without affine
+        # parameters on a batch-sharded input (output Shard(0), equals local).
         device_mesh = self.build_device_mesh()
         F = torch.nn.functional
 

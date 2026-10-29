@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-rank DTensor tests for matrix-multiply style ops: addmm, mm, bmm, baddbmm,
+# linear, matmul, t, _scaled_mm, scaled_dot_product_attention, tensordot, grouped_mm and
+# constant_pad_nd, plus single-dim einsum strategy generation and scaled_mm scale placement.
+# Tests compare DTensor results (and sometimes placements / collective counts via
+# CommDebugMode) with plain local tensor results. Import-time side effects: defines the
+# module-level alias funcol, instantiates the parametrized tests and creates the
+# DistMatrixOpsTestWithLocalTensor variant class; run_tests is invoked when run as a script.
 
 import itertools
 import math
@@ -55,6 +62,13 @@ funcol = torch.ops.c10d_functional
 def scale_for_fp8(
     t: torch.Tensor, scale_shape: tuple[int]
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: quantizes a 2D tensor t to float8 (e4m3) with block scales.
+    # scale_shape gives the number of scale blocks along (rows, cols); if every entry is 1
+    # (including an empty or 1-element shape) the whole tensor is one block (tensor-wise),
+    # otherwise rows and columns are split evenly into that many blocks. Each block's scale
+    # is its max absolute value (as float) divided by E4M3_MAX_POS; values are divided by
+    # their block scale and cast to e4m3_type.
+    # Returns the fp8 tensor flattened back to 2D and the scale tensor shaped scale_shape.
     if all(d == 1 for d in scale_shape):
         t = t.unsqueeze(0).unsqueeze(-2)
     else:
@@ -67,8 +81,18 @@ def scale_for_fp8(
 
 
 class DistMatrixOpsTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case (one device mesh over all ranks, built per
+    # test with build_device_mesh) for matmul-family ops. Most tests are decorated with
+    # with_comms to set up the process group; some need GPUs or FP8 hardware. Holds no state
+    # of its own. It is instantiated for parametrized tests and re-created as a local-tensor
+    # variant at module level.
     @with_comms
     def test_addmm(self):
+        # [FUNCTION DOC] Runs addmm on DTensors for LHS-free-dim sharding, RHS-free-dim
+        # sharding, contracting-dim sharding (Partial output, Partial bias) and all-Replicate
+        # inputs, with 1D, 2D, scalar, (1, N) and (M, 1) bias shapes. For each case it checks
+        # the gathered result equals local addmm and that the output placement is the
+        # expected Shard, Partial or Replicate, with the bias placement matching broadcast dims.
         """
         Test addmm with all sharding strategies from addmm_single_dim_strategy.
 
@@ -201,6 +225,9 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_addmm_empty_operand(self):
+        # [FUNCTION DOC] addmm where the contracted dim has size zero (12x0 sharded on dim 0
+        # times 0x4 replicated, replicated 1D bias); checks the gathered DTensor result equals
+        # the local addmm result.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
         replica_spec = [Replicate()]
@@ -218,6 +245,10 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_addmm_auto_redistribute(self):
+        # [FUNCTION DOC] addmm with mat1 sharded on dim 1, mat2 sharded on dim 0 and a
+        # replicated bias, all requiring grad. Asserts the output is a DTensor with a Partial
+        # placement, that its full tensor equals the local result, and that after backward
+        # the gathered mat2 gradient equals the local gradient.
         device_mesh = self.build_device_mesh()
         shard0_spec = [Shard(0)]
         shard1_spec = [Shard(1)]
@@ -248,6 +279,10 @@ class DistMatrixOpsTest(DTensorTestBase):
         self.assertEqual(mat2.grad.full_tensor(), tensor_to_shard0.grad)
 
     def test_gen_single_dim_einsum_strategies_bias_reduce_op(self):
+        # [FUNCTION DOC] Generates single-dim einsum strategies for the addmm equation with a
+        # 1D and a 2D bias shape (no process group needed). For every strategy whose output
+        # placement is Partial, asserts the bias placement is also Partial with the same
+        # reduce_op as the output.
         """Test that bias Partial placements preserve reduce_op from output Partial."""
         # Test addmm strategy: "mk,kn->mn" with bias
         # For contracting dim k: output=Partial, bias should also be Partial with same reduce_op
@@ -283,6 +318,10 @@ class DistMatrixOpsTest(DTensorTestBase):
                     )
 
     def test_gen_single_dim_einsum_strategies_batch_linearity(self):
+        # [FUNCTION DOC] For an all-batch equation with two inputs, asserts the generated
+        # strategies (compared by repr) are exactly: shard on each of the four dims, per-input
+        # linearity (one Partial sum/avg input, other Replicate) and all-Partial sum/avg. For
+        # the matmul equation (contracting dim present) asserts no strategy is all-Partial.
         """Test that batch-only equations auto-detect all-Partial linearity."""
         S = _ShardingPlaceholder
 
@@ -319,6 +358,10 @@ class DistMatrixOpsTest(DTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @with_comms
     def test_mm_with_strided_input(self):
+        # [FUNCTION DOC] Requires at least 4 GPUs. mm of an input sharded with _StridedShard
+        # on dim 0 by a replicated weight must keep the same _StridedShard placement: first on
+        # a 1D mesh (split factor 2), then on a 2x2 mesh with two _StridedShard placements
+        # of different split factors. Only the output placements are asserted.
         # Case 1: 1D mesh with StridedShard
         # Tests mm where input has _StridedShard(dim=0, split_factor=2) placement.
         # Input shape: (batch_size * seq_len, contract_dim), weight is Replicate.
@@ -384,6 +427,10 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_mm(self):
+        # [FUNCTION DOC] Tries mm on 1D-mesh DTensors for every pairing of Shard(0), Shard(1)
+        # and Replicate for the two operands. Each result is redistributed to Replicate and
+        # compared to the local mm, then backward is run and the first operand's grad is
+        # checked to exist.
         device_mesh = self.build_device_mesh()
         shard0_spec = Shard(0)
         shard1_spec = Shard(1)
@@ -396,6 +443,9 @@ class DistMatrixOpsTest(DTensorTestBase):
         def test_placement_comb(
             placements1: list[Placement], placements2: list[Placement]
         ) -> None:
+            # [FUNCTION DOC] HELPER: distributes t1 and t2 with the given placements, runs mm,
+            # redistributes to Replicate, asserts equality with the local result, runs backward
+            # with ones and asserts dt1 received a gradient.
             dt1 = distribute_tensor(t1, device_mesh, placements1)
             dt2 = distribute_tensor(t2, device_mesh, placements2)
             dist_res: DTensor = cast(DTensor, torch.mm(dt1, dt2)).redistribute(
@@ -414,6 +464,9 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_aten_linear(self):
+        # [FUNCTION DOC] Under inference mode (so aten linear is called directly) applies
+        # linear to a replicated input and a weight sharded on dim 0; asserts the output
+        # placement is Shard(2).
         device_mesh = self.build_device_mesh()
         x = distribute_tensor(
             torch.randn(1, 47, 2048),
@@ -433,6 +486,10 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_mm_single_dim_strategy(self):
+        # [FUNCTION DOC] Registers mm_single_dim_strategy as the single-dim strategy for aten
+        # mm (global registration side effect, never undone), then multiplies a
+        # (world_size-1, world_size) input sharded on dim 0 (so some ranks hold empty shards)
+        # by a replicated weight. Asserts the output placement is Replicate.
         register_single_dim_strategy(torch.ops.aten.mm.default)(mm_single_dim_strategy)
         # unshardable input where some rank have empty _local_tensor
         # eg sharding tensor (world_size - 1) over world_size
@@ -469,6 +526,12 @@ class DistMatrixOpsTest(DTensorTestBase):
         "https://github.com/pytorch/pytorch/issues/190086"
     )
     def test_scaled_mm(self):
+        # [FUNCTION DOC] Currently skipped unconditionally (CI failures on B200); also needs
+        # GPU, FP8 support and is skipped on ROCm. For tensor-wise and row-wise scaling
+        # configs (replicated, column-parallel, row-parallel) quantizes two bf16 matrices
+        # with scale_for_fp8, runs _scaled_mm on DTensors under CommDebugMode, and asserts the
+        # output placement, closeness to the full-precision product (loose tolerances) and
+        # zero collectives.
         device_mesh = self.build_device_mesh()
         shrd0 = Shard(0)
         shrd1 = Shard(1)
@@ -538,6 +601,10 @@ class DistMatrixOpsTest(DTensorTestBase):
             self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_scaled_mm_blockwise_1d_scale_placement(self):
+        # [FUNCTION DOC] Calls _scaled_mm_scale_placement directly (no process group, no
+        # with_comms) and asserts: single-element or scalar scales give Replicate; 2D scales
+        # copy the data placement; 1D blockwise scales map a non-contracting Shard to Shard(0),
+        # return None for a contracting-dim Shard, and map Replicate and Partial to Replicate.
         """Test that _scaled_mm_scale_placement handles 1D blockwise scales correctly.
 
         1D blockwise scales arise in MX (microscaling) formats where a data
@@ -602,6 +669,9 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_matmul(self):
+        # [FUNCTION DOC] Under inference mode (so matmul is decomposed by DTensor) multiplies
+        # a replicated input by a matrix sharded on dim 0 and asserts the full tensor equals
+        # the local matmul.
         device_mesh = self.build_device_mesh()
         dim = 128
         x = torch.randn(8, dim)
@@ -621,6 +691,8 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_t(self):
+        # [FUNCTION DOC] Transposes a Shard(0) DTensor and asserts the size is swapped and the
+        # placement becomes Shard(1); transposing again restores size and placement.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
 
@@ -635,6 +707,9 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_t_partial(self):
+        # [FUNCTION DOC] mm of Shard(1) by Shard(0) operands gives a Partial result; asserts
+        # transposing it stays Partial and, once redistributed to Replicate, equals the
+        # transposed local product.
         device_mesh = self.build_device_mesh()
 
         a = torch.randn(12, 8)
@@ -658,6 +733,8 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_t_1d(self):
+        # [FUNCTION DOC] Transposing a 1D Shard(0) DTensor is a no-op: asserts size, the
+        # Shard(0) placement and the gathered values are unchanged.
         # t() on a 1D tensor is a no-op and should preserve the shard placement
         device_mesh = self.build_device_mesh()
 
@@ -674,6 +751,11 @@ class DistMatrixOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_baddbmm(self):
+        # [FUNCTION DOC] GPU-only (CPU baddbmm can produce NaN occasionally). For beta/alpha
+        # pairs with zero and non-zero beta, computes a local baddbmm, then tries every
+        # combination of Shard(0..2)/Replicate for the three operands, asserting no NaNs and
+        # that the gathered DTensor result equals the local result. Backward checks are
+        # left as a TODO.
         device_mesh = self.build_device_mesh()
         tensor = torch.rand(4, 4, 8, device=self.device_type, requires_grad=True)
         batch_1 = torch.rand(4, 4, 8, device=self.device_type, requires_grad=True)
@@ -687,6 +769,10 @@ class DistMatrixOpsTest(DTensorTestBase):
             alpha: int,
             batch_1_grad: torch.Tensor | None,
         ) -> None:
+            # [FUNCTION DOC] HELPER: distributes the three operands with the given
+            # placements, runs baddbmm with beta and alpha, redistributes to Replicate and
+            # asserts the result has no NaNs (also checks the enclosing local_result) and
+            # matches local_result. batch_1_grad is unused (backward check is commented out).
             tensor_dt = distribute_tensor(tensor, device_mesh, tensor_placements)
             batch_1_dt = distribute_tensor(batch_1, device_mesh, batch_1_placements)
             batch_2_dt = distribute_tensor(batch_2, device_mesh, batch_2_placements)
@@ -740,6 +826,10 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_bmm(self):
+        # [FUNCTION DOC] Tries bmm on DTensors for every pairing of Shard(0..2)/Replicate for
+        # the two operands; each result is redistributed to Replicate and compared to the
+        # local bmm, then backward runs and the gathered mat1 gradient is compared to the
+        # local one.
         device_mesh = self.build_device_mesh()
         mat1 = torch.rand(4, 8, 4, device=self.device_type, requires_grad=True)
         mat2 = torch.rand(4, 4, 8, device=self.device_type, requires_grad=True)
@@ -751,6 +841,9 @@ class DistMatrixOpsTest(DTensorTestBase):
             placements1: list[Placement],
             placements2: list[Placement],
         ) -> None:
+            # [FUNCTION DOC] HELPER: distributes mat1 and mat2 with the given placements, runs
+            # bmm, redistributes to Replicate, compares to local_result, then backpropagates
+            # ones and compares the gathered mat1 gradient to the local mat1.grad.
             mat1_dt = distribute_tensor(mat1, device_mesh, placements1)
             mat2_dt = distribute_tensor(mat2, device_mesh, placements2)
             dist_res = cast(DTensor, torch.bmm(mat1_dt, mat2_dt)).redistribute(
@@ -785,6 +878,12 @@ class DistMatrixOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_mm_partial_inputs(self):
+        # [FUNCTION DOC] GPU-only. mm of two Partial inputs must give a Partial output (per-input
+        # linearity) on meshes of 1 to 5 dims and for each linear reduce op. Checks the
+        # output placements, the number of all-reduces (one per Partial mesh dim of size > 1,
+        # and nothing else) and numeric equality with mm of the gathered inputs. Then on a
+        # 2D mesh checks left Partial/Replicate by right Replicate/Partial gives
+        # Partial/Partial with zero communication.
         # mm with Partial inputs should produce Partial output via per-input
         # linearity, for both the default and single-dim strategy paths,
         # across various mesh dimensionalities and reduce ops (sum, avg).
@@ -797,6 +896,11 @@ class DistMatrixOpsTest(DTensorTestBase):
         ]
 
         def _run_mm(device_mesh, reduce_op="sum"):
+            # [FUNCTION DOC] HELPER: builds two random local tensors wrapped (without check)
+            # as DTensors Partial with reduce_op on every mesh dim, runs mm under
+            # CommDebugMode, and asserts Partial output placements, the expected all-reduce
+            # count equal to the total collective count, and numeric equality with mm of the
+            # gathered inputs.
             placements = [Partial(reduce_op)] * device_mesh.ndim
             a_local = torch.randn(16, 12, device=self.device_type)
             b_local = torch.randn(12, 20, device=self.device_type)
@@ -886,6 +990,11 @@ class DistMatrixOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_scaled_dot_product_attention(self):
+        # [FUNCTION DOC] GPU-only. For each available causal flash/efficient attention backend
+        # and input placement (Replicate, Shard(0), Shard(1)) on bf16 q/k/v, runs SDPA on
+        # DTensors and plain tensors. Asserts zero collectives forward and backward, outputs
+        # and q/k/v gradients keep the input placements and match the local results; local
+        # grads are zeroed between iterations.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
         head_dim = 8
@@ -967,6 +1076,9 @@ class DistMatrixOpsTest(DTensorTestBase):
     @skip_unless_torch_gpu
     @with_comms()
     def test_dtensor_mm(self):
+        # [FUNCTION DOC] GPU-only. Matrix-multiplies a row-sharded lhs by a column-sharded rhs
+        # on three 2D meshes (including ones with a size-1 dim) and asserts the gathered
+        # result equals the local product within tight tolerances.
         """
         Test mm with DTensor with 2D mesh.
         We need to add the test here since we only test 1D mesh in test_dtensor_ops.py.
@@ -994,6 +1106,9 @@ class DistMatrixOpsTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_tensordot_shampoo(self):
+        # [FUNCTION DOC] GPU-only. Contracts dim 0 of two matrices with tensordot for every
+        # pairing of Replicate/Shard(0)/Shard(1) on a 1D mesh and asserts the gathered result
+        # equals the local tensordot.
         """
         Create a simple test for Shampoo's use case.
         """
@@ -1049,6 +1164,15 @@ class DistMatrixOpsTest(DTensorTestBase):
         ],
     )
     def test_grouped_mm(self, backend, kwargs):
+        # [FUNCTION DOC] Parametrized by grouped-gemm backend (cublaslt or cutlass) and a
+        # config of shapes, placements and expected collective counts. Requires SM90+ and not
+        # ROCm; the cublaslt backend is also skipped unless CUDA >= 13.3 and compute
+        # capability major is 9 to 11. Temporarily sets prefer_cublaslt_grouped_gemm (restored
+        # by cleanup), runs two chained grouped_mm calls on local tensors and on DTensors
+        # (column-sharded then row-sharded weights), asserting forward collective count,
+        # output placement and values. Then runs backward on the Shard(0) redistributed
+        # output, asserting the backward collectives are all all-gathers of the expected
+        # count and that input and weight gradients match local ones.
         if backend == "cublaslt":
             if _get_torch_cuda_version() < (13, 3):
                 self.skipTest("cublaslt grouped gemm requires CUDA Toolkit >= 13.3")
@@ -1129,6 +1253,10 @@ class DistMatrixOpsTest(DTensorTestBase):
 
     @with_comms
     def test_constant_pad_nd(self):
+        # [FUNCTION DOC] Pads the last dim of a DTensor with a constant and compares gathered
+        # results with local padding for: Shard(0) (non-padded dim), Shard(1) (padded dim),
+        # Partial with pad value zero (placement stays Partial) and Partial with non-zero pad
+        # value (placement must no longer be Partial).
         """constant_pad_nd: shard non-padded, replicate padded, Partial iff value==0."""
         device_mesh = self.build_device_mesh()
         t = torch.randn(8, 6, device=self.device_type)

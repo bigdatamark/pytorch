@@ -1,5 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for torch.distributed.tensor OpSchema: equality/hash semantics
+# with static args and kwargs, and absence of a DTensorSpec reference leak.
+# No import-time side effects; runs via run_tests when executed as a script.
 
 import random
 
@@ -9,7 +12,11 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestOpSchema(TestCase):
+    # [CLASS DOC] Stateless unit tests for OpSchema equality, hashing and reference
+    # handling (no process group or devices needed).
     def test_equality_checks_lists_of_dtensor_spec(self):
+        # [FUNCTION DOC] Regression test: two OpSchemas whose second arg is a list of one vs
+        # two DTensorSpecs must compare unequal and have different hashes.
         """If x == y, then we must have h(x) == h(y)."""
         dts = DTensorSpec(mesh=None, placements=tuple(), tensor_meta=None)
         schema1 = OpSchema(op=None, args_schema=(dts, [dts]), kwargs_schema={})
@@ -19,7 +26,16 @@ class TestOpSchema(TestCase):
         self.assertNotEqual(hash(schema1), hash(schema2))
 
     def test_equality_respects_static_attributes(self):
+        # [FUNCTION DOC] Checks OpSchema equality over all pairs of the four static-info
+        # variants, with matching values and with mismatching static arg and/or kwarg values.
+        # Schemas are equal only if their static annotations agree and, for annotated
+        # positions, the values match; unannotated args/kwargs (random values) never matter.
         def _get_sample_op_schemas(static_arg_val, static_kwarg_val):
+            # [FUNCTION DOC] HELPER: builds four OpSchemas (no schema_info, static arg only,
+            # static kwarg only, both) sharing one DTensorSpec, a random ignored positional
+            # arg, the given value at argument index 2 and the given value for keyword
+            # "statickwarg" (plus a random ignored kwarg). Returns a list of tuples of
+            # (has_static_arg, has_static_kwarg, OpSchema).
             dts = DTensorSpec(mesh=None, placements=tuple(), tensor_meta=None)
             static_argnum = 2
             static_kwargkey = ["statickwarg"]
@@ -115,6 +131,9 @@ class TestOpSchema(TestCase):
                     self.assertEqual(lhs, rhs)
 
     def test_no_dtensor_spec_leak_in_comparison_key(self):
+        # [FUNCTION DOC] Regression test: builds an OpSchema holding one DTensorSpec, drops the
+        # local reference, and asserts a weak reference to the spec is dead, i.e. computing
+        # the schema's comparison key must not leak a reference to the spec.
         """Regression test for https://github.com/pytorch/pytorch/issues/181761.
 
         DTensor_OpSchema_recompute_comparison_key_impl used to release() the
