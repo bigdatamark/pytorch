@@ -1,4 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Validates DTensor sharding rules against ground truth. For each OpInfo sample it
+# enumerates 1-D mesh placement combinations (Replicate, Shard per dim, Partial sum/avg/min/max),
+# simulates them with LocalTensor on a simulated world, runs the raw op per rank, wraps the result
+# as a DTensor with the claimed output placement, redistributes to Replicate and compares with the
+# full-tensor result. Compares the valid set with rules DTensor registers (op strategies, single-dim
+# strategies, decompositions) and reports false positives (incorrect rules) and false negatives
+# (missing rules). Contains placement string parsing/normalization, partial-input construction,
+# false-positive mitigations (negated / non-rounded samples), reporting helpers and a CLI main
+# (argparse; flags select ops, aten-level mode, repro output, etc.). Module constants: ComboKey type,
+# PARTIAL_REDUCE_OPS, SKIP_OPS (ops skipped as non-deterministic or uninitialized).
+# No import-time side effects beyond imports and constant definitions.
 """
 Strategy validation for DTensor sharding rules.
 
@@ -79,6 +90,9 @@ PlacementCombination = tuple[tuple[Placement, ...], tuple[Placement, ...]]
 
 @dataclass
 class Discrepancy:
+    # Record of one disagreement between ground truth and DTensor for a sample: input/output placement
+    # strings, sample index, input shapes, type ("false_positive" or "false_negative"), error message,
+    # scalar args/kwargs, optional aten op, variant label and the SampleInput itself (for repro).
     """Represents a discrepancy between ground truth and DTensor's rules."""
 
     input_placements: tuple[str, ...]
@@ -96,6 +110,9 @@ class Discrepancy:
 
 @dataclass
 class ComparisonStats:
+    # Mutable counters and lists accumulated while comparing one op: true positives and negatives,
+    # lists of false positive and false negative Discrepancy records, sample/combination totals, skip
+    # reason counts, a flag for ops with no DTensor support, and per aten-variant true positive counts.
     """Statistics for comparing ground truth vs DTensor rules."""
 
     true_positives: int = 0
@@ -116,6 +133,8 @@ class ComparisonStats:
 
 @dataclass
 class _FalsePositiveMitigations:
+    # HELPER: Holds optional variants of a sample (negated, non-rounded, and both) with their tensors and
+    # ground truths. Used to re-test combinations that passed, catching sign or rounding artifacts.
     """Bundle of sample variants used to detect false positive validations.
 
     Contains negated and non-rounded variants of a sample. These are used to
@@ -134,6 +153,8 @@ class _FalsePositiveMitigations:
 
 
 def parse_placement(s: str) -> Placement | None:
+    # Parses a placement string (R, S(dim), P(reduce_op)) into Replicate, Shard or Partial after
+    # stripping whitespace. Returns None for unrecognized or malformed strings.
     """
     Parse a placement string back to a placement object.
     Placement strings are: R, S(dim), P(reduce_op)
@@ -153,11 +174,13 @@ def parse_placement(s: str) -> Placement | None:
 
 
 def is_fully_replicated(placements: tuple[Placement, ...]) -> bool:
+    # Returns True when every placement in the tuple is Replicate (vacuously True for empty).
     """Check if all placements are Replicate."""
     return all(isinstance(p, Replicate) for p in placements)
 
 
 def is_trivial_shard(p: Placement, tensor_shape: tuple[int, ...]) -> bool:
+    # Returns True if p is a plain Shard (not _StridedShard) whose dim exists in tensor_shape and has size 1.
     """Check if placement is a Shard on a size-1 dimension."""
     # NOTE: isinstance(_, Shard) does not match _StridedShard; see _is_shard_like().
     return (
@@ -166,6 +189,8 @@ def is_trivial_shard(p: Placement, tensor_shape: tuple[int, ...]) -> bool:
 
 
 def normalize_placement(p: Placement, tensor_shape: tuple[int, ...]) -> Placement:
+    # Returns Replicate for a trivial shard (Shard on a size-1 dim), otherwise p unchanged. Used to dedupe
+    # equivalent combos since sharding a size-1 dim carries no extra signal over Replicate.
     """
     Normalize a placement for a given tensor shape.
 
@@ -184,6 +209,8 @@ def normalize_placement(p: Placement, tensor_shape: tuple[int, ...]) -> Placemen
 
 
 def normalize_placement_str(p_str: str, shape: tuple[int, ...]) -> str:
+    # String form of normalize_placement: parses p_str; returns "R" if it normalizes to Replicate, else
+    # the original string (also original when unparsable).
     """Normalize a placement string, converting trivial shards to Replicate."""
     p = parse_placement(p_str)
     if p is None:
@@ -199,6 +226,9 @@ def normalize_combo_key(
     input_shapes: tuple[tuple[int, ...], ...],
     output_shapes: tuple[tuple[int, ...], ...],
 ) -> ComboKey:
+    # Normalizes a combo key (input placement strings, output placement strings) by mapping trivial
+    # shards to "R" using the matching input/output shapes (pairwise by position, extra entries dropped
+    # by zip). Returns a new combo key tuple.
     """
     Normalize a combo_key by converting trivial shards to Replicate.
 
@@ -232,6 +262,8 @@ def normalize_combo_key(
 def get_1d_input_placements_for_tensor(
     t: torch.Tensor, include_partial: bool = False
 ) -> list[Placement]:
+    # Lists candidate 1-D placements for an input tensor: Replicate, Shard for each dim, and (if
+    # include_partial and dtype is not bool) Partial for each reduce op in PARTIAL_REDUCE_OPS.
     """
     Get all possible 1-D mesh placements for an INPUT tensor.
 
@@ -249,6 +281,8 @@ def get_1d_input_placements_for_tensor(
 
 
 def get_1d_output_placements_for_tensor(t: torch.Tensor) -> list[Placement]:
+    # Lists candidate 1-D placements for an output tensor: Replicate, Shard per dim, and Partial for
+    # each reduce op unless the dtype is bool.
     """
     Get all possible 1-D mesh placements for an OUTPUT tensor.
     """
@@ -265,6 +299,9 @@ def get_1d_output_placements_for_tensor(t: torch.Tensor) -> list[Placement]:
 def extract_tensors_from_sample(
     sample_input: SampleInput,
 ) -> list[tuple[str, torch.Tensor]]:
+    # Collects every tensor in a SampleInput (input, then args, then kwargs, in pytree order) as
+    # (name, tensor) pairs named by running index. Order must match the replacement order used in
+    # validate_combination.
     """
     Extract all tensor arguments from a SampleInput.
     Returns a list of (name, tensor) pairs.
@@ -276,6 +313,7 @@ def extract_tensors_from_sample(
     idx = 0
 
     def _collect(x):
+        # HELPER: pytree visitor that appends tensor leaves with a running index; returns leaf unchanged.
         nonlocal idx
         if isinstance(x, torch.Tensor):
             tensors.append((f"tensor_{idx}", x))
@@ -292,6 +330,9 @@ def extract_tensors_from_sample(
 def _checkerboard_mask(
     tensor: torch.Tensor, tensor_idx: int = 0, mask_shift: int = 0
 ) -> torch.Tensor:
+    # HELPER: Returns a flat bool tensor (numel long) that is True where the sum of element coordinates
+    # plus tensor_idx plus mask_shift is even, so it alternates along every dimension. A 0-d tensor
+    # yields a one-element tensor. Used to choose which rank holds true values in Partial inputs.
     """Checkerboard mask that alternates in every dimension.
 
     Unlike flat-index % 2, which can be uniform along even-stride dimensions
@@ -318,6 +359,12 @@ def _create_partial_input(
     tensor_idx: int = 0,
     mask_shift: int = 0,
 ) -> LocalTensor:
+    # HELPER: Builds a LocalTensor (one local tensor per rank) that reduces back to the original tensor
+    # under the Partial placement. sum/avg: asymmetric split ratio (varies with tensor_idx) plus a
+    # sign-alternating offset, scaled by world_size for avg. min/max: checkerboard mask decides which
+    # rank holds the true value; the other gets an offset larger than the value range (positive for
+    # min, negative for max). Other reduce ops: plain copies. mask_shift flips the mask for re-validation.
+    # Does not mutate the input tensor.
     """
     Create a LocalTensor with values that reduce to the original tensor.
 
@@ -438,6 +485,10 @@ def _shard_tensors(
     mesh: DeviceMesh,
     mask_shift: int = 0,
 ) -> list[LocalTensor | torch.Tensor]:
+    # HELPER: Builds one input per (name, tensor) pair according to the placements: Partial via
+    # _create_partial_input, Replicate as copies per rank, Shard via splitting along the dim and cloning
+    # chunks per rank, other placement kinds via distribute_tensor then local view. Returns a list of
+    # LocalTensor (or local tensors). Uses zip so extra entries on either side are ignored.
     """Create sharded LocalTensors from tensors according to placements."""
     local_tensors: list[LocalTensor | torch.Tensor] = []
     for tensor_idx, ((name, tensor), placement) in enumerate(
@@ -474,6 +525,11 @@ def _compare_outputs(
     mesh: DeviceMesh,
     world_size: int,
 ) -> tuple[bool, str]:
+    # HELPER: Checks the per-rank op output against ground truth. Normalizes both to lists; fails on
+    # count mismatches, non-tensor or non-LocalTensor outputs. Wraps each output as a DTensor with the claimed
+    # placement and ground-truth shape/stride; for Replicate it requires all ranks to agree; then
+    # redistributes to Replicate and compares shape and values (allclose, equal_nan). Returns
+    # (ok, message) with empty message on success.
     """Compare op output (wrapped as DTensor) against ground truth."""
     if isinstance(local_output, (list, tuple)):
         local_outputs = list(local_output)
@@ -556,6 +612,13 @@ def validate_combination(
     mesh: DeviceMesh | None = None,
     mask_shift: int = 0,
 ) -> tuple[bool | None, str]:
+    # Tests one placement combination: shards the inputs (returns (None, "uneven shard") if a sharded
+    # dim is not divisible by world_size), substitutes local tensors into the sample structure in
+    # pytree order, runs the raw op on LocalTensors, and compares via _compare_outputs. Creates a
+    # device mesh if none is given. Returns (True, ""), (False, message) or (None, reason).
+    # Any exception is caught and reported as an invalid result.
+    # KNOWN ISSUE: the catch-all exception handler is overly broad (acknowledged by a TODO); real bugs
+    # become false results.
     """
     Validate a single placement combination against ground truth.
 
@@ -602,6 +665,8 @@ def validate_combination(
         local_idx = 0
 
         def _replace_with_local(a):
+        # HELPER: Replaces each tensor leaf with the next prepared local tensor (advancing a counter),
+        # leaving non-tensors unchanged.
             nonlocal local_idx
             if isinstance(a, torch.Tensor):
                 local = local_tensors[local_idx]
@@ -636,6 +701,8 @@ def extract_tensors_from_args(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> list[tuple[str, torch.Tensor]]:
+    # Collects tensors from flat aten-level args then kwargs (pytree order) as (name, tensor) pairs with
+    # running index names. Counterpart of extract_tensors_from_sample for captured aten calls.
     """Extract tensor arguments from captured aten args/kwargs.
 
     Unlike extract_tensors_from_sample which walks SampleInput pytrees,
@@ -645,6 +712,7 @@ def extract_tensors_from_args(
     idx = 0
 
     def _collect(x: Any) -> Any:
+        # HELPER: pytree visitor that appends tensor leaves with a running index; returns leaf unchanged.
         nonlocal idx
         if isinstance(x, torch.Tensor):
             tensors.append((f"tensor_{idx}", x))
@@ -666,6 +734,10 @@ def validate_aten_combination(
     mesh: DeviceMesh,
     mask_shift: int = 0,
 ) -> tuple[bool | None, str]:
+    # Aten-level analogue of validate_combination: extracts tensors from captured args/kwargs (returns
+    # (False, message) if none), returns (None, "uneven shard") when a sharded dim is not divisible by
+    # world_size, replaces tensors with sharded LocalTensors, calls the aten op and compares against
+    # ground truth through _compare_outputs. Any exception is reported as (False, "Exception: ...").
     """Validate a placement combination using aten-level captured args.
 
     Works directly with aten op args/kwargs instead of SampleInput pytrees.
@@ -691,6 +763,7 @@ def validate_aten_combination(
         local_idx = 0
 
         def _replace_with_local(a: Any) -> Any:
+        # HELPER: Replaces each tensor leaf with the next prepared local tensor, others unchanged.
             nonlocal local_idx
             if isinstance(a, torch.Tensor):
                 local = local_tensors[local_idx]
@@ -715,6 +788,7 @@ def has_pmin_pmax(
     input_placements: tuple[Placement, ...],
     output_placements: tuple[Placement, ...],
 ) -> bool:
+    # Returns True if any input or output placement is Partial with reduce op min or max.
     """Check if any placement is Partial(min) or Partial(max)."""
     for p in (*input_placements, *output_placements):
         if isinstance(p, Partial) and p.reduce_op in ("min", "max"):
@@ -726,6 +800,7 @@ def has_any_partial(
     input_placements: tuple[Placement, ...],
     output_placements: tuple[Placement, ...],
 ) -> bool:
+    # Returns True if any input or output placement is a Partial of any reduce op.
     """Check if any placement is Partial (any reduce op)."""
     for p in (*input_placements, *output_placements):
         if isinstance(p, Partial):
@@ -736,14 +811,18 @@ def has_any_partial(
 def negate_all_tensors(
     tensors: list[tuple[str, torch.Tensor]],
 ) -> list[tuple[str, torch.Tensor]]:
+    # Returns a new list of (name, tensor) pairs with each tensor negated; names preserved.
     """Return a new list with all tensors negated."""
     return [(name, -t) for name, t in tensors]
 
 
 def create_fully_negated_sample(sample: SampleInput) -> SampleInput:
+    # Builds a new SampleInput whose input, args and kwargs have every tensor leaf negated; non-tensor
+    # values are kept. Used for sign testing of min/max Partial placements.
     """Create a sample with ALL tensors negated (for P(min)/P(max) sign testing)."""
 
     def negate_tensor(x):
+        # HELPER: Returns the negated tensor, or the value unchanged if it is not a tensor.
         if isinstance(x, torch.Tensor):
             return -x
         return x
@@ -756,6 +835,8 @@ def create_fully_negated_sample(sample: SampleInput) -> SampleInput:
 
 
 def _run_op_on_sample(op: Callable[..., Any], sample: SampleInput) -> Any:
+    # HELPER: Runs op on a sample, calling with the input tensor first, or spreading the input if it is
+    # not a single tensor, followed by the sample args and kwargs. Returns the op result.
     """Run an operator on a SampleInput, handling both tensor and tuple inputs."""
     if isinstance(sample.input, torch.Tensor):
         return op(sample.input, *sample.args, **sample.kwargs)
@@ -767,6 +848,10 @@ def _extract_rules_from_op_strategy(
     input_shapes: tuple[tuple[int, ...], ...],
     output_shapes: tuple[tuple[int, ...], ...],
 ) -> set[ComboKey]:
+    # HELPER: Converts an OpStrategy into a set of normalized combo keys using the first mesh dim
+    # placements of each OpSpec. Returns an empty set for non-OpStrategy input. Skips specs without
+    # input specs and multi-output specs containing a None output. A single output spec is duplicated
+    # for every output. Rules whose inputs are all Replicate are dropped.
     """Extract normalized sharding rules from an OpStrategy.
 
     Called during rule comparison to collect DTensor's claimed-valid placement
@@ -810,9 +895,13 @@ def _extract_rules_from_op_strategy(
 
 
 class _CaptureAtenOp(torch.utils._python_dispatch.TorchDispatchMode):
+    # HELPER: TorchDispatchMode that records every aten-namespace op executed (op, args, kwargs, result)
+    # into all_ops, and remembers the first op whose base name contains the target name (lowercased)
+    # as best_match along with its args, kwargs and result. Ops are executed normally.
     """Dispatch mode that captures aten ops called, their args, and return values."""
 
     def __init__(self, target_op_name: str = ""):
+        # HELPER: Stores the lowercased target op name and initializes empty capture state.
         self.target_op_name = target_op_name.lower()
         self.all_ops: list[tuple[OpOverload, tuple[Any, ...], dict[str, Any], Any]] = []
         self.best_match: OpOverload | None = None
@@ -821,6 +910,8 @@ class _CaptureAtenOp(torch.utils._python_dispatch.TorchDispatchMode):
         self.best_match_result: Any = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # HELPER: Runs the op, and for aten ops records the call; sets the best-match fields on the first
+        # op whose name contains the target name. Returns the op result unchanged.
         if kwargs is None:
             kwargs = {}
         result = func(*args, **kwargs)
@@ -839,6 +930,9 @@ class _CaptureAtenOp(torch.utils._python_dispatch.TorchDispatchMode):
 def get_aten_op_for_sample(
     op: Callable[..., Any], sample: SampleInput, op_name: str = ""
 ) -> _CaptureAtenOp:
+    # Runs op on the sample under a _CaptureAtenOp mode and returns the capture object. Exceptions from
+    # the op are swallowed. If no op matched the target name, best_match falls back to the first
+    # captured aten op (if any).
     """
     Capture aten ops dispatched for a given sample.
 
@@ -871,6 +965,10 @@ def query_single_dim_strategy(
     captured_args: tuple[Any, ...],
     captured_kwargs: dict[str, Any],
 ) -> list[list[Placement]] | None:
+    # Asks the sharding propagator's single-dim strategy function for the aten op, using TensorMeta
+    # built from captured tensor args/kwargs. Returns a list of placement lists ([output placements...,
+    # input placements...]) with placeholder shards expanded to Shard, or None if the op has no single-dim
+    # strategy or if the strategy function raises.
     """
     Query DTensor's single-dim strategy for given input tensors.
     Returns list of [output_placement, *input_placements] rules.
@@ -914,6 +1012,8 @@ def query_single_dim_strategy(
 
 
 def get_opinfo_by_name(name: str) -> list[opinfo_core.OpInfo]:
+    # Returns all OpInfo entries in op_db with exactly this name. Raises ValueError, with
+    # suggestions when similar names exist, if there is none.
     """Find OpInfo entries by exact operator name."""
     matches = [op for op in op_db if op.name == name]
     if matches:
@@ -931,6 +1031,8 @@ def get_opinfo_by_name(name: str) -> list[opinfo_core.OpInfo]:
 
 
 def _find_opinfo_candidates(name: str) -> list[str]:
+    # HELPER: Returns OpInfo names whose aten_name equals name, then names ending with a dot plus name,
+    # without duplicates and in that order.
     """Find OpInfo names that plausibly match a short/incorrect name."""
     candidates: list[str] = []
     seen: set[str] = set()
@@ -949,6 +1051,9 @@ def _find_opinfo_candidates(name: str) -> list[str]:
 
 
 def resolve_op_names(patterns: list[str]) -> list[str]:
+    # Resolves user patterns to unique exact OpInfo names preserving order. Glob patterns (containing
+    # star or question mark) expand over all names, exact names pass through, and short names resolve if
+    # they have a single candidate. Raises ValueError for unmatched patterns/names or ambiguous short names.
     """Resolve user-provided op patterns to exact OpInfo names.
 
     Supports exact names, comma separation, and glob patterns (e.g.,
@@ -998,6 +1103,8 @@ def resolve_op_names(patterns: list[str]) -> list[str]:
 
 
 def _is_tensor_output(result: Any) -> bool:
+    # HELPER: True if result is a tensor or a list/tuple consisting only of tensors; False for other
+    # values. Raises NotImplementedError for sequences mixing tensors and non-tensors.
     """Check if a result is a tensor or list/tuple of tensors."""
     if isinstance(result, torch.Tensor):
         return True
@@ -1014,6 +1121,7 @@ def _is_tensor_output(result: Any) -> bool:
 
 
 def _to_ground_truth(result: Any) -> torch.Tensor | list[torch.Tensor]:
+    # HELPER: Returns a tensor as is, otherwise converts the sequence result to a list of tensors.
     """Convert an op result to the ground truth format (tensor or list of tensors)."""
     if isinstance(result, torch.Tensor):
         return result
@@ -1025,6 +1133,10 @@ def _prepare_false_positive_mitigations(
     sample: SampleInput,
     tensors: list[tuple[str, torch.Tensor]],
 ) -> _FalsePositiveMitigations:
+    # HELPER: Builds a _FalsePositiveMitigations for the sample: negated sample/tensors/ground truth, and,
+    # only if the sample has a rounding_mode kwarg, a non-rounded variant and its negated variant with
+    # ground truths. Any failing variant (exception or non-tensor output) is disabled by resetting its fields
+    # to None. Never raises.
     """Create negated and non-rounded sample variants for false positive detection."""
     m = _FalsePositiveMitigations()
 
@@ -1082,6 +1194,13 @@ def _query_dtensor_rules(
     world_size: int,
     verbose: bool,
 ) -> set[ComboKey]:
+    # HELPER: Collects DTensor's claimed rules as a set of combo keys for the aten op. Returns an empty set if
+    # aten_op is None. Uses the single-dim strategy if registered, else the op strategy function
+    # (building per-tensor OpStrategy with all candidate 1-D placements), else a decomp strategy
+    # seeded with Shard(0) on the first tensor. Errors in op strategy or decomp paths are swallowed
+    # (printed when verbose). Trivial all-Replicate-input rules are excluded.
+    # KNOWN ISSUE: the decomp path only explores rules reachable from the single seed placement, so it
+    # under-reports DTensor capabilities; it also duplicates ShardingPropagator logic (see its TODO).
     """Query DTensor's claimed sharding rules via single-dim, op_strategy, or decomp paths.
 
     TODO: This reimplements strategy resolution logic from ShardingPropagator.
@@ -1213,6 +1332,12 @@ def _validate_with_mitigations(
     mesh: DeviceMesh,
     mitigations: _FalsePositiveMitigations,
 ) -> bool | None:
+    # HELPER: Validates one input/output placement combination for an OpInfo sample. First runs
+    # validate_combination; returns None if untestable. If it passed, re-validates with a flipped
+    # checkerboard mask when any Partial is involved, with the negated sample when Partial min/max is
+    # involved, with the non-rounded sample for any Partial, and with the non-rounded negated sample for
+    # min/max, each overriding the result. Returns True, False or None. Raises AssertionError if a needed
+    # mitigation field is missing.
     """Validate a combination, including false positive mitigation re-checks.
 
     Returns True (valid), False (invalid), or None (untestable).
@@ -1302,6 +1427,8 @@ def _validate_with_mitigations(
 
 @dataclass
 class _AtenFalsePositiveMitigations:
+    # HELPER: Aten-level counterpart of _FalsePositiveMitigations holding negated args, kwargs and
+    # ground truth (all None when unavailable). No rounding_mode variants since that is OpInfo-specific.
     """Bundle of negated variants for aten-level false positive detection.
 
     Unlike _FalsePositiveMitigations, this works with captured aten args/kwargs
@@ -1315,9 +1442,11 @@ class _AtenFalsePositiveMitigations:
 
 
 def _negate_tensors_in_tree(tree: Any) -> Any:
+    # HELPER: Returns a copy of a pytree with every tensor leaf negated.
     """Negate all tensors in a pytree structure."""
 
     def _negate(x: Any) -> Any:
+        # HELPER: Negates tensors, returns other values unchanged.
         if isinstance(x, torch.Tensor):
             return -x
         return x
@@ -1330,6 +1459,8 @@ def _prepare_aten_mitigations(
     captured_args: tuple[Any, ...],
     captured_kwargs: dict[str, Any],
 ) -> _AtenFalsePositiveMitigations:
+    # HELPER: Builds negated aten args/kwargs and runs the aten op on them for a negated ground truth.
+    # If the op fails or does not return tensors, the negated fields are reset to None. Never raises.
     """Create negated variants for aten-level false positive detection."""
     m = _AtenFalsePositiveMitigations()
     try:
@@ -1358,6 +1489,10 @@ def _validate_aten_with_mitigations(
     mesh: DeviceMesh,
     mitigations: _AtenFalsePositiveMitigations,
 ) -> bool | None:
+    # HELPER: Aten-level validation of one combination via validate_aten_combination: returns None if
+    # untestable; re-validates with a flipped mask when Partial is involved and with negated args when
+    # Partial min/max is involved. Returns True, False or None. Raises AssertionError if negated kwargs
+    # or ground truth are missing while negated args exist.
     """Validate an aten-level combination with false positive mitigations.
 
     Returns True (valid), False (invalid), or None (untestable).
@@ -1414,6 +1549,8 @@ def _assert_keys_normalized(
     input_shapes: tuple[tuple[int, ...], ...],
     output_shapes: tuple[tuple[int, ...], ...],
 ) -> None:
+    # HELPER: Raises AssertionError if any combo key differs from its normalized form (trivial shards
+    # must already be Replicate). Returns None otherwise.
     """Assert all combo keys have trivial shards already normalized to Replicate."""
     for key in keys:
         if key != normalize_combo_key(key, input_shapes, output_shapes):
@@ -1437,6 +1574,11 @@ def _compare_rules(
     sample: SampleInput | None = None,
     untestable: set[ComboKey] | None = None,
 ) -> None:
+    # HELPER: Classifies rules into stats. Does nothing if dtensor_rules is empty (no stats updated).
+    # Asserts both sets are normalized. Keys in both sets count as true positives (global and per aten
+    # op); ground truth keys missing from DTensor rules and not untestable become false negative
+    # Discrepancy records; DTensor keys not in ground truth and not untestable become false positives.
+    # Mutates stats; returns None.
     """Compare ground truth valid rules against DTensor claimed rules, updating stats."""
     if not dtensor_rules:
         return
@@ -1488,6 +1630,7 @@ def _compare_rules(
 
 
 def _format_op_name(opinfo_name: str) -> str:
+    # HELPER: Returns the name prefixed with "aten." when it has no dot, otherwise unchanged.
     """Format an OpInfo name for display, adding aten. prefix for simple names."""
     if "." not in opinfo_name:
         return f"aten.{opinfo_name}"
@@ -1495,6 +1638,9 @@ def _format_op_name(opinfo_name: str) -> str:
 
 
 def _format_sample_repro(sample: SampleInput, aten_op: OpOverload | None = None) -> str:
+    # HELPER: Formats a sample as a comma separated list of name=repr pairs for repro output. Input and
+    # positional args are named using the aten schema argument names when available (falls back to
+    # "input" and indexed args names); kwargs use their own keys.
     """Format a SampleInput's values for repro output, using schema arg names."""
     # Get argument names from the aten op schema if available.
     # Schema args are ordered: the first is the input, then positional args,
@@ -1523,6 +1669,9 @@ def _format_sample_repro(sample: SampleInput, aten_op: OpOverload | None = None)
 def _print_discrepancy_section(
     title: str, discrepancies: list[Discrepancy], show_repro: int = 0
 ) -> None:
+    # HELPER: Prints a titled report of discrepancies grouped by aten op and placement combination,
+    # as "inputs -> output". If show_repro is nonzero prints up to that many repro lines per group
+    # (negative means all) and a count of the remaining. Prints nothing if the list is empty.
     """Print grouped discrepancies for a section (incorrect or missing)."""
     if not discrepancies:
         return
@@ -1556,6 +1705,8 @@ def _print_comparison_summary(
     stats: ComparisonStats,
     show_repro: int = 0,
 ) -> None:
+    # HELPER: Prints, when more than one aten op is involved, a per-op line with counts of correct,
+    # incorrect and missing placement combinations, then the incorrect and possibly missing sections.
     """Print discrepancy details for an operator."""
     # Per aten op variant breakdown
     fp_by_op: dict[str, set[ComboKey]] = defaultdict(set)
@@ -1588,6 +1739,8 @@ def _print_comparison_summary(
 
 
 def _has_dtensor_support(aten_op: OpOverload) -> bool:
+    # HELPER: Returns True if the op has a single-dim strategy, an op strategy or a decomposition
+    # registered in the DTensor sharding propagator.
     """Check if an aten op has any DTensor sharding strategy registered."""
     propagator = DTensor._op_dispatcher.sharding_propagator
     if aten_op in propagator.op_single_dim_strategy_funcs:
@@ -1602,6 +1755,9 @@ def _discover_aten_op(
     device: str,
     dtype: torch.dtype,
 ) -> OpOverload | None:
+    # HELPER: Finds the aten op dispatched by the first usable sample across the OpInfos (skipping
+    # OpInfos whose sample generation fails, and samples with no tensors or zero-size tensors) by
+    # capturing ops; returns the best match or None.
     """Discover the aten op dispatched by the first valid sample."""
     for opinfo in opinfos:
         try:
@@ -1622,6 +1778,8 @@ def _discover_aten_op(
 def _check_ground_truth(
     result: Any,
 ) -> torch.Tensor | list[torch.Tensor] | None:
+    # HELPER: Converts an op result into ground truth (tensor or list of tensors). Returns None if the
+    # result is not a tensor or sequence of tensors, or the first tensor is empty, all zeros or all NaN.
     """Validate an op result is suitable as ground truth.
 
     Returns the ground truth tensor(s) or None if the result should be skipped.
@@ -1658,6 +1816,13 @@ def _validate_aten_op_for_sample(
     stats: ComparisonStats,
     sample: SampleInput | None = None,
 ) -> tuple[int, int]:
+    # HELPER: Core per-aten-op validation for one captured call. Returns (0, 0) if there are no tensors
+    # or any has a zero-size dim. Queries DTensor rules; builds the placement combinations (only
+    # DTensor's claimed rules when incorrect_only, else the product of 1-D input placements, excluding
+    # all-Replicate inputs, with a same output placement for every output), validates each under
+    # LocalTensorMode with mitigations, collects normalized valid and untestable keys (excluding all-Replicate
+    # input rules), and updates stats via _compare_rules. Prints counts if verbose.
+    # Returns (1, number_of_combinations_tested).
     """Validate a single aten op with captured args against ground truth.
 
     Shared logic used by both default (1:1) and allow_composite modes in
@@ -1817,6 +1982,14 @@ def compare_operator(
     incorrect_only: bool = False,
     allow_composite: bool = False,
 ) -> ComparisonStats:
+    # Compares DTensor's rules with ground truth for the named OpInfo operator and returns a
+    # ComparisonStats. Ops in SKIP_OPS return empty stats. Without allow_composite, discovers the single
+    # aten op and returns stats flagged no_dtensor_support if it is missing or unsupported; each sample
+    # is then validated only if it dispatches exactly one DTensor-supported aten op. With
+    # allow_composite every supported aten op of a sample is validated individually. Samples with no
+    # tensors, zero-size tensors, no captured aten op or degenerate outputs are skipped and counted by
+    # reason; sample generation errors skip that OpInfo. max_samples truncates samples per OpInfo.
+    # Prints progress when verbose. Raises ValueError if the op name has no OpInfo.
     """
     Compare DTensor's sharding rules against ground truth for an operator.
 
@@ -1961,6 +2134,9 @@ def compare_operator(
 
 
 def get_registered_op_names() -> list[str]:
+    # Returns the sorted OpInfo names that correspond to aten ops registered in the sharding propagator
+    # (single-dim or op strategies). Matches the base name of each aten op to an OpInfo name directly or
+    # through the OpInfo aten_name (which may map to several OpInfo names).
     """Get all op names that have DTensor sharding rules and also have OpInfo.
 
     Returns OpInfo names (which may differ from aten base names, e.g.,
@@ -2002,6 +2178,9 @@ def get_registered_op_names() -> list[str]:
 
 
 def report_registrations(verbose: bool = False) -> None:
+    # Prints a report of how many ops are registered by prop rule, op strategy and single-dim strategy
+    # (and their total), plus the count of decomposition-table ops not directly registered. If verbose,
+    # also prints the full lists. Only reads propagator state; output goes to stdout.
     """Report the number (and optionally full list) of ops by registration method.
 
     Directly registered categories (mutually exclusive):
@@ -2059,6 +2238,7 @@ def report_registrations(verbose: bool = False) -> None:
     if verbose:
 
         def _print_ops(label: str, ops: list) -> None:
+        # HELPER: Prints a label with the item count and then each op on its own line.
             print(f"\n{label} ({len(ops)}):")
             for op in ops:
                 print(f"  {op}")

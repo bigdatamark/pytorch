@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared helpers for DTensor op sharding strategies: decorators that register
+# strategy/propagation rules with the sharding propagator, a fallback replicate strategy,
+# dim normalization utilities, shardability checks (including _StridedShard), broadcast
+# placement mapping, redistribute cost generation, and expand_to_full_mesh_op_strategy which
+# expands per-mesh-dim placement lists into full-mesh OpStrategy objects.
+# Import-time side effects: defines TypeVars and a type alias only.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import functools
 import itertools
@@ -37,7 +43,12 @@ def _get_registration_wrapper(
     schema_info: RuntimeSchemaInfo | None,
     arg_names_that_require_specializing_cache_strategy: list[str] | None,
 ):
+    # HELPER: Builds a decorator factory. The returned wrapper takes a strategy/rule implementation and,
+    # for each op overload (single or list), computes a RuntimeSchemaInfo (the given schema_info, or one
+    # with static kwarg keys for schema args named in the specializing-arg-name list, e.g. memory_format),
+    # then calls registration_fn(overload, impl, schema_info). Side effect: registers into the propagator.
     def wrapper(impl):
+        # HELPER: Registers impl for every overload and returns impl unchanged (decorator behavior).
         overloads = op if isinstance(op, list) else [op]
         for overload in overloads:
             curr_schema_info = None
@@ -69,6 +80,9 @@ def register_prop_rule(
 ) -> Callable[
     [Callable[[OpSchema], OutputSharding]], Callable[[OpSchema], OutputSharding]
 ]:
+    # Decorator factory registering a sharding propagation rule (OpSchema -> OutputSharding) for one op
+    # overload or a list of overloads, on the global DTensor sharding propagator. Optional schema_info is
+    # forwarded as runtime schema info. Returns a decorator that returns the rule unchanged.
     return _get_registration_wrapper(
         DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule,
         op,
@@ -91,6 +105,10 @@ def register_op_strategy(
     op: torch._ops.OpOverload | list[torch._ops.OpOverload],
     schema_info: RuntimeSchemaInfo | None = None,
 ) -> Callable[[_ShardingStrategyFunc], _ShardingStrategyFunc]:
+    # Decorator factory registering an op strategy function for one overload or a list on the global DTensor
+    # sharding propagator. If schema_info is None, schema args named memory_format automatically
+    # produce a RuntimeSchemaInfo with static kwarg keys so cached strategies specialize on them.
+    # Returns a decorator that returns the strategy function unchanged.
     # For every ATen op that accepts any args in this list,
     # the arg itself can impact the strides (and potentially the sharding strategy)
     # of the output tensor.
@@ -108,6 +126,10 @@ def register_op_strategy(
 
 
 def replicate_op_strategy(op_schema: OpSchema) -> StrategyType:
+    # Fallback strategy that replicates all inputs and outputs. Counts Tensor returns from the op schema,
+    # builds a single all-Replicate placement list and expands it over the mesh of the first input.
+    # Raises RuntimeError for view ops and for ops returning a list of tensors (list size may be data
+    # dependent). Returns an OpStrategy.
     """
     Fallback strategy all use Replication()
     """
@@ -142,6 +164,8 @@ def as_list(
     x: list[object] | object,
     # pyre-fixme[11]: Annotation `immutable_list` is not defined as a type.
 ) -> list[object] | torch.fx.immutable_collections.immutable_list:  # type: ignore[valid-type]
+    # HELPER: Returns x unchanged if it is a plain list or an fx immutable_list (kept intact for tracing),
+    # otherwise wraps it in a one-element list.
     # During tracing, `aten.sum.dim_IntList` uses `immutable_list` for its args,
     # which is an object but treated as a list by the tracer. Therefore, keep
     # `immutable_list` intact here as well.
@@ -152,10 +176,13 @@ def as_list(
 
 
 def normalize_dim(dim: int, ndim: int) -> int:
+    # Maps a possibly negative dim to its non-negative equivalent given ndim. No range validation.
     return dim if dim >= 0 else dim + ndim
 
 
 def normalize_dims(dims: DimsType, ndim: int) -> DimsSequenceType:
+    # Normalizes an int, list or tuple of dims to non-negative values using ndim; an int becomes a
+    # one-element tuple, list stays list, tuple stays tuple. Other types are returned unchanged.
     """Normalize a dim or a sequence of dims, so that they are all positive."""
     if isinstance(dims, int):
         dims = (normalize_dim(dims, ndim),)
@@ -167,6 +194,7 @@ def normalize_dims(dims: DimsType, ndim: int) -> DimsSequenceType:
 
 
 def prod(xs: Iterable[int]) -> int:
+    # Returns the product of an iterable of ints (1 for empty).
     return functools.reduce(operator.mul, xs, 1)
 
 
@@ -175,6 +203,12 @@ def is_tensor_shardable(
     spec: DTensorSpec,
     allow_unbacked_sharding: bool | None = None,
 ) -> bool:
+    # Returns whether a tensor of the given shape can be sharded under spec. For each shard-like
+    # placement it accumulates the number of shards per tensor dim across mesh dims and requires the dim
+    # size to be at least that count (times split_factor for _StridedShard). Returns False if a shard dim
+    # is out of range. allow_unbacked_sharding picks the fallback for unbacked symbolic sizes (None:
+    # data-dependent error, True: assume shardable, False: assume not). A user hint for unbacked symbols
+    # may prove shardability but a runtime check is then added via torch._check.
     """
     Check if the shape is shardable according to the spec.
 
@@ -209,6 +243,8 @@ def is_tensor_shardable(
     }[allow_unbacked_sharding]
 
     def hint_proves_at_least(size, lower_bound: int) -> bool:
+        # HELPER: True if the size is provably at least lower_bound, either by a guard or by a user-provided
+        # unbacked hint (in which case a runtime check on the lower bound is emitted as a side effect).
         if guard_or_false(size >= lower_bound):
             return True
         if not (
@@ -253,6 +289,8 @@ def is_tensor_shardable(
 
 
 def is_tensor_evenly_shardable(shape: Sequence[int], spec: DTensorSpec) -> bool:
+    # Returns whether every sharded tensor dim is evenly divisible by the total number of shards
+    # (times split_factor for _StridedShard). Returns False if a shard dim is out of range.
     """Check if the shape is evenly shardable according to the spec."""
     # number of shards in each tensor dimension
     num_shards = [1] * len(shape)
@@ -278,6 +316,8 @@ def is_tensor_evenly_shardable(shape: Sequence[int], spec: DTensorSpec) -> bool:
 def is_tensor_evenly_shardable_on_dim(
     shape: Sequence[int], spec: DTensorSpec, dim: int
 ) -> bool:
+    # Returns whether the given dim (normalized) is evenly divisible by the total number of shards placed
+    # on it by spec; for _StridedShard the divisor also includes split_factor.
     """Check if the shape is evenly shardable according to the spec on dim."""
     dim = normalize_dim(dim, len(shape))
 
@@ -299,11 +339,13 @@ def is_tensor_evenly_shardable_on_dim(
 
 
 def is_tensor_dim_sharded(spec: DTensorSpec, dim: int) -> bool:
+    # Returns True if any shard-like placement in spec shards tensor dim dim.
     """Return True if tensor dim is sharded."""
     return any(_is_shard_like(p) and p.dim == dim for p in spec.placements)
 
 
 def is_tensor_partial(spec: DTensorSpec) -> bool:
+    # Returns True if any placement in spec is Partial.
     """Return True if tensor is partial on the mesh."""
     return any(p.is_partial() for p in spec.placements)
 
@@ -311,6 +353,9 @@ def is_tensor_partial(spec: DTensorSpec) -> bool:
 def infer_broadcast_dims_map(
     common_shape: torch.Size, input_shape: torch.Size
 ) -> list[int]:
+    # Builds a list with one entry per common_shape dim giving the matching input_shape dim index, aligned
+    # from the trailing dims, or -1 where there is no mapping (missing leading dim or size mismatch
+    # as determined by guard_or_false, so unknown sizes count as unmapped).
     # infer the broadcast dims map, where it maps from the common shape dim to the input shape dim
     # this is aligned with the broadcast semantics
     # e.g. if common_shape = [1, 2, 3, 4] and input_shape = [2, 3, 4],
@@ -333,6 +378,10 @@ def map_placements_after_broadcast(
     broadcast_dims_map: list[int],
     partial_to_replicate: bool = False,
 ) -> tuple[Placement, ...]:
+    # Maps placements to the pre-broadcast input: Partial is kept (or turned into Replicate when
+    # partial_to_replicate), Replicate kept, Shard/_StridedShard dims are remapped through
+    # broadcast_dims_map and become Replicate when the dim is unmapped (implicitly broadcast).
+    # Returns a tuple of placements. Raises AssertionError for non-shard-like unknown placements.
     """Map each placement based on the output shape after broadcast."""
     new_placements: list[Placement] = []
     for placement in placements:
@@ -376,6 +425,8 @@ def map_placements_after_broadcast(
 def generate_redistribute_costs(
     src_strategy: OpStrategy, dst_spec: DTensorSpec
 ) -> list[float]:
+    # Returns one row of the redistribute-cost matrix: for each strategy in src_strategy, the cost of
+    # redistributing its output spec to dst_spec.
     """Generates one row in the 'redistribute_costs' matrix in an OpSpec
     The length of the returned list will match the number of strategies in 'src_strategy'.
 
@@ -405,6 +456,15 @@ def expand_to_full_mesh_op_strategy(
     | None = None,
     different_mesh_args: list[int] | None = None,
 ) -> OpStrategy:
+    # Expands single-mesh-dim placement lists into an OpStrategy over all mesh dims by taking the cartesian
+    # product across mesh.ndim. Each placement list has outputs first (input_index of them) followed by
+    # inputs. Builds DTensorSpecs (filling tensor_meta, propagating the strided-shard flag), then skips
+    # combinations with mixed partial kinds (except sum/avg), in-place or out-variant placement mismatches,
+    # non-shardable inputs (unless allow_uneven_sharding and input placement is unchanged), and those rejected
+    # by full_mesh_strategy_filter. different_mesh_args lists input indices whose Replicate-only specs on
+    # another mesh are preserved. Computes redistribute costs per input. Returns OpStrategy.
+    # Raises AssertionError on inconsistent None specs or input count mismatch, and RuntimeError when no
+    # strategy remains, a cross-mesh input is not Replicate, or an output spec is None.
     """
     Convenience function to allow writing a sharding strategy considering only a single mesh dimension,
     and have it expanded combinatorially to all mesh dimensions.
@@ -697,6 +757,8 @@ def expand_to_full_mesh_op_strategy(
 def shift_shard_dims_after_insert(
     placements: Sequence[Placement], insert_dim: int = 0
 ) -> Sequence[Placement]:
+    # Returns placements with Shard/_StridedShard dims at or after insert_dim incremented by one
+    # (as if a new tensor dim were inserted); other placements unchanged.
     normalized_placements: list[Placement] = []
     for placement in placements:
         if isinstance(placement, _StridedShard) and placement.dim >= insert_dim:
@@ -713,6 +775,8 @@ def shift_shard_dims_after_insert(
 def shift_shard_dims_after_remove(
     placements: Sequence[Placement], remove_dim: int = 0
 ) -> Sequence[Placement]:
+    # Returns placements with Shard/_StridedShard dims strictly after remove_dim decremented by one
+    # (as if a tensor dim were removed); other placements unchanged. A placement on remove_dim itself is not changed.
     normalized_placements: list[Placement] = []
     for placement in placements:
         if isinstance(placement, _StridedShard) and placement.dim > remove_dim:
