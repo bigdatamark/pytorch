@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests for functorch.einops.rearrange, adapted from the einops test suite. Covers
+# ellipsis handling, identity and equivalent patterns, axis permutations, grouping with explicit
+# axis sizes, list-of-tensor inputs, unit axes, zero-dim tensors, and dimension mismatch errors,
+# plus a check that torch.func re-exports the same rearrange function. Defines module-level
+# pattern lists used by the tests; no import-time side effects.
 
 """Adapted from https://github.com/arogozhnikov/einops/blob/230ac1526c1f42c9e1f7373912c7f8047496df11/tests/test_ops.py.
 
@@ -54,7 +59,10 @@ equivalent_rearrange_patterns: list[tuple[str, str]] = [
 
 
 class TestRearrange(TestCase):
+    # [CLASS DOC] Tests of rearrange behavior on tensors: patterns, errors and consistency.
     def test_collapsed_ellipsis_errors_out(self) -> None:
+        # [FUNCTION DOC] Checks that an ellipsis may not be wrapped in parentheses on the input
+        # side (raises ValueError) while the ellipsis grouped on the output side alone is accepted.
         x = torch.zeros([1, 1, 1, 1, 1])
         rearrange(x, "a b c d ... ->  a b c ... d")
         with self.assertRaises(ValueError):
@@ -65,6 +73,8 @@ class TestRearrange(TestCase):
             rearrange(x, "(...) -> (...)")
 
     def test_ellipsis_ops(self) -> None:
+        # [FUNCTION DOC] Checks every identity pattern returns an equal tensor for a 5-d input,
+        # and that each pair of equivalent explicit/ellipsis patterns gives equal results.
         x = torch.arange(2 * 3 * 4 * 5 * 6).reshape([2, 3, 4, 5, 6])
         for pattern in identity_patterns:
             torch.testing.assert_close(rearrange(x, pattern), x, msg=pattern)
@@ -77,6 +87,10 @@ class TestRearrange(TestCase):
             )
 
     def test_rearrange_consistency(self) -> None:
+        # [FUNCTION DOC] Consistency checks on a 6-d tensor: permutations/groupings preserve the
+        # set of values and dtype, round trips with explicit axis sizes (given via keyword
+        # arguments) restore the input, reversing axis order inverts correctly, and element
+        # positions match a transpose.
         shape = [1, 2, 3, 5, 7, 11]
         x = torch.arange(int(np.prod(shape, dtype=int))).reshape(shape)
         for pattern in [
@@ -119,6 +133,9 @@ class TestRearrange(TestCase):
         self.assertEqual(x2[0, 1, 2], result[1, 2, 0])
 
     def test_rearrange_permutations(self) -> None:
+        # [FUNCTION DOC] Random-permutation tests on tensors of size-2 axes (1 to 9 axes). First
+        # part compares sampled elements of the result with the permuted index; second part checks
+        # a bit-manipulation oracle that moves each axis bit to its permuted position.
         # tests random permutation of axes against two independent numpy ways
         for n_axes in range(1, 10):
             input = torch.arange(2**n_axes).reshape([2] * n_axes)
@@ -146,6 +163,9 @@ class TestRearrange(TestCase):
             torch.testing.assert_close(result, expected_result)
 
     def test_concatenations_and_stacking(self) -> None:
+        # [FUNCTION DOC] Checks that passing a list of equally shaped tensors (various shapes,
+        # 1/2/5 tensors) with the identity ellipsis pattern equals stacking them along a new
+        # leading axis.
         for n_arrays in [1, 2, 5]:
             shapes: list[list[int]] = [[], [1], [1, 1], [2, 3, 5, 7], [1] * 6]
             for shape in shapes:
@@ -158,18 +178,23 @@ class TestRearrange(TestCase):
                 torch.testing.assert_close(result0, result1)
 
     def test_unsqueeze(self) -> None:
+        # [FUNCTION DOC] Checks that unit axes on the output side insert size-1 dims
+        # like unsqueeze.
         x = torch.randn((2, 3, 4, 5))
         actual = rearrange(x, "b h w c -> b 1 h w 1 c")
         expected = x.unsqueeze(1).unsqueeze(-2)
         torch.testing.assert_close(actual, expected)
 
     def test_squeeze(self) -> None:
+        # [FUNCTION DOC] Checks that unit axes on the input side are removed like squeeze.
         x = torch.randn((2, 1, 3, 4, 1, 5))
         actual = rearrange(x, "b 1 h w 1 c -> b h w c")
         expected = x.squeeze()
         torch.testing.assert_close(actual, expected)
 
     def test_0_dim_tensor(self) -> None:
+        # [FUNCTION DOC] Checks that a zero-dim tensor passes through an empty pattern and a bare
+        # ellipsis pattern unchanged.
         x = expected = torch.tensor(1)
         actual = rearrange(x, "->")
         torch.testing.assert_close(actual, expected)
@@ -178,6 +203,8 @@ class TestRearrange(TestCase):
         torch.testing.assert_close(actual, expected)
 
     def test_dimension_mismatch_no_ellipsis(self) -> None:
+        # [FUNCTION DOC] Checks ValueError when the number of named axes does not match the tensor
+        # rank and no ellipsis is present (too few and too many axes).
         x = torch.randn((1, 2, 3))
         with self.assertRaises(ValueError):
             rearrange(x, "a b -> b a")
@@ -186,19 +213,26 @@ class TestRearrange(TestCase):
             rearrange(x, "a b c d -> c d b a")
 
     def test_dimension_mismatch_with_ellipsis(self) -> None:
+        # [FUNCTION DOC] Checks ValueError when a pattern with a named axis plus ellipsis is
+        # applied to a zero-dim tensor (fewer dims than named axes).
         x = torch.tensor(1)
         with self.assertRaises(ValueError):
             rearrange(x, "a ... -> ... a")
 
 
 class TestRearrangeTorchFuncExport(TestCase):
+    # [CLASS DOC] Tests that rearrange is exported from torch.func.
     def test_torch_func_rearrange_import(self) -> None:
+        # [FUNCTION DOC] Checks the object imported from torch.func is identical to the rearrange
+        # imported from functorch.einops.
         from torch.func import rearrange as torch_func_rearrange
 
         # Verify the import works and is the same function
         self.assertIs(torch_func_rearrange, rearrange)
 
     def test_torch_func_rearrange_basic(self) -> None:
+        # [FUNCTION DOC] Smoke test: rearrange imported from torch.func transforms a 3-d tensor
+        # with a grouping pattern and yields the expected 2-d shape.
         from torch.func import rearrange as torch_func_rearrange
 
         x = torch.randn((2, 3, 4))
