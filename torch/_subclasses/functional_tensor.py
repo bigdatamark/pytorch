@@ -1,3 +1,8 @@
+# [MODULE DOC] Python-side functionalization: FunctionalTensor (a wrapper subclass around a C++
+# functional tensor), FunctionalTensorMode (the dispatch mode that functionalizes ops), a
+# dispatcher-mode wrapper for functorch, and helpers deciding which ops to decompose.
+# Import-time side effects: creates the "not_implemented" artifact logger and binds the
+# functionalization reapply-views thread-local flag.
 from __future__ import annotations
 
 import contextlib
@@ -37,6 +42,9 @@ not_implemented_log = torch._logging.getArtifactLogger(__name__, "not_implemente
 
 
 def _has_unrecognized_tensor_types(types: Sequence[type]) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if types contains any class other than Tensor,
+    # FakeTensor or FunctionalTensor (so the caller should return NotImplemented); logs the
+    # offending types to the not_implemented logger at debug level.
     unrecognized_types = [
         t
         for t in types
@@ -53,6 +61,10 @@ def _has_unrecognized_tensor_types(types: Sequence[type]) -> bool:
 def _can_decompose_fast(
     func: OpOverload, export: bool, pre_dispatch: bool
 ) -> bool | None:
+    # [FUNCTION DOC] HELPER: Cached (by func, export, pre_dispatch) decision on whether func
+    # should be decomposed. Returns False for dropout in export, True for unsafe ops and for
+    # ops with aliasing or mutable schemas; in export returns False under pre-dispatch (warning
+    # for custom CompositeImplicit ops) and True otherwise. Returns None when undecided.
     """Fast path for _can_decompose that depends only on (func, export, pre_dispatch).
 
     Returns True/False for a definitive answer, or None to fall through
@@ -86,6 +98,8 @@ def _can_decompose_fast(
 
 
 def _assert_functionalize_not_active(msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises AssertionError with msg if the Functionalize dispatch key is
+    # currently included and not excluded in thread-local dispatch state.
     is_included = torch._C._dispatch_tls_is_dispatch_key_included(
         torch._C.DispatchKey.Functionalize
     )
@@ -111,13 +125,23 @@ def _assert_functionalize_not_active(msg: str) -> None:
 # pytorch document. https://pytorch.org/docs/stable/generated/torch.Tensor.float.html
 # thus we simply force them to go through .to() call.
 def _conversion_method_template(**extra_kwargs: Any) -> Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: Builds a method (used for char, cpu, float, etc.) that forwards to
+    # the tensor's to method with the given fixed keyword arguments (e.g. dtype) merged over
+    # any caller kwargs, so conversions always go through to() (needed for export).
     def _(self: FunctionalTensor, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls self.to with the caller arguments plus the fixed kwargs.
         return self.to(*args, **{**kwargs, **extra_kwargs})
 
     return _
 
 
 class FunctionalTensor(torch.Tensor):
+    # [CLASS DOC] Python wrapper subclass around a C++ functional tensor (attribute elem). All
+    # metadata queries are forwarded to the inner tensor; any other op must be dispatched
+    # through an active FunctionalTensorMode, else a RuntimeError is raised. Class state:
+    # metadata_fns (ops served directly), _extra_dispatch_keys (keys mirrored onto the
+    # wrapper), _inference_mode_base (base tensor for auto_functionalize in inference mode).
+    # Conversion methods (char, cpu, float, ...) are rerouted through to().
     """
     Functional tensors represent tensors that will remove mutations
     from a program. If you perform a mutable operation on a functional tensor,
@@ -172,6 +196,12 @@ class FunctionalTensor(torch.Tensor):
     _inference_mode_base: FunctionalTensor | None = None
 
     def __new__(cls, elem: torch.Tensor, mode: FunctionalTensorMode) -> Self:
+        # [FUNCTION DOC] Creates a wrapper subclass mirroring elem's shape, strides, offset,
+        # dtype, layout, device and requires_grad (strides/offset omitted for sparse), plus the
+        # mirrored dispatch keys, and stores elem. Raises AssertionError if elem is not a
+        # functional tensor. Side effects: marks the wrapper to throw on mutable data pointer
+        # access; in inference mode with auto-functionalized v2 enabled, records base/storage
+        # relationships in mode._storage_to_base.
         if not torch._is_functional_tensor(elem):
             raise AssertionError("elem must be a functional tensor")
 
@@ -244,6 +274,11 @@ class FunctionalTensor(torch.Tensor):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Dispatch hook used when no mode handles the call. Returns NotImplemented
+        # for unrecognized subclasses. Metadata ops (size, stride, contiguity, device, ...) are
+        # run on the unwrapped inner tensor and their result returned (AssertionError on bad
+        # arity or non-empty kwargs). detach on a single FunctionalTensor returns it unchanged.
+        # Anything else raises RuntimeError saying a FunctionalTensorMode is required.
         if _has_unrecognized_tensor_types(types):
             return NotImplemented
 
@@ -288,10 +323,17 @@ class FunctionalTensor(torch.Tensor):
         )
 
     def __repr__(self, *, tensor_contents: object | None = None) -> str:
+        # [FUNCTION DOC] Returns a string showing the wrapper name around the repr of the inner
+        # tensor; tensor_contents is ignored.
         return f"FunctionalTensor({repr(self.elem)})"
 
     @staticmethod
     def to_functional(x: torch.Tensor) -> FunctionalTensor:
+        # [FUNCTION DOC] Static method: wraps a non-functional tensor x as a FunctionalTensor.
+        # Converts x to a C++ functional tensor, then, inside the currently active functional
+        # infra mode, mirrors autograd metadata (requires_grad, leaf-ness) onto the inner and
+        # outer tensors. Raises AssertionError if x is already functional or no
+        # FunctionalTensorMode is active. Returns the new FunctionalTensor.
         # We will do the wrapping for the user.
 
         if torch._is_functional_tensor(x):
@@ -318,25 +360,36 @@ class FunctionalTensor(torch.Tensor):
         return out
 
     def from_functional(self) -> torch.Tensor:
+        # [FUNCTION DOC] Syncs pending updates then returns the plain (unwrapped) tensor
+        # underlying the inner functional tensor.
         torch._sync(self)
         return torch._from_functional_tensor(self.elem)
 
     def is_base_tensor(self) -> bool:
+        # [FUNCTION DOC] Returns True if the inner functional tensor is a base (not a view).
         return torch._is_functional_tensor_base(self.elem)
 
     def replace_(self, output: torch.Tensor) -> None:
+        # [FUNCTION DOC] Replaces the inner functional tensor's value with output (functionalized
+        # in-place update). Mutates the inner tensor.
         torch._functionalize_replace(self.elem, output)
 
     def commit_update(self) -> None:
+        # [FUNCTION DOC] Commits any pending functionalization update on the inner tensor.
         torch._functionalize_commit_update(self.elem)
 
     def sync(self) -> None:
+        # [FUNCTION DOC] Synchronizes the inner functional tensor with all pending mutations
+        # applied to its aliases/views.
         torch._functionalize_sync(self.elem)
 
     def mark_mutation_hidden_from_autograd(self) -> None:
+        # [FUNCTION DOC] Marks the latest mutation on the inner tensor as invisible to autograd.
         torch._functionalize_mark_mutation_hidden_from_autograd(self.elem)
 
     def tolist(self) -> Any:
+        # [FUNCTION DOC] Converts the inner tensor to nested Python lists: a scalar for 0-d, a
+        # list of scalars for 1-d, and recursive lists otherwise.
         if self.elem.dim() == 0:
             return self.elem.item()
         elif self.elem.dim() == 1:
@@ -345,6 +398,9 @@ class FunctionalTensor(torch.Tensor):
             return [elem.tolist() for elem in self.elem]
 
     def to(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        # [FUNCTION DOC] Standard tensor conversion. When the active functional mode is in export
+        # mode, first emits a tensor-metadata assertion op on self (so the conversion is
+        # preserved in the graph), then delegates to the base class implementation.
         if _detect_infra_mode(torch._C._TorchDispatchModeKey.FUNCTIONAL).export:
             torch.ops.aten._assert_tensor_metadata(
                 self,
@@ -358,6 +414,8 @@ class FunctionalTensor(torch.Tensor):
     def cuda(
         self, device: torch.device | int | str | None = None, *args: Any, **kwargs: Any
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Moves to a CUDA device by routing through to(); falls back to the
+        # current CUDA device when device is not given. Extra positional args go to to().
         device = device or torch.cuda.current_device()
         if len(args) > 0:
             return self.to(device, *args, **kwargs)
@@ -405,18 +463,27 @@ class FunctionalTensor(torch.Tensor):
     @property
     # pyrefly: ignore[bad-override]
     def is_mkldnn(self) -> builtins.bool:
+        # [FUNCTION DOC] Property: whether the unwrapped inner tensor is an MKLDNN tensor.
         return torch._from_functional_tensor(self.elem).is_mkldnn
 
     @property
     # pyrefly: ignore[bad-override]
     def layout(self) -> torch.layout:
+        # [FUNCTION DOC] Property: the layout of the unwrapped inner tensor.
         return torch._from_functional_tensor(self.elem).layout
 
     def __bool__(self) -> builtins.bool:
+        # [FUNCTION DOC] Truth value from the scalar item of this tensor.
         return bool(self.item())
 
 
 class FunctionalTensorMode(TorchDispatchMode):
+    # [CLASS DOC] Infra dispatch mode that functionalizes ops: wraps tensor inputs as
+    # FunctionalTensors, decomposes ops when appropriate, runs the op under C++
+    # functionalization, and wraps outputs. Re-entrant (nested entry is a no-op). State:
+    # export / pre_dispatch flags, effect-token maps (_tokens, _tokens_forward_output),
+    # _allow_token_discovery, _keep_input_mutations, _storage_to_base (weak map from storage
+    # to base FunctionalTensor) and enter_stack (records which entries really pushed the mode).
     def __init__(
         self,
         pre_dispatch: bool = False,
@@ -424,6 +491,9 @@ class FunctionalTensorMode(TorchDispatchMode):
         _allow_token_discovery: bool = False,
         _keep_input_mutations: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Initializes the mode with pre_dispatch/export flags, token-discovery and
+        # input-mutation-keeping options, empty token maps, an empty enter stack, and the
+        # functional mode key; sets the dispatch key to PreDispatch when pre_dispatch is set.
         super().__init__()
         self.export = export
         self.is_on_stack = False
@@ -458,7 +528,12 @@ class FunctionalTensorMode(TorchDispatchMode):
 
     # No-op if FunctionalTensorMode is already in use
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Pushes the mode unless a functional mode is already active (checked at
+        # the pre-dispatch or normal level); records on enter_stack whether this entry really
+        # pushed it. Returns self.
         def _get_prev_mode() -> FunctionalTensorMode | None:
+            # [FUNCTION DOC] HELPER: Returns the currently active functional mode at the
+            # relevant dispatch level, or None.
             if self._dispatch_key == torch._C.DispatchKey.PreDispatch:
                 return _get_dispatch_mode_pre_dispatch(
                     torch._C._TorchDispatchModeKey.FUNCTIONAL
@@ -481,6 +556,8 @@ class FunctionalTensorMode(TorchDispatchMode):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Pops the matching enter record and only really exits the mode if the
+        # corresponding entry had pushed it.
         is_on_stack = self.enter_stack.pop()
         if is_on_stack:
             super().__exit__(exc_type, exc_val, exc_tb)
@@ -492,6 +569,10 @@ class FunctionalTensorMode(TorchDispatchMode):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Main entry: returns NotImplemented for unrecognized subclasses; if func
+        # may be decomposed (non-metadata, has a dispatcher kernel) tries to decompose it first.
+        # Otherwise unwraps FunctionalTensor args, runs the op under C++ functionalization and
+        # wraps outputs back (see nested helpers below).
         if kwargs is None:
             kwargs = {}
 
@@ -511,6 +592,8 @@ class FunctionalTensorMode(TorchDispatchMode):
                     return r
 
         def wrap(x: object) -> object:
+            # [FUNCTION DOC] HELPER: Wraps x in a FunctionalTensor if it is a functional tensor;
+            # raises AssertionError if x is already a FunctionalTensor. Other values pass through.
             # Only wrap our outputs in subclasses if the inner functionalization call
             # also wrapped outputs into FunctionalTensorWrappers.
             # When can this happen? e.g. `torch.div(2, 2)`
@@ -521,6 +604,7 @@ class FunctionalTensorMode(TorchDispatchMode):
             return x
 
         def unwrap(x: FunctionalTensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns the inner functional tensor of a FunctionalTensor.
             return x.elem
 
         from torch._higher_order_ops.auto_functionalize import (
@@ -673,6 +757,8 @@ class FunctionalTensorMode(TorchDispatchMode):
                 input_dispatch_keys = input_unwrapped.dispatch_keys
 
                 def preserve_dispatch_keys(out: object) -> None:
+                    # [FUNCTION DOC] HELPER: For a FunctionalTensor output wrapping a fake tensor,
+                    # copies the input's saved dispatch keys onto that fake tensor (mutation).
                     if isinstance(out, FunctionalTensor):
                         unwrapped = torch._from_functional_tensor(out.elem)
                         if isinstance(  # noqa: ISINSTANCE_FAKE_TENSOR
@@ -713,6 +799,10 @@ class FunctionalTensorMode(TorchDispatchMode):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: When a proxy tracing mode is active, syncs each FunctionalTensor
+        # argument while the tracer's recorded fx node for it is set as the replay node, so
+        # lazily replayed views carry the original annotations. Raises RuntimeError if a tensor
+        # requiring grad is missing from the tracker; missing constants are skipped.
         """Sync FunctionalTensor args so view replay uses correct fx node metadata.
 
         When functionalization encounters a mutation, it handles aliases by lazily
@@ -759,6 +849,9 @@ class FunctionalTensorMode(TorchDispatchMode):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether func should be decomposed. Uses the cached fast
+        # decision when definitive; otherwise decomposes only if autograd would have decomposed
+        # it for the flattened arguments.
         result = _can_decompose_fast(func, self.export, self.pre_dispatch)
         if result is not None:
             return result
@@ -773,11 +866,15 @@ class FunctionalTensorMode(TorchDispatchMode):
 
     @classmethod
     def is_infra_mode(cls) -> bool:
+        # [FUNCTION DOC] Class method: always True; marks this as a low-precedence infra mode.
         return True
 
 
 @contextlib.contextmanager
 def disable_functional_mode() -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that temporarily disables the active functional infra mode.
+    # KNOWN ISSUE: it returns the result of the disable helper rather than yielding, so it
+    # relies on that helper already being a context manager.
     return _disable_infra_mode(torch._C._TorchDispatchModeKey.FUNCTIONAL)
 
 
@@ -796,13 +893,20 @@ def dispatch_functionalize(
     *,
     propagate_input_mutations: bool = False,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Returns a wrapper around func that runs it on FunctionalTensor versions of
+    # all tensor args/kwargs under mode (with the C++ Functionalize key excluded above), then
+    # syncs and unwraps tensor outputs. If propagate_input_mutations is set, afterwards copies
+    # mutations made to functional inputs back into the caller's original tensors.
     # TODO: pull these from aot autograd
     def to_fun(t: object) -> object:
+        # [FUNCTION DOC] HELPER: Wraps a tensor as a FunctionalTensor; other values unchanged.
         if isinstance(t, torch.Tensor):
             return FunctionalTensor.to_functional(t)
         return t
 
     def from_fun(t: object) -> object:
+        # [FUNCTION DOC] HELPER: Syncs and unwraps a FunctionalTensor to a plain tensor; other
+        # values pass through. Raises AssertionError for a functional tensor that is not wrapped.
         if not isinstance(t, FunctionalTensor):
             # quick sanity check
             if isinstance(t, torch.Tensor):
@@ -815,6 +919,8 @@ def dispatch_functionalize(
         return torch._from_functional_tensor(t.elem)
 
     def inner(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: The functionalized callable: wraps inputs, calls func inside the
+        # mode, unwraps outputs and optionally propagates input mutations. Returns the outputs.
         disable_above = torch._C._ExcludeDispatchKeyGuard(
             torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
         )
@@ -845,6 +951,11 @@ def dispatch_functionalize(
 
 
 class BaseFunctionalizeAPI(ABC):
+    # [CLASS DOC] Abstract interface used by higher-order ops to functionalize code regardless of
+    # backend: wrap/unwrap tensors, functionalize a callable, and redispatch to the next layer.
+    # Concrete replace/commit_update/sync/mark_mutation_hidden_from_autograd default to the raw
+    # C++ functionalization calls on plain functional tensors. Subclasses: PythonFunctionalizeAPI,
+    # CppFunctionalizeAPI, FunctorchFunctionalizeAPI.
     @abstractmethod
     def wrap_tensors(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
         pass
@@ -862,27 +973,36 @@ class BaseFunctionalizeAPI(ABC):
         pass
 
     def replace(self, input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Replaces the value of a functional input_tensor with output_tensor.
         torch._functionalize_replace(input_tensor, output_tensor)
 
     def commit_update(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Commits a pending functionalization update on tensor.
         torch._functionalize_commit_update(tensor)
 
     def sync(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Synchronizes tensor with pending mutations on its aliases.
         torch._functionalize_sync(tensor)
 
     def mark_mutation_hidden_from_autograd(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Marks the latest mutation of tensor as hidden from autograd.
         torch._functionalize_mark_mutation_hidden_from_autograd(tensor)
 
 
 class PythonFunctionalizeAPI(BaseFunctionalizeAPI):
+    # [CLASS DOC] Functionalize API backed by FunctionalTensor and a FunctionalTensorMode
+    # (attributes mode and pre_dispatch). Mutation helpers require FunctionalTensor arguments.
     def __init__(
         self, mode: FunctionalTensorMode | None = None, pre_dispatch: bool = False
     ) -> None:
+        # [FUNCTION DOC] Stores the given mode (or creates a fresh default FunctionalTensorMode)
+        # and the pre_dispatch flag.
         super().__init__()
         self.mode = mode if mode else FunctionalTensorMode()
         self.pre_dispatch = pre_dispatch
 
     def wrap_tensors(self, args: tuple[Any]) -> tuple[Any]:
+        # [FUNCTION DOC] Wraps every tensor in args as a FunctionalTensor inside the mode.
         with self.mode:
             return torch.utils._pytree.tree_map_only(
                 torch.Tensor, FunctionalTensor.to_functional, args
@@ -891,15 +1011,18 @@ class PythonFunctionalizeAPI(BaseFunctionalizeAPI):
     def unwrap_tensors(
         self, args: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]
     ) -> Any:
+        # [FUNCTION DOC] Syncs and unwraps every FunctionalTensor in args to a plain tensor.
         return torch.utils._pytree.tree_map_only(
             FunctionalTensor, FunctionalTensor.from_functional, args
         )
 
     # pyrefly: ignore [implicit-any]
     def functionalize(self, inner_f: Callable) -> Callable:
+        # [FUNCTION DOC] Returns inner_f functionalized with dispatch_functionalize using self.mode.
         return dispatch_functionalize(inner_f, self.mode)
 
     def redispatch_to_next(self) -> AbstractContextManager[None]:
+        # [FUNCTION DOC] Returns a no-op context manager (the mode was already popped).
         # [NOTE] We don't do anything here because at the time
         # we exercise this path, we would have already popped the
         # FunctionalTensorMode from mode stack. Since FunctionalTensorMode
@@ -909,6 +1032,8 @@ class PythonFunctionalizeAPI(BaseFunctionalizeAPI):
 
     @staticmethod
     def _check_cast_functional(tensor: torch.Tensor, name: str) -> FunctionalTensor:
+        # [FUNCTION DOC] HELPER: Static; returns tensor if it is a FunctionalTensor, else raises
+        # AssertionError naming the argument and its actual type.
         if not isinstance(tensor, FunctionalTensor):
             raise AssertionError(
                 f"{name} must be a FunctionalTensor, got {type(tensor)}"
@@ -916,25 +1041,34 @@ class PythonFunctionalizeAPI(BaseFunctionalizeAPI):
         return tensor
 
     def replace(self, input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Replaces the inner value of FunctionalTensor input_tensor with
+        # output_tensor. Raises AssertionError if input is not, or output is, a FunctionalTensor.
         ft = self._check_cast_functional(input_tensor, "input_tensor")
         if isinstance(output_tensor, FunctionalTensor):
             raise AssertionError("output_tensor must not be a FunctionalTensor")
         ft.replace_(output_tensor)
 
     def commit_update(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Commits the pending update of a FunctionalTensor (AssertionError otherwise).
         self._check_cast_functional(tensor, "tensor").commit_update()
 
     def sync(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Syncs a FunctionalTensor (AssertionError if it is not one).
         self._check_cast_functional(tensor, "tensor").sync()
 
     def mark_mutation_hidden_from_autograd(self, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Marks the mutation of a FunctionalTensor as hidden from autograd
+        # (AssertionError if it is not one).
         self._check_cast_functional(
             tensor, "tensor"
         ).mark_mutation_hidden_from_autograd()
 
 
 class CppFunctionalizeAPI(BaseFunctionalizeAPI):
+    # [CLASS DOC] Functionalize API using the C++ functionalization at functorch level 0 and
+    # torch.func.functionalize; redispatch excludes the Functionalize dispatch key.
     def wrap_tensors(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Wraps all tensors in args as C++ functional tensors at level 0.
         from torch._functorch.eager_transforms import _wrap_all_tensors_to_functional
 
         return _wrap_all_tensors_to_functional(args, level=0)
@@ -942,6 +1076,8 @@ class CppFunctionalizeAPI(BaseFunctionalizeAPI):
     def unwrap_tensors(
         self, args: torch.Tensor | tuple[torch.Tensor, ...]
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] Unwraps C++ functional tensors in args, honoring the thread-local
+        # reapply-views setting.
         from torch._functorch.eager_transforms import (
             _unwrap_all_tensors_from_functional,
         )
@@ -950,19 +1086,25 @@ class CppFunctionalizeAPI(BaseFunctionalizeAPI):
 
     # pyrefly: ignore [implicit-any]
     def functionalize(self, inner_f: Callable) -> Callable:
+        # [FUNCTION DOC] Returns inner_f wrapped by the public functionalize transform.
         return torch.func.functionalize(inner_f)
 
     def redispatch_to_next(self) -> AbstractContextManager[None]:
+        # [FUNCTION DOC] Returns a guard excluding the Functionalize dispatch key.
         return torch._C._ExcludeDispatchKeyGuard(
             torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
         )
 
 
 class FunctorchFunctionalizeAPI(BaseFunctionalizeAPI):
+    # [CLASS DOC] Functionalize API tied to a functorch FunctionalizeInterpreter (attribute
+    # interpreter) whose level and view policy drive wrapping, unwrapping and redispatch.
     def __init__(self, interpreter: FunctionalizeInterpreter) -> None:
+        # [FUNCTION DOC] Stores the functorch interpreter.
         self.interpreter = interpreter
 
     def wrap_tensors(self, args: tuple[Any]) -> tuple[Any]:
+        # [FUNCTION DOC] Wraps all tensors in args as functional tensors at the interpreter level.
         from torch._functorch.eager_transforms import _wrap_all_tensors_to_functional
 
         return _wrap_all_tensors_to_functional(args, level=self.interpreter.level())
@@ -970,6 +1112,7 @@ class FunctorchFunctionalizeAPI(BaseFunctionalizeAPI):
     def unwrap_tensors(
         self, args: torch.Tensor | tuple[torch.Tensor, ...]
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] Unwraps functional tensors in args, reapplying views per the interpreter.
         from torch._functorch.eager_transforms import (
             _unwrap_all_tensors_from_functional,
         )
@@ -980,6 +1123,8 @@ class FunctorchFunctionalizeAPI(BaseFunctionalizeAPI):
 
     # pyrefly: ignore [implicit-any]
     def functionalize(self, inner_f: Callable) -> Callable:
+        # [FUNCTION DOC] Returns inner_f functionalized, removing mutations (and views too when
+        # the interpreter adds back views).
         return torch.func.functionalize(
             inner_f,
             remove=(
@@ -990,10 +1135,13 @@ class FunctorchFunctionalizeAPI(BaseFunctionalizeAPI):
         )
 
     def redispatch_to_next(self) -> AbstractContextManager[None]:
+        # [FUNCTION DOC] Returns the interpreter's lower context manager.
         return self.interpreter.lower()
 
 
 def mb_unwrap_functional_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Maybe-unwrap: returns the plain tensor under a FunctionalTensor, or the
+    # input unchanged when it is not one.
     if isinstance(tensor, FunctionalTensor):
         return torch._from_functional_tensor(tensor.elem)
     return tensor

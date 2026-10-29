@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities for cross-checking FakeTensor execution against real tensors.
+# Provides aliasing-analysis helpers, a fake-to-real tensor converter, metadata comparison
+# helpers, and CrossRefFakeMode, a dispatch mode that runs each op on both real and fake
+# inputs and raises on any mismatch. Import-time side effect: binds the aten namespace.
 from __future__ import annotations
 
 import functools
@@ -29,6 +33,8 @@ aten = torch._ops.ops.aten
 
 
 def outputs_alias_inputs(outputs: PyTree, inputs: PyTree) -> bool:
+    # [FUNCTION DOC] Returns True if any tensor leaf in outputs shares underlying storage
+    # (by storage pointer) with any tensor leaf in inputs. Tensors without storage are ignored.
     input_storages = {
         inp._typed_storage()._cdata
         for inp in tree_flatten_only(torch.Tensor, inputs)
@@ -41,11 +47,15 @@ def outputs_alias_inputs(outputs: PyTree, inputs: PyTree) -> bool:
 
 
 def outputs_are_inputs(outputs: PyTree, inputs: PyTree) -> bool:
+    # [FUNCTION DOC] Returns True if any tensor leaf in outputs is the very same Python object
+    # (identity, not storage) as a tensor leaf in inputs.
     input_ids = {id(inp) for inp in tree_flatten_only(torch.Tensor, inputs)}
     return any(id(out) in input_ids for out in tree_flatten_only(torch.Tensor, outputs))
 
 
 def output_alias_each_other(outputs: PyTree) -> bool:
+    # [FUNCTION DOC] Returns True if two tensor leaves of outputs that have storage share the
+    # same underlying storage; storage-less tensors are skipped.
     storages = set()
     for out in tree_flatten_only(torch.Tensor, outputs):
         if not torch._C._has_storage(out):
@@ -64,6 +74,9 @@ def _check_alias_info(
     fake_out: PyTree,
     fake_in: PyTree,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Compares three aliasing properties (outputs alias inputs, outputs
+    # are inputs, outputs alias each other) between the real and fake runs of an op.
+    # Raises MetadataMismatchError, prefixed with context, on the first property that differs.
     r_aliasing = outputs_alias_inputs(real_out, real_in)
     f_aliasing = outputs_alias_inputs(fake_out, fake_in)
     if r_aliasing != f_aliasing:
@@ -88,6 +101,10 @@ def _check_alias_info(
 
 
 def is_sdpa_error(func: OpOverload, idx: int, e: Exception) -> bool:
+    # [FUNCTION DOC] Returns True if exception e for output index idx of func is a known,
+    # tolerated device mismatch on the extra outputs (e.g. philox seed/offset) of flash,
+    # efficient or cudnn scaled-dot-product-attention ops. Identified by op, output index
+    # and the word "Devices" in the exception text. Otherwise returns False.
     if (
         (
             func is aten._scaled_dot_product_flash_attention.default
@@ -118,6 +135,11 @@ def is_sdpa_error(func: OpOverload, idx: int, e: Exception) -> bool:
 def try_convert_fake_to_real(
     ten_list: list[FakeTensor | Any],
 ) -> list[FakeTensor | torch.Tensor | Any]:
+    # [FUNCTION DOC] Converts strided FakeTensors in ten_list to real tensors (clones of views
+    # onto the real storage recorded in the fake mode's meta converter), using concrete hints
+    # for symbolic sizes/strides/offset. Items that are not fake, not strided, have no known
+    # real storage, or have unhinted symbolic values are kept unchanged. Returns the input
+    # list itself if it holds no fake tensor or no fake mode is found; otherwise a new list.
     """
     Attempt to convert fake tensors to a corresponding real tensor with the correct underlying storage by looking up
     the FakeTensorMode meta to real storage mapping. On failure to find the storage mapping, the FakeTensor will
@@ -153,6 +175,8 @@ def try_convert_fake_to_real(
         contains_unhinted = False
 
         def map_symint(s: torch.SymInt | int) -> int:
+            # [FUNCTION DOC] HELPER: Returns s unchanged if plain int, else its hint; if no hint
+            # exists, sets the enclosing contains_unhinted flag and returns a dummy 0.
             nonlocal contains_unhinted
             if not isinstance(s, torch.SymInt):
                 return s
@@ -195,6 +219,12 @@ def _check_fake_real_tensors(
     storage_offset: bool = True,
     requires_grad: bool = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Checks that a real output and its fake counterpart agree on
+    # requires_grad (if requested), storage offset (when the real tensor has storage) and
+    # tensor meta (sizes, optionally strides, via compare_tensor_meta allowing unbacked rhs).
+    # Raises MetadataMismatchError on requires_grad or offset mismatch; compare_tensor_meta
+    # may raise its own error. KNOWN ISSUE: the storage_offset argument is never read; the
+    # offset check runs whenever the real tensor has storage.
     if requires_grad:
         if real_out.requires_grad != fake_out.requires_grad:
             raise MetadataMismatchError(
@@ -220,6 +250,11 @@ def _check_fake_real_tensors(
 
 
 class CrossRefFakeMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that executes every op on real tensors and, in parallel, on
+    # fake copies of the inputs (static shapes, fresh ShapeEnv), then verifies the fake result
+    # matches the real one in output count, aliasing, requires_grad, offsets and metadata.
+    # Attributes: ignore_op_fn (predicate to skip ops), check_strides, check_aliasing,
+    # only_check_ops_with_meta (restrict to ops with a meta implementation).
     def __init__(
         self,
         ignore_op_fn: Callable[[OpOverload], bool] | None = None,
@@ -228,6 +263,9 @@ class CrossRefFakeMode(TorchDispatchMode):
         check_aliasing: bool = True,
         only_check_ops_with_meta: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Stores the configuration: optional ignore predicate (defaults to never
+        # ignoring), and the keyword-only flags for stride checks, aliasing checks, and
+        # restricting checks to ops that have meta implementations.
         super().__init__()
         self.ignore_op_fn = (
             ignore_op_fn if ignore_op_fn is not None else lambda fn: False
@@ -243,6 +281,13 @@ class CrossRefFakeMode(TorchDispatchMode):
         args: Sequence[object] = (),
         kwargs: Mapping[str, object] | None = None,
     ) -> object:
+        # [FUNCTION DOC] Runs func on the real args and returns that real result. Unless func is
+        # excluded (lift_fresh, set_ with storage, ignored, no meta when required, or tagged
+        # dynamic-output-shape / inplace-view / data-dependent-output), it first runs func on
+        # fake copies inside a fresh FakeTensorMode; unsupported-fake errors skip the check.
+        # Then compares: leaf counts and tensor-ness (AssertionError on mismatch), aliasing
+        # (if enabled) and per-tensor metadata (MetadataMismatchError, chained), tolerating
+        # known SDPA device errors.
         kwargs = kwargs or {}
 
         fake_r = None
