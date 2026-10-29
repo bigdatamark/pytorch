@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Top-level torch logging package. Importing it runs the registrations module (which declares
+# log names and artifacts) and re-exports the public logging helpers from the internal module:
+# _init_logs, DEFAULT_LOGGING, dtrace_structured, get_structured_logging_overhead,
+# getArtifactLogger, hide_warnings, LazyString, set_logs, trace_structured, warning_once.
 # Top level logging module for torch logging
 # Design doc: https://docs.google.com/document/d/1ZRfTWKa8eaPq1AxaiHrq4ASTPouzzlPiuquSBEJYwS8/edit#
 # Simple setup for onboarding (see above doc for more detail):

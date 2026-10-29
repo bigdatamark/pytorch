@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Internal linear algebra helpers (sparse check, dtype choice, matmul/bilinear/quadratic forms,
+# orthonormal basis, symmetric eigendecomposition) used by lobpcg and similar code, plus stubs
+# for removed legacy functions (cholesky, matrix_rank, solve, lstsq, symeig, eig, qr) that only
+# raise errors pointing to torch.linalg replacements. No import-time side effects.
 """Various linear algebra utility methods for internal use."""
 
 import torch
@@ -5,6 +10,8 @@ from torch import Tensor
 
 
 def is_sparse(A: Tensor) -> bool:
+    # [FUNCTION DOC] Returns True only for sparse COO layout tensors; other layouts give False.
+    # Raises TypeError if A is not a Tensor.
     """Check if tensor A is a sparse COO tensor.
 
     All other sparse storage formats (CSR, CSC, etc...) will return False.
@@ -19,6 +26,8 @@ def is_sparse(A: Tensor) -> bool:
 
 
 def get_floating_dtype(A: Tensor) -> torch.dtype:
+    # [FUNCTION DOC] Returns A's dtype if float16/float32/float64, otherwise float32 (e.g. integers,
+    # bfloat16, complex).
     """Return the floating point dtype of tensor A.
 
     Integer types map to float32.
@@ -30,6 +39,8 @@ def get_floating_dtype(A: Tensor) -> torch.dtype:
 
 
 def matmul(A: Tensor | None, B: Tensor) -> Tensor:
+    # [FUNCTION DOC] Returns B if A is None, else the product of A and B using sparse matmul when A
+    # is sparse COO, dense matmul otherwise.
     """Multiply two matrices.
 
     If A is None, return B. A can be sparse or dense. B is always
@@ -43,21 +54,27 @@ def matmul(A: Tensor | None, B: Tensor) -> Tensor:
 
 
 def bform(X: Tensor, A: Tensor | None, Y: Tensor) -> Tensor:
+    # [FUNCTION DOC] Returns the bilinear form X^T A Y (A may be None for identity), using matrix transpose of X.
     """Return bilinear form of matrices: :math:`X^T A Y`."""
     return matmul(X.mT, matmul(A, Y))
 
 
 def qform(A: Tensor | None, S: Tensor) -> Tensor:
+    # [FUNCTION DOC] Returns the quadratic form S^T A S (A may be None for identity).
     """Return quadratic form :math:`S^T A S`."""
     return bform(S, A, S)
 
 
 def basis(A: Tensor) -> Tensor:
+    # [FUNCTION DOC] Returns the Q factor of the QR decomposition of A, an orthonormal basis of its columns.
     """Return orthogonal basis of A columns."""
     return torch.linalg.qr(A).Q
 
 
 def symeig(A: Tensor, largest: bool | None = False) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Eigendecomposition of symmetric A via eigh using the upper triangle.
+    # Returns (eigenvalues, eigenvectors) ascending, or flipped to descending if largest is true
+    # (None is treated as false).
     """Return eigenpairs of A with specified ordering."""
     if largest is None:
         largest = False
@@ -72,6 +89,8 @@ def symeig(A: Tensor, largest: bool | None = False) -> tuple[Tensor, Tensor]:
 # These functions were deprecated and removed
 # This nice error message can be removed in version 1.13+
 def cholesky(input: Tensor, upper: bool = False, *, out=None) -> Tensor:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError with migration advice to
+    # torch.linalg.cholesky.
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "
         "`torch.cholesky` is deprecated in favor of `torch.linalg.cholesky`.\n"
@@ -83,6 +102,7 @@ def cholesky(input: Tensor, upper: bool = False, *, out=None) -> Tensor:
 
 
 def matrix_rank(input, tol=None, symmetric=False, *, out=None) -> Tensor:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError advising torch.linalg.matrix_rank.
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed.\n"
         "Please use the `torch.linalg.matrix_rank` function instead. "
@@ -91,6 +111,7 @@ def matrix_rank(input, tol=None, symmetric=False, *, out=None) -> Tensor:
 
 
 def solve(input: Tensor, A: Tensor, *, out=None) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError advising torch.linalg.solve (argument order reversed).
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "
         "`torch.solve` is deprecated in favor of `torch.linalg.solve`. "
@@ -103,6 +124,7 @@ def solve(input: Tensor, A: Tensor, *, out=None) -> tuple[Tensor, Tensor]:
 
 
 def lstsq(input: Tensor, A: Tensor, *, out=None) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError advising torch.linalg.lstsq.
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "
         "`torch.lstsq` is deprecated in favor of `torch.linalg.lstsq`.\n"
@@ -126,6 +148,7 @@ def _symeig(
     *,
     out=None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] HELPER: Removed legacy symeig; always raises RuntimeError advising eigh/eigvalsh.
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "
         "The default behavior has changed from using the upper triangular portion of the matrix by default "
@@ -147,6 +170,7 @@ def eig(
     e=None,
     v=None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError advising torch.linalg.eig/eigvals.
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "
         "`torch.linalg.eig` returns complex tensors of dtype `cfloat` or `cdouble` rather than real tensors "
@@ -167,6 +191,8 @@ def qr(
     *,
     out=None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Removed legacy API; always raises RuntimeError advising torch.linalg.qr, with
+    # the mode ('reduced' or 'complete') matching the given some flag.
     reduced = "reduced" if some else "complete"
     raise RuntimeError(
         "This function was deprecated since version 1.9 and is now removed. "

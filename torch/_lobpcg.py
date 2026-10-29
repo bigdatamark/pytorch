@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Locally Optimal Block Preconditioned Conjugate Gradient (LOBPCG) eigensolver. Public export is
+# lobpcg, which finds k largest or smallest eigenpairs of a symmetric (generalized) problem for
+# dense, sparse or batched inputs; it dispatches to an autograd function (backward via symeig
+# formulas) when gradients are needed. Also contains polynomial helpers for the backward pass, the
+# internal driver _lobpcg, and the LOBPCG solver class with basic and ortho variants.
+# No import-time side effects beyond definitions.
 """Locally Optimal Block Preconditioned Conjugate Gradient methods."""
 # Author: Pearu Peterson
 # Created: February 2020
@@ -12,6 +19,9 @@ __all__ = ["lobpcg"]
 
 
 def _symeig_backward_complete_eigenspace(D_grad, U_grad, A, D, U):
+    # [FUNCTION DOC] HELPER: Backward of symmetric eigendecomposition when U holds a full eigenspace.
+    # Builds the matrix of inverse eigenvalue differences (zero diagonal) and returns the gradient of
+    # A as U times (diag of D_grad plus the projected U_grad scaled by that matrix) times U transposed.
     # compute F, such that F_ij = (d_j - d_i)^{-1} for i != j, F_ii = 0
     F = D.unsqueeze(-2) - D.unsqueeze(-1)
     F.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
@@ -27,6 +37,10 @@ def _symeig_backward_complete_eigenspace(D_grad, U_grad, A, D, U):
 
 
 def _polynomial_coefficients_given_roots(roots):
+    # [FUNCTION DOC] HELPER: Given roots of a polynomial (batched along leading dims), returns the
+    # coefficients a_0..a_n of the monic polynomial, using Horner-style steps. When roots require grad
+    # each step works on a copy so the autograd graph has one node per step. Returns a tensor with last
+    # dim n+1.
     """
     Given the `roots` of a polynomial, find the polynomial's coefficients.
 
@@ -69,6 +83,10 @@ def _polynomial_coefficients_given_roots(roots):
 
 
 def _polynomial_value(poly, x, zero_power, transition):
+    # [FUNCTION DOC] HELPER: Generic Horner evaluation of a polynomial with coefficients poly at x.
+    # Starts from a clone of zero_power and repeatedly applies the transition callable (current value,
+    # x, coefficient) from the highest coefficient (excluding the trailing one) down to the constant.
+    # Returns the result.
     """
     A generic method for computing poly(x) using the Horner's rule.
 
@@ -100,6 +118,7 @@ def _polynomial_value(poly, x, zero_power, transition):
 
 
 def _matrix_polynomial_value(poly, x, zero_power=None):
+    # [FUNCTION DOC] HELPER: Evaluates the polynomial at a (batched) square matrix x, defaulting zero_power to the identity matrix.
     """
     Evaluates `poly(x)` for the (batched) matrix input `x`.
     Check out `_polynomial_value` function for more details.
@@ -107,6 +126,7 @@ def _matrix_polynomial_value(poly, x, zero_power=None):
 
     # matrix-aware Horner's rule iteration
     def transition(curr_poly_val, x, poly_coeff):
+        # [FUNCTION DOC] HELPER: One matrix Horner step: multiplies x by the current value and adds the coefficient to the diagonal.
         res = x.matmul(curr_poly_val)
         res.diagonal(dim1=-2, dim2=-1).add_(poly_coeff.unsqueeze(-1))
         return res
@@ -120,6 +140,7 @@ def _matrix_polynomial_value(poly, x, zero_power=None):
 
 
 def _vector_polynomial_value(poly, x, zero_power=None):
+    # [FUNCTION DOC] HELPER: Evaluates the polynomial at (batched) vector x elementwise, defaulting zero_power to ones.
     """
     Evaluates `poly(x)` for the (batched) vector input `x`.
     Check out `_polynomial_value` function for more details.
@@ -127,6 +148,7 @@ def _vector_polynomial_value(poly, x, zero_power=None):
 
     # vector-aware Horner's rule iteration
     def transition(curr_poly_val, x, poly_coeff):
+        # [FUNCTION DOC] HELPER: One vector Horner step: coefficient plus x times the current value (elementwise).
         res = torch.addcmul(poly_coeff.unsqueeze(-1), x, curr_poly_val)
         return res
 
@@ -137,6 +159,14 @@ def _vector_polynomial_value(poly, x, zero_power=None):
 
 
 def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U, largest):
+    # [FUNCTION DOC] HELPER: Backward of symmetric eigendecomposition when U holds only k < m
+    # eigenvectors. Builds a basis of the orthogonal complement of span(U) from a projected random
+    # matrix (using a freshly created generator on A's device), computes the characteristic polynomial
+    # of D, solves the Sylvester-type system via Cholesky of the polynomial evaluated at A restricted
+    # to the complement, and adds that term to the complete-eigenspace gradient. Returns the gradient of A.
+    # Assumes distinct eigenvalues; the Cholesky sign depends on largest and the parity of the final
+    # series index.
+    # KNOWN ISSUE: the sign choice reads the leftover loop variable k, which relies on the series loop having run.
     # compute a projection operator onto an orthogonal subspace spanned by the
     # columns of U defined as (I - UU^T)
     Ut = U.mT.contiguous()
@@ -244,6 +274,8 @@ def _symeig_backward_partial_eigenspace(D_grad, U_grad, A, D, U, largest):
 
 
 def _symeig_backward(D_grad, U_grad, A, D, U, largest):
+    # [FUNCTION DOC] HELPER: Chooses the eigendecomposition backward: complete-eigenspace formula when U is square,
+    # else the partial-eigenspace formula. Returns the gradient of A.
     # if `U` is square, then the columns of `U` is a complete eigenspace
     if U.size(-1) == U.size(-2):
         return _symeig_backward_complete_eigenspace(D_grad, U_grad, A, D, U)
@@ -252,6 +284,10 @@ def _symeig_backward(D_grad, U_grad, A, D, U, largest):
 
 
 class LOBPCGAutogradFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function wrapping the LOBPCG forward solve so gradients with respect to A can be
+    # computed through the symmetric-eigendecomposition backward formulas. Saves A, B, D, U and the
+    # largest flag on the context. Backward is unsupported for sparse, complex, or generalized (B given) problems.
     @staticmethod
     def forward(  # type: ignore[override]
         ctx,
@@ -270,6 +306,8 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
         ortho_fparams: dict[str, float] | None = None,
         ortho_bparams: dict[str, bool] | None = None,
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Makes dense inputs contiguous, runs the internal LOBPCG driver with all
+        # parameters, saves A, B, eigenvalues D and eigenvectors U (and largest) for backward, and returns (D, U).
         # makes sure that input is contiguous for efficiency.
         # Note: autograd does not support dense gradients for sparse input yet.
         A = A.contiguous() if (not A.is_sparse) else A
@@ -300,6 +338,11 @@ class LOBPCGAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, D_grad, U_grad):  # pyrefly: ignore  # bad-override
+        # [FUNCTION DOC] Computes gradients for the 14 forward inputs; only A (index 0) can receive one.
+        # Raises ValueError for sparse A, sparse B needing grad, complex dtypes, or any B (generalized
+        # problem). A missing largest flag is treated as true. Returns a tuple of 14 gradients (None except A).
+        # KNOWN ISSUE: the B-related branches are effectively dead because any non-None B raises, and
+        # gradient for B is always None.
         A_grad = B_grad = None
         grads = [None] * 14
 
@@ -356,6 +399,11 @@ def lobpcg(
     ortho_fparams: dict[str, float] | None = None,
     ortho_bparams: dict[str, bool] | None = None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Public entry point: finds k largest/smallest eigenpairs of symmetric A (optionally
+    # generalized with B, initial X, preconditioner iK). Outside scripting, defers to tensor-like
+    # overrides via the torch function protocol. When A or B requires grad it symmetrizes them and uses
+    # the autograd function; in scripting mode requiring grad raises RuntimeError. Otherwise calls the
+    # internal driver. Returns (eigenvalues of shape (*, k), eigenvectors of shape (*, m, k)).
     """Find the k largest (or smallest) eigenvalues and the corresponding
     eigenvectors of a symmetric positive definite generalized
     eigenvalue problem using matrix-free LOBPCG methods.
@@ -596,6 +644,15 @@ def _lobpcg(
     ortho_fparams: dict[str, float] | None = None,
     ortho_bparams: dict[str, bool] | None = None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] HELPER: Internal driver for lobpcg. Validates that A is square (and B has the same
+    # shape), picks the dtype and default tolerance (square root of machine epsilon), resolves k and
+    # n (from X or defaults), raises ValueError if the row count is under three times n, and builds
+    # the integer/float/bool parameter dictionaries (defaults: ortho method, 1000 iterations, largest
+    # true, plus ortho-specific defaults merged with user overrides). For batched input, loops over
+    # the flattened batch, using random starting vectors when X is missing, and stacks results.
+    # Side effect: temporarily installs the tracker caller on the LOBPCG class outside scripting.
+    # Returns (eigenvalues, eigenvectors) truncated to k.
+    # KNOWN ISSUE: the original tracker caller is not restored if an exception occurs mid-run.
     # A must be square:
     if A.shape[-2] != A.shape[-1]:
         raise AssertionError(f"A must be square, got shape {A.shape}")
@@ -698,6 +755,13 @@ def _lobpcg(
 
 
 class LOBPCG:
+    # [CLASS DOC]
+    # Worker holding the state of one LOBPCG iteration on a single (non-batched) problem. Constant
+    # parameters: A, B, iK, iparams, fparams, bparams, method, tracker. Iteration state: X (eigenvector
+    # approximation), E (eigenvalues), R (residual), S (search basis of width 3n), and dictionaries
+    # ivars/fvars/bvars/tvars of integer, float, boolean and tensor iteration variables. Methods:
+    # update (one iteration), run (iterate until converged, out of iterations, or force-stopped),
+    # plus basic and ortho update variants and orthogonalization helpers.
     """Worker class of LOBPCG methods."""
 
     def __init__(
@@ -713,6 +777,7 @@ class LOBPCG:
         tracker: None,
     ) -> None:
         # constant parameters
+        # [FUNCTION DOC] Stores the constant parameters and allocates the iteration state: zero E, R and S, empty variable dictionaries, step counter zero.
         self.A = A
         self.B = B
         self.iK = iK
@@ -735,6 +800,7 @@ class LOBPCG:
         self.bvars: dict[str, bool] = {"_": False}
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a multi-line text dump of parameters, iteration variables and tensors for debugging.
         lines = ["LOBPCG:"]
         lines += [f"  iparams={self.iparams}"]
         lines += [f"  fparams={self.fparams}"]
@@ -754,6 +820,9 @@ class LOBPCG:
         return r
 
     def update(self):
+        # [FUNCTION DOC] Performs one iteration: on the first step computes norms of X, A X, B X and
+        # initializes iteration counters; then runs the ortho or basic update, decrements the remaining
+        # iterations and increments the step counter.
         """Set and update iteration variables."""
         if self.ivars["istep"] == 0:
             X_norm = float(torch.linalg.vector_norm(self.X))
@@ -780,11 +849,16 @@ class LOBPCG:
         self.ivars["istep"] = self.ivars["istep"] + 1
 
     def update_residual(self):
+        # [FUNCTION DOC] Recomputes the residual R as A X minus B X scaled column-wise by E (B may be None meaning identity).
         """Update residual R from A, B, X, E."""
         mm = _utils.matmul
         self.R = mm(self.A, self.X) - mm(self.B, self.X) * self.E
 
     def update_converged_count(self):
+        # [FUNCTION DOC] Computes the relative residual error per eigenpair, counts leading converged
+        # pairs (below tolerance; stops at the first unconverged to keep ordering), stores the count and error
+        # tensor in the iteration variables and returns the count. Raises AssertionError if the count
+        # decreased. Intended to be overridable for custom criteria.
         """Determine the number of converged eigenpairs using backward stable
         convergence criterion, see discussion in Sec 4.3 of [DuerschEtal2018].
 
@@ -817,6 +891,7 @@ class LOBPCG:
         return count
 
     def stop_iteration(self):
+        # [FUNCTION DOC] Returns True when a tracker forced a stop, iterations are exhausted, or at least k pairs converged.
         """Return True to stop iterations.
 
         Note that tracker (if defined) can force-stop iterations by
@@ -829,6 +904,8 @@ class LOBPCG:
         )
 
     def run(self):
+        # [FUNCTION DOC] Runs the iteration: one update, then repeated updates until stop_iteration is true,
+        # calling the tracker after each update when one is set and not scripting.
         """Run LOBPCG iterations.
 
         Use this method as a template for implementing LOBPCG
@@ -848,6 +925,7 @@ class LOBPCG:
 
     @torch.jit.unused
     def call_tracker(self):
+        # [FUNCTION DOC] Hook for tracing iteration in Python mode; does nothing here and is replaced at run time by a function that calls the tracker with the worker.
         """Interface for tracking iteration process in Python mode.
 
         Tracking the iteration process is disabled in TorchScript
@@ -859,6 +937,10 @@ class LOBPCG:
     # Internal methods
 
     def _update_basic(self):
+        # [FUNCTION DOC] HELPER: Iteration update for the basic method. First step: Rayleigh-Ritz on X,
+        # updates X, E, residual, convergence count and fills S with X and the preconditioned residual.
+        # Later steps: Rayleigh-Ritz on the unconverged part of S, updates X and E, forms the new
+        # direction P, refreshes the residual and rebuilds S as X, P, preconditioned residual.
         """
         Update or initialize iteration variables when `method == "basic"`.
         """
@@ -902,6 +984,9 @@ class LOBPCG:
             self.S[:, n + np : ns] = W
 
     def _update_ortho(self):
+        # [FUNCTION DOC] HELPER: Iteration update for the ortho method. Like the basic update but uses a
+        # plain Rayleigh-Ritz on the search basis, builds P from an orthonormal basis of a block of Z,
+        # and orthogonalizes the residual against the current basis via _get_ortho before filling S.
         """
         Update or initialize iteration variables when `method == "ortho"`.
         """
@@ -947,6 +1032,9 @@ class LOBPCG:
             self.S[:, n + np : ns] = W
 
     def _get_rayleigh_ritz_transform(self, S):
+        # [FUNCTION DOC] HELPER: Returns the upper-triangular matrix Ri that reduces the generalized
+        # Rayleigh-Ritz problem for basis S to a standard one, from the Cholesky factor of the diagonally
+        # scaled S^T B S, using element-wise scaling instead of diagonal matrix products.
         """Return a transformation matrix that is used in Rayleigh-Ritz
         procedure for reducing a general eigenvalue problem :math:`(S^TAS)
         C = (S^TBS) C E` to a standard eigenvalue problem :math: `(Ri^T
@@ -1002,6 +1090,10 @@ class LOBPCG:
         )
 
     def _get_svqb(self, U: Tensor, drop: bool, tau: float) -> Tensor:
+        # [FUNCTION DOC] HELPER: Returns B-orthonormal columns spanning U (SVQB). Empty U is returned as is;
+        # exact zero-B-norm columns are dropped first. Eigendecomposes the scaled Gram matrix; with drop
+        # true discards directions with eigenvalue below tau times the largest, otherwise clamps small
+        # eigenvalues up to that threshold. Result has n or fewer columns.
         """Return B-orthonormal U.
 
         .. note:: When `drop` is `False` then `svqb` is based on the
@@ -1071,6 +1163,12 @@ class LOBPCG:
         )
 
     def _get_ortho(self, U, V):
+        # [FUNCTION DOC] HELPER: Returns B-orthonormal columns from U that are B-orthogonal to V, by
+        # alternating projection against V and SVQB, up to the configured outer and inner iteration limits,
+        # stopping on relative-error thresholds. Records error and iteration counts in the float/int
+        # iteration variables (clearing the previous call's entries). Returns an empty tensor if all
+        # columns of U are collinear with V. Raises ValueError if the dimensions are overdetermined.
+        # KNOWN ISSUE: the overdetermined error message labels the row count as B columns.
         """Return B-orthonormal U with columns are B-orthogonal to V.
 
         .. note:: When `bparams["ortho_use_drop"] == False` then
@@ -1175,4 +1273,5 @@ LOBPCG_call_tracker_orig = LOBPCG.call_tracker
 
 
 def LOBPCG_call_tracker(self):
+    # [FUNCTION DOC] Module-level function installed as the call_tracker method outside scripting; invokes the stored tracker callable with the worker.
     self.tracker(self)

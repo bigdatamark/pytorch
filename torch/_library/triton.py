@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Support for triton-backed custom operators: the triton_op decorator, wrap_triton/capture_triton
+# for making triton kernel launches traceable, a thread-local switch controlling whether wrapping
+# dispatches through the higher-order op, and static analysis that finds the triton kernels used
+# by an op implementation. Holds a module-level mapping from op name to kernel list that triton_op
+# fills. Import-time side effects: creates a logger, the mapping and a thread-local object.
 import ast
 import contextlib
 import inspect
@@ -18,10 +24,17 @@ triton_ops_to_kernels: dict[str, list[object]] = {}
 
 
 def get_triton_kernels_for_op(name: str) -> list[object]:
+    # [FUNCTION DOC] Returns the list of triton kernels recorded for the op name, or an empty list if none.
     return triton_ops_to_kernels.get(name, [])
 
 
 def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
+    # [FUNCTION DOC] Best-effort static discovery of triton kernels used by fn. Parses fn's source,
+    # finds kernels passed to wrap_triton/capture_triton (following local variable assignments and
+    # returned expressions), and recurses into called helper functions and torch.ops custom ops
+    # (via their registered abstract functions) up to a fixed depth. Returns a de-duplicated list of
+    # kernel objects (JIT functions or autotuners); returns an empty list if triton is missing or
+    # source is unavailable. Logs but swallows analysis failures.
     """
     Inspect the source of an arbitrary callable passed to torch._library.triton_op,
     and grab all of the triton kernels that are wrapped inside of it.
@@ -46,6 +59,10 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
         visited_fns: set[int] | None = None,
         depth: int = 0,
     ) -> list[object]:
+        # [FUNCTION DOC] HELPER: Recursive worker. Unwraps decorators on fn, skips already visited
+        # functions or depth beyond the limit, parses its source, collects wrap calls, assignments, returns
+        # and called function names, resolves them against fn's globals and closure to kernels, then
+        # analyzes called functions recursively. Returns the kernel list; empty if triton is not importable.
         try:
             from triton.runtime.autotuner import Autotuner
             from triton.runtime.jit import JITFunction
@@ -85,7 +102,12 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
 
         # Visitor to collect function calls, assignments, and triton kernels
         class Visitor(ast.NodeVisitor):
+            # [CLASS DOC]
+            # HELPER: AST visitor recording wrapped-kernel names, local assignments (name to right-hand
+            # expressions), called function names (plain names and torch.ops calls as namespace::op) and
+            # return expressions.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes empty collections for kernels, assignments, calls and returns.
                 self.triton_kernels: list[Any] = []
                 # track local variable assignments: var_name -> list of RHS expressions
                 self.assignments: dict[str, list[ast.expr]] = {}
@@ -95,17 +117,22 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
                 self.return_exprs: list[ast.expr] = []
 
             def visit_Assign(self, node: ast.Assign) -> None:
+                # [FUNCTION DOC] HELPER: Records right-hand expressions for each simple-name target, then visits children.
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         self.assignments.setdefault(target.id, []).append(node.value)
                 self.generic_visit(node)
 
             def visit_Return(self, node: ast.Return) -> None:
+                # [FUNCTION DOC] HELPER: Records the returned expression if present, then visits children.
                 if node.value is not None:
                     self.return_exprs.append(node.value)
                 self.generic_visit(node)
 
             def visit_Call(self, node: ast.Call) -> None:
+                # [FUNCTION DOC] HELPER: Detects calls to capture_triton/wrap_triton (attribute form on the
+                # library module or bare imported name) and records the first argument's name; records calls to
+                # torch.ops functions and other plain-name calls as called functions; then visits children.
                 triton_func_names = ("capture_triton", "wrap_triton")
                 if isinstance(node.func, ast.Attribute):
                     attr = node.func
@@ -143,14 +170,18 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
         collector.visit(tree)
 
         def extract_names_from_expr(expr: ast.expr) -> list[str]:
+            # [FUNCTION DOC] HELPER: Returns all variable names referenced anywhere in the expression, in visit order.
             """Extract all Name references from an AST expression."""
             names: list[str] = []
 
             class NameExtractor(ast.NodeVisitor):
+                # [CLASS DOC] HELPER: AST visitor that appends every Name identifier to the enclosing names list.
                 def visit_Name(self, node: ast.Name) -> None:
+                    # [FUNCTION DOC] HELPER: Appends the identifier to the shared names list.
                     names.append(node.id)
 
                 def visit_Call(self, node: ast.Call) -> None:
+                    # [FUNCTION DOC] HELPER: Visits the call's children so the function and argument names are collected.
                     # for function calls, visit the function and all args
                     self.generic_visit(node)
 
@@ -158,6 +189,8 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
             return names
 
         def resolve_to_kernel(obj: object) -> object | None:
+            # [FUNCTION DOC] HELPER: Returns obj if it is a triton JIT function or autotuner, the inner JIT
+            # function if obj is a wrapper whose fn attribute is one, else None.
             """Check if obj is a triton kernel or wrapper and return the kernel."""
             if isinstance(obj, (JITFunction, Autotuner)):
                 return obj
@@ -169,6 +202,9 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
             return None
 
         def build_namespace(func_obj: object) -> dict[str, Any]:
+            # [FUNCTION DOC] HELPER: Builds one mapping of names visible to func_obj (builtins, globals,
+            # closure nonlocals, function globals) after unwrapping decorators. Returns an empty mapping if it
+            # is not a Python function.
             """Build a combined namespace from a function's globals and closures."""
             # unwrap decorated fns (e.g., @lru_cache)
             if callable(func_obj):
@@ -195,6 +231,9 @@ def get_inner_triton_kernels(fn: Callable[..., Any]) -> list[object]:
             assignments: dict[str, list[ast.expr]] | None = None,
             visited: set[str] | None = None,
         ) -> list[object]:
+            # [FUNCTION DOC] HELPER: Resolves names to triton kernels using the namespace. Direct kernels are
+            # collected; other callables are analyzed recursively; names found only in local assignments are
+            # traced through the referenced names. A visited set prevents cycles. Returns the kernels found.
             """
             Resolve a list of names to triton kernels using the given namespace.
             """
@@ -302,6 +341,12 @@ def triton_op(
     mutates_args: str | Iterable[str],
     schema: str | None = None,
 ) -> Callable:
+    # [FUNCTION DOC] Creates a custom operator backed by triton kernels, usable as a decorator
+    # (fn omitted) or directly (fn given). The op is built with custom_op using the inferred or given
+    # schema, fn registered as its fake kernel, the real kernel run with HOP wrapping disabled, and a
+    # FunctionalTensorMode dispatch rule that runs fn under the mode (decomposing the op) unless export
+    # disables decomposition or unrecognized tensor subclasses appear. Records the kernels found in fn
+    # in the module mapping under name. Returns the CustomOpDef.
     """Create a custom operator whose implementation is backed by 1+ triton kernels.
 
     This is a more structured way of using triton kernels with PyTorch.
@@ -392,7 +437,10 @@ def triton_op(
     """
 
     def dec(fn: Callable[..., object]) -> CustomOpDef:
+        # [FUNCTION DOC] HELPER: Decorator body: builds and returns the custom op for fn, registering the
+        # fake kernel and functional-mode decomposition, and recording the inner triton kernels.
         def backend_fn(*args, **kwargs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Runs fn on regular tensors with wrap_triton dispatch temporarily disabled.
             # Optimization: we're passing regular Tensors into the triton kernel, so
             # no need to go through HOP dispatch
             with set_wrap_triton_enabled(False):
@@ -422,6 +470,10 @@ def triton_op(
         def functional_decomp(  # type: ignore[no-untyped-def]
             mode, op, types, args, kwargs
         ):
+            # [FUNCTION DOC] HELPER: Dispatch rule for FunctionalTensorMode. During export with triton-op
+            # decomposition disabled, passes the op through the mode's dispatch unchanged. Otherwise returns
+            # NotImplemented if any argument type is not a fake tensor, plain tensor or functional tensor;
+            # else runs fn under the mode so the op decomposes into its kernel calls.
             # NOTE [Export custom triton op]
             # For torch.export (strict and non-strict), we don't do functional decomposition.
             # Instead, we preserve the custom triton ops as custom ops. This is because we want
@@ -480,6 +532,10 @@ wrap_triton_enabled_default = True
 
 @contextlib.contextmanager
 def set_wrap_triton_enabled(enabled: bool) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that sets the thread-local flag deciding whether wrapped triton
+    # kernels dispatch via the higher-order op, restoring the previous value on exit.
+    # KNOWN ISSUE: the previous value is read inside the try block, so if that read failed the finally
+    # clause would reference an unbound name (practically not reachable).
     """If triton kernels annotated with @wrap_triton should dispatch via HOP
     or go straight to the triton kernel execution.
 
@@ -496,10 +552,13 @@ def set_wrap_triton_enabled(enabled: bool) -> Generator[None, None, None]:
 
 
 def is_wrap_triton_enabled() -> bool:
+    # [FUNCTION DOC] Returns the thread-local wrap-triton flag, defaulting to True when unset in this thread.
     return getattr(wrap_triton_enabled, "value", wrap_triton_enabled_default)
 
 
 def _is_interpreted_triton_kernel(triton_kernel: Callable) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the kernel is a triton interpreter function (interpret
+    # mode); False otherwise or if triton is not importable.
     try:
         from triton.runtime.interpreter import InterpretedFunction
     except ImportError:
@@ -509,6 +568,8 @@ def _is_interpreted_triton_kernel(triton_kernel: Callable) -> bool:
 
 
 def _has_interpreted_triton_autotuner(triton_kernel: Callable) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the kernel is an autotuner or heuristics wrapper chain
+    # ending in an interpreted function; False on cycles, other kernels, or missing triton.
     try:
         from triton.runtime.autotuner import Autotuner, Heuristics
         from triton.runtime.interpreter import InterpretedFunction
@@ -527,12 +588,17 @@ def _has_interpreted_triton_autotuner(triton_kernel: Callable) -> bool:
 
 
 def capture_triton(triton_kernel: Callable, /) -> Any:
+    # [FUNCTION DOC] Old name of wrap_triton; forwards to it.
     """This API has been renamed to wrap_triton"""
     return wrap_triton(triton_kernel)
 
 
 @exposed_in("torch.library")
 def wrap_triton(triton_kernel: Callable, /) -> Any:
+    # [FUNCTION DOC] Wraps a triton kernel so make_fx or non-strict export can capture it. JIT
+    # functions and autotuners become a traceable wrapper (or are returned unchanged when wrapping is
+    # disabled; autotuners over interpreted functions are also returned unchanged). Interpreted
+    # kernels are returned unchanged. Raises RuntimeError for anything else.
     """Allows capture of a triton kernel into a graph via make_fx or
     non-strict ``torch.export``.
 

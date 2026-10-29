@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Shared utilities for torch.library: a Kernel record and RegistrationHandle, caller source
+# lookup, qualified-name parsing and operator lookup, schema classification helpers (functional,
+# out, inplace, tensor-like types), argument/default handling, trivial fake-impl generation,
+# higher-order-op schema construction from FX nodes, dispatch-mode handling, and
+# library-wide checks on operator inputs/outputs. No import-time side effects.
 import dataclasses
 import inspect
 import sys
@@ -14,26 +20,37 @@ from torch._ops import OpOverload
 
 @dataclasses.dataclass
 class Kernel:
+    # [CLASS DOC]
+    # Dataclass pairing a callable (func) with a source location string; calling the instance
+    # forwards to func.
     """Models a (function, source location)"""
 
     func: Callable
     source: str
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Calls the wrapped function with the given arguments and returns its result.
         return self.func(*args, **kwargs)
 
 
 class RegistrationHandle:
+    # [CLASS DOC]
+    # Handle returned by registrations; destroy runs the stored on_destroy callback to undo the
+    # registration.
     """Does something when someone calls .destroy() on it"""
 
     def __init__(self, on_destroy: Callable):
+        # [FUNCTION DOC] Stores the callback to run on destroy.
         self._on_destroy = on_destroy
 
     def destroy(self) -> None:
+        # [FUNCTION DOC] Invokes the stored callback (no guard against repeated calls).
         self._on_destroy()
 
 
 def get_source(stacklevel: int) -> str:
+    # [FUNCTION DOC] Returns "filename:lineno" for the frame stacklevel levels up from this function
+    # (1 is the caller of get_source). Inspects the Python call stack; no mutation.
     """Get a string that represents the caller.
 
     Example: "/path/to/foo.py:42"
@@ -48,6 +65,8 @@ def get_source(stacklevel: int) -> str:
 
 
 def parse_namespace(qualname: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits "namespace::name" into a (namespace, name) pair. Raises ValueError if
+    # the string does not split into exactly two parts on the double colon.
     splits = qualname.split("::")
     if len(splits) != 2:
         raise ValueError(
@@ -60,6 +79,9 @@ def parse_namespace(qualname: str) -> tuple[str, str]:
 
 
 def lookup_op(qualname: str) -> OpOverload:
+    # [FUNCTION DOC] Resolves a qualified name (optionally with ".overload" suffix, default overload
+    # otherwise) to the OpOverload under torch.ops. Raises ValueError for a malformed name and
+    # AttributeError (from attribute lookup) if the op or overload does not exist.
     namespace, name = parse_namespace(qualname)
     if "." in name:
         name, overload = name.split(".")
@@ -71,24 +93,31 @@ def lookup_op(qualname: str) -> OpOverload:
 
 
 def is_builtin(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Returns True if the OpOverload is in the aten, prim or prims namespace. Raises AssertionError if op is not an OpOverload.
     if not isinstance(op, OpOverload):
         raise AssertionError(f"op must be OpOverload, got {type(op)}")
     return op.namespace in {"aten", "prim", "prims"}
 
 
 def is_out(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Returns True if the op carries the out tag.
     """Returns True if the operator has "out" semantics: its mutable arguments
     are write-only output buffers that are not read from."""
     return torch.Tag.out in op.tags
 
 
 def is_inplace(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Returns True if the op carries the inplace tag.
     """Returns True if the operator has inplace semantics: it mutates its first
     positional argument and returns it."""
     return torch.Tag.inplace in op.tags
 
 
 def is_functional_schema(schema: Any, *, allow_valid_view: bool = False) -> bool:
+    # [FUNCTION DOC] Returns True if the schema (runtime schema, torchgen schema, or a string that is
+    # parsed) is functional: not mutable, has at least one return, and returns no view of its inputs
+    # unless allow_valid_view is set and it has exactly one tensor input and one tensor output.
+    # Raises AssertionError if the argument is not a recognized schema after parsing.
     """Check if the schema is functional.
 
     An operator is functional if:
@@ -101,6 +130,9 @@ def is_functional_schema(schema: Any, *, allow_valid_view: bool = False) -> bool
     """
 
     def is_functional(schema):
+        # [FUNCTION DOC] HELPER: Applies the functional test to a schema: false if mutable; counts tensor
+        # inputs and outputs; for a non-mutating view allows it only with a single tensor in and out; false
+        # if there are no returns.
         if schema.is_mutable:
             return False
         rets = schema.returns
@@ -151,6 +183,8 @@ def is_functional_schema(schema: Any, *, allow_valid_view: bool = False) -> bool
 
 # should be torch._C.JitType but that annotation is busted
 def is_tensorlist_like_type(typ: Any) -> bool:
+    # [FUNCTION DOC] Returns True if typ is a list of tensors, a list of optional tensors, or an
+    # optional of either (JIT type comparison).
     return (
         typ == _C.ListType(_C.TensorType.get())
         or typ == _C.ListType(_C.OptionalType(_C.TensorType.get()))
@@ -161,10 +195,14 @@ def is_tensorlist_like_type(typ: Any) -> bool:
 
 # should be torch._C.JitType but that annotation is busted
 def is_tensor_like_type(typ: Any) -> bool:
+    # [FUNCTION DOC] Returns True if typ is Tensor or Optional[Tensor] (JIT type comparison).
     return typ == _C.TensorType.get() or typ == _C.OptionalType(_C.TensorType.get())
 
 
 def mutates_and_returns_first_arg(op: OpOverload):
+    # [FUNCTION DOC] Returns True for aten ops whose schema has exactly one return aliasing the
+    # first argument, where the first argument is written to and no other argument has alias info
+    # (the inplace pattern). Returns False for non-aten ops and other shapes.
     """Check if an op is an inplace aten op, i.e. it mutates and returns the first arg.
 
     TODO: torchgen/model.py's FunctionSchema.parse is the source of truth for this,
@@ -203,6 +241,9 @@ def mutates_and_returns_first_arg(op: OpOverload):
 
 
 def fill_defaults(schema, args, kwargs):
+    # [FUNCTION DOC] Splits schema arguments into a positional tuple and keyword mapping, taking
+    # values from args/kwargs where present and the schema default otherwise. Returns (tuple, dict).
+    # Keyword-only arguments go into the dict; positional ones are filled by index.
     new_args = []
     new_kwargs = {}
     for i in range(len(schema.arguments)):
@@ -223,6 +264,9 @@ def fill_defaults(schema, args, kwargs):
 def zip_schema(
     schema: _C.FunctionSchema, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> Iterable[tuple[_C.Argument, Any]]:
+    # [FUNCTION DOC] Generator yielding (schema argument, value) pairs for the given positional and
+    # keyword values, in schema order; arguments not supplied (equal to defaults) are skipped.
+    # Raises AssertionError if more values are given than schema arguments.
     """zips schema.arguments and (args, kwargs) together.
 
     Assumes that (args, kwargs) were the inputs to some torch._ops.OpOverload:
@@ -250,6 +294,10 @@ def zip_schema(
 
 
 def hop_schema_from_fx_node(node):
+    # [FUNCTION DOC] Builds a function schema for the higher-order op that is the target of an FX
+    # node, using example values from node metadata (or module attributes for get_attr nodes) as
+    # inputs and the node's own value as the output. Raises RuntimeError if the target is not a
+    # higher-order op or an argument type is unsupported.
     from torchgen.gen_schema_utils import FunctionSchemaGen
 
     hop = node.target
@@ -257,6 +305,8 @@ def hop_schema_from_fx_node(node):
         raise RuntimeError("fx_node's target must be a hop.")
 
     def _collect_example_val(node):
+        # [FUNCTION DOC] HELPER: Returns the node's example value from metadata; for a get_attr node
+        # without one, fetches the attribute from the owning module. Raises AssertionError otherwise.
         meta_val = node.meta.get("val", None)
         if meta_val is None:
             if node.op != "get_attr":
@@ -291,6 +341,9 @@ def hop_schema_from_fx_node(node):
 
 
 def can_generate_trivial_fake_impl(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Returns True if a trivial fake implementation can be auto-generated: never for
+    # built-in namespaces; true for out-tagged or inplace-tagged ops; otherwise true only for mutable
+    # ops with no returns. Raises AssertionError if op is not an OpOverload.
     if not isinstance(op, OpOverload):
         raise AssertionError(f"op must be OpOverload, got {type(op)}")
     if is_builtin(op):
@@ -314,6 +367,9 @@ def can_generate_trivial_fake_impl(op: OpOverload) -> bool:
 
 
 def generate_trivial_fake_impl(op: OpOverload, *args, **kwargs):
+    # [FUNCTION DOC] Computes the result of the trivial fake impl: for out ops, the out keyword
+    # arguments in declaration order (a single value if only one); for inplace ops, the first
+    # positional arg; otherwise None.
     """Generate the result of a trivial fake impl for the given op.
 
     For ops with no returns: returns None.
@@ -333,6 +389,8 @@ def generate_trivial_fake_impl(op: OpOverload, *args, **kwargs):
 
 
 def requires_set_python_module() -> bool:
+    # [FUNCTION DOC] Returns whether ops defined in C++ and extended from Python must have set a
+    # python module; reads an internal override flag, defaulting to True.
     """If an op was defined in C++ and extended from Python using the
     torch.library APIs, returns if we require that there have been a
     m.set_python_module("mylib.ops") call from C++ that associates
@@ -342,6 +400,9 @@ def requires_set_python_module() -> bool:
 
 
 def handle_dispatch_mode(curr_mode, op_overload, *args, **kwargs):
+    # [FUNCTION DOC] Invokes a TorchDispatchMode on an operator: flattens args and kwarg values, collects
+    # the types of tensors carrying the Python dispatch key, and returns the mode's dispatch result for
+    # (op_overload, those types, args, kwargs). Raises AssertionError if curr_mode is not a mode.
     if not isinstance(curr_mode, torch.utils._python_dispatch.TorchDispatchMode):
         raise AssertionError(
             f"curr_mode must be TorchDispatchMode, got {type(curr_mode)}"
@@ -363,10 +424,12 @@ def handle_dispatch_mode(curr_mode, op_overload, *args, **kwargs):
 
 
 def has_kwarg_only_args(schema: _C.FunctionSchema):
+    # [FUNCTION DOC] Returns True if any schema argument is keyword-only.
     return any(a.kwarg_only for a in schema.arguments)
 
 
 def has_kwarg_only_tensors(schema: _C.FunctionSchema):
+    # [FUNCTION DOC] Returns True if any keyword-only schema argument is tensor-like or a tensor list type.
     for a in schema.arguments:
         if not (is_tensor_like_type(a.type) or is_tensorlist_like_type(a.type)):
             continue
@@ -377,6 +440,7 @@ def has_kwarg_only_tensors(schema: _C.FunctionSchema):
 
 
 def has_tensor_arg(schema: _C.FunctionSchema) -> bool:
+    # [FUNCTION DOC] Returns True if any schema argument has a tensor, optional tensor or tensor-list type.
     """
     Given a schema, returns True if the schema has a Tensor arg.
     A Tensor arg is any arg with a type annotation that might involve Tensor.
@@ -388,6 +452,7 @@ def has_tensor_arg(schema: _C.FunctionSchema) -> bool:
 
 
 def get_device_arg_index(schema: _C.FunctionSchema) -> int | None:
+    # [FUNCTION DOC] Returns the index of the argument named device with device type in the schema, or None if absent.
     """
     Given a schema, returns the id of the `device: torch.device` argument.
     If it does not exist, returns None.
@@ -401,7 +466,10 @@ def get_device_arg_index(schema: _C.FunctionSchema) -> int | None:
 def iter_tensors(
     args: tuple[Any], kwargs: dict[str, Any], allowed_nesting: int = 1
 ) -> Iterator[torch.Tensor]:
+    # [FUNCTION DOC] Generator yielding every tensor found in args and kwarg values, descending into
+    # tuples/lists up to allowed_nesting levels (default one level).
     def check(arg):
+        # [FUNCTION DOC] HELPER: Yields the tensor itself, or recursively the tensors in a tuple/list while nesting is allowed.
         if isinstance(arg, torch.Tensor):
             yield arg
         elif allowed_nesting > 0 and isinstance(arg, (tuple, list)):
@@ -414,6 +482,10 @@ def iter_tensors(
 
 
 def check_aliasing_constraint(name, prev, result, get_module=lambda: "???"):
+    # [FUNCTION DOC] Python-side check that custom operator outputs do not alias inputs or each other,
+    # by comparing underlying storage identities. Raises RuntimeError naming the operator (and
+    # implementation module from get_module) if any output tensor shares storage with an input or a
+    # previous output.
     """
     custom operators' outputs must not alias any inputs or other outputs.
     """
@@ -440,6 +512,9 @@ def check_aliasing_constraint(name, prev, result, get_module=lambda: "???"):
 
 
 def _c_check_aliasing_constraint(name, args, kwargs, result, get_module=lambda: "???"):
+    # [FUNCTION DOC] Same aliasing check as check_aliasing_constraint but delegated to a C++
+    # implementation for speed. Raises RuntimeError if any output aliases an input or another output.
+    # Only list containers are inspected.
     """
     custom operators' outputs must not have any aliases
     This version uses C++ implementation for perf.
@@ -465,6 +540,10 @@ def _c_check_aliasing_constraint(name, args, kwargs, result, get_module=lambda: 
 
 
 class MutationChecker:
+    # [CLASS DOC]
+    # Detects whether an operator mutated its tensor arguments. Constructed before the call (records a
+    # cheap hash of each flat tensor arg), then check is called after to compare against the schema.
+    # State: op, args_spec (structure of the flat args), flat_args, real_pre_hashes.
     """
     Check if an operator mutated its arguments.
     Usage:
@@ -475,6 +554,7 @@ class MutationChecker:
     """
 
     def __init__(self, op, flat_args, args_spec):
+        # [FUNCTION DOC] Stores op, spec and flat args and records pre-call hashes (None for non-tensors).
         self.op = op
         self.args_spec = args_spec
         self.flat_args = flat_args
@@ -483,6 +563,10 @@ class MutationChecker:
         ]
 
     def check(self):
+        # [FUNCTION DOC] Recomputes hashes, determines per argument whether it changed (a hash change
+        # unless both are all-NaN), maps back to the argument structure, and compares with the schema's
+        # write annotations (any element for tensor lists). Raises RuntimeError on inconsistency.
+        # KNOWN ISSUE: detection is heuristic (mean-based hash), so some mutations can go unnoticed.
         real_post_hashes = [
             hash_tensor(a) if isinstance(a, torch.Tensor) else None
             for a in self.flat_args
@@ -502,6 +586,8 @@ class MutationChecker:
         ):
 
             def check_one(info, was_mutated):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError if the schema's write flag differs from the observed mutation.
+                # KNOWN ISSUE: the error message lacks a space before the parenthesized hint about identifiers.
                 if info.is_write == was_mutated:
                     return
                 raise RuntimeError(
@@ -523,11 +609,16 @@ class MutationChecker:
 
 
 def hash_tensor(t: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Returns a cheap mutation indicator: the mean of the detached tensor as float.
     """Some inexpensive hash. Used as a quick and dirty indicator for tensor mutation"""
     return t.detach().float().mean()
 
 
 def has_fake_kernel(op: torch._ops.OpOverload) -> bool:
+    # [FUNCTION DOC] Returns True if the op has a fake kernel: trivially generatable, a
+    # CompositeImplicitAutograd kernel, a registered abstract function on its custom op definition,
+    # or (for ops not defined via custom_op) a CompositeExplicitAutograd kernel, a simple-registry fake
+    # impl, or a Meta kernel. Note this can create a registry entry as a side effect.
     """If an operator (that stays alive until FakeTensorMode) has a Fake kernel.
     Don't use this if the operator decomposes before FakeTensorMode.
     """
@@ -558,6 +649,8 @@ def has_fake_kernel(op: torch._ops.OpOverload) -> bool:
 
 
 def mutated_args_kwargs(schema: _C.FunctionSchema) -> tuple[list[int], list[str]]:
+    # [FUNCTION DOC] Returns (positional indices, keyword names) of schema arguments whose alias info
+    # marks them as written.
     idxs = []
     keys = []
     for i, info in enumerate(schema.arguments):
@@ -592,6 +685,10 @@ def get_layout_constraint_tag(
 
 
 def get_layout_constraint_tag(fn, *, with_default=True):
+    # [FUNCTION DOC] Returns the highest-priority layout constraint tag on fn (exact strides,
+    # contiguous strides, fixed stride order, flexible layout). If none and with_default is true,
+    # returns flexible layout for built-ins, otherwise the tag named by the functorch config default;
+    # returns None when with_default is false.
     for tag in tags_by_priority:
         if tag in fn.tags:
             return tag
@@ -628,6 +725,10 @@ def is_impure(
     kwargs: dict[str, Any] | None = None,
     impure_random: bool = True,
 ) -> bool:
+    # [FUNCTION DOC] Returns True if the operator has side effects: packets are judged by their default
+    # overload; overloads are impure if mutable, in the side-effect set or have a registered effect;
+    # higher-order ops by effect or side-effect set (auto-functionalized ones by their wrapped first
+    # argument); seeded nondeterministic ops (when impure_random) and the known random functions are impure.
     """
     An operator is impure if it:
     - Mutates its inputs (has a mutable schema)

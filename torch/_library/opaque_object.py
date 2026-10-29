@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Registry and helpers for opaque objects: user-defined black-box classes that custom operators
+# may take as inputs. Types are registered as "symbolic" or "constant" (see the note below),
+# tracked in two module-level tables (weak map by class, dict by qualified name), and registered
+# with the C++ side. Import-time side effects: creates a logger, registers a fake class for the
+# OpaqueObject schema type, and registers Enum as a constant opaque type.
 """
 Note [Opaque Objects]
 
@@ -58,6 +64,10 @@ log = logging.getLogger(__name__)
 
 
 class MemberType(Enum):
+    # [CLASS DOC]
+    # Enum of how a member of an opaque object is treated during torch.compile tracing:
+    # USE_REAL evaluates it on the real object at trace time and bakes the result as a constant;
+    # INLINED traces/inlines it.
     """
     Defines how a member (attribute/property/method) of an opaque object is handled
     during torch.compile tracing.
@@ -71,11 +81,16 @@ class MemberType(Enum):
 
 @register_fake_class("aten::OpaqueObject")
 class FakeOpaqueObject:
+    # [CLASS DOC]
+    # HELPER: Placeholder fake class registered for the opaque object schema type. Carries no state
+    # and is never meant to be built through unflattening.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: No-op constructor.
         pass
 
     @classmethod
     def __obj_unflatten__(cls, flattened_ctx: dict[str, Any]) -> None:
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError; this fake class must not be created by unflattening.
         raise RuntimeError(
             "FakeOpaqueObject should not be created through __obj_unflatten__ "
             "and should be special handled. Please file an issue to Github."
@@ -98,6 +113,10 @@ ReconstructFn: TypeAlias = Callable[
 
 @dataclass
 class _OpaqueTypeInfo:
+    # [CLASS DOC]
+    # HELPER: Dataclass record for one registered opaque type: qualified class_name, opaque_typ
+    # (symbolic or constant), guard_fn (values to guard on), members (name to MemberType mapping),
+    # hoist flag, and optional reconstruct_fn.
     class_name: str
     opaque_typ: Literal["symbolic", "constant"]
     guard_fn: Callable[
@@ -115,6 +134,9 @@ _OPAQUE_TYPES_BY_NAME: dict[str, _OpaqueTypeInfo] = {}
 
 
 def _resolve_opaque_type_info(cls: Any) -> _OpaqueTypeInfo | None:
+    # [FUNCTION DOC] HELPER: Returns the type info for cls, looking at cls itself then its parent
+    # classes in method resolution order (so subclasses of registered classes resolve). Returns None
+    # if nothing matches or cls is not a class.
     if cls in _OPAQUE_TYPES:
         return _OPAQUE_TYPES[cls]
     if not isinstance(cls, type):
@@ -128,6 +150,8 @@ def _resolve_opaque_type_info(cls: Any) -> _OpaqueTypeInfo | None:
 
 
 def get_opaque_type_name(cls: Any) -> str:
+    # [FUNCTION DOC] Returns the registered qualified opaque type name for cls (subclasses resolve to
+    # their registered parent). Raises ValueError if the class is not registered.
     """
     Gets the registered opaque type name for a given class.
 
@@ -158,6 +182,12 @@ def register_custom_class(
     members: dict[str, MemberType] | None = None,
     reconstruct_fn: ReconstructFn | None = None,
 ) -> None:
+    # [FUNCTION DOC] Registers cls as an opaque type, "symbolic" or "constant" (deprecated aliases
+    # "reference" and "value" are mapped with a warning). Raises ValueError for built-in types,
+    # torch.Tensor, or classes registered as pytree nodes; TypeError if a non-constant class lacks the
+    # custom-class base/metaclass, or a constant class lacks custom __eq__, __hash__ or __fx_repr__
+    # (Enums exempt from eq and repr) or is given a guard_fn; AssertionError for an unknown typ.
+    # Side effects: stores type info in both module tables and registers the name with the C++ side.
     """
     Registers the given type as an opaque type which allows this to be consumed
     by a custom operator.
@@ -285,6 +315,7 @@ def register_opaque_type(
     members: dict[str, MemberType] | None = None,
     reconstruct_fn: ReconstructFn | None = None,
 ) -> None:
+    # [FUNCTION DOC] Deprecated alias: logs a warning and forwards all arguments to register_custom_class.
     log.warning("register_opaque_type is deprecated, use register_custom_class instead")
     register_custom_class(
         cls,
@@ -301,6 +332,8 @@ register_custom_class(Enum, typ="constant")
 
 
 def is_custom_class_obj(value: object) -> TypeIs[OpaqueType]:
+    # [FUNCTION DOC] Returns True if value's type is a registered custom class, or if value is a
+    # FakeScriptObject wrapping a real object of a registered class; otherwise False.
     if is_custom_class(type(value)):
         return True
     from torch._library.fake_class_registry import FakeScriptObject
@@ -311,11 +344,13 @@ def is_custom_class_obj(value: object) -> TypeIs[OpaqueType]:
 
 
 def is_opaque_value(value: object) -> TypeIs[OpaqueType]:
+    # [FUNCTION DOC] Deprecated alias of is_custom_class_obj; logs a warning.
     log.warning("is_opaque_value is deprecated, use is_custom_class_obj instead")
     return is_custom_class_obj(value)
 
 
 def should_hoist(cls: Any) -> bool:
+    # [FUNCTION DOC] Returns the hoist flag of cls's registration, or False if unregistered.
     info = _resolve_opaque_type_info(cls)
     if info is None:
         return False
@@ -323,6 +358,7 @@ def should_hoist(cls: Any) -> bool:
 
 
 def get_reconstruct_fn(cls: type[CustomClassBase]) -> ReconstructFn | None:
+    # [FUNCTION DOC] Returns the reconstruct_fn registered for cls, or None if unregistered or none was given.
     info = _resolve_opaque_type_info(cls)
     if info is None:
         return None
@@ -330,6 +366,7 @@ def get_reconstruct_fn(cls: type[CustomClassBase]) -> ReconstructFn | None:
 
 
 def has_members(cls: Any) -> bool:
+    # [FUNCTION DOC] Returns True if cls is registered with at least one member mapping.
     info = _resolve_opaque_type_info(cls)
     if info is None:
         return False
@@ -337,6 +374,9 @@ def has_members(cls: Any) -> bool:
 
 
 def is_custom_class(cls: type[Any] | str) -> bool:
+    # [FUNCTION DOC] Returns True if cls (a class, or a qualified-name string) is a registered custom
+    # class. Strings are checked directly against the C++ registry; non-class, non-string input logs
+    # a warning and gives False; subclasses of registered classes count.
     """
     Checks if the given type is a registered custom class.
     Also returns True for subclasses of registered custom classes.
@@ -356,11 +396,15 @@ def is_custom_class(cls: type[Any] | str) -> bool:
 
 
 def is_opaque_type(cls: type[Any] | str) -> bool:
+    # [FUNCTION DOC] Deprecated alias of is_custom_class; logs a warning.
     log.warning("is_opaque_type is deprecated, use is_custom_class instead")
     return is_custom_class(cls)
 
 
 def is_opaque_constant_type(cls: type[Any] | str) -> bool:
+    # [FUNCTION DOC] Returns True if cls (class or name string) is a registered opaque constant type,
+    # False if unregistered or symbolic.
+    # KNOWN ISSUE: a string registered only on the C++ side (absent from the by-name table) raises KeyError.
     """
     Checks if the given type is an opaque **constant** type.
     See Note [Opaque Objects] for more information.
@@ -378,6 +422,7 @@ def is_opaque_constant_type(cls: type[Any] | str) -> bool:
 
 
 def is_opaque_value_type(cls: type[Any] | str) -> bool:
+    # [FUNCTION DOC] Deprecated alias of is_opaque_constant_type; logs a warning.
     log.warning(
         "is_opaque_value_type is deprecated, use is_opaque_constant_type instead"
     )
@@ -385,6 +430,9 @@ def is_opaque_value_type(cls: type[Any] | str) -> bool:
 
 
 def is_opaque_symbolic_type(cls: Any) -> bool:
+    # [FUNCTION DOC] Returns True if cls (class or name string) is a registered opaque symbolic type,
+    # False if unregistered or constant.
+    # KNOWN ISSUE: a string registered only on the C++ side (absent from the by-name table) raises KeyError.
     """
     Checks if the given type is an opaque **symbolic** type.
     See Note [Opaque Objects] for more information.
@@ -402,6 +450,7 @@ def is_opaque_symbolic_type(cls: Any) -> bool:
 
 
 def is_opaque_reference_type(cls: Any) -> bool:
+    # [FUNCTION DOC] Deprecated alias of is_opaque_symbolic_type; logs a warning.
     log.warning(
         "is_opaque_reference_type is deprecated, use is_opaque_symbolic_type instead"
     )
@@ -409,6 +458,10 @@ def is_opaque_reference_type(cls: Any) -> bool:
 
 
 def get_opaque_obj_repr(obj: Any) -> tuple[str, dict[str, type]]:
+    # [FUNCTION DOC] Returns (repr_string, globals_mapping) used to reconstruct an opaque object in
+    # FX codegen. Enum members yield "ClassName.member" with the class as the only global. Others
+    # must define __fx_repr__ returning a string and a dict. Raises TypeError if the method is
+    # missing or returns wrongly typed elements.
     """
     Get the FX-evaluable repr for an opaque object and collect required globals.
 
@@ -454,6 +507,8 @@ def get_opaque_obj_repr(obj: Any) -> tuple[str, dict[str, type]]:
 
 
 def get_opaque_obj_info(cls: Any) -> _OpaqueTypeInfo | None:
+    # [FUNCTION DOC] Returns the type info record for cls (class or name string), or None if it is
+    # not a registered custom class. Strings are looked up in the by-name table.
     if not is_custom_class(cls):
         return None
 
@@ -464,6 +519,8 @@ def get_opaque_obj_info(cls: Any) -> _OpaqueTypeInfo | None:
 
 
 def get_member_type(cls: Any, member_name: str) -> MemberType | None:
+    # [FUNCTION DOC] Returns the MemberType registered for member_name on cls (class or name
+    # string), or None if the class or member is unregistered.
     """
     Get the MemberType for a specific member of an opaque object class.
 
