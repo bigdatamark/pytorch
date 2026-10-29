@@ -1,3 +1,9 @@
+# [MODULE DOC] Driver script that runs the inductor opinfo test file in chunks. When run as a
+# main program it walks the operator database in windows of 20 entries, setting the environment
+# variables for the test range start and end, launching pytest on the opinfo test file as a
+# subprocess, echoing its output, and raising CalledProcessError on a nonzero exit code.
+# KNOWN ISSUE: the next window starts at end plus one, but the test file slices the operator
+# list with an exclusive end, so the entry at the index equal to each window end is never run.
 import os
 import subprocess
 
