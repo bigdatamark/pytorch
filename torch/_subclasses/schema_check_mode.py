@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Defines SchemaCheckMode, a TorchDispatchMode that validates operator schemas at
+# runtime: it records called op names and checks that inputs declared immutable are
+# not mutated, that outputs only alias inputs/outputs the schema allows, and that
+# non-mutable ops do not directly return their inputs. Also holds the Mutation and
+# Aliasing record tuples, short aliases for the C++ schema-info classes, and two
+# small tensor-list helpers (kept here to avoid a numpy dependency in common_utils).
+# Import-time side effect: binds module-level aliases to torch._C schema classes.
 from __future__ import annotations
 
 from copy import deepcopy
@@ -18,11 +26,13 @@ if TYPE_CHECKING:
 
 
 class Mutation(NamedTuple):
+    # [CLASS DOC] Record of one observed mutation: operator name and the (standardized) name of the argument that was mutated.
     op_name: str
     arg_name: str
 
 
 class Aliasing(NamedTuple):
+    # [CLASS DOC] Record of one observed alias: operator name, argument name, and a label such as output_0 naming the aliased output.
     op_name: str
     arg_name: str
     output_number: str
@@ -46,6 +56,9 @@ SchemaInfo = torch._C._SchemaInfo
 
 
 def is_iterable_of_tensors(iterable: Iterable[Any]) -> bool:
+    # [FUNCTION DOC] Returns True only if the argument is a non-empty iterable whose
+    # elements are all tensors. A bare tensor, an empty iterable, or a non-iterable
+    # (TypeError on len/iteration) yields False. No side effects.
     # Tensor itself is iterable so we check this first
     if isinstance(iterable, torch.Tensor):
         return False
@@ -62,6 +75,9 @@ def is_iterable_of_tensors(iterable: Iterable[Any]) -> bool:
 
 
 def clone_inputs(args: Iterable[Any]) -> list[Any]:
+    # [FUNCTION DOC] Returns a new list where each tensor is replaced by a detached
+    # clone, each iterable of tensors by a list of detached clones, and any other
+    # value is passed through unchanged.
     inputs: list[Any] = []
 
     for arg in args:
@@ -76,7 +92,13 @@ def clone_inputs(args: Iterable[Any]) -> list[Any]:
 
 
 class SchemaCheckMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that checks every intercepted op against its declared
+    # schema. State: ops (names of called ops), mutated (Mutation records for inputs
+    # actually mutated and allowed to be), aliasing (Aliasing records for allowed
+    # input/output aliasing). Violations raise RuntimeError from __torch_dispatch__.
+    # reset_cache clears the records; display_ops prints op names.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the three empty record lists (ops, mutated, aliasing).
         # Information recorded for testing purposes. For example:
         #  - incorrect schemas
         #  - overly conservative schemas
@@ -85,11 +107,13 @@ class SchemaCheckMode(TorchDispatchMode):
         self.aliasing: list[Aliasing] = []
 
     def reset_cache(self) -> None:
+        # [FUNCTION DOC] Empties the recorded ops, mutated and aliasing lists in place.
         self.ops.clear()
         self.mutated.clear()
         self.aliasing.clear()
 
     def display_ops(self) -> None:
+        # [FUNCTION DOC] Prints the recorded op names to stdout, comma separated.
         print(*self.ops, sep=",")
 
     def __torch_dispatch__(
@@ -99,7 +123,16 @@ class SchemaCheckMode(TorchDispatchMode):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Runs the op while verifying its schema. Records the op name,
+        # normalizes args to keyword form, snapshots clones and stride/storage metadata
+        # of inputs, runs the op, then for each non-None input checks: output aliasing
+        # is permitted by the schema (except unsafe view/split ops), non-mutable ops do
+        # not directly return an input (lift ops exempt), and mutation only occurs on
+        # mutable args. Also checks pairs of outputs for unexpected aliasing.
+        # Returns the op result. Raises RuntimeError on any violation; appends to
+        # self.aliasing and self.mutated for permitted cases.
         def bitwise_equal(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+            # [FUNCTION DOC] HELPER: NaN-tolerant equality; exact equal for quantized tensors, allclose with equal_nan otherwise.
             if lhs.is_quantized:
                 # TODO: This is only OK if can't have NaN quantized; idk if
                 # this is actually true
@@ -110,6 +143,8 @@ class SchemaCheckMode(TorchDispatchMode):
         def has_mutated(
             before: Any, after: Any, md: tuple[tuple[int, ...], int] | None
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if before/after are plain non-sparse-CSR tensors, metadata md exists, and
+            # size, values, stride or storage identity differ from the snapshot. Otherwise False.
             are_tensors = type(before) is torch.Tensor and type(after) is torch.Tensor
             if (
                 are_tensors
@@ -125,6 +160,7 @@ class SchemaCheckMode(TorchDispatchMode):
             return False
 
         def has_aliased(lhs: Any, rhs: Any) -> bool:
+            # [FUNCTION DOC] HELPER: True if the two values overlap in memory; values that cannot be inspected give False; other errors are re-raised.
             try:
                 # pyrefly: ignore [missing-attribute]
                 return torch._C._overlaps(lhs, rhs)
@@ -135,9 +171,11 @@ class SchemaCheckMode(TorchDispatchMode):
                     raise exception
 
         def standardize_name(name: str) -> str:
+            # [FUNCTION DOC] HELPER: maps the schema argument name self to input; others unchanged.
             return name if name != "self" else "input"
 
         def unwrap(e: Any) -> Any:
+            # [FUNCTION DOC] HELPER: for tensor subclass wrappers returns the inner elem tensor (or the value itself if no elem); other values unchanged.
             if isinstance(e, torch.Tensor) and type(e) is not torch.Tensor:
                 try:
                     # pyrefly: ignore[missing-attribute]
@@ -147,6 +185,8 @@ class SchemaCheckMode(TorchDispatchMode):
             return e
 
         def parse_metadata(e: Any) -> tuple[tuple[int, ...], int] | None:
+            # [FUNCTION DOC] HELPER: for a tensor (or the elem of a subclass wrapper) returns a copy of its stride and the
+            # storage identity; returns None for non-tensors, sparse CSR tensors, or wrappers lacking elem.
             if isinstance(e, torch.Tensor):
                 if type(e) is not torch.Tensor:
                     try:
