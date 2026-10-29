@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for inductor profile analysis utilities: table formatting, dict zipping,
+# device info lookup, trace augmentation with FLOP counts, bandwidth analysis, trace diffing and
+# combining through the profile_analysis main entry point. Defines a sample profile JSON string,
+# model-building helpers and a module-level temporary directory created at import time for trace
+# files. Device-type variants of TestAnalysis are generated at import time (XPU allowed).
 
 import json
 import tempfile
@@ -119,6 +124,9 @@ Strides": [[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], [], [],
 
 
 def verify_flops(self, expected_flops, out_profile):
+    # [FUNCTION DOC] HELPER: Walks the trace events of an augmented profile in order and, for each
+    # event whose args contain a kernel FLOP entry, asserts it equals the next value from the
+    # expected list (events without the entry are skipped). Mismatch fails the test.
     j = 0
     for i in range(len(out_profile["traceEvents"])):
         if "kernel_flop" in out_profile["traceEvents"][i]["args"]:
@@ -130,6 +138,9 @@ def verify_flops(self, expected_flops, out_profile):
 
 
 def random_tensor(size, dtype, **kwargs):
+    # [FUNCTION DOC] HELPER: Builds a random tensor of the given size and dtype. Floating dtypes
+    # use normal random values; integer dtypes use random integers in the range zero to 99. Extra
+    # keyword args are forwarded to the factory. Raises ValueError for any other dtype.
     if dtype in [torch.half, torch.bfloat16, torch.float, torch.double]:
         return torch.randn(size, dtype=dtype, **kwargs)
     elif dtype in [torch.uint8, torch.int8, torch.short, torch.int, torch.long]:
@@ -139,7 +150,11 @@ def random_tensor(size, dtype, **kwargs):
 
 
 def cT(device, dtype):
+    # [FUNCTION DOC] HELPER: Returns a tensor factory bound to a device and dtype; the factory
+    # takes shape dimensions and an optional requires_grad flag and delegates to random_tensor.
     def T(*shape, requires_grad=False):
+        # [FUNCTION DOC] HELPER: Creates a random tensor of the given shape on the captured device
+        # and dtype.
         return random_tensor(
             shape, requires_grad=requires_grad, device=device, dtype=dtype
         )
@@ -148,6 +163,8 @@ def cT(device, dtype):
 
 
 def FlopCounterMode(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Wrapper constructing the torch FlopCounterMode with display forced
+    # off, forwarding any other positional and keyword args.
     return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
 
 
@@ -155,15 +172,23 @@ TMP_DIR = tempfile.mkdtemp()
 
 
 def trace_files():
+    # [FUNCTION DOC] HELPER: Returns two unique JSON trace file paths inside the module temp
+    # directory, each with a fresh random UUID in the name. Does not create the files.
     TRACE1 = f"{TMP_DIR}/trace1-{uuid.uuid4()}.json"
     TRACE2 = f"{TMP_DIR}/trace2-{uuid.uuid4()}.json"
     return TRACE1, TRACE2
 
 
 def _test_model(device, dtype, compile=True, addmm=True, bmm=True):
+    # [FUNCTION DOC] HELPER: Builds a model function exercising convolution, matrix multiply and a
+    # scaled convolution output, optionally addmm, bmm and baddbmm (the last only if both addmm and
+    # bmm are enabled), concatenating flattened results. Returns the function compiled with kernel
+    # benchmarking and bandwidth profiling options when compile is true, else the eager function.
     T = cT(device, dtype)
 
     def model():
+        # [FUNCTION DOC] HELPER: Creates random inputs (conv input and weight, matrices, batched
+        # matrices), runs the enabled ops and returns the concatenation of all flattened outputs.
         input_conv = T(1, 3, 56, 56)
         conv_weight = T(12, 3, 5, 5)
 
@@ -222,9 +247,14 @@ def _test_model(device, dtype, compile=True, addmm=True, bmm=True):
 
 
 def _pointwise_test_model(device, dtype, compile=True):
+    # [FUNCTION DOC] HELPER: Builds a model computing add followed by sine over two random
+    # matrices. Returns it compiled with kernel benchmarking and bandwidth profiling options when
+    # compile is true, else the eager function.
     T = cT(device, dtype)
 
     def model():
+        # [FUNCTION DOC] HELPER: Creates two random 1024 by 512 matrices and returns the sine of
+        # their sum.
         M = 1024
         N = 512
         mat3 = T(M, N)
@@ -243,7 +273,11 @@ prefix = ["profile.py"]
 
 
 class TestUtils(TestCase):
+    # [CLASS DOC] CPU-only tests for helper utilities (table rendering, dict zipping and device
+    # info lookup).
     def test_tabulate2d(self):
+        # [FUNCTION DOC] Checks the 2-D table renderer against an expected multi-line layout with
+        # padded columns and a dashed separator, comparing line by line.
         headers = ["Kernel", "Self H100 TIME (ms)", "Count", "Percent"]
         rows = [
             ["aten::mm", 0.500, 7, 0.0],
@@ -266,6 +300,8 @@ class TestUtils(TestCase):
             self.assertEqual(r, t)
 
     def test_zip_dicts(self):
+        # [FUNCTION DOC] Checks zipping of two dicts over the union of keys, with explicit defaults
+        # for missing values and with default of none when omitted.
         d1 = {"a": 1, "b": 2}
         d2 = {"a": 3, "c": 4}
         res1 = zip_dicts(d1, d2, d1_default=32, d2_default=48)
@@ -274,9 +310,12 @@ class TestUtils(TestCase):
         self.assertEqual(set(res2), {("a", 1, 3), ("b", 2, None), ("c", None, 4)})
 
     def test_device_mapping_keys_are_upper_case(self):
+        # [FUNCTION DOC] Asserts every key of the static device mapping is already upper case.
         self.assertTrue(all(k == k.upper() for k in _device_mapping))
 
     def test_lookup_device_info_is_case_insensitive(self):
+        # [FUNCTION DOC] Asserts the device lookup finds an AMD MI300X entry and returns the same
+        # result for upper, mixed and lower case names.
         upper = lookup_device_info("AMD INSTINCT MI300X")
         self.assertIsNotNone(upper)
         self.assertEqual(lookup_device_info("AMD Instinct MI300X"), upper)
@@ -284,13 +323,19 @@ class TestUtils(TestCase):
 
 
 def has_supported_gpu():
+    # [FUNCTION DOC] HELPER: Returns a truthy value if an XPU is available, SM80 or later CUDA is
+    # present, or this is a ROCm build; used to gate the GPU tests.
     """Check if any GPU platform with Triton support is available."""
     return torch.xpu.is_available() or SM80OrLater or torch.version.hip
 
 
 class TestAnalysis(TestCase):
+    # [CLASS DOC] Device-type tests of profile analysis through its main entry point. Most tests
+    # need a supported GPU and return early (pass trivially) on CPU or ROCm. Trace files are
+    # written to the module temp directory.
     @skipIf(not has_supported_gpu(), "Requires XPU, CUDA SM80+, or ROCm")
     def test_noop(self):
+        # [FUNCTION DOC] Runs main with no arguments and asserts nothing is printed to stdout.
         with (
             patch("sys.stdout", new_callable=StringIO) as mock_stdout,
             patch("sys.argv", [*prefix]),
@@ -302,6 +347,10 @@ class TestAnalysis(TestCase):
     @dtypes(torch.float, torch.double, torch.float16)
     @xfailIfNoAcceleratorTriton
     def test_diff(self, device, dtype):
+        # [FUNCTION DOC] Profiles the compiled test model once and then several times (fresh
+        # inductor cache, dynamo reset each time), exports two chrome traces and runs the diff mode
+        # of main on them. Only checks that diffing runs without error.
+        # Returns early on CPU or ROCm.
         """
         diff, testing out the nruns feature too.
         """
@@ -345,6 +394,8 @@ class TestAnalysis(TestCase):
 
     @skipIf(not (SM80OrLater or TEST_XPU), "Requires SM80 or XPU")
     def test_augment_trace_helper_unit(self):
+        # [FUNCTION DOC] Parses the sample profile JSON, augments it with the helper and checks the
+        # per-kernel FLOP values against a fixed expected list.
         js = json.loads(example_profile)
         out_profile = _augment_trace_helper(js)
         expected_flops = [4096000, 4096000, 223552896, 223552896, 0, 0, 0]
@@ -361,6 +412,9 @@ class TestAnalysis(TestCase):
     @skipIf(not IS_BIG_GPU, "we can't use Triton only as a backend for max autotune")
     @torch._inductor.config.patch(force_disable_caches=True)
     def test_triton_has_metadata(self, device, dtype, maxat):
+        # [FUNCTION DOC] Compiles a convolution with Triton-only max autotune, profiles one run and
+        # exports a chrome trace, then asserts some event name contains both triton and conv.
+        # Returns early on CPU or ROCm.
         """
         make sure that the chrome trace of triton kernels contains certain values
         """
@@ -372,6 +426,7 @@ class TestAnalysis(TestCase):
         conv_weight = T(12, 3, 5, 5)
 
         def om(i, w):
+            # [FUNCTION DOC] HELPER: Model under test; 2-D convolution of input and weight.
             # Convolution operation
             conv_output = F.conv2d(i, w)
             return conv_output
@@ -387,6 +442,9 @@ class TestAnalysis(TestCase):
         )
 
         def verify_triton(comp):
+            # [FUNCTION DOC] HELPER: Resets dynamo and uses a fresh inductor cache, profiles one
+            # call of the compiled function, exports a chrome trace, reloads it and asserts a
+            # triton conv kernel event exists.
             torch._dynamo.reset()  # reset the cache
             with fresh_inductor_cache():
                 with torch.profiler.profile(record_shapes=True) as profile:
@@ -421,6 +479,11 @@ class TestAnalysis(TestCase):
     )
     @torch._inductor.config.patch(force_disable_caches=True)
     def test_augment_trace_against_flop_counter(self, device, dtype, maxat):
+        # [FUNCTION DOC] Compares FLOP counts attached by trace augmentation with the torch FLOP
+        # counter. Runs the compiled model under the profiler and under FlopCounterMode, augments
+        # the trace through main, then for each kernel event matches its external op (mm,
+        # convolution, baddbmm, bmm) and asserts equal FLOPs; finally asserts each kind was seen.
+        # Parametrized over autotune settings. Returns early on CPU or ROCm.
         # this tests to see if we can only use a Triton backend for max autotune
         max_autotune, backends = maxat
         if device == "cpu" or torch.version.hip is not None:
@@ -533,6 +596,11 @@ class TestAnalysis(TestCase):
     )
     @torch._inductor.config.patch(force_disable_caches=True)
     def test_pointwise_bandwidth(self, device, dtype, maxat):
+        # [FUNCTION DOC] Runs the pointwise model compiled with various autotune settings under the
+        # profiler, exports a trace and runs the bandwidth analysis mode of main. The final loop
+        # only assigns an expected value and asserts nothing, so the test only checks that analysis
+        # runs. Returns early on CPU or ROCm.
+        # KNOWN ISSUE: the trailing assignment to the kernel gigabyte count is never compared.
         # this tests to see if we can only use a Triton backend for max autotune
         max_autotune, backends = maxat
         if device == "cpu" or torch.version.hip is not None:
@@ -571,6 +639,10 @@ class TestAnalysis(TestCase):
     @dtypes(torch.float, torch.float16)
     @xfailIfNoAcceleratorTriton
     def test_combine_profiles(self, device, dtype):
+        # [FUNCTION DOC] Profiles three different models into three traces, combines them with the
+        # combine mode of main, and checks the combined file has the summed event count, has device
+        # properties (non-empty on CUDA) and shares event names with each source trace. Returns
+        # early on CPU or ROCm.
         """
         Test combining multiple profiles into a single profile.
         """
