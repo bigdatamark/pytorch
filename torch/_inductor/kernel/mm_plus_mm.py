@@ -1,3 +1,6 @@
+# [MODULE DOC] Inductor lowering for the fused op mm(a,b)+mm(c,d). Defines an aten extern choice and a Triton template
+# that accumulates both matmuls into one accumulator, plus tuned_mm_plus_mm which autotunes between them.
+# Import-time side effects: creates the module logger, the ExternKernelChoice and the TritonTemplate.
 # mypy: allow-untyped-defs
 
 import logging
@@ -126,6 +129,11 @@ mm_plus_mm_template = TritonTemplate(
 
 
 def tuned_mm_plus_mm(mat1, mat2, mat3, mat4, *, layout=None):
+    # [FUNCTION DOC] Lowers mm(mat1,mat2)+mm(mat3,mat4). Normalizes args via mm_args for both pairs.
+    # Falls back to plain add of two mm lowerings if any output is empty, the shapes of the two pairs are not statically equal,
+    # or native matmul is enabled. Otherwise gathers aten and Triton template choices and returns the autotuned node.
+    # Raises an error if the two derived layouts differ.
+    # KNOWN ISSUE: the second mm_args call is given the same layout argument as the first, so a user layout is shared by both pairs.
     """
     Computes mm(mat1, mat2) + mm(mat3, mat4)
     """

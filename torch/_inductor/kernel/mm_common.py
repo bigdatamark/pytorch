@@ -1,3 +1,7 @@
+# [MODULE DOC] Shared helpers for Inductor matmul-family lowerings: symbolic grid functions for Triton mm templates,
+# argument normalization (mm_args), accumulator dtype choice, epilogue builders, native-matmul eligibility checks,
+# striding/shape checks, and a loader for kernel template files. Import-time side effects: creates a logger and the
+# load_kernel_template partial bound to the templates directory next to this file.
 # mypy: allow-untyped-defs
 import logging
 from collections.abc import Sequence
@@ -22,6 +26,7 @@ log = logging.getLogger(__name__)
 
 @SymbolicGridFn
 def mm_grid(m, n, meta, *, cdiv):
+    # [FUNCTION DOC] Returns the 3-tuple launch grid: ceil(m/BLOCK_M)*ceil(n/BLOCK_N) programs on axis 0, 1 on the others. Uses symbolic cdiv; meta supplies BLOCK_M and BLOCK_N.
     """
     The CUDA grid size for matmul triton templates.
     """
@@ -30,6 +35,7 @@ def mm_grid(m, n, meta, *, cdiv):
 
 @SymbolicGridFn
 def persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, min):
+    # [FUNCTION DOC] Grid for persistent kernels: the smaller of NUM_SMS and the number of output tiles, as a 3-tuple with trailing ones.
     """Defines the grid for persistent kernels."""
     return (
         min(meta["NUM_SMS"], cdiv(M, meta["BLOCK_M"]) * cdiv(N, meta["BLOCK_N"])),
@@ -40,11 +46,13 @@ def persistent_mm_grid(M: int, N: int, meta: dict[str, Any], *, cdiv, min):
 
 @SymbolicGridFn
 def persistent_grouped_mm_grid(*args):
+    # [FUNCTION DOC] Grid for persistent grouped mm: NUM_SMS programs on axis 0. Only the last positional arg (the meta mapping) is used.
     meta = args[-1]
     return (meta["NUM_SMS"], 1, 1)
 
 
 def acc_type(dtype):
+    # [FUNCTION DOC] Returns the Triton accumulator type string: float32 for float16, bfloat16 and 1-byte float (fp8) dtypes, else the Triton type of dtype.
     if dtype in (torch.float16, torch.bfloat16):
         return "tl.float32"
     if dtype.is_floating_point and dtype.itemsize == 1:  # fp8 dtypes
@@ -61,6 +69,9 @@ def mm_args(
     use_4x2_dim=False,
     mat2_transposed=False,
 ):
+    # [FUNCTION DOC] Common argument processing for mm, bmm, addmm: realizes mat1/mat2, checks batch dims and K match (K of mat2 doubled if use_4x2_dim; N/K swapped if mat2_transposed).
+    # Builds a FixedLayout from mat1 device, out_dtype (default mat1 dtype) and batch+[m,n] if layout is None; raises an error if both layout and out_dtype are given.
+    # Expands and realizes extra inputs to the layout size. Returns [m, n, k, layout, mat1, mat2, *others].
     """
     Common arg processing for mm,bmm,addmm,etc
     """
@@ -96,7 +107,9 @@ def mm_args(
 
 
 def addmm_epilogue(dtype, alpha, beta):
+    # [FUNCTION DOC] HELPER: Builds an epilogue callable computing alpha*acc + beta*bias, skipping each multiply when its factor is 1. Constants use dtype.
     def epilogue(acc, bias):
+        # [FUNCTION DOC] HELPER: Applies optional scaling by alpha and beta then adds acc and bias via V.ops; returns the resulting op value.
         if alpha != 1:
             acc = V.ops.mul(acc, V.ops.constant(alpha, dtype))
         if beta != 1:
@@ -107,6 +120,8 @@ def addmm_epilogue(dtype, alpha, beta):
 
 
 def scale_mm_epilogue():
+    # [FUNCTION DOC] Builds an epilogue callable for scaled mm that multiplies the accumulator by the product of the two inverse scales and optionally adds a bias.
+    # KNOWN ISSUE: the docstring lists dtype, scale_a, scale_b args but the function takes none.
     """
     Create an epilogue function that applies scaling to matrix multiplication result
     using the given scale factors.
@@ -121,6 +136,7 @@ def scale_mm_epilogue():
     """
 
     def epilogue(acc, inv_a_scale, inv_b_scale, bias=None):
+        # [FUNCTION DOC] HELPER: Returns acc times (inv_a_scale times inv_b_scale), plus bias when bias is not None.
         # The epilogue function receives the accumulator (result of mat1 @ mat2)
         # and applies the scaling factors
         # In the original scaled_mm, we use inverse scales, so we multiply by them
@@ -135,6 +151,9 @@ def scale_mm_epilogue():
 
 
 def use_native_matmul(mat1, mat2):
+    # [FUNCTION DOC] Decides whether to use Triton native matmul codegen. Returns False if disabled in config, device is not cuda/xpu with triton backend,
+    # dtypes are unsupported (int8, uint8, fp16, bf16, fp32 only), any of m,k,n has free unbacked symbols, or any is statically <= 1; else True.
+    # Raises an error if TMA persistent matmul or block pointers are enabled alongside native matmul.
     if not config.triton.native_matmul:
         return False
 
@@ -195,6 +214,7 @@ def use_native_matmul(mat1, mat2):
 
 
 def _use_small_mm_pointwise(m, k, n, layout) -> bool:
+    # [FUNCTION DOC] HELPER: True when max autotune is off, device is not cpu/mps, and m>=64, k<5, n<5 are statically known; small mm is then lowered to pointwise ops.
     """Check if mm should be lowered to pointwise ops for small K and N.
 
     For very small inner dimensions (K < 5 and N < 5) with M >= 64,
@@ -215,6 +235,8 @@ def _use_small_mm_pointwise(m, k, n, layout) -> bool:
 
 
 def _is_static_problem(layout: Layout) -> tuple[bool, bool]:
+    # [FUNCTION DOC] HELPER: Returns (is_static, is_nonzero) for layout.size. If sizes are not all static, returns False and whether no dim is statically zero;
+    # otherwise True and whether the element count is positive.
     """
     Check if input tensors and output layout have static shapes and non-zero sizes.
 
@@ -246,13 +268,18 @@ def _is_static_problem(layout: Layout) -> tuple[bool, bool]:
 
 
 def check_supported_striding(mat_a: TensorBox, mat_b: TensorBox) -> None:
+    # [FUNCTION DOC] Validates that mat_a is row major (last stride 1) and mat_b is column major (second-to-last stride 1), unless the matrix has a zero dim.
+    # Raises a runtime error through the check mechanism otherwise. Returns nothing.
     def is_row_major(stride: Sequence[_IntLike]) -> bool:
+        # [FUNCTION DOC] HELPER: True if the last stride equals 1.
         return stride[-1] == 1
 
     def is_col_major(stride: Sequence[_IntLike]) -> bool:
+        # [FUNCTION DOC] HELPER: True if the second-to-last stride equals 1.
         return stride[-2] == 1
 
     def has_zero_dim(size: Sequence[_IntLike]) -> bool:
+        # [FUNCTION DOC] HELPER: True if either of the first two sizes is 0.
         return bool(size[0] == 0 or size[1] == 0)
 
     # Check mat_a (self) stride requirements
@@ -269,6 +296,8 @@ def check_supported_striding(mat_a: TensorBox, mat_b: TensorBox) -> None:
 
 
 def is_batch_stride_largest_or_zero(mat1, mat2, layout) -> bool:
+    # [FUNCTION DOC] True if, for mat1, mat2 and layout, the batch stride is zero or equals the product of the remaining sizes.
+    # Raises an error if any of the three is not 3D.
     """
     Checking if the batch stride is the largest in the stride.
     """

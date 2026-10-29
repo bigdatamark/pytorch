@@ -1,3 +1,7 @@
+# [MODULE DOC] Inductor lowerings and autotuning for grouped matmul (_grouped_mm) and scaled grouped matmul (_scaled_grouped_mm).
+# Provides Triton persistent-kernel configs and pruning, ROCm/CUDA capability checks, output layout construction, aten extern choices,
+# Triton/CuteDSL/NV-universal template choices and the registered lowerings. Import-time side effects: creates templates, extern choices,
+# the config list, and registers two lowerings in the global lowering table.
 # mypy: allow-untyped-defs
 import logging
 from dataclasses import asdict, dataclass
@@ -42,6 +46,8 @@ aten = torch.ops.aten
 
 @dataclass
 class Config:
+    # [CLASS DOC] Plain dataclass describing one Triton tuning config: kwargs (mapping of kernel constexpr names to ints such as block sizes),
+    # num_stages and num_warps.
     kwargs: dict[str, int]
     num_stages: int
     num_warps: int
@@ -67,10 +73,14 @@ _NV_CONFIGS = [
 
 
 def grouped_mm_configs():
+    # [FUNCTION DOC] Returns the module-level list of candidate Triton configs (block size, stage and warp combinations).
     return _NV_CONFIGS
 
 
 def early_config_prune(g, m, dtsize, configs, named_args):
+    # [FUNCTION DOC] Filters configs. With static g and m, prunes BLOCK_M by the average rows per group (small m keeps small blocks, large m drops tiny blocks);
+    # drops configs needing more shared memory than the GPU has ((BLOCK_M+BLOCK_N)*BLOCK_K*stages*dtsize); for warp-specialized configs requires 4 warps and enough partition size.
+    # named_args supplies A_IS_2D and B_IS_2D. Returns the list of kept configs.
     pruned_configs = []
     for config in configs:
         kw = config.kwargs
@@ -144,6 +154,7 @@ cutedsl_grouped_mm_template = CuteDSLTemplate(
 
 
 def has_grouped_mm_triton_support() -> bool:
+    # [FUNCTION DOC] True if CUDA is available and either the build is ROCm or the device capability is at least 9.0.
     if not torch.cuda.is_available():
         return False
     if torch.version.hip:
@@ -154,12 +165,14 @@ def has_grouped_mm_triton_support() -> bool:
 
 
 def _rocm_gcn_arch() -> str:
+    # [FUNCTION DOC] HELPER: Returns the GCN arch name of the current device with any feature suffix after a colon removed.
     return torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).gcnArchName.split(":", 1)[0]
 
 
 def has_rocm_fp8_hardware_support() -> bool:
+    # [FUNCTION DOC] True only on ROCm when the arch is gfx94, or gfx120 with ROCm >= 6.3, or gfx95 with ROCm >= 6.5; mirrors the test-side FP8 platform check.
     if not torch.version.hip:
         return False
 
@@ -177,6 +190,7 @@ def has_rocm_fp8_hardware_support() -> bool:
 
 
 def has_scaled_grouped_mm_triton_support(mat_a: TensorBox, mat_b: TensorBox) -> bool:
+    # [FUNCTION DOC] True on non-ROCm. On ROCm requires FP8 hardware and both inputs in the expected FP8 dtype (fnuz for gfx94, otherwise e4m3fn).
     if not torch.version.hip:
         return True
     if not has_rocm_fp8_hardware_support():
@@ -198,6 +212,10 @@ def grouped_mm_args(
     layout=None,
     out_dtype=None,
 ):
+    # [FUNCTION DOC] Normalizes inputs for grouped mm: realizes mat1, mat2 and offs, requires both mats to be 2D or 3D.
+    # If layout is None builds a FixedLayout with output size by operand dims (2Dx2D gives groups x m x n and needs offs; 2Dx3D, 3Dx2D and 3Dx3D handled),
+    # dtype out_dtype or mat1 dtype; strides are contiguous on ROCm and last dim padded to 16 bytes on CUDA. Raises an error if both layout and out_dtype are given.
+    # Returns (mat1 size, mat2 size, layout, mat1, mat2, offs).
     mat1, mat2 = realize_inputs(mat1, mat2)
     if offs is not None:
         realize_inputs(offs)
@@ -281,6 +299,7 @@ def can_use_triton_kernel(
     bias: TensorBox | None,
     scale_result: TensorBox | None,
 ) -> bool:
+    # [FUNCTION DOC] True if Triton grouped mm is supported on this device, Triton is installed, bias and scale_result are None, and offs is present exactly when either operand is 2D.
     if not has_grouped_mm_triton_support():
         return False
     if not has_triton():
@@ -300,6 +319,8 @@ def can_use_triton_kernel(
 
 
 def create_offsets(offs_box, m1_is_2d, m2_is_2d, m, n, k, alignment):
+    # [FUNCTION DOC] HELPER: Builds a synthetic offsets tensor for autotuning inputs. Picks the end value (k, m or n) by operand dimensionality; returns None for 3D x 3D.
+    # Spreads the group boundaries evenly using size hints, rounds all but the last to a multiple of alignment, sets the last to the end, and casts to the dtype and device of offs_box.
     if m1_is_2d:
         if m2_is_2d:
             end = k
@@ -337,6 +358,11 @@ def _tuned_grouped_mm_common(
     use_fast_accum: bool | None = None,
     layout: Layout | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] HELPER: Shared lowering body for grouped mm and scaled grouped mm. Validates scale args pairing, builds layout via grouped_mm_args, bumps the aten_mm_info counter and logs shapes,
+    # checks striding for scaled case, builds input node list (mats, scales, offs) and the aten choice (passing use_fast_accum only if given).
+    # Derives group count g and m,n,k and 2D flags from operand dims, checking dims equal. Adds Triton (pruned configs, TMA when available), Blackwell CuteDSL and NV universal choices when eligible,
+    # supplies an offsets generator for autotuning inputs, and returns the node chosen by autotune_select_algorithm.
+    # Raises an error on inconsistent scale arguments.
     if (scale_a is None) != (scale_b is None):
         raise AssertionError(
             "scale_a and scale_b must both be None or both be provided"
@@ -525,6 +551,7 @@ def tuned_grouped_mm(
     out_dtype: torch.dtype | None = None,
     layout: Layout | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Registered lowering for aten._grouped_mm: delegates to the common tuner with the aten and Triton grouped_mm templates and no scales. Returns the tuned TensorBox.
     """Auto-tuning for _grouped_mm() operator."""
 
     return _tuned_grouped_mm_common(
@@ -558,6 +585,7 @@ def tuned_scaled_grouped_mm(
     use_fast_accum: bool = False,
     layout: Layout | None = None,
 ) -> TensorBox:
+    # [FUNCTION DOC] Registered lowering for aten._scaled_grouped_mm: defaults out_dtype to bfloat16 and delegates to the common tuner with scales and the scaled templates. Returns the tuned TensorBox.
     """Auto-tuning for _scaled_grouped_mm() operator."""
 
     # matching _scaled_grouped_mm_cuda Blas.cpp implementation

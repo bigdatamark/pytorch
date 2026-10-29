@@ -1,3 +1,8 @@
+# [MODULE DOC] Inductor lowerings for matmul-family ops: aten.mm, _int_mm, addmm, _sparse_semi_structured_mm, _scaled_mm and _scaled_mm_v2.
+# Defines Triton templates (plain, persistent, TMA, scaled, Blackwell), aten extern choices, subgraph templates (decompose-K, contiguous),
+# scaling-recipe detection helpers, and AutoHeuristic ranking helpers. Each lowering gathers candidate choices from the enabled backends
+# (aten, Triton, CUTLASS, CK, NV universal gemm, C++ gemm) and returns the autotuned result.
+# Import-time side effects: detects the Triton version, builds the templates and extern choices, and registers several lowerings in the global lowering table.
 # mypy: allow-untyped-defs
 import functools
 import logging
@@ -135,6 +140,7 @@ blackwell_ws_persistent_device_tma_mm_template = TritonTemplate(
 # prevent duplication registration of extern functions
 @functools.cache
 def lazy_register_extern_choice(fn):
+    # [FUNCTION DOC] HELPER: Cached factory that wraps fn in an ExternKernelChoice so the same function is registered only once.
     return ExternKernelChoice(fn)
 
 
@@ -167,10 +173,12 @@ aten__fp8_mm = ExternKernelChoice(
 
 
 def _is_int8_mat(mat):
+    # [FUNCTION DOC] HELPER: True if the dtype of mat is int8 or uint8.
     return mat.get_dtype() in (torch.int8, torch.uint8)
 
 
 def bias_addmm(inp, mat1, mat2, *, out=None, alpha=1, beta=1):
+    # [FUNCTION DOC] Extern kernel body for addmm. If the bias is a broadcast row (stride 0 with nonzero size, or size 1) it passes the first row as a 1D bias so a faster cublasLt path is used; otherwise calls addmm directly. Returns the addmm result (written to out if given).
     """
     Giving torch.addmm a 1D tensor calls a different (faster) cublasLt
     kernel under the hood.  There are a few shapes where this is slower,
@@ -182,13 +190,18 @@ def bias_addmm(inp, mat1, mat2, *, out=None, alpha=1, beta=1):
 
 
 def check_supported_striding(mat_a, mat_b) -> None:
+    # [FUNCTION DOC] Requires mat_a row major and mat_b column major (statically known strides), unless the matrix has a zero dim. Raises a runtime error via the check mechanism otherwise.
+    # Same contract as the helper of the same name in mm_common, but uses statically-known comparisons for symbolic strides.
     def is_row_major(stride) -> bool:
+        # [FUNCTION DOC] HELPER: True if the second stride is statically known to be 1.
         return V.graph.sizevars.statically_known_equals(stride[1], 1)
 
     def is_col_major(stride) -> bool:
+        # [FUNCTION DOC] HELPER: True if the first stride is statically known to be 1.
         return V.graph.sizevars.statically_known_equals(stride[0], 1)
 
     def has_zero_dim(size) -> bool:
+        # [FUNCTION DOC] HELPER: True if either of the first two sizes is statically known to be 0.
         return bool(
             V.graph.sizevars.statically_known_equals(size[0], 0)
             or V.graph.sizevars.statically_known_equals(size[1], 0)
@@ -211,6 +224,7 @@ aten_bias_addmm = ExternKernelChoice(bias_addmm, None)
 
 
 def _check_addmm_input_metadata(inp, mat1, mat2) -> None:
+    # [FUNCTION DOC] HELPER: Raises a runtime error unless bias, mat1 and mat2 share dtype and device.
     torch._check(
         inp.get_dtype() == mat1.get_dtype() and inp.get_dtype() == mat2.get_dtype(),
         lambda: "input dtypes must be the same",
@@ -222,6 +236,7 @@ def _check_addmm_input_metadata(inp, mat1, mat2) -> None:
 
 
 def decomposeK(a, b, k_splits):
+    # [FUNCTION DOC] Reference implementation of split-K matmul: reshapes a (m,k) and b (k,n) into k_splits chunks along K, does a batched matmul with float32 output, sums over the chunks and casts back to a's dtype. Assumes k is divisible by k_splits (integer division drops the remainder).
     m = a.shape[0]
     n = b.shape[1]
     k = a.shape[1]
@@ -236,7 +251,9 @@ def decomposeK(a, b, k_splits):
 
 
 class DecomposeKSugraphTemplate(SubgraphTemplate):
+    # [CLASS DOC] Subgraph template producing a decompose-K choice: traces decomposeK with the given k_split into an FX graph and wraps it as a subgraph choice caller. Stateless apart from the fixed name decompose_k.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the base SubgraphTemplate with the name decompose_k.
         super().__init__(
             name="decompose_k",
         )
@@ -247,6 +264,7 @@ class DecomposeKSugraphTemplate(SubgraphTemplate):
         layout: Layout,
         k_split: int,
     ) -> SubgraphChoiceCaller:
+        # [FUNCTION DOC] Builds a SubgraphChoiceCaller named for the k_split value: traces decomposeK (partially applied with k_split) via make_fx under the python dispatcher with the selected decomposition table, then delegates to the base class generate with input_nodes, layout and a description. Returns the choice caller.
         from torch._dispatch.python import enable_python_dispatcher
 
         from ..decomposition import select_decomp_table
@@ -274,7 +292,9 @@ decompose_k_subgraph_template = DecomposeKSugraphTemplate()
 
 
 class ContiguousTemplate(SubgraphTemplate):
+    # [CLASS DOC] Subgraph template that wraps an arbitrary function (fn) as a choice. Stores name, description and fn; used for the contiguous mm and addmm variants that make the second matrix contiguous first.
     def __init__(self, name: str, description: str, fn: Any):
+        # [FUNCTION DOC] HELPER: Stores name, description and fn on the instance and initializes the base template with the name.
         self.name = name
         self.description = description
         self.fn = fn
@@ -287,6 +307,7 @@ class ContiguousTemplate(SubgraphTemplate):
         input_nodes: list[Buffer],
         layout: Layout,
     ) -> SubgraphChoiceCaller:
+        # [FUNCTION DOC] Traces the stored fn with make_fx under the python dispatcher and selected decomposition table, then delegates to the base class generate with the stored name and description. Returns a SubgraphChoiceCaller.
         from torch._dispatch.python import enable_python_dispatcher
 
         from ..decomposition import select_decomp_table
@@ -308,10 +329,12 @@ class ContiguousTemplate(SubgraphTemplate):
 
 
 def contiguous_mm(a, b):
+    # [FUNCTION DOC] HELPER: Matmul of a with a contiguous copy of b.
     return torch.mm(a, b.contiguous())
 
 
 def contiguous_addmm(inp, a, b):
+    # [FUNCTION DOC] HELPER: addmm of inp, a and a contiguous copy of b.
     return torch.addmm(inp, a, b.contiguous())
 
 
@@ -325,6 +348,11 @@ addmm_contiguous_subgraph_template = ContiguousTemplate(
 
 @register_lowering(aten.mm, type_promotion_kind=None)
 def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
+    # [FUNCTION DOC] Lowering for aten.mm with autotuning. Validates out_dtype (same dtype, or fp32 for fp16/bf16, CUDA/XPU only) and raises a runtime error otherwise.
+    # Uses native matmul (dot IR nodes via broadcast multiply and dot reduction) when eligible; for tiny K and N lowers to pointwise multiply and sum.
+    # Otherwise builds MMKernelInputs, bumps counters and logs, then collects aten, decompose-K, Triton (plain, TMA, Blackwell), contiguous, CUTLASS, CK, NV universal and C++ gemm choices,
+    # optionally ranks with AutoHeuristic, appends external matmul choices, may start a remote best-config lookup or remote autotune, and returns the autotuned node.
+    # KNOWN ISSUE: the loop over external_matmul reuses the name k, shadowing the K dimension; and static_shape/is_nonzero are computed twice.
     """
     Lowering for autotuning aten.mm with different backends (Aten, Triton, CUTLASS, etc.)
     """
@@ -378,6 +406,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         ]:
 
             def _to_dtype(x):
+                # [FUNCTION DOC] HELPER: Casts x to the dtype of mat1 without using compute types.
                 return ops.to_dtype(x, mat1.dtype, use_compute_types=False)
 
             args = [make_pointwise(_to_dtype)(x) for x in args]
@@ -579,6 +608,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
 
 @register_lowering(aten._int_mm, type_promotion_kind=None)
 def tuned_int_mm(mat1, mat2, *, layout=None):
+    # [FUNCTION DOC] Lowering for aten._int_mm: output layout int32; collects aten int_mm, Triton mm (int32 enabled) and CUTLASS choices; returns the autotuned node.
     # TODO(coconutruben): integrate into MMKernelInputs when all callsites use that
     m, n, k, layout, mat1, mat2 = mm_args(
         mat1, mat2, layout=layout, out_dtype=torch.int32
@@ -629,6 +659,8 @@ def tuned_int_mm(mat1, mat2, *, layout=None):
 
 @register_lowering(aten.addmm, type_promotion_kind=None)
 def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
+    # [FUNCTION DOC] Lowering for aten.addmm with autotuning. On CUDA with beta 0 it reduces to mm (scaled by alpha, or a zero-filled tensor when alpha is 0). With native matmul it composes beta*inp plus alpha*mm.
+    # Otherwise expands the bias, and if the problem is empty or max-autotune is off returns the aten addmm choice only. Else collects aten (and bias_addmm for broadcast 1D bias), Triton, TMA, contiguous, CUTLASS, NV universal, CK and C++ gemm choices (bias-first inputs are reordered for CUTLASS/CK) and returns the autotuned node.
     """
     Lowering for autotuning aten.addmm with different backends (Aten, Triton, CUTLASS, etc.)
     """
@@ -802,6 +834,8 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
 def tuned_sparse_semi_structured_mm(
     mat1, mat1_meta, mat2, *, out_dtype=None, layout=None
 ):
+    # [FUNCTION DOC] Lowering for aten._sparse_semi_structured_mm: realizes inputs, checks that row counts and the doubled compressed K match, builds a row-major layout from mat2 device and out_dtype if none given (raises an error if both layout and out_dtype are given),
+    # collects the aten choice and CUTLASS 2x choices, and returns the autotuned node.
     from torch._inductor.select_algorithm import realize_inputs
 
     # TODO(coconturuben): support V.choices.get_mm_configs for sparse_semi_structured_mm
@@ -863,12 +897,14 @@ main_loop_scaling_types = [ScalingType.BlockWise1x128, ScalingType.BlockWise128x
 
 
 def _is_tensorwise_scaling(sz: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the scale shape is empty or every dim is statically 1.
     return (len(sz) == 0) or all(
         V.graph.sizevars.statically_known_equals(d, 1) for d in sz
     )
 
 
 def _is_rowwise_scaling(sz: Any, transpose: bool) -> bool:
+    # [FUNCTION DOC] HELPER: True if the scale dim along the reduction axis (first if transpose, else last) is statically 1.
     idx = 0 if transpose else -1
     return V.graph.sizevars.statically_known_equals(sz[idx], 1)
 
@@ -876,6 +912,7 @@ def _is_rowwise_scaling(sz: Any, transpose: bool) -> bool:
 def _is_blockwise1xTILESIZE_scaling(
     sz: Any, tensor_sz: Any, tile_size: int, transpose: bool
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if the scale shape is (rows, ceil(cols / tile_size)) for the tensor shape, with axes swapped when transpose.
     lhs = 1 if transpose else 0
     rhs = 0 if transpose else 1
     return V.graph.sizevars.statically_known_equals(
@@ -886,6 +923,7 @@ def _is_blockwise1xTILESIZE_scaling(
 
 
 def _is_blockwise128x128_scaling(sz: Any, tensor_sz: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the scale shape equals ceil(dim/128) for both tensor dims.
     return V.graph.sizevars.statically_known_equals(
         sz[0], ceildiv(tensor_sz[0], 128)
     ) and V.graph.sizevars.statically_known_equals(sz[1], ceildiv(tensor_sz[1], 128))
@@ -897,6 +935,7 @@ def is_desired_scaling(
     scaling_type: ScalingType,
     transpose: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Checks whether a scale shape matches the given ScalingType for tensor t (tensor-wise, row-wise, 1x128 or 128x128 blockwise). Raises an error for any other scaling type.
     match scaling_type:
         case ScalingType.TensorWise:
             return _is_tensorwise_scaling(scale_size)
@@ -913,6 +952,7 @@ def is_desired_scaling(
 
 
 def get_tile_size(scale_option) -> int:
+    # [FUNCTION DOC] Returns the tile size 128 for the blockwise scaling types; raises an error for any other type.
     match scale_option:
         case ScalingType.BlockWise128x128:
             return 128
@@ -930,6 +970,7 @@ def get_scaling_options(
     scale_a_size: torch.Tensor,
     scale_b_size: torch.Tensor,
 ) -> tuple[ScalingType, ScalingType]:
+    # [FUNCTION DOC] Returns the first pair from scaling_pairs matching the scale shapes of A (as is) and B (transposed). Raises an error if no pair matches.
     for scale_option_a, scale_option_b in scaling_pairs:
         if is_desired_scaling(
             mat_a, scale_a_size, scale_option_a
@@ -966,6 +1007,9 @@ def tuned_scaled_mm_v2(
     use_fast_accum=False,
     layout=None,
 ):
+    # [FUNCTION DOC] Lowering for aten._scaled_mm_v2. Falls back to the eager op (with an empty list for a missing contraction_dim) when scales are swizzled, multi-level, use MX/NVFP4 recipes (BlockWise1x16 or 1x32) or are not float32.
+    # Otherwise mirrors tuned_scaled_mm using the first recipe of each side: checks striding, realizes scales and optional bias, adds aten fp8 choice, Triton scaled templates (TMA epilogue or main-loop scaling, Blackwell, plain mm), NV universal, CUTLASS and CK choices, and returns the autotuned node.
+    # Raises an error if scaling options fit neither epilogue nor main-loop scaling.
     """
     Performs an optimized matrix multiplication where scaling factors are
     applied to the inputs per the supplied recipes, and optionally swizzled.
@@ -987,6 +1031,7 @@ def tuned_scaled_mm_v2(
     # The eager op is called directly so it keeps its native v2 scale_b
     # convention, unlike the v1 aten__fp8_mm choice used on the supported path.
     def check_supported_recipe(recipe: list[int]) -> bool:
+        # [FUNCTION DOC] HELPER: True if none of the recipes is BlockWise1x16 or BlockWise1x32.
         disallowed = OrderedSet([ScalingType.BlockWise1x16, ScalingType.BlockWise1x32])
         return all(ScalingType(r) not in disallowed for r in recipe)
 
@@ -1183,6 +1228,8 @@ def tuned_scaled_mm(
     use_fast_accum=False,
     layout=None,
 ):
+    # [FUNCTION DOC] Lowering for aten._scaled_mm with autotuning. Checks striding, realizes scales and optional bias, adds the aten fp8 choice, then for float32 scales picks scaling options from scale shapes and adds Triton scaled templates (TMA epilogue or main-loop, Blackwell, plain mm; TMA ones skipped with bias),
+    # NV universal choices, and for float32 scales CUTLASS and CK choices; non-float32 (MX) scales return early after NV universal. Returns the autotuned node. Raises an error for unsupported scale shapes.
     """
     Performs an optimized matrix multiplication where scaling factors are applied
     to the inputs and/or output.
@@ -1355,11 +1402,13 @@ def tuned_scaled_mm(
 
 @functools.cache
 def _is_sm7x_or_older_gpu(index: int | None) -> bool:
+    # [FUNCTION DOC] HELPER: Cached check that the CUDA device at index (default 0) has compute capability major version at most 7.
     props = torch.cuda.get_device_properties(index or 0)
     return props.major <= 7
 
 
 def dims_are_int(dims):
+    # [FUNCTION DOC] HELPER: True if every dim is a plain integer (not symbolic).
     return all(isinstance(dim, int) for dim in dims)
 
 
@@ -1377,12 +1426,15 @@ def mm_autoheuristic(
     top_k: int | None = None,
     always_included=None,
 ):
+    # [FUNCTION DOC] Ranks choices using AutoHeuristic. Converts m,n,k to size hints and returns None if any is not a plain integer. Builds a feature context (sizes, dtypes, strides, contiguity, tf32 for mm),
+    # creates an AutoHeuristicSelectAlgorithm with a fallback returning None, and returns either the top_k choices (always_included kept) or the single best choice caller.
     m, n, k = get_size_hints(mat1, mat2, m, n, k)
     if not dims_are_int([m, n, k]):
         return None
     mat1_stride, mat2_stride = get_size_hints_strides(mat1, mat2)
 
     def get_context(m, k, n, mat1, mat2, mat1_stride, mat2_stride):
+        # [FUNCTION DOC] HELPER: Builds the AutoHeuristic context with m, k, n, dtypes, strides, contiguity flags and, for mm, tf32 usage.
         context = AHContext()
         context.add_feature("m", m)
         context.add_feature("k", k)
@@ -1402,6 +1454,7 @@ def mm_autoheuristic(
         return context
 
     def fallback():
+        # [FUNCTION DOC] HELPER: AutoHeuristic fallback that returns None.
         return None
 
     context = get_context(m, k, n, mat1, mat2, mat1_stride, mat2_stride)
@@ -1425,6 +1478,7 @@ def mm_autoheuristic(
 
 
 def get_size_hints(mat1, mat2, m, n, k):
+    # [FUNCTION DOC] HELPER: Replaces symbolic m, k (from mat1) and n, k (from mat2) with optimization hints; returns (m, n, k).
     if not isinstance(m, int) or not isinstance(k, int):
         (m, k) = V.graph.sizevars.optimization_hints(mat1.get_size())
 
@@ -1434,6 +1488,7 @@ def get_size_hints(mat1, mat2, m, n, k):
 
 
 def get_size_hints_strides(mat1, mat2):
+    # [FUNCTION DOC] HELPER: Returns the layout strides of mat1 and mat2 with non-integer strides replaced by optimization hints.
     mat1_stride = mat1.layout.stride
     mat2_stride = mat2.layout.stride
     strides = [mat1_stride, mat2_stride]
