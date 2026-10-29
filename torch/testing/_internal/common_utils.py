@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared infrastructure for PyTorch unit tests: the TestCase base class, the test
+# runner, parametrization decorators, skip/xfail decorators, environment-driven flags, numerical
+# comparison helpers, subprocess/multiprocess helpers, and many small utilities used by test
+# files across the repository. Import-time side effects: reads environment variables to define
+# global flags and settings (through TestEnvironment), loads the slow-test and disabled-test
+# JSON files named in the environment, disables global torch.backends flags, replaces the call
+# methods of TorchScript function and method objects with profiling-aware wrappers, and may
+# configure dynamo and inductor when running under compile modes. Importing this file must not
+# initialize a CUDA context (see the module docstring).
 
 r"""Importing this file must **not** initialize CUDA context. test_distributed
 relies on this assumption to properly run. This means that when this is imported
@@ -110,11 +119,17 @@ NAVI3_ARCH = ("gfx1100", "gfx1101")
 NAVI4_ARCH = ("gfx1200", "gfx1201")
 
 class ProfilingMode(Enum):
+    # [CLASS DOC] Enumeration of the JIT graph executor modes: LEGACY, SIMPLE and PROFILING.
+    # Stored in the global GRAPH_EXECUTOR and used to decide whether tests run with the
+    # profiling executor enabled.
     LEGACY = 1
     SIMPLE = 2
     PROFILING = 3
 
 class HardwareClassification(Enum):
+    # [CLASS DOC] Enumeration of hardware categories a test class can declare via its
+    # hw_classification attribute (generic, accelerator, or a specific device). Used with the
+    # --hw-classification command line option to select which test classes run.
     """Hardware classification metadata for test classes.
 
     Test classes declare a ``hw_classification`` class attribute to indicate
@@ -183,6 +198,9 @@ HW_CLASSIFICATION : set[HardwareClassification] | None = None
 def get_hw_classification(
     test_case_cls: type[unittest.TestCase],
 ) -> HardwareClassification | None:
+    # [FUNCTION DOC] Return the hardware classification declared by a test class through its
+    # hw_classification attribute, or None when the class does not declare one. Raises TypeError
+    # if the attribute is present but is not a HardwareClassification.
     requirement = getattr(test_case_cls, "hw_classification", None)
     if requirement is None:
         return None
@@ -203,6 +221,11 @@ def filter_by_hw_classification(
     *,
     on_match: Callable[[Any], None],
 ) -> None:
+    # [FUNCTION DOC] Walk a collection of items and keep those whose test class has a hardware
+    # classification contained in the requested set. The class of each item is obtained with the
+    # get_class callable; items with no class are counted separately. Each matching item is
+    # passed to the on_match callback. Prints one summary line with the counts of total, passed,
+    # unclassified, no-class and mismatched items. Returns None.
     """Filter items by hardware classification and print a summary.
 
     For each item, `get_class` extracts the associated test class. Items whose
@@ -240,6 +263,8 @@ def filter_by_hw_classification(
 
 
 def is_navi3_arch():
+    # [FUNCTION DOC] Return True if CUDA is available and device 0 is an AMD Navi 3 GPU
+    # (architecture name in NAVI3_ARCH), otherwise False. Queries device properties.
     if torch.cuda.is_available():
         prop = torch.cuda.get_device_properties(0)
         gfx_arch = prop.gcnArchName.split(":")[0]
@@ -248,6 +273,8 @@ def is_navi3_arch():
     return False
 
 def freeze_rng_state(*args, **kwargs):
+    # [FUNCTION DOC] Thin forwarding wrapper that calls the freeze_rng_state context manager
+    # helper from torch.testing._utils with the same arguments and returns its result.
     return torch.testing._utils.freeze_rng_state(*args, **kwargs)
 
 
@@ -256,6 +283,13 @@ def freeze_rng_state(*args, **kwargs):
 # definition.
 # TODO: Expand this class to handle arbitrary settings in addition to boolean flags?
 class TestEnvironment:
+    # [CLASS DOC] Registry of test flags and settings that are derived from environment
+    # variables. Static methods define a flag or setting, publish it as a module-level global,
+    # and remember which environment variables differ from their defaults so a reproduction
+    # command prefix can be printed on test failure. State: the class attribute repro_env_vars
+    # maps an environment variable name to the value it had when that value differs from the
+    # default and is not implied. Flags are meant to be read-only after definition; defining the
+    # same name twice raises.
     # Set of env vars to set for the repro command that is output on test failure.
     # Specifically, this includes env vars that are set to non-default values and
     # are not implied. Maps from env var name -> value (int)
@@ -295,6 +329,13 @@ class TestEnvironment:
             (env_var_val != "0") if default else (env_var_val == "1")),
         implied_by_fn=lambda: False,
     ):
+        # [FUNCTION DOC] Define a boolean test flag and export it as a module-level global.
+        # Reads the named environment variable (if any) and decides the value using enabled_fn
+        # (by default "0" disables a default-on flag and "1" enables a default-off flag). If the
+        # variable is unset, implied_by_fn may switch the flag on. When include_in_repro is true
+        # and the flag differs from its default without being implied, the variable is recorded
+        # in repro_env_vars. Returns the flag value. Raises AssertionError if a global with this
+        # name already exists.
         enabled = default
         env_var_val = None
         if env_var is not None:
@@ -338,6 +379,13 @@ class TestEnvironment:
         include_in_repro=True,
         parse_fn=lambda maybe_val_str: maybe_val_str,
     ):
+        # [FUNCTION DOC] Define a non-boolean test setting and export it as a module-level
+        # global. The raw value is the default when env_var is None, otherwise the environment
+        # variable value (possibly None); it is converted with parse_fn. If include_in_repro is
+        # true and the parsed value differs from the default, it is recorded in repro_env_vars.
+        # Returns the value. Raises AssertionError if the global name is already defined.
+        # KNOWN ISSUE: when env_var is None and parse_fn changes the default, the value is
+        # recorded in repro_env_vars under a None key.
         value = default if env_var is None else os.getenv(env_var)
         value = parse_fn(value)
         if include_in_repro and (value != default):
@@ -355,6 +403,9 @@ class TestEnvironment:
     # Example: "PYTORCH_TEST_WITH_ASAN=1 PYTORCH_TEST_WITH_ROCM=1"
     @staticmethod
     def repro_env_var_prefix() -> str:
+        # [FUNCTION DOC] Build a string of NAME=VALUE pairs, separated by spaces, from
+        # repro_env_vars. It can be prefixed to a command to reproduce the current test
+        # configuration. Returns an empty string when no variables were recorded.
         return " ".join([f"{env_var}={value}"
                          for env_var, value in TestEnvironment.repro_env_vars.items()])
 
@@ -448,6 +499,9 @@ slow_tests_dict = {}
 
 
 def resolve_sandcastle_slow_tests_file() -> str:
+    # [FUNCTION DOC] HELPER: On Sandcastle only, return the path of the slow-tests JSON file
+    # located through torch._utils_internal if it exists, otherwise an empty string. Returns an
+    # empty string when not running on Sandcastle.
     if not IS_SANDCASTLE:
         return ""
 
@@ -456,6 +510,8 @@ def resolve_sandcastle_slow_tests_file() -> str:
 
 
 def maybe_load_json(filename):
+    # [FUNCTION DOC] HELPER: Load and return the parsed JSON content of a file if it exists. If
+    # the file does not exist, logs a warning and returns an empty mapping.
     if os.path.isfile(filename):
         with open(filename) as fp:
             return json.load(fp)
@@ -481,9 +537,15 @@ check_names = ['orin', 'concord', 'galen', 'xavier', 'nano', 'jetson', 'tegra', 
 IS_JETSON = any(name in platform.platform() for name in check_names)
 
 def gcIfJetson(fn):
+    # [FUNCTION DOC] Decorator that wraps a function so that, on Jetson hosts, garbage
+    # collection and a CUDA cache release run before each call. Arguments and the call are
+    # forwarded to the wrapped function.
+    # KNOWN ISSUE: the wrapper discards the wrapped function's return value.
     # Irregular Jetson host/device memory setup requires cleanup to avoid tests being killed
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper produced by gcIfJetson. On Jetson, collects garbage and
+        # empties the CUDA cache, then calls the wrapped function and returns nothing.
         if IS_JETSON:
             gc.collect()
             torch.cuda.empty_cache()
@@ -493,6 +555,10 @@ def gcIfJetson(fn):
 # Tries to extract the current test function by crawling the stack.
 # If unsuccessful, return None.
 def extract_test_fn() -> Callable | None:
+    # [FUNCTION DOC] HELPER: Crawl the call stack looking for a frame whose self is a unittest
+    # TestCase, and return the underlying test method function for it (found from the test id
+    # and requiring a name starting with test). Returns None if nothing suitable is found or any
+    # error occurs; all exceptions are swallowed.
     try:
         stack = inspect.stack()
         for frame_info in stack:
@@ -513,6 +579,9 @@ def extract_test_fn() -> Callable | None:
 # Contains tracked input data useful for debugging purposes
 @dataclass
 class TrackedInput:
+    # [CLASS DOC] HELPER: Simple record of the most recent input produced while iterating test
+    # inputs: its index, the value, and a short description of the input kind. Stored on the
+    # test function for debugging failures.
     index: int
     val: Any
     type_desc: str
@@ -520,12 +589,16 @@ class TrackedInput:
 # Attempt to pull out tracked input information from the test function.
 # A TrackedInputIter is used to insert this information.
 def get_tracked_input() -> TrackedInput | None:
+    # [FUNCTION DOC] HELPER: Return the TrackedInput stored on the currently running test
+    # function, or None if there is no test function or nothing was tracked.
     test_fn = extract_test_fn()
     if test_fn is None:
         return None
     return getattr(test_fn, "tracked_input", None)
 
 def clear_tracked_input() -> None:
+    # [FUNCTION DOC] HELPER: Reset the tracked input on the currently running test function to
+    # None, if a test function is found and it has a tracking slot. Mutates that function.
     test_fn = extract_test_fn()
     if test_fn is None:
         return
@@ -536,6 +609,11 @@ def clear_tracked_input() -> None:
 # Wraps an iterator and tracks the most recent value the iterator produces
 # for debugging purposes. Tracked values are stored on the test function.
 class TrackedInputIter:
+    # [CLASS DOC] Iterator wrapper that yields items from a child iterable while recording the
+    # latest produced value as the tracked input on the current test function. State: the
+    # enumerated child iterator, a description of the input kind, optional item and track
+    # callbacks, the test function found at construction, whether to reseed the RNG before each
+    # item, and an optional single index to restrict iteration to.
     def __init__(
         self,
         child_iter,
@@ -545,6 +623,9 @@ class TrackedInputIter:
         set_seed=True,
         restrict_to_index=None
     ):
+        # [FUNCTION DOC] Store the child iterable (enumerated) and configuration. item_callback
+        # maps (value, index) to the returned item (default: the value itself); track_callback
+        # maps a value to what gets tracked (default: the value). Looks up the test function.
         self.child_iter = enumerate(child_iter)
         # Input type describes the things we're tracking (e.g. "sample input", "error input").
         self.input_type_desc = input_type_desc
@@ -568,9 +649,15 @@ class TrackedInputIter:
         self.restrict_to_index = restrict_to_index
 
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Return the iterator itself.
         return self
 
     def __next__(self):
+        # [FUNCTION DOC] Produce the next item. If set_seed is enabled, first reseed the RNG
+        # using a hash of the test function qualified name (or the default SEED when there is no
+        # test function). Skips items whose index differs from restrict_to_index when set.
+        # Records the chosen item as the tracked input and returns the item_callback result.
+        # StopIteration from the child iterator propagates.
         while True:
             if self.set_seed:
                 # use a test-name-specific hash for the seed if possible
@@ -594,6 +681,8 @@ class TrackedInputIter:
         return self.item_callback(input_val, input_idx)
 
     def _set_tracked_input(self, tracked_input: TrackedInput):
+        # [FUNCTION DOC] HELPER: Store the given tracked input on the test function, but only if
+        # a test function exists and already carries a tracking slot.
         if self.test_fn is None:
             return
         if not hasattr(self.test_fn, "tracked_input"):
@@ -601,6 +690,12 @@ class TrackedInputIter:
         self.test_fn.tracked_input = tracked_input  # type: ignore[attr-defined]
 
 class _TestParametrizer:
+    # [CLASS DOC] Base class for test parametrization decorators. Applying an instance to a
+    # test function attaches a parametrize_fn attribute that later generates specialized
+    # tests, either through instantiate_device_type_tests or instantiate_parametrized_tests.
+    # When applied to a function that already has a parametrize_fn, the two are composed so
+    # the generated tests are the product of both parametrizations. Subclasses must
+    # implement _parametrize_test.
     """
     Decorator class for parametrizing a test function, yielding a set of new tests spawned
     from the original generic test, each specialized for a specific set of test inputs. For
@@ -620,6 +715,10 @@ class _TestParametrizer:
     generated by the old and new parametrize_fns. This allows for convenient composability of decorators.
     """
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Abstract hook: subclasses yield 4-tuples of (test function, name
+        # suffix, parameter keyword mapping, decorator function that maps parameters to a list
+        # of decorators) for the given test, generic class and device class (None if device
+        # agnostic). Raises NotImplementedError in the base class.
         """
         Parametrizes the given test function across whatever dimension is specified by the derived class.
         Tests can be parametrized over any arbitrary dimension or combination of dimensions, such as all
@@ -642,6 +741,9 @@ class _TestParametrizer:
         raise NotImplementedError
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Attach a parametrize_fn to the test function and return the function.
+        # If one is already present, replace it with a composition of the old and the new one.
+        # Mutates the function object.
         if hasattr(fn, 'parametrize_fn'):
             # Do composition with the product of args.
             old_parametrize_fn = fn.parametrize_fn
@@ -653,6 +755,10 @@ class _TestParametrizer:
 
 
 def compose_parametrize_fns(old_parametrize_fn, new_parametrize_fn):
+    # [FUNCTION DOC] Compose two parametrize functions into one that yields the product of their
+    # parametrizations. Test names are joined as new name then old name with an underscore when
+    # both are non-empty. Returns the composite generator function. The composite raises
+    # RuntimeError if both functions parametrize the same parameter.
     """
     Returns a parametrize_fn that parametrizes over the product of the parameters handled
     by the given parametrize_fns. Each given parametrize_fn should each have the signature
@@ -671,6 +777,10 @@ def compose_parametrize_fns(old_parametrize_fn, new_parametrize_fn):
     def composite_fn(test, generic_cls, device_cls,
                      old_parametrize_fn=old_parametrize_fn,
                      new_parametrize_fn=new_parametrize_fn):
+        # [FUNCTION DOC] HELPER: Generator that expands every parametrization of the old
+        # function and applies the new function to each result, yielding the merged test, merged
+        # name, merged parameter mapping and a merged decorator function. Raises RuntimeError on
+        # parameters handled by both.
         old_tests = list(old_parametrize_fn(test, generic_cls, device_cls))
         for (old_test, old_test_name, old_param_kwargs, old_dec_fn) in old_tests:
             for (new_test, new_test_name, new_param_kwargs, new_dec_fn) in \
@@ -686,6 +796,8 @@ def compose_parametrize_fns(old_parametrize_fn, new_parametrize_fn):
                                                    old_test_name)
 
                 def merged_decorator_fn(param_kwargs, old_dec_fn=old_dec_fn, new_dec_fn=new_dec_fn):
+                    # [FUNCTION DOC] HELPER: Return the concatenation of the decorators produced
+                    # by the old and new decorator functions for the given parameters.
                     return list(old_dec_fn(param_kwargs)) + list(new_dec_fn(param_kwargs))
 
                 yield (new_test, merged_test_name, full_param_kwargs, merged_decorator_fn)
@@ -694,6 +806,8 @@ def compose_parametrize_fns(old_parametrize_fn, new_parametrize_fn):
 
 
 def validate_test_name(name):
+    # [FUNCTION DOC] Check a generated test name and raise RuntimeError if it contains a dot,
+    # because dotted names cannot be loaded by name through unittest. Returns None otherwise.
     """
     Validates a generated test name at instantiation time. In particular, test names must
     not contain '.': unittest.TestLoader.loadTestsFromName resolves dotted names by
@@ -712,6 +826,12 @@ def validate_test_name(name):
 
 
 def instantiate_parametrized_tests(generic_cls):
+    # [FUNCTION DOC] Replace each parametrized test on a device-agnostic test class by the
+    # generated specialized tests. For every attribute with a parametrize_fn, the generic test
+    # is deleted from the class and each parametrization is added under a name made of the test
+    # name and suffix, after validating the name and applying the decorators chosen for the
+    # parameters. Returns the class so it can be used as a class decorator. Raises
+    # AssertionError if a generated name already exists on the class.
     """
     Instantiates tests that have been decorated with a parametrize_fn. This is generally performed by a
     decorator subclass of _TestParametrizer. The generic test will be replaced on the test class by
@@ -739,8 +859,13 @@ def instantiate_parametrized_tests(generic_cls):
 
         # Add parametrized tests to the test class.
         def instantiate_test_helper(cls, name, test, param_kwargs):
+            # [FUNCTION DOC] HELPER: Create a test method that calls the original test with the
+            # given parameter mapping and attach it to the class under the given name. Raises
+            # AssertionError if the class already has an attribute with that name.
             @wraps(test)
             def instantiated_test(self, param_kwargs=param_kwargs):
+                # [FUNCTION DOC] HELPER: Test body that forwards its parameters as keyword
+                # arguments to the original test function.
                 test(self, **param_kwargs)
 
             if hasattr(generic_cls, name):
@@ -761,6 +886,9 @@ def instantiate_parametrized_tests(generic_cls):
 
 
 class subtest:
+    # [CLASS DOC] Explicit subtest value for use with the parametrize decorator. Holds the
+    # argument values, an optional explicit test name, and a list of decorators to apply to the
+    # generated test. Uses slots; no behavior beyond storing these fields.
     """
     Explicit subtest case for use with test parametrization.
     Allows for explicit naming of individual subtest cases as well as applying
@@ -775,12 +903,20 @@ class subtest:
     __slots__ = ['arg_values', 'name', 'decorators']
 
     def __init__(self, arg_values, name=None, decorators=None):
+        # [FUNCTION DOC] Store the argument values and optional name; decorators default to an
+        # empty list when not given.
         self.arg_values = arg_values
         self.name = name
         self.decorators = decorators if decorators else []
 
 
 class parametrize(_TestParametrizer):
+    # [CLASS DOC] Generic parametrization decorator modeled after the pytest parametrize
+    # mark. Takes a comma-separated string of argument names, an iterable of values (or
+    # subtest objects) and an optional name function. Each value set yields one generated
+    # test whose name is derived from the argument names and values unless an explicit name
+    # or name function is given. State: the list of argument names, the values iterable and
+    # the name function.
     """
     Decorator for applying generic test parametrizations.
 
@@ -837,11 +973,17 @@ class parametrize(_TestParametrizer):
         name_fn (Callable): Optional function that takes in parameters and returns subtest name.
     """
     def __init__(self, arg_str, arg_values, name_fn=None):
+        # [FUNCTION DOC] Split the argument string on commas into stripped argument names and
+        # store them along with the values iterable and the optional name function.
         self.arg_names: list[str] = [s.strip() for s in arg_str.split(',') if s != '']
         self.arg_values = arg_values
         self.name_fn = name_fn
 
     def _formatted_str_repr(self, idx, name, value):
+        # [FUNCTION DOC] HELPER: Produce the piece of a test name for one argument. Dtypes and
+        # OpInfo/ModuleInfo objects use their short names, devices use their string form, ints,
+        # floats and strings use name plus value with dots replaced by underscores, and any
+        # other value uses the name followed by the index.
         """ Returns a string representation for the given arg that is suitable for use in test function names. """
         if isinstance(value, torch.dtype):
             return dtype_name(value)
@@ -856,9 +998,13 @@ class parametrize(_TestParametrizer):
             return f"{name}{idx}"
 
     def _default_subtest_name(self, idx, values):
+        # [FUNCTION DOC] HELPER: Join the per-argument name pieces for a value set with
+        # underscores to make the default subtest name.
         return '_'.join([self._formatted_str_repr(idx, a, v) for a, v in zip(self.arg_names, values, strict=True)])
 
     def _get_subtest_name(self, idx, values, explicit_name=None):
+        # [FUNCTION DOC] HELPER: Choose the subtest name: the explicit name if given, else the
+        # result of calling the name function with the values, else the default name.
         if explicit_name:
             subtest_name = explicit_name
         elif self.name_fn:
@@ -868,6 +1014,12 @@ class parametrize(_TestParametrizer):
         return subtest_name
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator that yields the parametrizations for a test. With no argument
+        # names it yields the test once with an empty name. Otherwise, for each value set it
+        # unwraps subtest objects (wrapping the test so decorators apply separately), checks
+        # that the number of values matches the number of names, and yields the test, its name,
+        # the parameter mapping and a decorator function. Raises RuntimeError on a count
+        # mismatch and ValueError if the values iterable is empty.
         if len(self.arg_names) == 0:
             # No additional parameters needed for the test.
             test_name = ''
@@ -888,6 +1040,8 @@ class parametrize(_TestParametrizer):
 
                     @wraps(test)
                     def test_wrapper(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Wrapper that calls the original test, so that
+                        # per-subtest decorators apply to a distinct function object.
                         return test(*args, **kwargs)
 
                     decorators = sub.decorators
@@ -905,6 +1059,8 @@ class parametrize(_TestParametrizer):
                 test_name = self._get_subtest_name(idx, values, explicit_name=maybe_name)
 
                 def decorator_fn(_, decorators=decorators):
+                    # [FUNCTION DOC] HELPER: Return the pre-bound list of decorators regardless
+                    # of parameters.
                     return decorators
 
                 yield (gen_test, test_name, param_kwargs, decorator_fn)
@@ -915,6 +1071,10 @@ class parametrize(_TestParametrizer):
 
 
 class reparametrize(_TestParametrizer):
+    # [CLASS DOC] Decorator that adapts another parametrizer. For every parametrization the
+    # wrapped parametrizer produces, an adapter function receives the test name and the
+    # parameter mapping and returns None (drop it) or an iterable of replacement (name,
+    # parameter mapping) pairs. State: the wrapped parametrizer and the adapter.
     """
     Decorator for adjusting the way an existing parametrizer operates. This class runs
     the given adapter_fn on each parametrization produced by the given parametrizer,
@@ -955,10 +1115,14 @@ class reparametrize(_TestParametrizer):
 
     """
     def __init__(self, parametrizer, adapter_fn):
+        # [FUNCTION DOC] Store the wrapped parametrizer and the adapter function.
         self.parametrizer = parametrizer
         self.adapter_fn = adapter_fn
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator that runs the wrapped parametrizer and, for each result,
+        # calls the adapter. Items the adapter drops are skipped; for the rest it yields the
+        # test with the new name and parameters and the original decorator function.
         for (gen_test, test_name, param_kwargs, decorator_fn) in \
                 self.parametrizer._parametrize_test(test, generic_cls, device_cls):
             adapted = self.adapter_fn(test_name, param_kwargs)
@@ -970,6 +1134,9 @@ class reparametrize(_TestParametrizer):
 
 
 class decorateIf(_TestParametrizer):
+    # [CLASS DOC] Parametrizer that conditionally applies a decorator based on the final
+    # parameters of each generated test, and composes with other parametrizers. State: the
+    # decorator and a predicate taking the parameter mapping and returning a boolean.
     """
     Decorator for applying parameter-specific conditional decoration.
     Composes with other test parametrizers (e.g. @modules, @ops, @parametrize, etc.).
@@ -1012,13 +1179,19 @@ class decorateIf(_TestParametrizer):
             indicating whether the decorator should be applied or not.
     """
     def __init__(self, decorator, predicate_fn):
+        # [FUNCTION DOC] Store the decorator and predicate function.
         self.decorator = decorator
         self.predicate_fn = predicate_fn
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator that yields a single unmodified (wrapped) test with an empty
+        # name and empty parameters, together with a decorator function that applies the stored
+        # decorator only when the predicate accepts the parameters.
 
         # Leave test as-is and return the appropriate decorator_fn.
         def decorator_fn(params, decorator=self.decorator, predicate_fn=self.predicate_fn):
+            # [FUNCTION DOC] HELPER: Return a list holding the decorator if the predicate
+            # accepts the parameters, otherwise an empty list.
             if predicate_fn(params):
                 return [decorator]
             else:
@@ -1026,6 +1199,7 @@ class decorateIf(_TestParametrizer):
 
         @wraps(test)
         def test_wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper that calls the original test.
             return test(*args, **kwargs)
 
         test_name = ''
@@ -1033,6 +1207,12 @@ class decorateIf(_TestParametrizer):
 
 
 def cppProfilingFlagsToProfilingMode():
+    # [FUNCTION DOC] Determine the JIT profiling mode implied by the current C++ settings.
+    # Temporarily enables the profiling executor and graph optimization to read the previous
+    # values, restores them, and returns PROFILING, SIMPLE or LEGACY accordingly. Side effect:
+    # calls the C++ setters on the JIT executor flags.
+    # KNOWN ISSUE: the graph optimize call used for restoring is a getter-named binding that is
+    # used as a setter; the restore of that flag relies on it acting as a setter.
     old_prof_exec_state = torch._C._jit_set_profiling_executor(True)
     old_prof_mode_state = torch._C._get_graph_executor_optimize(True)
     torch._C._jit_set_profiling_executor(old_prof_exec_state)
@@ -1048,6 +1228,9 @@ def cppProfilingFlagsToProfilingMode():
 
 @contextmanager
 def enable_profiling_mode_for_profiling_tests():
+    # [FUNCTION DOC] Context manager that, when the global graph executor is PROFILING, enables
+    # the profiling executor and optimization for the body and restores the previous values on
+    # exit. Does nothing otherwise. Raises AssertionError if GRAPH_EXECUTOR is unset.
     old_prof_exec_state = False
     old_prof_mode_state = False
     if not GRAPH_EXECUTOR:
@@ -1064,6 +1247,8 @@ def enable_profiling_mode_for_profiling_tests():
 
 @contextmanager
 def enable_profiling_mode():
+    # [FUNCTION DOC] Context manager that enables the JIT profiling executor and graph
+    # optimization for the body and restores the previous settings on exit.
     old_prof_exec_state = torch._C._jit_set_profiling_executor(True)
     old_prof_mode_state = torch._C._get_graph_executor_optimize(True)
     try:
@@ -1074,6 +1259,8 @@ def enable_profiling_mode():
 
 @contextmanager
 def num_profiled_runs(num_runs):
+    # [FUNCTION DOC] Context manager that sets the number of profiled runs of the JIT for the
+    # body and restores the previous number on exit.
     old_num_runs = torch._C._jit_set_num_profiled_runs(num_runs)
     try:
         yield
@@ -1084,6 +1271,11 @@ func_call = torch._C.ScriptFunction.__call__
 meth_call = torch._C.ScriptMethod.__call__
 
 def prof_callable(callable, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Call a TorchScript callable. If the keyword profile_and_replay is
+    # given it is removed, and when the graph executor is PROFILING the callable is run twice
+    # under profiling mode (the first run profiles, the second returns the result). Otherwise
+    # the callable is called once. Returns its result. Raises AssertionError if the keyword is
+    # given and GRAPH_EXECUTOR is unset.
     if 'profile_and_replay' in kwargs:
         del kwargs['profile_and_replay']
         if not GRAPH_EXECUTOR:
@@ -1096,20 +1288,29 @@ def prof_callable(callable, *args, **kwargs):
     return callable(*args, **kwargs)
 
 def raise_on_run_directly(file_to_call):
+    # [FUNCTION DOC] Always raises RuntimeError telling the user that the given test file must
+    # not be run directly and showing the correct invocation with a test name.
     raise RuntimeError("This test file is not meant to be run directly, "
                        f"use:\n\n\tpython {file_to_call} TESTNAME\n\n"
                        "instead.")
 
 def prof_func_call(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement for the call method of script functions; forwards to
+    # prof_callable with the original call.
     return prof_callable(func_call, *args, **kwargs)
 
 def prof_meth_call(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement for the call method of script methods; forwards to
+    # prof_callable with the original call.
     return prof_callable(meth_call, *args, **kwargs)
 
 torch._C.ScriptFunction.__call__ = prof_func_call  # type: ignore[method-assign]
 torch._C.ScriptMethod.__call__ = prof_meth_call  # type: ignore[method-assign]
 
 def _get_test_report_path():
+    # [FUNCTION DOC] HELPER: Return the relative report directory: test-reports joined with the
+    # value of the TEST_REPORT_SOURCE_OVERRIDE environment variable, or python-unittest when it
+    # is unset.
     # allow users to override the test file location. We need this
     # because the distributed tests run the same test file multiple
     # times with different configurations.
@@ -1118,6 +1319,14 @@ def _get_test_report_path():
     return os.path.join('test-reports', test_source)
 
 def parse_cmd_line_args():
+    # [FUNCTION DOC] Parse the test command line (subprocess, accept, jit executor, repeat,
+    # bailouts, pytest, XML output, discover, log suffix, parallel, slow/disabled test files,
+    # rerun disabled, single pytest test, showlocals, hw classification) and publish the results
+    # into the module-level globals. The unrecognized arguments are kept in UNITTEST_ARGS after
+    # the program name. If help is requested it also runs unittest's help in a thread. Sets the
+    # graph executor mode, the expecttest accept flag, and seeds the RNG through set_rng_seed.
+    # Returns None.
+    # KNOWN ISSUE: the repeat option defaults to 1, while REPEAT_COUNT starts at 0.
     global DISABLED_TESTS_FILE
     global GRAPH_EXECUTOR
     global LOG_SUFFIX
@@ -1159,6 +1368,8 @@ def parse_cmd_line_args():
 
 # Only run when -h or --help flag is active to display both unittest and parser help messages.
     def run_unittest_help(argv):
+        # [FUNCTION DOC] HELPER: Run unittest main with the given argument list (used to print
+        # unittest help text; unittest exits the process afterwards).
         unittest.main(argv=argv)
 
     if '-h' in sys.argv or '--help' in sys.argv:
@@ -1204,6 +1415,13 @@ def parse_cmd_line_args():
 
 
 def wait_for_process(p, timeout=None):
+    # [FUNCTION DOC] Wait for a subprocess and return its exit status. On KeyboardInterrupt it
+    # waits up to five seconds for the child and kills it if still running, then re-raises. On
+    # timeout it sends SIGINT, waits five more seconds, and kills the child if needed, then
+    # re-raises the timeout. Any other exception kills the child and is re-raised. A final wait
+    # always runs.
+    # KNOWN ISSUE: in the keyboard interrupt branch the wait with a timeout raises
+    # TimeoutExpired rather than returning None, so the kill branch is rarely reached.
     try:
         return p.wait(timeout=timeout)
     except KeyboardInterrupt:
@@ -1238,6 +1456,9 @@ def wait_for_process(p, timeout=None):
         p.wait()
 
 def shell(command, cwd=None, env=None, stdout=None, stderr=None, timeout=None):
+    # [FUNCTION DOC] Start a subprocess for the given command and wait for it through
+    # wait_for_process. Flushes stdout and stderr first. Returns the exit status. Raises
+    # AssertionError if the command is a string rather than a list or tuple.
     sys.stdout.flush()
     sys.stderr.flush()
     # The following cool snippet is copied from Py3 core library subprocess.call
@@ -1264,6 +1485,10 @@ def retry_shell(
     was_rerun=False,
     label="",
 ) -> tuple[int, bool]:
+    # [FUNCTION DOC] Run a command via shell and return a pair (exit code, whether it was
+    # rerun). On a nonzero exit or timeout it retries recursively while retries remain, printing
+    # a message to stdout. When retries are exhausted on timeout it prints a message with the
+    # label and returns exit code 124. Raises AssertionError if retries is negative.
     # Returns exicode + whether it was rerun
     if not (retries >= 0):
         raise AssertionError(
@@ -1313,6 +1538,8 @@ def retry_shell(
 
 
 def discover_test_cases_recursively(suite_or_case):
+    # [FUNCTION DOC] Flatten a unittest suite into a list of its individual TestCase objects by
+    # recursion. A TestCase argument returns a one-element list.
     if isinstance(suite_or_case, unittest.TestCase):
         return [suite_or_case]
     rc = []
@@ -1321,23 +1548,36 @@ def discover_test_cases_recursively(suite_or_case):
     return rc
 
 def get_test_names(test_cases):
+    # [FUNCTION DOC] Return, for each test case, a string made of the last two dotted parts of
+    # its id (class name and test method name).
     return ['.'.join(case.id().split('.')[-2:]) for case in test_cases]
 
 def _print_test_names():
+    # [FUNCTION DOC] HELPER: Load the tests of the main module and print each test name (class
+    # and method) on its own line. Used by the discover-tests mode.
     suite = unittest.TestLoader().loadTestsFromModule(__main__)
     test_cases = discover_test_cases_recursively(suite)
     for name in get_test_names(test_cases):
         print(name)
 
 def chunk_list(lst, nchunks):
+    # [FUNCTION DOC] Split a list into nchunks interleaved sublists (round robin) and return
+    # them as a list of lists.
     return [lst[i::nchunks] for i in range(nchunks)]
 
 # sanitize filename e.g., distributed/pipeline/sync/skip/test_api.py -> distributed.pipeline.sync.skip.test_api
 def sanitize_test_filename(filename):
+    # [FUNCTION DOC] HELPER: Convert a test file path into a dotted name by removing a trailing
+    # .py and replacing slashes with dots.
     strip_py = re.sub(r'.py$', '', filename)
     return re.sub('/', r'.', strip_py)
 
 def lint_test_case_extension(suite):
+    # [FUNCTION DOC] Check that every test class in a suite extends the TestCase of this module.
+    # Prints a failure message naming each offending class and returns False if any was found,
+    # otherwise True. Recurses into nested suites.
+    # KNOWN ISSUE: when a nested suite is found as the first test, the function returns
+    # immediately after recursing, so later siblings are not checked.
     succeed = True
     for test_case_or_suite in suite:
         test_case = test_case_or_suite
@@ -1357,6 +1597,10 @@ def lint_test_case_extension(suite):
 
 
 def get_report_path(argv=None, pytest=False):
+    # [FUNCTION DOC] Compute and create the directory for XML test reports using the save
+    # location, log suffix and sanitized test file name (argv defaults to UNITTEST_ARGS). For
+    # pytest it switches the directory name to python-pytest and returns a unique XML file path
+    # inside it. Creates directories as a side effect and returns the path.
     if argv is None:
         argv = UNITTEST_ARGS
     test_filename = sanitize_test_filename(argv[0])
@@ -1372,6 +1616,9 @@ def get_report_path(argv=None, pytest=False):
 
 
 def sanitize_pytest_xml(xml_file: str):
+    # [FUNCTION DOC] Rewrite a pytest XML report in place so test case entries look like
+    # unittest ones: split the class name into a file attribute (with slashes and .py) and a
+    # short class name. Test cases with no class name or an unmatched one are left alone.
     # pytext xml is different from unittext xml, this function makes pytest xml more similar to unittest xml
     # consider somehow modifying the XML logger in conftest to do this instead
     import xml.etree.ElementTree as ET
@@ -1392,11 +1639,19 @@ def sanitize_pytest_xml(xml_file: str):
 
 
 def get_pytest_test_cases(argv: list[str]) -> list[str]:
+    # [FUNCTION DOC] Collect pytest test node ids without running tests. Runs pytest in
+    # collect-only mode with the given argument list (dropping the -vv flag) and a plugin that
+    # records each item's id relative to the working directory. Returns the list of ids.
     class TestCollectorPlugin:
+        # [CLASS DOC] HELPER: Pytest plugin that records the node ids of collected tests in
+        # a list.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Initialize an empty list of collected test ids.
             self.tests: list[Any] = []
 
         def pytest_collection_finish(self, session):
+            # [FUNCTION DOC] HELPER: Pytest hook called after collection; appends the working
+            # directory relative node id of every collected item to the list.
             for item in session.items:
                 self.tests.append(session.config.cwd_relative_nodeid(item.nodeid))
 
@@ -1410,8 +1665,12 @@ def get_pytest_test_cases(argv: list[str]) -> list[str]:
 
 
 class HardwareClassificationTestLoader(unittest.TestLoader):
+    # [CLASS DOC] Test loader that filters the loaded tests by hardware classification. State:
+    # the set of requested classifications (None disables filtering). Loading from a module or a
+    # name returns a suite containing only tests whose class matches.
     """Unittest TestLoader that filters loaded tests by hw_classification."""
     def __init__(self, hw_classification):
+        # [FUNCTION DOC] Initialize the loader and store the requested hardware classifications.
         super().__init__()
         self.hw_classification = hw_classification
 
@@ -1419,6 +1678,8 @@ class HardwareClassificationTestLoader(unittest.TestLoader):
     def iter_test_cases_recursively(
         suite_or_case: unittest.TestSuite | unittest.TestCase,
     ) -> Iterator[unittest.TestCase]:
+        # [FUNCTION DOC] Static generator that yields every individual test case from a suite or
+        # case by recursion.
         if isinstance(suite_or_case, unittest.TestCase):
             yield suite_or_case
             return
@@ -1428,6 +1689,9 @@ class HardwareClassificationTestLoader(unittest.TestLoader):
             yield from _iter(element)
 
     def get_filtered_suite(self, tests: unittest.TestSuite) -> unittest.TestSuite:
+        # [FUNCTION DOC] Return the given suite unchanged if no classification filter is set,
+        # otherwise a new suite with the test cases whose classes match the filter (a summary
+        # line is printed by the filtering helper).
         if self.hw_classification is None:
             return tests
 
@@ -1442,12 +1706,17 @@ class HardwareClassificationTestLoader(unittest.TestLoader):
         return filtered_suite
 
     def loadTestsFromModule(self, module, *args, pattern=None, **kwargs):
+        # [FUNCTION DOC] Load the tests of a module using the base loader and return them after
+        # applying the hardware classification filter.
         suite = super().loadTestsFromModule(
             module, *args, pattern=pattern, **kwargs
         )
         return self.get_filtered_suite(suite)
 
     def loadTestsFromName(self, name, module=None, *args, **kwargs):
+        # [FUNCTION DOC] Load tests by name with the base loader and return them filtered by
+        # hardware classification. A suite that begins with a failed-load placeholder is
+        # returned unfiltered so the load error is still reported.
         suite = super().loadTestsFromName(name, module, *args, **kwargs)
         # _FailedTest has no hw_classification attribute, so
         # get_filtered_suite would count it as unclassified and drop it
@@ -1461,6 +1730,16 @@ class HardwareClassificationTestLoader(unittest.TestLoader):
 
 
 def run_tests(argv=None):
+    # [FUNCTION DOC] Main entry point of test files. Parses the command line, loads the slow and
+    # disabled test lists (updating globals and environment variables, warning if a file is
+    # missing), optionally prints the test names and returns, and checks that all test classes
+    # extend the right TestCase (exiting with status 1 otherwise). It then runs the tests in one
+    # of several modes: one subprocess per test (retrying once, reporting failures with a
+    # reproduction command and raising AssertionError listing failed tests), sharded parallel
+    # subprocesses (AssertionError if any shard fails), pytest (exit code 5 treated as success),
+    # unittest with the XML runner that also prints skip reasons, a repeated run (exits with -1
+    # on a failure), or a plain unittest run. Side effects: global state, environment variables,
+    # subprocesses, report files, exits.
     parse_cmd_line_args()
     if argv is None:
         argv = UNITTEST_ARGS
@@ -1598,6 +1877,8 @@ def run_tests(argv=None):
         from xmlrunner.result import _XMLTestResult  # type: ignore[import]
 
         class XMLTestResultVerbose(_XMLTestResult):
+            # [CLASS DOC] HELPER: XML test result class that makes the skip message include the
+            # skip reason and prints unexpected successes as XPASS in the error summary.
             """
             Adding verbosity to test outputs:
             by default test summary prints 'skip',
@@ -1609,6 +1890,9 @@ def run_tests(argv=None):
             """
 
             def addSkip(self, test, reason):
+                # [FUNCTION DOC] HELPER: Record a skip as in the base class, then patch the
+                # captured verbose string in the callback closure to read skip followed by
+                # the reason.
                 super().addSkip(test, reason)
                 for c in self.callback.__closure__:
                     if isinstance(c.cell_contents, str) and c.cell_contents == 'skip':
@@ -1617,6 +1901,8 @@ def run_tests(argv=None):
                         c.cell_contents = f"skip: {reason}"
 
             def printErrors(self) -> None:
+                # [FUNCTION DOC] HELPER: Print errors as in the base class and additionally
+                # print the list of unexpected successes under the XPASS label.
                 super().printErrors()
                 self.printErrorList("XPASS", self.unexpectedSuccesses)
         test_report_path = get_report_path()
@@ -1649,6 +1935,9 @@ IS_CPU_CAPABILITY_SVE256 = torch._C._get_cpu_capability() == "SVE256"
 if IS_WINDOWS:
     @contextmanager
     def TemporaryFileName(*args, **kwargs):
+        # [FUNCTION DOC] Windows variant: context manager that creates a named temporary file,
+        # closes it, yields its name, and deletes it afterwards. Arguments go to the temp file
+        # constructor; deletion must be disabled (default), otherwise UserWarning is raised.
         # Ideally we would like to not have to manually delete the file, but NamedTemporaryFile
         # opens the file, and it cannot be opened multiple times in Windows. To support Windows,
         # close the file after creation and try to remove it manually
@@ -1666,12 +1955,16 @@ if IS_WINDOWS:
 else:
     @contextmanager  # noqa: T484
     def TemporaryFileName(*args, **kwargs):
+        # [FUNCTION DOC] Non-Windows variant: context manager that yields the name of a named
+        # temporary file created with the given arguments; the file is removed on exit.
         with tempfile.NamedTemporaryFile(*args, **kwargs) as f:
             yield f.name
 
 if IS_WINDOWS:
     @contextmanager
     def TemporaryDirectoryName(suffix=None):
+        # [FUNCTION DOC] Windows variant: context manager that creates a temporary directory
+        # with mkdtemp, yields its name, and removes it with rmtree on exit.
         # On Windows the directory created by TemporaryDirectory is likely to be removed prematurely,
         # so we first create the directory using mkdtemp and then remove it manually
         try:
@@ -1682,13 +1975,21 @@ if IS_WINDOWS:
 else:
     @contextmanager  # noqa: T484
     def TemporaryDirectoryName(suffix=None):
+        # [FUNCTION DOC] Non-Windows variant: context manager that yields the path of a
+        # temporary directory (with the given suffix) which is removed on exit.
         with tempfile.TemporaryDirectory(suffix=suffix) as d:
             yield d
 
 
 def make_lazy_class(cls):
+    # [FUNCTION DOC] Class decorator that turns a class into a lazy value holder. It replaces
+    # the initializer with one taking a callback, and installs arithmetic, comparison, bool, int
+    # and index special methods that evaluate the callback on first use, cache the value, and
+    # delegate to the cached value. Mutates and returns the class.
 
     def lazy_init(self, cb):
+        # [FUNCTION DOC] HELPER: Initializer installed on lazy classes; stores the callback and
+        # an empty value.
         self._cb = cb
         self._value = None
 
@@ -1702,9 +2003,15 @@ def make_lazy_class(cls):
         name = f"__{basename}__"
 
         def inner_wrapper(name):
+            # [FUNCTION DOC] HELPER: Build the special method for one operator name. The result
+            # evaluates the callback once on first call, then calls either the value's own
+            # method (for bool and int) or the operator module function of the same name.
             use_operator = basename not in ("bool", "int")
 
             def wrapped(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: The generated special method: evaluates the pending
+                # callback if any (and clears it), then delegates the operation to the
+                # cached value.
                 if self._cb is not None:
                     self._value = self._cb()
                     self._cb = None
@@ -1721,6 +2028,9 @@ def make_lazy_class(cls):
 
 @make_lazy_class
 class LazyVal:
+    # [CLASS DOC] Lazily evaluated value (created through make_lazy_class). Wraps a callback
+    # that is evaluated on first use of the object in an operator, comparison, bool or int
+    # context. Used for expensive availability flags such as TEST_ACCELERATOR.
     pass
 
 
@@ -1755,12 +2065,19 @@ TEST_Z3 = _check_module_exists('z3')
 
 # DSL availability (lazy evaluation to avoid import overhead)
 class LazyDSLCheck:
+    # [CLASS DOC] Lazy checker for availability of native DSL backends. It imports the DSL
+    # registry only on first use and answers availability questions, so that importing this
+    # module does not pay the import cost. State: the registry (None if unavailable) and a flag
+    # recording whether an import was attempted.
     """Lazy DSL availability checker to avoid import-time overhead"""
     def __init__(self):
+        # [FUNCTION DOC] Initialize with no registry and no import attempted.
         self._registry = None
         self._import_attempted = False
 
     def _get_registry(self):
+        # [FUNCTION DOC] HELPER: Import the DSL registry once; remember failure by keeping None.
+        # Returns the registry or None.
         if not self._import_attempted:
             self._import_attempted = True
             try:
@@ -1771,16 +2088,22 @@ class LazyDSLCheck:
         return self._registry
 
     def is_available(self, dsl_name: str) -> bool:
+        # [FUNCTION DOC] Return True if the registry reports the named DSL as available, False
+        # if there is no registry.
         """Check if specific DSL is available"""
         registry = self._get_registry()
         return registry.is_dsl_available(dsl_name) if registry is not None else False
 
     def list_available(self) -> list[str]:
+        # [FUNCTION DOC] Return a list of the names of available DSLs, empty if there is
+        # no registry.
         """Get list of available DSLs"""
         registry = self._get_registry()
         return list(registry.list_available_dsls()) if registry is not None else []
 
     def list_all(self) -> list[str]:
+        # [FUNCTION DOC] Return a list of the names of all registered DSLs, empty if there is
+        # no registry.
         """Get list of all registered DSLs"""
         registry = self._get_registry()
         return list(registry.list_all_dsls()) if registry is not None else []
@@ -1793,6 +2116,8 @@ TEST_CUTEDSL = LazyVal(lambda: _dsl_checker.is_available('cutedsl'))
 TEST_HELION_DSL = LazyVal(lambda: _dsl_checker.is_available('helion'))
 
 def split_if_not_empty(x: str):
+    # [FUNCTION DOC] HELPER: Split a string on commas, returning an empty list for an
+    # empty string.
     return x.split(",") if len(x) != 0 else []
 
 NOTEST_CPU = "cpu" in split_if_not_empty(os.getenv('PYTORCH_TESTING_DEVICE_EXCEPT_FOR', ''))
@@ -1805,26 +2130,33 @@ skipIfNoCuteDSL = unittest.skipIf(not TEST_CUTEDSL, "CuTeDSL not available")
 skipIfNoHelionDSL = unittest.skipIf(not TEST_HELION_DSL, "Helion DSL not available")
 
 def skipIfDSLUnavailable(dsl_name: str, reason: str | None = None):
+    # [FUNCTION DOC] Return a unittest skip decorator that skips tests when the named DSL is not
+    # available. The check happens at decoration time. A custom reason may be given.
     """Skip test if specific DSL is not available"""
     available = _dsl_checker.is_available(dsl_name)
     msg = reason or f"{dsl_name} DSL not available"
     return unittest.skipIf(not available, msg)
 
 def skipUnlessDSLAvailable(dsl_name: str, reason: str | None = None):
+    # [FUNCTION DOC] Return a unittest skip decorator that skips tests unless the named DSL is
+    # available. The check happens at decoration time. A custom reason may be given.
     """Skip test unless specific DSL is available"""
     available = _dsl_checker.is_available(dsl_name)
     msg = reason or f"{dsl_name} DSL required"
     return unittest.skipUnless(available, msg)
 
 def get_available_dsls() -> list[str]:
+    # [FUNCTION DOC] Return the list of available DSL names, for use in test parametrization.
     """Get list of available DSL names for test parameterization"""
     return _dsl_checker.list_available()
 
 def is_dsl_available(dsl_name: str) -> bool:
+    # [FUNCTION DOC] Return True if the named DSL is available.
     """Check if specific DSL is available for conditional testing"""
     return _dsl_checker.is_available(dsl_name)
 
 def get_all_dsls() -> list[str]:
+    # [FUNCTION DOC] Return the list of all registered DSL names, available or not.
     """Get all registered DSL names (available or not) for comprehensive testing"""
     return _dsl_checker.list_all()
 
@@ -1903,6 +2235,9 @@ skipIfNoNvmath = unittest.skipIf(not TEST_NVMATH, "nvmath-python not available")
 
 if TEST_CUDA_PYTHON_BINDINGS:
     def cuda_python_error_check(function_call_output):
+        # [FUNCTION DOC] Check the result tuple of a cuda-python runtime call. The first element
+        # is the error code; if it is not the success code a ValueError is raised, otherwise the
+        # remaining elements are returned as a tuple. Defined only when the bindings exist.
         """Makes calls to cuda-python's cuda runtime functions more
         pythonic by throwing an exception if they return a status
         which is not cudaSuccess
@@ -1918,6 +2253,10 @@ else:
     cuda_python_error_check = None  # type: ignore[assignment]
 
 def allocator_option_enabled_fn(allocator_config, _, option):
+    # [FUNCTION DOC] HELPER: Enabled-function for TestEnvironment flags that read allocator
+    # configuration. Parses a comma separated list of name and value pairs and returns True
+    # only if the named option is present with the value True. Returns False if the
+    # configuration is None.
     if allocator_config is None:
         return False
     allocator_config = allocator_config.split(',') if ',' in allocator_config else [allocator_config]
@@ -1944,6 +2283,10 @@ requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "Requires CUDA")
 
 
 def lazy_skip_if(condition_fn, reason):
+    # [FUNCTION DOC] Build a decorator that skips a test function or test class when the
+    # condition function returns true. For functions the condition is checked on every run and a
+    # SkipTest is raised; for classes it is checked once at decoration time and the standard
+    # unittest skip attributes are set. Returns the decorator.
     """Skip a test (function or class) when ``condition_fn()`` is true.
 
     For function targets the condition is evaluated each time the test
@@ -1959,6 +2302,9 @@ def lazy_skip_if(condition_fn, reason):
     """
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Apply the skip logic to a class (mark it skipped if the
+        # condition holds) or a function (wrap it so it raises SkipTest when the
+        # condition holds).
         if isinstance(fn, type):
             if condition_fn():
                 fn.__unittest_skip__ = True  # type: ignore[attr-defined]
@@ -1967,6 +2313,8 @@ def lazy_skip_if(condition_fn, reason):
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raise SkipTest with the reason if the condition holds,
+            # otherwise call the wrapped test and return its result.
             if condition_fn():
                 raise unittest.SkipTest(reason)
             return fn(*args, **kwargs)
@@ -1975,10 +2323,18 @@ def lazy_skip_if(condition_fn, reason):
 
 
 def skipIfCrossRef(fn):
+    # [FUNCTION DOC] Decorator that skips the test when the crossref mode is enabled. Returns
+    # the wrapped function.
+    # KNOWN ISSUE: the skip reason text reads "test doesn't currently with crossref", a word
+    # is missing.
     return lazy_skip_if(lambda: TEST_WITH_CROSSREF, "test doesn't currently with crossref")(fn)
 
 class CrossRefMode(torch.overrides.TorchFunctionMode):
+    # [CLASS DOC] Torch function mode used for crossref testing; it simply runs each function
+    # call normally and returns its result without extra computation.
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Run the intercepted function with its arguments (keyword arguments
+        # default to empty) and return the result unchanged.
         kwargs = kwargs or {}
         r = func(*args, **kwargs)
         return r
@@ -2021,6 +2377,9 @@ if TEST_WITH_TORCHDYNAMO:
 
 # seems like this is only used in test/torch_np
 def xpassIfTorchDynamo_np(func):
+    # [FUNCTION DOC] Decorator for numpy-compat tests. Under dynamo with numpy 2 it skips the
+    # test; under dynamo otherwise it returns the function; outside dynamo it marks the test as
+    # an expected failure. Returns the function or wrapped function.
     # numpy 2.0+ is causing issues
     if TEST_WITH_TORCHDYNAMO and np.__version__[0] == '2':
         return unittest.skip("skipping numpy 2.0+ dynamo-wrapped test")(func)
@@ -2031,38 +2390,51 @@ requires_mkl = unittest.skipUnless(TEST_MKL, "Test requires MKL")
 requires_onednn = unittest.skipUnless(TEST_ONEDNN, "Test requires OneDNN/MKLDNN")
 
 def xfailIfACL(func):
+    # [FUNCTION DOC] Mark the function as expected to fail when ACL (Arm Compute Library)
+    # support is present, otherwise return it unchanged.
     return unittest.expectedFailure(func) if TEST_ACL else func
 
 
 def xfailIfTorchDynamo(func):
+    # [FUNCTION DOC] Mark the function as expected to fail when running under dynamo, otherwise
+    # return it unchanged.
     return unittest.expectedFailure(func) if TEST_WITH_TORCHDYNAMO else func
 
 
 def xfailIfPy312Plus(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on Python 3.12 and newer.
     return unittest.expectedFailure(func) if sys.version_info >= (3, 12) else func
 
 
 def xfailIfPy314Plus(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on Python 3.14 and newer.
     return unittest.expectedFailure(func) if sys.version_info >= (3, 14) else func
 
 
 def xfailIfPy313AndEarlier(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on Python versions before 3.14.
     return unittest.expectedFailure(func) if sys.version_info < (3, 14) else func
 
 
 def xfailIfLinux(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on Linux, except on ROCm and in
+    # fbcode builds.
     return unittest.expectedFailure(func) if IS_LINUX and not TEST_WITH_ROCM and not IS_FBCODE else func
 
 
 def xfailIfWindows(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on Windows.
     return unittest.expectedFailure(func) if IS_WINDOWS else func
 
 
 def xfailIfROCm(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on ROCm builds.
     return unittest.expectedFailure(func) if torch.version.hip is not None else func
 
 
 def _is_cpu_device_type(dev) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the argument is a torch device of type cpu or a
+    # string naming cpu (optionally with an index), otherwise False.
     if isinstance(dev, torch.device):
         return dev.type == "cpu"
     if isinstance(dev, str):
@@ -2071,6 +2443,8 @@ def _is_cpu_device_type(dev) -> bool:
 
 
 def _device_spec_from_test_call(args: tuple, kwargs: dict):
+    # [FUNCTION DOC] HELPER: Return the device or devices keyword argument of a test call,
+    # preferring device, or None if neither is present. Positional args are ignored.
     if "device" in kwargs:
         return kwargs["device"]
     if "devices" in kwargs:
@@ -2079,6 +2453,10 @@ def _device_spec_from_test_call(args: tuple, kwargs: dict):
 
 
 def xfailIfNoAcceleratorTriton(test_func):
+    # [FUNCTION DOC] Decorator for a test function or a whole test class. If triton is installed
+    # the test runs normally. Otherwise, for CPU devices the test runs and an import error
+    # mentioning triton becomes an xfail; for other devices it is xfailed through pytest. For a
+    # class, each test method is wrapped. Returns the class or wrapper.
     """Run test normally if triton is present or if running on CPU (which falls back to openmp).
     Otherwise mark as xfail — any accelerator (CUDA, XPU, ROCm, etc.) requires triton.
     Can be applied to a test method or an entire test class."""
@@ -2096,6 +2474,8 @@ def xfailIfNoAcceleratorTriton(test_func):
 
     @functools.wraps(test_func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the test if triton exists. Otherwise find the device from
+        # the call, run on CPU converting triton import errors into xfail, or call pytest xfail.
         if has_triton():
             return test_func(*args, **kwargs)
 
@@ -2121,12 +2501,17 @@ def xfailIfNoAcceleratorTriton(test_func):
 
 
 def skipIfFreeThreaded(msg="Test doesn't work with free-threaded python"):
+    # [FUNCTION DOC] Return a skip decorator for free-threaded Python builds with the given
+    # message. Raises AssertionError if the message is not a string (e.g. decorator misuse).
     if not isinstance(msg, str):
         raise AssertionError("Are you using skipIfFreeThreaded correctly?")
     return unittest.skipIf(sysconfig.get_config_var("Py_GIL_DISABLED") == 1, msg)
 
 
 def skipIfTorchDynamo(msg="test doesn't currently work with dynamo"):
+    # [FUNCTION DOC] Return a decorator that skips a test function, or a class, when running
+    # under dynamo, with the given message. Raises AssertionError if the message is not a
+    # string. Function tests raise SkipTest at call time; classes get skip attributes set.
     """
     Usage:
     @skipIfTorchDynamo(msg)
@@ -2137,9 +2522,15 @@ def skipIfTorchDynamo(msg="test doesn't currently work with dynamo"):
         raise AssertionError("Are you using skipIfTorchDynamo correctly?")
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest under dynamo, or mark a
+        # class as skipped under dynamo. Returns the wrapper or class.
+        # KNOWN ISSUE: the second check that fn is a type is redundant, since non-types return
+        # earlier; also the wrapper drops the return value of the test.
         if not isinstance(fn, type):
             @wraps(fn)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Raise SkipTest under dynamo, otherwise call the test
+                # (the return value is not propagated).
                 if TEST_WITH_TORCHDYNAMO:
                     raise unittest.SkipTest(msg)
                 else:
@@ -2158,10 +2549,16 @@ def skipIfTorchDynamo(msg="test doesn't currently work with dynamo"):
 
 def skipIfTorchInductor(msg="test doesn't currently work with torchinductor",
                         condition=TEST_WITH_TORCHINDUCTOR):
+    # [FUNCTION DOC] Return a decorator that skips a test function or class when condition is
+    # true (by default, when running under inductor), with the given message.
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest when the condition holds,
+        # or mark a class as skipped. Returns the wrapper or class.
         if not isinstance(fn, type):
             @wraps(fn)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Raise SkipTest if the condition holds, otherwise call
+                # the test (the return value is not propagated).
                 if condition:
                     raise unittest.SkipTest(msg)
                 else:
@@ -2179,6 +2576,8 @@ def skipIfTorchInductor(msg="test doesn't currently work with torchinductor",
     return decorator
 
 def runWithoutCompiledAutograd(msg="test doesn't currently work with compiled autograd"):
+    # [FUNCTION DOC] Return a decorator that runs the test with compiled autograd disabled.
+    # Raises AssertionError if the message is not a string.
     """
     Usage:
     @runWithoutCompiledAutograd(msg)
@@ -2189,8 +2588,12 @@ def runWithoutCompiledAutograd(msg="test doesn't currently work with compiled au
         raise AssertionError(f"expected msg to be str, got {type(msg)}")
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wrap the function so it runs inside the compiled autograd
+        # disable context.
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Call the test under the compiled autograd disable context
+            # (the return value is not propagated).
             with torch._dynamo.compiled_autograd._disable():
                 func(*args, **kwargs)
         return wrapper
@@ -2198,6 +2601,9 @@ def runWithoutCompiledAutograd(msg="test doesn't currently work with compiled au
     return decorator
 
 def serialTest(condition=True):
+    # [FUNCTION DOC] Return a decorator that marks a test with the pytest serial marker when
+    # pytest is installed and the condition is true; otherwise the test is unchanged. Raises
+    # AssertionError if the condition is not a bool, which catches use without call.
     """
     Decorator for running tests serially.  Requires pytest
     """
@@ -2207,13 +2613,20 @@ def serialTest(condition=True):
         raise AssertionError(f"expected condition to be bool, got {type(condition)}")
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Mark the function serial if pytest exists and the condition is
+        # true, else return it unchanged.
         if has_pytest and condition:
             return pytest.mark.serial(fn)
         return fn
     return decorator
 
 def unMarkDynamoStrictTest(cls=None):
+    # [FUNCTION DOC] Mark a class as not strict for dynamo by setting its dynamo_strict
+    # attribute to False. Usable with or without parentheses: with a class it modifies and
+    # returns it, without one it returns a decorator.
     def decorator(cls):
+        # [FUNCTION DOC] HELPER: Set the dynamo_strict attribute of the class to False and
+        # return it.
         cls.dynamo_strict = False
         return cls
 
@@ -2224,6 +2637,10 @@ def unMarkDynamoStrictTest(cls=None):
 
 
 def markDynamoStrictTest(cls_or_func=None, nopython=False):
+    # [FUNCTION DOC] Mark a test class or function as strict for dynamo. For classes it sets the
+    # strict attributes (including whether nopython is used). For functions it returns a wrapper
+    # that resets dynamo before and after and runs with suppress_errors off. Usable with or
+    # without parentheses.
     """
     Marks the test as 'strict'. In strict mode, we reset before and after the
     test, and run without suppress errors.
@@ -2232,6 +2649,8 @@ def markDynamoStrictTest(cls_or_func=None, nopython=False):
     - nopython: if we should run torch._dynamo.optimize with nopython={True/False}.
     """
     def decorator(cls_or_func):
+        # [FUNCTION DOC] HELPER: Apply strict marking to a class (setting attributes) or wrap a
+        # function with dynamo reset and suppress_errors disabled. Returns class or wrapper.
         if inspect.isclass(cls_or_func):
             cls_or_func.dynamo_strict = True
             cls_or_func.dynamo_strict_nopython = nopython
@@ -2241,6 +2660,8 @@ def markDynamoStrictTest(cls_or_func=None, nopython=False):
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Reset dynamo, run the test with suppress_errors set to
+            # False, reset dynamo again. The return value is not propagated.
             torch._dynamo.reset()
             with unittest.mock.patch("torch._dynamo.config.suppress_errors", False):
                 fn(*args, **kwargs)
@@ -2254,13 +2675,22 @@ def markDynamoStrictTest(cls_or_func=None, nopython=False):
 
 
 def skipRocmIfTorchInductor(msg="test doesn't currently work with torchinductor on the ROCm stack"):
+    # [FUNCTION DOC] Skip decorator for ROCm plus inductor: delegates to skipIfTorchInductor
+    # with the condition that both ROCm and inductor testing are enabled.
     return skipIfTorchInductor(msg=msg, condition=TEST_WITH_ROCM and TEST_WITH_TORCHINDUCTOR)
 
 def skipIfLegacyJitExecutor(msg="test doesn't currently work with legacy JIT executor"):
+    # [FUNCTION DOC] Return a decorator that skips a function or class when the JIT graph
+    # executor is LEGACY, with the given message.
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest under the legacy
+        # executor, or mark a class as skipped there. Raises AssertionError if GRAPH_EXECUTOR
+        # is unset.
         if not isinstance(fn, type):
             @wraps(fn)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Raise SkipTest under the legacy executor, otherwise
+                # call the test. Raises AssertionError if GRAPH_EXECUTOR is unset.
                 if not GRAPH_EXECUTOR:
                     raise AssertionError("GRAPH_EXECUTOR must be set")
                 if GRAPH_EXECUTOR == ProfilingMode.LEGACY:
@@ -2284,6 +2714,10 @@ def skipIfLegacyJitExecutor(msg="test doesn't currently work with legacy JIT exe
 def make_dynamo_test(
     fn: Callable[..., Any] | None = None
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Decorator that turns a test method into a dynamo test. The wrapped test
+    # takes the unittest object as its first argument; it is run once in eager mode and once
+    # compiled with dynamo, asserting no graph break, with dynamo reset between and after. If
+    # called without a function it returns a decorator. Returns the test.
     """
     Decorator function to create a dynamo test case. A function annotate with
     this decorator takes as input a unittest object.
@@ -2297,7 +2731,11 @@ def make_dynamo_test(
         fn: Callable[..., Any],
         kwargs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Run the test function eagerly, reset dynamo, run it again
+        # through optimize_assert with a compile counter, then reset dynamo.
         def dummy() -> None:
+            # [FUNCTION DOC] HELPER: Call the test function with the test object and the
+            # keyword arguments.
             fn(self, **kwargs)
 
         actual = CompileCounter()
@@ -2310,6 +2748,8 @@ def make_dynamo_test(
 
     @functools.wraps(fn)
     def test_fn(self: Any, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: The generated test method; forwards keyword arguments to
+        # standard_test together with the original function.
         return standard_test(
             self,
             fn=fn,
@@ -2360,6 +2800,8 @@ numpy_to_torch_dtype_dict = {
 # np.float64 != np.dtype("float64") but np.float64 == np.dtype("float64").type.
 # Especially when checking against a reference we can't be sure which variant we get, so we simply try both.
 def numpy_to_torch_dtype(np_dtype):
+    # [FUNCTION DOC] Map a numpy dtype (or scalar type) to the matching torch dtype using the
+    # table. If the key is missing, retries with the dtype type attribute; may raise KeyError.
     try:
         return numpy_to_torch_dtype_dict[np_dtype]
     except KeyError:
@@ -2367,6 +2809,7 @@ def numpy_to_torch_dtype(np_dtype):
 
 
 def has_corresponding_torch_dtype(np_dtype):
+    # [FUNCTION DOC] Return True if the numpy dtype has a matching torch dtype, else False.
     try:
         numpy_to_torch_dtype(np_dtype)
         return True
@@ -2392,11 +2835,19 @@ def skipIfNNModuleInlined(
     msg="test doesn't currently work with nn module inlining",
     condition=True,
 ):
+    # [FUNCTION DOC] Return a decorator that skips a function or class when nn module inlining
+    # is active (condition defaults to true), with the given message.
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest when the condition holds,
+        # or mark a class as skipped. Returns the wrapper or class.
+        # KNOWN ISSUE: the second type check is redundant and the wrapper drops the
+        # return value.
         if not isinstance(fn, type):
 
             @wraps(fn)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Raise SkipTest if the condition holds, otherwise call
+                # the test (the return value is not propagated).
                 if condition:
                     raise unittest.SkipTest(msg)
                 else:
@@ -2415,16 +2866,25 @@ def skipIfNNModuleInlined(
     return decorator
 
 def skipIfRocm(func=None, *, msg="test doesn't currently work on the ROCm stack"):
+    # [FUNCTION DOC] Skip decorator for ROCm builds. Usable bare or with a msg keyword; built on
+    # lazy_skip_if so it works for test methods and test classes. Returns the decorated object,
+    # or a decorator when no function is given.
     decorator = lazy_skip_if(lambda: TEST_WITH_ROCM, f"skipIfRocm: {msg}")
     return decorator(func) if func is not None else decorator
 
 def skipIfRocm_BUGGY(func=None, *, msg="test doesn't currently work on the ROCm stack"):
+    # [FUNCTION DOC] Deprecated variant of skipIfRocm kept for migration. It only wraps
+    # functions and so silently drops classes from discovery. Returns the decorated function or
+    # a decorator when no function is given.
     """Old skipIfRocm that silently drops classes from discovery. Migrate to skipIfRocm."""
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest on ROCm builds.
         reason = f"skipIfRocm: {msg}"
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raise SkipTest on ROCm, otherwise call the test and return
+            # its result.
             if TEST_WITH_ROCM:
                 raise unittest.SkipTest(reason)
             else:
@@ -2435,23 +2895,32 @@ def skipIfRocm_BUGGY(func=None, *, msg="test doesn't currently work on the ROCm 
     return dec_fn
 
 def getRocmArchName(device_index: int = 0):
+    # [FUNCTION DOC] Return the architecture name string (for example gfx942) of the given
+    # CUDA/HIP device index (default 0). Queries device properties.
     return torch.cuda.get_device_properties(device_index).gcnArchName
 
 def isRocmArchAnyOf(arch: tuple[str, ...]):
+    # [FUNCTION DOC] Return True if this is a HIP build and the device 0 architecture name
+    # contains any of the given architecture strings; False on non-HIP builds.
     if not torch.version.hip:
         return False
     rocmArch = getRocmArchName()
     return any(x in rocmArch for x in arch)
 
 def skipIfRocmArch(arch: tuple[str, ...]):
+    # [FUNCTION DOC] Return a skip decorator that skips tests on ROCm when the device
+    # architecture is one of the given ones. Evaluated lazily at test time.
     return lazy_skip_if(
         lambda: TEST_WITH_ROCM and isRocmArchAnyOf(arch),
         f"skipIfRocm: test skipped on {arch}",
     )
 
 def runOnRocm(fn):
+    # [FUNCTION DOC] Decorator that runs a test only on ROCm and raises SkipTest otherwise.
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the test on ROCm (return value not propagated) or
+        # raise SkipTest.
         if TEST_WITH_ROCM:
             fn(*args, **kwargs)
         else:
@@ -2459,9 +2928,14 @@ def runOnRocm(fn):
     return wrapper
 
 def runOnRocmArch(arch: tuple[str, ...]):
+    # [FUNCTION DOC] Return a decorator that, on ROCm builds only, skips the test unless the
+    # device architecture matches one of the given ones. Non-ROCm builds are not skipped.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wrap a test method with the architecture check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: On ROCm with a non matching architecture raise SkipTest,
+            # otherwise call the method and return its result.
             if TEST_WITH_ROCM and not isRocmArchAnyOf(arch):
                 reason = f"skipIfRocm: test only runs on {arch}"
                 raise unittest.SkipTest(reason)
@@ -2470,10 +2944,14 @@ def runOnRocmArch(arch: tuple[str, ...]):
     return dec_fn
 
 def xfailIfS390X(func):
+    # [FUNCTION DOC] Mark the function as expected to fail on s390x machines.
     return unittest.expectedFailure(func) if IS_S390X else func
 
 def xfailIf(condition):
+    # [FUNCTION DOC] Return a decorator that marks a function as an expected failure when the
+    # condition is true and leaves it unchanged otherwise.
     def wrapper(func):
+        # [FUNCTION DOC] HELPER: Apply expected failure marking if the condition holds.
         if condition:
             return unittest.expectedFailure(func)
         else:
@@ -2481,16 +2959,23 @@ def xfailIf(condition):
     return wrapper
 
 def skipIfXpu(func=None, *, msg="test doesn't currently work on the XPU stack"):
+    # [FUNCTION DOC] Skip decorator for XPU builds. Usable bare or with a msg keyword; works for
+    # test methods and classes through lazy_skip_if.
     decorator = lazy_skip_if(lambda: TEST_XPU, f"skipIfXpu: {msg}")
     return decorator(func) if func is not None else decorator
 
 def skipIfXpu_BUGGY(func=None, *, msg="test doesn't currently work on the XPU stack"):
+    # [FUNCTION DOC] Deprecated variant of skipIfXpu kept for migration; it only wraps functions
+    # and so silently drops classes from discovery.
     """Old skipIfXpu that silently drops classes from discovery. Migrate to skipIfXpu."""
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wrap a function so it raises SkipTest when XPU testing is on.
         reason = f"skipIfXpu: {msg}"
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raise SkipTest on XPU, otherwise call the test and return
+            # its result.
             if TEST_XPU:
                 raise unittest.SkipTest(reason)
             else:
@@ -2501,6 +2986,10 @@ def skipIfXpu_BUGGY(func=None, *, msg="test doesn't currently work on the XPU st
     return dec_fn
 
 def skipIfMPS(fn):
+    # [FUNCTION DOC] Skip decorator for MPS. A class is marked skipped if MPS is available. A
+    # function with a device parameter is skipped only when the device of the test instance is
+    # mps; a function without one is skipped whenever MPS is available, and a warning is emitted
+    # suggesting device generic tests. Returns the class or wrapped function.
     reason = "test doesn't currently work with MPS"
     # Class-level skip falls back to the global TEST_MPS check; the wrapper
     # below inspects args[0].device_type, which is only available per-method.
@@ -2522,6 +3011,8 @@ def skipIfMPS(fn):
 
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Skip (raise SkipTest) when the instance device type is mps, or
+        # when no device parameter exists and MPS is available; otherwise call the test.
         if has_device_arg:
             # For device-generic tests, only skip when actually running on MPS
             slf = args[0] if args else None
@@ -2539,12 +3030,16 @@ def skipIfMPS(fn):
 
 
 def skipIfHpu(fn):
+    # [FUNCTION DOC] Skip decorator for HPU builds, applicable to functions and classes.
     return lazy_skip_if(lambda: TEST_HPU, "test doesn't currently work with HPU")(fn)
 
 def skipIfHpu_BUGGY(fn):
+    # [FUNCTION DOC] Deprecated variant of skipIfHpu kept for migration; only wraps functions.
     """Old skipIfHpu that silently drops classes from discovery. Migrate to skipIfHpu."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raise SkipTest if HPU testing is on, otherwise call the test
+        # (the return value is not propagated).
         if TEST_HPU:
             raise unittest.SkipTest("test doesn't currently work with HPU")
         else:
@@ -2552,13 +3047,19 @@ def skipIfHpu_BUGGY(fn):
     return wrapper
 
 def getRocmVersion() -> tuple[int, int]:
+    # [FUNCTION DOC] Return the ROCm version as a (major, minor) tuple using the CUDA test
+    # utilities. The import is done inside the function to avoid circular imports.
     from torch.testing._internal.common_cuda import _get_torch_rocm_version
     rocm_version = _get_torch_rocm_version()
     return (rocm_version[0], rocm_version[1])
 
 # Skips a test on CUDA if ROCm is available and its version is lower than requested.
 def skipIfRocmVersionLessThan(version=None):
+    # [FUNCTION DOC] Return a lazy skip decorator that skips on ROCm when the ROCm version is
+    # lower than the given version tuple (or when no version is given).
     def _should_skip():
+        # [FUNCTION DOC] HELPER: Condition for the decorator: false on non-ROCm builds,
+        # otherwise true if the ROCm version is lower than the requested one or none was given.
         if not TEST_WITH_ROCM:
             return False
         rocm_version_tuple = getRocmVersion()
@@ -2574,7 +3075,11 @@ def skipIfRocmVersionLessThan(version=None):
 # e.g. skipIfRocmVersionAtLeast([7, 14]) skips on 7.14+ but runs on 7.2.x.
 # Built on lazy_skip_if so it works on both test methods and test classes.
 def skipIfRocmVersionAtLeast(version=None):
+    # [FUNCTION DOC] Return a lazy skip decorator that skips on ROCm when the ROCm version is at
+    # least the given major and minor tuple. Works for methods and classes.
     def _should_skip():
+        # [FUNCTION DOC] HELPER: Condition for the decorator: true only on ROCm with a version
+        # at least the requested one.
         if not TEST_WITH_ROCM:
             return False
         rocm_version_tuple = getRocmVersion()
@@ -2586,16 +3091,21 @@ def skipIfRocmVersionAtLeast(version=None):
     return lazy_skip_if(_should_skip, f"ROCm version at least {version}: known failure")
 
 def skipIfNotMiopenSuggestNHWC(fn):
+    # [FUNCTION DOC] Skip the test unless MIOpen NHWC suggestion is enabled through
+    # the environment.
     return lazy_skip_if(
         lambda: not TEST_WITH_MIOPEN_SUGGEST_NHWC,
         "test doesn't currently work without MIOpen NHWC activation",
     )(fn)
 
 def skipIfWindows(func=None, *, msg="test doesn't currently work on the Windows stack"):
+    # [FUNCTION DOC] Skip decorator for Windows. Usable bare or with a msg keyword.
     decorator = lazy_skip_if(lambda: IS_WINDOWS, f"skipIfWindows: {msg}")
     return decorator(func) if func is not None else decorator
 
 def skipIfWindowsXPU(func=None, *, msg="test doesn't currently work on the Windows stack"):
+    # [FUNCTION DOC] Skip decorator for Windows when XPU is available. Usable bare or with a
+    # msg keyword.
     decorator = lazy_skip_if(
         lambda: IS_WINDOWS and torch.xpu.is_available(), f"skipIfWindowsXPU: {msg}"
     )
@@ -2604,6 +3114,9 @@ def skipIfWindowsXPU(func=None, *, msg="test doesn't currently work on the Windo
 requires_cuda_python_bindings = unittest.skipUnless(TEST_CUDA_PYTHON_BINDINGS, "requires cuda-python (cuda.bindings)")
 
 def requires_cuda_p2p_access():
+    # [FUNCTION DOC] Return a skip decorator (pass in sandcastle variant) that skips tests
+    # unless there are at least two CUDA devices with compute capability 8.0 or above and all
+    # device pairs can access each other as peers. Queries CUDA at call time.
     cuda_p2p_access_available = (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability() >= (8, 0)
@@ -2626,8 +3139,12 @@ def requires_cuda_p2p_access():
 # Reverts the linalg backend back to default to make sure potential failures in one
 # test do not affect other tests
 def setLinalgBackendsToDefaultFinally(fn):
+    # [FUNCTION DOC] Decorator that runs the test and afterwards restores the preferred linalg
+    # library backend to its earlier value, even on failure. Return value not propagated.
     @wraps(fn)
     def _fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Remember the preferred linalg backend, run the test, and
+        # restore it.
         _preferred_backend = torch.backends.cuda.preferred_linalg_library()
         try:
             fn(*args, **kwargs)
@@ -2639,8 +3156,12 @@ def setLinalgBackendsToDefaultFinally(fn):
 # Reverts the blas backend back to default to make sure potential failures in one
 # test do not affect other tests
 def setBlasBackendsToDefaultFinally(fn):
+    # [FUNCTION DOC] Decorator that runs the test and afterwards restores the preferred BLAS
+    # library backend and, if CUDA is built, resets cuBLAS workspaces. Return value dropped.
     @wraps(fn)
     def _fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Remember the preferred BLAS backend, run the test, then restore
+        # it and clear cuBLAS and cuBLASLt workspaces when CUDA is built.
         _preferred_backend = torch.backends.cuda.preferred_blas_library()
         try:
             fn(*args, **kwargs)
@@ -2653,8 +3174,12 @@ def setBlasBackendsToDefaultFinally(fn):
     return _fn
 
 def setSdpaBackendsToDefaultFinally(fn):
+    # [FUNCTION DOC] Decorator that runs the test and afterwards restores the preferred ROCm
+    # flash attention backend. Return value is dropped.
     @wraps(fn)
     def _fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Remember the preferred ROCm flash attention library, run the
+        # test, and restore it.
         _preferred_backend = torch.backends.cuda.preferred_rocm_fa_library()
         try:
             fn(*args, **kwargs)
@@ -2665,13 +3190,20 @@ def setSdpaBackendsToDefaultFinally(fn):
 # Context manager for setting deterministic flag and automatically
 # resetting it to its original value
 class DeterministicGuard:
+    # [CLASS DOC] Context manager that sets deterministic algorithm mode (plus warn only and
+    # uninitialized memory fill flags) on entry and restores the previous state on exit. State:
+    # the three requested settings and, while active, a guard holding the previous state.
     def __init__(self, deterministic, *, warn_only=False, fill_uninitialized_memory=True):
+        # [FUNCTION DOC] Store the requested deterministic flag, warn only flag and fill
+        # uninitialized memory flag.
         self.deterministic = deterministic
         self.warn_only = warn_only
         self.fill_uninitialized_memory = fill_uninitialized_memory
 
     @classmethod
     def _current_state(cls):
+        # [FUNCTION DOC] HELPER: Class method that returns a guard describing the currently
+        # active settings of deterministic mode, warn only, and fill of uninitialized memory.
         return cls(
             torch.are_deterministic_algorithms_enabled(),
             warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
@@ -2679,27 +3211,37 @@ class DeterministicGuard:
         )
 
     def _update(self):
+        # [FUNCTION DOC] HELPER: Apply this guard's settings to torch (deterministic algorithms
+        # and the fill uninitialized memory global).
         torch.use_deterministic_algorithms(self.deterministic, warn_only=self.warn_only)
         torch.utils.deterministic.fill_uninitialized_memory = self.fill_uninitialized_memory  # type: ignore[attr-defined]
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current deterministic settings and apply the requested ones.
         self._restore = self._current_state()
         self._update()
 
     def __exit__(self, exception_type, exception_value, traceback):
+        # [FUNCTION DOC] Restore the saved settings. Exceptions from the body are
+        # not suppressed.
         self._restore._update()
 
 class AlwaysWarnTypedStorageRemoval:
+    # [CLASS DOC] Context manager that sets the global flag to always warn about typed storage
+    # removal and restores the previous value on exit. State: the requested boolean.
     def __init__(self, always_warn):
+        # [FUNCTION DOC] Store the flag. Raises AssertionError if it is not a bool.
         if not isinstance(always_warn, bool):
             raise AssertionError(f"expected always_warn to be bool, got {type(always_warn)}")
         self.always_warn = always_warn
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current always warn setting and set the requested one.
         self.always_warn_restore = torch.storage._get_always_warn_typed_storage_removal()
         torch.storage._set_always_warn_typed_storage_removal(self.always_warn)
 
     def __exit__(self, exception_type, exception_value, traceback):
+        # [FUNCTION DOC] Restore the saved always warn setting.
         torch.storage._set_always_warn_typed_storage_removal(self.always_warn_restore)
 
 # Context manager for setting cuda sync debug mode and reset it
@@ -2707,28 +3249,40 @@ class AlwaysWarnTypedStorageRemoval:
 # we are not exposing it to the core because sync debug mode is
 # global and thus not thread safe
 class CudaSyncGuard:
+    # [CLASS DOC] Context manager that sets the CUDA sync debug mode and restores the
+    # previous mode on exit. Kept here rather than in core because the mode is global and not
+    # thread safe.
     def __init__(self, sync_debug_mode):
+        # [FUNCTION DOC] Store the requested sync debug mode.
         self.mode = sync_debug_mode
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current sync debug mode and set the requested one.
         self.debug_mode_restore = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode(self.mode)
 
     def __exit__(self, exception_type, exception_value, traceback):
+        # [FUNCTION DOC] Restore the saved sync debug mode.
         torch.cuda.set_sync_debug_mode(self.debug_mode_restore)
 
 # Context manager for setting torch.__future__.set_swap_module_params_on_conversion
 # and automatically resetting it to its original value
 class SwapTensorsGuard:
+    # [CLASS DOC] Context manager that sets the swap module parameters on conversion option
+    # (unless None) and restores the previous value on exit.
     def __init__(self, use_swap_tensors):
+        # [FUNCTION DOC] Store the requested value (True, False or None meaning
+        # leave unchanged).
         self.use_swap_tensors = use_swap_tensors
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current option and set the requested one when it is not None.
         self.swap_tensors_restore = torch.__future__.get_swap_module_params_on_conversion()
         if self.use_swap_tensors is not None:
             torch.__future__.set_swap_module_params_on_conversion(self.use_swap_tensors)
 
     def __exit__(self, exception_type, exception_value, traceback):
+        # [FUNCTION DOC] Restore the saved option.
         torch.__future__.set_swap_module_params_on_conversion(self.swap_tensors_restore)
 
 # This decorator can be used for API tests that call
@@ -2761,19 +3315,30 @@ class SwapTensorsGuard:
 #       # Handle exceptions raised by the subprocess here
 #
 def wrapDeterministicFlagAPITest(fn):
+    # [FUNCTION DOC] Decorator for tests that change the deterministic algorithms flag. The
+    # wrapped test runs inside a deterministic guard that restores the old flags afterwards and
+    # inside a guard that sets the cuBLAS workspace configuration variable and restores or
+    # removes it afterwards. The return value of the test is not propagated.
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the test within the deterministic and cuBLAS config guards.
         with DeterministicGuard(
                 torch.are_deterministic_algorithms_enabled(),
                 warn_only=torch.is_deterministic_algorithms_warn_only_enabled()):
             class CuBLASConfigGuard:
+                # [CLASS DOC] HELPER: Context manager that sets the CUBLAS_WORKSPACE_CONFIG
+                # environment variable to a fixed value and restores or deletes it on exit.
                 cublas_var_name = 'CUBLAS_WORKSPACE_CONFIG'
 
                 def __enter__(self):
+                    # [FUNCTION DOC] HELPER: Remember the old value of the variable and set it
+                    # to the fixed value.
                     self.cublas_config_restore = os.environ.get(self.cublas_var_name)
                     os.environ[self.cublas_var_name] = ':4096:8'
 
                 def __exit__(self, exception_type, exception_value, traceback):
+                    # [FUNCTION DOC] HELPER: Restore the old value, or delete the variable if it
+                    # was unset before and is still set.
                     cur_cublas_config = os.environ.get(self.cublas_var_name)
                     if self.cublas_config_restore is None:
                         if cur_cublas_config is not None:
@@ -2790,9 +3355,15 @@ def wrapDeterministicFlagAPITest(fn):
 # set the flag. When the test is finished, it will restore the previous swap
 # flag setting.
 def wrapSwapTensorsTest(swap=None):
+    # [FUNCTION DOC] Return a decorator that runs a test with the swap module parameters on
+    # conversion option set to the given value (True, False or None for unchanged) and restores
+    # it afterwards.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wrap the test with the swap tensors guard.
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Run the test inside the guard (return value
+            # not propagated).
             with SwapTensorsGuard(swap):
                 fn(*args, **kwargs)
         return wrapper
@@ -2800,15 +3371,23 @@ def wrapSwapTensorsTest(swap=None):
 
 # test parametrizer for swapping
 class swap(_TestParametrizer):
+    # [CLASS DOC] Parametrizer that runs a test once per swap value, wrapping the test with the
+    # swap tensors decorator and naming it with the value. State: the list of swap values.
     def __init__(self, swap_values):
+        # [FUNCTION DOC] Initialize the base class and store the swap values.
         super().__init__()
         self.swap_values = swap_values
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator yielding, for each swap value, the test wrapped for that
+        # swap value, a name suffix, an empty parameter mapping, and a decorator function that
+        # adds none.
         for swap in self.swap_values:
             yield wrapSwapTensorsTest(swap)(test), f'swap_{swap}', {}, lambda _: []
 
 def skipIfCompiledWithoutNumpy(fn):
+    # [FUNCTION DOC] Skip decorator: the test is skipped if numpy is missing or if converting a
+    # small array to a tensor fails, which indicates a build without numpy support.
     # Even if the numpy module is present, if `USE_NUMPY=0` is used during the
     # build, numpy tests will fail
     numpy_support = TEST_NUMPY
@@ -2820,20 +3399,28 @@ def skipIfCompiledWithoutNumpy(fn):
     return unittest.skipIf(not numpy_support, "PyTorch was compiled without numpy support")(fn)
 
 def _test_function(fn, device):
+    # [FUNCTION DOC] HELPER: Return a one argument test method that calls the given function
+    # with the test object and the device.
     def run_test_function(self):
+        # [FUNCTION DOC] HELPER: Call the captured function with the test object and device.
         return fn(self, device)
     return run_test_function
 
 def skipIfNoXNNPACK(fn):
+    # [FUNCTION DOC] Skip the test when XNNPACK is not enabled.
     return lazy_skip_if(
         lambda: not torch.backends.xnnpack.enabled,  # type: ignore[attr-defined]
         "XNNPACK must be enabled for these tests. Please build with USE_XNNPACK=1.",
     )(fn)
 
 def skipIfNoLapack(fn):
+    # [FUNCTION DOC] Skip the test when PyTorch was built without LAPACK.
     return lazy_skip_if(lambda: not torch._C.has_lapack, "PyTorch compiled without Lapack")(fn)
 
 def skipIfNotRegistered(op_name, message):
+    # [FUNCTION DOC] Returns a skip decorator unconditionally, saying Caffe2 is not compiled.
+    # KNOWN ISSUE: the arguments are ignored and the test is always skipped, although the
+    # docstring describes checking whether an operator is registered.
     """Wraps the decorator to hide the import of the `core`.
 
     Args:
@@ -2847,17 +3434,23 @@ def skipIfNotRegistered(op_name, message):
     return unittest.skip("Pytorch is compiled without Caffe2")
 
 def skipIfNoSciPy(fn):
+    # [FUNCTION DOC] Skip the test when SciPy is not installed.
     return lazy_skip_if(lambda: not TEST_SCIPY, "test require SciPy, but SciPy not found")(fn)
 
 def skip_if_pytest(fn):
+    # [FUNCTION DOC] Skip the test when running under pytest (detected by the current test
+    # environment variable).
     return lazy_skip_if(
         lambda: "PYTEST_CURRENT_TEST" in os.environ, "does not work under pytest"
     )(fn)
 
 def skipIfNoXPU(fn):
+    # [FUNCTION DOC] Skip the test when XPU support is not available.
     return lazy_skip_if(lambda: not TEST_XPU, "test required PyTorched compiled with XPU")(fn)
 
 def skipIfCachingAllocatorDisabled(fn):
+    # [FUNCTION DOC] Skip the test when CUDA is available and the caching allocator is disabled
+    # (at runtime or through environment variables). CPU only builds are not skipped.
     """Skip if the CUDA/HIP caching allocator is not active. Covers both the
     runtime toggle (``torch.cuda.caching_allocator_enable(False)``) and the
     env-var bypass (``PYTORCH_NO_CUDA_MEMORY_CACHING`` /
@@ -2870,8 +3463,13 @@ def skipIfCachingAllocatorDisabled(fn):
     )(fn)
 
 def slowTest(fn):
+    # [FUNCTION DOC] Decorator for slow tests. The wrapped test raises SkipTest unless slow
+    # tests are enabled, and carries a slow test marker in its dictionary. The return value of
+    # the test is not propagated.
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raise SkipTest if slow tests are not enabled, else call
+        # the test.
         if not TEST_WITH_SLOW:
             raise unittest.SkipTest("test is slow; run with PYTORCH_TEST_WITH_SLOW to enable test")
         else:
@@ -2881,26 +3479,39 @@ def slowTest(fn):
 
 
 def slowTestIf(condition):
+    # [FUNCTION DOC] Return the slowTest decorator if the condition is true, otherwise an
+    # identity decorator.
     return slowTest if condition else lambda fn: fn
 
 
 def skipCUDAMemoryLeakCheckIf(condition):
+    # [FUNCTION DOC] Return a decorator that disables the CUDA memory leak check on a test when
+    # the condition is true, only if the check is currently enabled for it. Sets an attribute on
+    # the function.
     def dec(fn):
+        # [FUNCTION DOC] HELPER: Update the leak check attribute on the function and return it.
         if getattr(fn, '_do_cuda_memory_leak_check', True):  # if current True
             fn._do_cuda_memory_leak_check = not condition
         return fn
     return dec
 
 def skipCUDANonDefaultStreamIf(condition):
+    # [FUNCTION DOC] Return a decorator that disables running the test on a non default CUDA
+    # stream when the condition is true, only if currently enabled. Sets an attribute.
     def dec(fn):
+        # [FUNCTION DOC] HELPER: Update the non default stream attribute and return
+        # the function.
         if getattr(fn, '_do_cuda_non_default_stream', True):  # if current True
             fn._do_cuda_non_default_stream = not condition
         return fn
     return dec
 
 def suppress_warnings(fn):
+    # [FUNCTION DOC] Decorator that runs the test with all warnings ignored.
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the test inside a warnings catch block with the
+        # ignore filter.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             fn(*args, **kwargs)
@@ -2908,6 +3519,10 @@ def suppress_warnings(fn):
 
 
 def to_gpu(obj, type_map=None):
+    # [FUNCTION DOC] Recursively copy an object to CUDA. Leaf tensors are copied to the CUDA
+    # device with optional dtype mapping and the same requires_grad flag; storages are copied;
+    # lists and tuples are processed element by element; other objects are deep copied. Raises
+    # AssertionError if a tensor is not a leaf.
     if type_map is None:
         type_map = {}
     if isinstance(obj, torch.Tensor):
@@ -2929,10 +3544,13 @@ def to_gpu(obj, type_map=None):
 
 
 def get_function_arglist(func):
+    # [FUNCTION DOC] Return the list of positional argument names of a function.
     return inspect.getfullargspec(func).args
 
 
 def set_rng_seed(seed=None):
+    # [FUNCTION DOC] Seed the torch, python and (if available) numpy random number generators
+    # with the given seed, or the module default seed when None. Mutates global RNG state.
     if seed is None:
         seed = SEED
     torch.manual_seed(seed)
@@ -2943,6 +3561,8 @@ def set_rng_seed(seed=None):
 
 @contextlib.contextmanager
 def set_default_dtype(dtype):
+    # [FUNCTION DOC] Context manager that sets the torch default dtype for the body and restores
+    # the previous default afterwards.
     saved_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
@@ -2952,6 +3572,10 @@ def set_default_dtype(dtype):
 
 
 class set_default_dtype_if_supported:
+    # [CLASS DOC] Decorator class like set_default_dtype that only sets the dtype if the primary
+    # device of the test instance supports it (checked by trying to create an empty tensor,
+    # catching TypeError). The decorated method must belong to a class instantiated by the
+    # device type test machinery, since it calls get_primary_device. State: the dtype.
     """Decorator like set_default_dtype, but only sets the dtype if the device
     supports it.
 
@@ -2961,11 +3585,16 @@ class set_default_dtype_if_supported:
     """
 
     def __init__(self, dtype):
+        # [FUNCTION DOC] Store the dtype.
         self._dtype = dtype
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Wrap the test method. Returns the wrapper.
         @functools.wraps(fn)
         def wrapper(test_self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Check whether the primary device supports the dtype, set
+            # it as the default if so, run the test and return its result, and restore the
+            # old default.
             device = test_self.get_primary_device()
             dtype_supported = True
             try:
@@ -2990,6 +3619,8 @@ class set_default_dtype_if_supported:
 
 @contextlib.contextmanager
 def set_default_tensor_type(tensor_type):
+    # [FUNCTION DOC] Context manager that sets the default tensor type for the body and restores
+    # the previous one afterwards.
     saved_tensor_type = torch.tensor([]).type()
     torch.set_default_tensor_type(tensor_type)
     try:
@@ -2998,6 +3629,8 @@ def set_default_tensor_type(tensor_type):
         torch.set_default_tensor_type(saved_tensor_type)
 
 def iter_indices(tensor):
+    # [FUNCTION DOC] Return an iterable of indices of a tensor: an empty range for zero
+    # dimensions, a range for one dimension, otherwise the cartesian product of the ranges.
     if tensor.dim() == 0:
         return range(0)
     if tensor.dim() == 1:
@@ -3006,6 +3639,8 @@ def iter_indices(tensor):
 
 
 def is_iterable(obj):
+    # [FUNCTION DOC] Return True if the object can be iterated, False if iterating
+    # raises TypeError.
     try:
         iter(obj)
         return True
@@ -3014,6 +3649,9 @@ def is_iterable(obj):
 
 
 def is_iterable_of_tensors(iterable, include_empty=False):
+    # [FUNCTION DOC] Return True if the argument is an iterable (not a tensor itself) whose
+    # elements are all tensors. An empty iterable returns the include_empty value; a non
+    # iterable returns False.
     """ Returns True if iterable is an iterable of tensors and False o.w.
 
         If the iterable is empty, the return value is :attr:`include_empty`
@@ -3037,7 +3675,12 @@ def is_iterable_of_tensors(iterable, include_empty=False):
 
 
 class CudaNonDefaultStream:
+    # [CLASS DOC] Context manager that makes every CUDA device use a fresh non default stream on
+    # entry (after synchronizing the previous current streams) and restores the previous streams
+    # on exit. State: the list of previous streams per device.
     def __enter__(self):
+        # [FUNCTION DOC] Save current streams of each device, create and set new streams, and
+        # restore the current device.
         # Before starting CUDA test save currently active streams on all
         # CUDA devices and set new non default streams to all CUDA devices
         # to ensure CUDA tests do not use default stream by mistake.
@@ -3053,6 +3696,7 @@ class CudaNonDefaultStream:
         torch._C._cuda_setDevice(beforeDevice)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC] Restore the saved stream of each device and the current device.
         # After completing CUDA test load previously active streams on all
         # CUDA devices.
         beforeDevice = torch.cuda.current_device()
@@ -3063,7 +3707,14 @@ class CudaNonDefaultStream:
         torch._C._cuda_setDevice(beforeDevice)
 
 class CudaMemoryLeakCheck:
+    # [CLASS DOC] Context manager that detects CUDA memory leaks around a test. On entry it
+    # records caching allocator and driver memory per device after collecting garbage if needed;
+    # on exit (only when no exception occurred) it compares memory, re-checks several times,
+    # warns if only the allocator reports growth and raises RuntimeError if the driver confirms.
+    # State: the test case, a name, and the recorded before values.
     def __init__(self, testcase, name=None):
+        # [FUNCTION DOC] Store the test case and a display name (the test id by default) and
+        # initialize the CUDA context and RNG so the first test does not look like a leak.
         self.name = testcase.id() if name is None else name
         self.testcase = testcase
 
@@ -3078,6 +3729,8 @@ class CudaMemoryLeakCheck:
     # NOTE: The undocumented torch.cuda.mem_get_info() returns
     #   (#free bytes, #total bytes available) on the GPU
     def __enter__(self):
+        # [FUNCTION DOC] Collect garbage and empty caches if any memory is allocated, then
+        # record the caching allocator and driver allocated memory of every device.
         self.caching_allocator_befores = []
         self.driver_befores = []
 
@@ -3101,6 +3754,12 @@ class CudaMemoryLeakCheck:
             self.driver_befores.append(driver_mem_allocated)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC] Skip when an exception is propagating. Otherwise call the test case
+        # hook before the check, collect garbage, compare the allocator memory per device, and
+        # if growth persists after cleanup and three repeated queries, warn (allocator only) or
+        # raise RuntimeError (confirmed by the driver) naming the test and the memory values.
+        # KNOWN ISSUE: a comment mentions an exception on ROCm described below, but no ROCm
+        # specific handling exists in this method.
         # Don't check for leaks if an exception was thrown
         if exc_type is not None:
             return
@@ -3192,6 +3851,8 @@ class CudaMemoryLeakCheck:
 
 @contextmanager
 def skip_exception_type(exc_type):
+    # [FUNCTION DOC] Context manager that converts the given exception type raised in the body
+    # into unittest.SkipTest with a not implemented message.
     try:
         yield
     except exc_type as e:
@@ -3199,6 +3860,10 @@ def skip_exception_type(exc_type):
 
 @contextmanager
 def print_repro_on_failure(repro_parts):
+    # [FUNCTION DOC] Context manager that, on any exception other than SkipTest, appends
+    # reproduction instructions to the exception message (including the failing sample input
+    # index when known), sends a signpost record, and re-raises. repro_parts is a list of
+    # command parts.
     try:
         yield
     except unittest.SkipTest:
@@ -3240,6 +3905,8 @@ try:
     import hypothesis
 
     def settings(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper over hypothesis settings that drops the removed
+        # min_satisfying_examples option on hypothesis versions at or above 3.56.0.
         if 'min_satisfying_examples' in kwargs and hypothesis.version.__version_info__ >= (3, 56, 0):
             kwargs.pop('min_satisfying_examples')
         return hypothesis.settings(*args, **kwargs)
@@ -3279,6 +3946,9 @@ except ImportError:
 # e.g., an issue with title "DISABLED test_bitwise_ops (__main__.TestBinaryUfuncs)" should
 # disabled ALL parametrized test_bitwise_ops tests, such test_bitwise_ops_cuda_int32
 def remove_device_and_dtype_suffixes(test_name: str) -> str:
+    # [FUNCTION DOC] Strip a trailing dtype suffix, and a device suffix just before it, from a
+    # generated test name, so a disabled issue can match all parametrized variants. Imports the
+    # device test base machinery lazily to avoid a circular import.
     # import statement is localized to avoid circular dependency issues with common_device_type.py
     from torch.testing._internal.common_device_type import get_device_type_test_bases
     device_suffixes = [x.device_type for x in get_device_type_test_bases()]
@@ -3293,10 +3963,19 @@ def remove_device_and_dtype_suffixes(test_name: str) -> str:
 
 
 def check_if_enable(test: unittest.TestCase):
+    # [FUNCTION DOC] Decide whether a test should be skipped. Marks the test slow and skips if
+    # slow tests are disabled and the test appears in the slow test list. Outside Sandcastle,
+    # checks the disabled tests list for matching test and class names, filters platforms
+    # (printing a message for unknown names), and raises SkipTest if disabled for the current
+    # platform (or, in rerun mode, if not disabled). Also skips fast tests when only slow tests
+    # are requested.
     classname = str(test.__class__).split("'")[1].split(".")[-1]
     sanitized_testname = remove_device_and_dtype_suffixes(test._testMethodName)
 
     def matches_test(target: str):
+        # [FUNCTION DOC] HELPER: Check whether a disabled test entry (name and class in
+        # parentheses) matches this test, allowing class name prefixes and sanitized method
+        # names. Returns False for malformed entries.
         target_test_parts = target.split()
         if len(target_test_parts) < 2:
             # poorly formed target test name
@@ -3379,6 +4058,9 @@ def check_if_enable(test: unittest.TestCase):
 # TODO: Revisit the relaxed pairs and check how much work it is to fix the tests that would fail without the relaxation.
 
 class RelaxedBooleanPair(BooleanPair):
+    # [CLASS DOC] Comparison pair for boolean like values that, unlike the builtin pair, allows
+    # one side to be a number or a single element tensor or array, provided the other side is a
+    # bool. Used by TestCase.assertEqual.
     """Pair for boolean-like inputs.
 
     In contrast to the builtin :class:`BooleanPair`, this class also supports one input being a number or a single
@@ -3387,6 +4069,9 @@ class RelaxedBooleanPair(BooleanPair):
     _supported_number_types = NumberPair(0, 0)._supported_types
 
     def _process_inputs(self, actual, expected, *, id):
+        # [FUNCTION DOC] Verify that at least one input is a boolean and the other is a boolean,
+        # number, tensor or array, calling the not supported hook otherwise, and return both
+        # inputs converted to bool values.
         # We require only one of the inputs of the inputs to be a boolean and the other can also be a boolean, a
         # number, or a single element tensor or array, whereas in default BooleanPair both inputs have to be booleans.
         tensor_or_array_types: tuple[type, ...] = (torch.Tensor, np.ndarray)
@@ -3400,6 +4085,9 @@ class RelaxedBooleanPair(BooleanPair):
         return [self._to_bool(input, id=id) for input in (actual, expected)]
 
     def _to_bool(self, bool_like, *, id):
+        # [FUNCTION DOC] Convert a bool like value to bool: numpy numbers and Python numbers are
+        # converted directly; tensors and arrays must have a single element (otherwise a
+        # ValueError failure is reported); everything else uses the parent conversion.
         if isinstance(bool_like, np.number):
             return bool(bool_like.item())
         elif type(bool_like) in self._supported_number_types:
@@ -3420,6 +4108,9 @@ class RelaxedBooleanPair(BooleanPair):
 
 
 class RelaxedNumberPair(NumberPair):
+    # [CLASS DOC] Comparison pair for numbers that also accepts a single element tensor or array
+    # or an Enum on one side, ignores dtype checking, uses looser default tolerances and honors
+    # tolerance overrides from the precision and tolerance decorators.
     """Pair for number-like inputs.
 
     In contrast to the builtin :class:`NumberPair`, this class also supports one input being a single element
@@ -3439,11 +4130,16 @@ class RelaxedNumberPair(NumberPair):
     def __init__(
             self, actual, expected, *, rtol_override=0.0, atol_override=0.0, check_dtype=None, **other_parameters
     ) -> None:
+        # [FUNCTION DOC] Initialize the parent with dtype checking disabled, then raise the
+        # relative and absolute tolerances to at least the override values.
+        # KNOWN ISSUE: the check_dtype argument is accepted but ignored.
         super().__init__(actual, expected, check_dtype=False, **other_parameters)
         self.rtol = max(self.rtol, rtol_override)
         self.atol = max(self.atol, atol_override)
 
     def _process_inputs(self, actual, expected, *, id):
+        # [FUNCTION DOC] Verify that one input is a number and the other is a number, tensor or
+        # array, calling the not supported hook otherwise; return both converted to numbers.
         # We require only one of the inputs of the inputs to be a number and the other can also be a number or a single
         # element tensor or array, whereas in default NumberPair both inputs have to be numbers.
         tensor_or_array_types: tuple[type, ...] = (torch.Tensor, np.ndarray)
@@ -3457,6 +4153,10 @@ class RelaxedNumberPair(NumberPair):
         return [self._to_number(input, id=id) for input in (actual, expected)]
 
     def _to_number(self, number_like, *, id):
+        # [FUNCTION DOC] Convert a value to a Python number. Single element tensors and arrays
+        # use their item (booleans become ints); multi element ones fail with ValueError.
+        # Enums become ints. Other values use the parent conversion and must be a supported
+        # number type.
         if isinstance(number_like, (torch.Tensor, np.ndarray)):
             numel = number_like.numel() if isinstance(number_like, torch.Tensor) else number_like.size
             if numel > 1:
@@ -3481,6 +4181,9 @@ class RelaxedNumberPair(NumberPair):
 
 
 class TensorOrArrayPair(TensorLikePair):
+    # [CLASS DOC] Comparison pair for tensors and numpy arrays: only these two types are
+    # accepted, both are converted to tensors, and mixing them is allowed. Supports tolerance
+    # overrides from the precision decorators.
     """Pair for tensor-like inputs.
 
     On the one hand this class is stricter than the builtin :class:`TensorLikePair` since it only allows instances of
@@ -3492,11 +4195,15 @@ class TensorOrArrayPair(TensorLikePair):
     and ``@toleranceOverride`` decorators.
     """
     def __init__(self, actual, expected, *, rtol_override=0.0, atol_override=0.0, **other_parameters):
+        # [FUNCTION DOC] Initialize the parent and raise the tolerances to at least
+        # the overrides.
         super().__init__(actual, expected, **other_parameters)
         self.rtol = max(self.rtol, rtol_override)
         self.atol = max(self.atol, atol_override)
 
     def _process_inputs(self, actual, expected, *, id, allow_subclasses):
+        # [FUNCTION DOC] Check both inputs are tensors or arrays, convert them to tensors, check
+        # that the tensors are supported, and return the pair.
         self._check_inputs_isinstance(actual, expected, cls=(torch.Tensor, np.ndarray))
 
         actual, expected = (self._to_tensor(input) for input in (actual, expected))
@@ -3506,14 +4213,20 @@ class TensorOrArrayPair(TensorLikePair):
 
 
 class TypedStoragePair(TensorLikePair):
+    # [CLASS DOC] Comparison pair for typed storage objects, comparing them as tensors built
+    # from their untyped storage, with tolerance overrides.
     """Pair for :class:`torch.storage.TypedStorage` inputs."""
     def __init__(self, actual, expected, *, rtol_override=0.0, atol_override=0.0, **other_parameters):
+        # [FUNCTION DOC] Check that both inputs are typed storages, then initialize the parent
+        # and raise the tolerances to at least the overrides.
         self._check_inputs_isinstance(actual, expected, cls=torch.storage.TypedStorage)
         super().__init__(actual, expected, **other_parameters)
         self.rtol = max(self.rtol, rtol_override)
         self.atol = max(self.atol, atol_override)
 
     def _to_tensor(self, typed_storage):
+        # [FUNCTION DOC] Convert a typed storage into a tensor on its device, mapping quantized
+        # dtypes to the matching plain integer dtypes.
         return torch.tensor(
             typed_storage._untyped_storage,
             dtype={
@@ -3528,6 +4241,9 @@ class TypedStoragePair(TensorLikePair):
 
 
 class UnittestPair(Pair):
+    # [CLASS DOC] Abstract base for fallback comparison pairs that delegate to the unittest
+    # assertEqual. Subclasses set CLS to the supported input class(es) and optionally TYPE_NAME
+    # used in the failure message.
     """Fallback ABC pair that handles non-numeric inputs.
 
     To avoid recreating the mismatch messages of :meth:`unittest.TestCase.assertEqual`, this pair simply wraps it in
@@ -3539,10 +4255,14 @@ class UnittestPair(Pair):
     TYPE_NAME: str | None = None
 
     def __init__(self, actual, expected, **other_parameters):
+        # [FUNCTION DOC] Check that both inputs are instances of CLS and initialize the parent.
         self._check_inputs_isinstance(actual, expected, cls=self.CLS)
         super().__init__(actual, expected, **other_parameters)
 
     def compare(self):
+        # [FUNCTION DOC] Compare the inputs with assertEqual of a fresh unittest TestCase. On
+        # mismatch raises (through the fail hook) AssertionError with a message naming the type
+        # and containing the original message.
         test_case = unittest.TestCase()
 
         try:
@@ -3555,19 +4275,23 @@ class UnittestPair(Pair):
 
 
 class StringPair(UnittestPair):
+    # [CLASS DOC] Comparison pair for strings and bytes.
     CLS = (str, bytes)
     TYPE_NAME = "string"
 
 
 class SetPair(UnittestPair):
+    # [CLASS DOC] Comparison pair for sets.
     CLS = set
 
 
 class TypePair(UnittestPair):
+    # [CLASS DOC] Comparison pair for type objects.
     CLS = type
 
 
 class ObjectPair(UnittestPair):
+    # [CLASS DOC] Fallback comparison pair for arbitrary objects.
     CLS = object
 
 
@@ -3580,7 +4304,12 @@ class ObjectPair(UnittestPair):
 # behavior.  The year is 2021: this private class hierarchy hasn't changed since
 # 2010, seems low risk to inherit from.
 class AssertRaisesContextIgnoreNotImplementedError(unittest.case._AssertRaisesContext):
+    # [CLASS DOC] Variant of the assertRaises context from unittest which, if the exception
+    # raised is NotImplementedError, skips the test instead of failing. Inherits from a private
+    # unittest class.
     def __exit__(self, exc_type, exc_value, tb):
+        # [FUNCTION DOC] If the exception is a NotImplementedError, skip the test with a
+        # message; otherwise defer to the parent behavior and return its result.
         if exc_type is not None and issubclass(exc_type, NotImplementedError):
             self.test_case.skipTest(f"not_implemented: {exc_value}")  # type: ignore[attr-defined]
         return super().__exit__(exc_type, exc_value, tb)
@@ -3588,6 +4317,8 @@ class AssertRaisesContextIgnoreNotImplementedError(unittest.case._AssertRaisesCo
 
 @contextmanager
 def set_warn_always_context(new_val: bool):
+    # [FUNCTION DOC] Context manager that sets the global warn always mode for the body and
+    # restores the previous value afterwards.
     old_val = torch.is_warn_always_enabled()
     torch.set_warn_always(new_val)
     try:
@@ -3597,11 +4328,23 @@ def set_warn_always_context(new_val: bool):
 
 
 class NoTest:
+    # [CLASS DOC] HELPER: Marker base class whose test flag is false so pytest does not collect
+    # it as a test.
     # causes pytest to not recognize this class as a test
     __test__ = False
 
 
 class TestCase(expecttest.TestCase):
+    # [CLASS DOC] Base class of all PyTorch unit tests, extending the expecttest TestCase. Role:
+    # provides global state hygiene (RNG seeding, leak detection of grad mode, default dtype,
+    # torch function mode state and fp32 precision flags), automatic skipping of disabled and
+    # slow tests, optional dynamo, aot eager and inductor runs with expected failure tables,
+    # CUDA memory leak and non default stream policies, reproduction commands on failure, and
+    # many assertion helpers (tensor aware assertEqual, expected output files, log, warning and
+    # determinism checks, sparse tensor generators). State: class attributes for precision and
+    # relative tolerance overrides, flags for the CUDA policies, the default dtype check and
+    # NotImplementedError handling, and values saved in setUp for restoration in tearDown. Key
+    # methods: setUp, tearDown, run, assertEqual, assertExpectedInline.
     # NOTE: "precision" lets classes and generated tests set minimum
     # atol values when comparing tensors. Used by @precisionOverride and @toleranceOverride, for
     # example.
@@ -3624,6 +4367,9 @@ class TestCase(expecttest.TestCase):
 
     # checker to early terminate test suite if unrecoverable failure occurs.
     def _should_stop_test_suite(self):
+        # [FUNCTION DOC] HELPER: If CUDA has been initialized, synchronize it; return True (and
+        # print a message to stderr) when a RuntimeError occurs, which means the suite should be
+        # terminated early. Returns False otherwise.
         if torch.cuda.is_initialized():
             # CUDA device side error will cause subsequence test cases to fail.
             # stop entire test suite if catches RuntimeError during torch.cuda.synchronize().
@@ -3639,18 +4385,25 @@ class TestCase(expecttest.TestCase):
 
     @property
     def precision(self) -> float:
+        # [FUNCTION DOC] Property returning the class level minimum absolute tolerance used in
+        # tensor comparisons.
         return self._precision
 
     @precision.setter
     def precision(self, prec: float) -> None:
+        # [FUNCTION DOC] Property setter that stores a new class or instance level minimum
+        # absolute tolerance used in tensor comparisons.
         self._precision = prec
 
     @property
     def rel_tol(self) -> float:
+        # [FUNCTION DOC] Property returning the minimum relative tolerance used in
+        # tensor comparisons.
         return self._rel_tol
 
     @rel_tol.setter
     def rel_tol(self, prec: float) -> None:
+        # [FUNCTION DOC] Property setter that stores a new minimum relative tolerance.
         self._rel_tol = prec
 
     _do_cuda_memory_leak_check = False
@@ -3661,6 +4414,15 @@ class TestCase(expecttest.TestCase):
     _ignore_not_implemented_error = False
 
     def __init__(self, method_name='runTest', methodName='runTest'):
+        # [FUNCTION DOC] Construct the test case for a method name (either keyword spelling is
+        # accepted for compatibility with testslide; the method name keyword wins when not the
+        # default). Wraps the test method with policies according to global settings: a CUDA
+        # memory leak check (when enabled, not on Windows), enforcement of a non default CUDA
+        # stream, skipping on NotImplementedError when requested, and printing a reproduction
+        # command (test file path, class and method plus environment prefix) on failure.
+        # Failures to compute the repro command are logged and ignored.
+        # KNOWN ISSUE: the log call passes a string as the extra argument, which logging expects
+        # to be a mapping, so reporting that failure would itself raise inside logging.
         # methodName is the correct naming in unittest and testslide uses keyword arguments.
         # So we need to use both to 1) not break BC and, 2) support testslide.
         if methodName != "runTest":
@@ -3687,6 +4449,9 @@ class TestCase(expecttest.TestCase):
             if PRINT_REPRO_ON_FAILURE:
                 try:
                     def _get_rel_test_path(abs_test_path):
+                        # [FUNCTION DOC] HELPER: Return the path of a test file relative to the
+                        # directory containing a path component named test; if none exists,
+                        # return only the file name.
                         # Attempt to get relative path based on the "test" dir.
                         # In CI, the working dir is not guaranteed to be the base repo dir so
                         # we can't just compute relative path from that.
@@ -3714,14 +4479,20 @@ class TestCase(expecttest.TestCase):
                     log.info("could not print repro string", extra=str(e))  # type: ignore[arg-type]
 
     def assertLeaksNoCudaTensors(self, name=None):
+        # [FUNCTION DOC] Return a context manager (CudaMemoryLeakCheck) that checks for leaked
+        # CUDA memory over its body; name defaults to the test id.
         name = self.id() if name is None else name
         return CudaMemoryLeakCheck(self, name)
 
     def before_cuda_memory_leak_check(self):
+        # [FUNCTION DOC] Hook called before the leak check compares memory; resets dynamo state
+        # if dynamo has been imported.
         self._reset_dynamo_if_imported()
 
     @staticmethod
     def _reset_dynamo_if_imported():
+        # [FUNCTION DOC] HELPER: Static method that resets dynamo if its module is already in
+        # the module table, without importing it otherwise.
         dynamo = sys.modules.get("torch._dynamo")
         if dynamo is not None:
             reset = getattr(dynamo, "reset", None)
@@ -3729,9 +4500,12 @@ class TestCase(expecttest.TestCase):
                 reset()
 
     def enforceNonDefaultStream(self):
+        # [FUNCTION DOC] Return a context manager that forces non default CUDA streams.
         return CudaNonDefaultStream()
 
     def _remove_ansi_escape(self, input):
+        # [FUNCTION DOC] HELPER: Return the input string with 7-bit ANSI escape
+        # sequences removed.
         # 7-bit C1 ANSI sequences
         ansi_escape = re.compile(r'''
             \x1B  # ESC
@@ -3747,17 +4521,24 @@ class TestCase(expecttest.TestCase):
         return ansi_escape.sub('', input)
 
     def remove_comment_lines(self, input_string):
+        # [FUNCTION DOC] Return the string with lines whose first non blank character is a hash
+        # sign removed.
         lines = input_string.split('\n')
         filtered_lines = [line for line in lines if not line.strip().startswith('#')]
         return '\n'.join(filtered_lines)
 
     def remove_empty_lines(self, input_string):
+        # [FUNCTION DOC] Return the string with blank lines removed.
         lines = input_string.split('\n')
         filtered_lines = [line for line in lines if line.strip() != '']
         return '\n'.join(filtered_lines)
 
     # ignore comments will ignore lines that starts with # after being stripped
     def assertExpectedInline(self, actual, expect, skip=0, ignore_comments=False, ignore_empty_lines=False):
+        # [FUNCTION DOC] Compare the string form of the actual value with the expected inline
+        # string, after removing ANSI escapes and optionally comment lines and empty lines from
+        # both. Delegates to the expecttest implementation (which can rewrite the source in
+        # accept mode); skip adds one frame for this wrapper. Returns its result.
         actual = actual if isinstance(actual, str) else str(actual)
         actual = self._remove_ansi_escape(actual)
         expect = self._remove_ansi_escape(expect)
@@ -3775,6 +4556,9 @@ class TestCase(expecttest.TestCase):
     def assertExpectedInlineMunged(
         self, exc_type, callable, expect, *, skip=0, suppress_suffix=True, post_munge=None,
     ):
+        # [FUNCTION DOC] Call a callable that is expected to raise exc_type, munge the exception
+        # text with munge_exc (removing stack trace specific details), optionally post process
+        # it, and compare to the expected inline string. Fails the test if nothing is raised.
         try:
             callable()
         except exc_type as e:
@@ -3788,16 +4572,23 @@ class TestCase(expecttest.TestCase):
         self.fail(msg="Did not raise when expected to")
 
     def assertLogs(self, logger=None, level=None):
+        # [FUNCTION DOC] Same as the unittest version, but defaults the logger to the
+        # torch logger.
         if logger is None:
             logger = logging.getLogger("torch")
         return super().assertLogs(logger, level)
 
     def assertNoLogs(self, logger=None, level=None):
+        # [FUNCTION DOC] Same as the unittest version, but defaults the logger to the
+        # torch logger.
         if logger is None:
             logger = logging.getLogger("torch")
         return super().assertNoLogs(logger, level)
 
     def wrap_with_cuda_policy(self, method_name, policy):
+        # [FUNCTION DOC] Wrap the named test method with the given policy, but only if CUDA is
+        # available and the test id mentions gpu or cuda. Imports the CUDA test module, which
+        # may initialize CUDA.
         test_method = getattr(self, method_name)
         # the import below may initialize CUDA context, so we do it only if
         # self._do_cuda_memory_leak_check or self._do_cuda_non_default_stream
@@ -3810,6 +4601,8 @@ class TestCase(expecttest.TestCase):
             setattr(self, method_name, self.wrap_method_with_policy(test_method, policy))
 
     def wrap_with_policy(self, method_name, policy):
+        # [FUNCTION DOC] Replace the named test method on this instance by a version wrapped
+        # with the given policy.
         test_method = getattr(self, method_name)
         setattr(self, method_name, self.wrap_method_with_policy(test_method, policy))
 
@@ -3817,6 +4610,9 @@ class TestCase(expecttest.TestCase):
     # We don't take the context manager directly as it may be necessary to
     # construct it once per test method
     def wrap_method_with_policy(self, method, policy):
+        # [FUNCTION DOC] Return a bound method that runs the given method inside the context
+        # manager created by calling the policy (a zero argument function). The check is done
+        # around each call, not in setUp and tearDown, because exceptions keep objects alive.
         # Assumes that `method` is the tested function in `self`.
         # NOTE: Python Exceptions (e.g., unittest.Skip) keeps objects in scope
         #       alive, so this cannot be done in setUp and tearDown because
@@ -3825,21 +4621,34 @@ class TestCase(expecttest.TestCase):
         #       call in try-finally and always do the check.
         @wraps(method)
         def wrapper(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Enter the policy context, call the method and drop
+            # its result.
             with policy():
                 method(*args, **kwargs)
         return types.MethodType(wrapper, self)
 
     def wrap_with_cuda_memory_check(self, method):
+        # [FUNCTION DOC] Wrap a method with the CUDA memory leak check policy and return it.
         return self.wrap_method_with_policy(method, self.assertLeaksNoCudaTensors)
 
     def _dynamo_test_key(self):
+        # [FUNCTION DOC] HELPER: Return the key class name dot test method name, used to look up
+        # expected failures and skips for dynamo and inductor runs.
         return f"{self.__class__.__name__}.{self._testMethodName}"
 
     def compile_fn(self, fn, backend, nopython):
+        # [FUNCTION DOC] Hook that compiles a function with dynamo optimize for the backend and
+        # nopython flag; subclasses can override to control compilation.
         # Allows subclasses to control compilation
         return torch._dynamo.optimize(backend, nopython=nopython)(fn)
 
     def _run_custom(self, result=None):
+        # [FUNCTION DOC] HELPER: Run the test, optionally under dynamo, aot eager or inductor.
+        # Determines strict mode from environment and class and method attributes, resets dynamo
+        # state before and after, patches suppress_errors, can disable inductor size asserts for
+        # test_ops, wraps the run with expected failure or skip handling from the failure
+        # tables, and runs without compiled autograd where listed. Afterwards, if the suite must
+        # stop early (CUDA failure), records a fake failure and stops the result.
         using_unittest = isinstance(result, unittest.TestResult)
 
         super_run = super().run
@@ -3933,8 +4742,13 @@ class TestCase(expecttest.TestCase):
                 key = self._dynamo_test_key()
 
                 def expect_failure(f, file_name):
+                    # [FUNCTION DOC] HELPER: Wrap a function so that any failure becomes a skip,
+                    # and passing raises RuntimeError asking to remove the expected failure
+                    # marker file.
                     @wraps(f)
                     def wrapper(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Run the function; skip on any exception,
+                        # otherwise raise RuntimeError about the unexpected success.
                         try:
                             f(*args, **kwargs)
                         except BaseException as e:
@@ -3955,8 +4769,13 @@ class TestCase(expecttest.TestCase):
                     setattr(self, self._testMethodName, expect_failure(method, file_name))
 
                 def ignore_failure(f, file_name):
+                    # [FUNCTION DOC] HELPER: Wrap a function so that failures and passes both
+                    # end in a skip with an explanatory message about the skip marker file.
                     @wraps(f)
                     def wrapper(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Run the function; skip on exception; after
+                        # success skip with a message depending on whether the test was marked
+                        # as expected failure.
                         try:
                             f(*args, **kwargs)
                         except BaseException as e:
@@ -4015,6 +4834,8 @@ class TestCase(expecttest.TestCase):
 
 
     def run(self, result=None):
+        # [FUNCTION DOC] Run the test inside an exit stack, entering the crossref mode when that
+        # mode is enabled, and delegate to the custom runner.
         with contextlib.ExitStack() as stack:
             if TEST_WITH_CROSSREF:
                 stack.enter_context(CrossRefMode())
@@ -4023,6 +4844,10 @@ class TestCase(expecttest.TestCase):
             )
 
     def setUp(self):
+        # [FUNCTION DOC] Prepare for a test: check whether it is disabled or slow (may skip),
+        # seed the RNGs, remember and enable sparse tensor invariant checking, check the default
+        # dtype if requested, and snapshot grad mode, the torch function mode stack length and
+        # state, and the fp32 precision flags. Raises AssertionError on a wrong default dtype.
         check_if_enable(self)
         set_rng_seed()
 
@@ -4051,6 +4876,11 @@ class TestCase(expecttest.TestCase):
         self._prev_fp32_precision = _snapshot_fp32_precision()
 
     def tearDown(self):
+        # [FUNCTION DOC] Clean up after a test and detect leaked global state. Restores the
+        # sparse invariant checking and grad mode, then raises AssertionError if the default
+        # dtype changed (when checked), the torch function mode stack length or state changed
+        # (after repairing them), or the fp32 precision flags changed (after restoring them)
+        # unless the leak check is disabled with an environment variable.
         # There exists test cases that override TestCase.setUp
         # definition, so we cannot assume that _check_invariants
         # attribute is defined in general.
@@ -4115,6 +4945,11 @@ class TestCase(expecttest.TestCase):
     @staticmethod
     def _make_crow_indices(n_rows, n_cols, nnz,
                            *, device, dtype, random=True):
+        # [FUNCTION DOC] HELPER: Static method that builds the compressed row indices of a CSR
+        # tensor with the given number of rows and columns and exactly nnz specified elements on
+        # the requested device and dtype. Uses a sawtooth model of per row counts so that rows
+        # are full, empty or partial, bisecting to size the window, and optionally shuffles the
+        # row order. Raises AssertionError if nnz is out of bounds.
         """Return crow_indices of a CSR tensor with size (n_rows, n_cols) and
         the number of specified elements nnz.
 
@@ -4172,6 +5007,8 @@ class TestCase(expecttest.TestCase):
             )
 
         def sawteeth(n, m):
+            # [FUNCTION DOC] HELPER: Return the total count of elements in the sequence of
+            # sawteeth that fits a window defined by n rows and m columns removed from the grid.
             # return the total number of counts in the sequence of
             # sawteeth where n and m define a window in (n_rows+1,
             # n_cols+1) rectangle where the sequence of sawteeth
@@ -4263,6 +5100,10 @@ class TestCase(expecttest.TestCase):
         return crow_indices.to(device=device)
 
     def genSparseCompressedTensor(self, size, nnz, *, layout, device, dtype, index_dtype, blocksize=(), dense_dims=0):
+        # [FUNCTION DOC] Generate a random sparse compressed tensor (CSR, CSC, BSR or BSC
+        # depending on layout) with the given size, number of specified elements, index dtype,
+        # optional block size and number of trailing dense dimensions. Batches are generated one
+        # by one and stacked. Raises AssertionError on invalid sizes, nnz, or block sizes.
         from operator import mul
         from functools import reduce
         sparse_dim = 2
@@ -4289,6 +5130,8 @@ class TestCase(expecttest.TestCase):
         dense_size = size[(len(size) - dense_dims):]
 
         def random_sparse_compressed(n_compressed_dims, n_plain_dims, nnz):
+            # [FUNCTION DOC] HELPER: Create values, compressed indices and sorted plain indices
+            # for a single (non batch) matrix with random column or row positions.
             compressed_indices = self._make_crow_indices(n_compressed_dims, n_plain_dims, nnz, device=device, dtype=index_dtype)
             plain_indices = torch.zeros(nnz, dtype=index_dtype, device=device)
             for i in range(n_compressed_dims):
@@ -4318,26 +5161,40 @@ class TestCase(expecttest.TestCase):
                                               values, size=size, dtype=dtype, layout=layout, device=device)
 
     def genSparseCSRTensor(self, size, nnz, *, device, dtype, index_dtype, dense_dims=0):
+        # [FUNCTION DOC] Generate a random CSR tensor by delegating to
+        # genSparseCompressedTensor.
         return self.genSparseCompressedTensor(size, nnz, layout=torch.sparse_csr, device=device,
                                               dtype=dtype, index_dtype=index_dtype, blocksize=(), dense_dims=dense_dims)
 
     def genSparseCSCTensor(self, size, nnz, *, device, dtype, index_dtype, dense_dims=0):
+        # [FUNCTION DOC] Generate a random CSC tensor by delegating to
+        # genSparseCompressedTensor.
+        # KNOWN ISSUE: the dense_dims argument is accepted but a fixed zero is passed on, so
+        # hybrid CSC tensors cannot be generated.
         return self.genSparseCompressedTensor(size, nnz, layout=torch.sparse_csc, device=device,
                                               dtype=dtype, index_dtype=index_dtype, blocksize=(), dense_dims=0)
 
     def genSparseBSRTensor(self, size, blocksize, nnz, *, device, dtype, index_dtype, dense_dims=0):
+        # [FUNCTION DOC] Generate a random BSR tensor with the given block size (must have
+        # length two, otherwise AssertionError) via genSparseCompressedTensor.
         if len(blocksize) != 2:
             raise AssertionError(f"expected len(blocksize) == 2, got {len(blocksize)}")
         return self.genSparseCompressedTensor(size, nnz, layout=torch.sparse_bsr, device=device,
                                               dtype=dtype, index_dtype=index_dtype, blocksize=blocksize, dense_dims=dense_dims)
 
     def genSparseBSCTensor(self, size, blocksize, nnz, *, device, dtype, index_dtype, dense_dims=0):
+        # [FUNCTION DOC] Generate a random BSC tensor with the given block size (must have
+        # length two, otherwise AssertionError) via genSparseCompressedTensor.
         if len(blocksize) != 2:
             raise AssertionError(f"expected len(blocksize) == 2, got {len(blocksize)}")
         return self.genSparseCompressedTensor(size, nnz, layout=torch.sparse_bsc, device=device,
                                               dtype=dtype, index_dtype=index_dtype, blocksize=blocksize, dense_dims=dense_dims)
 
     def genSparseTensor(self, size, sparse_dim, nnz, is_uncoalesced, device, dtype):
+        # [FUNCTION DOC] Generate a random sparse COO tensor of the given size and sparse
+        # dimensions with nnz entries (duplicated indices if uncoalesced). Returns a tuple of
+        # the tensor, a copy of its indices and a copy of its values. Raises AssertionError on
+        # an impossible combination of sizes and nnz.
         # Assert not given impossible combination, where the sparse dims have
         # empty numel, but nnz > 0 makes the indices containing values.
         if not (all(size[d] > 0 for d in range(sparse_dim)) or nnz == 0):
@@ -4380,6 +5237,12 @@ class TestCase(expecttest.TestCase):
                                enable_batch_variable_nse=False,
                                output_tensor=True,
                                patterns=None):
+        # [FUNCTION DOC] Generator of small, deterministic inputs for tensor constructors of the
+        # given layout (strided, COO, CSR, CSC, BSR, BSC). Covers regular, batched, hybrid, zero
+        # sized and optionally non contiguous indices or values, all representing the same
+        # mathematical tensors across layouts. With output_tensor true, yields tensors;
+        # otherwise yields pairs of positional arguments and keyword arguments for the
+        # constructors. Raises AssertionError on unexpected layouts or malformed patterns.
         """Generator of simple inputs for tensor constructors of the given layout.
 
         The generated tensor inputs have the following properties:
@@ -4440,6 +5303,9 @@ class TestCase(expecttest.TestCase):
             return
 
         def get_blockpattern(pattern, blocksize):
+            # [FUNCTION DOC] HELPER: Reduce a 2-D pattern to a block pattern where each block
+            # holds a nonzero element is numbered with a block id; the pattern shape must divide
+            # by the block size, otherwise AssertionError.
             basesize = pattern.shape
             if basesize[0] % blocksize[0] != 0:
                 raise AssertionError(
@@ -4457,6 +5323,10 @@ class TestCase(expecttest.TestCase):
             return (blockpattern != 0) * block_ids
 
         def get_sparse_data(pattern):
+            # [FUNCTION DOC] HELPER: For a 2-D pattern compute the data of each layout (COO,
+            # CSR, CSC and strided) independently from the factory functions, with values
+            # numbered from one in row major order. Raises AssertionError if the pattern is not
+            # a matrix.
             basesize = pattern.shape
             if len(basesize) != 2:
                 raise AssertionError(f"pattern is expected to be a matrix, got shape {basesize}")
@@ -4494,6 +5364,9 @@ class TestCase(expecttest.TestCase):
                     torch.strided: (strided_values,)}
 
         def get_sparse_data_with_block(pattern, blocksize):
+            # [FUNCTION DOC] HELPER: Compute data for all layouts including BSR and BSC for
+            # a pattern and block size, by grouping values into blocks and reordering them
+            # for BSC.
             nonblock_data = get_sparse_data(pattern)
             blockpattern = get_blockpattern(pattern, blocksize)
             block_data = get_sparse_data(blockpattern)
@@ -4514,6 +5387,8 @@ class TestCase(expecttest.TestCase):
                     **nonblock_data}
 
         def get_batch_sparse_data(pattern, blocksize):
+            # [FUNCTION DOC] HELPER: Compute layout data for a pattern that may have batch
+            # dimensions by recursing over the leading dimension and concatenating results.
             size = pattern.shape
             if len(size) <= 2:  # non-batch
                 return get_sparse_data_with_block(pattern, blocksize)
@@ -4542,6 +5417,9 @@ class TestCase(expecttest.TestCase):
             return batch_data
 
         def generate_values(base, densesize):
+            # [FUNCTION DOC] HELPER: Create dense values of the given dense shape from a base
+            # value or a batch of base values, such that each element encodes its dense indices
+            # in decimal digits plus the base. Unique when every dense size is below ten.
             """Generates a tensor of shape densesize with values equal to
 
               base + i_1 * 10^0 + ... + i_d * 10^{d - 1}
@@ -4624,6 +5502,9 @@ class TestCase(expecttest.TestCase):
                    [0, 0]]], [(1, 1)], ([()] if enable_batch_variable_nse else []))]
 
         def non_contiguous_copy(t, dim=-1, offset=0):
+            # [FUNCTION DOC] HELPER: Return a copy of a contiguous tensor that is not contiguous
+            # along the given dimension, using the given storage offset. Asserts the input is
+            # contiguous, the copy is not, and the values are equal.
             # return a copy of t that is non-contiguous along the
             # given dimension and with the given storage offset
             self.assertTrue(t.is_contiguous())
@@ -4715,6 +5596,8 @@ class TestCase(expecttest.TestCase):
                         yield (*indices, values), kwargs
 
     def safeToDense(self, t):
+        # [FUNCTION DOC] Convert a tensor to a dense strided tensor, coalescing it first when it
+        # is sparse COO.
         # coalesce is only implemented for COO
         if t.layout == torch.sparse_coo:
             t = t.coalesce()
@@ -4723,6 +5606,10 @@ class TestCase(expecttest.TestCase):
     # Compares a torch function with a reference function for a given sample input (object of SampleInput)
     # Note: only values are compared, type comparison is not done here
     def compare_with_reference(self, torch_fn, ref_fn, sample_input, **kwargs):
+        # [FUNCTION DOC] Compare a torch function against a reference (numpy) function on a
+        # sample input. Calls both with the sample (the reference with its numpy version)
+        # and checks equality by values only, ignoring device. Extra keyword arguments go
+        # to assertEqual.
         numpy_sample = sample_input.numpy()
         n_inp, n_args, n_kwargs = numpy_sample.input, numpy_sample.args, numpy_sample.kwargs
         t_inp, t_args, t_kwargs = sample_input.input, sample_input.args, sample_input.kwargs
@@ -4739,6 +5626,11 @@ class TestCase(expecttest.TestCase):
     # TODO: add args/kwargs for passing to assertEqual (e.g. rtol, atol)
     def compare_with_numpy(self, torch_fn, np_fn, tensor_like,
                            device=None, dtype=None, **kwargs):
+        # [FUNCTION DOC] Compare a torch function and a numpy function applied to a tensor like
+        # object. A tensor input is converted to a numpy array (bfloat16 via float32); other
+        # inputs are built into both an array and a tensor with the given device and dtype. The
+        # numpy result is converted to a tensor and compared with assertEqual. Raises
+        # AssertionError if numpy is unavailable or device or dtype is given with a tensor.
         if not TEST_NUMPY:
             raise AssertionError("TEST_NUMPY must be True to use compare_with_numpy")
 
@@ -4775,11 +5667,15 @@ class TestCase(expecttest.TestCase):
         self.assertEqual(np_result, torch_result, **kwargs)
 
     def assertEqualIgnoreType(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Compare two values with assertEqual without checking dtype. Its use is
+        # discouraged and signals a test written wrongly.
         # If you are seeing this function used, that means test is written wrongly
         # and deserves detailed investigation
         return self.assertEqual(*args, exact_dtype=False, **kwargs)
 
     def assertEqualBroadcasting(self, x, y, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Assert that x equals y after broadcasting y to the shape of x. Scalars
+        # and sequences are converted to tensors first. Extra arguments go to assertEqual.
         r"""Tests if tensor x equals to y, if y to be broadcast to x.shape.
         """
         if not isinstance(y, Iterable):
@@ -4806,6 +5702,14 @@ class TestCase(expecttest.TestCase):
             exact_stride=False,
             exact_is_coalesced=False
     ):
+        # [FUNCTION DOC] Main equality assertion for tests. Normalizes the inputs (numpy arrays
+        # with dtypes unknown to torch and sequence versus tensor comparisons are converted,
+        # strided nested tensors are unbound, distributed tensors are unwrapped) and compares
+        # using the relaxed comparison pair classes. Tolerances default by dtype and are raised
+        # to the class level precision and relative tolerance overrides. Flags control checks of
+        # dtype, device, layout, stride and coalescing, and NaN equality. msg may be a string or
+        # a function that builds the message from the generated one. Raises AssertionError
+        # describing the mismatch.
         # Hide this function from `pytest`'s traceback
         __tracebackhide__ = True
 
@@ -4817,6 +5721,8 @@ class TestCase(expecttest.TestCase):
             isinstance(input, np.ndarray) and not has_corresponding_torch_dtype(input.dtype) for input in (x, y)
         ):
             def to_list(input):
+                # [FUNCTION DOC] HELPER: Convert a tensor, array or iterable into a list of
+                # its elements.
                 return input.tolist() if isinstance(input, (torch.Tensor, np.ndarray)) else list(input)
 
             x = to_list(x)
@@ -4885,22 +5791,30 @@ class TestCase(expecttest.TestCase):
 
     def assertNotEqual(self, x, y, msg: str | None = None, *,                                       # type: ignore[override]
                        atol: float | None = None, rtol: float | None = None, **kwargs) -> None:
+        # [FUNCTION DOC] Assert that two values are not equal, by asserting that assertEqual
+        # raises AssertionError. Tolerances and extra arguments are forwarded.
         with self.assertRaises(AssertionError, msg=msg):
             self.assertEqual(x, y, msg, atol=atol, rtol=rtol, **kwargs)
 
     def _formatMessage(self, msg, standardMsg) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Allow a callable message, called with the standard message to
+        # produce the final message; otherwise defer to the parent implementation.
         # Allow a callable msg, invoked lazily on failure to build the message.
         if callable(msg):
             return msg(standardMsg)
         return super()._formatMessage(msg, standardMsg)
 
     def assertEqualTypeString(self, x, y) -> None:
+        # [FUNCTION DOC] Assert two tensors have the same device, dtype and sparsity, standing
+        # in for the removed comparison of type strings.
         # This API is used simulate deprecated x.type() is y.type()
         self.assertEqual(x.device, y.device)
         self.assertEqual(x.dtype, y.dtype)
         self.assertEqual(x.is_sparse, y.is_sparse)
 
     def assertObjectIn(self, obj: Any, iterable: Iterable[Any]) -> None:
+        # [FUNCTION DOC] Assert that the very same object (compared by identity) occurs in the
+        # iterable. Raises AssertionError otherwise.
         for elem in iterable:
             if id(obj) == id(elem):
                 return
@@ -4909,6 +5823,9 @@ class TestCase(expecttest.TestCase):
     # Reimplemented to provide special behavior when
     # _ignore_not_implemented_error is True
     def assertRaises(self, expected_exception, *args, **kwargs):
+        # [FUNCTION DOC] Override of assertRaises: when not implemented errors are being
+        # ignored, use a context that skips the test on NotImplementedError; otherwise defer to
+        # the parent.
         if self._ignore_not_implemented_error:
             context: AssertRaisesContextIgnoreNotImplementedError | None = \
                 AssertRaisesContextIgnoreNotImplementedError(expected_exception, self)  # type: ignore[call-arg]
@@ -4923,6 +5840,9 @@ class TestCase(expecttest.TestCase):
     # Reimplemented to provide special behavior when
     # _ignore_not_implemented_error is True
     def assertRaisesRegex(self, expected_exception, expected_regex, *args, **kwargs):
+        # [FUNCTION DOC] Override of assertRaisesRegex: for device types that are not native
+        # (and not mps) the message is not validated (empty pattern). When not implemented
+        # errors are being ignored, a context that skips on NotImplementedError is used.
         # Verifies that an exception with the type expected_exception and message
         # matching the regular expression defined by expected_regex is thrown.
         # If the test is instantiated for a non-native device type (like XLA)
@@ -4946,9 +5866,14 @@ class TestCase(expecttest.TestCase):
     # exceptions, these do not actually propagate to the caller and are
     # suppressed.  We must test for them specially.
     def assertNoUnraisable(self, callable, *args, **kwargs):
+        # [FUNCTION DOC] Assert that calling the callable raises no unraisable exception (which
+        # normally is silently ignored). Temporarily replaces the unraisable hook and disables
+        # garbage collection during the call to avoid spurious failures, then asserts that
+        # nothing was recorded.
         raised = None
 
         def record_unraisable(unraisable):
+            # [FUNCTION DOC] HELPER: Hook that remembers the last unraisable exception record.
             nonlocal raised
             raised = unraisable
 
@@ -4969,6 +5894,10 @@ class TestCase(expecttest.TestCase):
     # NB: The kwargs forwarding to callable robs the 'subname' parameter.
     # If you need it, manually apply your callable in a lambda instead.
     def assertExpectedRaises(self, exc_type, callable, *args, **kwargs):
+        # [FUNCTION DOC] Call a callable that must raise the given exception type and compare
+        # the exception text to a recorded expect file (using assertExpected). An optional
+        # subname keyword is consumed and not forwarded to the callable. Fails the test if
+        # nothing is raised.
         subname = None
         if 'subname' in kwargs:
             subname = kwargs['subname']
@@ -4982,6 +5911,8 @@ class TestCase(expecttest.TestCase):
         self.fail(msg="Did not raise when expected to")
 
     def assertNotWarn(self, callable, msg=''):
+        # [FUNCTION DOC] Assert that calling the callable produces no warnings, with warn always
+        # mode forced on so warn once warnings are also seen.
         r"""
         Test if :attr:`callable` does not raise a warning.
         """
@@ -4993,6 +5924,9 @@ class TestCase(expecttest.TestCase):
 
     @contextmanager
     def assertWarnsOnceRegex(self, category, regex=''):
+        # [FUNCTION DOC] Context manager for code that must always warn. Forces warn always
+        # mode, records the warnings from the body, and fails if none was caught, if none has
+        # exactly the given category, or if none has a message matching the regex.
         """Context manager for code that *must always* warn
 
         This filters expected warnings from the test and fails if
@@ -5012,6 +5946,12 @@ class TestCase(expecttest.TestCase):
                 f'{pattern}, {[w.message for w in ws if type(w.message) is category]}')
 
     def assertExpected(self, s, subname=None):
+        # [FUNCTION DOC] Compare a string with the content of an expect file named from the test
+        # id (and optional unique subname) in an expect directory next to the test script. In
+        # accept mode a missing or different file is rewritten (with the ONNX producer version
+        # normalized); otherwise a missing file raises RuntimeError with instructions and a
+        # difference raises an assertion failure. Raises TypeError if the argument is not a
+        # string. Side effects: reads and may write files.
         r"""
         Test that a string matches the recorded contents of a file
         derived from the name of this test and subname.  This file
@@ -5026,6 +5966,8 @@ class TestCase(expecttest.TestCase):
             raise TypeError("assertExpected is strings only")
 
         def remove_prefix(text, prefix):
+            # [FUNCTION DOC] HELPER: Return the text without the given prefix if it starts
+            # with it.
             if text.startswith(prefix):
                 return text[len(prefix):]
             return text
@@ -5049,6 +5991,8 @@ class TestCase(expecttest.TestCase):
         expected = None
 
         def accept_output(update_type):
+            # [FUNCTION DOC] HELPER: Print a message and write the string, with the producer
+            # version replaced by a placeholder, into the expect file.
             print(f"Accepting {update_type} for {munged_id}{subname_output}:\n\n{s}")
             with open(expected_file, 'w') as f:
                 # Adjust for producer_version, leave s unmodified
@@ -5092,10 +6036,16 @@ class TestCase(expecttest.TestCase):
                 self.assertEqual(s, expected)
 
     def assertExpectedStripMangled(self, s, subname=None):
+        # [FUNCTION DOC] Remove the mangled module names beginning with the torch module marker
+        # from the string and then compare with assertExpected.
         s = re.sub(r'__torch__[^ ]+', '', s)
         self.assertExpected(s, subname)
 
     def assertGreaterAlmostEqual(self, first, second, places=None, msg=None, delta=None):
+        # [FUNCTION DOC] Assert that first is greater than or equal to second, or within
+        # delta (or a number of decimal places, default seven) below it. Raises TypeError if
+        # both delta and places are given, and the failure exception with a formatted
+        # message otherwise.
         """Assert that ``first`` is greater than or almost equal to ``second``.
 
         The equality of ``first`` and ``second`` is determined in a similar way to
@@ -5126,6 +6076,9 @@ class TestCase(expecttest.TestCase):
         raise self.failureException(msg)
 
     def assertAtenOp(self, onnx_model, operator, overload_name=""):
+        # [FUNCTION DOC] Assert that an ONNX model contains an ATen operator node with the given
+        # operator name and overload name. Fails the test when no ATen node exists or the
+        # attributes differ.
         all_aten_nodes = [p for p in onnx_model.graph.node
                           if p.op_type == "ATen" and p.domain == "org.pytorch.aten"]
         self.assertTrue(all_aten_nodes)
@@ -5139,6 +6092,13 @@ class TestCase(expecttest.TestCase):
         self.assertEqual(attrs.get("overload_name", ""), overload_name)
 
     def check_nondeterministic_alert(self, fn, caller_name, should_alert=True):
+        # [FUNCTION DOC] Check that fn produces (or, when should_alert is false, does not
+        # produce) a nondeterministic alert. Under deterministic mode it expects a RuntimeError
+        # mentioning the caller name; under warn only mode it expects a UserWarning with that
+        # message. When no alert is expected, it checks neither is produced.
+        # KNOWN ISSUE: in the no-alert branch the loop tests whether the recorded warning
+        # objects are UserWarning instances, but they are warning message records, so the
+        # assertion inside never runs.
         '''Checks that an operation produces a nondeterministic alert when
         expected while `torch.use_deterministic_algorithms(True)` is set.
 
@@ -5197,6 +6157,9 @@ class TestCase(expecttest.TestCase):
     # run code in subprocess and capture exceptions.
     @staticmethod
     def run_process_no_exception(code, env=None):
+        # [FUNCTION DOC] Static method: run Python code in a new interpreter process with
+        # the optional environment, capture output, and return a tuple of stdout bytes and
+        # stderr bytes.
         import subprocess
 
         with subprocess.Popen(
@@ -5211,6 +6174,9 @@ class TestCase(expecttest.TestCase):
     # returns captured stderr
     @staticmethod
     def runWithPytorchAPIUsageStderr(code):
+        # [FUNCTION DOC] Static method: run the code in a subprocess with API usage logging to
+        # stderr enabled and the CI and show locals variables removed, and return the captured
+        # stderr decoded as ascii text.
         env = os.environ.copy()
         env["PYTORCH_API_USAGE_STDERR"] = "1"
         # remove CI flag since this is a wrapped test process.
@@ -5226,6 +6192,10 @@ class TestCase(expecttest.TestCase):
         import_string: str,
         expected_failure_message: str | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Try to load a checkpoint file in a fresh subprocess with
+        # weights only loading, after running an import string. If an expected failure message
+        # is given, the load must raise RuntimeError containing it; otherwise it must succeed.
+        # Subprocess failures are re-raised as RuntimeError with the output text.
         """
         Attempts weights_only `torch.load` in a subprocess. This is used to test that
         weights_only `torch.load` works as expected without global imports.
@@ -5255,6 +6225,9 @@ class TestCase(expecttest.TestCase):
 
 
 class TestCaseBase(TestCase):
+    # [CLASS DOC] HELPER: Empty subclass of TestCase. It exists so dynamically created classes
+    # can call the parent implementations of setUp, tearDown and so on by passing this class to
+    # super (see the linked discussion).
     # Calls to super() in dynamically created classes are a bit odd.
     # See https://github.com/pytorch/pytorch/pull/118586 for more info
     # Subclassing this class and then calling super(TestCaseBase) will run
@@ -5263,6 +6236,9 @@ class TestCaseBase(TestCase):
 
 
 def download_file(url, binary=True):
+    # [FUNCTION DOC] Download a file from a URL into a data directory next to this module (a
+    # writable path) and return its local path; an existing file is reused. A network failure
+    # emits a RuntimeWarning and raises unittest.SkipTest. Side effects: network, file.
     from urllib.parse import urlsplit
     from urllib import request, error
 
@@ -5283,6 +6259,8 @@ def download_file(url, binary=True):
         raise unittest.SkipTest(msg) from e
 
 def find_free_port():
+    # [FUNCTION DOC] Find a free TCP port on localhost by binding to port zero, and return its
+    # number. The port may be taken by someone else before it is used (race condition).
     """
     Finds an available port and returns that port number.
 
@@ -5302,6 +6280,12 @@ ADDRESS_IN_USE = "address already in use"
 CONNECT_TIMEOUT = "connect() timed out."
 
 def retry_on_connect_failures(func=None, connect_errors=(ADDRESS_IN_USE)):
+    # [FUNCTION DOC] Decorator that reruns a test when it raises RuntimeError whose message
+    # (also lowercased) contains one of the given error strings, up to ten tries with a random
+    # sleep below one second; after that raises RuntimeError. Other errors propagate. Usable
+    # with or without arguments.
+    # KNOWN ISSUE: the default for connect_errors is a plain string, not a tuple, so the loop
+    # iterates over single characters and nearly any error message matches.
     """Reruns a test if the test returns a RuntimeError and the exception
     contains one of the strings in connect_errors."""
     # This if block is executed when using this function as a decorator with arguments.
@@ -5310,6 +6294,7 @@ def retry_on_connect_failures(func=None, connect_errors=(ADDRESS_IN_USE)):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Retry loop around the test function described above.
         n_retries = 10
         tries_remaining = n_retries
         while True:
@@ -5328,9 +6313,19 @@ def retry_on_connect_failures(func=None, connect_errors=(ADDRESS_IN_USE)):
 
 # Decorator to retry upon certain Exceptions.
 def retry(ExceptionToCheck, tries=3, delay=3, skip_after_retries=False):
+    # [FUNCTION DOC] Return a decorator that retries a function when it raises the given
+    # exception type, up to the number of tries with a fixed delay in seconds, printing a
+    # message each time. The final failed attempt raises SkipTest.
+    # KNOWN ISSUE: the final raise has the form of raising SkipTest from a conditional
+    # expression, so SkipTest is raised even when skip_after_retries is false, and the original
+    # error is only used as the cause.
     def deco_retry(f):
+        # [FUNCTION DOC] HELPER: Wrap the function with the retry logic.
         @wraps(f)
         def f_retry(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Call the function, retrying on the checked exception while
+            # more than one try remains, then make one last call that converts the failure into
+            # a skip.
             mtries, mdelay = tries, delay
             while mtries > 1:
                 try:
@@ -5353,6 +6348,10 @@ def retry(ExceptionToCheck, tries=3, delay=3, skip_after_retries=False):
 # Methods for matrix generation
 
 def random_square_matrix_of_rank(l, rank, dtype=torch.double, device='cpu'):
+    # [FUNCTION DOC] Return a random square matrix of size l by l with the given rank, built
+    # from the SVD of a random matrix by zeroing the singular values at and past the rank (and
+    # replacing any zero singular value inside the rank by one). Raises AssertionError if rank
+    # exceeds l.
     if rank > l:
         raise AssertionError(f"rank must be <= l, got rank={rank}, l={l}")
     A = torch.randn(l, l, dtype=dtype, device=device)
@@ -5365,6 +6364,9 @@ def random_square_matrix_of_rank(l, rank, dtype=torch.double, device='cpu'):
     return (u * s.to(dtype).unsqueeze(-2)) @ vh
 
 def random_well_conditioned_matrix(*shape, dtype, device, mean=1.0, sigma=0.001):
+    # [FUNCTION DOC] Return a random matrix or batch of matrices of the given shape whose
+    # singular values are sampled from a Gaussian with the given mean and standard deviation
+    # (small sigma means better conditioned), sorted in descending order.
     """
     Returns a random rectangular matrix (batch of matrices)
     with singular values sampled from a Gaussian with
@@ -5391,6 +6393,9 @@ def random_well_conditioned_matrix(*shape, dtype, device, mean=1.0, sigma=0.001)
 #   dimension are separated by zeros or (whenever possible) nans
 # TODO: consider more complicated noncontiguity schemes
 def noncontiguous_like(t):
+    # [FUNCTION DOC] Return a non contiguous tensor with the same shape and values as t, made as
+    # a slice of a larger tensor where the other elements hold nan, True or 12 depending on
+    # dtype. A tensor that is already non contiguous is returned as is. requires_grad is copied.
     # Short-circuits if t is already noncontiguous
     if not t.is_contiguous():
         return t
@@ -5412,6 +6417,9 @@ def noncontiguous_like(t):
 
 # TODO: remove this (prefer make_symmetric_matrices below)
 def random_symmetric_matrix(l, *batches, **kwargs):
+    # [FUNCTION DOC] Return a random symmetric matrix, or batch of them, of size l by l using
+    # optional dtype and device keyword arguments (default double and cpu). Deprecated in favor
+    # of make_symmetric_matrices.
     dtype = kwargs.get('dtype', torch.double)
     device = kwargs.get('device', 'cpu')
     A = torch.randn(*(batches + (l, l)), dtype=dtype, device=device)
@@ -5421,6 +6429,8 @@ def random_symmetric_matrix(l, *batches, **kwargs):
 # Creates a symmetric matrix or batch of symmetric matrices
 # Shape must be a square matrix or batch of square matrices
 def make_symmetric_matrices(*shape, device, dtype):
+    # [FUNCTION DOC] Return a random symmetric matrix or batch of matrices with the given shape,
+    # device and dtype. Raises AssertionError if the last two dimensions differ.
     if shape[-1] != shape[-2]:
         raise AssertionError(f"expected square matrix, got shape[-1]={shape[-1]} != shape[-2]={shape[-2]}")
     t = make_tensor(shape, device=device, dtype=dtype)
@@ -5428,6 +6438,8 @@ def make_symmetric_matrices(*shape, device, dtype):
     return t
 
 def random_hermitian_matrix(l, *batches, **kwargs):
+    # [FUNCTION DOC] Return a random Hermitian matrix, or batch of them, of size l by l using
+    # optional dtype and device keyword arguments (default double and cpu).
     dtype = kwargs.get('dtype', torch.double)
     device = kwargs.get('device', 'cpu')
     A = torch.randn(*(batches + (l, l)), dtype=dtype, device=device)
@@ -5436,6 +6448,8 @@ def random_hermitian_matrix(l, *batches, **kwargs):
 
 
 def random_symmetric_psd_matrix(l, *batches, **kwargs):
+    # [FUNCTION DOC] Return a batch of random symmetric positive semi-definite matrices of size
+    # l by l, computed as a random matrix times its transpose.
     """
     Returns a batch of random symmetric positive-semi-definite matrices.
     The shape of the result is batch_dims + (matrix_size, matrix_size)
@@ -5450,6 +6464,8 @@ def random_symmetric_psd_matrix(l, *batches, **kwargs):
 
 
 def random_hermitian_psd_matrix(matrix_size, *batch_dims, dtype=torch.double, device='cpu'):
+    # [FUNCTION DOC] Return a batch of random Hermitian positive semi-definite matrices of the
+    # given size, computed as a random matrix times its conjugate transpose.
     """
     Returns a batch of random Hermitian positive-semi-definite matrices.
     The shape of the result is batch_dims + (matrix_size, matrix_size)
@@ -5463,6 +6479,9 @@ def random_hermitian_psd_matrix(matrix_size, *batch_dims, dtype=torch.double, de
 
 # TODO: remove this (prefer make_symmetric_pd_matrices below)
 def random_symmetric_pd_matrix(matrix_size, *batch_dims, **kwargs):
+    # [FUNCTION DOC] Return a batch of random symmetric positive definite matrices, computed as
+    # a random matrix times its transpose plus a small multiple of the identity. Deprecated in
+    # favor of make_symmetric_pd_matrices.
     dtype = kwargs.get('dtype', torch.double)
     device = kwargs.get('device', 'cpu')
     A = torch.randn(*(batch_dims + (matrix_size, matrix_size)),
@@ -5474,6 +6493,9 @@ def random_symmetric_pd_matrix(matrix_size, *batch_dims, **kwargs):
 # Creates a symmetric positive-definite matrix or batch of
 #   such matrices
 def make_symmetric_pd_matrices(*shape, device, dtype):
+    # [FUNCTION DOC] Return a random symmetric positive definite matrix or batch of matrices
+    # with the given shape (random matrix times its transpose plus a small multiple of the
+    # identity). Raises AssertionError if the last two dimensions differ.
     if shape[-1] != shape[-2]:
         raise AssertionError(f"expected square matrix, got shape[-1]={shape[-1]} != shape[-2]={shape[-2]}")
     t = make_tensor(shape, device=device, dtype=dtype)
@@ -5481,6 +6503,8 @@ def make_symmetric_pd_matrices(*shape, device, dtype):
     return t @ t.mT + i
 
 def random_hermitian_pd_matrix(matrix_size, *batch_dims, dtype, device):
+    # [FUNCTION DOC] Return a batch of random Hermitian positive definite matrices, computed as
+    # a random matrix times its conjugate transpose plus the identity.
     """
     Returns a batch of random Hermitian positive-definite matrices.
     The shape of the result is batch_dims + (matrix_size, matrix_size)
@@ -5495,6 +6519,9 @@ def random_hermitian_pd_matrix(matrix_size, *batch_dims, dtype, device):
 # Creates a full rank matrix with distinct singular values or
 #   a batch of such matrices
 def make_fullrank_matrices_with_distinct_singular_values(*shape, device, dtype, requires_grad=False):
+    # [FUNCTION DOC] Return a full rank matrix or batch of matrices with distinct singular
+    # values in the range of about 2/3 to 3/2 (alternating signs), built from the SVD of a
+    # random tensor. The result is optionally marked as requiring grad.
     with torch.no_grad():
         t = make_tensor(shape, device=device, dtype=dtype)
         u, _, vh = torch.linalg.svd(t, full_matrices=False)
@@ -5516,6 +6543,10 @@ def make_fullrank_matrices_with_distinct_singular_values(*shape, device, dtype, 
     return x
 
 def random_matrix(rows, columns, *batch_dims, **kwargs):
+    # [FUNCTION DOC] Return a random rectangular matrix (or batch) with singular values between
+    # about 1/(k+1) and 1, built from an SVD. Keyword arguments: dtype, device, silent (returns
+    # ones if LAPACK is missing), and singular (zero out the smallest singular value or values
+    # to make it singular). An empty matrix is returned unchanged.
     """Return rectangular matrix or batches of rectangular matrices.
 
     Parameters:
@@ -5547,6 +6578,10 @@ def random_matrix(rows, columns, *batch_dims, **kwargs):
 
 
 def random_matrix_with_scaled_reduction_dim(rows, columns, *batch_dims, **kwargs):
+    # [FUNCTION DOC] Return a random rectangular matrix (or batch) of normally distributed
+    # entries scaled by the square root of the size of the reduction dimension, so a product
+    # along that dimension has unit variance. Keyword arguments: dtype, device, requires_grad
+    # and reduction_dim (minus one or minus two).
     """Return rectangular matrix or batches of rectangular matrices
     with entries being iid and sampled from N(0, sigma^2) such that
     the variance of (A @ A.T)[..., i, j] is 1 if reduction_dim=-1, or
@@ -5572,6 +6607,8 @@ def random_matrix_with_scaled_reduction_dim(rows, columns, *batch_dims, **kwargs
 
 
 def random_lowrank_matrix(rank, rows, columns, *batch_dims, **kwargs):
+    # [FUNCTION DOC] Return a rectangular matrix (or batch) of the given rank as the product of
+    # two random matrices; keyword arguments are forwarded to random_matrix.
     """Return rectangular matrix or batches of rectangular matrices with
     given rank.
     """
@@ -5581,6 +6618,9 @@ def random_lowrank_matrix(rank, rows, columns, *batch_dims, **kwargs):
 
 
 def _generate_indices_prefer_all_rows(rows: int, cols: int, num_indices: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Generate a tensor of at most num_indices row and column index pairs
+    # for a matrix, choosing the same number of random columns in each row (so each row gets an
+    # entry if possible); pairs can overlap.
     """Generate indices for a row x cols matrix, preferring at least one index per row if possible."""
     indices = []  # type: ignore[var-annotated]
     n_per_row = math.ceil(num_indices / rows)
@@ -5594,6 +6634,9 @@ def _generate_indices_prefer_all_rows(rows: int, cols: int, num_indices: int) ->
 
 
 def random_sparse_matrix(rows, columns, density=0.01, **kwargs):
+    # [FUNCTION DOC] Return a coalesced random sparse COO matrix with approximately the given
+    # density but at least min(rows, columns) elements, with values decaying away from the
+    # diagonal. Keyword arguments: dtype and device.
     """Return rectangular random sparse matrix within given density.
 
     The density of the result approaches to given density as the size
@@ -5615,6 +6658,10 @@ def random_sparse_matrix(rows, columns, density=0.01, **kwargs):
 
 
 def random_sparse_pd_matrix(matrix_size, density=0.01, **kwargs):
+    # [FUNCTION DOC] Return a random sparse positive definite matrix with eigenvalues spread
+    # between 1/n and 1. Starts from a diagonal matrix and repeatedly applies random plane
+    # rotations (on both sides) until the number of nonzero entries reaches the target density.
+    # Keyword arguments: torch (module override), dtype and device.
     """Return random sparse positive-definite matrix with given density.
 
     The eigenvalues of the matrix are defined as::
@@ -5636,6 +6683,9 @@ def random_sparse_pd_matrix(matrix_size, density=0.01, **kwargs):
 
 
     def multiply(data, N, i, j, cs, sn, left=True):
+        # [FUNCTION DOC] HELPER: Apply a plane rotation with the given cosine and sine to rows
+        # (or columns) i and j of a sparse matrix stored as a mapping from index pairs to
+        # values, removing entries that become zero. Mutates the mapping.
         for k in range(N):
             if left:
                 ik, jk = (k, i), (k, j)
@@ -5672,6 +6722,8 @@ def random_sparse_pd_matrix(matrix_size, density=0.01, **kwargs):
 
 # FIXME: remove this by updating test suites using it
 def do_test_dtypes(self, dtypes, layout, device):
+    # [FUNCTION DOC] Legacy test helper: for each dtype except float16, create a zero tensor
+    # with the layout and device and check the dtype, layout and device of the result.
     for dtype in dtypes:
         if dtype != torch.float16:
             out = torch.zeros((2, 3), dtype=dtype, layout=layout, device=device)
@@ -5681,9 +6733,14 @@ def do_test_dtypes(self, dtypes, layout, device):
 
 # FIXME: remove this by updating test suites using it
 def do_test_empty_full(self, dtypes, layout, device):
+    # [FUNCTION DOC] Legacy test helper: check dtype, layout, device, requires_grad and filled
+    # values for the results of empty, full and their like and new variants, over the given
+    # dtypes and layout and with or without requires_grad.
     shape = torch.Size([2, 3])
 
     def check_value(tensor, dtype, layout, device, value, requires_grad):
+        # [FUNCTION DOC] HELPER: Assert the shape, dtype, layout, requires_grad, device (for
+        # CUDA tensors) and, if a value is given, the filled content of a tensor.
         self.assertEqual(shape, tensor.shape)
         self.assertIs(dtype, tensor.dtype)
         self.assertIs(layout, tensor.layout)
@@ -5695,6 +6752,8 @@ def do_test_empty_full(self, dtypes, layout, device):
             self.assertEqual(tensor, fill)
 
     def get_int64_dtype(dtype):
+        # [FUNCTION DOC] HELPER: Return the int64 dtype from the same module as the given dtype
+        # (for example the quantized or default namespace).
         module = '.'.join(str(dtype).split('.')[1:-1])
         if not module:
             return torch.int64
@@ -5736,6 +6795,8 @@ def do_test_empty_full(self, dtypes, layout, device):
 # FIXME: improve load_tests() documentation here
 running_script_path = None  # type: ignore[var-annotated]
 def set_running_script_path():
+    # [FUNCTION DOC] Record the absolute resolved path of the running script (the first command
+    # line argument) in the global, only if it ends in .py. Errors are ignored.
     global running_script_path
     try:
         running_file = os.path.abspath(os.path.realpath(sys.argv[0]))
@@ -5745,6 +6806,9 @@ def set_running_script_path():
         pass
 
 def check_test_defined_in_running_script(test_case):
+    # [FUNCTION DOC] Raise AssertionError if the class of the given test case is defined in a
+    # file other than the running script, which indicates an accidental import of a test case
+    # from another file. Does nothing if the running script path is not known.
     if running_script_path is None:
         return
     test_case_class_file = os.path.abspath(os.path.realpath(inspect.getfile(test_case.__class__)))
@@ -5756,6 +6820,9 @@ def check_test_defined_in_running_script(test_case):
         )
 
 def load_tests(loader, tests, pattern):
+    # [FUNCTION DOC] The load_tests protocol hook. Records the running script and returns a
+    # suite with the non empty test groups, checking (unless disabled by the environment) that
+    # each test is defined in the running script.
     set_running_script_path()
     test_suite = unittest.TestSuite()
     for test_group in tests:
@@ -5768,10 +6835,14 @@ def load_tests(loader, tests, pattern):
 
 # FIXME: document this and move it to test_serialization
 class BytesIOContext(io.BytesIO):
+    # [CLASS DOC] HELPER: In-memory bytes buffer that can be used in a with statement without
+    # being closed on exit (the exit method does nothing).
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Return the buffer itself.
         return self
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] HELPER: Do nothing, leaving the buffer open.
         pass
 
 # Tentative value for nondet_tol for gradcheck when backward implementation
@@ -5793,6 +6864,9 @@ skipIfSlowGradcheckEnv = unittest.skipIf(
 
 
 def gradcheck(fn, inputs, **kwargs):
+    # [FUNCTION DOC] Wrapper around autograd gradcheck that turns on batched grad checking and
+    # fast mode by default (fast mode off when slow gradcheck is enabled); values passed as None
+    # are replaced by these defaults. Returns the result of gradcheck.
     # Wrapper around gradcheck that enables certain keys by default.
     # Use this testing-internal gradcheck instead of autograd.gradcheck so that new features like vmap and
     # forward-mode AD are tested by default. We create this wrapper because we'd like to keep new checks
@@ -5815,6 +6889,8 @@ def gradcheck(fn, inputs, **kwargs):
     return torch.autograd.gradcheck(fn, inputs, **kwargs)
 
 def gradgradcheck(fn, inputs, grad_outputs=None, **kwargs):
+    # [FUNCTION DOC] Wrapper around autograd gradgradcheck with the same defaults as gradcheck
+    # (batched grad check on, fast mode unless slow gradcheck is enabled). Returns its result.
     # Wrapper around gradgradcheck that enables certain keys by default
     # See gradcheck above for an explanation of why we need something like this.
     #
@@ -5836,6 +6912,8 @@ def gradgradcheck(fn, inputs, grad_outputs=None, **kwargs):
 
 
 def _assertGradAndGradgradChecks(test_case, apply_fn, inputs, **kwargs):
+    # [FUNCTION DOC] HELPER: Assert that both gradcheck and gradgradcheck pass for the function
+    # and inputs, using the test case assertions.
     # call assert function rather than returning a bool since it's nicer
     # if we get whether this failed on the gradcheck or the gradgradcheck.
     test_case.assertTrue(gradcheck(apply_fn, inputs, **kwargs))
@@ -5844,6 +6922,8 @@ def _assertGradAndGradgradChecks(test_case, apply_fn, inputs, **kwargs):
 
 @contextmanager
 def set_cwd(path: str) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that changes the working directory to the given path for
+    # the body and restores the previous directory afterwards.
     old_cwd = os.getcwd()
     try:
         os.chdir(path)
@@ -5864,14 +6944,19 @@ dtype2prec_DONTUSE = {torch.float: 1e-5,
 # This is a wrapper that wraps a test to run this test twice, one with
 # coalesced=True, another with coalesced=False for coalesced/uncoalesced sparse tensors.
 def coalescedonoff(f):
+    # [FUNCTION DOC] Decorator for sparse tests: runs the test twice, once with the coalesced
+    # keyword true and once false.
     @wraps(f)
     def wrapped(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Call the test with coalesced true then false.
         f(self, *args, **kwargs, coalesced=True)
         f(self, *args, **kwargs, coalesced=False)
     return wrapped
 
 
 def is_coalesced_indices(s):
+    # [FUNCTION DOC] Return True if the indices of a sparse COO tensor are sorted in
+    # lexicographic order and have no duplicates, using a hash of each index column.
     indices = s._indices()
     hash_coeffs = (1,) + s.shape[s.sparse_dim() - 1:0:-1]
     hash_indices = torch.tensor(hash_coeffs, device=s.device).cumprod(-1).flip(-1)
@@ -5892,6 +6977,8 @@ def is_coalesced_indices(s):
 
 @contextlib.contextmanager
 def disable_gc():
+    # [FUNCTION DOC] Context manager that disables garbage collection for the body if it is
+    # enabled, and re-enables it afterwards.
     if gc.isenabled():
         try:
             gc.disable()
@@ -5903,6 +6990,8 @@ def disable_gc():
 
 
 def find_library_location(lib_name: str) -> Path:
+    # [FUNCTION DOC] Return the path of a shared library: the file in the torch lib directory if
+    # it exists, otherwise the file in the build lib directory of the source tree.
     # return the shared library file in the installed folder if exist,
     # else the file in the build folder
     torch_root = Path(torch.__file__).resolve().parent
@@ -5913,12 +7002,16 @@ def find_library_location(lib_name: str) -> Path:
     return torch_root / 'build' / 'lib' / lib_name
 
 def skip_but_pass_in_sandcastle(reason):
+    # [FUNCTION DOC] Return a decorator like unittest skip, except on Sandcastle where the test
+    # instead runs as an empty pass after printing a message to stderr.
     """
     Similar to unittest.skip, however in the sandcastle environment it just
     "passes" the test instead to avoid creating tasks complaining about tests
     skipping continuously.
     """
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Mark the function as skipped (outside Sandcastle) or wrap it so
+        # it prints a message and returns nothing (on Sandcastle).
         if not IS_SANDCASTLE:
             func.__unittest_skip__ = True
             func.__unittest_skip_why__ = reason
@@ -5926,6 +7019,8 @@ def skip_but_pass_in_sandcastle(reason):
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Print the skip message on stderr and return
+            # without running.
             print(f'Skipping {func.__name__} on sandcastle for following reason: {reason}', file=sys.stderr)
             return
         return wrapper
@@ -5933,6 +7028,8 @@ def skip_but_pass_in_sandcastle(reason):
     return decorator
 
 def mock_wrapper(method):
+    # [FUNCTION DOC] Return a function that calls the real method and also records the call on a
+    # mock object.
     """
     Returns a function that calls the real implementation of a method
     in addition to passing args to a mock object.
@@ -5941,12 +7038,16 @@ def mock_wrapper(method):
 
     @wraps(method)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Record the call arguments on the mock (without the instance),
+        # then call the real method with the instance and arguments and return its result.
         mock(*args, **kwargs)
         return method(self, *args, **kwargs)
     wrapper.mock = mock  # type: ignore[attr-defined]
     return wrapper
 
 def get_tensors_from(args, kwargs):
+    # [FUNCTION DOC] Return a set of all Tensor objects found among the positional arguments and
+    # the keyword argument values (not searching inside containers).
     """ Returns a set of all Tensor objects in the given args and kwargs. """
     return set([arg for arg in args if isinstance(arg, Tensor)] +
                [v for v in kwargs.values() if isinstance(v, Tensor)])
@@ -5954,6 +7055,10 @@ def get_tensors_from(args, kwargs):
 
 # Returns scalar tensor representation of a list of integer byte values
 def bytes_to_scalar(byte_list: list[int], dtype: torch.dtype, device: torch.device):
+    # [FUNCTION DOC] Build a scalar tensor from a list of byte values (each from 0 to 255)
+    # interpreted in native byte order as the C type matching the dtype; complex dtypes need
+    # twice the bytes (real part then imaginary part). Raises AssertionError on a wrong number
+    # of bytes or out of range bytes, and KeyError for unsupported dtypes.
     dtype_to_ctype: dict[torch.dtype, Any] = {
         torch.int8: ctypes.c_int8,
         torch.uint8: ctypes.c_uint8,
@@ -5973,6 +7078,8 @@ def bytes_to_scalar(byte_list: list[int], dtype: torch.dtype, device: torch.devi
     num_bytes = ctypes.sizeof(ctype)
 
     def check_bytes(byte_list):
+        # [FUNCTION DOC] HELPER: Raise AssertionError if any value is outside the range 0
+        # to 255.
         for byte in byte_list:
             if not (0 <= byte <= 255):
                 raise AssertionError(f"byte value out of range: expected 0 <= byte <= 255, got {byte}")
@@ -6001,6 +7108,9 @@ def bytes_to_scalar(byte_list: list[int], dtype: torch.dtype, device: torch.devi
 
 
 def copy_func(f):
+    # [FUNCTION DOC] Return a new function object sharing the code, globals, defaults and
+    # closure of the given function, with its metadata and keyword defaults copied. Needed so
+    # marking a copy as expected failure does not alter the original.
     """Based on http://stackoverflow.com/a/6528148/190597 (Glenn Maynard)"""
     g = types.FunctionType(f.__code__, f.__globals__, name=f.__name__,
                            argdefs=f.__defaults__,
@@ -6011,6 +7121,9 @@ def copy_func(f):
 
 
 def xfail_inherited_tests(tests):
+    # [FUNCTION DOC] Return a class decorator that marks the listed inherited test methods as
+    # expected failures on the decorated class, by replacing each with an expected failure copy
+    # of the inherited function. Returns the class.
     """
     Given a list of test names which are defined by a superclass of the
     class this decorates, mark them as expected failure.  This is useful
@@ -6018,6 +7131,8 @@ def xfail_inherited_tests(tests):
     test class.
     """
     def deco(cls):
+        # [FUNCTION DOC] HELPER: Apply the expected failure marking to each named test of
+        # the class.
         for t in tests:
             # NB: expectedFailure operates by mutating the method in question,
             # which is why you have to copy the function first
@@ -6027,16 +7142,23 @@ def xfail_inherited_tests(tests):
 
 
 def skip_but_pass_in_sandcastle_if(condition, reason):
+    # [FUNCTION DOC] Return a decorator like unittest skipIf which, on Sandcastle, replaces a
+    # test that would be skipped by a function that prints a message to stderr and passes.
+    # Outside Sandcastle it marks the function skipped with the reason.
     """
     Similar to unittest.skipIf, however in the sandcastle environment it just
     "passes" the test instead to avoid creating tasks complaining about tests
     skipping continuously.
     """
     def decorator(func):
+        # [FUNCTION DOC] HELPER: If the condition holds, on Sandcastle return a printing no-op
+        # wrapper, otherwise mark the function skipped; return the function unchanged otherwise.
         if condition:
             if IS_SANDCASTLE:
                 @wraps(func)
                 def wrapper(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Print the skip message to stderr and return without
+                    # running the test.
                     print(f'Skipping {func.__name__} on sandcastle for following reason: {reason}', file=sys.stderr)
                 return wrapper
             else:
@@ -6048,17 +7170,24 @@ def skip_but_pass_in_sandcastle_if(condition, reason):
     return decorator
 
 def dtype_name(dtype):
+    # [FUNCTION DOC] Return the short name of a dtype, the part of its string form after the
+    # module prefix (for example int64).
     """ Returns the pretty name of the dtype (e.g. torch.int64 -> int64). """
     return str(dtype).split('.')[1]
 
 
 def _cpu_sleep(cycles: int) -> None:
+    # [FUNCTION DOC] HELPER: Busy loop for the given number of iterations, standing in for a
+    # device sleep on CPU.
     """Spin-wait for approximately the given number of cycles."""
     for _ in range(cycles):
         pass
 
 
 def device_sleep(device: str, cycles: int) -> None:
+    # [FUNCTION DOC] Sleep for a number of cycles on a device. For CPU, temporarily installs a
+    # spin loop as the cpu sleep function and removes or restores it afterwards; for other
+    # devices calls the sleep function of the device module.
     """Sleep for the given number of cycles on the specified device.
 
     For CPU, temporarily patches torch.cpu._sleep if needed.
@@ -6080,6 +7209,10 @@ def device_sleep(device: str, cycles: int) -> None:
 
 @functools.lru_cache
 def get_cycles_per_ms(device: str = "cuda") -> float:
+    # [FUNCTION DOC] Measure and return the approximate number of device sleep cycles per
+    # millisecond for a device type. Takes ten measurements (timed with wall clock for CPU, with
+    # device events otherwise; a fixed estimate when the device has no sleep), drops the two
+    # smallest and two largest, and averages the rest. The result is cached per device.
     """Measure and return approximate number of cycles per millisecond for device _sleep.
 
     Args:
@@ -6093,6 +7226,7 @@ def get_cycles_per_ms(device: str = "cuda") -> float:
         import time
 
         def measure() -> float:
+            # [FUNCTION DOC] HELPER: Time a CPU spin loop and return cycles per millisecond.
             start = time.perf_counter()
             _cpu_sleep(test_cycles)
             end = time.perf_counter()
@@ -6101,6 +7235,9 @@ def get_cycles_per_ms(device: str = "cuda") -> float:
             return cycles_per_ms
     else:
         def measure() -> float:
+            # [FUNCTION DOC] HELPER: Time a device sleep with events and return cycles per
+            # millisecond, or a fixed default value of one million when the device module has no
+            # sleep function.
             if hasattr(torch.get_device_module(device), "_sleep"):
                 start = torch.Event(enable_timing=True)
                 end = torch.Event(enable_timing=True)
@@ -6132,6 +7269,8 @@ def get_cycles_per_ms(device: str = "cuda") -> float:
 
 T = TypeVar('T')
 def first_sample(self: unittest.TestCase, samples: Iterable[T]) -> T:
+    # [FUNCTION DOC] Return the first item of an iterable of samples. Raises unittest.SkipTest
+    # when the iterable is empty. The test case argument is unused.
     """
     Returns the first sample from an iterable of samples, like those returned by OpInfo.
     The test will be skipped if no samples are available.
@@ -6144,6 +7283,8 @@ def first_sample(self: unittest.TestCase, samples: Iterable[T]) -> T:
 # this helper method is to recursively
 # clone the tensor-type input of operators tested by OpInfo
 def clone_input_helper(input):
+    # [FUNCTION DOC] Recursively clone tensor inputs of an OpInfo test: tensors are cloned,
+    # sequences become tuples of cloned elements, other values are returned unchanged.
     if isinstance(input, torch.Tensor):
         return torch.clone(input)
 
@@ -6154,6 +7295,8 @@ def clone_input_helper(input):
 
 @contextmanager
 def custom_op(opname, symbolic_fn, opset_version):
+    # [FUNCTION DOC] Context manager that registers a custom ONNX symbolic function for an
+    # operator at an opset version for the body, and unregisters it afterwards (even on error).
     """Context manager/decorator to test ONNX export with custom operator"""
     try:
         register_custom_op_symbolic(opname, symbolic_fn, opset_version)
@@ -6163,6 +7306,10 @@ def custom_op(opname, symbolic_fn, opset_version):
 
 
 def outs_and_grads(fn, graph_inps, inps):
+    # [FUNCTION DOC] Run a function on the given inputs, backpropagate a sum of each output that
+    # requires grad (retaining the graph), collect the gradients of the tensor leaves of the
+    # second inputs argument, clear those gradients, and return a pair of outputs and gradients.
+    # Mutates the grad attributes of the inputs.
     outs = fn(*graph_inps)
     for out in pytree.tree_leaves(outs):
         if isinstance(out, torch.Tensor) and out.requires_grad:
@@ -6174,25 +7321,41 @@ def outs_and_grads(fn, graph_inps, inps):
     return outs, grads
 
 def compare_equal_outs_and_grads(test, m1, m2, inps):
+    # [FUNCTION DOC] Run two callables on the same inputs through outs_and_grads and assert
+    # (with the test case) that their outputs and gradients are equal.
     r1, g1 = outs_and_grads(m1, inps, inps)
     r2, g2 = outs_and_grads(m2, inps, inps)
     test.assertEqual(r1, r2)
     test.assertEqual(g1, g2)
 
 class TestGradients(TestCase):
+    # [CLASS DOC] Test case base class for gradient tests over OpInfo operators. Provides the
+    # shared helper that runs gradcheck, gradgradcheck or forward over reverse checks for every
+    # sample input of an operator and variant, plus skip helpers. State: the class attribute
+    # exact_dtype set to true.
     exact_dtype = True
 
     # Copies inputs to inplace operations to avoid inplace modifications
     #   to leaves requiring gradient
     def _get_safe_inplace(self, inplace_variant):
+        # [FUNCTION DOC] HELPER: Wrap an in-place variant so it operates on a clone of its first
+        # argument, protecting leaf tensors that require grad.
         @wraps(inplace_variant)
         def _fn(t, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Call the in-place variant on a clone of the tensor with the
+            # other arguments and return the result.
             return inplace_variant(t.clone(), *args, **kwargs)
 
         return _fn
 
     def _check_helper(self, device, dtype, op, variant, check, *, check_forward_ad=False, check_backward_ad=True,
                       check_batched_grad=None, check_batched_forward_grad=False):
+        # [FUNCTION DOC] HELPER: Run one of the gradient checks (gradcheck, bwgrad_bwgrad, or
+        # fwgrad_bwgrad) for every sample input of the operator for the variant, device and
+        # dtype. Skips the test if the variant is missing or the dtype is unsupported, skips
+        # in-place variants for broadcasting samples, and fails if a sample tensor already
+        # carries a gradient. Builds a function over just the tensors requiring grad that
+        # recomposes the original input. Raises AssertionError for an unknown check name.
         if check not in ('gradcheck', 'bwgrad_bwgrad', 'fwgrad_bwgrad'):
             raise AssertionError(
                 f"check must be one of ('gradcheck', 'bwgrad_bwgrad', 'fwgrad_bwgrad'), got {check!r}"
@@ -6204,6 +7367,8 @@ class TestGradients(TestCase):
             self.skipTest(f"Skipped! {op.name} does not support dtype {str(dtype)}")
 
         def is_inplace(variant):
+            # [FUNCTION DOC] HELPER: Return True if the variant (or the function it wraps) is
+            # the operator's in-place variant.
             if hasattr(variant, "__wrapped__"):
                 return variant.__wrapped__ is op.get_inplace()
             return variant is op.get_inplace()
@@ -6240,6 +7405,9 @@ class TestGradients(TestCase):
                                   "Please create a new tensor for each SampleInput.")
 
             def _input_recomposition_helper(inputs, inp, input_idx):
+                # [FUNCTION DOC] HELPER: Take the next tensors requiring grad from the flat
+                # inputs to rebuild one original argument (a single tensor or a list of
+                # tensors); return the rebuilt argument and the updated index.
                 if is_iterable_of_tensors(inp):
                     tensor_list = []
                     for x in inp:
@@ -6255,6 +7423,10 @@ class TestGradients(TestCase):
                     return inp, input_idx
 
             def fn(*inputs):
+                # [FUNCTION DOC] HELPER: The function under test for the gradient check: puts
+                # the flat tensor inputs back into positional and keyword arguments of the
+                # sample, calls the operator's wrapper on the variant, and applies the sample's
+                # output processing function when present.
                 # Puts inputs back into sample properly
                 positional_args = []
                 input_idx = 0
@@ -6310,11 +7482,15 @@ class TestGradients(TestCase):
 
     def _grad_test_helper(self, device, dtype, op, variant, *, check_forward_ad=False, check_backward_ad=True,
                           check_batched_grad=None, check_batched_forward_grad=False):
+        # [FUNCTION DOC] HELPER: Run the gradcheck variant of the gradient check with the given
+        # forward and backward AD and batched grad options.
         return self._check_helper(device, dtype, op, variant, 'gradcheck', check_forward_ad=check_forward_ad,
                                   check_backward_ad=check_backward_ad, check_batched_grad=check_batched_grad,
                                   check_batched_forward_grad=check_batched_forward_grad)
 
     def _skip_helper(self, op, device, dtype):
+        # [FUNCTION DOC] HELPER: Skip the test if the operator does not support backward for the
+        # dtype or supports neither autograd nor forward AD.
         if dtype not in op.supported_backward_dtypes(torch.device(device).type):
             self.skipTest("Skipped! Op doesn't support autograd for this dtype.")
         if not op.supports_autograd and not op.supports_forward_ad:
@@ -6325,10 +7501,17 @@ class TestGradients(TestCase):
 
 # Base TestCase for NT tests; used to define common helpers, etc.
 class NestedTensorTestCase(TestCase):
+    # [CLASS DOC] Base TestCase for nested tensor tests with common helpers for comparing
+    # nested tensors, including jagged ones, and for saving and restoring the nested tensor
+    # global registries.
     def assertEqualIgnoringNestedInts(self, a, b):
+        # [FUNCTION DOC] Assert two structures are equal after unbinding jagged nested tensors
+        # into lists of tensors, so nested integer symbols are not compared.
         # unbinding NJTs allows us to compare them as essentially equal without
         # caring about exact nested int comparison
         def _unbind_njts(x):
+            # [FUNCTION DOC] HELPER: Unbind a jagged nested tensor, return other
+            # values unchanged.
             if isinstance(x, torch.Tensor) and x.is_nested and x.layout == torch.jagged:
                 return x.unbind()
             else:
@@ -6337,11 +7520,15 @@ class NestedTensorTestCase(TestCase):
         self.assertEqual(pytree.tree_map(_unbind_njts, a), pytree.tree_map(_unbind_njts, b))
 
     def assertEqualNoncontigAware(self, a, b):
+        # [FUNCTION DOC] Assert equality of two structures by unbinding jagged nested tensors
+        # and also comparing the shapes of nested tensors, since plain equality ignores lengths.
         # assertEqual() doesn't take into account lengths, so hack around this
         # by comparing unbound components and shapes
         self.assertEqualIgnoringNestedInts(a, b)
 
         def _get_njt_shapes(x):
+            # [FUNCTION DOC] HELPER: Return the shape of a nested tensor, None for any
+            # other value.
             return (
                 x.shape
                 if isinstance(x, torch.Tensor) and x.is_nested
@@ -6354,6 +7541,8 @@ class NestedTensorTestCase(TestCase):
 
     @contextlib.contextmanager
     def branch_nested_state(self):
+        # [FUNCTION DOC] Context manager that remembers the nested tensor symint registry and
+        # tensor id counter, and restores them after the body, to branch the nested state.
         """Context manager to branch and restore the nested tensor state."""
         nested_tensor_module = torch.nested._internal.nested_tensor
         original_tensor_symint_registry = nested_tensor_module._tensor_symint_registry.copy()
@@ -6366,6 +7555,12 @@ class NestedTensorTestCase(TestCase):
 
 
 def munge_exc(e, *, suppress_suffix=True, suppress_prefix=True, file=None, skip=0, strip_carets=True, strip_stack_attribution=True):
+    # [FUNCTION DOC] Normalize the text of an exception so it can be compared against inline
+    # expected output. Removes stack frames outside the given file (default: the caller's file,
+    # with skip extra frames), replaces line numbers, local paths and the torch install prefix,
+    # rewrites a bytecode name for compatibility, and optionally strips trailing logging hints,
+    # a prefix line, source attribution blocks and caret lines. Returns the normalized string.
+    # KNOWN ISSUE: the file path is used as a regular expression pattern without escaping.
     from torch._dynamo.trace_rules import _as_posix_path
 
     if file is None:
@@ -6376,6 +7571,8 @@ def munge_exc(e, *, suppress_suffix=True, suppress_prefix=True, file=None, skip=
 
     # Remove everything that looks like stack frames in NOT this file
     def repl_frame(m):
+        # [FUNCTION DOC] HELPER: Replacement for a regex match of a stack frame: keep it only if
+        # it belongs to the given file and is not the top level module code; otherwise drop it.
         if m.group(2) != file:
             return ""
         # Don't accept top-level, even for this script, these will wobble
@@ -6427,6 +7624,11 @@ def munge_exc(e, *, suppress_suffix=True, suppress_prefix=True, file=None, skip=
 
 @contextmanager
 def check_leaked_tensors(limit=1, matched_type=torch.Tensor):
+    # [FUNCTION DOC] Context manager yielding a list that, after the body, is extended with
+    # tensors (or the matched type) found in the garbage collector's uncollectable objects
+    # (debug save-all mode is enabled during the body). Warns if any were found and tries to
+    # draw back references with objgraph, limited to limit objects. The garbage collector debug
+    # flags are reset to zero at the end.
     """Wrap around operations you want to ensure are not leaking tensor memory.
 
     This code intentionally ignores other reference cycles, which can be benign and which we have plenty
@@ -6436,6 +7638,7 @@ def check_leaked_tensors(limit=1, matched_type=torch.Tensor):
     limit specifies how many tensors to dump debug graphs for (default=1)
     """
     def match_obj(obj):
+        # [FUNCTION DOC] HELPER: Return True if the object is an instance of the matched type.
         return isinstance(obj, matched_type)
 
     try:
@@ -6469,6 +7672,8 @@ def check_leaked_tensors(limit=1, matched_type=torch.Tensor):
 
 
 def remove_cpp_extensions_build_root():
+    # [FUNCTION DOC] Delete the default build root directory for extensions, if it exists (with
+    # a shell command on Windows to avoid permission errors). Errors are ignored elsewhere.
     """
     Removes the default root folder under which extensions are built.
     """
@@ -6483,6 +7688,10 @@ def remove_cpp_extensions_build_root():
 
 
 def install_cpp_extension(extension_root):
+    # [FUNCTION DOC] Build and install a C++ extension package from a directory into a local
+    # install folder with pip (removing old build and install folders), run through the shell
+    # helper, then add the resulting packages directory to the module search path. Raises
+    # RuntimeError if the build fails or no packages directory is found.
     # Wipe the build / install dirs if they exist
     build_dir = os.path.join(extension_root, "build")
     install_dir = os.path.join(extension_root, "install")
@@ -6512,10 +7721,16 @@ def install_cpp_extension(extension_root):
 
 # Decorator to provide a helper to load inline extensions to a temp directory
 def scoped_load_inline(func):
+    # [FUNCTION DOC] Decorator that supplies a load_inline keyword argument to the test
+    # function. The supplied function builds inline extensions in a temporary directory
+    # (directly on Windows). Returns the wrapped function.
 
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Call the function with the generated load_inline helper added.
         def load_inline(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Load an inline extension in a fresh temporary build
+            # directory. Raises AssertionError if the caller passes a build directory.
             if IS_WINDOWS:
                 # TODO(xmfan): even using TemporaryDirectoryName will result in permission error
                 return cpp_extension.load_inline(*args, **kwargs)
@@ -6535,6 +7750,9 @@ def scoped_load_inline(func):
 # Add a new flag here and both recover_orig_fp32_precision and the TestCase
 # leak detector pick it up automatically.
 def _fp32_precision_flag_specs():
+    # [FUNCTION DOC] HELPER: Return the single table of the six fp32 precision settings (CUDA
+    # matmul, cudnn conv and rnn, mkldnn matmul, conv and rnn), each as a label, a getter
+    # function and a setter function. It drives snapshots, restoration and leak checks.
     return (
         ("torch.backends.cuda.matmul.fp32_precision",
             lambda: torch.backends.cuda.matmul.fp32_precision,
@@ -6558,10 +7776,13 @@ def _fp32_precision_flag_specs():
 
 
 def _snapshot_fp32_precision():
+    # [FUNCTION DOC] HELPER: Return a tuple with the current value of every fp32 precision flag.
     return tuple(get() for _, get, _ in _fp32_precision_flag_specs())
 
 
 def _restore_fp32_precision(snapshot):
+    # [FUNCTION DOC] HELPER: Set all fp32 precision flags back to the values in a snapshot.
+    # Raises TypeError if the snapshot is not a tuple of the expected length.
     specs = _fp32_precision_flag_specs()
     if not isinstance(snapshot, tuple) or len(snapshot) != len(specs):
         # Catches accidental shadowing of self._prev_fp32_precision by a
@@ -6577,8 +7798,12 @@ def _restore_fp32_precision(snapshot):
 
 
 def recover_orig_fp32_precision(fn):
+    # [FUNCTION DOC] Decorate a function so that the fp32 precision flags are saved before each
+    # call and restored afterwards, even if the function fails.
     @contextlib.contextmanager
     def recover():
+        # [FUNCTION DOC] HELPER: Context manager that snapshots the fp32 precision flags and
+        # restores them on exit.
         snap = _snapshot_fp32_precision()
         try:
             yield
@@ -6588,6 +7813,8 @@ def recover_orig_fp32_precision(fn):
     return recover()(fn)
 
 def skipIfPythonVersionMismatch(predicate):
+    # [FUNCTION DOC] Return a lazy skip decorator that skips when the predicate, called with the
+    # major, minor and micro Python version numbers, returns false.
     vi = sys.version_info
     return lazy_skip_if(
         lambda: not predicate(vi.major, vi.minor, vi.micro), "Python version mismatch"
@@ -6595,9 +7822,14 @@ def skipIfPythonVersionMismatch(predicate):
 
 # Decorator to patch multiple test class members for the duration of the subtest
 def patch_test_members(updates: dict[str, Any]):
+    # [FUNCTION DOC] Return a decorator that temporarily sets the given attributes on the test
+    # instance for the duration of the test and restores the original values afterwards.
     def decorator(test_func):
+        # [FUNCTION DOC] HELPER: Wrap the test function with the member patching logic.
         @wraps(test_func)
         def wrapper(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Save the original attribute values, set the new ones, run
+            # the test and return its result, and restore the originals in all cases.
             # Store the original values of the specified members
             original_values = {member: getattr(self, member) for member in updates}
 
@@ -6617,6 +7849,8 @@ def patch_test_members(updates: dict[str, Any]):
     return decorator
 
 def get_gcc_major_version():
+    # [FUNCTION DOC] Return the major version of the installed gcc as an int, or None if gcc
+    # cannot be run or its output cannot be parsed.
     """
     Return GCC major version as int, or None if GCC is not available.
     """
@@ -6632,6 +7866,12 @@ def get_gcc_major_version():
 
 
 def run_concurrently(worker_func, num_threads=None, args=(), kwargs=None):
+    # [FUNCTION DOC] Run a worker function (or one function per thread, if a list is given) in
+    # multiple threads that wait on a barrier so they start together, to expose thread safety
+    # bugs. Returns the list of results per thread. If any worker raised, the last recorded
+    # exception is re-raised after all threads have joined. Extra args and kwargs are passed on.
+    # KNOWN ISSUE: when a single callable is given and num_threads is omitted, taking the length
+    # of the callable fails with a TypeError.
     # Adapted from CPython test suite. Runs worker_func in multiple threads
     # concurrently to help expose thread-safety issues. Works best in
     # combination with ThreadSanitizer (TSan).
@@ -6650,6 +7890,8 @@ def run_concurrently(worker_func, num_threads=None, args=(), kwargs=None):
     exc_value = None
 
     def wrapper_func(idx, func, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wait on the barrier, run the function, store its result at the
+        # thread's index; on any exception record it in the shared variable instead of raising.
         # Wait for all threads to reach this point before proceeding.
         try:
             barrier.wait()
