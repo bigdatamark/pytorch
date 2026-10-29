@@ -6,6 +6,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] OpInfo based tests for functorch transforms (grad, jvp, vjp, vmap and their
+# compositions) in a single class TestOperators. Defines helpers that normalize op inputs and
+# outputs to differentiable tensors, build jvp and vjp functions, and reference
+# implementations from autograd, plus module level tables of expected failures and aliasing
+# ops. At import time it instantiates the device type tests for cpu and cuda.
 import functools
 import itertools
 import unittest
@@ -71,6 +76,13 @@ aten = torch.ops.aten
 def _autograd_grad(
     outputs, inputs, grad_outputs=None, retain_graph=False, create_graph=True
 ):
+    # [FUNCTION DOC] HELPER: Variant of autograd grad used as the reference. Arguments:
+    # outputs, inputs (a pytree of tensors), optional grad outputs, retain_graph (default
+    # False) and create_graph (default True). Only inputs and outputs that require grad
+    # are passed to autograd grad with unused inputs allowed; inputs that do not require
+    # grad or got no gradient get a zero tensor of the same shape. Returns gradients in
+    # the input pytree structure. If every output is non-differentiable and grad outputs
+    # were given, empty tuples are used.
     inputs, inputs_spec = tree_flatten(inputs)
     diff_inputs = tuple(inp for inp in inputs if inp.requires_grad)
     if grad_outputs is None:
@@ -106,7 +118,14 @@ def _autograd_grad(
 
 
 def diff_arg(arg, requires_grad=True):
+    # [FUNCTION DOC] HELPER: Decides whether a test argument is differentiable. With
+    # requires_grad true, a tensor qualifies if it requires grad; otherwise if floating
+    # point or complex. A sequence of tensors qualifies only if all or none of its members
+    # do; a mix raises RuntimeError. Non-tensors return False.
     def is_differentiable_arg(arg):
+        # [FUNCTION DOC] HELPER: Predicate for one tensor: its requires_grad flag when
+        # the enclosing call asked for that, otherwise whether it is floating
+        # point or complex.
         if requires_grad:
             return arg.requires_grad
         else:
@@ -128,6 +147,13 @@ def diff_arg(arg, requires_grad=True):
 def normalize_op_input_output2(
     f, args, kwargs, output_process_fn_grad=None, requires_grad=True
 ):
+    # [FUNCTION DOC] HELPER: Wraps a function so that it takes only the differentiable
+    # leaves as positional arguments. Flattens args, picks the differentiable positions,
+    # and returns the wrapper and the tuple of primal tensors. The wrapper rebuilds the
+    # full arguments, calls the function with the kwargs, applies the optional output
+    # processing function and, for tuple results, keeps only floating point members.
+    # Raises AssertionError if no argument is differentiable or if a tuple result has no
+    # floating point member.
     flat_args, args_spec = tree_flatten(args)
     diff_argnums = tuple(
         i
@@ -140,6 +166,11 @@ def normalize_op_input_output2(
 
     @functools.wraps(f)
     def wrapped(*primals):
+        # [FUNCTION DOC] HELPER: Wrapper produced by the normalizer: substitutes the
+        # given primals into the flattened argument list at the differentiable
+        # positions, rebuilds the structure, calls the original function with the
+        # kwargs, applies the output processing function if any, and filters tuple
+        # outputs to floating point tensors (raising AssertionError if none remain).
         _args = list(flat_args)
         for num, arg in zip(diff_argnums, primals):
             _args[num] = arg
@@ -160,6 +191,11 @@ def normalize_op_input_output2(
 def normalize_op_input_output3(
     f, args, kwargs, sample_args, output_process_fn_grad=None
 ):
+    # [FUNCTION DOC] HELPER: Like the second normalizer but decides which flattened
+    # arguments are differentiable by looking at a parallel sample argument list, always
+    # requiring grad. Returns the wrapper over primals and the primal tuple taken from the
+    # given args. Raises AssertionError when nothing is differentiable or no floating
+    # point result remains. The code carries a TODO to merge it with the other normalizer.
     flat_args, args_spec = tree_flatten(args)
     flat_sample_args = pytree.tree_leaves(sample_args)
     diff_argnums = tuple(
@@ -173,6 +209,10 @@ def normalize_op_input_output3(
 
     @functools.wraps(f)
     def wrapped(*primals):
+        # [FUNCTION DOC] HELPER: Wrapper with the same behavior as in the second
+        # normalizer: puts the primals back into the flattened arguments, calls the
+        # function, optionally post-processes the result, and for tuples keeps
+        # floating point outputs only, raising AssertionError if none.
         _args = list(flat_args)
         for num, arg in zip(diff_argnums, primals):
             _args[num] = arg
@@ -190,6 +230,10 @@ def normalize_op_input_output3(
 
 
 def normalize_op_input_output(f, sample, requires_grad=True):
+    # [FUNCTION DOC] HELPER: Convenience form of the second normalizer taking an OpInfo
+    # sample: the positional args are the sample input followed by its args, and the
+    # sample kwargs and output processing function are passed through. Returns the wrapper
+    # and primals.
     args = tuple([sample.input] + list(sample.args))
     return normalize_op_input_output2(
         f,
@@ -201,15 +245,25 @@ def normalize_op_input_output(f, sample, requires_grad=True):
 
 
 def ref_vjp(f, *primals):
+    # [FUNCTION DOC] HELPER: Reference vjp. Runs the function on the primals once and
+    # returns that result plus a closure that maps cotangents to gradients using the
+    # autograd based reference helper, so higher order graph building is kept.
     result = f(*primals)
 
     def wrapped(cotangents):
+        # [FUNCTION DOC] HELPER: Closure returned by the reference vjp: takes
+        # cotangents, wraps result and cotangents as tuples if needed, and returns
+        # reference gradients with respect to the primals.
         return _autograd_grad(_as_tuple(result), primals, _as_tuple(cotangents))
 
     return result, wrapped
 
 
 def ref_jvp(f, primals, tangents):
+    # [FUNCTION DOC] HELPER: Reference forward mode derivative. Inside a dual level, makes
+    # dual tensors from primals and tangents, calls the function, then unpacks every
+    # flattened output with the safe unpack helper that turns missing tangents into zeros.
+    # Returns the primal outputs and tangent outputs, each in the output structure.
     with fwAD.dual_level():
         duals = tuple(fwAD.make_dual(p, t) for p, t in zip(primals, tangents))
         result_duals = f(*duals)
@@ -223,6 +277,9 @@ def ref_jvp(f, primals, tangents):
 
 
 def get_sample_cotangents(f, sample):
+    # [FUNCTION DOC] HELPER: Builds random cotangents for a sample: normalizes the op,
+    # runs it on the primals, and returns a pytree of standard normal tensors shaped like
+    # each output.
     fn, primals = normalize_op_input_output(f, sample)
     output = fn(*primals)
     return tree_map(torch.randn_like, output)
@@ -231,6 +288,11 @@ def get_sample_cotangents(f, sample):
 # returns a new function g(*args, *cotangents)
 # that computes vjps and (*args, cotangents)
 def get_vjp_fn_and_args_with_cotangents(f, sample, cotangents):
+    # [FUNCTION DOC] HELPER: Builds a function of all sample arguments followed by the
+    # cotangents that returns the vjp results, and the flat tuple of those values. The
+    # returned wrapper checks the count of arguments (raising AssertionError on mismatch),
+    # splits and restructures them, normalizes with the third normalizer, runs vjp and
+    # applies the vjp function to the cotangents.
     args = tuple([sample.input] + list(sample.args))
     kwargs = sample.kwargs
     flat_args, args_spec = tree_flatten(args)
@@ -238,6 +300,10 @@ def get_vjp_fn_and_args_with_cotangents(f, sample, cotangents):
 
     @functools.wraps(f)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: Wrapper: splits the flat arguments into sample
+        # arguments and cotangents, rebuilds both pytrees, calls vjp on the normalized
+        # function and returns the vjp function applied to the cotangents. Raises
+        # AssertionError on a wrong argument count.
         if len(args) != len(flat_args) + len(flat_cotangents):
             raise AssertionError(
                 f"Expected {len(flat_args) + len(flat_cotangents)} args, got {len(args)}"
@@ -259,16 +325,24 @@ def get_vjp_fn_and_args_with_cotangents(f, sample, cotangents):
 # Returns a new function g(*args, *cotangents) that computes vjps and
 # sample (*args, *cotangents)
 def get_vjpfull_variant(f, sample):
+    # [FUNCTION DOC] HELPER: Returns the vjp-with-cotangents function and its arguments
+    # for an OpInfo sample, by normalizing the op and delegating to the private builder.
     fn, primals = normalize_op_input_output(f, sample)
     return _get_vjpfull_variant(fn, primals)
 
 
 def get_vjpfull_variant2(f, args, kwargs):
+    # [FUNCTION DOC] HELPER: Same as the sample based builder but takes explicit args and
+    # kwargs and uses the second normalizer with its defaults.
     fn, primals = normalize_op_input_output2(f, args, kwargs)
     return _get_vjpfull_variant(fn, primals)
 
 
 def _get_vjpfull_variant(fn, primals):
+    # [FUNCTION DOC] HELPER: Builds a function of the primals and fresh random cotangents
+    # (which require grad) that returns the vjp results, together with the argument tuple
+    # of primals plus cotangents. The wrapper unwraps a lone cotangent when the result is
+    # a single tensor and raises AssertionError if more than one cotangent was given.
     result = fn(*primals)
     cotangents = _as_tuple(
         tree_map(lambda x: torch.randn_like(x, requires_grad=True), result)
@@ -278,6 +352,10 @@ def _get_vjpfull_variant(fn, primals):
 
     @functools.wraps(fn)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: Wrapper: splits arguments into primals and
+        # cotangents, runs vjp of the function, passes a single cotangent unwrapped
+        # when the output is a tensor (raising AssertionError if the count is not
+        # one), and returns the vjp results.
         primals = args[:num_primals]
         cotangents = args[num_primals:]
         result, vjp_fn = vjp(fn, *primals)
@@ -291,6 +369,11 @@ def _get_vjpfull_variant(fn, primals):
 
 
 def get_jvp_variant(f, sample):
+    # [FUNCTION DOC] HELPER: Builds a forward mode function for a sample: normalizes
+    # without requiring grad, draws random tangents for primals, and returns a wrapper
+    # that takes tangents only and returns primals out and tangents out, flattened into
+    # one tuple when the output is not a single tensor. Returns the wrapper and the
+    # tangents. Note the sample primals are captured, so only tangents are arguments.
     # We want this higher-order variant of jvp, so that it can
     # be used to wrap vmap
     fn, primals = normalize_op_input_output(f, sample, requires_grad=False)
@@ -298,6 +381,9 @@ def get_jvp_variant(f, sample):
 
     @functools.wraps(f)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: Wrapper: treats all arguments as tangents, runs jvp
+        # on the captured primals, and returns either the pair for a tensor output or
+        # a tuple of flattened primal outputs followed by flattened tangent outputs.
         tangents = args
         primals_out, tangents_out = jvp(fn, primals, tangents)
 
@@ -314,6 +400,10 @@ def get_jvp_variant(f, sample):
 def get_jvp_variant_primals_tangents2(
     f, args, kwargs, output_process_fn_grad=None, requires_grad=False
 ):
+    # [FUNCTION DOC] HELPER: Builds a jvp function from explicit args and kwargs.
+    # Normalizes the function (optional output processing and requires_grad flag, default
+    # False), draws random tangents and delegates to the private builder. Returns the
+    # wrapper and the primals plus tangents tuple.
     fn, primals = normalize_op_input_output2(
         f, args, kwargs, output_process_fn_grad, requires_grad
     )
@@ -322,6 +412,9 @@ def get_jvp_variant_primals_tangents2(
 
 
 def get_jvp_variant_primals_tangents(f, sample):
+    # [FUNCTION DOC] HELPER: Builds a jvp function for a sample whose arguments are
+    # primals followed by tangents: normalizes without requiring grad, draws random
+    # tangents and delegates to the private builder.
     # We want this higher-order variant of jvp, so that it can
     # be used to wrap vmap
     fn, primals = normalize_op_input_output(f, sample, requires_grad=False)
@@ -330,8 +423,14 @@ def get_jvp_variant_primals_tangents(f, sample):
 
 
 def _get_jvp_variant(fn, primals, tangents):
+    # [FUNCTION DOC] HELPER: Returns a function of primals followed by tangents that runs
+    # jvp and flattens the output pairs, together with the concatenated
+    # primals and tangents.
     @functools.wraps(fn)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: Wrapper: splits the arguments at the primal count,
+        # runs jvp, and returns the pair for tensor outputs or a single tuple of
+        # flattened primal and tangent outputs.
         primals_in = args[: len(primals)]
         tangents_in = args[len(primals) :]
         primals_out, tangents_out = jvp(fn, primals_in, tangents_in)
@@ -347,6 +446,9 @@ def _get_jvp_variant(fn, primals, tangents):
 
 
 def is_inplace(op, variant):
+    # [FUNCTION DOC] HELPER: Reports whether a variant is the in-place variant of an op. A
+    # wrapped function is first unwrapped through its wrapped attribute; returns the
+    # identity comparison with the op in-place variant.
     if hasattr(variant, "__wrapped__"):
         return variant.__wrapped__ is op.get_inplace()
     return variant is op.get_inplace()
@@ -441,6 +543,12 @@ complex_ordered_op_db = tuple(
 @unittest.skipIf(TEST_WITH_ASAN, "tests time out with asan, are probably redundant")
 @unMarkDynamoStrictTest
 class TestOperators(TestCase):
+    # [CLASS DOC] Main OpInfo driven test class for functorch transforms. Test methods are
+    # templated over devices and dtypes (restricted to cpu and cuda at the bottom of the
+    # module). Skipped under ASAN and Dynamo strict mode is unmarked. Tests compare grad,
+    # jvp, vjp and composites such as vmap of vjp or jvp of vjp against autograd based
+    # references or against explicit loops, with per-test expected failure sets and
+    # tolerance overrides declared in decorators. Also contains a few non-OpInfo tests.
     @with_tf32_off  # https://github.com/pytorch/pytorch/issues/86798
     @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @skipOps(
@@ -517,6 +625,12 @@ class TestOperators(TestCase):
         ),
     )
     def test_grad(self, device, dtype, op):
+        # [FUNCTION DOC] Checks the grad transform against autograd for one op. Skips
+        # if the op is in the vjp failure set, lacks autograd support, or is an in-
+        # place op. For each sample reduces the output to a scalar (sum, absolute
+        # value for complex) and compares grad over the differentiable positions with
+        # the reference autograd result; also repeats with non-contiguous samples
+        # unless the op is listed as exempt.
         if op.name in vjp_fail:
             self.skipTest("Skipped; Expected failures")
             return
@@ -546,11 +660,17 @@ class TestOperators(TestCase):
             diff_args = tuple(args[i] for i in diff_argnums)
 
             def wrapped_fn(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Calls the op, applies the sample
+                # output processing function, and reduces the result to a
+                # single value by summing each output tensor (taking absolute
+                # value of complex sums) for tensors or tuples.
                 result = op(*args, **kwargs)
                 if sample.output_process_fn_grad is not None:
                     result = sample.output_process_fn_grad(result)
 
                 def abs_if_complex(t):
+                    # [FUNCTION DOC] HELPER: Returns the absolute value if
+                    # the tensor is complex, else the tensor unchanged.
                     if t.dtype.is_complex:
                         return t.abs()
                     return t
@@ -655,6 +775,11 @@ class TestOperators(TestCase):
         ),
     )
     def test_jvp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks forward mode derivatives from jvp for each sample, via
+        # jvp_opinfo_test. Skips if forward AD is unsupported. Tests the out-of-place
+        # op (unless the op itself is in-place) without cloning inputs, and the in-
+        # place variant when the sample is valid for it, with inputs cloned. Non-
+        # contiguity is tested unless the op is exempt.
         if not op.supports_forward_ad:
             self.skipTest("Skipped! Forward AD not supported.")
             return
@@ -690,6 +815,12 @@ class TestOperators(TestCase):
         clone_inputs,
         test_noncontig,
     ):
+        # [FUNCTION DOC] Compares jvp of an op function with the reference forward
+        # mode implementation. Arguments: the function, a sample, output processing
+        # function, whether to clone inputs for each call, and whether to also test
+        # non-contiguous inputs. Draws random tangents, asserts primal and tangent
+        # outputs are equal to reference, and for non-contiguous inputs checks the
+        # same expected values.
         # NB: we used requires_grad=True to determine where the primals are,
         # but don't need that information otherwise
         args = (sample.input,) + sample.args
@@ -701,6 +832,9 @@ class TestOperators(TestCase):
         orig_tangents = tree_map(lambda x: torch.randn_like(x), primals)
 
         def maybe_clone_inputs():
+            # [FUNCTION DOC] HELPER: Returns the saved primals and tangents, as
+            # fresh clones when cloning is enabled so in-place variants do not
+            # corrupt later calls, otherwise the originals.
             if clone_inputs:
                 primals = tree_map(torch.clone, orig_primals)
                 tangents = tree_map(torch.clone, orig_tangents)
@@ -796,6 +930,11 @@ class TestOperators(TestCase):
         ),
     )
     def test_vjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vjp for one op against the autograd reference. Skips
+        # without autograd support. Runs the inner check on the op, its aliases, and
+        # (with a cloned input) the in-place variant; the check compares outputs, vjp
+        # results with the reference for random cotangents, and the non-contiguous
+        # equivalent unless the op is exempt.
         if not op.supports_autograd:
             self.skipTest("Skipped! Autograd not supported.")
             return
@@ -803,6 +942,9 @@ class TestOperators(TestCase):
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         def _test(_op, inplace=False):
+            # [FUNCTION DOC] HELPER: Runs the vjp comparison over all samples for
+            # one callable; in-place mode skips samples not valid for
+            # the in-place variant.
             for sample in samples:
                 if inplace and not is_valid_inplace_sample_input(
                     sample, op, op.inplace_variant
@@ -839,6 +981,8 @@ class TestOperators(TestCase):
         if op.inplace_variant:
 
             def f(inp, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Calls the in-place variant on a clone
+                # of the first argument so the original input is kept.
                 return op.inplace_variant(inp.clone(), *args, **kwargs)
 
             _test(f, inplace=True)
@@ -883,6 +1027,10 @@ class TestOperators(TestCase):
         ),
     )
     def test_vjpvjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vjp of vjp against the reference for one op. Skips if
+        # autograd or double backward is unsupported. For each sample uses the full
+        # vjp variant function taking primals and cotangents, and compares vjp of it
+        # with the reference vjp for random cotangents; in-place variant also tested.
         if not op.supports_autograd:
             self.skipTest("Skipped! Autograd not supported.")
             return
@@ -893,6 +1041,9 @@ class TestOperators(TestCase):
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         def test(_op, inplace=False):
+            # [FUNCTION DOC] HELPER: Compares vjp of the full vjp variant with the
+            # reference for each sample of the given callable; in-place mode skips
+            # invalid samples.
             for sample in samples:
                 if inplace and not is_valid_inplace_sample_input(
                     sample, op, op.inplace_variant
@@ -918,6 +1069,8 @@ class TestOperators(TestCase):
         if op.inplace_variant:
 
             def fn(inp, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Calls the in-place variant on a clone
+                # of the first argument.
                 return op.inplace_variant(inp.clone(), *args, **kwargs)
 
             test(fn, inplace=True)
@@ -1045,6 +1198,11 @@ class TestOperators(TestCase):
         },
     )
     def test_vmapvjpvjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vmap of vjp of vjp. Skips without autograd or double
+        # backward support and for in-place ops. Builds the full vjp variant, forms a
+        # function whose output is the flattened result followed by the flattened vjp
+        # results, and compares the vmap outputs with loop results through the
+        # exhaustive generator.
         # Since, we test `vjpvjp` independently,
         # for this test, we just verify that vmap
         # of `vjpvjp` is correct.
@@ -1072,6 +1230,10 @@ class TestOperators(TestCase):
             args_and_cotangents = tuple(args) + tuple(cotangents)
 
             def vjp_of_vjp(*args_and_cotangents):
+                # [FUNCTION DOC] HELPER: Splits arguments into primals and
+                # cotangents, runs vjp, applies the vjp function to the
+                # cotangents and returns the flattened outputs followed by the
+                # flattened vjp results.
                 args = args_and_cotangents[:num_args]
                 cotangents = args_and_cotangents[num_args:]
                 result, vjp_fn = vjp(fn, *args)
@@ -1202,6 +1364,10 @@ class TestOperators(TestCase):
         ),
     )
     def test_vmapvjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vmap of vjp. Skips without autograd or for in-place
+        # ops. For each sample builds random cotangents and a function of args plus
+        # cotangents, and compares against the loop reference on
+        # exhaustive batched inputs.
         if not op.supports_autograd:
             self.skipTest("Skipped! Autograd not supported.")
             return
@@ -1324,6 +1490,11 @@ class TestOperators(TestCase):
     # or figure out if we can split vmapjvpall. It's useful to keep test_vmapjvp intact
     # because that corresponds to "batched forward-mode AD" testing in PyTorch core
     def test_vmapjvpall(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vmap of jvp for the op (all variants of batching).
+        # Skips in-place ops and ops without forward AD support. Uses unbatched-
+        # gradient samples, builds the jvp function of primals plus tangents and
+        # compares batched with loop outputs. The comment notes this is a superset of
+        # an older vmapjvp test.
         if is_inplace(op, op.get_op()):
             # TODO: test in-place
             self.skipTest("Skipped! NYI: inplace-testing not supported.")
@@ -1383,6 +1554,10 @@ class TestOperators(TestCase):
     )
     @toleranceOverride({torch.float32: tol(atol=1e-04, rtol=1e-04)})
     def test_vmapjvpall_has_batch_rule(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that vmap of jvp reaches batching rules without using
+        # the vmap fallback. Skips in-place ops and ops without forward AD. Runs the
+        # generator with no loop outputs computed inside the helper that disables the
+        # fallback and raises if the fallback is hit.
         if is_inplace(op, op.get_op()):
             # TODO: test in-place
             self.skipTest("Skipped! NYI: inplace-testing not supported.")
@@ -1395,6 +1570,9 @@ class TestOperators(TestCase):
             return
 
         def test():
+            # [FUNCTION DOC] HELPER: Iterates samples, builds the jvp function and
+            # drains the exhaustive vmap generator without comparing results; only
+            # the execution matters.
             for sample in samples:
                 kwarg_values = sample.kwargs
                 fn, args = get_jvp_variant_primals_tangents(op, sample)
@@ -1501,6 +1679,10 @@ class TestOperators(TestCase):
         ),
     )
     def test_vmapvjp_has_batch_rule(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that vmap of vjp does not need the vmap fallback.
+        # Skips without autograd and for in-place ops. For each sample, and also for
+        # each alias of the op, builds the vjp function with cotangents and drains the
+        # generator without loop outputs under the fallback guard.
         if not op.supports_autograd:
             self.skipTest("Skipped! Autograd not supported.")
             return
@@ -1513,6 +1695,8 @@ class TestOperators(TestCase):
             return
 
         def test():
+            # [FUNCTION DOC] HELPER: Runs all samples and aliases through the vmap
+            # of vjp generator, ignoring the outputs.
             for sample in samples:
                 cotangents = get_sample_cotangents(op, sample)
                 fn, args = get_vjp_fn_and_args_with_cotangents(op, sample, cotangents)
@@ -1608,6 +1792,11 @@ class TestOperators(TestCase):
         ),
     )
     def test_vjpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vjp of vmap against the reference vjp. Skips the
+        # dropout op, ops without autograd and in-place ops. For each sample and each
+        # generated batched input with in dims, vmaps the op, normalizes, and compares
+        # vjp with the autograd based reference for random cotangents. Batch norm
+        # training is flagged for input generation.
         # NB: there is no vjpvmap_has_batch_rule test because that is almost
         # certainly redundant with the vmap_has_batch_rule test in test_vmap.py
 
@@ -1662,10 +1851,17 @@ class TestOperators(TestCase):
     def _compare_jacobians_of_vjp(
         self, fn, cotangents_and_primals, argnums=None, atol_rtol=None
     ):
+        # [FUNCTION DOC] HELPER: Compares the forward-over-reverse Jacobian with the
+        # reverse-over-reverse Jacobian of the vjp function. Arguments: function,
+        # tuple of cotangents followed by primals, optional argument numbers (default
+        # all), optional absolute and relative tolerance pair. Both Jacobians are cast
+        # to float before comparing.
         if argnums is None:
             argnums = tuple(range(len(cotangents_and_primals)))
 
         def get_vjp(cotangents, *primals):
+            # [FUNCTION DOC] HELPER: Returns the vjp of the function evaluated at
+            # the primals, applied to the given cotangents.
             _, vjp_fn = vjp(fn, *primals)
             return vjp_fn(cotangents)
 
@@ -1771,6 +1967,11 @@ class TestOperators(TestCase):
         ),
     )
     def test_jvpvjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks jvp of vjp against a reference built from dual
+        # tensors. Skips without autograd support and for in-place ops. For each
+        # sample draws random cotangents and tangents for both primals and cotangents,
+        # applies jvp to the vjp-pushing function and asserts it returns two items
+        # equal to the reference expected value.
         if not op.supports_autograd:
             self.skipTest("Skipped! Autograd not supported.")
             return
@@ -1791,6 +1992,8 @@ class TestOperators(TestCase):
             cotangents_tangents = tree_map(lambda x: torch.randn_like(x), cotangents)
 
             def push_vjp(primals, cotangents):
+                # [FUNCTION DOC] HELPER: Runs vjp for the normalized function
+                # at the primals and applies it to the cotangents.
                 _, vjp_fn = vjp(fn, *primals)
                 return vjp_fn(cotangents)
 
@@ -1800,6 +2003,10 @@ class TestOperators(TestCase):
             self.assertEqual(len(result), 2)
 
             def tree_map2(fn, first, second):
+                # [FUNCTION DOC] HELPER: Applies a binary function to
+                # corresponding leaves of two pytrees and rebuilds the
+                # structure; raises AssertionError if the
+                # tree structures differ.
                 flat_first, spec_first = tree_flatten(first)
                 flat_second, spec_second = tree_flatten(second)
                 if spec_first != spec_second:
@@ -1810,6 +2017,11 @@ class TestOperators(TestCase):
                 return tree_unflatten(flat_result, spec_first)
 
             def reference(primals, cotangents, primals_tangents, cotangents_tangents):
+                # [FUNCTION DOC] HELPER: Reference result: inside a dual level
+                # makes duals from primals and from cotangents, applies the
+                # reference vjp, unpacks the dual results, replaces missing
+                # tangents with zeros, and returns primals and tangents in the
+                # output structure.
                 with fwAD.dual_level():
                     primal_duals = tree_map2(fwAD.make_dual, primals, primals_tangents)
                     _, vjp_fn = ref_vjp(fn, *primal_duals)
@@ -2013,6 +2225,11 @@ class TestOperators(TestCase):
         ),
     )
     def test_vmapjvpvjp(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vmap of jvp of vjp. Skips without autograd support and
+        # in-place ops. Flattens primals, cotangents and their tangents into one list,
+        # builds a function that runs jvp of the vjp function and returns flattened
+        # outputs, and compares vmap with loop outputs through
+        # the exhaustive generator.
         # Since we test `jvpvjp` separately,
         # in this we just check that vmap of `jvpvjp`
         # is correct.
@@ -2036,6 +2253,8 @@ class TestOperators(TestCase):
             cotangents_tangents = tree_map(lambda x: torch.randn_like(x), cotangents)
 
             def push_vjp(primals, cotangents):
+                # [FUNCTION DOC] HELPER: Runs vjp for the normalized function
+                # and applies it to the cotangents.
                 _, vjp_fn = vjp(fn, *primals)
                 return vjp_fn(cotangents)
 
@@ -2044,6 +2263,9 @@ class TestOperators(TestCase):
             )
 
             def jvp_of_vjp(*args):
+                # [FUNCTION DOC] HELPER: Restores the structure of the flat
+                # arguments, runs jvp of the vjp-pushing function and returns
+                # the flattened primal and tangent outputs as one tuple.
                 (primals, tangents) = tree_unflatten(args, spec)
                 primals_out, tangents_out = jvp(push_vjp, primals, tangents)
 
@@ -2062,6 +2284,9 @@ class TestOperators(TestCase):
                 self.assertEqual(loop_out, batched_out)
 
     def _make_extremal_inputs(self, shape, device):
+        # [FUNCTION DOC] HELPER: Test helper: returns a tuple of three tensors of the
+        # given shape filled with minus one thousand, zeros and one thousand on the
+        # device, or a one-item tuple with None when the shape is None.
         if shape is None:
             return (None,)
         return (
@@ -2071,9 +2296,16 @@ class TestOperators(TestCase):
         )
 
     def _arg_and_kwarg_options(self, args_options, kwargs_options):
+        # [FUNCTION DOC] HELPER: Test helper: returns the Cartesian product of the
+        # argument option lists extended with the keyword options mapping choices.
         return itertools.product(*args_options, kwargs_options)
 
     def test_extremal_numerics_nll_loss(self, device):
+        # [FUNCTION DOC] Checks forward-over-reverse equals reverse-over-reverse
+        # Jacobians of the vjp of nll loss, on extreme valued inputs, with 2D and 5D
+        # class inputs, optional class weights and several reduction and ignore index
+        # settings. Targets are random class indices with the first target
+        # forced non- zero.
         N, C = 3, 4
         d1, d2, d3 = 5, 6, 7
         shapes = (
@@ -2110,6 +2342,9 @@ class TestOperators(TestCase):
                 self._compare_jacobians_of_vjp(fn, (cotangents, input))
 
     def test_extremal_numerics_l1_loss(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for l1 loss on extreme input
+        # and target values with different shapes. The keyword options are generated
+        # but not applied to the loss call.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         kwargs_options = ({"reduction": "sum"}, {"reduction": "none"}, {})
@@ -2126,6 +2361,9 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_mse_loss(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for mse loss on extreme input
+        # and target values with different shapes. The keyword options are generated
+        # but not applied.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         kwargs_options = ({"reduction": "sum"}, {"reduction": "none"}, {})
@@ -2142,6 +2380,9 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_softmax(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for softmax on extreme inputs
+        # of several ranks. The dimension option is generated but not applied
+        # to the call.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         kwargs_options = ({"dim": 1}, {})
@@ -2157,6 +2398,9 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_log_softmax(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for log softmax on extreme
+        # inputs of several ranks. The dimension option is generated but not applied
+        # to the call.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         kwargs_options = ({"dim": 1}, {})
@@ -2172,6 +2416,10 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_cross_entropy(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for cross entropy with class
+        # index and probability targets, optional weights, and several reductions,
+        # using a tolerance pair. Ignore index is only used when input and target
+        # shapes differ.
         N, C = 3, 4
         d1, d2, d3 = 5, 6, 7
         shapes = (
@@ -2224,6 +2472,9 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_binary_cross_entropy(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for binary cross entropy with
+        # extreme weight values, random input and target in the unit interval, and
+        # several reductions, with a tolerance pair.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         for shape in shapes:
@@ -2248,6 +2499,8 @@ class TestOperators(TestCase):
                 )
 
     def test_extremal_numerics_layer_norm(self, device):
+        # [FUNCTION DOC] Same Jacobian consistency check for layer norm with extreme
+        # input, weight and bias values, normalizing over all non-batch dimensions.
         N, C, H, W = 3, 4, 5, 6
         shapes = ((N, C), (N, C, H), (N, C, H, W))
         for shape in shapes:
@@ -2261,6 +2514,9 @@ class TestOperators(TestCase):
             ):
 
                 def fn(input, weight, bias):
+                    # [FUNCTION DOC] HELPER: Applies layer norm over the
+                    # fixed normalized shape with the given
+                    # weight and bias.
                     return torch.nn.functional.layer_norm(
                         input, normalized_shape, weight=weight, bias=bias
                     )
@@ -2347,16 +2603,27 @@ class TestOperators(TestCase):
         ),
     )
     def test_vmap_autograd_grad(self, device, dtype, op):
+        # [FUNCTION DOC] Checks vmap of the autograd grad function against loops.
+        # Skips without autograd support. For each sample builds random cotangents and
+        # a function of the cotangents computing gradients of the outputs with respect
+        # to differentiable primals, retaining the graph and allowing unused inputs,
+        # dropping None results.
         def is_differentiable(inp):
+            # [FUNCTION DOC] HELPER: True for tensors that have a grad function or
+            # require grad.
             return isinstance(inp, Tensor) and (
                 inp.grad_fn is not None or inp.requires_grad
             )
 
         def get_flat_differentiable(tree):
+            # [FUNCTION DOC] HELPER: Flattens a pytree and returns the
+            # differentiable tensors as a tuple.
             flattened = pytree.tree_leaves(tree)
             return tuple(i for i in flattened if is_differentiable(i))
 
         def get_differentiable_linked(list1, list2):
+            # [FUNCTION DOC] HELPER: Pairs two lists, keeps the pairs whose first
+            # entry is differentiable, and returns the unzipped lists.
             paired_list = zip(list1, list2)
             paired_list = tuple(
                 (first, second)
@@ -2366,6 +2633,8 @@ class TestOperators(TestCase):
             return zip(*paired_list)
 
         def filter_none(out):
+            # [FUNCTION DOC] HELPER: Flattens a pytree and returns a tuple of the
+            # leaves that are not None.
             flattened = pytree.tree_leaves(out)
             return tuple(o for o in flattened if o is not None)
 
@@ -2381,6 +2650,10 @@ class TestOperators(TestCase):
             cotangents = tree_map(torch.randn_like, out)
 
             def compute_grad(cotangents):
+                # [FUNCTION DOC] HELPER: Calls autograd grad of the outputs
+                # with respect to the differentiable primals; non-tensor
+                # outputs are flattened and filtered to differentiable pairs
+                # with the cotangents. Returns non-None gradients.
                 out_flattened = out
                 cotangents_flattened = cotangents
                 if not isinstance(out_flattened, torch.Tensor):
@@ -2411,6 +2684,10 @@ class TestOperators(TestCase):
                 self.assertEqual(loop_out, batched_out)
 
     def test_vmapvmapjvp_linalg_solve(self):
+        # [FUNCTION DOC] Checks double vmap of jvp for linalg solve where the matrix
+        # is contiguous for jvp but becomes non-contiguous after vmap expands it at
+        # both levels. Asserts the OpInfo exists, then compares the two level vmap
+        # result with the explicit two level loop reference.
         ops = [op for op in op_db if op.name == "linalg.solve"]
         if len(ops) == 0:
             raise AssertionError("Expected at least one linalg.solve op")
@@ -2440,9 +2717,16 @@ class TestOperators(TestCase):
     )
     @parametrize("grad_op", ["jvp", "vjp"])
     def test_view_then_inplace(self, device, dtype, op, grad_op):
+        # [FUNCTION DOC] For each aliasing (view) op, checks that writing in place
+        # into the view result under jvp or vjp raises RuntimeError mentioning an in-
+        # place operation during a grad transform. The transform name comes from the
+        # parametrized argument and anything other than vjp or
+        # jvp raises AssertionError.
         for sample_input in op.sample_inputs(device, dtype):
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Calls the op on the sample, copies
+                # the argument into the view result, and returns the argument.
                 op(sample_input.input, *sample_input.args, **sample_input.kwargs).copy_(
                     x
                 )
@@ -2478,9 +2762,15 @@ class TestOperators(TestCase):
     )
     @parametrize("grad_op", ["jvp", "vjp"])
     def test_view_then_inplace_list_return(self, device, dtype, op, grad_op):
+        # [FUNCTION DOC] Same in-place after view check for ops that return lists of
+        # views: the first element is written to and the expected error is
+        # RuntimeError mentioning an in-place operation during a grad transform, under
+        # jvp or vjp.
         for sample_input in op.sample_inputs(device, dtype):
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Calls the op, copies the argument
+                # into the first returned view, and returns the argument.
                 op(sample_input.input, *sample_input.args, **sample_input.kwargs)[
                     0
                 ].copy_(x)
@@ -2505,6 +2795,10 @@ class TestOperators(TestCase):
 
     @parametrize("grad_op", ["jvp", "vjp"])
     def test_view_then_inplace_special(self, grad_op):
+        # [FUNCTION DOC] Same in-place after view check using several indexing
+        # expressions that alias their input (integer and slice indexing), applied to
+        # a captured random tensor, under jvp or vjp. Expects RuntimeError with the
+        # in-place during grad message.
         # some things in __getitem__ use at::index, which doesn't alias, so this tests a subset of them that do alias
         ops = [
             lambda x: x[0],
@@ -2517,6 +2811,9 @@ class TestOperators(TestCase):
         for op in ops:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Applies the current indexing function
+                # to the captured tensor, copies the argument into the result
+                # and returns the argument.
                 op(captured).copy_(x)
                 return x
 
@@ -2557,6 +2854,10 @@ class TestOperators(TestCase):
         },
     )
     def test_vmapvjpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check for autograd function ops: vmap of vjp
+        # of vmap against loop-based references. Skips the non-composable cube
+        # function through the expected failure set. For each sample and batched input
+        # compares vmap over the vjp of the vmapped op with the looped version.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2580,7 +2881,12 @@ class TestOperators(TestCase):
                 cotangents = tree_map(lambda x: torch.rand_like(x), result)
 
                 def apply_vjp(fn):
+                    # [FUNCTION DOC] HELPER: Returns a function that takes
+                    # primals and cotangents and applies vjp.
                     def inner(primals, cotangents):
+                        # [FUNCTION DOC] HELPER: Runs vjp of the
+                        # captured function on the primals and applies
+                        # it to the cotangents.
                         _, vjp_fn = vjp(fn, *primals)
                         return vjp_fn(cotangents)
 
@@ -2608,6 +2914,10 @@ class TestOperators(TestCase):
         },
     )
     def test_vjpvmapvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: vjp of vmap of vmap compared with vjp
+        # of looped versions for autograd function ops. Builds expected vjps from the
+        # looped op and actual vjps from the double vmapped op
+        # using random cotangents.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2649,6 +2959,8 @@ class TestOperators(TestCase):
         },
     )
     def test_vjpvjpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: vjp of vjp of vmap compared with the
+        # looped op, for autograd function ops, using the full vjp variants of both.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2684,6 +2996,8 @@ class TestOperators(TestCase):
         },
     )
     def test_jvpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Checks jvp of vmap against jvp of the looped op, for autograd
+        # function ops only, as the comment says other cases are trusted.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2716,6 +3030,8 @@ class TestOperators(TestCase):
         },
     )
     def test_jvpvmapvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: jvp of vmap of vmap compared with jvp
+        # of the looped version, for autograd function ops.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2751,6 +3067,8 @@ class TestOperators(TestCase):
         },
     )
     def test_vmapjvpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: vmap of jvp of vmap compared with the
+        # looped equivalent for autograd function ops, with TF32 disabled.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2790,6 +3108,8 @@ class TestOperators(TestCase):
         },
     )
     def test_jvpjvpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: jvp of jvp of vmap compared with the
+        # looped equivalent for autograd function ops.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2827,6 +3147,8 @@ class TestOperators(TestCase):
         },
     )
     def test_jvpvjpvmap(self, device, dtype, op):
+        # [FUNCTION DOC] Three-transform check: jvp of vjp of vmap compared with the
+        # looped equivalent for autograd function ops.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         B = 2
         for sample in samples:
@@ -2854,9 +3176,14 @@ class TestOperators(TestCase):
                 self.assertEqual(result, expected)
 
     def test_data_write_errors_under_transform(self, device):
+        # [FUNCTION DOC] Checks that assigning to the data attribute of a tensor
+        # inside a function transformed by grad, vjp or jvp raises RuntimeError
+        # mentioning direct mutation through data in a functorch transform.
         t = torch.randn(3, 3, device=device)
 
         def fn(t):
+            # [FUNCTION DOC] HELPER: Assigns a new random tensor to the data
+            # attribute of the argument and returns its sum.
             t.data = torch.randn(3, 3)
             return t.sum()
 
@@ -2871,12 +3198,19 @@ class TestOperators(TestCase):
             jvp(fn, (t,), (torch.randn_like(t),))
 
     def test_tensor_with_scalar_list(self, device):
+        # [FUNCTION DOC] Checks that vjp gives the same output and gradient for
+        # building a tensor from a list holding one scalar tensor as for building a
+        # tensor from the scalar and viewing it with length one.
         x = torch.randn((), device=device)
 
         def func_list_of_scalar(x):
+            # [FUNCTION DOC] HELPER: Builds a one-element tensor from a list
+            # holding the argument.
             return torch.tensor([x], device=device)
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Builds a tensor from the argument and views
+            # it as length one.
             return torch.tensor(x, device=device).view(1)
 
         actual_o, actual_fn = vjp(func_list_of_scalar, x)
@@ -2890,6 +3224,8 @@ class TestOperators(TestCase):
 
     @ops(bool_ordered_op_db, dtypes=[torch.bool])
     def test_ordered_bool_raises(self, device, dtype, op):
+        # [FUNCTION DOC] For ops that do not support ordering on booleans, asserts
+        # every sample raises RuntimeError when called with a bool dtype.
         # Generate sample inputs for the op
         sample_inputs = op.sample_inputs(device, dtype)
 
@@ -2908,6 +3244,8 @@ class TestOperators(TestCase):
         dtypes=[torch.complex32, torch.complex64, torch.complex128],
     )
     def test_ordered_complex_raises(self, device, dtype, op):
+        # [FUNCTION DOC] For ops that do not support ordering on complex numbers,
+        # asserts every sample raises RuntimeError for each complex dtype.
         # Generate sample inputs for the op
         sample_inputs = op.sample_inputs(device, dtype)
 
