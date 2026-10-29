@@ -1,3 +1,6 @@
+# [MODULE DOC] Matcher that extends SubgraphMatcher so matched nodes can be looked up by name.
+# The pattern graph module must return an extra trailing dict of name to pattern node. Exports
+# SubgraphMatcherWithNameNodeMap. No import-time side effects.
 from torch.fx import Graph, GraphModule, Node
 from torch.fx._compatibility import compatibility
 
@@ -10,6 +13,11 @@ __all__ = ["SubgraphMatcherWithNameNodeMap"]
 def _split_to_graph_and_name_node_map(
     gm: GraphModule,
 ) -> tuple[GraphModule, dict[str, Node]]:
+    # [FUNCTION DOC] HELPER: Strips the trailing name-to-node dict from the output of the pattern graph module.
+    # Finds the output node, unflattens with the module output spec, requires a tuple of at least two
+    # elements whose last element is a dict (AssertionError otherwise), rewrites the output node to return the
+    # remaining flattened values, updates the module pytree output spec, recompiles in place and returns
+    # the module with the extracted dict. Mutates the input module.
     from torch.fx.graph import _PyTreeInfo
     from torch.utils._pytree import tree_flatten, tree_unflatten
 
@@ -42,6 +50,9 @@ def _split_to_graph_and_name_node_map(
 
 @compatibility(is_backward_compatible=False)
 class SubgraphMatcherWithNameNodeMap(SubgraphMatcher):
+    # [CLASS DOC] SubgraphMatcher variant built from a pattern GraphModule (not Graph) whose extra dict output
+    # is removed at construction. State: name_node_map (pattern node names to pattern nodes). After matching,
+    # each returned InternalMatch gets its own name_node_map from names to matched target nodes.
     """Extends SubgraphMatcher to support querying the matched subgraph nodes through node name,
     this requires pattern to have specific format (returning and additional dictionary at the output,
     that has node name as key, and the node in the pattern graph as value, see Example for more details)
@@ -81,6 +92,8 @@ class SubgraphMatcherWithNameNodeMap(SubgraphMatcher):
         remove_overlapping_matches: bool = True,
         ignore_literals: bool = False,
     ) -> None:
+    # [FUNCTION DOC] Splits the pattern module into graph and name map (mutating and recompiling the module),
+    # stores the map, then initializes the base matcher with the stripped graph and the matching options.
         pattern_gm, name_node_map = _split_to_graph_and_name_node_map(pattern_gm)
         self.name_node_map = name_node_map
         super().__init__(
@@ -92,6 +105,9 @@ class SubgraphMatcherWithNameNodeMap(SubgraphMatcher):
         )
 
     def match(self, graph: Graph, node_name_match: str = "") -> list[InternalMatch]:
+    # [FUNCTION DOC] Runs the base match on graph (optionally restricted by node_name_match) and fills each
+    # returned InternalMatch name_node_map by translating each pattern node in the stored map through the
+    # match nodes_map. Returns the list of matches.
         """The returned InternalMatch will have name_node_map populated with a map
         from node name (str) to the target node, e.g.
         ``{"conv": target_conv_node, "relu": target_relu_node}``

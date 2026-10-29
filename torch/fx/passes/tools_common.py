@@ -1,3 +1,7 @@
+# [MODULE DOC] Shared helpers for fx partitioning and splitting tools. Defines type aliases (NodeList,
+# NodeSet, Names, Tensors), the set of callable node ops, node-target naming helpers, FxNetAccFusionsFinder
+# (finds groups of accelerator nodes that must be fused because they exchange non-tensor data) and two
+# topological-sort passes (legalize_graph, stable_topological_sort). No import-time side effects.
 import collections
 import heapq
 import operator
@@ -30,6 +34,10 @@ CALLABLE_NODE_OPS = {"call_module", "call_function", "call_method"}
 
 @compatibility(is_backward_compatible=False)
 def get_acc_ops_name(k: str | type) -> str:
+    # [FUNCTION DOC] Returns a printable name for an op key. A string is returned unchanged; a type from an
+    # acc_ops module becomes "acc_ops." plus its name; otherwise the module path (with torch._ops rewritten to
+    # torch.ops) joined with the name.
+    # KNOWN ISSUE: if the type has a None module the replace call would fail; only an empty module is tolerated.
     if isinstance(k, str):
         return k
     elif k.__module__ and "acc_ops" in k.__module__:
@@ -45,6 +53,10 @@ def get_acc_ops_name(k: str | type) -> str:
 def get_node_target(
     submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node
 ) -> str:
+    # [FUNCTION DOC] Returns the target type name of a callable node. call_module gives the (acc_ops-style)
+    # name of the submodule type, honoring a base-class-origin attribute; call_function gives an acc_ops name
+    # or the qualified function name; call_method gives the method name string. Raises AssertionError if the
+    # op is not call_module/call_function/call_method or a string target is expected but not found.
     """
     Given a `node` returns its target typename.
 
@@ -87,6 +99,8 @@ def get_node_target(
 
 @compatibility(is_backward_compatible=False)
 def is_node_output_tensor(node: torch.fx.Node) -> bool:
+    # [FUNCTION DOC] Returns True if the type metadata of the node is set and is a Tensor subclass. Requires
+    # shape propagation to have populated the metadata; otherwise returns False.
     """Checks if the node output produces a Tensor or not.
 
     NOTE: This requires to run `ShapeProp` on the containing fx graph before
@@ -99,12 +113,18 @@ def is_node_output_tensor(node: torch.fx.Node) -> bool:
 
 @compatibility(is_backward_compatible=False)
 class FxNetAccFusionsFinder:
+    # [CLASS DOC] Callable that finds fusion groups: sets of connected accelerator nodes that pass non-tensor
+    # data between each other and so cannot be split apart. State: module, nodes (graph node list), acc_nodes
+    # (set of supported nodes, mutated by calls), node_index (node to position). Calling it returns a mapping
+    # from each grouped node to its group set.
     """
     Finds groups of connected ACC nodes that pass non-tensor data between each other.
     Such groups are called fusion groups.
     """
 
     def __init__(self, module: torch.fx.GraphModule, acc_nodes: NodeSet) -> None:
+        # [FUNCTION DOC] Stores the module, snapshot list of graph nodes, the accelerator node set (kept by
+        # reference) and a node-to-position index.
         self.module = module
         self.nodes = list(module.graph.nodes)
         self.acc_nodes = acc_nodes
@@ -112,6 +132,9 @@ class FxNetAccFusionsFinder:
 
     @dataclass
     class FusionGroup:
+        # [CLASS DOC] Dataclass for one in-progress fusion group: top_node_idx (smallest position of members), nodes
+        # (members), inputs (callable producer nodes outside the group) and nodes_need_process (members still to
+        # expand).
         # The smallest idx of nodes in the fusion group after topological sorting all the nodes in the model.
         top_node_idx: int
 
@@ -125,6 +148,8 @@ class FxNetAccFusionsFinder:
         nodes_need_process: NodeSet
 
         def add_node(self, node: torch.fx.Node) -> None:
+            # [FUNCTION DOC] Adds a node to the group (no-op if present): marks it for processing, removes it from
+            # inputs and adds its callable input nodes not already in the group to inputs. Mutates the group.
             """
             Add a node to fusion group.
             """
@@ -148,6 +173,10 @@ class FxNetAccFusionsFinder:
         inputs: NodeSet | NodeList,
         visited: NodeSet | None = None,
     ) -> bool:
+        # [FUNCTION DOC] Walks producers (reverse topological) from the given inputs, skipping visited, non-callable
+        # and earlier-than-group nodes. Returns True when a path reaches a group member, adding path nodes to the
+        # group; returns False otherwise. Mutates the group and the visited set.
+        # KNOWN ISSUE: returns True on the first successful input, so other inputs are not examined in that call.
         """
         Start from inputs and going reverse topological order. If any upstream node
         is in the fusion group, add all the nodes in this path to fusion group.
@@ -181,6 +210,11 @@ class FxNetAccFusionsFinder:
         return False
 
     def __call__(self) -> dict[torch.fx.Node, NodeSet]:
+        # [FUNCTION DOC] Computes fusion groups. For each unprocessed callable accelerator node without tensor
+        # metadata it grows a group by adding connecting paths, downstream users of non-tensor nodes and
+        # non-tensor upstream inputs until none remain. If the group contains nodes outside the accelerator set
+        # those group nodes are removed from acc_nodes (mutating it); otherwise each member maps to the group node
+        # set in the result. Returns that mapping.
         result: dict[torch.fx.Node, NodeSet] = {}
         acc_nodes = list(self.acc_nodes)
 
@@ -253,6 +287,12 @@ class FxNetAccFusionsFinder:
 
 @compatibility(is_backward_compatible=False)
 def legalize_graph(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Rebuilds the graph of gm in topological order (queue-based, prioritizing arithmetic,
+    # comparison and assertion ops so runtime asserts come early), copying nodes into a new graph, keeping
+    # the codegen and assigning it to gm. Not stable. Mutates and returns gm. Raises RuntimeError if the
+    # graph has a cycle.
+    # KNOWN ISSUE: the docstring mentions a merge_matmul transformation "below" that is not in this file; the
+    # stable variant raises AssertionError rather than RuntimeError for cycles.
     """
     Replace the graph of the given GraphModule with one that contains the same nodes as the
     original, but in topologically sorted order.
@@ -332,6 +372,10 @@ def legalize_graph(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 @compatibility(is_backward_compatible=False)
 def stable_topological_sort(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Rebuilds the graph of gm in topological order using a min-heap keyed by original node
+    # position (Kahn's algorithm) so independent nodes keep their original order. Copies nodes to a new graph,
+    # keeps the codegen and assigns it to gm. Mutates and returns gm. Raises AssertionError if the graph has
+    # a cycle.
     """
     Replace the graph of the given GraphModule with one that contains the same nodes as the
     original, but in topologically sorted order while preserving the original node order

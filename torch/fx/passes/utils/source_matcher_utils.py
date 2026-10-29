@@ -1,3 +1,7 @@
+# [MODULE DOC] Groups graph nodes by the source (function or leaf module type) they were decomposed from,
+# using node metadata. Exports get_source_partitions, check_subgraphs_connected and SourcePartition.
+# Import-time side effect: creates a module logger configured from the environment variable
+# PYTORCH_MATCHER_LOGLEVEL (default WARNING) with its own console handler and no propagation.
 import logging
 import os
 from collections.abc import Callable
@@ -14,6 +18,9 @@ __all__ = ["get_source_partitions", "check_subgraphs_connected", "SourcePartitio
 
 # Set`PYTORCH_MATCHER_LOGLEVEL=INFO` to see debug logs
 def _init_logger() -> logging.Logger:
+    # [FUNCTION DOC] HELPER: Creates and returns the module logger, setting its level and a new stream handler
+    # level from the environment variable PYTORCH_MATCHER_LOGLEVEL (default WARNING) and disabling propagation.
+    # Side effect: mutates global logging state.
     logger = logging.getLogger(__name__)
 
     level = os.environ.get("PYTORCH_MATCHER_LOGLEVEL", "WARNING").upper()
@@ -34,6 +41,9 @@ logger = _init_logger()
 @compatibility(is_backward_compatible=False)
 @dataclass
 class SourcePartition:
+    # [CLASS DOC] Dataclass describing one partition of nodes that came from a single source. Fields: nodes
+    # (partition nodes), source (function or module type), input_nodes (outside nodes feeding the partition,
+    # excluding parameters), output_nodes (partition nodes used outside it) and params (get_attr nodes used).
     # Nodes in a particular partition
     nodes: list[Node]
 
@@ -58,6 +68,14 @@ def get_source_partitions(
     wanted_sources: list[Any],
     filter_fn: Callable[[Node], bool] | None = None,
 ) -> dict[Any, list[SourcePartition]]:
+    # [FUNCTION DOC] Groups graph nodes by their originating source. For each node it uses the last entry of
+    # the source_fn_stack metadata (a name and source pair); if absent it tries torch_fn metadata (matching
+    # by source name), then, for call_function nodes only, falls back to the innermost entry of
+    # nn_module_stack, matching by subclass, qualified type name string or equality. Only sources listed in
+    # wanted_sources are kept. Groups are keyed by source then by name; optional filter_fn drops groups where
+    # any node fails it. Returns a mapping from source to a list of SourcePartition. Does not mutate the graph.
+    # KNOWN ISSUE: the docstring omits filter_fn; the annotation on the internal grouping map says type keys
+    # although keys may be strings or functions.
     """
     Args:
         graph: The graph we want to partition
@@ -73,6 +91,7 @@ def get_source_partitions(
     modules: dict[type, dict[str, list[Node]]] = {}
 
     def add_to_partition(src: Any, fqn: str, node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Appends the node to the group for the source and name, creating groups as needed.
         diff_modules = modules.setdefault(src, {})
         partition = diff_modules.setdefault(fqn, [])
         partition.append(node)
@@ -128,6 +147,9 @@ def get_source_partitions(
                 add_to_partition(source_fn[1], source_fn[0], node)
 
     def make_partition(nodes: list[Node], module_type: type) -> SourcePartition:
+        # [FUNCTION DOC] HELPER: Builds a SourcePartition from a node list: input_nodes are node arguments outside
+        # the partition that are not get_attr; get_attr nodes become params; nodes with a user outside the
+        # partition become output_nodes. All three are returned sorted.
         input_nodes = set()
         output_nodes = set()
         params = set()
@@ -178,6 +200,8 @@ def get_source_partitions(
 def check_subgraphs_connected(
     subgraph1: SourcePartition, subgraph2: SourcePartition
 ) -> bool:
+    # [FUNCTION DOC] Returns True if some node of subgraph1 has a user that belongs to subgraph2 (directed
+    # connection from the first to the second), else False. No side effects.
     """
     Given two subgraphs A and B (in the form of a list of nodes), checks if
     A has nodes connecting to at least one node in B -- aka there exists a node

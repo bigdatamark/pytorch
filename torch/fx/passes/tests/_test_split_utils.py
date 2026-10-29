@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Unit tests for move_non_tensor_nodes_on_boundary from split_utils, using hand
+# built mock nodes and subgraphs with patched tensor checks and patched input-node properties. The file
+# name starts with an underscore so it is a test helper module. No import-time side effects.
 import unittest
 from typing import Any
 from unittest.mock import patch, PropertyMock
@@ -9,13 +12,19 @@ from torch.fx.passes.splitter_base import Subgraph
 
 
 class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
+# [CLASS DOC] HELPER: Test case verifying that non-tensor nodes on acc subgraph boundaries move to the
+# neighboring subgraph and are left alone when a move is unsafe. State: self.graph, a fresh Graph per test.
     def setUp(self) -> None:
+    # [FUNCTION DOC] HELPER: Fixture creating an empty fx Graph stored on the test case.
         """Set up test fixtures."""
         self.graph = torch.fx.Graph()
 
     def _create_mock_node(
         self, name: str, op: str, target: Any = None, is_tensor: bool = True
     ) -> torch.fx.Node:
+        # [FUNCTION DOC] HELPER: Creates a node of the requested op in the test graph, renames it, gives it type
+        # metadata of tensor or int, and replaces its users and input-node mappings with empty ones so tests can
+        # wire relationships by hand. Unknown ops are created as call_function and relabelled. Returns the node.
         """Helper to create a mock FX node with necessary attributes."""
         if op == "placeholder":
             node = self.graph.placeholder(name)
@@ -52,6 +61,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
         return node
 
     def test_move_non_tensor_nodes_basic_case(self) -> None:
+        # [FUNCTION DOC] Non-tensor node feeding two tensor nodes in the next subgraph is moved into that subgraph.
         """Test basic case where non-tensor node should be moved."""
         # Create nodes
         node1 = self._create_mock_node("node1", "call_function", is_tensor=False)
@@ -96,6 +106,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node3, subgraph2.nodes)
 
     def test_no_movement_for_tensor_nodes(self) -> None:
+        # [FUNCTION DOC] With all nodes tensor-typed, nothing is moved between subgraphs.
         """Test that tensor nodes are not moved."""
         # Create tensor nodes
         node1 = self._create_mock_node("node1", "call_function", is_tensor=True)
@@ -128,6 +139,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node2, subgraph2.nodes)
 
     def test_no_movement_for_non_acc_subgraph(self) -> None:
+        # [FUNCTION DOC] A non-tensor node in a non-acc subgraph is not moved.
         """Test that nodes in non-acc subgraphs are not processed."""
         # Create non-tensor node
         node1 = self._create_mock_node("node1", "call_function", is_tensor=False)
@@ -160,6 +172,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node2, subgraph2.nodes)
 
     def test_multiple_target_subgraphs_no_movement(self) -> None:
+        # [FUNCTION DOC] A non-tensor node whose users are in two different other subgraphs is not moved.
         """Test that nodes with children in multiple different subgraphs don't get moved."""
         # Create nodes
         node1 = self._create_mock_node("node1", "call_function", is_tensor=False)
@@ -202,6 +215,9 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node3, subgraph3.nodes)
 
     def test_dependency_chain_movement(self) -> None:
+        # [FUNCTION DOC] Chain of three non-tensor nodes followed by a tensor node in another subgraph; checks only
+        # loose bounds on subgraph sizes after the move.
+        # KNOWN ISSUE: the assertions are weak (size bounds only) and the test prints debug output.
         """Test movement of a chain of dependent non-tensor nodes."""
         # Create chain: node1 -> node2 -> node3 -> node4
         node1 = self._create_mock_node("node1", "call_function", is_tensor=False)
@@ -266,6 +282,9 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 )  # At least node4 should be there
 
     def test_parent_node_processing(self) -> None:
+        # [FUNCTION DOC] Parent and non-tensor node chain feeding a tensor child in the next subgraph; checks the
+        # child stays and the first subgraph does not grow.
+        # KNOWN ISSUE: assertions are loose; the comments claim node1 is verified as moved but it is not asserted.
         """Test that parent nodes are added to processing queue when appropriate."""
         # Create chain: parent -> node1 -> child
         parent = self._create_mock_node("parent", "call_function", is_tensor=False)
@@ -318,6 +337,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 )  # Some nodes should be moved
 
     def test_empty_subgraphs(self) -> None:
+        # [FUNCTION DOC] Empty subgraphs are handled without error and remain empty.
         """Test handling of empty subgraphs."""
         subgraphs = [Subgraph(nodes=[], is_acc=True), Subgraph(nodes=[], is_acc=True)]
 
@@ -329,6 +349,7 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
         self.assertEqual(len(subgraphs[1].nodes), 0)
 
     def test_single_subgraph(self) -> None:
+        # [FUNCTION DOC] With a single subgraph nothing moves.
         """Test handling of single subgraph - no movement should occur."""
         node1 = self._create_mock_node("node1", "call_function", is_tensor=False)
         node2 = self._create_mock_node("node2", "call_function", is_tensor=True)
@@ -357,6 +378,9 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node2, subgraph1.nodes)
 
     def test_third_subgraph_crossing_blocks_movement(self) -> None:
+        # [FUNCTION DOC] Moving is blocked when the dependency walk reaches a node in a third subgraph; all nodes
+        # must remain in their original subgraphs.
+        # KNOWN ISSUE: the docstring refers to source line numbers that may be stale.
         """Test that movement is blocked when dependency path crosses through an intermediate subgraph.
 
         This tests a critical failure path (lines 411-414): during DFS, when we encounter
@@ -451,6 +475,8 @@ class TestMoveNonTensorNodesOnBoundary(unittest.TestCase):
                 self.assertIn(node_d, subgraph1.nodes)
 
     def test_acc_to_cpu_movement(self) -> None:
+        # [FUNCTION DOC] A non-tensor node in an acc subgraph with a user in a non-acc subgraph moves to the
+        # non-acc subgraph.
         """Test movement from ACC subgraph to CPU/GPU subgraph.
 
         This tests that non-tensor nodes can be moved from ACC to CPU/GPU subgraphs,

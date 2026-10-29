@@ -1,3 +1,6 @@
+# [MODULE DOC] Utilities for fusing sets of fx nodes into submodules: stable topological sort, cycle
+# validation, extracting nodes as a GraphModule, inserting it as a call_module node, erasing the originals
+# and a driver that fuses a list of partitions. No import-time side effects.
 import copy
 import heapq
 
@@ -12,6 +15,9 @@ from torch.fx.passes.utils import lift_subgraph_as_module  # type: ignore[attr-d
 
 @compatibility(is_backward_compatible=False)
 def topo_sort(nodes: NodeList) -> NodeList:
+    # [FUNCTION DOC] Stable topological sort of nodes: dependencies are only counted among the given nodes and a
+    # min-heap keyed by original position keeps input order among independent nodes. Returns the sorted list;
+    # raises AssertionError if the result length differs (a cycle).
     # Stable topological sort: among nodes with no dependency between them,
     # preserve their relative order in the input list. This uses a min-heap
     # keyed by original position instead of a FIFO queue.
@@ -47,6 +53,9 @@ def topo_sort(nodes: NodeList) -> NodeList:
 
 @compatibility(is_backward_compatible=False)
 def validate_partition(partition: NodeList) -> bool:
+    # [FUNCTION DOC] Returns True if fusing the partition would not create a dependency cycle in the original
+    # graph, False otherwise. Collects users outside the partition, then searches from them through users; if the
+    # search reaches a partition node, a cycle exists.
     # verify the partition doesn't form a dependency cycle in the original graph
     # returns True for valid partition, False for invalid
 
@@ -63,6 +72,8 @@ def validate_partition(partition: NodeList) -> bool:
     # If it reaches a node within the partition, then it found a cycle.
     # This function takes the ownership of `root_nodes` and may modify it.
     def bfs_find_cycle(root_nodes: NodeList) -> bool:
+        # [FUNCTION DOC] HELPER: Iterative traversal along users starting from the given roots (consumes and mutates
+        # the list); returns True if any visited node is in the partition, else False.
         # Set used to exclude nodes that have already been visited.
         # If a node has been visited, that node and all its children have
         # been checked for cycles.
@@ -103,6 +114,14 @@ def fuse_as_graphmodule(
     *,
     always_return_tuple: bool = False,
 ) -> tuple[GraphModule, tuple[Node, ...], tuple[Node, ...]]:
+    # [FUNCTION DOC] Copies the given topologically sorted nodes of gm into a new Graph and wraps it as a
+    # GraphModule named module_name. External input nodes become placeholders (sorted by graph order if all
+    # are graph placeholders, else in encounter order); nodes with users outside the partition become outputs
+    # (single value unless several or always_return_tuple). Returns the fused module, the original input
+    # nodes and the original output nodes. Raises AssertionError if a node is not in gm, was erased or is not
+    # found in the graph lookup table, or if the partition forms a cycle. Lints the new graph. Does not mutate gm.
+    # KNOWN ISSUE: the docstring calls original_outputs consumer nodes, but they are the partition nodes that
+    # have users outside the partition.
     """
     Fuse nodes in graph_module into a GraphModule.
 
@@ -156,6 +175,8 @@ def fuse_as_graphmodule(
     node_map: dict[Node, Node] = {}  # mapping of nodes from old graph to new graph
 
     def create_placeholder(input_node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Adds a placeholder to the new graph named and typed like input_node, copies its
+        # meta, and records the mapping from input node to placeholder.
         placeholder_node = subgraph.placeholder(
             input_node.name, type_expr=input_node.type
         )
@@ -189,6 +210,9 @@ def fuse_as_graphmodule(
 
     # handles inputs through graph.node_copy's arg_transform functions
     def remap_inputs(x: Node) -> Node:
+        # [FUNCTION DOC] HELPER: Argument transform for node copying: returns the copied node for inputs inside
+        # the partition, else the placeholder created for that external input.
+        # KNOWN ISSUE: the get_attr branch is a no-op placeholder (TODO) and has no effect.
         if x.op == "get_attr":
             # TODO: do we really need copy the get_attr node into the graph?
             # do something here
@@ -249,6 +273,11 @@ def insert_subgm(
     orig_outputs: tuple[Node, ...],
     insertion_point: Node | None = None,
 ) -> GraphModule:
+    # [FUNCTION DOC] Registers sub_gm as a submodule of gm (named by its class name), inserts a call_module
+    # node after insertion_point (default: the last original output in graph order; AssertionError if none can
+    # be found) with orig_inputs as arguments, and redirects uses of orig_outputs to it (directly when there
+    # is one non-tuple output, else through getitem proxies, also setting the node val meta to a tuple).
+    # Mutates gm and returns it.
     # add sub_gm into gm
     submodule_name = sub_gm.__class__.__name__
     gm.add_submodule(submodule_name, sub_gm)
@@ -294,6 +323,8 @@ def insert_subgm(
 
 @compatibility(is_backward_compatible=False)
 def erase_nodes(gm: GraphModule, nodes: NodeList) -> None:
+    # [FUNCTION DOC] Erases the given nodes from gm graph in reverse order so users go before producers.
+    # Mutates gm.
     # erase original nodes in inverse topological order
     for node in reversed(nodes):
         gm.graph.erase_node(node)
@@ -306,6 +337,9 @@ def fuse_by_partitions(
     prefix: str = "fused_",
     always_return_tuple: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] For each partition (mapping of nodes), topologically sorts it, fuses it into a submodule
+    # named prefix plus its index, inserts that submodule after the last sorted node, and erases the original
+    # nodes. Finally stable-topologically sorts the graph and lints it. Mutates and returns gm.
     for partition_id, partition in enumerate(partitions):
         sorted_nodes = topo_sort(list(partition))
 

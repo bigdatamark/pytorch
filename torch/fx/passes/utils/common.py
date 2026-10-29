@@ -1,3 +1,5 @@
+# [MODULE DOC] Helpers for lifting a subgraph into a standalone GraphModule and comparing graphs.
+# Exports HolderModule, lift_subgraph_as_module and compare_graphs. No import-time side effects.
 from torch.fx._compatibility import compatibility
 from torch.fx.graph import Graph
 from torch.fx.graph_module import GraphModule
@@ -10,12 +12,16 @@ __all__ = ["HolderModule", "lift_subgraph_as_module", "compare_graphs"]
 
 @compatibility(is_backward_compatible=False)
 class HolderModule(Module):
+    # [CLASS DOC] Module whose only role is to hold submodules/attributes copied from an original module
+    # so that dotted attribute paths used by a subgraph resolve. Built from a mapping of name to module
+    # (values may be None); each entry is registered as a child module.
     """
     HolderModule is used to copy all the attributes from original module to submodules
     that uses the attributes
     """
 
     def __init__(self, d: dict[str, Module | None]) -> None:
+    # [FUNCTION DOC] Initializes the module and registers every entry of the mapping as a named child module.
         super().__init__()
         for k, v in d.items():
             self.add_module(k, v)
@@ -28,6 +34,11 @@ def lift_subgraph_as_module(
     comp_name: str = "",
     class_name: str = "GraphModule",
 ) -> tuple[GraphModule, dict[str, str]]:
+    # [FUNCTION DOC] Builds a GraphModule for the given subgraph. Walks nodes of op call_module or get_attr,
+    # creates nested HolderModules along each dotted target path and copies the leaf attribute from the
+    # parent gm. Returns the new GraphModule (named class_name) and a mapping from original target to
+    # "comp_name.target". Raises AssertionError if a node target is not a string; fails with
+    # AttributeError if the target is missing in gm. Shares (does not clone) leaf objects.
     """
     Create a GraphModule for subgraph, which copies the necessary attributes
     from the original parent graph_module.
@@ -82,6 +93,10 @@ def lift_subgraph_as_module(
 
 @compatibility(is_backward_compatible=False)
 def compare_graphs(left: Graph, right: Graph) -> bool:
+    # [FUNCTION DOC] Returns True if a SubgraphMatcher built from left (matching output and placeholders)
+    # finds at least one match in right, i.e. the graphs are structurally identical.
+    # KNOWN ISSUE: the docstring claims identical node sets, but matching is subgraph-based, so a larger
+    # right graph containing left as a subgraph may also match.
     """
     Return True if two graphs are identical, i.e they
         - have the same number of outputs in the same order
