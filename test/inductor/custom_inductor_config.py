@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] HELPER: Minimal custom config module used by test_codecache to check that
+# FXGraphHashDetails accounts for a third-party backend config. Defines one boolean flag
+# (enable_optimisation, default False) and, at import time, calls install_config_module on
+# itself so the module gains the standard config helpers (patch, save_config, and so on).
 
 # This module is used in test_codecache.py to verify the correctness
 # of FXGraphHashDetails when a custom inductor backend registers its own

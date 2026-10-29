@@ -1,5 +1,12 @@
 # Owner(s): ["module: functorch"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the with_effects higher order op and effectful operator support. Shows how
+# AOTAutograd threads ordering tokens through effectful ops (the aten print op, torchbind custom
+# ops, user custom ops registered with an effect type) in forward and backward graphs, with and
+# without unlifting of effect tokens, plus Dynamo/Inductor compilation, FX dead code elimination,
+# torch.export with invoke_subgraph, and functional tensor mode. Helper functions build
+# forward/backward graphs. Import-time effects: none beyond imports (torchbind implementations are
+# initialized in setUp). Many tests need CUDA, SM80+ and triton.
 import unittest
 from collections import deque
 from functools import partial
@@ -49,6 +56,9 @@ from torch.testing._internal.two_tensor import TwoTensor
 
 
 def extract_graph(fx_g, _, graph_cell):
+    # [FUNCTION DOC] HELPER: Compiler callback for aot_function. Stores the received graph module
+    # into the first slot of the given single-element list and returns the graph module unchanged;
+    # the second positional argument (example inputs) is ignored.
     graph_cell[0] = fx_g
     return fx_g
 
@@ -56,11 +66,19 @@ def extract_graph(fx_g, _, graph_cell):
 def get_fw_bw_graph(
     f, inps, partitioner=min_cut_rematerialization_partition, dynamic=False
 ):
+    # [FUNCTION DOC] HELPER: Runs the function through AOT compilation and returns the forward and
+    # backward graph modules. Records graphs via callbacks into one-element lists. If any input
+    # tensor requires grad, the output is summed and backward is run so the backward graph is
+    # captured; otherwise the backward compiler is a no-op and the backward entry is None. Uses the
+    # given partitioner (default min-cut rematerialization), the default decompositions, and the
+    # dynamic flag. Returns a pair (forward graph, backward graph or None).
     fw_graph_cell = [None]
     bw_graph_cell = [None]
     requires_grad = False
 
     def fn_req_grad(t):
+        # [FUNCTION DOC] HELPER: Tree-map callback that sets the enclosing flag when any tensor
+        # requires grad, and returns the tensor unchanged.
         nonlocal requires_grad
         requires_grad = requires_grad or t.requires_grad
         return t
@@ -85,18 +103,33 @@ def get_fw_bw_graph(
 
 
 def make_inputs_non_leaves(inps):
+    # [FUNCTION DOC] HELPER: Returns the same nested structure with every tensor replaced by that
+    # tensor plus one, which makes leaf inputs into non-leaf tensors in the autograd graph.
     return torch.utils._pytree.tree_map_only(torch.Tensor, lambda t: t.add(1), inps)
 
 
 @unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "dynamo isn't support")
 class TestWithEffects(TestCase):
+    # [CLASS DOC] Tests for the with_effects higher order op. The class is skipped when Dynamo is
+    # unsupported. setUp initializes the torchbind test implementations. Most tests export or
+    # compile small functions with effectful ops and compare exact generated graph text.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setup and initializes the torchbind test implementations.
         super().setUp()
         init_torchbind_implementations()
 
     def test_print(self):
+        # [FUNCTION DOC] Traces a module with two aten print calls: with plain tracing both stay
+        # direct (checked with FileCheck counting exactly two); with AOTAutograd export each is
+        # wrapped in with_effects chained through a token (exact code checked; one input and one
+        # output token). With the unlift tokens config enabled, tokens are created inside the graph
+        # and sunk at the end.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that prints a message, doubles the input, prints again,
+            # returns a tuple.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Print, double the input, print, and return the result
+                # in a one-tuple.
                 torch.ops.aten._print("moo")
                 res = x + x
                 torch.ops.aten._print("moo")
@@ -143,12 +176,21 @@ def forward(self, arg1_1):
             )
 
     def test_torchbind_custom_op(self):
+        # [FUNCTION DOC] Exports under torchbind tracing a module that calls a custom op taking
+        # a torchbind object and a tensor. Asserts the exact graph code, where the call is
+        # wrapped in with_effects with the torchbind object as an attribute, and one input and
+        # one output token.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a torchbind Foo object (10, 20) and adding the
+            # custom op result on the input and object to the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the torchbind Foo object attribute.
                 super().__init__()
                 self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a one-tuple of the input plus the output of the
+                # torchbind custom op.
                 return (x + torch.ops._TorchScriptTesting.takes_foo(self.attr, x),)
 
         with enable_torchbind_tracing():
@@ -169,12 +211,21 @@ def forward(self, arg0_1, arg1_1):
         self.assertEqual(len(gs.output_tokens), 1)
 
     def test_print_with_buffer_mutations(self):
+        # [FUNCTION DOC] Exports a module that prints, mutates a buffer in place and prints again.
+        # Asserts exact graph code (effect-wrapped prints, buffer mutation as functional add), plus
+        # one input token, one output token and one mutated buffer.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer of ones; forward prints, adds the doubled
+            # input into the buffer in place, adds the input to the buffer and prints again;
+            # returns a one-tuple.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the buffer of three ones.
                 super().__init__()
                 self.buf = torch.nn.Buffer(torch.ones(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the print, buffer mutation, sum and print sequence
+                # from the class.
                 torch.ops.aten._print("moo")
                 res = x + x
                 self.buf.add_(res)
@@ -204,11 +255,18 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(len(gs.buffers_to_mutate), 1)
 
     def test_print_with_input_mutations(self):
+        # [FUNCTION DOC] Exports a module that prints, mutates its input in place and prints again.
+        # Asserts one input token, one output token and one mutated user input.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that prints, mutates its input in place with its
+            # double, prints again.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Prints, mutates the input in place, recomputes a double,
+                # prints, and returns it in a one-tuple.
                 torch.ops.aten._print("moo")
                 res = x + x
                 x.add_(res)
@@ -225,7 +283,12 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(len(gs.user_inputs_to_mutate), 1)
 
     def test_alias_op(self):
+        # [FUNCTION DOC] Checks that with_effects rejects an aliasing operator: tracing with
+        # make_fx a function that applies the in-place absolute op through with_effects must raise
+        # AssertionError whose message says ops with aliasing are not supported.
         def f(token, x):
+            # [FUNCTION DOC] HELPER: Calls with_effects with a token and the in-place absolute op
+            # on x and returns the new token and the output.
             token, out = with_effects(token, torch.ops.aten.absolute_.default, x)
             return token, out
 
@@ -235,7 +298,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             make_fx(f)(torch.tensor([]), torch.tensor(4))
 
     def test_compile_aot_eager(self):
+        # [FUNCTION DOC] Compiles a function with two prints using the aot_eager backend and
+        # asserts the result is close to the eager result.
         def f(x):
+            # [FUNCTION DOC] HELPER: Print, double the input, print, return the doubled tensor.
             torch.ops.aten._print("moo")
             res = x + x
             torch.ops.aten._print("moo")
@@ -249,7 +315,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     @unittest.skipIf(IS_WINDOWS, "triton")
     @unittest.skipIf(not SM70OrLater, "triton")
     def test_compile_inductor(self):
+        # [FUNCTION DOC] Same as the aot_eager compile test but with the inductor backend; skipped
+        # on Windows and when GPU compute capability is below 7.0.
         def f(x):
+            # [FUNCTION DOC] HELPER: Print, double the input, print, return the doubled tensor.
             torch.ops.aten._print("moo")
             res = x + x
             torch.ops.aten._print("moo")
@@ -263,6 +332,9 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     @unittest.skipIf(IS_WINDOWS, "Skipped on Windows!")
     @skipIfNoDynamoSupport
     def test_compile_inductor_external_op_return_none(self):
+        # [FUNCTION DOC] Registers a custom op in a scoped library that mutates its output argument
+        # and returns nothing, then compiles a function calling it with inductor and checks the
+        # result is close to eager. Skipped on Windows or without Dynamo support.
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
             torch.library.define(
                 "mylib::inplace_add",
@@ -271,6 +343,9 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
             def inplace_add(input: torch.Tensor, output: torch.Tensor) -> None:
+                # [FUNCTION DOC] HELPER: Custom op implementation: raises AssertionError if the two
+                # tensors are on different devices, otherwise adds the input into the output in
+                # place; returns nothing.
                 if input.device != output.device:
                     raise AssertionError(
                         f"Expected input.device == output.device, "
@@ -281,6 +356,8 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             lib.impl("inplace_add", inplace_add, "CompositeExplicitAutograd")
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Makes a zero tensor of size three, calls the in-place
+                # custom op with the input and that tensor, and returns it.
                 out = torch.empty(3)
                 out = torch.zeros_like(out)
                 torch.ops.mylib.inplace_add(x, out)
@@ -292,7 +369,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             self.assertTrue(torch.allclose(res, f(*inputs)))
 
     def test_compile_aot_eager_requires_grad(self):
+        # [FUNCTION DOC] Compiles a printing function with aot_eager on an input requiring grad,
+        # checks the result against eager, and runs backward on the sum.
         def f(x):
+            # [FUNCTION DOC] HELPER: Print, double the input, print, return the doubled tensor.
             torch.ops.aten._print("moo")
             res = x + x
             torch.ops.aten._print("moo")
@@ -310,6 +390,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
     @unittest.skipIf(not TEST_CUDA, "triton")
     @skipIfNoDynamoSupport
     def test_register_effectful_custom_op(self):
+        # [FUNCTION DOC] Registers a custom op that records tensors into a dictionary by prefix,
+        # marks it as an ordered effect, and attaches forward hooks to every submodule of a small
+        # model via a breadth traversal. Compiles with inductor on CUDA, checks outputs, backward
+        # and gradient, and that exactly two records (for the model and its linear layer) were
+        # made. Needs CUDA and SM80.
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
             torch._dynamo.config.capture_scalar_outputs = True
             torch._dynamo.config.capture_dynamic_output_shape_ops = True
@@ -320,12 +405,15 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             # Pytorch custom op implementation
             @torch.library.custom_op("mylib::record_scalar_tensor", mutates_args=())
             def record_scalar_tensor(x: torch.Tensor, prefix: str) -> None:
+                # [FUNCTION DOC] HELPER: Custom op body: stores a clone of the tensor in the shared
+                # dictionary under the given prefix; returns nothing.
                 recorded_dict[prefix] = x.clone()
                 return
 
             # Meta function of the custom op
             @record_scalar_tensor.register_fake
             def record_scalar_tensor_meta(x, prefix):
+                # [FUNCTION DOC] HELPER: Fake implementation of the recording op; returns nothing.
                 return
 
             record_scalar_tensor.register_effect(_EffectType.ORDERED)
@@ -338,7 +426,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             my_config["MockModule.relu"] = "mean"
 
             class MyLinear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear layer with randomly initialized weight
+                # and bias parameters.
                 def __init__(self, in_features, out_features):
+                    # [FUNCTION DOC] HELPER: Creates the weight and bias parameters of
+                    # the requested sizes.
                     super().__init__()
                     self.weight = torch.nn.Parameter(
                         torch.randn(out_features, in_features), requires_grad=True
@@ -348,10 +440,16 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the functional linear transform with
+                    # the stored parameters.
                     return torch.nn.functional.linear(x, self.weight, self.bias)
 
             class MockModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Model with a 10 by 10 custom linear layer and a trainable 10
+                # by 10 buffer; forward applies ReLU to the linear output plus the buffer.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear layer and registers
+                    # the random buffer.
                     super().__init__()
                     self.linear = MyLinear(10, 10)
                     self.register_buffer(
@@ -359,6 +457,7 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the ReLU of the linear output plus the buffer.
                     return torch.nn.functional.relu(self.linear(x) + self.buf0)
 
             def forward_hook(
@@ -368,6 +467,9 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                 prefix: str,
                 aggregate_method: str,
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Forward hook: records an aggregate of the output (mean,
+                # max, or sum for any other method name) through the effectful recording op under
+                # the given prefix, then returns the output unchanged.
                 if aggregate_method == "mean":
                     torch.ops.mylib.record_scalar_tensor(output.mean(), prefix)
                 elif aggregate_method == "max":
@@ -378,6 +480,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                 return output
 
             def add_hooks(module, config):
+                # [FUNCTION DOC] HELPER: Walks the module tree breadth-wise from the root; for each
+                # module picks the aggregate method from the config (default mean), builds a prefix
+                # from the dotted name and method, registers the forward hook, and collects
+                # handles. Returns the list of handles.
                 handles: list[RemovableHandle] = []
                 q = deque([(module.__class__.__name__, module)])
                 while q:
@@ -417,6 +523,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     @skipIfNoDynamoSupport
     def test_effectful_custom_op_with_subclasses(self):
+        # [FUNCTION DOC] Defines two ordered effectful ops with CPU/CUDA/Meta implementations that
+        # count forward and backward calls, with an autograd rule whose backward calls the second
+        # op. Checks call counts and results against eager for dense and TwoTensor subclass inputs,
+        # without and with grad, using aot_eager and the default backend. Also checks exact forward
+        # and backward graph text with tokens for subclass inputs. Skipped without Dynamo support.
         with torch.library._scoped_library("_mylib", "FRAGMENT") as lib:
             lib.define("zoo(Tensor x) -> Tensor")
             lib.define("zoo2(Tensor x) -> Tensor")
@@ -424,25 +535,36 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             d = {"fw": 0, "bw": 0}
 
             def reset_counter():
+                # [FUNCTION DOC] HELPER: Sets both the forward and backward call counters to zero.
                 d["fw"] = 0
                 d["bw"] = 0
 
             def assert_counter(fw, bw):
+                # [FUNCTION DOC] HELPER: Asserts the forward and backward call counters equal
+                # the expected values.
                 self.assertEqual(d["fw"], fw)
                 self.assertEqual(d["bw"], bw)
 
             def foo_impl(a):
+                # [FUNCTION DOC] HELPER: Implementation of the first op: increments the forward
+                # counter and returns twice a clone of the input.
                 d["fw"] = d["fw"] + 1
                 return 2 * a.clone()
 
             def foo_meta(a):
+                # [FUNCTION DOC] HELPER: Meta implementation for the first op: returns a clone
+                # of the input.
                 return a.clone()
 
             def foo2_impl(x):
+                # [FUNCTION DOC] HELPER: Implementation of the second op: increments the backward
+                # counter and returns a clone of the input.
                 d["bw"] = d["bw"] + 1
                 return x.clone()
 
             def foo2_meta(a):
+                # [FUNCTION DOC] HELPER: Meta implementation for the second op: returns a clone
+                # of the input.
                 return a.clone()
 
             for backend in ["CPU", "CUDA"]:
@@ -452,6 +574,8 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             lib.impl("zoo2", foo2_meta, "Meta")
 
             def foo_bwd(ctx, grad):
+                # [FUNCTION DOC] HELPER: Backward rule for the first op: calls the second op on the
+                # gradient (for its counting side effect) and returns a clone of the gradient.
                 torch.ops._mylib.zoo2(grad)
                 return grad.clone()
 
@@ -465,9 +589,12 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Applies the first custom op to x and adds y.
                 return torch.ops._mylib.zoo(x) + y
 
             def ins_sc():
+                # [FUNCTION DOC] HELPER: Returns a pair of inputs: a TwoTensor wrapping two equal
+                # float tensors, and a plain float tensor.
                 return (
                     TwoTensor(
                         torch.tensor([1.0, 2.0, 3.0]), torch.tensor([1.0, 2.0, 3.0])
@@ -476,6 +603,7 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                 )
 
             def ins_dense():
+                # [FUNCTION DOC] HELPER: Returns a pair of plain float tensors.
                 return torch.tensor([1.0, 2.0, 3.0]), torch.tensor([4.0, 5.0, 6.0])
 
             for ins_fn, expected_fw_count in zip([ins_sc, ins_dense], [2, 1]):
@@ -492,12 +620,15 @@ def forward(self, arg0_1, arg1_1, arg2_1):
                 self.assertEqual(ref_out, out)
 
             def ins_dense_req_grad():
+                # [FUNCTION DOC] HELPER: Returns a pair of plain float tensors that require grad.
                 return (
                     torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
                     torch.tensor([4.0, 5.0, 6.0], requires_grad=True),
                 )
 
             def ins_sc_req_grad():
+                # [FUNCTION DOC] HELPER: Returns a pair of TwoTensor objects, each wrapping two
+                # float tensors that require grad.
                 return (
                     TwoTensor(
                         torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
@@ -566,6 +697,13 @@ def forward(self, tangents_1, tangents_2, tangents_token):
             )
 
     def test_dce(self):
+        # [FUNCTION DOC] Checks that an op marked side-effectful is not removed by FX dead code
+        # elimination. Registers a logging custom op (appending to a list), registers it as an
+        # ordered effect, traces a function using it symbolically, eliminates dead code,
+        # recompiles, runs the graph and checks the op still ran.
+        # KNOWN ISSUE: the final assertion passes the list length as an assertTrue condition with
+        #   1 as the message, so it only checks the log is non-empty and does not compare the
+        #   length to one.
         # If an operator is marked as side effectful, it should not get DCEd by
         # FX's eliminate_dead_code
 
@@ -577,11 +715,15 @@ def forward(self, tangents_1, tangents_2, tangents_token):
                 mutates_args=(),
             )
             def my_logger3(s: str, t: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op body: appends the string to the log list and
+                # returns a one-element zero tensor.
                 log3.append(s)
                 return torch.zeros(1)
 
             @my_logger3.register_fake
             def my_logger3(s, t) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation of the logging op: returns a
+                # one-element zero tensor.
                 return torch.zeros(1)
 
             # Registering an op as being effectful should also prevent FX DCE
@@ -592,6 +734,8 @@ def forward(self, tangents_1, tangents_2, tangents_token):
             )
 
             def foo(x):
+                # [FUNCTION DOC] HELPER: Makes a scalar tensor from the first dimension size, calls
+                # the logging op on it, and returns the input doubled.
                 b = torch.scalar_tensor(x.shape[0])
                 torch.ops.mylib.my_logger3("moo", b)
                 return x + x
@@ -603,7 +747,12 @@ def forward(self, tangents_1, tangents_2, tangents_token):
             self.assertTrue(len(log3), 1)
 
     def test_effects_and_input_mutation_return(self):
+        # [FUNCTION DOC] Checks a print combined with an op writing to an output argument (sin with
+        # an out tensor): compiled full graph output equals eager, and the forward graph text shows
+        # the print wrapped in with_effects and the mutated input returned as an extra output.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Prints, then computes sin of the first argument into the
+            # second and returns the result.
             torch.ops.aten._print("effect")
             return torch.sin(a, out=b)
 
@@ -624,7 +773,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         )
 
     def test_effects_and_input_output_view_simple(self):
+        # [FUNCTION DOC] Checks a function that only returns a view of its input: compiled outputs
+        # equal eager for inputs without and with grad, and the forward graph has just the view
+        # with no effects.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Returns the input flattened by a view.
             return a.view(-1)
 
         inp = [torch.ones(2, 2, requires_grad=False).add(1)]
@@ -648,7 +801,12 @@ def forward(self, arg0_1):
         )
 
     def test_effects_and_aliased_outputs(self):
+        # [FUNCTION DOC] Checks that aliasing between outputs (an output and a view of it) is
+        # preserved by AOT compilation in the presence of a print, for inputs with and without
+        # grad: after mutating one output in place, both outputs still match the eager ones.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Doubles the input, prints, creates a flattened
+            # view, returns both.
             b = a.mul(2)
             torch.ops.aten._print("effect")
             c = b.view(-1)
@@ -669,7 +827,13 @@ def forward(self, arg0_1):
             self.assertEqual(out_ref[1], out_test[1])
 
     def test_effects_and_input_mutation_is_output(self):
+        # [FUNCTION DOC] Checks a function that mutates its input in place, prints, and returns the
+        # input. Compares aot_eager full graph results to eager for non-leaf grad-requiring input
+        # and plain input, and checks the exact forward graph (multiplication, wrapped print,
+        # mutated output returned twice).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two in place, prints, and
+            # returns the input.
             a.mul_(2)
             torch.ops.aten._print("effect")
             return a
@@ -697,13 +861,21 @@ def forward(self, arg0_1, arg1_1):
 
     @skipIfTorchDynamo()
     def test_effectful_op_in_backward(self):
+        # [FUNCTION DOC] Registers an ordered effect for a custom op that is used in its own
+        # backward rule, compiles with inductor for dense and TwoTensor inputs and compares results
+        # and gradients to eager, and checks exact forward/backward graph text (the backward graph
+        # gets the token as an input). Unregisters the effect at the end and asserts it is gone.
+        # Skipped under Dynamo.
         with torch.library._scoped_library("_mylib", "FRAGMENT") as lib:
             lib.define("foo(Tensor x) -> Tensor")
 
             def foo_impl(a):
+                # [FUNCTION DOC] HELPER: Implementation of the op: returns a clone of the input.
                 return a.clone()
 
             def foo_bwd(ctx, grad):
+                # [FUNCTION DOC] HELPER: Backward rule: calls the same op on the gradient and
+                # returns the result.
                 return torch.ops._mylib.foo(grad)
 
             for backend in ["CPU", "CUDA", "Meta"]:
@@ -721,15 +893,20 @@ def forward(self, arg0_1, arg1_1):
             try:
 
                 def fn(x, y):
+                    # [FUNCTION DOC] HELPER: Applies the custom op to x and adds y.
                     return torch.ops._mylib.foo(x) + y
 
                 def ins_dense_req_grad():
+                    # [FUNCTION DOC] HELPER: Returns a pair of plain float tensors
+                    # that require grad.
                     return (
                         torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
                         torch.tensor([4.0, 5.0, 6.0], requires_grad=True),
                     )
 
                 def ins_sc_req_grad():
+                    # [FUNCTION DOC] HELPER: Returns a TwoTensor of two grad-requiring tensors plus
+                    # a plain tensor that requires grad.
                     return (
                         TwoTensor(
                             torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
@@ -809,13 +986,21 @@ def forward(self, tangents_1, tangents_2, tangents_token):
 
     @skipIfNoDynamoSupport
     def test_regular_effectful_op_only_in_backward(self):
+        # [FUNCTION DOC] Registers an ordered effect for the cosine op, which only appears in
+        # the sine backward. Compiles with inductor and checks the exact graphs: the forward
+        # has no effects and the backward wraps the cosine in with_effects using a token
+        # input. Repeats for a TwoTensor input (two wrapped calls). The registration is
+        # destroyed in a finally clause.
         handle = _register_effectful_op(torch.ops.aten.cos.default, _EffectType.ORDERED)
         try:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Returns the sine of the input.
                 return x.sin()
 
             def inps_fn():
+                # [FUNCTION DOC] HELPER: Returns a one-tuple with a float vector
+                # that requires grad.
                 return (torch.tensor([1.0, 2.0, 3.0], requires_grad=True),)
 
             torch.compile(fn, backend="inductor", fullgraph=True)(*inps_fn())
@@ -840,6 +1025,8 @@ def forward(self, primals_1, tangents_1, tangents_token):
             )
 
             def inps_fn_sc():
+                # [FUNCTION DOC] HELPER: Returns a one-tuple with a TwoTensor of two
+                # grad-requiring float vectors.
                 return (
                     TwoTensor(
                         torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
@@ -876,10 +1063,14 @@ def forward(self, primals_1, primals_2, tangents_1, tangents_2, tangents_token):
 
     @skipIfNoDynamoSupport
     def test_regular_effectful_op_in_forward_and_backward(self):
+        # [FUNCTION DOC] Registers an ordered effect for cosine, which now appears in the forward
+        # and in the sine backward. Compiles with inductor and checks exact forward and backward
+        # graph text with tokens. The registration is destroyed in a finally clause.
         handle = _register_effectful_op(torch.ops.aten.cos.default, _EffectType.ORDERED)
         try:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Applies cosine then sine to the input.
                 x = x.cos()
                 return x.sin()
 
@@ -917,11 +1108,20 @@ def forward(self, primals_2, getitem_1, tangents_1, tangents_token):
     @unittest.skipIf(not TEST_CUDA, "triton")
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_export_invoke_subgraph(self):
+        # [FUNCTION DOC] Needs CUDA and triton (expected to fail without an accelerator triton).
+        # Registers a memory-recording ordered-effect op, builds a model with three repeated nested
+        # compile regions, exports it and runs decompositions, then checks the subgraph structure
+        # and the exact graph text, the number of records, numerical match, and the unlifted-token
+        # graph form; finally compiles the model and checks record count and closeness. Inline of
+        # single-use subgraphs is off.
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
             recorded_list = []
 
             @torch.library.custom_op("mylib::record_memory", mutates_args=())
             def record_memory(prefix: str, module_name: str) -> None:
+                # [FUNCTION DOC] HELPER: Custom op body: synchronizes CUDA, formats allocated and
+                # reserved memory in megabytes with the prefix and module name, and appends the
+                # string to the shared list.
                 torch.cuda.synchronize()
                 mem_alloc = torch.cuda.memory_allocated() / 1024**2
                 mem_reserved = torch.cuda.memory_reserved() / 1024**2
@@ -930,13 +1130,19 @@ def forward(self, primals_2, getitem_1, tangents_1, tangents_token):
 
             @record_memory.register_fake
             def record_memory_fake(prefix, module_name):
+                # [FUNCTION DOC] HELPER: Fake implementation of the memory-recording
+                # op; returns nothing.
                 return
 
             record_memory.register_effect(_EffectType.ORDERED)
             has_side_effect(torch.ops.mylib.record_memory.default)
 
             class N(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with two 1024 by 1024 linear layers and a
+                # ReLU; forward is a nested compile region that records memory and applies
+                # linear, ReLU, linear.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Creates the two linear layers and the ReLU.
                     super().__init__()
                     self.linear1 = torch.nn.Linear(1024, 1024)
                     self.relu = torch.nn.ReLU()
@@ -944,6 +1150,8 @@ def forward(self, primals_2, getitem_1, tangents_1, tangents_token):
 
                 @torch.compiler.nested_compile_region
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Records memory with the forward label, then
+                    # applies the layers.
                     torch.ops.mylib.record_memory("forward", "N")
                     x = self.linear1(x)
                     x = self.relu(x)
@@ -951,11 +1159,17 @@ def forward(self, primals_2, getitem_1, tangents_1, tangents_token):
                     return x
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module holding three of the above submodules in a
+                # list; forward applies them in sequence, records memory once more and
+                # returns a one-tuple.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Creates the module list of three submodules.
                     super().__init__()
                     self.mod_list = torch.nn.ModuleList(N() for _ in range(3))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Runs the submodules in order, records memory, and
+                    # returns a one-tuple.
                     for m in self.mod_list:
                         x = m(x)
                     torch.ops.mylib.record_memory("forward", "N")
@@ -1062,29 +1276,43 @@ def forward(self, arg1_1, arg2_1, arg3_1, arg4_1, arg5_1):
 
     @skipIfTorchDynamo()
     def test_effect_autograd_function(self):
+        # [FUNCTION DOC] Registers an ordered effect for a gradient-logging custom op called inside
+        # a custom autograd function backward. Compiles with the AOT eager recording backend,
+        # compares loss with eager, and checks the exact forward graph (no effects) and backward
+        # graph (token input, effect-wrapped op). Skipped under Dynamo.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
 
             @torch.library.custom_op("mylib::log_grad", mutates_args=())
             def log_grad(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op body: returns a clone of the input.
                 return x.clone()
 
             @torch.library.register_fake("mylib::log_grad")
             def log_grad_fake(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation: returns a clone of the input.
                 return x.clone()
 
             log_grad.register_effect(_EffectType.ORDERED)
 
             class NoOpWithLoggingBackward(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Autograd function whose forward squares the input elementwise
+                # and whose backward passes the gradient through the logging op and returns it.
                 @staticmethod
                 def forward(ctx, x):
+                    # [FUNCTION DOC] HELPER: Returns the input multiplied by itself; the
+                    # context is unused.
                     return x * x
 
                 @staticmethod
                 def backward(ctx, grad_output):
+                    # [FUNCTION DOC] HELPER: Passes the gradient through the logging op and
+                    # returns the result.
                     logged_grad = torch.ops.mylib.log_grad(grad_output)
                     return logged_grad
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Applies the autograd function and returns the sum
+                # of the result.
                 y = NoOpWithLoggingBackward.apply(x)
                 return y.sum()
 
@@ -1121,12 +1349,17 @@ def forward(self, tangents_1, tangents_token):
             )
 
     def test_with_effects_through_functional_tensor_mode(self):
+        # [FUNCTION DOC] Calls with_effects on an add op under functional tensor mode (with the
+        # functionalize dispatch key excluded) using functional tensor inputs, unwraps the result
+        # if it is a functional tensor, and asserts it equals the plain sum.
         from torch._subclasses.functional_tensor import (
             FunctionalTensor,
             FunctionalTensorMode,
         )
 
         def fn_with_effects(x, y):
+            # [FUNCTION DOC] HELPER: Makes a token, calls with_effects on the add op with both
+            # inputs and returns only the computed result, ignoring the new token.
             token = torch.ops.prims._make_token()
             new_token, result = with_effects(
                 token,
@@ -1158,6 +1391,9 @@ def forward(self, tangents_1, tangents_token):
     @unittest.skipIf(not SM80OrLater, "triton")
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     def test_effectful_op_with_flex_attention(self):
+        # [FUNCTION DOC] Needs CUDA and SM80. Registers an ordered-effect noop custom op, uses it
+        # on the query before flex attention with a pass-through score function, compiles the
+        # function and checks the output shape matches the query shape (2, 4, 128, 64).
         """Test that effectful custom ops work with flex_attention."""
         from torch._library.effects import EffectType
         from torch.nn.attention.flex_attention import flex_attention
@@ -1166,18 +1402,23 @@ def forward(self, tangents_1, tangents_token):
 
             @torch.library.custom_op("mylib::noop", mutates_args=())
             def noop(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op body: returns a clone of the input.
                 return x.clone()
 
             @noop.register_fake
             def noop_fake(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation: returns a clone of the input.
                 return x.clone()
 
             noop.register_effect(EffectType.ORDERED)
 
             def score_mod(score, b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: Score modification that returns the score unchanged.
                 return score
 
             def fn(q, k, v):
+                # [FUNCTION DOC] HELPER: Applies the noop custom op to q, then flex attention with
+                # the score mod.
                 q = torch.ops.mylib.noop(q)
                 out = flex_attention(q, k, v, score_mod=score_mod)
                 return out
