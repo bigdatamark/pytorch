@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Compatibility shim re-exporting the fused conv QAT modules (ConvBn, ConvBnReLU, ConvReLU for 1d/2d/3d) and the helper functions
+# freeze_bn_stats and update_bn_stats from torch.ao.nn.intrinsic.qat. No logic, no side effects.
 r"""Intrinsic QAT Modules.
 
 This file is in the process of migration to `torch/ao/nn/intrinsic/qat`, and

@@ -1,3 +1,6 @@
+# [PACKAGE DOC]
+# Compatibility package for intrinsic QAT modules. Re-exports ConvBn/ConvBnReLU/ConvReLU 1d-3d, LinearBn1d, LinearReLU and the
+# utilities freeze_bn_stats and update_bn_stats from the per-file shim modules (which forward to torch.ao.nn.intrinsic.qat).
 from torch.nn.intrinsic.qat.modules.conv_fused import (
     ConvBn1d,
     ConvBn2d,

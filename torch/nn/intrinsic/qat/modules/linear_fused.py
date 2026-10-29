@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Compatibility shim re-exporting the LinearBn1d QAT module from torch.ao.nn.intrinsic.qat. No logic, no side effects.
 r"""Intrinsic QAT Modules.
 
 This file is in the process of migration to `torch/ao/nn/intrinsic/qat`, and

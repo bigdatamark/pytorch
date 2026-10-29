@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Functional helpers computing gradients of conv1d/2d/3d with respect to the input or the weight, by calling the aten
+# convolution_backward op directly. No import-time side effects beyond importing torch and the _single/_pair/_triple helpers.
 """Gradient interface."""
 
 import torch
@@ -14,6 +17,11 @@ def conv1d_input(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv1d w.r.t. its input, given the input shape (input_size), the weight and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the input gradient, and returns it. stride/padding/dilation are expanded to 1-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
     r"""Compute the gradient of conv1d with respect to the input of the convolution.
 
     This is same as the 1D transposed convolution operator under the hood but requires
@@ -64,6 +72,12 @@ def conv1d_weight(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv1d w.r.t. its weight, given the input, the weight shape (weight_size) and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the weight gradient, and returns it. stride/padding/dilation are expanded to 1-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
+    # KNOWN ISSUE: the docstring example calls autograd grad with an undefined name (filter) instead of the weight tensor.
     r"""Compute the gradient of conv1d with respect to the weight of the convolution.
 
     Args:
@@ -112,6 +126,11 @@ def conv2d_input(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv2d w.r.t. its input, given the input shape (input_size), the weight and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the input gradient, and returns it. stride/padding/dilation are expanded to 2-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
     r"""Compute the gradient of conv2d with respect to the input of the convolution.
 
     This is same as the 2D transposed convolution operator under the hood but requires
@@ -162,6 +181,12 @@ def conv2d_weight(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv2d w.r.t. its weight, given the input, the weight shape (weight_size) and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the weight gradient, and returns it. stride/padding/dilation are expanded to 2-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
+    # KNOWN ISSUE: the docstring example calls autograd grad with an undefined name (filter) instead of the weight tensor.
     r"""Compute the gradient of conv2d with respect to the weight of the convolution.
 
     Args:
@@ -210,6 +235,11 @@ def conv3d_input(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv3d w.r.t. its input, given the input shape (input_size), the weight and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the input gradient, and returns it. stride/padding/dilation are expanded to 3-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
     r"""Compute the gradient of conv3d with respect to the input of the convolution.
 
     This is same as the 3D transposed convolution operator under the hood but requires
@@ -260,6 +290,11 @@ def conv3d_weight(
     dilation=1,
     groups=1,
 ):
+    # [FUNCTION DOC]
+    # Returns the gradient of conv3d w.r.t. its weight, given the input, the weight shape (weight_size) and the output gradient.
+    # Builds a dummy expanded tensor of that shape, calls aten convolution_backward (non-transposed, zero output padding)
+    # requesting only the weight gradient, and returns it. stride/padding/dilation are expanded to 3-tuples; groups is passed through.
+    # Validation and errors come from the aten op.
     r"""Compute the gradient of conv3d with respect to the weight of the convolution.
 
     Args:

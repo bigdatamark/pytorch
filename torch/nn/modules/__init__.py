@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# torch.nn.modules: collection of all built-in nn.Module subclasses (linear, activation, conv, pooling, normalization, recurrent, transformer,
+# loss, container, embedding, upsampling, etc.). Imports every public module class from its submodule and lists them in a sorted __all__.
+# Import-time side effect: raises an AssertionError at the end if __all__ is not sorted.
 from .module import Module  # usort: skip
 from .linear import Bilinear, Identity, LazyLinear, Linear  # usort: skip
 from .activation import (

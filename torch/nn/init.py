@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Weight initialization utilities for neural network parameters: in-place initializers (uniform_, normal_, trunc_normal_, constant_, ones_, zeros_,
+# eye_, dirac_, xavier_*, kaiming_*, orthogonal_, sparse_), calculate_gain, and deprecated non-underscore aliases generated at import time
+# by _make_deprecate. All initializers mutate the given tensor under no_grad and return it. Import-time side effects: creates the deprecated alias functions.
 """This file contains utilities for initializing neural network parameters."""
 
 import math
@@ -69,6 +73,7 @@ _FanMode = Literal["fan_in", "fan_out"]
 def _no_grad_uniform_(
     tensor: Tensor, a: float, b: float, generator: torch.Generator | None = None
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Fills tensor in place with uniform samples in [a, b) using the optional generator, under no_grad. Returns the same tensor.
     with torch.no_grad():
         return tensor.uniform_(a, b, generator=generator)
 
@@ -79,6 +84,7 @@ def _no_grad_normal_(
     std: float,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Fills tensor in place with normal samples (mean, std) using the optional generator, under no_grad. Returns the same tensor.
     with torch.no_grad():
         return tensor.normal_(mean, std, generator=generator)
 
@@ -91,11 +97,16 @@ def _no_grad_trunc_normal_(
     b: float,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Fills tensor in place with samples from a normal(mean, std) truncated to [a, b], under no_grad; returns the tensor.
+    # Meta tensors are returned untouched. Warns (UserWarning) if the mean is more than 2 std outside [a, b].
+    # If the in-bounds probability mass exceeds 0.3, draws normal samples and redraws out-of-range elements until none remain (bounds cast to the tensor dtype).
+    # Otherwise uses per-element rejection sampling: uniform candidates in [a, b] are accepted with probability proportional to the normal density relative to its peak inside the interval.
     # Meta tensors have no storage, so sampling is a no-op.
     if tensor.is_meta:
         return tensor
 
     def norm_cdf(x: float) -> float:
+        # HELPER: Standard normal cumulative distribution function evaluated at x, computed with the error function.
         return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
     if (mean < a - 2 * std) or (mean > b + 2 * std):
@@ -161,11 +172,13 @@ def _no_grad_trunc_normal_(
 
 
 def _no_grad_fill_(tensor: Tensor, val: float) -> Tensor:
+    # [FUNCTION DOC] HELPER: Fills tensor in place with the scalar val under no_grad and returns it.
     with torch.no_grad():
         return tensor.fill_(val)
 
 
 def _no_grad_zero_(tensor: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Zeroes tensor in place under no_grad and returns it.
     with torch.no_grad():
         return tensor.zero_()
 
@@ -173,6 +186,11 @@ def _no_grad_zero_(tensor: Tensor) -> Tensor:
 def calculate_gain(
     nonlinearity: _NonlinearityType, param: int | float | None = None
 ) -> float:
+    # [FUNCTION DOC]
+    # Returns the recommended scaling gain (float) for a named nonlinearity: 1 for linear, convolution variants and sigmoid, 5/3 for tanh,
+    # sqrt(2) for relu, sqrt(2 / (1 + slope squared)) for leaky_relu (slope is param, default 0.01; param must be a real int or float, not a bool), and 3/4 for selu.
+    # Raises ValueError if param is not a valid number for leaky_relu or if the nonlinearity name is unsupported.
+    # KNOWN ISSUE: the type hint says the return is float but the linear/sigmoid branch returns the int 1.
     r"""Return the recommended gain value for the given nonlinearity function.
 
     The values are as follows:
@@ -250,6 +268,9 @@ def uniform_(
     b: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with samples from uniform(a, b) using the optional generator, under no_grad, and returns it.
+    # If the tensor overrides torch function handling, dispatches to that handler instead.
     r"""Fill the input Tensor with values drawn from the uniform distribution.
 
     :math:`\mathcal{U}(a, b)`.
@@ -277,6 +298,9 @@ def normal_(
     std: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with samples from normal(mean, std) using the optional generator, under no_grad, and returns it.
+    # Dispatches to the torch function handler if the tensor overrides it.
     r"""Fill the input Tensor with values drawn from the normal distribution.
 
     :math:`\mathcal{N}(\text{mean}, \text{std}^2)`.
@@ -306,6 +330,10 @@ def trunc_normal_(
     b: float = 2.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with samples from normal(mean, std) truncated to [a, b] (see _no_grad_trunc_normal_) and returns it.
+    # Warns if the mean is far outside the bounds; meta tensors are returned unchanged.
+    # KNOWN ISSUE: unlike uniform_ and normal_, this does not check for torch function overrides.
     r"""Fill the input Tensor with values drawn from a truncated normal distribution.
 
     The values are effectively drawn from the
@@ -335,6 +363,8 @@ def trunc_normal_(
 
 
 def constant_(tensor: Tensor, val: float) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with the scalar val under no_grad and returns it; dispatches to the torch function handler if overridden.
     r"""Fill the input Tensor with the value :math:`\text{val}`.
 
     Args:
@@ -353,6 +383,8 @@ def constant_(tensor: Tensor, val: float) -> Tensor:
 
 
 def ones_(tensor: Tensor) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with ones under no_grad and returns it.
     r"""Fill the input Tensor with the scalar value `1`.
 
     Args:
@@ -366,6 +398,8 @@ def ones_(tensor: Tensor) -> Tensor:
 
 
 def zeros_(tensor: Tensor) -> Tensor:
+    # [FUNCTION DOC]
+    # Zeroes tensor in place under no_grad and returns it.
     r"""Fill the input Tensor with the scalar value `0`.
 
     Args:
@@ -379,6 +413,9 @@ def zeros_(tensor: Tensor) -> Tensor:
 
 
 def eye_(tensor: Tensor) -> Tensor:
+    # [FUNCTION DOC]
+    # Writes an identity matrix (ones on the diagonal, zeros elsewhere, for non-square shapes too) into a 2-D tensor in place under no_grad; returns it.
+    # Raises ValueError if the tensor is not 2-dimensional.
     r"""Fill the 2-dimensional input `Tensor` with the identity matrix.
 
     Preserves the identity of the inputs in `Linear` layers, where as
@@ -400,6 +437,10 @@ def eye_(tensor: Tensor) -> Tensor:
 
 
 def dirac_(tensor: Tensor, groups: int = 1) -> Tensor:
+    # [FUNCTION DOC]
+    # Initializes a 3-, 4- or 5-D convolution weight in place so that conv preserves input channels: zeroes it, then for each group sets a one at the
+    # spatial center of the kernel for channel pairs (group output channel d, input channel d) up to the smaller of out-channels-per-group and in-channels.
+    # Raises ValueError if ndim is not 3/4/5 or dim 0 is not divisible by groups. Meta tensors are returned unchanged (after the checks). Returns the tensor.
     r"""Fill the {3, 4, 5}-dimensional input `Tensor` with the Dirac delta function.
 
     Preserves the identity of the inputs in `Convolutional`
@@ -456,6 +497,8 @@ def dirac_(tensor: Tensor, groups: int = 1) -> Tensor:
 
 
 def _calculate_fan_in_and_fan_out(tensor: Tensor) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Returns (fan_in, fan_out) for a tensor with at least 2 dims: fan_in is size of dim 1 times the product of the remaining (receptive field) dims,
+    # fan_out is size of dim 0 times the same product. Raises ValueError if the tensor has fewer than 2 dimensions.
     dimensions = tensor.dim()
     if dimensions < 2:
         raise ValueError(
@@ -481,6 +524,9 @@ def xavier_uniform_(
     gain: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with uniform samples in (-a, a), where a = gain * sqrt(6 / (fan_in + fan_out)), computed from the tensor shape; returns it.
+    # Raises ValueError for tensors with fewer than 2 dims. Uses the optional generator.
     r"""Fill the input `Tensor` with values using a Xavier uniform distribution.
 
     The method is described in `Understanding the difficulty of training
@@ -514,6 +560,9 @@ def xavier_normal_(
     gain: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with normal samples (mean 0, std = gain * sqrt(2 / (fan_in + fan_out))); returns it.
+    # Raises ValueError for tensors with fewer than 2 dims. Uses the optional generator.
     r"""Fill the input `Tensor` with values using a Xavier normal distribution.
 
     The method is described in `Understanding the difficulty of training deep feedforward
@@ -541,6 +590,7 @@ def xavier_normal_(
 
 
 def _calculate_correct_fan(tensor: Tensor, mode: _FanMode) -> int:
+    # [FUNCTION DOC] HELPER: Returns fan_in or fan_out of the tensor depending on mode (case-insensitive). Raises ValueError for any other mode or for tensors with fewer than 2 dims.
     # pyrefly: ignore [bad-assignment]
     mode = mode.lower()
     valid_modes = ["fan_in", "fan_out"]
@@ -558,6 +608,10 @@ def kaiming_uniform_(
     nonlinearity: _NonlinearityType = "leaky_relu",
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with uniform samples in (-bound, bound), bound = sqrt(3) * gain / sqrt(fan), where gain comes from calculate_gain(nonlinearity, a)
+    # and fan from the chosen mode. Dispatches to the torch function handler if overridden. Zero-element tensors only trigger a warning and are returned unchanged.
+    # Raises ValueError for fewer than 2 dims, an invalid mode or an unsupported nonlinearity. Returns the tensor.
     r"""Fill the input `Tensor` with values using a Kaiming uniform distribution.
 
     The method is described in `Delving deep into rectifiers: Surpassing
@@ -623,6 +677,10 @@ def kaiming_normal_(
     nonlinearity: _NonlinearityType = "leaky_relu",
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with normal samples (mean 0, std = gain / sqrt(fan)), gain from calculate_gain(nonlinearity, a), fan from the mode.
+    # Zero-element tensors only warn and are returned unchanged. Raises ValueError for fewer than 2 dims, invalid mode or unsupported nonlinearity.
+    # KNOWN ISSUE: unlike kaiming_uniform_, this does not check for torch function overrides.
     r"""Fill the input `Tensor` with values using a Kaiming normal distribution.
 
     The method is described in `Delving deep into rectifiers: Surpassing
@@ -674,6 +732,10 @@ def orthogonal_(
     gain: float = 1,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills tensor in place with a (semi) orthogonal matrix scaled by gain: samples a normal matrix of shape (rows, remaining elements), transposes it if wide,
+    # takes the Q factor of a QR decomposition with signs corrected by the diagonal of R, and copies it into the tensor. Raises ValueError for fewer than 2 dims.
+    # Empty or meta tensors are returned unchanged. Returns the tensor.
     r"""Fill the input `Tensor` with a (semi) orthogonal matrix.
 
     Described in `Exact solutions to the nonlinear dynamics of learning in deep
@@ -726,6 +788,10 @@ def sparse_(
     std: float = 0.01,
     generator: torch.Generator | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Fills a 2-D tensor in place with normal(0, std) values, then zeroes ceil(sparsity * rows) randomly chosen rows in every column; returns it.
+    # Raises ValueError if the tensor is not 2-D. Meta tensors are returned unchanged.
+    # KNOWN ISSUE: the row permutation uses the global RNG, not the given generator; the docstring also states a fixed variance of 0.01 although std is a parameter.
     r"""Fill the 2D input `Tensor` as a sparse matrix.
 
     The non-zero elements will be drawn from the normal distribution
@@ -763,10 +829,13 @@ def sparse_(
 
 # for backward compatibility
 def _make_deprecate(meth: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Given an underscore-suffixed initializer, returns a wrapper named without the trailing underscore that emits a FutureWarning (deprecated in favor of the new name)
+    # and then calls the original. The wrapper gets a deprecation docstring and the old name.
     new_name = meth.__name__
     old_name = new_name[:-1]
 
     def deprecated_init(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Warns (FutureWarning) that the old name is deprecated, then forwards all arguments to the wrapped initializer and returns its result.
         warnings.warn(
             f"`nn.init.{old_name}` is now deprecated in favor of `nn.init.{new_name}`.",
             FutureWarning,

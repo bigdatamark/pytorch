@@ -1,10 +1,18 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Custom autograd Functions used by nn modules: SyncBatchNorm (cross-process batch norm statistics via distributed collectives),
+# CrossMapLRN2d (cross-channel local response normalization) and BackwardHookFunction (identity op used to attach backward hooks).
+# No import-time side effects beyond imports.
 import torch
 import torch.distributed as dist
 from torch.autograd.function import Function
 
 
 class SyncBatchNorm(Function):
+    # [CLASS DOC]
+    # Autograd Function implementing synchronized batch normalization across a process group. Stateless; per-call state is kept on the autograd context
+    # (saved tensors plus the process group). forward gathers per-rank mean/invstd/count, computes global statistics (updating running stats) and normalizes;
+    # backward all-reduces the gradient statistics. Ranks with empty inputs still join collectives so peers do not hang.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -19,6 +27,13 @@ class SyncBatchNorm(Function):
         process_group,
         world_size,
     ):
+        # [FUNCTION DOC]
+        # Computes the batch norm output with statistics synchronized over process_group (world_size ranks). Makes input (channels-last aware) and weight contiguous.
+        # Raises ValueError if there is only one value per channel in total (size 1 with world_size below 2). Computes local mean/invstd/count (zeros for empty input),
+        # all-gathers them (all_gather_single unless the backend is gloo, which uses all_gather), drops entries with zero count when not capturing a CUDA graph (this syncs host and device),
+        # then calls the gather-stats op which also updates running_mean/running_var in place. Saves input, weight, mean, invstd and counts for backward and stores process_group on the context.
+        # Returns the normalized tensor (an empty tensor for empty input).
+        # KNOWN ISSUE: the first parameter of this static method is named self although it is the autograd context.
         if not (
             input.is_contiguous(memory_format=torch.channels_last)
             or input.is_contiguous(memory_format=torch.channels_last_3d)
@@ -126,6 +141,10 @@ class SyncBatchNorm(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(self, grad_output):
+        # [FUNCTION DOC]
+        # Computes gradients for input, weight and bias. Reduces local sums via the batch norm backward reduce op; if the input gradient is needed, all-reduces the summed
+        # statistics (SUM) over the saved process group and computes the input gradient. Weight/bias gradients are not synchronized here (left to data-parallel reduction) and are None
+        # when not needed or weight is None. If the saved input was empty, only joins the all-reduce (zeros) and returns None gradients. Returns a 9-tuple: the three gradients then six None.
         if not (
             grad_output.is_contiguous(memory_format=torch.channels_last)
             or grad_output.is_contiguous(memory_format=torch.channels_last_3d)
@@ -211,9 +230,15 @@ class SyncBatchNorm(Function):
 
 
 class CrossMapLRN2d(Function):
+    # [CLASS DOC]
+    # Autograd Function for local response normalization across channels on 4-D input (size, alpha, beta, k). Stores hyperparameters and a scale buffer on the context;
+    # forward and backward are explicit loops over channels. Used by the CrossMapLRN2d module.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, input, size, alpha=1e-4, beta=0.75, k=1):
+        # [FUNCTION DOC]
+        # Computes output = input * (k + alpha/size * sum of squares over a sliding channel window of width size) ** (-beta), using a running window sum across channels.
+        # Stores size, alpha, beta, k and the scale tensor on ctx and saves input and output for backward. Raises ValueError if input is not 4-D. Returns the output tensor.
         ctx.size = size
         ctx.alpha = alpha
         ctx.beta = beta
@@ -270,6 +295,9 @@ class CrossMapLRN2d(Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Computes the gradient of the local response normalization w.r.t. the input from grad_output, the saved input/output and the scale buffer, looping over batch and channels
+        # with a sliding window accumulator of grad_output*output/scale. Returns the input gradient followed by four None for size, alpha, beta, k.
         input, output = ctx.saved_tensors
         grad_input = grad_output.new()
 
@@ -309,12 +337,19 @@ class CrossMapLRN2d(Function):
 
 
 class BackwardHookFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Identity autograd Function over a variable number of tensors, used to insert a node into the graph so module backward hooks can observe gradients.
+    # Outputs for inputs that do not require grad are marked non-differentiable.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, *args):
+        # [FUNCTION DOC]
+        # Marks every input that does not require grad as non-differentiable and returns all inputs unchanged as a tuple.
         ctx.mark_non_differentiable(*[arg for arg in args if not arg.requires_grad])
         return args
 
     @staticmethod
     def backward(ctx, *args):
+        # [FUNCTION DOC]
+        # Passes the incoming gradients through unchanged (identity).
         return args

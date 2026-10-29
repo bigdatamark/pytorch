@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Backward-compatibility package torch.nn.intrinsic: re-exports the fused (intrinsic) module classes from torch.ao.nn.intrinsic
+# (ConvBn/ConvBnReLU/ConvReLU 1d-3d, LinearReLU, LinearBn1d, BNReLU2d/3d). Also imports the modules, qat and quantized subpackages so
+# they are reachable as attributes. The private _FusedModule base is imported but not listed in __all__.
 from torch.ao.nn.intrinsic import (
     BNReLU2d,
     BNReLU3d,
