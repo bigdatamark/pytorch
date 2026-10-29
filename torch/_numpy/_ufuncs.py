@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] Public-layer numpy ufuncs built on torch. Wraps the plain-torch
+# implementations in the binary and unary ufunc implementation modules with argument
+# normalization, dtype/casting handling and the out argument, and special-cases
+# matmul, ldexp, divmod and modf. Import-time side effects: for every public name in
+# the implementation modules a wrapped function is created and attached to this
+# module's namespace; also builds the lists of binary and unary names and sets the
+# export list to their concatenation.
 
 from __future__ import annotations
 
@@ -17,6 +24,9 @@ from ._normalizations import (
 
 
 def _ufunc_postprocess(result, out, casting):
+    # [FUNCTION DOC] HELPER: Finish a ufunc call. If out is given, casts the result to
+    # out's torch dtype under the casting rule and broadcasts it to out's shape; otherwise
+    # returns the result unchanged. Does not copy into out (the normalizer handles that).
     if out is not None:
         result = _util.typecast_tensor(result, out.dtype.torch_dtype, casting)
         result = torch.broadcast_to(result, out.shape)
@@ -63,6 +73,10 @@ NEP50_FUNCS = (
 
 
 def deco_binary_ufunc(torch_func):
+    # [FUNCTION DOC] Build a numpy-style binary ufunc around a torch function. The wrapped
+    # function (normalized arguments) takes two array-or-scalar operands plus out,
+    # casting, dtype and several accepted-but-unsupported numpy options. Returns the
+    # wrapped function, renamed after the torch function.
     """Common infra for binary ufuncs.
 
     Normalize arguments, sort out type casting, broadcasting and delegate to
@@ -84,9 +98,16 @@ def deco_binary_ufunc(torch_func):
         signature: NotImplementedType = None,
         extobj: NotImplementedType = None,
     ):
+        # [FUNCTION DOC] HELPER: The ufunc entry point. With dtype given, both operands are
+        # cast to it; with two tensors, they are cast to their common result type under the
+        # casting rule; otherwise scalars and tensors are converted following NEP 50 promotion
+        # (applied only to names in the NEP50 list). Calls the torch function and post-
+        # processes with out and casting. Raises errors from casting violations.
         if dtype is not None:
 
             def cast(x, dtype):
+            # [FUNCTION DOC] HELPER: Cast one operand to dtype: tensors via checked typecast under
+            # the casting rule, other values by conversion to a tensor of that dtype.
                 if isinstance(x, torch.Tensor):
                     return _util.typecast_tensor(x, dtype, casting)
                 else:
@@ -132,6 +153,10 @@ def matmul(
     axes: NotImplementedType = None,
     axis: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Matrix product ufunc. Unlike other ufuncs it has no where argument
+    # and no NEP 50 scalar handling. Computes the common result type (or uses dtype),
+    # casts both operands under the casting rule, multiplies, and post-processes with out.
+    # axes, axis and similar options are accepted but unsupported.
     if dtype is None:
         dtype = _dtypes_impl.result_type_impl(x1, x2)
     x1, x2 = _util.typecast_tensors((x1, x2), dtype, casting)
@@ -158,6 +183,10 @@ def ldexp(
     signature: NotImplementedType = None,
     extobj: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] x1 * 2**x2 ufunc. Result dtype follows the first argument: with dtype
+    # given the first operand is cast to it, otherwise a non-tensor first operand is
+    # converted and integers become float. Raises ValueError if the second argument is not
+    # integer typed. A float16 result, which torch upcasts, is converted back to float16.
     if dtype is not None:
         if isinstance(x1, torch.Tensor):
             x1 = _util.typecast_tensor(x1, dtype, casting)
@@ -200,6 +229,11 @@ def divmod(
     signature: NotImplementedType = None,
     extobj: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Floor division and modulus returning the pair (quotient, remainder).
+    # Output arrays may be given as out1 and out2 positionally or as an out pair, but not
+    # mixed: raises ValueError if only one positional out is supplied, and TypeError if
+    # both positional and keyword forms are used. Operands are cast to the common result
+    # type (or dtype) under casting; each result is post-processed against its out.
     # make sure we either have no out arrays at all, or there is either
     # out1, out2, or out=tuple, but not both
     num_outs = sum(x is not None for x in [out1, out2])
@@ -234,6 +268,9 @@ for name in _binary:
 
 
 def modf(x, /, *args, **kwds):
+    # [FUNCTION DOC] Split x into fractional and integral parts, implemented via divmod by
+    # one. Returns the pair (remainder, quotient), i.e. fractional part first. Extra
+    # arguments are forwarded to divmod.
     quot, rem = divmod(x, 1, *args, **kwds)
     return rem, quot
 
@@ -285,6 +322,9 @@ _fp_unary = [
 
 
 def deco_unary_ufunc(torch_func):
+    # [FUNCTION DOC] Build a numpy-style unary ufunc around a torch function. The wrapped
+    # function takes one array plus out, casting, dtype and accepted-but-unsupported numpy
+    # options. Returns the wrapped function renamed after the torch function.
     """Common infra for unary ufuncs.
 
     Normalize arguments, sort out type casting, broadcasting and delegate to
@@ -305,6 +345,10 @@ def deco_unary_ufunc(torch_func):
         signature=None,
         extobj=None,
     ):
+        # [FUNCTION DOC] HELPER: The unary ufunc entry point. Optionally casts the input to
+        # dtype under the casting rule; for functions in the integer-to-float list, integer
+        # input is converted to float first. Calls the torch function and post-processes with
+        # out and casting.
         if dtype is not None:
             x = _util.typecast_tensor(x, dtype, casting)
 

@@ -1,4 +1,11 @@
 # mypy: ignore-errors
+# [MODULE DOC] Partial numpy.random API (seed, random_sample/sample/random, rand,
+# randn, normal, uniform, randint, shuffle, choice) implemented on torch random
+# generation, with no reproducibility guarantee relative to numpy. Each function is
+# wrapped by a stream decorator which, when the dynamo config flag for using the numpy
+# random stream is on, delegates to real numpy and wraps array results; otherwise uses
+# torch. Default dtype is the default float dtype. No import-time side effects;
+# defines the export list.
 
 """Wrapper to mimic (parts of) np.random API surface.
 
@@ -35,6 +42,8 @@ __all__ = [
 
 
 def use_numpy_random():
+    # [FUNCTION DOC] HELPER: Return the dynamo config flag saying whether to use numpy's
+    # own random stream. Imports the config lazily to avoid reference cycles.
     # local import to avoid ref cycles
     import torch._dynamo.config as config
 
@@ -42,8 +51,15 @@ def use_numpy_random():
 
 
 def deco_stream(func):
+    # [FUNCTION DOC] HELPER: Decorator choosing the random backend per call. Returns a
+    # wrapper that runs the torch implementation unless the numpy-stream flag is set.
     @functools.wraps(func)
     def inner(*args, **kwds):
+        # [FUNCTION DOC] HELPER: Wrapper. If numpy stream is disabled, calls the torch
+        # implementation. Otherwise unwraps ndarray arguments (positional and keyword) to
+        # numpy arrays, calls the numpy.random function of the same name, and wraps a numpy
+        # array result into the library ndarray (scalars and None pass through). Imports numpy
+        # lazily.
         if not use_numpy_random():
             return func(*args, **kwds)
         else:
@@ -75,12 +91,16 @@ def deco_stream(func):
 
 @deco_stream
 def seed(seed=None):
+    # [FUNCTION DOC] Seed the global torch random generator when seed is not None;
+    # otherwise does nothing. Side effect: mutates global RNG state. Returns None.
     if seed is not None:
         torch.random.manual_seed(seed)
 
 
 @deco_stream
 def random_sample(size=None):
+    # [FUNCTION DOC] Uniform samples in [0, 1) of shape size (scalar when size is None) in
+    # the default float dtype. Returns a scalar for empty size, else an ndarray.
     if size is None:
         size = ()
     dtype = _dtypes_impl.default_dtypes().float_dtype
@@ -89,6 +109,8 @@ def random_sample(size=None):
 
 
 def rand(*size):
+    # [FUNCTION DOC] Uniform [0, 1) samples with shape given by positional dimension
+    # arguments; no arguments yields a scalar. Delegates to random_sample.
     if size == ():
         size = None
     return random_sample(size)
@@ -100,6 +122,8 @@ random = random_sample
 
 @deco_stream
 def uniform(low=0.0, high=1.0, size=None):
+    # [FUNCTION DOC] Uniform samples in [low, high) of shape size (scalar when None) in
+    # the default float dtype. Returns a scalar or ndarray.
     if size is None:
         size = ()
     dtype = _dtypes_impl.default_dtypes().float_dtype
@@ -109,6 +133,8 @@ def uniform(low=0.0, high=1.0, size=None):
 
 @deco_stream
 def randn(*size):
+    # [FUNCTION DOC] Standard normal samples with shape given by positional dimension
+    # arguments in the default float dtype; scalar when no dimensions given.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     values = torch.randn(size, dtype=dtype)
     return array_or_scalar(values, return_scalar=size == ())
@@ -116,6 +142,8 @@ def randn(*size):
 
 @deco_stream
 def normal(loc=0.0, scale=1.0, size=None):
+    # [FUNCTION DOC] Normal samples with mean loc and standard deviation scale and shape
+    # size (scalar when None), default float dtype. Returns a scalar or ndarray.
     if size is None:
         size = ()
     dtype = _dtypes_impl.default_dtypes().float_dtype
@@ -125,6 +153,9 @@ def normal(loc=0.0, scale=1.0, size=None):
 
 @deco_stream
 def shuffle(x):
+    # [FUNCTION DOC] Shuffle a tensor or ndarray in place along its first axis using a
+    # random permutation. Raises NotImplementedError for any other type (lists
+    # unsupported). Side effect: mutates the argument and the RNG state.
     # no @normalizer because we do not cast e.g. lists to tensors
     from ._ndarray import ndarray
 
@@ -142,6 +173,9 @@ def shuffle(x):
 
 @deco_stream
 def randint(low, high=None, size=None):
+    # [FUNCTION DOC] Random integers in [low, high) (or [0, low) when high is None) with
+    # shape size (int promoted to a one-element tuple; scalar when None). Returns an int
+    # scalar or ndarray.
     if size is None:
         size = ()
     if not isinstance(size, (tuple, list)):
@@ -155,6 +189,14 @@ def randint(low, high=None, size=None):
 @deco_stream
 @normalizer
 def choice(a: ArrayLike, size=None, replace=True, p: ArrayLike | None = None):
+    # [FUNCTION DOC] Sample from a 1D array (or arange of a when a has a single element)
+    # with or without replacement, optionally with probabilities p (default uniform). size
+    # may be None (one draw), an int, or a sequence, in which case the result is reshaped.
+    # Raises ValueError if probabilities do not sum to 1 within a tolerance based on
+    # machine epsilon. Returns the sampled elements.
+    # KNOWN ISSUE: a one-element array is always treated as a count to take arange of, and
+    #   a non-integer a is not rejected as numpy does; with no size the result is a
+    #   length-one array rather than a scalar.
     # https://stackoverflow.com/questions/59461811/random-choice-with-pytorch
     if a.numel() == 1:
         a = torch.arange(a)

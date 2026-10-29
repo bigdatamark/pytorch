@@ -1,4 +1,5 @@
 # mypy: ignore-errors
+# [PACKAGE DOC] Re-exports numpy-style testing helpers (assert_equal, assert_allclose, assert_array_equal, assert_raises_regex, assert_warns, suppress_warnings and related flags) from the utils submodule.
 
 from .utils import (
     _gen_alignment_data,

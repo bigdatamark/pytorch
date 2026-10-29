@@ -1,3 +1,11 @@
+# [MODULE DOC] Torch-level implementations of numpy-style reductions (sum, prod, mean,
+# std, var, min/max, any/all, argmax/argmin, cumsum/cumprod, average, quantile,
+# percentile, median, ptp, count_nonzero). Functions take and return torch tensors and
+# torch dtypes only; the public layer wraps them with array/dtype normalization.
+# Aliases max, min, product and cumproduct are defined. Many numpy arguments (out,
+# keepdims, where, initial) are accepted for signature compatibility and handled or
+# ignored by the wrapping layer. No import-time side effects besides defining
+# functions.
 """Implementation of reduction operations, to be wrapped into arrays, dtypes etc
 in the 'public' layer.
 
@@ -34,6 +42,11 @@ _R = TypeVar("_R")
 def _deco_axis_expand(
     func: Callable[Concatenate[torch.Tensor, AxisLike, _P], _R],
 ) -> Callable[Concatenate[torch.Tensor, AxisLike, _P], _R]:
+    # [FUNCTION DOC] HELPER: Decorator for reductions whose second positional argument is
+    # axis. Normalizes a non-None axis into a tuple of non-negative ints for the tensor
+    # rank. An empty axis tuple is handled by reshaping the input with an extra length-one
+    # leading dimension and reducing over it, so the wrapped function's own checks still
+    # run. Returns the wrapped function (functools.wraps applied).
     """
     Generically handle axis arguments in reductions.
     axis is *always* the 2nd arg in the function so no need to have a look at its signature
@@ -43,6 +56,10 @@ def _deco_axis_expand(
     def wrapped(
         a: torch.Tensor, axis: AxisLike = None, *args: _P.args, **kwds: _P.kwargs
     ) -> _R:
+        # [FUNCTION DOC] HELPER: Wrapper produced by the axis-expansion decorator; normalizes
+        # axis, rewrites the empty-tuple case, then calls the original function with the
+        # tensor, the axis and the remaining arguments. Raises whatever axis normalization
+        # raises for out-of-range or repeated axes.
         if axis is not None:
             axis = _util.normalize_axis_tuple(axis, a.ndim)
 
@@ -59,6 +76,9 @@ def _deco_axis_expand(
 
 
 def _atleast_float(dtype: torch.dtype | None, other_dtype: torch.dtype) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Pick a floating or complex dtype: uses the given dtype, or
+    # other_dtype when none given. Bool and integer dtypes map to the default float dtype;
+    # float and complex dtypes pass through unchanged.
     """Return a dtype that is real or complex floating-point.
 
     For inputs that are boolean or integer dtypes, this returns the default
@@ -76,6 +96,9 @@ def _atleast_float(dtype: torch.dtype | None, other_dtype: torch.dtype) -> torch
 def count_nonzero(
     a: ArrayLike, axis: AxisLike = None, *, keepdims: KeepDims = False
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Count nonzero elements of a tensor, over axis (already normalized by
+    # the decorator) or over everything when axis is None. keepdims is accepted but not
+    # used here.
     return a.count_nonzero(axis)
 
 
@@ -87,6 +110,11 @@ def argmax(
     *,
     keepdims: KeepDims = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Index of the maximum value along a single axis (or of the flattened
+    # tensor when axis is None). Bool input is cast to uint8 since torch lacks a bool
+    # kernel. Raises NotImplementedError for complex input and an error from
+    # allow_only_single_axis when multiple axes are given. out and keepdims are ignored
+    # here.
     if a.is_complex():
         raise NotImplementedError(f"argmax with dtype={a.dtype}.")
 
@@ -107,6 +135,10 @@ def argmin(
     *,
     keepdims: KeepDims = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Index of the minimum value along a single axis (or of the flattened
+    # tensor when axis is None). Bool input is cast to uint8. Raises NotImplementedError
+    # for complex input; multi-axis tuples are rejected. out and keepdims are ignored
+    # here.
     if a.is_complex():
         raise NotImplementedError(f"argmin with dtype={a.dtype}.")
 
@@ -128,6 +160,9 @@ def any(
     *,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Logical OR reduction over a single axis, or over all elements when
+    # axis is None. Multi-axis tuples are rejected. out, keepdims and where are not used
+    # in this layer.
     axis = _util.allow_only_single_axis(axis)
     return torch.any(a) if axis is None else torch.any(a, dim=axis)
 
@@ -141,6 +176,9 @@ def all(
     *,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Logical AND reduction over a single axis, or over all elements when
+    # axis is None. Multi-axis tuples are rejected. out, keepdims and where are not used
+    # in this layer.
     axis = _util.allow_only_single_axis(axis)
     return torch.all(a) if axis is None else torch.all(a, dim=axis)
 
@@ -154,6 +192,9 @@ def amax(
     initial: NotImplementedType = None,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Maximum reduction over axis (tuple allowed) or over all elements when
+    # axis is None. Raises NotImplementedError for complex input. out, keepdims, initial
+    # and where are not used here. Also exported as max.
     if a.is_complex():
         raise NotImplementedError(f"amax with dtype={a.dtype}")
 
@@ -172,6 +213,9 @@ def amin(
     initial: NotImplementedType = None,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Minimum reduction over axis (tuple allowed) or over all elements when
+    # axis is None. Raises NotImplementedError for complex input. out, keepdims, initial
+    # and where are not used here. Also exported as min.
     if a.is_complex():
         raise NotImplementedError(f"amin with dtype={a.dtype}")
 
@@ -188,6 +232,9 @@ def ptp(
     out: OutArray | None = None,
     keepdims: KeepDims = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Peak-to-peak range: maximum minus minimum along axis, or over all
+    # elements when axis is None. No complex check is made. out and keepdims are not used
+    # here.
     amax = a.amax() if axis is None else a.amax(axis)
     amin = a.amin() if axis is None else a.amin(axis)
     return amax - amin
@@ -203,6 +250,12 @@ def sum(
     initial: NotImplementedType = None,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Sum over axis (tuple allowed) or all elements. dtype must be None or
+    # a torch dtype (otherwise raises AssertionError); a bool dtype is replaced by the
+    # default integer dtype. Returns the reduced tensor. out, keepdims, initial and where
+    # are not used here.
+    # KNOWN ISSUE: only an explicitly requested bool dtype is promoted; bool input with
+    #   dtype None is passed to torch sum, which itself promotes to int64.
     if dtype is not None and not isinstance(dtype, torch.dtype):
         raise AssertionError(
             f"dtype must be None or a torch.dtype, got {type(dtype).__name__}"
@@ -226,6 +279,9 @@ def prod(
     initial: NotImplementedType = None,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Product over a single axis or all elements when axis is None (multi-
+    # axis tuples rejected). A bool dtype is replaced by the default integer dtype. Other
+    # arguments (out, keepdims, initial, where) are unused here. Also exported as product.
     axis = _util.allow_only_single_axis(axis)
 
     if dtype == torch.bool:
@@ -249,6 +305,9 @@ def mean(
     *,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Mean over axis or all elements. The computation dtype is the
+    # requested dtype, or the input dtype made floating (default float for bool and ints).
+    # Returns a tensor of that dtype. out, keepdims and where are unused here.
     dtype = _atleast_float(dtype, a.dtype)
 
     if axis is None:
@@ -267,6 +326,10 @@ def std(
     *,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Standard deviation with delta degrees of freedom ddof. Casts the
+    # input to a floating dtype, reduces over axis, then casts the result to the
+    # originally requested dtype (unchanged if None). out, keepdims and where are unused
+    # here.
     in_dtype = dtype
     dtype = _atleast_float(dtype, a.dtype)
     tensor = _util.cast_if_needed(a, dtype)
@@ -285,6 +348,9 @@ def var(
     *,
     where: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Variance with delta degrees of freedom ddof. Casts the input to a
+    # floating dtype, reduces over axis, then casts the result to the originally requested
+    # dtype (unchanged if None). out, keepdims and where are unused here.
     in_dtype = dtype
     dtype = _atleast_float(dtype, a.dtype)
     tensor = _util.cast_if_needed(a, dtype)
@@ -303,6 +369,10 @@ def cumsum(
     dtype: DTypeLike | None = None,
     out: OutArray | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Cumulative sum. dtype defaults to the input dtype, with bool mapped
+    # to the default integer dtype. When axis is None the input is flattened; otherwise
+    # axis is normalized to a valid index. Returns a tensor of the same size as the
+    # (flattened) input. out is unused here.
     if dtype == torch.bool:
         dtype = _dtypes_impl.default_dtypes().int_dtype
     if dtype is None:
@@ -323,6 +393,10 @@ def cumprod(
     dtype: DTypeLike | None = None,
     out: OutArray | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Cumulative product. dtype defaults to the input dtype, with bool
+    # mapped to the default integer dtype. When axis is None the input is flattened;
+    # otherwise axis is normalized to a valid index. Returns a tensor of the same size as
+    # the (flattened) input. out is unused here. Also exported as cumproduct.
     if dtype == torch.bool:
         dtype = _dtypes_impl.default_dtypes().int_dtype
     if dtype is None:
@@ -348,6 +422,13 @@ def average(
     *,
     keepdims: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Weighted or plain average along a single axis. Without weights this
+    # is the mean, and the weight sum is the element count per output. With weights, non-
+    # float input becomes double; if shapes differ, axis is required and weights must be
+    # 1D with length matching that axis (TypeError or ValueError otherwise), and weights
+    # are broadcast along the axis. Result is the weighted sum divided by the weight sum.
+    # keepdims re-expands the reduced axis. When returned is true, returns a pair of
+    # result and the weight sum broadcast to the result shape.
     if weights is None:
         result = mean(a, axis)
         wsum = torch.as_tensor(a.numel() / result.numel(), dtype=result.dtype)
@@ -404,6 +485,12 @@ def quantile(
     *,
     interpolation: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Quantile of a tensor with q in [0, 1], along one axis or the
+    # flattened input when axis is None. Non-float input is cast to the default float
+    # dtype and float16 to float32; q is cast to the input dtype. method is passed to
+    # torch as the interpolation mode. overwrite_input is ignored (always out-of-place).
+    # Multi-axis tuples are rejected. out, keepdims and interpolation are unused here.
+    # KNOWN ISSUE: keepdims is accepted but never applied.
     if overwrite_input:
         # raise NotImplementedError("overwrite_input in quantile not implemented.")
         # NumPy documents that `overwrite_input` MAY modify inputs:
@@ -447,6 +534,9 @@ def percentile(
     *,
     interpolation: NotImplementedType = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Percentile: converts q (0-100) to a fraction (integer q first becomes
+    # default float) and delegates to quantile with the same axis, method and other
+    # arguments. out is not forwarded.
     # np.percentile(float_tensor, 30) : q.dtype is int64 => q / 100.0 is float32
     if _dtypes_impl.python_type_for_torch(q.dtype) is int:
         q = q.to(_dtypes_impl.default_dtypes().float_dtype)
@@ -470,6 +560,9 @@ def median(
     overwrite_input: bool = False,
     keepdims: KeepDims = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Median, implemented as the 0.5 quantile along axis (or of the
+    # flattened input). Delegates to quantile and forwards out, overwrite_input and
+    # keepdims.
     return quantile(
         a,
         torch.as_tensor(0.5),

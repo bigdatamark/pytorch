@@ -1,3 +1,9 @@
+# [MODULE DOC] Assorted helpers for the torch-backed numpy layer that depend only on
+# torch and the standard library: sequence test, numpy-compatible exception classes,
+# dtype casting helpers, axis normalization (index, tuple, single-axis), shape
+# expansion for keepdims and expand_dims, flattening for axis=None, checked
+# typecasting, and coercion of arbitrary objects or ndarray wrappers into tensors. No
+# import-time side effects.
 """Assorted utilities, which do not need anything other than torch and stdlib."""
 
 import operator
@@ -11,6 +17,8 @@ from . import _dtypes_impl
 
 # https://github.com/numpy/numpy/blob/v1.23.0/numpy/distutils/misc_util.py#L497-L504
 def is_sequence(seq: object) -> TypeGuard[Sized]:
+    # [FUNCTION DOC] True if seq is a sized, non-string object whose length can be taken;
+    # False for strings, unsized objects, or if taking the length raises.
     if isinstance(seq, str):
         return False
     if not isinstance(seq, Sized):
@@ -23,14 +31,20 @@ def is_sequence(seq: object) -> TypeGuard[Sized]:
 
 
 class AxisError(ValueError, IndexError):
+    # [CLASS DOC] Error for an out-of-range axis; inherits ValueError and IndexError so
+    # either handler catches it, mirroring numpy's AxisError. No added state.
     pass
 
 
 class UFuncTypeError(TypeError, RuntimeError):
+    # [CLASS DOC] Error for ufunc type problems; inherits TypeError and RuntimeError to
+    # mirror numpy's UFuncTypeError. No added state.
     pass
 
 
 def cast_if_needed(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    # [FUNCTION DOC] Return tensor converted to dtype only when dtype is not None and
+    # differs from the tensor's dtype; otherwise return the same tensor object.
     # NB: no casting if dtype=None
     if dtype is not None and tensor.dtype != dtype:
         tensor = tensor.to(dtype)
@@ -38,6 +52,8 @@ def cast_if_needed(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Ten
 
 
 def cast_int_to_float(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Convert bool and integer tensors to the default float dtype; floating
+    # and complex tensors are returned unchanged.
     # cast integers and bools to the default float dtype
     if _dtypes_impl._category(x.dtype) < 2:
         x = x.to(_dtypes_impl.default_dtypes().float_dtype)
@@ -46,6 +62,8 @@ def cast_int_to_float(x: torch.Tensor) -> torch.Tensor:
 
 # a replica of the version in ./numpy/numpy/core/src/multiarray/common.h
 def normalize_axis_index(ax: int, ndim: int, argname: str | None = None) -> int:
+    # [FUNCTION DOC] Validate a single axis against ndim and return it as a non-negative
+    # index (negative values wrap). Raises AxisError if out of range. argname is unused.
     if not (-ndim <= ax < ndim):
         raise AxisError(f"axis {ax} is out of bounds for array of dimension {ndim}")
     if ax < 0:
@@ -60,6 +78,10 @@ def normalize_axis_tuple(
     argname: str | None = None,
     allow_duplicate: bool = False,
 ) -> tuple[int, ...]:
+    # [FUNCTION DOC] Convert an axis argument (int, index-like, or iterable of ints) to a
+    # tuple of non-negative axes using normalize_axis_index. Unless allow_duplicate is
+    # set, raises ValueError on repeated axes (message mentions argname when given).
+    # Raises AxisError for out-of-range values.
     """
     Normalizes an axis argument into a tuple of non-negative integer axes.
 
@@ -110,6 +132,9 @@ def normalize_axis_tuple(
 
 
 def allow_only_single_axis(axis: int | tuple[int, ...] | None) -> int | None:
+    # [FUNCTION DOC] Reduce an axis argument to a single int or None. None and ints pass
+    # through; a sequence must have exactly one entry, which is returned; otherwise raises
+    # NotImplementedError.
     if axis is None:
         return axis
     if isinstance(axis, int):
@@ -122,6 +147,10 @@ def allow_only_single_axis(axis: int | tuple[int, ...] | None) -> int | None:
 def expand_shape(
     arr_shape: Sequence[int], axis: int | tuple[int, ...] | list[int]
 ) -> list[int]:
+    # [FUNCTION DOC] Compute the shape obtained by inserting length-one dimensions at the
+    # given axis or axes (as numpy expand_dims). Axes are normalized against the output
+    # rank; the remaining positions are filled from arr_shape in order. Returns a list of
+    # ints; raises on out-of-range or repeated axes.
     # taken from numpy 1.23.x, expand_dims function
     axis_seq = axis if isinstance(axis, (list, tuple)) else (axis,)
     out_ndim = len(axis_seq) + len(arr_shape)
@@ -134,6 +163,10 @@ def expand_shape(
 def apply_keepdims(
     tensor: torch.Tensor, axis: int | tuple[int, ...] | None, ndim: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Restore reduced dimensions after a reduction. With axis None the
+    # (scalar) result is expanded to ndim length-one dimensions and made contiguous;
+    # otherwise the result is reshaped to include length-one dimensions at the given axes.
+    # Returns the reshaped tensor.
     if axis is None:
         # tensor was a scalar
         shape = (1,) * ndim
@@ -147,6 +180,9 @@ def apply_keepdims(
 def axis_none_flatten(
     *tensors: torch.Tensor, axis: int | None = None
 ) -> tuple[tuple[torch.Tensor, ...], int]:
+    # [FUNCTION DOC] When axis is None, flatten every given tensor and return them with
+    # axis 0; otherwise return the tensors unchanged with the given axis. Returns a pair
+    # of (tuple of tensors, axis).
     """Flatten the arrays if axis is None."""
     if axis is None:
         tensors = tuple(ar.flatten() for ar in tensors)
@@ -158,6 +194,9 @@ def axis_none_flatten(
 def typecast_tensor(
     t: torch.Tensor, target_dtype: torch.dtype, casting: str
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Cast a tensor to target_dtype if the casting rule allows it, else
+    # raise TypeError describing the disallowed cast. Returns the (possibly same) tensor.
+    # KNOWN ISSUE: the docstring says ValueError is raised but the code raises TypeError.
     """Dtype-cast tensor to target_dtype.
 
     Parameters
@@ -192,10 +231,14 @@ def typecast_tensor(
 def typecast_tensors(
     tensors: Sequence[torch.Tensor], target_dtype: torch.dtype, casting: str
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Apply typecast_tensor to every tensor in a sequence with the same
+    # target dtype and casting rule; returns a tuple.
     return tuple(typecast_tensor(t, target_dtype, casting) for t in tensors)
 
 
 def _try_convert_to_tensor(obj: object) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Convert an object to a tensor via torch.as_tensor; any
+    # failure is re-raised as NotImplementedError carrying the original error text.
     try:
         tensor = torch.as_tensor(obj)
     except Exception as e:
@@ -210,6 +253,13 @@ def _coerce_to_tensor(
     copy: bool = False,
     ndmin: int = 0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Core of the array-creation function. Tensors pass through;
+    # other objects are converted with the default dtype temporarily set to the numpy-
+    # compatible float default (restored afterwards even on error). Then casts to dtype if
+    # given, prepends length-one dimensions until the rank reaches ndmin, and clones when
+    # copy is truthy (a non-boolean copy mode that cannot be converted is treated as
+    # false). Raises NotImplementedError if conversion fails. Side effect: temporarily
+    # mutates the global default dtype.
     """The core logic of the array(...) function.
 
     Parameters
@@ -272,6 +322,12 @@ def _coerce_to_tensor(
 
 
 def ndarrays_to_tensors(*inputs: object) -> object:
+    # [FUNCTION DOC] Replace ndarray wrapper objects with their underlying tensors; other
+    # values are untouched. A single ndarray gives its tensor; a single tuple is converted
+    # element-wise (recursively) into a new tuple; several arguments are treated as one
+    # tuple. Imports the ndarray class lazily.
+    # KNOWN ISSUE: with no arguments it returns a ValueError instance instead of raising
+    #   it.
     """Convert all ndarrays from `inputs` to tensors. (other things are intact)"""
     from ._ndarray import ndarray
 
