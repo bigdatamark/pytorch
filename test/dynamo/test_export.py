@@ -1,4 +1,15 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for torch._dynamo.export. Most tests build a small function or module, run it
+# through torch.compile with the eager backend as the reference, reset dynamo, export it with
+# torch._dynamo.export (plain FX or aten graph, optionally with dynamic shape constraints,
+# pre-dispatch or symbolic tracing) and check that the exported graph module reproduces the
+# reference result, the generated code, guards, node metadata, or the expected error. Defines
+# three test classes: ExportTests (the bulk), ExportTestsSubprocess (strict export under optimized
+# Python in a child process) and ExportTestsDevice (device-parametrized torch.export tests).
+# Import time side effects: defines a module-level constant-result function, expands parametrized
+# tests for ExportTests, and generates per-device classes for ExportTestsDevice for every device
+# type except cpu (xpu allowed) into the module globals. When run as a script it calls the dynamo
+# test_case run_tests.
 """
 PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
 with test_export_persist_assert)
@@ -41,15 +52,28 @@ from torch.testing._internal.common_utils import IS_LINUX, TEST_WITH_SLOW
 
 @torch._dynamo.assume_constant_result
 def dynamo_assume_constant_result_global_function():
+    # [FUNCTION DOC] HELPER: Module-level function marked as an assumed constant result; it takes
+    # no arguments and always returns the string test. Used to check that export treats the call
+    # as a constant instead of tracing it.
     return "test"
 
 
 class ExportTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Main export test case built on the dynamo TestCase. Every method exercises
+    # torch._dynamo.export on a different input structure (lists, dicts, scalars, modules, control
+    # flow, constraints, aten graph mode) and compares exported results against eager or compiled
+    # results. Holds no state of its own.
     # TODO(voz): Refactor to a shared test function.
     # The tests in this file are a little redundant,
     # They all take a func, run it with eager, then export it, then compare
     def test_export(self):
+        # [FUNCTION DOC] Exports a zero-argument function that builds nested lists of tensors from
+        # fixed constants and checks the exported graph returns the same nested result as the
+        # compiled eager-backend function.
         def pre_attention_state_ops(input, mems, state):
+            # [FUNCTION DOC] HELPER: Builds a list of four lists, each holding three tensors equal
+            # to the sum of the first two entries of the state list plus a fixed five element
+            # tensor. The input and mems arguments are unused.
             lc_key = state[0]
             lc_val = state[1]
             bar = []
@@ -64,6 +88,8 @@ class ExportTests(torch._dynamo.test_case.TestCase):
             return bar
 
         def func():
+            # [FUNCTION DOC] HELPER: Creates fixed mems, state and input tensors and returns the
+            # nested list produced by the pre-attention helper.
             mems = torch.tensor([[[1.8364, 0.2724, -1.4917, -0.4367, 0.8640]]])
             state = [
                 torch.tensor([[[1.0517, 0.3848, -0.6472, 0.0823, 0.9116]]]),
@@ -90,6 +116,9 @@ class ExportTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_no_tensor_computation_fail(self):
+        # [FUNCTION DOC] Checks that exporting a function that performs no tensor computation,
+        # with same_signature disabled and a list plus an int as inputs, raises an AssertionError
+        # whose message mentions that no graph was produced.
         with self.assertRaisesRegex(
             AssertionError,
             "Failed to produce a graph",
@@ -99,16 +128,22 @@ class ExportTests(torch._dynamo.test_case.TestCase):
             inps = [inp, inp2]
 
             def func(x, y):
+                # [FUNCTION DOC] HELPER: Returns its first argument unchanged; the second argument
+                # is ignored.
                 return x
 
             torch._dynamo.export(func, same_signature=False)(*inps)
 
     def test_no_tensor_computation(self):
+        # [FUNCTION DOC] Exports a function that returns its first (list) input untouched while a
+        # second input is an int; checks the result equals the compiled result and the generated
+        # forward code flattens the inputs and unflattens the first one.
         inp = [torch.randn(3)]
         inp2 = 2
         inps = [inp, inp2]
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns its first argument unchanged; the second is ignored.
             return x
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -132,7 +167,11 @@ def forward(self, x, y):
         )
 
     def test_export_empty_graph_no_error(self):
+        # [FUNCTION DOC] Checks that exporting a function that only returns the length of
+        # its input (no graph ops) does not error and the exported module returns 5 for a
+        # size 5 tensor.
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the length of the input as a Python int.
             return len(x)
 
         exported = torch._dynamo.export(func)(torch.randn(5))
@@ -141,11 +180,15 @@ def forward(self, x, y):
         self.assertEqual(result, 5)
 
     def test_no_tensor_computation_2(self):
+        # [FUNCTION DOC] Like the no-tensor-computation test but the function returns the int
+        # input; checks the exported result matches and the generated code returns the constant 2
+        # through the output spec.
         inp = torch.randn(3)
         inp2 = 2
         inps = [inp, inp2]
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns its second argument and ignores the first.
             return y
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -169,7 +212,12 @@ def forward(self, x, y):
         )
 
     def test_export_mismatched_out(self):
+        # [FUNCTION DOC] Exports a function returning a nested structure that mixes the input
+        # tensor twice in a list and a computed tensor twice in a tuple; checks the exported
+        # output matches the compiled one.
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns a list with the input twice
+            # and a tuple with the sum twice.
             y = x + 1
             return ([x, x], (y, y))
 
@@ -186,7 +234,13 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_shape_control_flow_1(self):
+        # [FUNCTION DOC] Exports a function that branches on the first dimension of the input
+        # and inspects the guards: expects at least one guard whose source is the shape
+        # environment and that its code list equals a fixed golden list of size, stride, offset
+        # and range conditions.
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns cosine of the input if its first dimension exceeds
+            # ten, otherwise sine.
             if x.shape[0] > 10:
                 return x.cos()
             return x.sin()
@@ -217,15 +271,25 @@ def forward(self, x, y):
         self.assertTrue(hit)
 
     def test_export_control_flow_with_getattr(self):
+        # [FUNCTION DOC] Exports a module whose forward branches on an attribute compared with an
+        # Enum member's value; checks the exported graph gives the same result as the module in
+        # eager mode.
         class Animal(Enum):
+            # [CLASS DOC] HELPER: Enum with a single member COW whose value is the string moo.
             COW = "moo"
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a string attribute a; forward squares the input
+            # when the attribute equals the COW enum value and raises ValueError otherwise.
             def __init__(self, a):
+                # [FUNCTION DOC] HELPER: Stores the given value as attribute a after initializing
+                # the base module.
                 super().__init__()
                 self.a = a
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by itself if the attribute
+                # matches the enum value, else raises ValueError with message bad.
                 if self.a == Animal.COW.value:
                     return x * x
                 else:
@@ -239,6 +303,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(resA, resB))
 
     def test_export_graph_bypass(self):
+        # [FUNCTION DOC] Exports a function that multiplies a list element by itself; checks the
+        # exported graph over a list of three tensors matches the compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -246,6 +312,7 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Reads the third list element twice and returns their product.
             first = x[2]
             second = x[2]
             return first * second
@@ -263,6 +330,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_list_unpack(self):
+        # [FUNCTION DOC] Exports a function that returns several list elements and a product of
+        # elements from an input list; checks equality with the compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -270,6 +339,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the first element, the product of the third element
+            # with itself, the second element and the third element.
             first = x[2]
             second = x[2]
             return x[0], first * second, x[1], x[2]
@@ -287,7 +358,12 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_with_shallow_list_copy_wo_side_effects(self):
+        # [FUNCTION DOC] Exports with aten graph and symbolic tracing a function that shallow
+        # copies a list and sums two entries, with no mutation of the original; checks the
+        # exported module agrees with eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Copies the input list and returns the sum of its first
+            # two entries.
             y = x.copy()
             return y[0] + y[1]
 
@@ -298,7 +374,13 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(gm(inp), f(inp)))
 
     def test_export_with_shallow_list_copy_with_side_effects(self):
+        # [FUNCTION DOC] Exports with aten graph and symbolic tracing a function that mutates the
+        # original list after copying and appends to the copy; checks outputs match eager and that
+        # the first two results are equal.
         def f(x):
+            # [FUNCTION DOC] HELPER: Copies the list, overwrites the original's first entry with
+            # its second, appends a tensor to the copy, and returns sums of the original, sums of
+            # the copy's first two entries and the appended tensor.
             y = x.copy()
             x[0] = x[1]
             y.append(torch.tensor([[100]]))
@@ -314,7 +396,11 @@ def forward(self, x, y):
         self.assertEqual(res[0], res[1])
 
     def test_export_mismatched_out_2(self):
+        # [FUNCTION DOC] Duplicate of the mismatched output test: exports a function returning a
+        # list and a tuple that repeat the same tensors, and compares to the compiled result.
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns a list with the input twice
+            # and a tuple with the sum twice.
             y = x + 1
             return ([x, x], (y, y))
 
@@ -331,6 +417,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_graph_with_list(self):
+        # [FUNCTION DOC] Exports a function that returns a product of list elements together with
+        # the whole input list; checks the exported output matches the compiled one.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -339,6 +427,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the product of the third element with itself and the
+            # input list.
             first = x[2]
             second = x[2]
             return first * second, x
@@ -356,6 +446,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_graph_with_complex_reorder(self):
+        # [FUNCTION DOC] Exports a function that returns list elements in a different order
+        # together with pairwise products; checks equality with the compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -364,6 +456,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the third, first and second elements followed by the
+            # products first times second and first times third.
             first = x[0]
             second = x[1]
             third = x[2]
@@ -382,8 +476,14 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_immutable_list_dict(self):
+        # [FUNCTION DOC] Traces a module returning a list and a dict with make_fx in symbolic
+        # mode, exports that graph, then compiles the exported module with dynamic fullgraph eager
+        # and checks it matches the original module.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns a one element list with the sum of
+            # two inputs and a dict with the squares of each input under keys moo1 and moo2.
             def forward(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Returns the list and dict described by the class.
                 return [x1 + x2], {"moo1": x1 * x1, "moo2": x2 * x2}
 
         x1 = torch.randn(2, 3)
@@ -403,9 +503,12 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(res, M()(x1, x2)))
 
     def test_dupes(self):
+        # [FUNCTION DOC] Exports a function returning the same computed tensor twice (duplicate
+        # outputs) and checks the result matches the compiled one.
         inp = torch.tensor([0.1, 0.1])
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns the result twice.
             y = x + 1
             return y, y
 
@@ -422,9 +525,12 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_2(self):
+        # [FUNCTION DOC] Second copy of the duplicate output test with an identical body; checks
+        # export equals compiled result.
         inp = torch.tensor([0.1, 0.1])
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns the result twice.
             y = x + 1
             return y, y
 
@@ -441,11 +547,15 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass(self):
+        # [FUNCTION DOC] Exports a function that returns a computed tensor twice plus an input
+        # passed straight through (bypass); checks equality with the compiled result.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.4, 0.4])
         inps = [inp, inp2]
 
         def func(x, z):
+            # [FUNCTION DOC] HELPER: Adds one to the first argument and returns it twice followed
+            # by the second argument.
             y = x + 1
             return y, y, z
 
@@ -462,12 +572,16 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass_with_non_tensor_arg(self):
+        # [FUNCTION DOC] Like the dupes-and-bypass test but with an extra int input used in the
+        # computation; checks exported output equals the compiled one.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the sum twice
+            # followed by the second tensor.
             y = x + k
             return y, y, z
 
@@ -484,12 +598,16 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass_reorder_with_non_tensor_arg(self):
+        # [FUNCTION DOC] Same as the non-tensor argument test but the bypassed input is returned
+        # first, reordering outputs; checks equality with compiled output.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the second
+            # tensor then the sum twice.
             y = x + k
             return z, y, y
 
@@ -507,12 +625,17 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_dupes_and_bypass_with_non_tensor_output(self):
+        # [FUNCTION DOC] With scalar output capture enabled, exports a function whose first output
+        # is a Python scalar taken from a tensor, followed by duplicated and bypassed tensors;
+        # checks equality with the compiled result.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the scalar value
+            # of its first element, the sum and the second tensor.
             y = x + k
             return y[0].item(), y, z
 
@@ -529,6 +652,9 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_zeroes_in_and_out_different_shape_on_test(self):
+        # [FUNCTION DOC] Exports using all-zero example inputs and then runs the exported graph on
+        # random inputs of the same shape; the function returns nested lists of tensors, and the
+        # result must match the compiled run on the random inputs.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -537,6 +663,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns nested lists made from the three inputs, their
+            # pairwise sum and the doubled third input.
             return [[a], [b, c], [a + b], [[c + c]]]
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -553,6 +681,9 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_zeroes_in_new_shape_scalar_out(self):
+        # [FUNCTION DOC] With scalar output capture enabled, exports on zero inputs and runs
+        # on random inputs a function returning a sum of scalars; checks it matches the
+        # compiled result.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -561,6 +692,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns the sum of the scalar values of the first element of
+            # each of the three inputs.
             return a[0].item() + b[0].item() + c[0].item()
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -577,6 +710,8 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_zeroes_in_new_shape_scalar_out_permute(self):
+        # [FUNCTION DOC] Like the scalar output test but the scalars are summed in a permuted
+        # order with the first input counted twice; checks equality with compiled result.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -585,6 +720,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns the sum of scalar first elements of the second,
+            # third, first and first inputs.
             return b[0].item() + c[0].item() + a[0].item() + a[0].item()
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -601,6 +738,9 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_zeroes_in_new_shape_scalar_out_permute_dupe_and_bypass(self):
+        # [FUNCTION DOC] Scalar output permuted case that also returns the first input before
+        # and after the scalar sum (duplicate and bypass outputs); checks equality with
+        # compiled result.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -609,6 +749,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns the first input, the sum of scalar first elements of
+            # the second, third, first and first inputs, and the first input again.
             return a, b[0].item() + c[0].item() + a[0].item() + a[0].item(), a
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -624,6 +766,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_func_return(self):
+        # [FUNCTION DOC] Exports a function that defines and calls a closure capturing a computed
+        # tensor; checks the exported output matches the compiled one when run on random inputs.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -632,9 +776,13 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Sums the three inputs and returns the product of the sum with
+            # itself via an inner function.
             x = a + b + c
 
             def func2(y):
+                # [FUNCTION DOC] HELPER: Closure returning the product of its argument with the
+                # captured sum.
                 return x * y
 
             return func2(x)
@@ -652,6 +800,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dict_return(self):
+        # [FUNCTION DOC] Exports a function returning a dictionary and checks the exported graph's
+        # result matches the compiled one on random inputs.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -660,6 +810,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns a dictionary with key a mapped to the sum of the
+            # three inputs.
             x = a + b + c
             return {"a": x}
 
@@ -676,7 +828,11 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_with_aten_graph(self):
+        # [FUNCTION DOC] Same as the first export test (nested lists built from constants) but
+        # exports with aten_graph enabled and compares to the compiled result.
         def pre_attention_state_ops(input, mems, state):
+            # [FUNCTION DOC] HELPER: Builds a list of four lists, each with three tensors equal to
+            # the sum of the first two state entries plus a fixed tensor; other arguments unused.
             lc_key = state[0]
             lc_val = state[1]
             bar = []
@@ -691,6 +847,8 @@ def forward(self, x, y):
             return bar
 
         def func():
+            # [FUNCTION DOC] HELPER: Builds fixed constants and returns the nested list from the
+            # pre-attention helper.
             mems = torch.tensor([[[1.8364, 0.2724, -1.4917, -0.4367, 0.8640]]])
             state = [
                 torch.tensor([[[1.0517, 0.3848, -0.6472, 0.0823, 0.9116]]]),
@@ -717,11 +875,15 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_no_tensor_computation_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function returning its list input untouched with
+        # an int second input; checks equality and that the generated code aliases the flattened
+        # first input and returns it.
         inp = [torch.randn(3)]
         inp2 = 2
         inps = [inp, inp2]
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns its first argument and ignores the second.
             return x
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -745,11 +907,14 @@ def forward(self, x, y):
         )
 
     def test_no_tensor_computation_2_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function returning the int input; checks equality
+        # and that the code returns the constant 2.
         inp = torch.randn(3)
         inp2 = 2
         inps = [inp, inp2]
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns the second argument and ignores the first.
             return y
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -773,7 +938,11 @@ def forward(self, x, y):
         )
 
     def test_export_mismatched_out_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function whose list and tuple outputs repeat
+        # tensors; compares against the compiled result.
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns a list with the input twice
+            # and a tuple with the sum twice.
             y = x + 1
             return ([x, x], (y, y))
 
@@ -792,6 +961,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_graph_bypass_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that multiplies a list element by itself;
+        # compares with compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -799,6 +970,7 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the product of the third list element with itself.
             first = x[2]
             second = x[2]
             return first * second
@@ -816,6 +988,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_list_unpack_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that returns several list elements and a
+        # product; compares with compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -823,6 +997,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the first element, the product of the third with
+            # itself, the second and the third.
             first = x[2]
             second = x[2]
             return x[0], first * second, x[1], x[2]
@@ -840,7 +1016,11 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_mismatched_out_2_with_aten_graph(self):
+        # [FUNCTION DOC] Duplicate of the aten-graph mismatched output test; compares exported
+        # with compiled result.
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns a list with the input twice
+            # and a tuple with the sum twice.
             y = x + 1
             return ([x, x], (y, y))
 
@@ -859,6 +1039,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_graph_with_list_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function returning a product plus the whole input
+        # list; compares with compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -867,6 +1049,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the product of the third element with itself and the
+            # input list.
             first = x[2]
             second = x[2]
             return first * second, x
@@ -884,6 +1068,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_graph_with_complex_reorder_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that reorders list elements and returns
+        # products; compares with compiled result.
         inp = [
             torch.tensor([0.1, 0.1]),
             torch.tensor([0.2, 0.2]),
@@ -892,6 +1078,8 @@ def forward(self, x, y):
         ]
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the third, first and second elements and the products
+            # first times second and first times third.
             first = x[0]
             second = x[1]
             third = x[2]
@@ -910,9 +1098,12 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that returns the same tensor twice;
+        # compares with compiled result.
         inp = torch.tensor([0.1, 0.1])
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns it twice.
             y = x + 1
             return y, y
 
@@ -929,9 +1120,12 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_2_with_aten_graph(self):
+        # [FUNCTION DOC] Second copy of the aten-graph duplicate output test; compares with
+        # compiled result.
         inp = torch.tensor([0.1, 0.1])
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and returns it twice.
             y = x + 1
             return y, y
 
@@ -948,11 +1142,15 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that returns a duplicated computed tensor
+        # and a bypassed input; compares with compiled result.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.4, 0.4])
         inps = [inp, inp2]
 
         def func(x, z):
+            # [FUNCTION DOC] HELPER: Adds one to the first argument and returns it twice followed
+            # by the second argument.
             y = x + 1
             return y, y, z
 
@@ -969,12 +1167,16 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass_with_non_tensor_arg_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of the duplicate and bypass case with an extra int
+        # input; compares with compiled result.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the sum twice
+            # and the second tensor.
             y = x + k
             return y, y, z
 
@@ -991,12 +1193,16 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dupes_and_bypass_reorder_with_non_tensor_arg_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export where the bypassed tensor is returned before the
+        # duplicated outputs; compares with compiled result.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the second
+            # tensor then the sum twice.
             y = x + k
             return z, y, y
 
@@ -1014,12 +1220,18 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_dupes_and_bypass_with_non_tensor_output_with_aten_graph(self):
+        # [FUNCTION DOC] With scalar output capture enabled, exports a function returning a scalar
+        # plus duplicated and bypassed tensors, and compares with the compiled result.
+        # KNOWN ISSUE: despite the name it exports without aten_graph, so the aten path is
+        # not exercised.
         inp = torch.tensor([0.1, 0.1])
         inp2 = torch.tensor([0.1, 0.1])
         inp3 = 4
         inps = [inp, inp2, inp3]
 
         def func(x, z, k):
+            # [FUNCTION DOC] HELPER: Adds the int to the first tensor and returns the scalar value
+            # of its first element, the sum and the second tensor.
             y = x + k
             return y[0].item(), y, z
 
@@ -1036,6 +1248,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_zeroes_in_and_out_different_shape_on_test_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export on zero inputs, executed on random inputs, of a
+        # function returning nested lists; compares with compiled result.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -1044,6 +1258,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns nested lists made of the three inputs, their pairwise
+            # sum and the doubled third input.
             return [[a], [b, c], [a + b], [[c + c]]]
 
         opt_func = torch.compile(func, backend="eager", fullgraph=True, dynamic=True)
@@ -1059,6 +1275,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_func_return_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function that calls a closure; exported on zero
+        # inputs and run on random inputs; compares with compiled result.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -1067,9 +1285,13 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Sums the three inputs and returns the product of the sum with
+            # itself via an inner function.
             x = a + b + c
 
             def func2(y):
+                # [FUNCTION DOC] HELPER: Closure returning the product of its argument with the
+                # captured sum.
                 return x * y
 
             return func2(x)
@@ -1087,6 +1309,8 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_dict_return_with_aten_graph(self):
+        # [FUNCTION DOC] Aten-graph export of a function returning a dictionary; compares with
+        # compiled result on random inputs.
         inp = torch.zeros(10)
         inp2 = torch.zeros(10)
         inp3 = torch.zeros(10)
@@ -1095,6 +1319,8 @@ def forward(self, x, y):
         inps_rand = [torch.randn(10), torch.randn(10), torch.randn(10)]
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns a dictionary with key a mapped to the sum of the
+            # three inputs.
             x = a + b + c
             return {"a": x}
 
@@ -1111,19 +1337,31 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_with_stack_trace(self):
+        # [FUNCTION DOC] Exports a module with and without aten_graph and checks that every
+        # non-placeholder, non-output node in the plain graph, and every function-call node in the
+        # aten graph, carries a stack trace, module stack and source function stack, with aten
+        # nodes also having a value and original aten op in metadata.
         inp = torch.randn(4, 4)
 
         class MyBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies a linear layer with random weights,
+            # cosine, relu and adds one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear with a freshly generated 4x4 random
+                # weight, then cosine, relu and adds one.
                 x = torch.nn.functional.linear(x, torch.randn(4, 4))
                 return torch.cos(x).relu() + 1
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding a MyBlock child and delegating forward
+            # to it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child block attribute.
                 super().__init__()
                 self.block = MyBlock()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the child block on the input and returns its output.
                 out = self.block(x)
                 return out
 
@@ -1149,24 +1387,36 @@ def forward(self, x, y):
                 self.assertTrue(node.meta["original_aten"] is not None)
 
     def test_export_preserves_nn_module_stack_for_get_attr(self):
+        # [FUNCTION DOC] Exports a nested module with a parameter and a buffer in both plain and
+        # aten modes and asserts that exactly two get_attr nodes exist in each graph and each has
+        # module stack metadata.
         inp = torch.randn(4, 4)
 
         class MyBlock(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter and a buffer, both of shape 1x1 filled
+            # with ones; forward applies linear, cosine, relu and adds both.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a ones parameter and a ones buffer.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.ones(1, 1))
                 self.buffer = torch.nn.Buffer(torch.ones(1, 1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear with a random weight, cosine and relu,
+                # then adds the parameter and buffer.
                 x = torch.nn.functional.linear(x, torch.randn(4, 4))
                 return torch.cos(x).relu() + self.weight + self.buffer
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding a MyBlock child and delegating forward
+            # to it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child block attribute.
                 super().__init__()
                 self.block = MyBlock()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the child block on the input and returns its output.
                 out = self.block(x)
                 return out
 
@@ -1194,10 +1444,16 @@ def forward(self, x, y):
         self.assertEqual(attr_access_count, 2)
 
     def test_export_compare_optimize_with_make_fx(self):
+        # [FUNCTION DOC] Compares three ways of producing an aten graph for a small
+        # transpose/relu/linear function: dynamo export with aten_graph, a custom compile backend
+        # that re-traces with make_fx, and direct make_fx; asserts the latter two match the
+        # export result.
         inp = torch.tensor([0.1, 0.1])
         linear = torch.nn.Linear(2, 2)
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input, transposes it, applies relu and the
+            # enclosing linear layer, and returns the result.
             x = x + 1
             y = x.t()
             y = y.relu()
@@ -1211,7 +1467,13 @@ def forward(self, x, y):
         torch._dynamo.reset()
 
         def compiler(gm, sample_inputs):
+            # [FUNCTION DOC] HELPER: Custom compile backend taking a graph module and sample
+            # inputs; returns a callable that re-traces the module with make_fx on the real
+            # arguments and runs the traced module.
             def fw(*args):
+                # [FUNCTION DOC] HELPER: Backend runtime wrapper; traces the captured graph module
+                # with make_fx using the call arguments and returns the output of the traced
+                # module on the same arguments.
                 aten_gm = make_fx(gm)(*args)
                 return aten_gm(*args)
 
@@ -1231,17 +1493,28 @@ def forward(self, x, y):
         )
 
     def test_export_with_constant_method_on_module(self):
+        # [FUNCTION DOC] Exports a module whose helper method is marked assume_constant_result and
+        # returns nonzero indices; the export is traced on an all-zero input but the graph, when
+        # run on other inputs, must return the eager result computed from a nonzero input, showing
+        # the helper output was frozen.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random parameter and a linear layer whose forward
+            # calls a constant-result helper on the linear output and returns that result.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random 4x2 parameter and a 2x2 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 2))
                 self.linear = torch.nn.Linear(2, 2)
 
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Marked as assumed constant; returns the indices of
+                # nonzero entries of the input.
                 return torch.nonzero(x)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes sine of the input and the linear layer output
+                # (both unused afterwards) and returns the helper's result for the linear output.
                 y = torch.sin(x)
                 x = self.linear(x)
                 y = self.helper_fn(x)
@@ -1257,17 +1530,27 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_method_on_module_invoke_twice(self):
+        # [FUNCTION DOC] Same as the constant method test but the helper is called twice and
+        # the results added; checks the exported graph reproduces the eager result on two
+        # different inputs.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module like the constant method module, but forward sums two
+            # calls of the constant-result helper.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random parameter and a linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 2))
                 self.linear = torch.nn.Linear(2, 2)
 
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning nonzero indices of
+                # its input.
                 return torch.nonzero(x)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer then returns the sum of two
+                # helper calls on the result.
                 y = torch.sin(x)
                 x = self.linear(x)
                 y = self.helper_fn(x) + self.helper_fn(x)
@@ -1283,21 +1566,33 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_free_function(self):
+        # [FUNCTION DOC] Exports a module that mixes a constant-result free function and a
+        # constant-result method in the same forward; checks the graph matches the eager result on
+        # two inputs.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning nonzero indices of
+            # its input.
             return torch.nonzero(x)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the results of the free helper and the
+            # method helper applied to the linear output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random parameter and a linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 2))
                 self.linear = torch.nn.Linear(2, 2)
 
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning nonzero indices of
+                # its input.
                 return torch.nonzero(x)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and returns the sum of the free
+                # helper and method helper results.
                 y = torch.sin(x)
                 x = self.linear(x)
                 y = helper_fn(x) + self.helper_fn(x)
@@ -1313,8 +1608,15 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_global_function(self):
+        # [FUNCTION DOC] Exports a module that calls the module-level constant-result
+        # global function twice and adds the results; checks the exported graph returns the
+        # string testtest.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose argument-less forward concatenates two calls of the
+            # global constant-result function.
             def forward(self):
+                # [FUNCTION DOC] HELPER: Calls the global constant-result function twice and
+                # returns the sum of the two strings.
                 a = dynamo_assume_constant_result_global_function()
                 b = dynamo_assume_constant_result_global_function()
                 return a + b
@@ -1325,17 +1627,27 @@ def forward(self, x, y):
         self.assertEqual(result, "testtest")
 
     def test_export_with_constant_free_function_and_class_method(self):
+        # [FUNCTION DOC] Exports a module that calls a locally defined constant-result free
+        # function inside forward; checks the exported graph returns the eager result on
+        # two inputs.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning nonzero indices of
+            # its input.
             return torch.nonzero(x)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear layer then the constant-result
+            # free function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random parameter and a linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 2))
                 self.linear = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear and returns the helper function result for
+                # the linear output.
                 y = torch.sin(x)
                 x = self.linear(x)
                 y = helper_fn(x)
@@ -1351,17 +1663,26 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_free_function_and_class_method_multiarg(self):
+        # [FUNCTION DOC] Same as the free function test but forward takes two inputs and the
+        # helper is called on both; checks equality with eager on two input pairs.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning nonzero indices of
+            # its input.
             return torch.nonzero(x)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the helper result for the linear
+            # output of the first input and for the second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random parameter and a linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 2))
                 self.linear = torch.nn.Linear(2, 2)
 
             def forward(self, x, z):
+                # [FUNCTION DOC] HELPER: Returns the sum of the helper applied to the linear
+                # output of the first input and the helper applied to the second input.
                 y = torch.sin(x)
                 x = self.linear(x)
                 y = helper_fn(x) + helper_fn(z)
@@ -1385,12 +1706,20 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_free_function_and_class_method_multiarg_diff(self):
+        # [FUNCTION DOC] Constant-result helper called on two inputs; the export example inputs
+        # differ from the eager ones, yet the exported graph must reproduce the eager result
+        # computed on other values, showing both helper outputs were frozen.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning nonzero indices of
+            # its input.
             return torch.nonzero(x)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns the sum of the helper results for
+            # its two inputs.
             def forward(self, x, z):
+                # [FUNCTION DOC] HELPER: Returns the sum of the helper results for both inputs.
                 y = helper_fn(x) + helper_fn(z)
                 return y
 
@@ -1413,12 +1742,22 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_tuple_nonzero(self):
+        # [FUNCTION DOC] Constant-result method returning a tuple of two nonzero index tensors,
+        # consumed in forward by looping over elements; checks the exported graph, called on a
+        # different input, equals the eager result.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward multiplies a constant tensor by every
+            # row of every tensor returned by the constant-result helper and returns the list
+            # of products.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning a tuple with two copies
+                # of the nonzero indices of the input.
                 return (torch.nonzero(x), torch.nonzero(x))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Iterates over the nested helper result and returns a list
+                # of products with a fixed half-valued tensor.
                 y = torch.tensor([0.5])
                 elements = self.helper_fn(x)
                 all_y = []
@@ -1437,12 +1776,20 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_list_nonzero(self):
+        # [FUNCTION DOC] Same as the tuple test but the helper returns a list; checks the exported
+        # graph matches eager on a different input.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module consuming a constant-result list of index tensors and
+            # producing a list of scaled items.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning a list of two nonzero
+                # index tensors.
                 return [torch.nonzero(x), torch.nonzero(x)]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Loops over the helper's tensors and rows and returns a
+                # list of products with a fixed tensor.
                 y = torch.tensor([0.5])
                 elements = self.helper_fn(x)
                 all_y = []
@@ -1461,12 +1808,20 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_list_nonzero_free_function(self):
+        # [FUNCTION DOC] Same as the list test but the constant-result helper is a free function;
+        # checks equality with eager on a different input.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning a list of two
+            # nonzero index tensors.
             return [torch.nonzero(x), torch.nonzero(x)]
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module consuming a free-function constant list of index tensors
+            # and producing a list of scaled items.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Loops over the helper result and returns a list of
+                # products with a fixed tensor.
                 y = torch.tensor([0.5])
                 elements = helper_fn(x)
                 all_y = []
@@ -1485,12 +1840,21 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_dict_values(self):
+        # [FUNCTION DOC] Constant-result method returns a dictionary; checks the exported
+        # graph, run on a differently shaped input, equals the eager result computed from the
+        # original input.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that multiplies a fixed tensor by two entries of a
+            # constant-result dictionary.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning a dictionary with the
+                # input and its square.
                 return {"x": x, "x^2": x * x}
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Multiplies a fixed tensor by the x entry then the x^2
+                # entry of the helper result.
                 y = torch.tensor([0.5])
                 elements = self.helper_fn(x)
                 y = y * elements["x"]
@@ -1507,15 +1871,24 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_none_control_flow(self):
+        # [FUNCTION DOC] Constant-result helper returns None for a negative scalar; export is
+        # traced on a negative input and the graph, run on a positive input, must still return the
+        # none-branch result.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns a fixed tensor if the constant
+            # helper returned None, else the product with the helper value.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning None when the scalar
+                # value of the input is negative, otherwise the input.
                 if x.item() < 0:
                     return None
                 else:
                     return x
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor when the helper result is None,
+                # otherwise the fixed tensor times the helper result.
                 y = torch.tensor([0.5])
                 x = self.helper_fn(x)
                 if x is None:
@@ -1534,15 +1907,23 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_not_none_control_flow(self):
+        # [FUNCTION DOC] Mirror of the none-control-flow test: traced on a positive input, so the
+        # frozen helper returns the input; the graph run on a negative input must still return the
+        # product result.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether the constant helper returned None.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning None for negative
+                # scalars, otherwise the input.
                 if x.item() < 0:
                     return None
                 else:
                     return x
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor if the helper result is None, else
+                # the product with the helper result.
                 y = torch.tensor([0.5])
                 x = self.helper_fn(x)
                 if x is None:
@@ -1561,15 +1942,23 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_none_control_flow_free_func(self):
+        # [FUNCTION DOC] None-control-flow test with the helper as a constant-result
+        # free function.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning None for negative
+            # scalars, otherwise the input.
             if x.item() < 0:
                 return None
             else:
                 return x
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on the constant free function result
+            # being None.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor if the helper result is None, else
+                # the product with it.
                 y = torch.tensor([0.5])
                 x = helper_fn(x)
                 if x is None:
@@ -1588,15 +1977,22 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_not_none_control_flow_pos(self):
+        # [FUNCTION DOC] Positive-input variant of the not-none test, using a method helper; the
+        # exported graph run on a negative input must still return the product.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether the constant helper returned None.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning None for negative
+                # scalars, otherwise the input.
                 if x.item() < 0:
                     return None
                 else:
                     return x
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor if the helper result is None, else
+                # the product with it.
                 y = torch.tensor([0.5])
                 x = self.helper_fn(x)
                 if x is None:
@@ -1615,15 +2011,23 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_not_none_control_flow_free_func(self):
+        # [FUNCTION DOC] Not-none control flow test with the helper as a constant-result
+        # free function.
         @torch._dynamo.assume_constant_result
         def helper_fn(x):
+            # [FUNCTION DOC] HELPER: Assumed-constant free function returning None for negative
+            # scalars, otherwise the input.
             if x.item() < 0:
                 return None
             else:
                 return x
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on the constant free function result
+            # being None.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor if the helper result is None, else
+                # the product with it.
                 y = torch.tensor([0.5])
                 x = helper_fn(x)
                 if x is None:
@@ -1642,12 +2046,21 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(result, real_result))
 
     def test_export_with_constant_not_return_const(self):
+        # [FUNCTION DOC] Constant-result method returns a string attribute from the module; the
+        # module value is changed after export and the exported graph result must equal the result
+        # computed before the change, showing the attribute was frozen at trace time.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns a fixed tensor when the constant
+            # helper value is the string A and the int minus one otherwise.
             @torch._dynamo.assume_constant_result
             def helper_fn(self, x):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning the module
+                # attribute val.
                 return self.val
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a fixed tensor if the helper value equals A,
+                # otherwise minus one.
                 y = torch.tensor([0.5])
                 x = self.helper_fn(x)
                 if x == "A":
@@ -1663,17 +2076,28 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(resA, resB))
 
     def test_export_with_builtin_op_on_assume_constant(self):
+        # [FUNCTION DOC] Uses a constant-result function on a parameter in a comparison with a
+        # float attribute to select a branch; checks the exported graph equals the eager
+        # module output.
         @torch._dynamo.assume_constant_result
         def get_y(y) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Assumed-constant function that returns its argument.
             return y
 
         class Bob(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a float threshold p and a scalar parameter y;
+            # forward concatenates the input with itself if the constant-wrapped parameter is
+            # below the threshold, else returns the input.
             def __init__(self, p, val) -> None:
+                # [FUNCTION DOC] HELPER: Stores p and wraps the value val in a parameter.
                 super().__init__()
                 self.p = p
                 self.y = torch.nn.Parameter(torch.tensor(val))
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns the input concatenated with itself if
+                # the helper-wrapped parameter is less than the threshold, otherwise the
+                # input unchanged.
                 # This only looks dynamic but it's actually a constant value
                 if get_y(self.y) < self.p:
                     return torch.cat([x, x])
@@ -1686,16 +2110,26 @@ def forward(self, x, y):
         self.assertEqual(model(inp), graph(inp))
 
     def test_export_with_constant_in_unspecialized_nn_module(self):
+        # [FUNCTION DOC] Exports a module that gets recorded as an unspecialized module because
+        # forward assigns an attribute; a constant-result method on it decides the branch. Checks
+        # the exported graph matches eager.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a tensor y; forward records the input device then
+            # adds one or two to the input depending on a constant-result check of y.
             def __init__(self, y):
+                # [FUNCTION DOC] HELPER: Stores the given tensor as attribute y.
                 super().__init__()
                 self.y = y
 
             @torch._dynamo.assume_constant_result
             def check(self):
+                # [FUNCTION DOC] HELPER: Assumed-constant method returning whether the scalar
+                # value of the first element of y equals one.
                 return self.y[0].item() == 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Stores the input's device on the module, then returns the
+                # input plus one when the check is true, else plus two.
                 # This line leads to module obj being tracked as UnspecializedNNModuleVariable in dynamo
                 self.device = x.device
 
@@ -1710,10 +2144,15 @@ def forward(self, x, y):
         self.assertEqual(model(inp), graph(inp))
 
     def test_export_decomp(self):
+        # [FUNCTION DOC] Exports with aten graph and a decomposition table replacing the transpose
+        # op with a cosine function and asserts no transpose nodes remain; then exports with no
+        # table and asserts two transpose nodes are present.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of two transposes of the input.
             return x.t() + x.t()
 
         def nop(x):
+            # [FUNCTION DOC] HELPER: Replacement decomposition returning the cosine of the input.
             return x.cos()
 
         graph, _ = torch._dynamo.export(
@@ -1735,10 +2174,14 @@ def forward(self, x, y):
         )
 
     def test_export_decomp_asserts_bad_args(self):
+        # [FUNCTION DOC] Checks that passing a decomposition table to export without aten_graph
+        # raises an AssertionError.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of two transposes of the input.
             return x.t() + x.t()
 
         def nop(x):
+            # [FUNCTION DOC] HELPER: Replacement decomposition returning the cosine of the input.
             return x.cos()
 
         with self.assertRaises(AssertionError):
@@ -1751,18 +2194,31 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_export_with_module_layer(self):
+        # [FUNCTION DOC] With scalar output capture enabled, exports a bound forward method
+        # that uses a conditional with two branch closures calling a linear layer; checks
+        # results equal eager on the original input and on a negated input to show the
+        # predicate was not specialized.
         from functorch.experimental.control_flow import cond
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer whose forward chooses between two
+            # closures by a tensor predicate and passes the input as an operand.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 3x3 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional on the predicate, choosing between
+                # two closures, with the input as the sole operand.
                 def true_fn(val):
+                    # [FUNCTION DOC] HELPER: True branch returning the linear output times the
+                    # tensor two.
                     return self.linear(val) * torch.tensor(2)
 
                 def false_fn(val):
+                    # [FUNCTION DOC] HELPER: False branch returning the linear output times the
+                    # tensor minus one.
                     return self.linear(val) * torch.tensor(-1)
 
                 return cond(pred, true_fn, false_fn, [x])
@@ -1789,27 +2245,40 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_export_with_cond_branches_calling_methods(self):
+        # [FUNCTION DOC] Exports a bound forward method that passes module methods as branches of
+        # a conditional; checks the exported graph equals eager.
         from functorch.experimental.control_flow import cond
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and methods used as
+            # conditional branches.
             # ok
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 3x3 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def t(self, val):
+                # [FUNCTION DOC] HELPER: Returns the input plus one.
                 return val + 1
 
             def f(self, val):
+                # [FUNCTION DOC] HELPER: Returns the input minus one.
                 return val - 1
 
             def true_fn(self, val):
+                # [FUNCTION DOC] HELPER: True branch: linear output plus the result of the
+                # plus-one method.
                 return self.linear(val) + self.t(val)
 
             def false_fn(self, val):
+                # [FUNCTION DOC] HELPER: False branch: linear output minus the result of the
+                # minus-one method.
                 return self.linear(val) - self.f(val)
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional with the true and false branch
+                # methods and the input as operand.
                 return cond(pred, self.true_fn, self.false_fn, [x])
 
         mod = Module()
@@ -1822,46 +2291,71 @@ def forward(self, x, y):
 
     @config.patch(capture_scalar_outputs=True)
     def test_export_with_cond_closure(self):
+        # [FUNCTION DOC] Exports forward methods of three modules whose conditional branches are
+        # closures (plain, with a modified operand, and capturing a linear layer and a local
+        # tensor), in a loop with gradient-requiring inputs; each exported graph must match eager.
         from functorch.experimental.control_flow import cond
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a conditional whose branches double or subtract two
+            # from the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only initializes the base module.
                 super().__init__()
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional between a doubling and a
+                # minus-two closure.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input times two.
                     return x * 2
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input minus two.
                     return x - 2
 
                 return cond(pred, true_fn, false_fn, [x])
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module like the first one but the operand passed to the
+            # conditional is the input plus one.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only initializes the base module.
                 super().__init__()
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional with the input plus one as operand.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input times two.
                     return x * 2
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input minus two.
                     return x - 2
 
                 return cond(pred, true_fn, false_fn, [x + 1])
 
         class FooBar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a linear layer; its conditional branches capture
+            # self and take the input and a doubled input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 3x3 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Computes the doubled input and runs the conditional with
+                # two operands.
                 y = x + x
 
                 def true_fn(x, y):
+                    # [FUNCTION DOC] HELPER: Returns the linear output of the first operand times
+                    # the sum of both operands.
                     return self.linear(x) * (x + y)
 
                 def false_fn(x, y):
+                    # [FUNCTION DOC] HELPER: Returns the first operand times the difference of the
+                    # second and first.
                     return x * (y - x)
 
                 return cond(pred, true_fn, false_fn, [x, y])
@@ -1876,17 +2370,25 @@ def forward(self, x, y):
             self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_with_cond_with_closed_function(self):
+        # [FUNCTION DOC] Exports a function whose conditional branches call free functions defined
+        # in the enclosing test; checks the exported graph matches the eager result.
         def hello(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus one.
             return x + 1
 
         def hi(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus two.
             return x + 2
 
         def foo(pred, x):
+            # [FUNCTION DOC] HELPER: Runs the conditional on the predicate with branches that call
+            # the plus-one and plus-two functions.
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: Returns the plus-one function applied to the input.
                 return hello(x)
 
             def false_fn(x):
+                # [FUNCTION DOC] HELPER: Returns the plus-two function applied to the input.
                 return hi(x)
 
             return cond(pred, true_fn, false_fn, [x])
@@ -1899,24 +2401,39 @@ def forward(self, x, y):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_with_cond_dynamic_shape_pred(self):
+        # [FUNCTION DOC] Exports two modules whose predicate is a shape comparison; compares
+        # generated code of the main graph and both branch submodules against golden strings, then
+        # checks that export with a different batch size succeeds and that calling the module with
+        # it runs.
         from functorch.experimental.control_flow import cond
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward branches on whether the first dimension is
+            # at most two, passing the operand as a list.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional with branch closures; true doubles
+                # by adding to itself, false returns a clone of the first two rows.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input added to itself.
                     return x + x
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns a clone of the first two rows of the input.
                     return x[:2].clone()
 
                 return cond(x.shape[0] <= 2, true_fn, false_fn, [x])
 
         class Module2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Same as the first module but the operands are passed as a tuple.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional with the operand passed as a one
+                # element tuple.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input added to itself.
                     return x + x
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns a clone of the first two rows of the input.
                     return x[:2].clone()
 
                 return cond(x.shape[0] <= 2, true_fn, false_fn, (x,))
@@ -1968,20 +2485,32 @@ def forward(self, l_x_):
             mod(test_x)
 
     def test_export_with_map_cond(self):
+        # [FUNCTION DOC] Exports a module that maps a body containing a conditional over the
+        # leading dimension of a tensor; export is traced on one shape and predicate value, and
+        # the graph is checked against eager for a different shape and predicate.
         from functorch.experimental.control_flow import cond, map
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward maps a body over the leading dimension,
+            # where the body applies an inner conditional.
             def inner(self, x, pred):
+                # [FUNCTION DOC] HELPER: Runs a conditional that doubles via addition when the
+                # predicate is true and squares otherwise.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input added to itself.
                     return x + x
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Returns the input squared.
                     return x * x
 
                 return cond(pred, true_fn, false_fn, [x])
 
             def forward(self, pred, xs):
+                # [FUNCTION DOC] HELPER: Applies the map higher-order operator with the body over
+                # the input, passing the predicate.
                 def body(x, pred):
+                    # [FUNCTION DOC] HELPER: Map body delegating to the inner method.
                     return self.inner(x, pred)
 
                 return map(body, xs, pred)
@@ -1998,11 +2527,16 @@ def forward(self, l_x_):
         self.assertEqual(real_result, out_graph(pred_y, y))
 
     def test_export_with_map_zero_sized_tensor(self):
+        # [FUNCTION DOC] Checks that exporting a module that maps over a zero-sized tensor raises
+        # the dynamo Unsupported error with a message containing Observed exception.
         from functorch.experimental.control_flow import map
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward maps an add-one body over its input.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: Applies map with the add-one body to the input.
                 def body(x):
+                    # [FUNCTION DOC] HELPER: Map body returning the input plus one.
                     return x + 1
 
                 return map(body, xs)
@@ -2016,7 +2550,11 @@ def forward(self, l_x_):
             torch._dynamo.export(mod)(xs)
 
     def test_export_meta_val(self):
+        # [FUNCTION DOC] Exports with aten graph a multiply-add function and asserts every
+        # placeholder node has a val entry in its metadata.
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Returns the product of the first two arguments plus
+            # the third.
             return x * y + z
 
         gm, _ = torch._dynamo.export(
@@ -2032,7 +2570,11 @@ def forward(self, l_x_):
                 self.assertIn("val", node.meta)
 
     def test_input_container_type(self):
+        # [FUNCTION DOC] Exports with aten graph a function taking a tensor and a list of tensors
+        # and returning a dict; checks the exported module equals eager.
         def f(x: torch.Tensor, y: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Returns a dictionary with key a mapped to the sum of the
+            # first tensor's elements plus the sum of all list tensors.
             return {"a": x.sum() + sum(y).sum()}
 
         inp = (torch.randn(6, 5), [torch.randn(6, 5), torch.randn(6, 5)])
@@ -2043,7 +2585,12 @@ def forward(self, l_x_):
 
     @config.patch(assume_static_by_default=False)
     def test_export_symbolic_shape(self):
+        # [FUNCTION DOC] With static-by-default disabled, exports with aten graph a function
+        # allocating a tensor sized from the input's first dimension and asserts the graph
+        # contains a symbolic size node.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns an uninitialized tensor whose length is twice the
+            # input's first dimension.
             return torch.empty(x.shape[0] * 2)
 
         inp = (torch.randn(6, 5),)
@@ -2058,7 +2605,12 @@ def forward(self, l_x_):
 
     @config.patch(assume_static_by_default=False)
     def test_dynamic_slicing(self):
+        # [FUNCTION DOC] With dynamic shapes by default, exports a slicing function in aten and
+        # torch modes; checks output shapes on a new input, that the aten graph contains two slice
+        # operations and the torch graph contains one getitem call.
         def f(x):
+            # [FUNCTION DOC] HELPER: Slices the input to all but the last two rows and every
+            # second column starting from the last column.
             return x[: x.shape[0] - 2, x.shape[1] - 1 :: 2]
 
         gm_aten_mode, _ = torch._dynamo.export(f, aten_graph=True)(torch.randn(4, 5))
@@ -2094,7 +2646,11 @@ def forward(self, l_x_):
 
     @config.patch(capture_scalar_outputs=True)
     def test_dynamic_slicing_simple(self):
+        # [FUNCTION DOC] With scalar output capture enabled, exports with aten graph a
+        # function indexing with an empty slice object; checks the result equals eager on a
+        # different shape.
         def f(x):
+            # [FUNCTION DOC] HELPER: Indexes the input with a slice object having no bounds.
             return x[slice(None, None, None)]
 
         gm, _ = torch._dynamo.export(f, aten_graph=True)(torch.randn(4, 5))
@@ -2103,7 +2659,12 @@ def forward(self, l_x_):
         self.assertEqual(gm(inp), f(inp))
 
     def test_pre_dispatch_simple(self):
+        # [FUNCTION DOC] Exports with aten graph, pre-dispatch and fake tracing a matmul
+        # with ones; checks results on a new input shape and compares generated code to a
+        # golden string.
         def f(x):
+            # [FUNCTION DOC] HELPER: Matrix-multiplies the input with a tensor of ones of the
+            # same shape.
             y = torch.ones_like(x)
             return torch.matmul(x, y)
 
@@ -2131,14 +2692,23 @@ def forward(self, x):
 
     @patch.object(torch._dynamo.config, "capture_scalar_outputs", True)
     def test_export_cond_in_aten_symbolic(self):
+        # [FUNCTION DOC] With scalar output capture patched on, exports a module using a
+        # conditional via aten graph export, prints the readable graph and checks the result
+        # equals eager.
         class ConditionOp(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with methods used as conditional branches multiplying or
+            # adding two operands.
             def true_fn(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the product of the two operands.
                 return x * y
 
             def false_fn(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two operands.
                 return x + y
 
             def forward(self, pred, x, y):
+                # [FUNCTION DOC] HELPER: Runs the conditional on the predicate with the
+                # two operands.
                 return cond(pred, self.true_fn, self.false_fn, [x, y])
 
         model = ConditionOp()
@@ -2154,7 +2724,13 @@ def forward(self, x):
         self.assertEqual(gm(*inp), model(*inp))
 
     def test_export_with_kwargs(self):
+        # [FUNCTION DOC] Exports a function with positional, tuple, variadic, keyword-only and
+        # extra keyword arguments via the signature-preserving helper, expecting flattened
+        # argument names for each.
         def fn_with_kwargs(pos0, tuple0, *myargs, mykw0=None, **mykwargs):
+            # [FUNCTION DOC] HELPER: Multiplies the first argument by all tuple entries, all
+            # variadic args, the keyword argument and the product of two extra keyword inputs, in
+            # place, and returns it.
             out = pos0
             for arg in tuple0:
                 out *= arg
@@ -2190,7 +2766,12 @@ def forward(self, x):
         )
 
     def test_export_with_kwargs_and_empty_args(self):
+        # [FUNCTION DOC] Exports a function that takes only keyword arguments and checks
+        # the signature-preserving helper with expected names of the keyword and extra
+        # keyword arguments.
         def fn_with_kwargs(mykw0=None, **mykwargs):
+            # [FUNCTION DOC] HELPER: Multiplies the keyword input in place by the product of two
+            # extra keyword inputs and returns it.
             out = mykw0
             out *= mykwargs["input0"] * mykwargs["input1"]
             return out
@@ -2204,7 +2785,11 @@ def forward(self, x):
         )
 
     def test_export_with_args_and_empty_kwargs(self):
+        # [FUNCTION DOC] Exports a function with positional, tuple and variadic arguments and no
+        # keywords via the signature-preserving helper with expected flattened names.
         def fn_with_kwargs(pos0, tuple0, *myargs):
+            # [FUNCTION DOC] HELPER: Multiplies the first argument in place by every entry of the
+            # tuple and every variadic argument and returns it.
             out = pos0
             for arg in tuple0:
                 out *= arg
@@ -2241,7 +2826,12 @@ def forward(self, x):
         ],
     )
     def test_export_with_args_with_default(self, default_value):
+        # [FUNCTION DOC] Parameterized over default values (none, float, tensor, tuple; tensor and
+        # tuple expected to fail): exports a function with a defaulted positional argument via the
+        # signature-preserving helper, expecting only the first argument as an input name.
         def fn(pos0, pos1_default=default_value):
+            # [FUNCTION DOC] HELPER: Multiplies the input in place by the default, first replacing
+            # a None default with a random tensor and unwrapping a tuple to its first entry.
             out = pos0
             if pos1_default is None:
                 pos1_default = torch.randn(4)
@@ -2276,7 +2866,13 @@ def forward(self, x):
         ],
     )
     def test_export_with_kwargs_with_default(self, default_value):
+        # [FUNCTION DOC] Parameterized over default values (none, float, tensor, tuple; tensor and
+        # tuple expected to fail): exports a function with a keyword-only required argument, a
+        # defaulted keyword and extra keywords via the signature-preserving helper.
         def fn(pos0, *, kw0, kw1_default=default_value, **kwargs):
+            # [FUNCTION DOC] HELPER: Adds the required keyword, the defaulted keyword (replaced by
+            # random tensor if None, or unwrapped if a tuple) and the extra keyword kw2 to the
+            # input in place.
             out = pos0
             out += kw0
             if kw1_default is None:
@@ -2299,10 +2895,17 @@ def forward(self, x):
         )
 
     def test_export_with_wrapped_fn(self):
+        # [FUNCTION DOC] Exports a generic wrapper function (variadic positional and keyword
+        # arguments) that forwards to a function with a rich signature; since the original
+        # signature is not inspectable, the expected names are numbered positional entries
+        # followed by the keyword names.
         # To ensure dynamo.export is robust to wrapped functions
         # when it cannot use `inspect` to retrieve original signature
         # info.
         def _fn(pos0, pos1=1.0, *args, kw0, kw1=2.0, **kwargs):
+            # [FUNCTION DOC] HELPER: Sums the first argument, the defaulted positional, the
+            # keyword-only required, the defaulted keyword, all extra positionals and all extra
+            # keyword values, in place, and returns it.
             out = pos0
             out += pos1
             out += kw0
@@ -2314,6 +2917,8 @@ def forward(self, x):
             return out
 
         def wrapped_fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards all positional and keyword arguments to the wrapped
+            # function and returns its result.
             return _fn(*args, **kwargs)
 
         pos0 = torch.randn(4)
@@ -2329,22 +2934,36 @@ def forward(self, x):
         )
 
     def test_export_with_functools_wrapped_method(self):
+        # [FUNCTION DOC] Exports a bound method that was decorated with a functools wrapping
+        # decorator; the exported graph should keep the original parameter names for the named
+        # positionals and number the extra positional.
         def test_decorator(func):
+            # [FUNCTION DOC] HELPER: Decorator factory returning a wrapper (built with functools
+            # wraps) around the given function.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Forwards all arguments to the decorated function and
+                # returns its result.
                 return func(*args, **kwargs)
 
             return wrapper
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an identity forward and a decorated method taking
+            # positional, defaulted, variadic and keyword arguments.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only initializes the base module.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
             @test_decorator
             def method_to_test(self, pos0, pos1=1.0, *args, kw0, kw1=2.0, **kwargs):
+                # [FUNCTION DOC] HELPER: Decorated method; adds the other arguments (defaulted
+                # positional, required keyword, defaulted keyword, extras) to the first in place
+                # and returns it.
                 out = pos0
                 out += pos1
                 out += kw0
@@ -2373,15 +2992,23 @@ def forward(self, x):
         )
 
     def test_export_with_functools_wrapped_fn(self):
+        # [FUNCTION DOC] Exports a wrapper function that calls a functools-decorated function,
+        # checking numbered positional names and keyword names are preserved.
         def test_decorator(func):
+            # [FUNCTION DOC] HELPER: Decorator factory returning a wrapper (built with functools
+            # wraps) around the given function.
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Forwards all arguments to the decorated function and
+                # returns its result.
                 return func(*args, **kwargs)
 
             return wrapper
 
         @test_decorator
         def _fn(pos0, pos1=1.0, *args, kw0, kw1=2.0, **kwargs):
+            # [FUNCTION DOC] HELPER: Decorated function; adds the other arguments to the first in
+            # place and returns it.
             out = pos0
             out += pos1
             out += kw0
@@ -2393,6 +3020,8 @@ def forward(self, x):
             return out
 
         def wrapped_fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards all arguments to the decorated function and returns
+            # its result.
             return _fn(*args, **kwargs)
 
         pos0 = torch.randn(4)
@@ -2410,6 +3039,10 @@ def forward(self, x):
     def _test_export_preserving_original_signature(
         self, fn, expected_argument_names: Sequence[str], *args, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: Shared checker. Resets dynamo, exports fn with the example args
+        # and kwargs without aten graph, asserts the exported module matches the original function
+        # on those inputs, and that the exported forward's argument names (excluding self) equal
+        # the expected list.
         torch._dynamo.reset()
         exported = torch._dynamo.export(
             fn,
@@ -2429,14 +3062,20 @@ def forward(self, x):
         )
 
     def test_dataclass_input_output(self):
+        # [FUNCTION DOC] Checks that exporting a function taking a dataclass instance, and one
+        # returning a dataclass instance, each raise UserError with a message saying the input or
+        # output type is not supported or pytree-flattenable.
         from dataclasses import dataclass
 
         @dataclass
         class Tensors:
+            # [CLASS DOC] HELPER: Dataclass holding two tensors x and y; not registered with
+            # pytree, which is why export rejects it.
             x: torch.Tensor
             y: torch.Tensor
 
         def f(t):
+            # [FUNCTION DOC] HELPER: Returns the sum of the dataclass fields x and y.
             return t.x + t.y
 
         with self.assertRaisesRegex(
@@ -2449,6 +3088,8 @@ def forward(self, x):
             )
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Redefinition of f; returns the dataclass holding the sine of
+            # the first argument and the cosine of the second.
             return Tensors(x=x.sin(), y=y.cos())
 
         with self.assertRaisesRegex(
@@ -2459,7 +3100,10 @@ def forward(self, x):
             torch._dynamo.export(f, aten_graph=False)(torch.randn(10), torch.randn(10))
 
     def test_empty(self):
+        # [FUNCTION DOC] Exports an identity function and an argument-less module returning a
+        # stored tensor and checks the exported graphs return the input and the stored tensor.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input unchanged.
             return x
 
         exported = torch._dynamo.export(f)(torch.randn(3, 3))
@@ -2468,11 +3112,15 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(inp, out_graph(inp)))
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a 3x3 tensor of ones as a plain attribute and
+            # returning it from an argument-less forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores the ones tensor.
                 super().__init__()
                 self.a = torch.ones(3, 3)
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the stored tensor.
                 return self.a
 
         exported = torch._dynamo.export(M())()
@@ -2480,12 +3128,17 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(torch.ones(3, 3), out_graph()))
 
     def test_export_meta(self):
+        # [FUNCTION DOC] Builds a module under the meta device, exports it with a meta-device
+        # input, and checks that running the exported graph equals running the module.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 2x3 parameter added to the input in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the parameter of ones.
                 super().__init__()
                 self.p = torch.nn.Parameter(torch.ones(2, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the parameter plus the input.
                 return self.p + x
 
         with torch.device("meta"):
@@ -2498,8 +3151,15 @@ def forward(self, x):
         self.assertEqual(dynamo_result, m(inp))
 
     def test_constraint_violation_error_messages(self):
+        # [FUNCTION DOC] Checks the messages of the constraint errors raised by torch.export in
+        # strict mode for three modules: a relationship between two dimensions with ranges, a
+        # dimension marked dynamic but specialized to a constant, and a range-restricted guard.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether the first dimension equals twice
+            # the second.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if the first dimension is twice the second, else
+                # adds two.
                 if x.shape[0] == x.shape[1] * 2:
                     return x + 1
                 else:
@@ -2521,7 +3181,9 @@ def forward(self, x):
             torch.export.export(foo, (t,), dynamic_shapes=dynamic_shapes, strict=True)
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether the first dimension equals five.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if the first dimension is five, else adds two.
                 if x.shape[0] == 5:
                     return x + 1
                 else:
@@ -2540,7 +3202,11 @@ def forward(self, x):
             torch.export.export(bar, (t,), dynamic_shapes=dynamic_shapes, strict=True)
 
         class Qux(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on the first dimension being between five and
+            # ten exclusive.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if the first dimension is greater than five and
+                # less than ten, else adds two.
                 if x.shape[0] > 5 and x.shape[0] < 10:
                     return x + 1
                 else:
@@ -2558,10 +3224,15 @@ def forward(self, x):
             torch.export.export(qux, (t,), dynamic_shapes=dynamic_shapes, strict=True)
 
     def test_untracked_inputs_in_constraints(self):
+        # [FUNCTION DOC] Exports with dynamic dimensions on two inputs, one of which is unused,
+        # then calls the exported module with a different size for the unused input and checks
+        # that no specialization error occurs.
         from copy import copy
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that uses only its second input.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the second input plus one; the first is unused.
                 return y + 1
 
         foo = Foo()
@@ -2579,9 +3250,14 @@ def forward(self, x):
         ep.module()(torch.randn(3), y)  # no specialization error
 
     def test_export_raise_guard_full_constraint(self):
+        # [FUNCTION DOC] Checks that exporting a function whose branch specializes the first
+        # dimension to three succeeds unconstrained but raises ConstraintViolationError when that
+        # dimension is declared dynamic.
         y = torch.randn([3, 3, 3])
 
         def my_dyn_fn(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input if its first dimension is three,
+            # else cosine.
             if x.shape[0] == 3:
                 return x.sin()
             return x.cos()
@@ -2594,10 +3270,15 @@ def forward(self, x):
             )(y)
 
     def test_export_module_specify_constraints_signature(self):
+        # [FUNCTION DOC] Same as the full constraint test but for a module; the error message must
+        # mention the dimension being equal to three.
         y = torch.randn([3, 3, 3])
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether the first dimension equals three.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns sine of the input if its first dimension is
+                # three, else cosine.
                 if x.shape[0] == 3:
                     return x.sin()
                 return x.cos()
@@ -2611,9 +3292,13 @@ def forward(self, x):
             )
 
     def test_export_raise_guard_partial_constraint(self):
+        # [FUNCTION DOC] Checks that a guard of first dimension greater than three conflicts with
+        # a dynamic dimension that has no bounds and raises ConstraintViolationError.
         y = torch.randn([3, 3, 3])
 
         def my_dyn_fn(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input if its first dimension exceeds
+            # three, else cosine.
             if x.shape[0] > 3:
                 return x.sin()
             return x.cos()
@@ -2626,9 +3311,14 @@ def forward(self, x):
             )(y)
 
     def test_export_raise_on_relationship(self):
+        # [FUNCTION DOC] Checks that forcing one symbolic dimension onto the same axis of three
+        # inputs raises ConstraintViolationError when the code requires equality across different
+        # axes, and that using the matching axes succeeds.
         y = torch.randn([3, 3, 3])
 
         def my_dyn_fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns sine of the first input if dimension 0 of the first,
+            # dimension 1 of the second and dimension 2 of the third are all equal, else cosine.
             if a.shape[0] == b.shape[1] == c.shape[2]:
                 return a.sin()
 
@@ -2643,9 +3333,13 @@ def forward(self, x):
         torch._dynamo.export(my_dyn_fn, dynamic_shapes=dynamic_shapes)(y, y, y)
 
     def test_export_no_raise(self):
+        # [FUNCTION DOC] Checks that exporting with a shared dynamic dimension does not raise when
+        # the code only depends on a different dimension.
         y = torch.randn([3, 3, 3])
 
         def my_dyn_fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns cosine of the first input if its second dimension is
+            # three, else the product of all three inputs.
             if a.shape[1] == 3:
                 return a.cos()
             return a * b * c
@@ -2656,11 +3350,17 @@ def forward(self, x):
         torch._dynamo.export(my_dyn_fn, dynamic_shapes=dynamic_shapes)(y, y, y)
 
     def test_export_multi_dynamic_dim_unsafe_relationship(self):
+        # [FUNCTION DOC] Checks that independent dynamic dimensions on inputs that the code
+        # compares raise ConstraintViolationError, and that reusing the same dimension object for
+        # those two inputs succeeds.
         x = torch.randn([3, 3, 3])
         y = torch.randn([2, 2, 2])
         z = torch.randn([3, 3, 3])
 
         def my_dyn_fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns cosine of the first input if the first dimensions of
+            # the first and third inputs are equal, else the product of those inputs and the
+            # second input.
             if a.shape[0] == c.shape[0]:
                 return a.cos()
             return a * c, b
@@ -2675,8 +3375,15 @@ def forward(self, x):
         torch._dynamo.export(my_dyn_fn, dynamic_shapes=dynamic_shapes)(x, y, z)
 
     def test_remove_redundant_dynamic_dim_in_error_message(self):
+        # [FUNCTION DOC] Checks that the constraint error message for a comparison between two
+        # inputs, one in a dict, mentions the relation of the second dimension to the first
+        # (without redundant info).
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module comparing the first dimension of its input with that of a
+            # dictionary entry.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the input plus one if the first dimensions match,
+                # else minus one.
                 if x.shape[0] == y["k"].shape[0]:
                     return x + 1
                 else:
@@ -2696,8 +3403,14 @@ def forward(self, x):
             )
 
     def test_enforce_equalities(self):
+        # [FUNCTION DOC] Checks that a matmul with batch and shared size dimensions raises a
+        # UserError about unequal sizes for mismatching inputs when using the new
+        # experimental tracer, and with matching inputs the exported placeholders have equal
+        # last two dimensions.
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing a matrix product of its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matrix product of the two inputs.
                 return torch.matmul(x, y)
 
         bar = Bar()
@@ -2732,7 +3445,12 @@ def forward(self, x):
         capture_scalar_outputs=True,
     )
     def test_export_preserve_constraints_as_metadata_tensor(self):
+        # [FUNCTION DOC] Exports with aten graph and symbolic tracing a function that takes the
+        # nonzero indices and checks that their count lies in a given range; only verifies that
+        # export succeeds with dynamic output shape, specialized int and scalar capture enabled.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes nonzero indices, asserts via torch checks the count
+            # is between two and five, and returns the indices.
             b = x.nonzero()
             torch._check(b.shape[0] >= 2)
             torch._check(b.shape[0] <= 5)
@@ -2751,7 +3469,12 @@ def forward(self, x):
         capture_scalar_outputs=True,
     )
     def test_exported_graph_serialization(self):
+        # [FUNCTION DOC] Exports with aten graph and symbolic tracing a function building a tensor
+        # from a scalar and a dynamic size, then saves the graph module to an in-memory buffer to
+        # check it is serializable.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Reads the scalar value of the first input and returns an
+            # uninitialized tensor of shape scalar by the second input's first dimension.
             b = x.item()
             return torch.empty((b, y.shape[0]))
 
@@ -2772,9 +3495,13 @@ def forward(self, x):
         torch.save(gm, buffer)
 
     def test_export_dynamic_dim_not_1(self):
+        # [FUNCTION DOC] Checks that a guard where the first dimension must not be one conflicts
+        # with a dynamic dimension and raises ConstraintViolationError.
         x = torch.randn([1, 1, 1])
 
         def my_dyn_fn(a):
+            # [FUNCTION DOC] HELPER: Returns cosine of the input if its first dimension is not
+            # one, else the input squared.
             if a.shape[0] != 1:
                 return a.cos()
             return a * a
@@ -2786,7 +3513,11 @@ def forward(self, x):
             )(x)
 
     def test_symbool(self):
+        # [FUNCTION DOC] Exports with aten graph a function using a boolean derived from a shape
+        # comparison; checks the graph on a smaller input matches eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Builds a scalar tensor from the comparison of the first
+            # dimension to four and returns the sum of the sine of the input plus that scalar.
             a = torch.scalar_tensor(x.shape[0] > 4)
             return x.sin().sum() + a.sum()
 
@@ -2794,11 +3525,17 @@ def forward(self, x):
         self.assertEqual(gm(torch.ones(3, 4)), f(torch.ones(3, 4)))
 
     def test_export_multi_dynamic_dim_constraint(self):
+        # [FUNCTION DOC] Checks that making all dimensions of the first input dynamic while the
+        # code compares first dimensions of two inputs raises ConstraintViolationError, and that
+        # sharing the first dimension with the third input succeeds.
         x = torch.randn([3, 3, 3])
         y = torch.randn([2, 2, 2])
         z = torch.randn([3, 3, 3])
 
         def my_dyn_fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns cosine of the first input if first dimensions of
+            # the first and third inputs are equal, else a pair with their product and the
+            # second input.
             if a.shape[0] == c.shape[0]:
                 return a.cos()
             return a * c, b
@@ -2812,10 +3549,15 @@ def forward(self, x):
         torch._dynamo.export(my_dyn_fn, dynamic_shapes=dynamic_shapes)(x, y, z)
 
     def test_export_dynamic_dim_range_constraint(self):
+        # [FUNCTION DOC] Exports with a bounded dynamic dimension of five to six: a
+        # function with a guard that is compatible succeeds, and one with a guard above
+        # five raises ConstraintViolationError.
         x = torch.ones(6, 4, 4)
         dynamic_shapes = ({0: torch.export.Dim("dimx", min=5, max=6)},)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input if its first dimension is above
+            # three, else cosine.
             if x.shape[0] > 3:  # ok
                 return x.sin()
             return x.cos()
@@ -2827,6 +3569,8 @@ def forward(self, x):
         )(x)
 
         def bar(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input if its first dimension is above
+            # five, else cosine.
             if x.shape[0] > 5:  # error
                 return x.sin()
             return x.cos()
@@ -2839,8 +3583,15 @@ def forward(self, x):
             )(x)
 
     def test_trivial_constraint(self):
+        # [FUNCTION DOC] Checks that a complex or non-trivial divisibility condition on a dynamic
+        # dimension raises a constraints violated UserError, while a trivially true condition
+        # exports without error.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on a divisibility condition that is not
+            # always true.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if a linear expression of the first dimension is
+                # divisible by another linear expression, else subtracts one.
                 # complex divisibility condition
                 if (2 * x.shape[0] + 3) % (x.shape[0] - 3) == 0:
                     return x + 1
@@ -2850,7 +3601,11 @@ def forward(self, x):
         foo = Foo()
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on a divisibility condition that is
+            # always true.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if twice the first dimension plus two is
+                # divisible by the first dimension plus one (always true), else subtracts one.
                 # trivially true
                 if (2 * x.shape[0] + 2) % (x.shape[0] + 1) == 0:
                     return x + 1
@@ -2860,7 +3615,11 @@ def forward(self, x):
         bar = Bar()
 
         class Qux(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module branching on whether three times the first dimension
+            # is even.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one if three times the first dimension is even, else
+                # subtracts one.
                 # simple divisibility condition (not trivially true)
                 if (3 * x.shape[0]) % 2 == 0:
                     return x + 1
@@ -2887,7 +3646,11 @@ def forward(self, x):
             torch.export.export(qux, (x,), dynamic_shapes=dynamic_shapes, strict=True)
 
     def test_list_contains(self):
+        # [FUNCTION DOC] Exports with aten graph a function with an assert on a list membership
+        # test of the last dimension size; checks the result equals the compiled one.
         def func(x):
+            # [FUNCTION DOC] HELPER: Asserts the last dimension is one of four, five or six and
+            # returns the input doubled.
             assert x.size(-1) in [4, 5, 6], "bad"  # noqa: S101
             return x + x
 
@@ -2905,7 +3668,11 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_list_not_contains(self):
+        # [FUNCTION DOC] Exports with aten graph a function with asserts using not-in membership
+        # tests on a size and on strings; compares to compiled result.
         def func(x):
+            # [FUNCTION DOC] HELPER: Asserts the first dimension is not one of four, five or six
+            # and that a string is not in a list of animals, then returns the input doubled.
             assert x.size(0) not in [4, 5, 6], "bad1"  # noqa: S101
             assert "monkey" not in ["cow", "pig"], "bad2"  # noqa: S101
             return x + x
@@ -2924,9 +3691,12 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(real_result, dynamo_result))
 
     def test_export_identity(self):
+        # [FUNCTION DOC] Exports an identity function and checks the exported module returns
+        # the input.
         inp = torch.tensor([0.1, 0.1])
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the input unchanged.
             return x
 
         torch._dynamo.reset()
@@ -2935,11 +3705,18 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(inp, dynamo_result))
 
     def test_export_specialized_int(self):
+        # [FUNCTION DOC] Exports a module with an int attribute and a layer norm epsilon
+        # and asserts the graph has exactly one placeholder, showing int and float values
+        # are specialized.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a layer norm and an int attribute; forward
+            # multiplies cosine of the input by both the int and the layer norm epsilon.
             def __init__(
                 self,
                 input_dim,
             ):
+                # [FUNCTION DOC] HELPER: Builds a layer norm of the given dimension with eps 1e-5
+                # and stores an int of 100.
                 super().__init__()
                 self.torch_module = torch.nn.LayerNorm(
                     input_dim, eps=1e-5, elementwise_affine=True
@@ -2947,6 +3724,8 @@ def forward(self, x):
                 self.int_val = 100
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Returns the input cosine times the int attribute times
+                # the layer norm epsilon.
                 return input.cos() * self.int_val * self.torch_module.eps
 
         mod = Foo(128)
@@ -2961,12 +3740,18 @@ def forward(self, x):
         self.assertEqual(count, 1)
 
     def test_export_with_nonzero_static(self):
+        # [FUNCTION DOC] Exports a module calling nonzero_static with a fixed size for two input
+        # kinds; checks the output length equals the size and the values match a direct call.
         class BasicModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a static size and returning the static-size
+            # nonzero indices of the input.
             def __init__(self, static_size):
+                # [FUNCTION DOC] HELPER: Stores the static size.
                 super().__init__()
                 self.static_size = static_size
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the static-size nonzero indices of the input.
                 return torch.nonzero_static(x, size=self.static_size)
 
         input_tensors = torch.tensor([6, 8]), torch.zeros(2, 3)
@@ -2983,12 +3768,17 @@ def forward(self, x):
             )
 
     def test_export_pass_arg_by_name(self):
+        # [FUNCTION DOC] Exports a linear module and checks the original and exported modules both
+        # accept the input passed by keyword name and agree.
         class BasicModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 3 to 4 linear layer with bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.my_lin = torch.nn.Linear(3, 4, bias=True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input.
                 return self.my_lin(x)
 
         mod, input_tensor = BasicModule(), torch.randn(2, 3)
@@ -2998,12 +3788,19 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(ref, res))
 
     def test_export_pass_arg_by_name_star_args(self):
+        # [FUNCTION DOC] Exports a module taking variadic positional inputs and checks original
+        # and exported modules agree on two inputs.
         class BasicModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer whose forward multiplies the layer
+            # applied to the first and second variadic inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.my_lin = torch.nn.Linear(3, 4, bias=True)
 
             def forward(self, *args):
+                # [FUNCTION DOC] HELPER: Returns the product of the linear layer on the first and
+                # on the second input.
                 return self.my_lin(args[0]) * self.my_lin(args[1])
 
         mod, input_tensor, input_tensor2 = (
@@ -3017,9 +3814,12 @@ def forward(self, x):
         self.assertTrue(torch._dynamo.utils.same(ref, res))
 
     def test_export_dynamic_dim_cleanup(self):
+        # [FUNCTION DOC] Exports a function with a dynamic dimension on its input; only checks
+        # that it does not raise.
         y = torch.randn([3, 3, 3])
 
         def my_dyn_fn(x):
+            # [FUNCTION DOC] HELPER: Returns cosine of the input.
             return x.cos()
 
         torch._dynamo.export(my_dyn_fn, dynamic_shapes=({0: torch.export.Dim("dim")},))(
@@ -3028,7 +3828,12 @@ def forward(self, x):
 
     @config.patch(capture_dynamic_output_shape_ops=True)
     def test_export_dynamic_control_flow_error(self):
+        # [FUNCTION DOC] With dynamic output shape ops captured, checks that export of a function
+        # that branches on a nonzero result raises the dynamo Unsupported error with a message
+        # about data-dependent branching.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns cosine of the input if the nonzero indices compare
+            # greater than three, else sine.
             if x.nonzero() > 3:
                 return x.cos()
             return x.sin()
@@ -3041,7 +3846,13 @@ def forward(self, x):
 
     @config.patch(assume_static_by_default=False)
     def test_export_persist_assert(self):
+        # [FUNCTION DOC] With dynamic shapes by default, exports a function with a tensor-valued
+        # assert; checks the aten assert op appears in the graph, still appears after dead code
+        # elimination and recompile, and that running on a violating input raises RuntimeError
+        # with the assert message.
         def f(x):
+            # [FUNCTION DOC] HELPER: Asserts that the sum of the first slice exceeds four with a
+            # message, then returns the sum of cosine and sine of the input.
             assert x[0].sum() > 4, "Shape must be more than 4"  # noqa: S101
             return x.cos() + x.sin()
 
@@ -3050,6 +3861,8 @@ def forward(self, x):
         )
 
         def has_aten_op(gm, op):
+            # [FUNCTION DOC] HELPER: Returns True if any node in the graph has the given target,
+            # else False.
             for node in gm.graph.nodes:
                 if node.target == op:
                     return True
@@ -3072,12 +3885,22 @@ def forward(self, x):
         ],
     )
     def test_access_class_method_from_user_class(self, type_fn):
+        # [FUNCTION DOC] Parameterized over how the type of an instance is obtained (builtin type
+        # or its class attribute); exports a function that calls a class method through that type
+        # and checks agreement with eager.
         class A:
+            # [CLASS DOC] HELPER: User class with a single class method that builds a tensor of
+            # four and five.
             @classmethod
             def func(cls):
+                # [FUNCTION DOC] HELPER: Class method returning a tensor with the values four
+                # and five.
                 return torch.Tensor([4, 5])
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Creates an instance of the user class and returns the input
+            # sum plus the sum of the tensor from calling the class method via the type obtained
+            # by the parametrized function.
             a = A()
             return x.sum() + type_fn(a).func().sum()
 
@@ -3085,12 +3908,20 @@ def forward(self, x):
         self.assertEqual(f(torch.ones(6, 4)), gm(torch.ones(6, 4)))
 
     def test_not_functionalize(self):
+        # [FUNCTION DOC] Exports with symbolic tracing a module that mutates its input in place;
+        # asserts exactly one in-place add node remains (no functionalization) and results match
+        # eager on fresh inputs.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer of ones whose forward adds two to its input
+            # in place and returns the sum of the input and the buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers the buffer.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.ones(6, 2))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds two in place to the input and returns the input sum
+                # plus the buffer sum.
                 x.add_(2)
                 return x.sum() + self.buffer1.sum()
 
@@ -3110,7 +3941,11 @@ def forward(self, x):
         self.assertEqual(gm(*test_inp), Foo()(*test_inp_v2))
 
     def test_round_dynamic_shapes(self):
+        # [FUNCTION DOC] Exports with aten graph a function that slices by a rounded half of the
+        # first dimension; checks the result matches eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the leading rows of the input, count equal to half
+            # the first dimension rounded.
             return x[: round(x.shape[0] / 2)]
 
         gm, _ = torch._dynamo.export(f, aten_graph=True)(torch.ones(6, 4))
@@ -3118,19 +3953,30 @@ def forward(self, x):
         self.assertEqual(f(torch.ones(6, 4)), gm(torch.ones(6, 4)))
 
     def test_cond_supported_pred_types(self):
+        # [FUNCTION DOC] Exports three functions each calling a conditional with a different kind
+        # of predicate (symbolic shape comparison, tensor value, and compound expression) and
+        # checks each exported graph matches eager.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch returning cosine of the input.
             return x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch returning sine of the input.
             return x.sin()
 
         def f_pred_traced_as_symnode_var(x):
+            # [FUNCTION DOC] HELPER: Conditional whose predicate is a comparison of the first
+            # dimension with two.
             return cond(x.shape[0] > 2, true_fn, false_fn, [x])
 
         def f_pred_traced_as_tensor_var(x):
+            # [FUNCTION DOC] HELPER: Conditional whose predicate is a tensor reduction that tests
+            # whether all entries are true.
             return cond(x.all(), true_fn, false_fn, [x])
 
         def f_pred_complex_expression_traced_as_symnode_var(x):
+            # [FUNCTION DOC] HELPER: Conditional whose predicate is a compound expression of the
+            # dimension count and bounds on the second dimension.
             return cond(
                 x.dim() > 1 and x.shape[1] > 5 and x.shape[1] <= 10,
                 true_fn,
@@ -3148,26 +3994,42 @@ def forward(self, x):
             self.assertEqual(gm(*example_inputs), f(*example_inputs))
 
     def test_sum_param(self):
+        # [FUNCTION DOC] Exports a module that sets a new attribute inside forward; checks only
+        # that export does not fail.
         # Setting a new attribute inside forward()
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random tensor attribute that sets an int attribute
+            # in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores a random tensor attribute.
                 super().__init__()
                 self.a = torch.randn(3, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sets attribute b to two and returns the input sum plus
+                # the stored tensor sum plus b.
                 self.b = 2
                 return x.sum() + self.a.sum() + self.b
 
         torch._dynamo.export(Foo())(torch.randn(3, 2))
 
     def test_mixed_real_and_fake_inputs(self):
+        # [FUNCTION DOC] Exports with aten graph a conv plus batch norm pattern module on a real
+        # input, to check export handles mixed real and fake tensors without error.
         class _TestPattern(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 1x1 convolution and a batch norm; forward folds
+            # the batch norm scale into the convolution weight, convolves with a zero bias,
+            # rescales and adds the original bias, then applies batch norm.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the convolution and batch norm layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
                 self.bn = torch.nn.BatchNorm2d(1)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Computes a scaled weight from batch norm statistics, runs
+                # the convolution with the scaled weight and zero bias, undoes the scale, adds the
+                # bias and returns the batch norm output.
                 running_std = torch.sqrt(self.bn.running_var + self.bn.eps)
                 scale_factor = self.bn.weight / running_std
                 weight_shape = [1] * len(self.conv.weight.shape)
@@ -3194,7 +4056,12 @@ def forward(self, x):
         assume_static_by_default=False,
     )
     def test_sym_contains(self):
+        # [FUNCTION DOC] With dynamic shapes by default, exports a function testing membership of
+        # an input's size in a tensor; checks the graph agrees with eager on inputs where the
+        # result is true and false.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns whether the first dimension of the first input is
+            # contained in the second input.
             return x.size(0) in y
 
         gm, _ = torch._dynamo.export(f, aten_graph=True)(torch.ones(2), torch.ones(3))
@@ -3205,13 +4072,19 @@ def forward(self, x):
         self.assertEqual(gm(*false_inp), f(*false_inp))
 
     def test_cond_raise_user_error_on_missing_args(self):
+        # [FUNCTION DOC] Checks that calling a function that uses a conditional without operands
+        # (no export involved) raises TypeError complaining about the missing positional argument
+        # of the false branch.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch returning cosine of the input.
             return x.cos()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch returning sine of the input.
             return x.sin()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the conditional with a shape predicate and no operands.
             return cond(x.shape[0] > 10, true_fn, false_fn)
 
         # Now we allow torch.cond to handle empty args
@@ -3223,7 +4096,11 @@ def forward(self, x):
             f(*example_inputs)
 
     def test_cond_raise_user_error_on_unsupported_pred(self):
+        # [FUNCTION DOC] Checks that calling a function using a module object as the conditional
+        # predicate (eagerly, no export) raises RuntimeError saying pred must be a bool or tensor.
         def f_unsupported_pred(x):
+            # [FUNCTION DOC] HELPER: Builds a plain module as the predicate and runs the
+            # conditional with sine and cosine lambdas.
             pred = torch.nn.Module()
             return cond(pred, lambda x: x.sin(), lambda x: x.cos(), [x])
 
@@ -3235,7 +4112,12 @@ def forward(self, x):
             f_unsupported_pred(*example_inputs)
 
     def test_cond_raise_user_error_on_non_list_operands(self):
+        # [FUNCTION DOC] Checks that calling a function that passes a bare tensor instead of a
+        # list as operands raises RuntimeError saying operands must be a tuple of possibly nested
+        # dict, list or tuple.
         def f_non_list_operands(x):
+            # [FUNCTION DOC] HELPER: Runs the conditional with a true tensor predicate and the
+            # input passed directly as operands.
             return cond(torch.tensor(True), lambda x: x.sin(), lambda x: x.cos(), x)
 
         example_inputs = (torch.rand(5),)
@@ -3246,7 +4128,11 @@ def forward(self, x):
             f_non_list_operands(*example_inputs)
 
     def test_cond_raise_user_error_on_non_tensor_operands(self):
+        # [FUNCTION DOC] Checks that calling a function passing a float inside the operand list
+        # raises RuntimeError with the operands message (eager call, no export).
         def f_non_tensor_operands(x):
+            # [FUNCTION DOC] HELPER: Runs the conditional with a tensor predicate and operands
+            # made of the input and a float.
             a: float = 3.14
             return cond(
                 torch.tensor(1234), lambda x, a: x.sin(), lambda x, a: x.cos(), [x, a]
@@ -3260,13 +4146,20 @@ def forward(self, x):
             f_non_tensor_operands(*example_inputs)
 
     def test_cond_raise_user_error_on_branch_args_mismatch(self):
+        # [FUNCTION DOC] Checks that exporting a function whose branches take different numbers of
+        # arguments raises UncapturedHigherOrderOpError mentioning the cond operator.
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: True branch taking two arguments and returning sine of
+            # the first.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch taking one argument and returning cosine of it.
             return x.cos()
 
         def f_branch_args_mismatch(x, y):
+            # [FUNCTION DOC] HELPER: Runs the conditional with a four-dimensional true tensor
+            # predicate and both inputs.
             return cond(torch.tensor([[[[True]]]]), true_fn, false_fn, [x, y])
 
         example_inputs = (torch.rand(5), torch.rand(2))
@@ -3283,13 +4176,21 @@ def forward(self, x):
 
     @config.patch(suppress_errors=True)
     def test_uncaptured_higher_order_op_error_not_suppresed(self):
+        # [FUNCTION DOC] With error suppression enabled in config, checks the mismatched
+        # branch arguments still raise UncapturedHigherOrderOpError mentioning the cond
+        # operator (not suppressed).
         def true_fn(x, y):
+            # [FUNCTION DOC] HELPER: True branch taking two arguments and returning sine of
+            # the first.
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch taking one argument and returning cosine of it.
             return x.cos()
 
         def f_branch_args_mismatch(x, y):
+            # [FUNCTION DOC] HELPER: Runs the conditional with a tensor predicate of value 100 and
+            # both inputs.
             return cond(torch.tensor([[[[100]]]]), true_fn, false_fn, [x, y])
 
         example_inputs = (torch.rand(5), torch.rand(2))
@@ -3305,7 +4206,11 @@ def forward(self, x):
             )
 
     def test_cond_raise_user_error_on_branch_return_non_tensor(self):
+        # [FUNCTION DOC] Checks that exporting a conditional whose branches return a Python float
+        # raises UncapturedHigherOrderOpError mentioning the cond operator.
         def f_branch_return_non_tensor(x):
+            # [FUNCTION DOC] HELPER: Runs the conditional with a shape predicate and two lambdas
+            # returning a float.
             return cond(x.shape[0] <= 5, lambda x: 3.14, lambda x: 3.14, [x])
 
         example_inputs = (torch.rand(5),)
@@ -3319,7 +4224,11 @@ def forward(self, x):
             )(*example_inputs)
 
     def test_cond_raise_user_error_on_branch_return_multiple_tensors(self):
+        # [FUNCTION DOC] Exports a conditional whose branches both return a tuple of two clones,
+        # and checks the exported graph equals eager.
         def f_branch_return_multiple_tensors(pred, x, y):
+            # [FUNCTION DOC] HELPER: Runs the conditional with predicate pred on operand list
+            # holding only y, branches returning two clones.
             return cond(
                 pred,
                 lambda x: (x.clone(), x.clone()),
@@ -3337,8 +4246,12 @@ def forward(self, x):
         )
 
     def test_multiple_outputs_op_with_evaluator(self):
+        # [FUNCTION DOC] Exports a module using top-k and a sum to check an op with multiple
+        # outputs works with export; only checks that it does not raise.
         class TopKModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of the top three values of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes the three largest values and returns their sum.
                 values, _ = torch.topk(x, 3)
                 return torch.sum(values)
 
@@ -3346,13 +4259,19 @@ def forward(self, x):
         torch._dynamo.export(TopKModel())(x)
 
     def test_cond_raise_user_error_on_mismatch_return_length(self):
+        # [FUNCTION DOC] Checks that export of a conditional whose branches return a single
+        # tensor versus a tuple raises TorchRuntimeError saying the output spec from the branches
+        # is unmatched.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch returning a clone of the input.
             return x.clone()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch returning a tuple of two clones.
             return (x.clone(), x.clone())
 
         def f_mismatch_return_length(x):
+            # [FUNCTION DOC] HELPER: Runs the conditional with tensor predicate 100 and the input.
             return cond(torch.tensor(100), true_fn, false_fn, [x])
 
         example_inputs = (torch.rand(5),)
@@ -3366,13 +4285,19 @@ def forward(self, x):
             )(*example_inputs)
 
     def test_cond_raise_user_error_on_mismatch_return_tensor_meta(self):
+        # [FUNCTION DOC] Checks that export of a conditional whose branches return tensors of
+        # different dtype and shape raises TorchRuntimeError about merging the two branch outputs.
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch returning an int tensor of shape two by one.
             return torch.tensor([[3], [2]])
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch returning a float tensor of one element.
             return torch.tensor([3.14])
 
         def f_return_tensor_mismatch(x):
+            # [FUNCTION DOC] HELPER: Runs the conditional with predicate on the first dimension
+            # being below three.
             return cond(x.shape[0] < 3, true_fn, false_fn, [x])
 
         example_inputs = (torch.rand(5),)
@@ -3385,8 +4310,12 @@ def forward(self, x):
             )
 
     def test_byte_tensor_does_not_crash(self):
+        # [FUNCTION DOC] Regression check for issue 100455: compiles dynamically a function
+        # building a byte tensor from text, called with two different lengths, to verify no crash.
         # See https://github.com/pytorch/pytorch/issues/100455
         def func(text):
+            # [FUNCTION DOC] HELPER: Builds a byte tensor from the UTF-8 bytes of the text and
+            # returns it doubled.
             tensor = torch.ByteTensor(list(bytes(text, "utf8")))
             return tensor + tensor
 
@@ -3397,8 +4326,15 @@ def forward(self, x):
             opt_func(input)
 
     def test_export_defaults_ok(self):
+        # [FUNCTION DOC] Exports with aten graph a module slicing the input in a loop of four
+        # iterations with offsets depending on the iteration and on the input sizes; compares the
+        # generated code to a golden string.
         class DynamicSliceExportMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a tuple of four dynamic slices of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: For each of four offsets, slices the input leading
+                # dimension down by the offset, the second dimension from the offset, and the last
+                # from the offset to three, and returns the slices as a tuple.
                 results = []
                 for i in range(4):
                     results.append(x[: x.size(0) - i, i : x.size(2), i:3])
@@ -3432,9 +4368,14 @@ def forward(self, x):
         )
 
     def test_capture_symbolic_tracing_simple_within_fake_mode(self):
+        # [FUNCTION DOC] Creates a user FakeTensorMode with a shape environment and exports a
+        # function drawing random numbers with and without aten graph; asserts each export returns
+        # a GraphModule.
         from torch._dynamo.output_graph import config
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Draws a random vector of three and returns the input plus the
+            # input times that vector.
             y = torch.randn(3)
             return x + x * y
 
@@ -3455,7 +4396,12 @@ def forward(self, x):
                 )
 
     def test_export_with_symbool_inputs(self):
+        # [FUNCTION DOC] Exports a function that takes a symbolic boolean created from a fake
+        # tensor size comparison, for several sizes, and verifies the readable graph, the dynamo
+        # guard on the predicate, and that the outer shape environment gets no guards.
         def f(pred: bool, x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Returns sine of the tensor if the boolean is true,
+            # else cosine.
             if pred:
                 return x.sin()
             else:
@@ -3466,6 +4412,11 @@ def forward(self, x):
         def test_symbool_guards(
             f, size_tests, exp_graph, exp_guard_code, exp_shape_env_guards
         ):
+            # [FUNCTION DOC] HELPER: Creates a shape env and fake mode, fakes the tensor with all
+            # dimensions dynamic, and for each size builds a symbolic predicate comparing the
+            # first dimension to the size. Exports the function, compares normalized readable
+            # graph to the expected template filled with the size, requires exactly one shape-env
+            # guard, compares predicate guard code and the outer shape env guards to expectations.
             shape_env = ShapeEnv()
             with fake_tensor.FakeTensorMode(
                 shape_env=shape_env,
@@ -3538,24 +4489,32 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_input_global(self) -> None:
+        # [FUNCTION DOC] Sets a module global to a random tensor and exports a function adding it
+        # to its input; checks only that export succeeds.
         global bulbous_bouffant
         bulbous_bouffant = torch.randn(3)
 
         def f(y):
+            # [FUNCTION DOC] HELPER: Returns the global tensor plus the input.
             return bulbous_bouffant + y
 
         torch._dynamo.export(f)(torch.randn(3))
 
     def test_input_global_multiple_access(self) -> None:
+        # [FUNCTION DOC] Exports a function that reads a module global both directly and through a
+        # helper that also declares it global; checks only that export succeeds.
         global macademia
         macademia = torch.randn(3)
 
         def g(y):
+            # [FUNCTION DOC] HELPER: Adds the global tensor to the input and returns it.
             global macademia
             y = macademia + y
             return y
 
         def f(y):
+            # [FUNCTION DOC] HELPER: Passes the input through the helper and returns the global
+            # tensor plus the result.
             global macademia
             y = g(y)
             return macademia + y
@@ -3563,32 +4522,48 @@ class GraphModule(torch.nn.Module):
         torch._dynamo.export(f)(torch.randn(3))
 
     def test_input_nonlocal(self) -> None:
+        # [FUNCTION DOC] Exports a function that reads a closure variable; checks only that
+        # export succeeds.
         arglebargle = torch.randn(3)
 
         def f(y):
+            # [FUNCTION DOC] HELPER: Returns the captured tensor plus the input.
             return arglebargle + y
 
         torch._dynamo.export(f)(torch.randn(3))
 
     def test_input_unused_nonlocal_ok(self) -> None:
+        # [FUNCTION DOC] Exports a function that binds a closure variable it never uses; checks
+        # only that export succeeds.
         arglebargle = torch.randn(3)
 
         def f(y):
+            # [FUNCTION DOC] HELPER: Copies the captured tensor to an unused local and returns
+            # the input.
             x = arglebargle  # noqa: F841
             return y
 
         torch._dynamo.export(f)(torch.randn(3))
 
     def test_symbolic_tracing_within_fake_mode_with_constraints(self):
+        # [FUNCTION DOC] Within a fake tensor mode, exports a module with a shared dynamic
+        # dimension on two inputs, both in aten and non-aten mode; then checks the last graph
+        # module gives the same result as the module on real inputs.
         from torch._subclasses import fake_tensor
 
         fake_mode = fake_tensor.FakeTensorMode()
 
         class DynamicShapeSimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing the average of a matrix product and a third
+            # input, flattening it by view and returning it concatenated with itself.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only initializes the base module.
                 super().__init__()
 
             def forward(self, a, b, c) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Computes the matrix product of the first two inputs plus
+                # the third, halves it, flattens it to one dimension using the product of its two
+                # sizes and returns it repeated twice via concatenation.
                 d = (torch.matmul(a, b) + c) / 2
                 d_s0 = d.shape[0]
                 d_s1 = d.shape[1]
@@ -3613,6 +4588,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(model(*inputs), gm(*inputs))
 
     def test_symbolic_tracing_within_fake_mode_with_constraints_with_parameters(self):
+        # [FUNCTION DOC] Within a fake tensor mode, builds a linear model and exports it
+        # with a dynamic first dimension in both aten and non-aten modes; checks only that
+        # export succeeds.
         from torch._subclasses import fake_tensor
 
         fake_mode = fake_tensor.FakeTensorMode()
@@ -3620,11 +4598,14 @@ class GraphModule(torch.nn.Module):
         # TODO: Seems to choke if you don't make a fresh model and
         # just try to export Linear directly...
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 2 by 2 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 out = self.linear(x)
                 return out
 
@@ -3640,17 +4621,23 @@ class GraphModule(torch.nn.Module):
                 )(*inputs).graph_module
 
     def test_capture_symbolic_tracing_within_fake_mode(self):
+        # [FUNCTION DOC] Creates a user FakeTensorMode with a shape environment, builds a
+        # two-layer model and input inside it, and exports it in aten and non-aten modes asserting
+        # a GraphModule is returned.
         from torch._dynamo.output_graph import config
         from torch._subclasses import fake_tensor
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two chained 2 by 2 linear layers.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates both linear layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(2, 2)
                 self.linear2 = torch.nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first then the second linear layer.
                 out = self.linear(x)
                 out = self.linear2(out)
                 return out
@@ -3679,33 +4666,51 @@ class GraphModule(torch.nn.Module):
                 )
 
     def test_cond_op_param_buffer_lifted(self):
+        # [FUNCTION DOC] Exports a module whose conditional branches call submodules that hold
+        # buffers, checking that buffers are lifted correctly: the graph agrees with eager for
+        # inputs taking either branch.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a zero buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of zeros.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.zeros(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer1.sum()
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a ones buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of ones.
                 super().__init__()
                 self.buffer2 = torch.nn.Buffer(torch.ones(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer2.sum()
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with submodules A and B; forward runs a conditional on
+            # whether the first dimension exceeds four, with branches using each submodule, and
+            # returns a one tuple.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two submodules.
                 super().__init__()
                 self.a = A()
                 self.b = B()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional and returns its result in a tuple.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch returning cosine of the input plus the
+                    # first submodule output.
                     return x.cos() + self.a()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch returning sine of the input plus the
+                    # second submodule output.
                     return x.sin() + self.b()
 
                 return (cond(x.shape[0] > 4, true_fn, false_fn, [x]),)
@@ -3715,39 +4720,60 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(gm(torch.ones(3, 4)), M()(torch.ones(3, 4)))
 
     def test_nested_cond_op_param_buffer_lifted(self):
+        # [FUNCTION DOC] Like the lifted-buffer test but with a nested conditional in the true
+        # branch; checks the graph against eager for three input sizes covering all paths.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a zero buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of zeros.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.zeros(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer1.sum()
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a ones buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of ones.
                 super().__init__()
                 self.buffer2 = torch.nn.Buffer(torch.ones(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer2.sum()
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward has an outer conditional with a nested
+            # conditional in its true branch, using both submodules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two submodules.
                 super().__init__()
                 self.a = A()
                 self.b = B()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Defines the branch closures and returns the outer
+                # conditional result in a tuple.
                 def true_true_fn(x):
+                    # [FUNCTION DOC] HELPER: Innermost true branch: cosine of the input plus the
+                    # first submodule output.
                     return x.cos() + self.a()
 
                 def true_false_fn(x):
+                    # [FUNCTION DOC] HELPER: Innermost false branch: cosine of the input plus the
+                    # first submodule output plus one.
                     return x.cos() + self.a() + 1
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: Outer true branch running the nested conditional on
+                    # whether the first dimension exceeds five.
                     return cond(x.shape[0] > 5, true_true_fn, true_false_fn, [x])
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: Outer false branch: sine of the input plus the second
+                    # submodule output.
                     return x.sin() + self.b()
 
                 return (cond(x.shape[0] > 4, true_fn, false_fn, [x]),)
@@ -3758,41 +4784,62 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(gm(torch.ones(3, 4)), M()(torch.ones(3, 4)))
 
     def test_map_cond_param_buffer_lifted(self):
+        # [FUNCTION DOC] Exports a module that maps a body over a tensor, where the body runs a
+        # conditional using submodule buffers; export is traced on one shape and the graph
+        # compared with eager on another.
         from functorch.experimental.control_flow import cond, map
 
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a zero buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of zeros.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.zeros(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer1.sum()
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding a ones buffer and returning its sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a 6 by 4 buffer of ones.
                 super().__init__()
                 self.buffer2 = torch.nn.Buffer(torch.ones(6, 4))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the sum of the buffer.
                 return self.buffer2.sum()
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that maps a body over its input where the body combines
+            # an inner conditional with the second submodule output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two submodules.
                 super().__init__()
                 self.a = A()
                 self.b = B()
 
             def inner(self, x, pred):
+                # [FUNCTION DOC] HELPER: Runs a conditional on the predicate with branches
+                # doubling plus the first submodule output or squaring plus the second.
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch: input doubled by addition plus the first
+                    # submodule output.
                     return x + x + self.a()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch: input squared plus the second
+                    # submodule output.
                     return x * x + self.b()
 
                 return cond(pred, true_fn, false_fn, [x])
 
             def forward(self, pred, xs):
+                # [FUNCTION DOC] HELPER: Maps the body over the input with the predicate.
                 def body(x, pred):
+                    # [FUNCTION DOC] HELPER: Map body returning the inner result plus the second
+                    # submodule output.
                     return self.inner(x, pred) + self.b()
 
                 return map(body, xs, pred)
@@ -3809,22 +4856,34 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(real_result, out_graph(pred_y, y))
 
     def test_cond_free_variables_overlapping(self):
+        # [FUNCTION DOC] Exports a module whose conditional branches capture overlapping sets of
+        # local tensors, and compares the generated code of the main graph and both branch
+        # submodules to golden strings showing the shared and branch-specific lifted arguments.
         from functorch.experimental.control_flow import cond
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module creating four ones tensors and running a conditional
+            # whose true branch uses three of them and false branch uses a different three.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only initializes the base module.
                 super().__init__()
 
             def forward(self, pred, x):
+                # [FUNCTION DOC] HELPER: Creates tensors a, b, c, d and runs the conditional on
+                # the predicate with the closures.
                 a = torch.ones(6, 4)
                 b = torch.ones(6, 4)
                 c = torch.ones(6, 4)
                 d = torch.ones(6, 4)
 
                 def true_fn(x):
+                    # [FUNCTION DOC] HELPER: True branch using a, b and d cosines added to the
+                    # doubled input.
                     return x + x + a.cos() + b.cos() + d.cos()
 
                 def false_fn(x):
+                    # [FUNCTION DOC] HELPER: False branch using a, b and c sines added to the
+                    # squared input.
                     return x * x + a.sin() + b.sin() + c.sin()
 
                 return cond(pred, true_fn, false_fn, [x])
@@ -3891,22 +4950,39 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         "Times out with ASAN, see https://github.com/pytorch/pytorch/issues/110416",
     )
     def test_retracibility(self):
+        # [FUNCTION DOC] Skipped under ASAN. Exports a convolution plus linear module with a tuple
+        # of two inputs, then exports the resulting graph module again, and checks the two graphs
+        # give close outputs on new data.
         class MyLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear transformation with plain random tensor
+            # weight and bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random 20 by 98 weight and random bias as
+                # plain tensors.
                 super().__init__()
                 self.weight = torch.randn(20, 98)
                 self.bias = torch.randn(20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear with stored weight
+                # and bias.
                 return torch.nn.functional.linear(x, self.weight, self.bias)
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution and the custom linear; forward
+            # applies both to each of two input tensors and returns two combined outputs using
+            # sine and cosine.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 16 to 33 convolution with kernel 3 and the
+                # custom linear module.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(16, 33, 3)
                 self.linear = MyLinear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Unpacks the pair, runs convolution then linear on each
+                # and returns a tuple of cosine of the first plus sine of the second, and sine of
+                # the first plus cosine of the second.
                 a, b = x
                 a_conv = self.conv(a)
                 a_linear = self.linear(a_conv)
@@ -3928,22 +5004,37 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(gm(inp_test)[1], gm2(inp_test)[1]))
 
     def test_retracibility_dict_container_inp_out(self):
+        # [FUNCTION DOC] Retracing test with a dict containing a tuple and a tensor as input and a
+        # dict with a list and a tensor as output; exports, re-exports the graph and compares
+        # outputs entry by entry.
         class MyLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear transformation with plain random tensor
+            # weight and bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random 20 by 98 weight and random bias as
+                # plain tensors.
                 super().__init__()
                 self.weight = torch.randn(20, 98)
                 self.bias = torch.randn(20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear with stored weight
+                # and bias.
                 return torch.nn.functional.linear(x, self.weight, self.bias)
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking a dict input and returning a dict output built
+            # from convolution and linear results.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the convolution and the custom linear module.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(16, 33, 3)
                 self.linear = MyLinear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution and linear on the two tensors of the a
+                # entry and on b, returns a dict with a list of two identical combined tensors and
+                # b combined from the second a tensor.
                 a1, a2 = x["a"]
                 b = x["b"]
                 a1_conv = self.conv(a1)
@@ -3978,22 +5069,35 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(gm(inp_test)["b"], gm2(inp_test)["b"]))
 
     def test_retracibility_nested_list_out(self):
+        # [FUNCTION DOC] Retracing test with a dict input and a nested list output; exports,
+        # re-exports and compares each nested output.
         class MyLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a linear transformation with plain random tensor
+            # weight and bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a random 20 by 98 weight and random bias as
+                # plain tensors.
                 super().__init__()
                 self.weight = torch.randn(20, 98)
                 self.bias = torch.randn(20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear with stored weight
+                # and bias.
                 return torch.nn.functional.linear(x, self.weight, self.bias)
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking a dict input and returning a list of two lists of
+            # combined tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the convolution and the custom linear module.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(16, 33, 3)
                 self.linear = MyLinear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution and linear on the inputs and returns two
+                # inner lists each holding two identical combined tensors.
                 a1, a2 = x["a"]
                 b = x["b"]
                 a1_conv = self.conv(a1)
@@ -4032,7 +5136,11 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(gm(inp_test)[1][1], gm2(inp_test)[1][1]))
 
     def test_fx_pytree(self):
+        # [FUNCTION DOC] Exports a function that mixes torch utils pytree flattening with fx
+        # pytree flatten of a tuple of tensors and checks the exported graph equals eager.
         def foo(args):
+            # [FUNCTION DOC] HELPER: Flattens the arguments with the pytree utility and with the
+            # fx flatten spec function and returns the sum of the two first leaves.
             flat_args, spec = torch.utils._pytree.tree_flatten(args)
             flat_args_fx = torch.fx._pytree.tree_flatten_spec(args, spec)
             return flat_args_fx[0] + flat_args[0]
@@ -4046,11 +5154,16 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
     @config.patch(suppress_errors=True)
     @config.patch(verbose=True)
     def test_export_with_map_zero_sized_tensor_suppress_errors(self):
+        # [FUNCTION DOC] With error suppression and verbose config on, checks that exporting a
+        # module that maps over a zero-sized tensor still raises the dynamo Unsupported error.
         from functorch.experimental.control_flow import map
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that maps an add-one body over its input.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: Applies map with the add-one body to the input.
                 def body(x):
+                    # [FUNCTION DOC] HELPER: Map body returning the input plus one.
                     return x + 1
 
                 return map(body, xs)
@@ -4063,12 +5176,20 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
             torch._dynamo.export(mod, xs)
 
     def test_param_buffer_safe_from_mutation_simple(self):
+        # [FUNCTION DOC] Exports a module that mutates its buffer in forward and asserts the
+        # exported graph holds one buffer named for the module attribute whose value is still the
+        # original zeros, so export did not mutate the source buffer.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 5 by 5 zero buffer incremented in place
+            # in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers the zero buffer.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.zeros(5, 5))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to the buffer in place and returns the input
+                # plus the buffer.
                 self.buffer1.add_(1)
                 return x + self.buffer1
 
@@ -4082,21 +5203,32 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(buffer, torch.zeros(5)))
 
     def test_param_buffer_safe_from_mutation_recurse(self):
+        # [FUNCTION DOC] Same buffer safety check with a child module; every buffer in the
+        # exported graph must still equal zeros after export.
         class Child(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule with a zero buffer whose forward returns the input sum
+            # plus the buffer sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a zero buffer of five.
                 super().__init__()
                 self.buffer2 = torch.nn.Buffer(torch.zeros(5))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input sum plus the buffer sum.
                 return x.sum() + self.buffer2.sum()
 
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer and a child; forward increments both
+            # buffers in place and returns a combined sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Registers a zero buffer and creates the child.
                 super().__init__()
                 self.buffer1 = torch.nn.Buffer(torch.zeros(5))
                 self.child = Child()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to its buffer and two to the child's buffer in
+                # place; returns the input sum plus the buffer sum plus the child output.
                 self.buffer1.add_(1)
                 self.child.buffer2.add_(2)
                 return x.sum() + self.buffer1.sum() + self.child(x)
@@ -4106,7 +5238,12 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
             self.assertTrue(torch.allclose(buffer, torch.zeros(5)))
 
     def test_predispatch_with_higher_order(self):
+        # [FUNCTION DOC] Exports with aten graph and pre-dispatch a function with a
+        # conditional on a shape predicate; checks results against eager for inputs on both
+        # sides of the threshold.
         def f(x):
+            # [FUNCTION DOC] HELPER: Conditional on whether the first dimension exceeds four,
+            # adding five or subtracting three.
             return cond(x.shape[0] > 4, lambda x: x + 5, lambda x: x - 3, [x])
 
         gm, _ = torch._dynamo.export(f, aten_graph=True, pre_dispatch=True)(
@@ -4118,8 +5255,14 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(f(inp2), gm(inp2)))
 
     def test_predispatch_with_higher_order_nested(self):
+        # [FUNCTION DOC] Pre-dispatch export of a function with nested conditionals; checks
+        # equality with eager for three input sizes covering each path.
         def f(x):
+            # [FUNCTION DOC] HELPER: Outer conditional on first dimension above four choosing the
+            # nested conditional or minus three.
             def true_fn(x):
+                # [FUNCTION DOC] HELPER: Nested conditional on first dimension above six adding
+                # ten or subtracting ten.
                 return cond(x.shape[0] > 6, lambda x: x + 10, lambda x: x - 10, [x])
 
             return cond(x.shape[0] > 4, true_fn, lambda x: x - 3, [x])
@@ -4135,12 +5278,19 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(f(inp3), gm(inp3)))
 
     def test_predispatch_with_for_out_dtype(self):
+        # [FUNCTION DOC] Pre-dispatch export of a module using the out_dtype higher order op for
+        # an int8 matrix multiply with int32 output; checks outputs equal.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding an int8 weight and returning the int32 matrix
+            # product through out_dtype.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Stores the given weight.
                 super().__init__()
                 self.weight = weight
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns an int32 matrix product of the input and weight
+                # via out_dtype.
                 return out_dtype(torch.ops.aten.mm.default, torch.int32, x, self.weight)
 
         weight = torch.randint(-128, 127, (5, 5), dtype=torch.int8)
@@ -4151,22 +5301,33 @@ def forward(self, a, b, l_x_, d_true_branch, c_false_branch):
         self.assertTrue(torch.allclose(m(x), gm(x)))
 
     def test_predispatch_with_for_out_dtype_nested(self):
+        # [FUNCTION DOC] Pre-dispatch export of a module with a conditional whose branches use
+        # out_dtype (matmul versus multiply); checks results for nonzero and zero inputs and
+        # compares generated code of both branch graphs with golden strings.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding an int8 weight; its conditional on whether the
+            # input sum is nonzero selects between out_dtype matmul and out_dtype multiply sums.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Stores the given weight.
                 super().__init__()
                 self.weight = weight
 
             def true_fn(self, x):
+                # [FUNCTION DOC] HELPER: True branch: sum of the int32 matrix product of input
+                # and weight.
                 return out_dtype(
                     torch.ops.aten.mm.default, torch.int32, x, self.weight
                 ).sum()
 
             def false_fn(self, x):
+                # [FUNCTION DOC] HELPER: False branch: sum of the int32 elementwise product of
+                # input and weight.
                 return out_dtype(
                     torch.ops.aten.mul.Tensor, torch.int32, x, self.weight
                 ).sum()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the conditional on whether the input sum is nonzero.
                 return cond(x.sum() != 0, self.true_fn, self.false_fn, [x])
 
         weight = torch.randint(-128, 127, (5, 5), dtype=torch.int8)
@@ -4197,19 +5358,30 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_export_nn_module_stack_patched_module(self):
+        # [FUNCTION DOC] Patches the forward of a wrapped submodule with a function that
+        # multiplies instead of adds, exports the top-level module, checks the exported result
+        # equals the patched function and that every function-call node has module stack metadata.
         def forward(self, x, y):
+            # [FUNCTION DOC] HELPER: Replacement forward returning the product of x and y; the
+            # first argument stands for self.
             return x * y
 
         class Toplevel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding a child module and calling it in forward.
             def __init__(self, m):
+                # [FUNCTION DOC] HELPER: Stores the child module.
                 super().__init__()
                 self.m = m
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the child module called on both inputs.
                 return self.m(x, y)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds two inputs (replaced at runtime by
+            # the test).
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the inputs.
                 return x + y
 
         t = Toplevel(M())
@@ -4223,22 +5395,33 @@ def forward(self, arg0_1, arg1_1):
                 self.assertIn("nn_module_stack", node.meta)
 
     def test_preserve_fx_node_metadata(self):
+        # [FUNCTION DOC] Exports a two-level module, edits the graph by replacing the relu call
+        # with an absolute value function (clearing node metadata), re-exports the edited graph
+        # and compares generated code, and that module stack and stack trace metadata for the sine
+        # and cosine nodes survive between both exports.
         class Module1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning sine of the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns sine of the input.
                 return torch.sin(x)
 
         class Module2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying cosine, the inner module and relu in sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the inner Module1 child.
                 super().__init__()
                 self.mod1 = Module1()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies cosine, then the child, then relu.
                 x = torch.cos(x)
                 x = self.mod1(x)
                 x = torch.relu(x)
                 return x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Replacement function returning the absolute value of
+            # the input.
             return torch.abs(x)
 
         mod = Module2()
@@ -4270,6 +5453,8 @@ def forward(self, x):
         )
 
         def _constais_op(gm, target):
+            # [FUNCTION DOC] HELPER: Returns True if any node of the graph has the given target,
+            # else False.
             for nd in gm.graph.nodes:
                 if nd.target == target:
                     return True
@@ -4305,7 +5490,11 @@ def forward(self, x):
             self.assertEqual(nd1.meta["stack_trace"], nd2.meta["stack_trace"])
 
     def test_preserve_fx_node_metadata_recompile(self):
+        # [FUNCTION DOC] Exports a function, then re-exports the resulting graph module twice with
+        # different input sizes after compiling the original in between, and checks both
+        # regenerated code strings are identical sine-only graphs.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input.
             return torch.sin(x)
 
         gm, _ = torch._dynamo.export(fn)(torch.randn(3, 3))
@@ -4334,12 +5523,18 @@ def forward(self, x):
         )
 
     def test_preserve_fx_node_metadata_inline(self):
+        # [FUNCTION DOC] Exports a function, then exports a second function that calls the
+        # first exported graph module inline after a cosine, and compares the inlined code to a
+        # golden string.
         def f1(x):
+            # [FUNCTION DOC] HELPER: Returns sine of the input.
             return torch.sin(x)
 
         gm, _ = torch._dynamo.export(f1)(torch.randn(3, 3))
 
         def f2(x):
+            # [FUNCTION DOC] HELPER: Applies cosine then calls the previously exported
+            # graph module.
             x = torch.cos(x)
             return gm(x)
 
@@ -4357,12 +5552,18 @@ def forward(self, x):
         )
 
     def test_preserve_fx_node_metadata_graph_break(self):
+        # [FUNCTION DOC] Exports a sine, abs, cosine function, replaces the abs call by a function
+        # that forces a graph break, and compiles the edited module with a checking backend that
+        # verifies each resulting graph contains the expected line (the sine segment first, then
+        # the cosine segment).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sine, absolute value and cosine in sequence.
             x = torch.sin(x)
             x = torch.abs(x)
             return torch.cos(x)
 
         def bad_fn(x):
+            # [FUNCTION DOC] HELPER: Forces a dynamo graph break and returns the input unchanged.
             torch._dynamo.graph_break()
             return x
 
@@ -4383,6 +5584,9 @@ def forward(self, x):
         ]
 
         def test_backend(gm: torch.fx.GraphModule, example_inputs):
+            # [FUNCTION DOC] HELPER: Custom backend; asserts expected strings remain, removes
+            # example value metadata from nodes, asserts the first expected string is in the
+            # readable graph, pops it, and returns the graph's forward.
             self.assertTrue(expected)
             # Normalize output for dynamic and not
             for nd in gm.graph.nodes:
@@ -4397,8 +5601,14 @@ def forward(self, x):
         opt_gm_edit(torch.randn(3, 3))
 
     def test_torch_inference_mode_ctx(self):
+        # [FUNCTION DOC] Exports a function decorated with inference mode on, one with it off, and
+        # one using the context manager; compares generated code with golden strings for enter and
+        # exit inference mode calls and checks the outputs do not require grad and requires_grad
+        # assignment raises for inference tensors only where expected.
         @torch.inference_mode()
         def fn(x):
+            # [FUNCTION DOC] HELPER: Decorated with inference mode enabled; returns the input
+            # plus one.
             return x + 1
 
         gm, _ = torch._dynamo.export(fn, torch.rand(2, 2))
@@ -4425,6 +5635,8 @@ def forward(self, x):
 
         @torch.inference_mode(False)
         def fn_no_inference(x):
+            # [FUNCTION DOC] HELPER: Decorated with inference mode disabled; returns the input
+            # plus one.
             return x + 1
 
         gm_no_inference, _ = torch._dynamo.export(fn_no_inference, torch.rand(2, 2))
@@ -4446,6 +5658,7 @@ def forward(self, x):
         out.requires_grad = True
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input inside an inference mode context.
             with torch.inference_mode():
                 return x + 1
 
@@ -4466,16 +5679,24 @@ def forward(self, x):
         self.assertEqual(out.requires_grad, False)
 
     def test_export_masking_with_no_grad(self):
+        # [FUNCTION DOC] Exports functions performing a masked assignment under no_grad and under
+        # inference mode and compares the generated code with golden strings showing grad mode
+        # toggles or inference mode enter and exit; also exports the version with neither wrapper
+        # without checking the result.
         def fn(x, b, y):
+            # [FUNCTION DOC] HELPER: Clones the first argument, assigns the third where the mask
+            # is true, and returns it.
             x = x.clone()
             x[b] = y
             return x
 
         def fn_no_grad(x, b, y):
+            # [FUNCTION DOC] HELPER: Runs the masking function under no_grad.
             with torch.no_grad():
                 return fn(x, b, y)
 
         def fn_inference_mode(x, b, y):
+            # [FUNCTION DOC] HELPER: Runs the masking function under inference mode.
             with torch.inference_mode():
                 return fn(x, b, y)
 
@@ -4518,7 +5739,10 @@ def forward(self, x, b, y):
         gm, _ = torch._dynamo.export(fn)(x, b, y)
 
     def test_dynamo_list_index(self):
+        # [FUNCTION DOC] Exports a function that calls the list index method on an input list of
+        # ints and checks the exported graph returns a ones tensor plus one.
         def fn(x, in_list):
+            # [FUNCTION DOC] HELPER: Adds the position of the value two in the list to the input.
             return x + in_list.index(2)
 
         inputs = (torch.ones(2, 2), [1, 2])
@@ -4527,10 +5751,14 @@ def forward(self, x, b, y):
         self.assertEqual(out, torch.ones(2, 2) + 1)
 
     def test_dynamo_enum_in_tuple(self):
+        # [FUNCTION DOC] Exports a function that indexes a tensor with an ellipsis and an
+        # int-valued enum member; checks the result equals the first column.
         class IntEnum(int, Enum):
+            # [CLASS DOC] HELPER: Enum that is also an int, with a single member X equal to zero.
             X = 0
 
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Indexes the tensor with an ellipsis and the enum member.
             return tensor[..., IntEnum.X]
 
         tensor = torch.rand((5, 5))
@@ -4539,10 +5767,16 @@ def forward(self, x, b, y):
         self.assertEqual(out, tensor[:, 0])
 
     def test_subclass_parameters(self):
+        # [FUNCTION DOC] Exports a module with a plain parameter and a tensor-subclass parameter
+        # after unwrapping subclass parameters; checks the unwrapped module matches the original
+        # output and the exported graph matches too.
         from torch.testing._internal.two_tensor import TwoTensor
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ones parameter and a two-tensor subclass parameter
+            # of zeros; forward adds twice the first and the second to the input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates both parameters.
                 super().__init__()
                 self.p1 = torch.nn.Parameter(torch.ones(3, 4))
                 self.p2 = torch.nn.Parameter(
@@ -4550,6 +5784,8 @@ def forward(self, x, b, y):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus twice the first parameter plus
+                # the second.
                 return x + 2 * self.p1 + self.p2
 
         m = M()
@@ -4571,8 +5807,14 @@ def forward(self, x, b, y):
         self.assertEqual(ref_out, out)
 
     def test_strict_fake_tensor_prop_real_tensors(self):
+        # [FUNCTION DOC] With fake tensor propagation using real tensors enabled, strictly exports
+        # a module that converts a comparison result to a Python bool and checks the exported
+        # module result equals eager.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning whether any element of the input equals 0.1.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a Python bool saying whether any element
+                # equals 0.1.
                 return bool(x.eq(0.1).any().item())
 
         model = Foo()
@@ -4586,7 +5828,12 @@ def forward(self, x, b, y):
 
 
 class ExportTestsSubprocess(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case that runs a snippet in a child Python process; holds no state.
     def test_strict_export_under_pythonoptimize(self):
+        # [FUNCTION DOC] Runs a child interpreter with the optimize environment variable set to
+        # one, executing a snippet that strictly exports a linear layer and checks the exported
+        # module output is close to the original; asserts the child exit code is zero, with the
+        # child stdout and stderr in the failure message.
         env = dict(os.environ)
         env["PYTHONOPTIMIZE"] = "1"
         code = """\
@@ -4612,12 +5859,23 @@ torch.testing.assert_close(out_export, out_orig)
 
 
 class ExportTestsDevice(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Device-parametrized test case: each method takes a device argument and is
+    # instantiated for non-cpu device types (xpu allowed) at module import. Holds no state of
+    # its own.
     @unittest.skipIf(
         IS_LINUX or TEST_WITH_SLOW, "https://github.com/pytorch/pytorch/issues/181344"
     )
     def test_export_with_parameters(self, device):
+        # [FUNCTION DOC] Exports a small convolution network with a dynamic batch dimension on the
+        # given device, saves and loads the exported program through a buffer and checks that the
+        # loaded module's convolution weight is a Parameter.
+        # KNOWN ISSUE: skipped whenever running on Linux or with slow tests, so it effectively
+        # never runs on Linux; the skip condition may be intended to be the negation.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a sequential convolution and in-place relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the sequential of a 3 to 64 channel 3x3
+                # convolution with padding one and relu.
                 super().__init__()
                 self.features = torch.nn.Sequential(
                     torch.nn.Conv2d(
@@ -4627,6 +5885,7 @@ class ExportTestsDevice(torch._dynamo.test_case.TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the sequential features to the input.
                 return self.features(x)
 
         model = MyModule().eval().to(device)
@@ -4647,12 +5906,18 @@ class ExportTestsDevice(torch._dynamo.test_case.TestCase):
         )
 
     def test_export_fast_binary_broadcast_check(self, device):
+        # [FUNCTION DOC] Strictly exports an add of a batched tensor and a broadcast tensor with a
+        # bounded dynamic batch dimension, to check that no spurious guard is created by the
+        # binary op fast path shape comparison.
         # This test looks at the case where we erroneously create a guard
         # when checking the equality of the operands' shape and the output
         # shape during FakeTensor's binary op fast path.
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the second input to the first with
+            # broadcasting, operand order chosen so the first and the output have equal shapes.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the second input plus the first.
                 # final shape is (dim0, 4, 8)
                 # order matters since a & the output have the same shape
                 return b + a
@@ -4668,8 +5933,15 @@ class ExportTestsDevice(torch._dynamo.test_case.TestCase):
         )
 
     def test_export_fast_binary_broadcast_check_unbacked(self, device):
+        # [FUNCTION DOC] Strictly exports a module whose output size depends on an unbacked
+        # value taken from a tensor and subtracts it from a scalar tensor; checks only that
+        # export succeeds.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module creating a ones tensor sized by an unbacked scalar plus
+            # one and subtracting it from a scalar input.
             def forward(self, numel, scalar):
+                # [FUNCTION DOC] HELPER: Reads the scalar value of the first input, builds a ones
+                # vector of that length plus one and returns the second input minus it.
                 u0 = numel.item()
                 x = torch.ones(u0 + 1)
                 return scalar - x
