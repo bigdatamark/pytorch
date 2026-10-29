@@ -1,5 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor random number generation: random init ops on sharded tensors,
+# multinomial strategy, user generators, meta-tensor and TP/FSDP/HSDP model initialization, RNG
+# tracker setup and manual_seed, determinism across 1D and 2D meshes, a _PhiloxState seed
+# roundtrip, and torch.compile consistency of random ops with eager. LocalTensor variants of the
+# test classes are created at import time; running the file executes run_tests.
 
 import itertools
 
@@ -36,6 +41,8 @@ from torch.utils._typing_utils import not_none
 
 
 def get_generator_seed_for_device_type(device_type: str):
+    # [FUNCTION DOC] HELPER: Lazily imports and returns the current generator seed for
+    # device_type from the local tensor module (returns what that function returns).
     from torch.distributed._local_tensor import (
         get_generator_seed_for_device_type as _get_seed,
     )
@@ -44,7 +51,13 @@ def get_generator_seed_for_device_type(device_type: str):
 
 
 class DistTensorRandomInitTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process tests for random initialization of DTensors and models (init
+    # ops, multinomial, user generators, meta init under TP, FSDP+TP).
     def _run_init_op(self, init_op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Applies init_op (with args/kwargs) to a Shard(0) DTensor. If
+        # the mesh does not support DTensor RNG, checks the result equals the same op on a plain
+        # local clone with the same per-rank seed. Otherwise inits a Shard(1) DTensor and
+        # asserts every other rank's block of the full tensor differs from the local one.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(0)]
         input_size = (8, 4)
@@ -83,6 +96,9 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
     @with_comms
     def test_init_ops(self):
+        # [FUNCTION DOC] Runs _run_init_op for kaiming_uniform_, normal_, uniform_, log_normal_,
+        # exponential_, geometric_, and for float32 and float16 for rand_like, randn_like and
+        # randint_like.
         self._run_init_op(
             torch.nn.init.kaiming_uniform_,
             a=0,
@@ -102,6 +118,9 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
     @with_comms
     def test_multinomial_sharded(self):
+        # [FUNCTION DOC] Checks multinomial on a probability DTensor: sharded on the batch dim
+        # gives output of shape 8 by 2 sharded on dim 0; sharded on the category dim triggers
+        # communication (redistribute) and gives a Replicate output of the same shape.
         """Test multinomial with sharded batch dimension."""
         device_mesh = self.build_device_mesh()
         # Create a probability tensor with shape [8, 4] (batch_size=8, categories=4)
@@ -132,6 +151,10 @@ class DistTensorRandomInitTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_init_with_user_generator(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. Checks that initializing a DTensor with an
+        # explicit torch.Generator gives the same full tensor as the default generator seeded
+        # identically, twice in a row (generator offset advances), and again after reseeding
+        # both.
         device_mesh = self.build_device_mesh()
         torch.manual_seed(42)
         rng = torch.Generator(device=self.device_type).manual_seed(42)
@@ -161,6 +184,10 @@ class DistTensorRandomInitTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_meta_tensor_init(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. Initializes a replicated meta DTensor with
+        # uniform_ with the RNG distribute region enabled and then disabled, gathers local
+        # tensors and asserts all ranks hold identical values; also checks the tracker flag
+        # distribute_region_enabled.
         # test suite sets each rank's seed to the same value.
         # The DTensor random ops will use the same generator as the default one on the device.
 
@@ -187,6 +214,8 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(gathered_local_tensors, rank):
+        # [FUNCTION DOC] HELPER: For the given (gathered) tensor and rank, asserts the rank's
+        # block of rows equals every other rank's block. Run per rank in LocalTensor mode.
             # the tensor slice on the current rank
             self_slice = slice(1024 * rank, 1024 * rank + 1024)
 
@@ -222,6 +251,10 @@ class DistTensorRandomInitTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_tp_model_meta_init(self):
+        # [FUNCTION DOC] GPU-only. Meta-initializes a Linear under ColwiseParallel on a 1D TP
+        # mesh, enables the RNG distribute region, materializes with to_empty and
+        # reset_parameters, and checks the RNG tracker is an OffsetBasedRNGTracker, the weight
+        # is a DTensor, and its shard differs on every rank.
         # initialize the 1-d device mesh for TP
         tp_mesh = init_device_mesh(self.device_type, mesh_shape=(self.world_size,))
 
@@ -264,6 +297,8 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(weight_local, weight_gather, rank):
+        # [FUNCTION DOC] HELPER: Asserts the local weight differs from each other rank's row of
+        # the gathered weight.
             # verify the weights are initialized differently on all ranks
             for other_rank in range(self.world_size):
                 if rank != other_rank:
@@ -277,6 +312,9 @@ class DistTensorRandomInitTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_fsdp_tp_model_meta_init(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. Same meta-init check as the TP test but on a 2D
+        # dp/tp mesh with TP plus fully_shard, asserting the materialized weight is a DTensor
+        # and each rank's shard differs from others.
         # initialize the 2-d device mesh
         global_mesh = init_device_mesh(
             self.device_type,
@@ -325,6 +363,8 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(weight_local, weight_gather, rank):
+        # [FUNCTION DOC] HELPER: Asserts the local weight differs from each other rank's row of
+        # the gathered weight.
             # verify the weights are initialized differently on all ranks
             for other_rank in range(self.world_size):
                 if rank != other_rank:
@@ -338,6 +378,10 @@ class DistTensorRandomInitTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_dtensor_init_helper_tensor_meta_strides(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Wraps the global RNG tracker in a spec-capturing
+        # wrapper, then creates a Shard(0) randn DTensor and asserts exactly one spec was
+        # captured whose tensor_meta shape is 8 by 8 and stride is (8, 1). Replaces the module-
+        # level tracker permanently (side effect).
         """Test that DTensorSpec.tensor_meta has correct strides in _distribute_region."""
         import torch.distributed.tensor._random as random_module
 
@@ -345,12 +389,17 @@ class DistTensorRandomInitTest(DTensorTestBase):
         captured_specs = []
 
         class SpecCapturingTracker:
+            # [CLASS DOC] HELPER: Test wrapper around the RNG tracker that records the tensor_meta
+            # of each spec passed to _distribute_region and delegates to the wrapped tracker.
             """Wrapper to intercept _distribute_region and capture DTensorSpec."""
 
             def __init__(self, tracker):
+                # [FUNCTION DOC] HELPER: Stores the wrapped tracker.
                 self._tracker = tracker
 
             def _distribute_region(self, spec):
+                # [FUNCTION DOC] HELPER: Appends the spec's tensor_meta to captured_specs and
+                # returns the wrapped tracker's _distribute_region result.
                 captured_specs.append(spec.tensor_meta)
                 return self._tracker._distribute_region(spec)
 
@@ -373,9 +422,14 @@ class DistTensorRandomInitTest(DTensorTestBase):
 
 
 class DistTensorRandomOpTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process tests for RNG tracker initialization, manual_seed, and cross-
+    # rank determinism of DTensor random ops.
     @with_comms
     @skip_unless_torch_gpu
     def test_rng_tracker_init(self):
+        # [FUNCTION DOC] GPU-only. Broadcasts rank 0's initial seed, checks the RNG tracker is
+        # still None after distribute_tensor, then after a DTensor uniform_ call asserts the
+        # device generator seed equals rank 0's seed.
         torch.manual_seed(self.rank)
         seed_local = (
             torch.zeros_like(torch.empty(1), device=self.device_type)
@@ -408,6 +462,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_manual_seed(self):
+        # [FUNCTION DOC] GPU-only. Checks manual_seed on a DTensor mesh initializes the tracker
+        # and sets the device generator seed (rank, then 1234) with no communication.
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
         # in the case of calling ``torch.distributed.tensor._random.manual_seed``,
@@ -435,8 +491,12 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_manual_seed_submesh(self):
+        # [FUNCTION DOC] GPU-only. Checks manual_seed raises RuntimeError when the current rank
+        # is not part of the given single-rank mesh.
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(rank):
+            # [FUNCTION DOC] HELPER: Per-rank body; builds a one-rank mesh that excludes the
+            # rank and asserts manual_seed raises the expected RuntimeError.
             # the current rank is not a part of the mesh
             single_rank_device_mesh = DeviceMesh(
                 self.device_type, [(rank + 1) % self.world_size], _rank=rank
@@ -452,6 +512,9 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_pipeline_parallel_manual_seed(self):
+        # [FUNCTION DOC] GPU-only. On a pp by spmd mesh, seeds with 123 plus the pp rank on the
+        # spmd sub-mesh, checks the generator seed, normal_ inits a sharded DTensor and asserts
+        # every rank's shard differs from all other ranks' shards.
         # This test is to verify the `manual_seed` API works as expected in the
         # pipeline parallel setting.
         world_mesh = init_device_mesh(
@@ -495,6 +558,9 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_deterministic_dropout_1d(self):
+        # [FUNCTION DOC] GPU-only. Applies uniform_, redistributes a Shard(1) tensor to
+        # Replicate, applies dropout with p 0.2, gathers, and asserts every rank holds identical
+        # values.
         # test suite sets each rank's seed to the same value but in actual
         # execution the default random seed will be different (a random value).
         # The DTensor random ops will use the same random seed even though the
@@ -524,6 +590,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(local_tensor, rank):
+            # [FUNCTION DOC] HELPER: Asserts the rank's block of rows is equal to every other
+            # rank's block.
             # compare with local tensors from other ranks
             self_slice = slice(4 * rank, 4 * rank + 4)
             for other_rank in range(self.world_size):
@@ -540,6 +608,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_deterministic_rand_1d(self):
+        # [FUNCTION DOC] GPU-only. For DTensor rand and randn, Shard(1) gives different blocks
+        # on each rank and Replicate (after a common seed) gives identical blocks.
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
         size = [4, 4 * self.world_size]
 
@@ -554,6 +624,10 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
             @maybe_run_for_local_tensor
             def compute_rankwise_if_local_tensor(local_tensor, rank):
+                # [FUNCTION DOC] HELPER: Asserts the rank's block differs from every other
+                # rank's block.
+                # KNOWN ISSUE: the inner comment says identical local tensor for replicate
+                # placement, but this version asserts inequality (sharded case).
                 # compare with local tensors from other ranks
                 self_slice = slice(4 * rank, 4 * rank + 4)
                 for other_rank in range(self.world_size):
@@ -576,6 +650,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
             @maybe_run_for_local_tensor
             def compute_rankwise_if_local_tensor(local_tensor, rank):
+                # [FUNCTION DOC] HELPER: Asserts the rank's block equals every other rank's
+                # block (replicate case).
                 # compare with local tensors from other ranks
                 self_slice = slice(4 * rank, 4 * rank + 4)
                 for other_rank in range(self.world_size):
@@ -592,6 +668,12 @@ class DistTensorRandomOpTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_deterministic_uniform_2d(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. On a 2x2 mesh, for seven placement combinations,
+        # redistributes then calls uniform_, checks the RNG tracker shard linear index against
+        # the expected mapping per rank, and checks the full tensor block at the local offset
+        # equals the local tensor while every other block differs.
+        # KNOWN ISSUE: the shard block iterator is single-use, so the loop over other blocks
+        # only works for the first call of the nested checker.
         mesh = torch.arange(self.world_size).reshape(2, 2)
         device_mesh = DeviceMesh(self.device_type, mesh)
         dtensor = distribute_tensor(
@@ -649,6 +731,8 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
             @maybe_run_for_local_tensor
             def check_shard_index(shard_linear_idx, rank):
+                # [FUNCTION DOC] HELPER: Asserts the computed shard linear index equals the
+                # expected one for the rank.
                 self.assertEqual(shard_linear_idx, shard_index[rank])
 
             check_shard_index(shard_linear_idx, self.rank)
@@ -698,6 +782,9 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
             @maybe_run_for_local_tensor
             def blockwise_iter_if_localtensor(local_tensor, local_shard_offset):
+                # [FUNCTION DOC] HELPER: Iterates over all shard blocks; asserts the full tensor
+                # block equals the local tensor when its offset matches the local shard offset,
+                # otherwise differs.
                 # compare local tensor with each other shard
                 for other_local_shard in local_shard_comb:
                     other_local_shard_offset, _ = zip(*other_local_shard)
@@ -713,6 +800,9 @@ class DistTensorRandomOpTest(DTensorTestBase):
             blockwise_iter_if_localtensor(local_tensor, local_shard_offset)
 
     def test_philox_state_seed_roundtrip(self):
+        # [FUNCTION DOC] Checks _PhiloxState can set a seed tensor with uint64 sign bit set,
+        # then read it back and set it again without raising. Runs without comms on a CPU state
+        # tensor.
         """
         Test that _PhiloxState seed can be read and re-set without error.
 
@@ -734,7 +824,12 @@ class DistTensorRandomOpTest(DTensorTestBase):
 
 
 class DistTensorRandomOpCompileTest(DTensorTestBase):
+    # [CLASS DOC] Tests that DTensor random ops under torch.compile (aot_eager and inductor)
+    # give the same results and RNG state progression as eager. Uses CUDA RNG state directly.
     def _run_with_seed(self, fn, create_input, num_runs):
+        # [FUNCTION DOC] HELPER: Seeds with 0, runs fn on new inputs num_runs times, records
+        # each local result clone and the CUDA RNG state, asserts the state changes after every
+        # call, and returns results and states.
         """Run fn num_runs times after resetting RNG, returning results and states."""
         torch.manual_seed(0)
         results = []
@@ -753,6 +848,9 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
         return results, rng_states
 
     def _run_eager_and_compiled(self, fn, create_input, num_runs):
+        # [FUNCTION DOC] HELPER: Runs fn eagerly then compiled with the aot_eager recording
+        # backend (fullgraph), asserts the forward graph contains run_dtensor_rng_op, and
+        # returns eager results, eager states, compiled results, compiled states.
         """Run fn both eagerly and compiled with aot_eager, returning results
         and RNG states. Verifies the graph contains run_dtensor_rng_op."""
         from torch._dynamo.testing import AotEagerAndRecordGraphs
@@ -771,6 +869,8 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     def _assert_eager_compiled_match(
         self, eager_results, eager_rng_states, compiled_results, compiled_rng_states
     ):
+        # [FUNCTION DOC] HELPER: Asserts per-iteration results and the RNG states after each
+        # call match between the eager and compiled runs.
         """Assert per-iteration results and RNG states match between eager and compiled."""
         for i in range(len(eager_results)):
             self.assertEqual(eager_results[i], compiled_results[i])
@@ -781,6 +881,8 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
             )
 
     def _assert_replicate_cross_rank_equal(self, results, device_mesh):
+        # [FUNCTION DOC] HELPER: Gathers each result across ranks and asserts all ranks' blocks
+        # are equal (replicate placement check).
         """Assert all ranks produced identical results (for Replicate placement)."""
         for i in range(len(results)):
             local_result = results[i]
@@ -804,6 +906,10 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     def _test_compile_random_op(
         self, fn, device_mesh, create_input=None, num_runs=3, placements=None
     ):
+        # [FUNCTION DOC] HELPER: Runs fn eagerly and compiled num_runs times (default placements
+        # Shard(0), default input a ones DTensor of shape 8 by 8), asserts results and RNG
+        # states match, checks cross-rank equality for all-Replicate placements, then repeats
+        # the comparison with the inductor backend after resetting dynamo.
         """Run fn eager and compiled num_runs times, assert i-th results match
         and graph contains run_dtensor_rng_op. Tests both aot_eager and inductor
         backends."""
@@ -813,6 +919,8 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
         if create_input is None:
 
             def create_input():
+                # [FUNCTION DOC] HELPER: Returns a ones DTensor of shape 8 by 8 with the
+                # enclosing mesh and placements.
                 return torch.distributed.tensor.ones(
                     (8, 8), device_mesh=device_mesh, placements=placements
                 )
@@ -840,9 +948,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_native_dropout(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for dropout (p 0.5, training) with
+        # Shard(0) and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies training dropout with p 0.5 to x.
             return torch.nn.functional.dropout(x, p=0.5, training=True)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -851,9 +962,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_normal_(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for in-place normal_ with Shard(0) and
+        # Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls normal_ on x.
             return x.normal_()
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -862,9 +976,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_rand_like(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for rand_like with Shard(0) and
+        # Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns rand_like of x.
             return torch.rand_like(x)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -873,9 +990,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_randn_like(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for randn_like with Shard(0) and
+        # Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns randn_like of x.
             return torch.randn_like(x)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -884,9 +1004,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_randint_like(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for randint_like (0 to 10) with
+        # Shard(0) and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns randint_like of x with low 0 and high 10.
             return torch.randint_like(x, 0, 10)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -895,9 +1018,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_uniform_(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for in-place uniform_ with Shard(0)
+        # and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls uniform_ with 0.0 and 1.0 on x.
             return x.uniform_(0.0, 1.0)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -906,14 +1032,19 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_bernoulli(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for bernoulli using a DTensor of
+        # probability 0.5 as input, for Shard(0) and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns bernoulli of x.
             return torch.bernoulli(x)
 
         for placements in ([Shard(0)], [Replicate()]):
 
             def create_input(placements=placements):
+                # [FUNCTION DOC] HELPER: Returns a distributed tensor of 0.5 values of shape 8
+                # by 8 with the bound placements.
                 return distribute_tensor(
                     torch.full((8, 8), 0.5, device=self.device_type),
                     device_mesh,
@@ -927,9 +1058,12 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_bernoulli_float(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for in-place bernoulli_ with
+        # probability 0.5, for Shard(0) and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls bernoulli_ with 0.5 on x.
             return x.bernoulli_(0.5)
 
         for placements in ([Shard(0)], [Replicate()]):
@@ -938,9 +1072,13 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_compile_multiple_random_ops(self):
+        # [FUNCTION DOC] GPU-only. Compile-vs-eager check for a function that chains uniform_
+        # and dropout, for Shard(0) and Replicate placements.
         device_mesh = self.build_device_mesh()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies uniform_ from 0 to 1 and then dropout with p 0.5 to
+            # x; returns the result.
             x = x.uniform_(0, 1)
             x = torch.nn.functional.dropout(x, p=0.5)
             return x
@@ -950,13 +1088,20 @@ class DistTensorRandomOpCompileTest(DTensorTestBase):
 
 
 class DistTensorRandomOpsTest3D(DTensorTestBase):
+    # [CLASS DOC] Multi-process test on 8 ranks for HSDP plus TP random initialization (3D
+    # mesh).
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property overriding the test world size; returns 8.
         return 8
 
     @skip_if_lt_x_gpu(8)
     @with_comms
     def test_hsdp_tp_model_meta_init(self):
+        # [FUNCTION DOC] Needs 8 GPUs. Meta-initializes a Linear with TP and fully_shard on a 3D
+        # replicate/shard/tp mesh, materializes it, checks RNG tracker type and DTensor weight,
+        # and asserts shards are equal across data-parallel replicas (same rank modulo 4) and
+        # differ otherwise.
         # initialize the 3-d device mesh
         global_mesh = init_device_mesh(
             self.device_type,
@@ -1014,6 +1159,8 @@ class DistTensorRandomOpsTest3D(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def compute_rankwise_if_local_tensor(weight_local, rank):
+            # [FUNCTION DOC] HELPER: Compares the local weight with each rank's slice of the
+            # gathered weight; equal when rank modulo 4 matches, different otherwise.
             # verify the weights are initialized differently on all ranks
             shard_dim_0_len = self.world_size // 4
             for other_rank in range(self.world_size):

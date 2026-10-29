@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor pointwise (elementwise) operators. Contains helper functions
+# that convert tensors in nested structures to and from DTensors, a multi-process test class
+# (DistElementwiseOpsTest) that checks placement propagation (Shard, Replicate, Partial
+# sum/avg/max/min, _NormPartial), communication counts via CommDebugMode, in-place and out=
+# variants, foreach and fused Adam/AdamW ops, and a single-process validation class that checks
+# registered partial rules against OpInfo samples. A LocalTensor variant of the main class is
+# created at import time; running the file executes run_tests.
 
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -38,6 +45,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 def no_op():
+    # [FUNCTION DOC] HELPER: Default pre-op hook; does nothing and returns None.
     return None
 
 
@@ -46,6 +54,10 @@ def deepcopy_convert_to_dtensor(
     device_mesh: DeviceMesh,
     placements: Sequence[Placement],
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Return a copy of val (a nested structure of lists/dicts/tuples,
+    # mapped with pytree) in which every plain Tensor is replaced by distribute_tensor on the
+    # given device_mesh and placements; DTensors and non-tensor leaves are kept unchanged. Args:
+    # val structure, device_mesh, placements.
     """
     Recursively convert (over Sequence and Dict types) Tensors into DTensors.
 
@@ -55,6 +67,8 @@ def deepcopy_convert_to_dtensor(
     """
 
     def f(x):
+        # [FUNCTION DOC] HELPER: Leaf mapper; distributes a non-DTensor Tensor with the
+        # enclosing mesh and placements, otherwise returns the leaf unchanged.
         if isinstance(x, Tensor) and not isinstance(x, DTensor):
             return distribute_tensor(
                 x,
@@ -67,6 +81,9 @@ def deepcopy_convert_to_dtensor(
 
 
 def deepcopy_convert_from_dtensor(val: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Return a copy of val (pytree-mapped nested structure) where every
+    # DTensor is replaced by its full_tensor (which may communicate); other leaves are
+    # unchanged.
     """
     Recursive convert any DTensor to local Tensor.
 
@@ -75,6 +92,8 @@ def deepcopy_convert_from_dtensor(val: Any) -> Any:
     """
 
     def f(x):
+        # [FUNCTION DOC] HELPER: Leaf mapper; returns full_tensor for a DTensor leaf, otherwise
+        # the leaf itself.
         if isinstance(x, DTensor):
             return x.full_tensor()
         return x
@@ -83,6 +102,11 @@ def deepcopy_convert_from_dtensor(val: Any) -> Any:
 
 
 class DistElementwiseOpsTest(DTensorOpTestBase):
+    # [CLASS DOC] Multi-process DTensor tests (base DTensorOpTestBase) for pointwise ops. Two
+    # private helpers run an op on plain tensors and on DTensors and compare; the test methods
+    # check placement rules (especially Partial propagation and redistribution), communication
+    # counts, in-place/out= behavior, foreach ops and fused optimizer ops. Also wrapped for
+    # LocalTensor mode below.
     def _compare_pairwise_ops(
         self,
         *,
@@ -93,6 +117,11 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Run op on the plain args/kwargs first as the reference, then on
+        # copies converted to DTensors with the given mesh and placements, convert the result
+        # back with full_tensor and assert equality via assertEqualOnRank. pre_op_fn (default
+        # no-op) is called before each run, e.g. to reseed RNG. kwargs of None means empty.
+        # Raises on mismatch.
         if pre_op_fn is None:
             pre_op_fn = no_op
 
@@ -135,6 +164,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
         op: Callable,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Create a random float tensor (requires_grad set) of input_size
+        # on the test device and compare op applied to plain versus DTensor inputs via
+        # _compare_pairwise_ops. Extra keyword arguments are forwarded to the op as kwargs.
         if pre_op_fn is None:
             pre_op_fn = no_op
 
@@ -156,6 +188,8 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     @with_comms
     @skip("This test will sometimes hang and a timeout error will be thrown")
     def test_partial_add(self):
+        # [FUNCTION DOC] Adds two Partial DTensors and asserts the result is still partial.
+        # Unconditionally skipped because it sometimes hangs and times out, so it never runs.
         device_mesh = self.build_device_mesh()
         d_1 = DTensor.from_local(torch.rand(2, 2), device_mesh, [Partial()])
         d_2 = DTensor.from_local(torch.rand(2, 2), device_mesh, [Partial()])
@@ -164,6 +198,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_partial_replicate_add(self):
+        # [FUNCTION DOC] For both sum and avg reduce ops, adds a Partial DTensor and a Replicate
+        # DTensor (broadcastable shape) and asserts no communication happened, the result keeps
+        # the Partial placement with the same reduce op, and its full tensor equals the sum of
+        # the two full tensors.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -189,6 +227,8 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_activations(self):
+        # [FUNCTION DOC] Runs gelu, relu and sigmoid on sharded and replicated inputs via
+        # _run_sharded_elementwise_ops, checking DTensor results match plain tensor results.
         device_mesh = self.build_device_mesh()
         self._run_sharded_elementwise_ops(
             device_mesh=device_mesh,
@@ -232,9 +272,15 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
         "testing RNG based ops is broken: https://github.com/pytorch/PiPPy/issues/494"
     )
     def test_dropout(self):
+        # [FUNCTION DOC] Compares dropout on sharded inputs (Shard 0 with p 0.4 not training,
+        # Shard 1 with p 0.5 training) against plain tensors, reseeding per rank before each
+        # run. Skipped unconditionally (RNG-based op comparison is known broken), so it never
+        # runs.
         device_mesh = self.build_device_mesh()
 
         def _reset_random_seed():
+            # [FUNCTION DOC] HELPER: Seed the global RNG with the rank plus 4; used as
+            # pre_op_fn.
             torch.manual_seed(self.rank + 4)
 
         self._run_sharded_elementwise_ops(
@@ -259,6 +305,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_dropout_backward(self):
+        # [FUNCTION DOC] GPU-only. Compares native_dropout_backward (grad_output random, boolean
+        # mask from a threshold of 0.8, scale 0.3) on Shard(0) DTensors against plain tensors
+        # via _compare_pairwise_ops.
         device_mesh = self.build_device_mesh()
         placements = [Shard(0)]
 
@@ -292,6 +341,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_dropout_partial_redistributes(self):
+        # [FUNCTION DOC] GPU-only. Applies training-mode dropout to a Partial sum DTensor and
+        # asserts the result is a DTensor with Replicate placement, i.e. the input is
+        # redistributed instead of raising.
         """Dropout on Partial input redistributes to Replicate first (no error)."""
         device_mesh = self.build_device_mesh()
         input_tensor = torch.randn(8, 5, device=self.device_type)
@@ -302,6 +354,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_out(self):
+        # [FUNCTION DOC] Calls mul with an out= DTensor on Shard(0) inputs (per-rank seeded) and
+        # compares both the input and the returned result with the plain tensor computation done
+        # with the same out= pattern.
         device_mesh = self.build_device_mesh()
         torch.manual_seed(self.rank)
         shard_spec = [Shard(0)]
@@ -321,6 +376,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_out_partial(self):
+        # [FUNCTION DOC] Multiplies Partial sum by Replicate with an out= DTensor that is
+        # Partial sum, and asserts both the returned DTensor and the out tensor keep placement
+        # Partial sum.
         device_mesh = self.build_device_mesh()
         input_size = (8, 4)
         # P(sum) * R -> P(sum), with out= kwarg
@@ -346,6 +404,11 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_partial(self):
+        # [FUNCTION DOC] Checks mul on Partial inputs. Partial times Partial costs exactly one
+        # communication and gives Partial with value world_size for ones. Partial sum/avg times
+        # a scalar, scalar tensor or Replicate tensor needs no communication, stays Partial and
+        # has the expected full tensor. Partial max times Replicate is redistributed and yields
+        # Replicate.
         # we only test the partial behavior for mul op as other placement
         # behaviors should be well tested in test_dtensor_ops.py
         device_mesh = self.build_device_mesh()
@@ -403,6 +466,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_div_partial(self):
+        # [FUNCTION DOC] Checks div with Partial numerator. Partial sum/avg divided by a scalar,
+        # scalar tensor or Replicate tensor needs no communication, keeps the Partial placement
+        # and gives the expected full tensor. Partial max divided by Replicate yields Replicate
+        # with the local value divided by 2.
         # we only test the partial behavior for div op as other placement
         # behaviors should be well tested in test_dtensor_ops.py
         device_mesh = self.build_device_mesh()
@@ -453,6 +520,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_masked_fill_scalar(self):
+        # [FUNCTION DOC] Compares in-place masked_fill_ with a scalar between plain tensors and
+        # DTensors for Shard(0), Replicate and Shard(1) placements using deterministic arange-
+        # based inputs and masks, asserting the full tensors match.
         """Test masked_fill_ with scalar value."""
         device_mesh = self.build_device_mesh()
 
@@ -508,6 +578,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_inplace_op_partial_to_replicate(self):
+        # [FUNCTION DOC] Asserts that an in-place clamp_ on a Partial DTensor (which would need
+        # a Partial to Replicate redistribution) raises RuntimeError saying in-place operations
+        # that require placement changes are not supported.
         # test that in-place operations that require redistribution raise an error
         # to preserve aliasing semantics (issue #163374)
         device_mesh = self.build_device_mesh()
@@ -528,6 +601,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_div_scalar_partial(self):
+        # [FUNCTION DOC] Checks aten mul.Scalar and div.Scalar on a Partial sum DTensor whose
+        # local value is the rank: local results are scaled, the placement stays partial, and
+        # after redistributing to Replicate the full tensor equals the rank sum scaled by 2
+        # (mul) or divided by 2 (div).
         aten = torch.ops.aten
         mesh = self.build_device_mesh()
 
@@ -562,6 +639,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_div_scalar_norm_partial(self):
+        # [FUNCTION DOC] Computes the norm of a Shard(0) tensor, asserts it has a _NormPartial
+        # placement, then checks mul.Scalar and div.Scalar by 2 and -2 give full tensors 20, 5,
+        # -20 and -5 (norm of the data is 10).
         mesh = self.build_device_mesh()
         aten = torch.ops.aten
         local_tensor = torch.tensor([1.0, 1.0, 7.0, 7.0])
@@ -577,6 +657,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_add_sub_scalar_partial(self):
+        # [FUNCTION DOC] Checks Partial sum with scalars: adding or subtracting a scalar (also
+        # scalar minus tensor) yields a Replicate result with the correct full value; adding or
+        # subtracting a Partial DTensor with itself stays partial, with local value rank plus or
+        # minus rank, and redistributes to the expected total.
         mesh = self.build_device_mesh()
 
         rank = self.rank
@@ -627,6 +711,8 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_add_sub_scalar_norm_partial(self):
+        # [FUNCTION DOC] Checks that adding or subtracting a scalar to a _NormPartial result
+        # (norm of Shard(0) data) gives Replicate placement with full values 11 and 9.
         mesh = self.build_device_mesh()
 
         # norm partial + scalar
@@ -652,6 +738,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     @with_comms
     @parametrize("op,reduce_op", [(torch.maximum, "max"), (torch.minimum, "min")])
     def test_partial_propagation(self, op, reduce_op):
+        # [FUNCTION DOC] Parametrized over maximum/max and minimum/min. Applies the op to two
+        # Partial DTensors with the matching reduce op and asserts zero communication and that
+        # the result keeps Partial with that reduce op.
         # Test that torch.maximum/minimum preserves Partial("max"/"min") placements
         # since max(max(a), max(b)) == max(a, b) and min(min(a), min(b)) == min(a, b)
         device_mesh = self.build_device_mesh()
@@ -673,6 +762,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_neg_partial(self):
+        # [FUNCTION DOC] Checks neg on Partial DTensors with no communication: sum and avg stay
+        # the same partial type with negated full values, Partial max becomes Partial min, and
+        # Partial min becomes Partial max.
         # test that neg preserves Partial placement without communication
         # math: -(A1 + A2) = -A1 + -A2
         device_mesh = self.build_device_mesh()
@@ -720,6 +812,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_maximum_mixed_partials_redistribution(self):
+        # [FUNCTION DOC] Calls maximum on a Partial max and a Partial sum DTensor; asserts
+        # communication occurred (the sum partial is reduced first), that the result is Partial
+        # max, and that its full tensor first element equals world_size.
         # Test that mixing Partial("max") with Partial("sum") correctly
         # redistributes the incompatible partial before computing maximum
         device_mesh = self.build_device_mesh()
@@ -750,6 +845,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_add_partial_with_replicate_rules(self):
+        # [FUNCTION DOC] For reduce ops avg, max, min, adds a Partial DTensor and a Replicate
+        # constant tensor and asserts no communication, the result keeps Partial of that op, and
+        # the full tensor equals the expected reduced value plus the constant.
         # P(x) + R -> P(x) for x in {avg, max, min}: adding a replicated constant
         # preserves the partial reduce type (constant is the same on all ranks)
         device_mesh = self.build_device_mesh()
@@ -786,6 +884,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_add_replicate_with_partial_avg(self):
+        # [FUNCTION DOC] Adds a Replicate tensor and a Partial avg DTensor; asserts no
+        # communication, the result is Partial avg, and the full tensor equals the replicate
+        # value plus the average of the per-rank values.
         # R + P(avg) -> P(avg): avg is linear, so this holds for any alpha
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
@@ -814,6 +915,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_mul_div_replicate_partial_asymmetry(self):
+        # [FUNCTION DOC] Contrasts Replicate times Partial sum (no communication, stays Partial
+        # sum, correct full value) with Replicate divided by Partial sum (communication
+        # required, correct full result after reducing the denominator).
         # mul is bilinear: r * (p1 + p2) = r*p1 + r*p2, so R * P(sum) -> P(sum).
         # div is only linear in the numerator: r / (p1 + p2) != r/p1 + r/p2.
         device_mesh = self.build_device_mesh()
@@ -867,6 +971,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_inplace_add_partial_avg_with_replicate(self):
+        # [FUNCTION DOC] In-place add_ of a Replicate tensor into a Partial avg DTensor: asserts
+        # no communication, self keeps Partial avg, and the full tensor equals the average of
+        # per-rank values plus 3.
         # P(avg) += R -> P(avg): self is P(avg), other is R, valid inplace
         # because the rule P(avg)+R->P(avg) keeps output == self placement.
         device_mesh = self.build_device_mesh()
@@ -895,6 +1002,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_inplace_add_replicate_with_partial_avg_requires_comm(self):
+        # [FUNCTION DOC] In-place add_ of a Partial avg DTensor into a Replicate DTensor:
+        # asserts communication occurred (the partial is redistributed), self stays Replicate,
+        # and the full tensor equals 3 plus the average of per-rank values.
         # R += P(avg): the out-of-place rule R+P(avg)->P(avg) is valid, but
         # inplace requires output == self == R, so P(avg) output is rejected.
         # The runtime must redistribute P(avg) to R first (communication).
@@ -936,6 +1046,11 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     def test_foreach_placement_propagation(
         self, op_fn, second_arg, placement, expected
     ):
+        # [FUNCTION DOC] Parametrized over foreach add (list), foreach mul (scalar), foreach neg
+        # and foreach add on Shard(0). Builds three DTensors of different shapes with the given
+        # placement (Partial or Shard), calls the foreach op, and asserts no communication, a
+        # result list of the same length with every element a DTensor with the expected
+        # placement.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -991,6 +1106,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_foreach_mixed_placements(self):
+        # [FUNCTION DOC] Calls foreach add on a list mixing a Partial sum DTensor and a Shard(0)
+        # DTensor; asserts no communication and that each result element keeps its own
+        # placement.
         """Each element in a foreach list independently preserves its placement."""
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
@@ -1021,6 +1139,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_auto_registered_foreach_unary(self):
+        # [FUNCTION DOC] Checks an automatically registered foreach unary op (foreach acos) on
+        # Shard(0) DTensors: out-of-place and in-place results keep Shard(0) placement and full
+        # tensors equal the plain tensor results.
         device_mesh = self.build_device_mesh()
         inputs = [
             torch.linspace(0.05, 0.95, 32, device=self.device_type).reshape(8, 4),
@@ -1065,6 +1186,11 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
         ],
     )
     def test_fused_adam(self, mesh_type, amsgrad):
+        # [FUNCTION DOC] GPU-only, parametrized by mesh_type (same or cross) and amsgrad. Calls
+        # the fused Adam update on DTensor params, grads, and states on a Shard(0) mesh, with
+        # the step counters Replicate on either the same mesh or a different sub-mesh of a 2D
+        # dp/tp mesh (split uses ws//2). Asserts the param stays a DTensor with Shard(0) on the
+        # original mesh.
         if mesh_type == "same":
             param_mesh = self.build_device_mesh()
             step_mesh = param_mesh
@@ -1137,6 +1263,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
     @with_comms
     @skip_unless_torch_gpu
     def test_fused_adamw_strided_shard_cross_mesh(self):
+        # [FUNCTION DOC] GPU-only. Calls aten fused AdamW with params/grads/states using a
+        # _StridedShard plus Shard placement on a 2D mesh, while state steps live on the 1D dp
+        # sub-mesh as Replicate; asserts the parameter keeps its DTensor type, placements and
+        # mesh.
         """Reproduce the torchtitan pattern: params with _StridedShard on a 2D
         mesh, state_steps with Replicate on a 1D DP sub-mesh."""
         mesh_2d = init_device_mesh(
@@ -1210,6 +1340,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_fused_adamw_tensor_lr(self):
+        # [FUNCTION DOC] Calls the aten fused AdamW tensor_lr overload with the learning rate
+        # passed as a Replicate DTensor and Shard(0) params; asserts the parameter remains a
+        # DTensor with Shard(0).
         """Test _fused_adamw_ with tensor lr kwarg."""
         device_mesh = self.build_device_mesh()
 
@@ -1268,6 +1401,9 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_new_pointwise_ops(self):
+        # [FUNCTION DOC] Checks that hardshrink, lcm, special xlog1py and special entr work on
+        # Shard(0) DTensors built from per-rank local tensors, comparing to_local with the plain
+        # tensor result.
         device_mesh = self.build_device_mesh()
         torch.manual_seed(self.rank)
         shard_spec = [Shard(0)]
@@ -1301,6 +1437,10 @@ class DistElementwiseOpsTest(DTensorOpTestBase):
 
     @with_comms
     def test_new_special_pointwise_ops(self):
+        # [FUNCTION DOC] Checks a list of unary special functions (airy_ai, bessel y0/y1,
+        # modified bessel i0/i1/k0/k1 and scaled k0/k1) and binary orthogonal polynomial ops
+        # (chebyshev t/u, hermite h/he, laguerre, legendre) on Shard(0) DTensors, comparing
+        # local shards with plain results.
         device_mesh = self.build_device_mesh()
         torch.manual_seed(self.rank)
         shard_spec = [Shard(0)]
@@ -1341,11 +1481,16 @@ instantiate_parametrized_tests(DistElementwiseOpsTest)
 
 
 class TestPointwiseRuleValidation(TestCase):
+    # [CLASS DOC] Single-process TestCase (fake process group of world size 2) validating
+    # registered partial-placement rules for pointwise ops against OpInfo samples with evenly
+    # divisible sizes.
     """Validate registered partial-placement rules via OpInfo samples."""
 
     world_size = 2
 
     def setUp(self):
+        # [FUNCTION DOC] Initializes a fake-backend process group (rank 0, world size from the
+        # class) if none is initialized; side effect on global distributed state.
         super().setUp()
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
@@ -1353,11 +1498,16 @@ class TestPointwiseRuleValidation(TestCase):
             )
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the default process group if initialized, after the base
+        # tearDown.
         super().tearDown()
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
     def _with_even_sizes(self, fn):
+        # [FUNCTION DOC] HELPER: Temporarily overrides the OpInfo size constants L, M, S, XS (to
+        # 24, 12, 4, 2) in both the opinfo core module and common_methods_invocations, calls fn,
+        # returns its result, and always restores the original values in a finally block.
         """Run fn with opinfo sizes overridden to be evenly divisible by world_size."""
         import torch.testing._internal.common_methods_invocations as common_ops
         from torch.testing._internal.opinfo import core as opinfo_core
@@ -1384,6 +1534,11 @@ class TestPointwiseRuleValidation(TestCase):
             ) = orig_sizes
 
     def test_per_category_no_incorrect_rules(self):
+        # [FUNCTION DOC] For ten representative ops (one per rule category) runs
+        # compare_operator on cpu float32 with incorrect_only set, and asserts the number of
+        # true positives equals the recorded expected count and that no false positives
+        # (incorrect rules) are found. Each op is a subTest, run with the even sizes override.
+        # The hard-coded counts will need updating if sample inputs or rules change.
         """Verify no incorrect rules for one representative op per category.
 
         Each category of specialized pointwise ops shares the same partial
@@ -1411,6 +1566,9 @@ class TestPointwiseRuleValidation(TestCase):
             with self.subTest(op=op_name, category=category):
 
                 def run(name=op_name, expected=expected_tp):
+                    # [FUNCTION DOC] HELPER: Runs compare_operator for the given op name and
+                    # asserts the expected true positive count and zero false positives; bound
+                    # to loop values through default arguments.
                     stats = compare_operator(
                         name,
                         device="cpu",
