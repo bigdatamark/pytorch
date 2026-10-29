@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper utilities for the FX graph mode quantization flow (prepare/convert).
+# Provides node-argument classification (weight/bias, non-tensor args), prepack op lookup,
+# unique attribute naming, producer-node extraction, getattr node creation, and custom module
+# LSTM/MHA dequant-stub rewriting plus qconfig vs backend dtype-constraint checks.
+# Import-time side effect: imports the _decomposed module so quantized_decomposed ops get registered.
 import copy
 import functools
 import operator
@@ -75,6 +80,9 @@ NON_QUANTIZABLE_WEIGHT_OPS = {
 
 @dataclass
 class ObservedGraphModuleAttrs:
+    # [CLASS DOC] Dataclass of metadata attached to an observed (prepared) GraphModule: per-node qconfig and
+    # scope maps, prepare custom config, equalization qconfigs, the qconfig mapping, QAT flag, set of
+    # observed node names, and standalone-module flags/input-output quantized index lists (default off/None).
     node_name_to_qconfig: dict[str, QConfigAny]
     node_name_to_scope: dict[str, tuple[str, type]]
     prepare_custom_config: PrepareCustomConfig
@@ -88,6 +96,8 @@ class ObservedGraphModuleAttrs:
 
 
 def node_arg_is_weight(node: Node, arg: Any) -> bool:
+    # [FUNCTION DOC] Return True if arg is the weight of node: matches args at the weight_index stored in
+    # node.meta target_dtype_info (when in range), else the 'weight' keyword argument. Identity comparison.
     """Returns if node arg is weight"""
     weight_index = None
     if "target_dtype_info" in node.meta:
@@ -102,6 +112,8 @@ def node_arg_is_weight(node: Node, arg: Any) -> bool:
 
 
 def node_arg_is_bias(node: Node, arg: Any) -> bool:
+    # [FUNCTION DOC] Return True if arg is the bias of node: matches args at the bias_index stored in
+    # node.meta target_dtype_info (when in range), else the 'bias' keyword argument. Identity comparison.
     """Returns if node arg is bias"""
     bias_index = None
     if "target_dtype_info" in node.meta:
@@ -118,6 +130,9 @@ def node_arg_is_bias(node: Node, arg: Any) -> bool:
 def get_custom_module_class_keys(
     custom_module_mapping: dict[QuantType, dict[type, type]],
 ) -> list[Any]:
+    # [FUNCTION DOC] Collect the unique float custom module classes across the STATIC, DYNAMIC and WEIGHT_ONLY
+    # entries of a custom module mapping (missing quant types are ignored). Returns them as a list in
+    # unspecified order (set-based dedup).
     r"""Get all the unique custom module keys in the custom config dict.
 
     Example input::
@@ -143,6 +158,8 @@ def get_custom_module_class_keys(
 
 
 def get_linear_prepack_op_for_dtype(dtype):
+    # [FUNCTION DOC] Map a dtype to the quantized linear prepack op: float16 -> linear_prepack_fp16, qint8 -> linear_prepack.
+    # Raises a generic Exception for any other dtype.
     if dtype == torch.float16:
         return torch.ops.quantized.linear_prepack_fp16
     elif dtype == torch.qint8:
@@ -152,6 +169,8 @@ def get_linear_prepack_op_for_dtype(dtype):
 
 
 def get_qconv_prepack_op(conv_op: Callable) -> Callable:
+    # [FUNCTION DOC] Map a functional conv/conv_transpose op (1d/2d/3d) to its quantized prepack op.
+    # Raises AssertionError if the op is not in the table.
     prepack_ops = {
         torch.nn.functional.conv1d: torch.ops.quantized.conv1d_prepack,
         torch.nn.functional.conv2d: torch.ops.quantized.conv2d_prepack,
@@ -172,10 +191,14 @@ def get_qconv_prepack_op(conv_op: Callable) -> Callable:
 # >> new_name = get_new_observer_name(module)
 # new_name will be an unused attribute name on module, e.g. `_observer_1`
 def get_new_attr_name_with_prefix(prefix: str) -> Callable:
+    # [FUNCTION DOC] Return a function that, given a module, yields an unused attribute name made of the prefix
+    # (dots replaced with underscores) plus the smallest non-negative integer suffix not already an attribute.
     prefix = prefix.replace(".", "_")
 
     def get_new_attr_name(module: torch.nn.Module):
+        # [FUNCTION DOC] HELPER: Inner closure: probes numeric suffixes starting at zero until the name is not an attribute of module.
         def get_attr_name(i: int):
+            # [FUNCTION DOC] HELPER: Builds a candidate attribute name from the prefix and integer i.
             return prefix + str(i)
 
         i = 0
@@ -189,6 +212,9 @@ def get_new_attr_name_with_prefix(prefix: str) -> Callable:
 
 
 def collect_producer_nodes(node: Node) -> list[Node] | None:
+    # [FUNCTION DOC] Trace back from node through args/kwargs collecting producer nodes, stopping expansion at
+    # getattr call_function nodes. Returns the node list, or None if a placeholder (graph input) is reached,
+    # since the chain is then not self contained.
     r"""Starting from a target node, trace back until we hit input or
     getattr node. This is used to extract the chain of operators
     starting from getattr to the target node, for example::
@@ -221,6 +247,9 @@ def collect_producer_nodes(node: Node) -> list[Node] | None:
 def graph_module_from_producer_nodes(
     root: GraphModule, producer_nodes: list[Node]
 ) -> GraphModule:
+    # [FUNCTION DOC] Build a new GraphModule rooted at root from a non-empty producer node list. Reverses the list in
+    # place (mutation), copies each node into a fresh Graph, and outputs the last copied node.
+    # Raises AssertionError if the list is empty.
     r"""Construct a graph module from extracted producer nodes
     from `collect_producer_nodes` function
     Args:
@@ -237,6 +266,7 @@ def graph_module_from_producer_nodes(
     env: dict[Any, Any] = {}
 
     def load_arg(a):
+        # [FUNCTION DOC] HELPER: Remaps node arguments to their copies in the new graph via the env mapping.
         return map_arg(a, lambda node: env[node])
 
     for producer_node in producer_nodes:
@@ -249,6 +279,8 @@ def graph_module_from_producer_nodes(
 # TODO: delete
 @functools.cache
 def assert_and_get_unique_device(module: torch.nn.Module) -> Any:
+    # [FUNCTION DOC] Cached (functools.cache) wrapper returning the unique device of a module's params/buffers, or None
+    # if none; errors when multiple devices are found. Marked TODO delete.
     """
     Returns the unique device for a module, or None if no device is found.
     Throws an error if multiple devices are detected.
@@ -263,6 +295,9 @@ def create_getattr_from_value(
     value: Any,
     device: torch.device | None = None,
 ) -> Node:
+    # [FUNCTION DOC] Register value (tensor cloned/detached, otherwise converted to a tensor on device) as a new buffer on
+    # module under a fresh name derived from prefix, and create a get_attr node for it in graph.
+    # If device is None it is inferred from the module. Mutates module; returns the new node.
     """
     Given a value of any type, creates a getattr node corresponding to the value and
     registers the value as a buffer to the module.
@@ -285,6 +320,12 @@ def create_getattr_from_value(
 def all_node_args_have_no_tensors(
     node: Node, modules: dict[str, torch.nn.Module], cache: dict[Node, bool]
 ) -> bool:
+    # [FUNCTION DOC] Conservatively decide whether all args of node are non-tensors (primitives); results are memoized
+    # in cache. Returns True only when certain; unknown or tensor cases give False. Recurses through
+    # observer modules, getitem, ndim/shape getattr and size calls, and list/Node args.
+    # Raises AssertionError if a call_module node target is not a string.
+    # KNOWN ISSUE: a call_module node whose module is not an activation post process leaves result False,
+    # and the second call_module branch is unreachable dead code. Also the non-Node-arg case marks tensor found.
     """
     If we know for sure that all of this node's args have no
     tensors (are primitives), return True.  If we either
@@ -367,6 +408,7 @@ def all_node_args_have_no_tensors(
 
 
 def all_node_args_except_first(node: Node) -> list[int]:
+    # [FUNCTION DOC] Return the list of arg indices from 1 up to the number of positional args of node.
     """
     Returns all node arg indices after first
     """
@@ -374,12 +416,14 @@ def all_node_args_except_first(node: Node) -> list[int]:
 
 
 def return_arg_list(arg_indices: list[int]) -> Callable[[Node], list[int]]:
+    # [FUNCTION DOC] Return a function that, for a node, gives those of the given arg_indices that are valid positions in node.args.
     """
     Constructs a function that takes a node as arg and returns the arg_indices
     that are valid for node.args
     """
 
     def arg_indices_func(node: Node) -> list[int]:
+        # [FUNCTION DOC] HELPER: Inner closure filtering arg_indices to those smaller than the node's positional arg count.
         return [i for i in arg_indices if i < len(node.args)]
 
     return arg_indices_func
@@ -416,6 +460,8 @@ EMPTY_ARG_DICT: dict[type | torch.dtype, Callable[[Node], list[int]]] = {}
 def get_non_observable_arg_indexes_and_types(
     node: Node,
 ) -> dict[type | torch.dtype, Callable[[Node], list[int]]]:
+    # [FUNCTION DOC] Look up the node (op, target) in NON_OBSERVABLE_ARG_DICT and return its mapping from non-float
+    # type/dtype to an index-selecting function; returns the empty mapping when not listed.
     """
     Returns a dict with of non float tensor types as keys and values which correspond to a
     function to retrieve the list (which takes the node as an argument)
@@ -431,6 +477,9 @@ def maybe_get_next_module(
     target_module_type: type[nn.Module] | None = None,
     target_functional_type: Any = None,
 ) -> Node | None:
+    # [FUNCTION DOC] Return the first user of node that is a call_module whose module is an instance of
+    # target_module_type, or a call_function whose target equals target_functional_type; else None.
+    # Checks are skipped for a type that is None.
     """Gets the next module that matches what is needed in
     is_target_module_type if it exists
 
@@ -462,6 +511,7 @@ def create_node_from_old_node_preserve_meta(
     create_node_args: tuple[Any, ...],
     old_node: Node,
 ) -> Node:
+    # [FUNCTION DOC] Create a node in quantized_graph from create_node_args and copy stack_trace from old_node. Returns the new node.
     """
     Creates `new_node` and copies the necessary metadata to it from `old_node`.
     """
@@ -473,6 +523,9 @@ def create_node_from_old_node_preserve_meta(
 def get_skipped_module_name_and_classes(
     prepare_custom_config: PrepareCustomConfig, is_standalone_module: bool
 ) -> tuple[list[str], list[type[Any]]]:
+    # [FUNCTION DOC] Return (names, classes) of modules to skip tracing: copies of the non-traceable names/classes from
+    # the prepare custom config; for non-standalone modules also adds standalone module names/classes
+    # and the float custom module classes.
     skipped_module_names = copy.copy(prepare_custom_config.non_traceable_module_names)
     skipped_module_classes = copy.copy(
         prepare_custom_config.non_traceable_module_classes
@@ -499,6 +552,9 @@ def _is_custom_module_lstm(
     # QuantizeHandler, but we cannot include the type here due to circular imports
     qhandler: Any | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if node is a custom-module LSTM. With a qconfig and a QuantizeHandler: torch.nn.LSTM, statically
+    # quantized activation and handler.is_custom_module(); otherwise: quantizable LSTM instance.
+    # Raises AssertionError if qhandler is not a QuantizeHandler.
     """
     Return whether this refers to the custom module LSTM flow.
     """
@@ -524,6 +580,8 @@ def _is_custom_module_mha(
     # QuantizeHandler, but we cannot include the type here due to circular imports
     qhandler: Any | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Same as the LSTM check but for MultiheadAttention (nn.MultiheadAttention with static qconfig and
+    # custom-module handler, or quantizable MultiheadAttention). Raises AssertionError on a bad qhandler.
     """
     Return whether this refers to the custom module MultiheadAttention flow.
     """
@@ -545,6 +603,7 @@ def _is_custom_module_mha(
 def _get_module(
     node: Node, named_modules: dict[str, torch.nn.Module]
 ) -> torch.nn.Module | None:
+    # [FUNCTION DOC] HELPER: Return the module for a call_module node found in named_modules, else None.
     """
     If `node` refers to a call_module node, return the module, else None.
     """
@@ -560,6 +619,8 @@ def _insert_dequant_stub(
     named_modules: dict[str, torch.nn.Module],
     graph: Graph,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Attach a new DeQuantStub (unique 'dequant_stub_' name) to model and named_modules, and insert a
+    # call_module node for it right after node in graph. Returns the new node.
     """
     Attach a `DeQuantStub` to the model and create a node that calls this
     `DeQuantStub` on the output of `node`, similar to how observers are inserted.
@@ -580,6 +641,10 @@ def _insert_dequant_stubs_for_custom_module_lstm_output(
     named_modules: dict[str, torch.nn.Module],
     graph: Graph,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Rewrite graph so the nested tuple output of a custom LSTM node is split via getitem into output and
+    # (hidden0, hidden1), each dequantized by a DeQuantStub, and recombined by tuple nodes. Reroutes other
+    # users of the LSTM node to the recombined tuple, then simplifies via tuple/getitem rerouting.
+    # Returns the recombined top-level tuple node. Mutates graph and model.
     """
     Insert DeQuantStubs after each internal output node of custom module LSTM.
 
@@ -673,6 +738,8 @@ def _maybe_get_custom_module_lstm_from_node_arg(
     arg: Node,
     named_modules: dict[str, torch.nn.Module],
 ) -> Node | None:
+    # [FUNCTION DOC] HELPER: If arg reaches a custom module LSTM through one of four dequant/getitem/tuple chains, return the LSTM
+    # node; else None. Used to skip input observers for consumers of LSTM outputs.
     """
     Given an argument of a node, if the argument refers to the path through which the node
     is a consumer of custom module LSTM, return the custom module LSTM node, or None otherwise.
@@ -698,18 +765,24 @@ def _maybe_get_custom_module_lstm_from_node_arg(
     """
 
     def match_dq(a):
+        # [FUNCTION DOC] HELPER: True if a is a DeQuantStub call_module node.
         return isinstance(_get_module(a, named_modules), DeQuantStub)
 
     def match_lstm(a):
+        # [FUNCTION DOC] HELPER: True if a is a custom module LSTM node.
         return _is_custom_module_lstm(a, named_modules)
 
     def match_getitem(a):
+        # [FUNCTION DOC] HELPER: True if a is an operator.getitem call_function node.
         return a.op == "call_function" and a.target is operator.getitem
 
     def match_tuple(a):
+        # [FUNCTION DOC] HELPER: True if a is a tuple-construction call_function node.
         return a.op == "call_function" and a.target is tuple
 
     def _match_pattern(match_pattern: list[Callable]) -> Node | None:
+        # [FUNCTION DOC] HELPER: Walk upward from arg following the given matcher list, stepping into the first list element for
+        # tuple nodes and the first arg otherwise; returns the last node reached or None on mismatch.
         """
         Traverse up the graph and match the args one by one.
         If there is a match, return the last matched node, or None otherwise.
@@ -743,6 +816,9 @@ def _maybe_get_custom_module_lstm_from_node_arg(
 
 
 def _reroute_tuple_getitem_pattern(graph: Graph):
+    # [FUNCTION DOC] HELPER: Find N consecutive tuple nodes followed by N reversing getitem nodes and redirect users of the
+    # last getitem to the originally packed element, bypassing the pair chain. Mutates graph users;
+    # raises AssertionError if a matched pattern has unexpected first/last node kinds.
     """
     Search for patterns where N consecutive `tuple` call_function nodes are followed by
     N consecutive `getitem` call_function nodes that are "reverses" of the `tuple` nodes.
@@ -777,6 +853,9 @@ def _reroute_tuple_getitem_pattern(graph: Graph):
         matched_patterns: list[list[Node]],
         seen: set[tuple[Node, tuple[int, ...]]],
     ):
+        # [FUNCTION DOC] HELPER: Recursive search from node for tuple/getitem patterns using a stack of expected getitem indices;
+        # appends completed patterns to matched_patterns, memoizing visited (node, stack) states in seen.
+        # Returns matched_patterns (None when returning early on a seen state).
         """
         Traverse the graph recursively to match for the N-tuple - N-getitem patterns,
         starting at the given node.
@@ -850,6 +929,8 @@ def _reroute_tuple_getitem_pattern(graph: Graph):
 def _get_observer_from_activation_post_process(
     activation_post_process: ObserverBase | FakeQuantizeBase,
 ) -> ObserverBase:
+    # [FUNCTION DOC] HELPER: Return the observer itself, or the inner observer of a FakeQuantizeBase.
+    # Raises AssertionError for other types.
     """
     If `activation_post_process` is an observer, return the observer.
     If `activation_post_process` is a fake quantize, return the internal observer.
@@ -869,6 +950,10 @@ def _qconfig_satisfies_dtype_config_constraints(
     dtype_with_constraints: DTypeWithConstraints,
     is_activation: bool = True,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Check a qconfig's activation (or weight) observer against backend DTypeWithConstraints: quant range,
+    # minimum scale (eps), and fixed scale/zero point. Instantiates the observer constructor, warns and
+    # returns False on violation. Returns True if qconfig is None, backend dtype is None, or dtypes differ.
+    # Raises AssertionError if the instantiated object is not an activation post process.
     """
     Return whether `qconfig` satisfies the following constraints from the backend,
     specified through the activation and weight DTypeWithConstraints.
@@ -888,6 +973,8 @@ def _qconfig_satisfies_dtype_config_constraints(
         dtype_with_constraints: DTypeWithConstraints,
         debug_string: str,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Inner check of one observer/fake-quant against the constraints; emits warnings with debug_string and
+        # returns False on any violation. fp16 static/dynamic qconfigs are accepted when fixed qparams are required.
         observer = _get_observer_from_activation_post_process(activation_post_process)
         app_quant_min = getattr(observer, "quant_min", None)
         app_quant_max = getattr(observer, "quant_max", None)
