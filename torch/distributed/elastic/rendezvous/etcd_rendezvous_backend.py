@@ -5,6 +5,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Etcd-backed RendezvousBackend used by the dynamic rendezvous ("etcd-v2"). Holds the serialized rendezvous state
+# in a single etcd key with compare-and-swap semantics, and provides create_backend which builds the backend plus an EtcdStore
+# from RendezvousParameters. Falls back to a stub etcd module if the etcd package is not installed.
 import binascii
 from base64 import b64decode, b64encode
 from typing import cast
@@ -26,6 +29,9 @@ from .utils import parse_rendezvous_endpoint
 
 
 class EtcdRendezvousBackend(RendezvousBackend):
+    # [CLASS DOC] Rendezvous backend that stores the opaque rendezvous state (base64 text) under one etcd key
+    # (optional key prefix, slash, run id) with a TTL (default 7200 seconds when unset or non-positive).
+    # The etcd modified index serves as the version token for optimistic concurrency. Key methods: name, get_state, set_state.
     """Represents an etcd-based rendezvous backend.
 
     Args:
@@ -52,6 +58,8 @@ class EtcdRendezvousBackend(RendezvousBackend):
         key_prefix: str | None = None,
         ttl: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the etcd client, builds the state key from the optional key_prefix and run_id, and picks the TTL
+        # (given value if positive, else the default). Raises ValueError if run_id is empty.
         if not run_id:
             raise ValueError("The run id must be a non-empty string.")
 
@@ -69,10 +77,14 @@ class EtcdRendezvousBackend(RendezvousBackend):
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Property returning the backend name "etcd-v2".
         """See base class."""
         return "etcd-v2"
 
     def get_state(self) -> tuple[bytes, Token] | None:
+        # [FUNCTION DOC] Reads the state key from etcd. Returns None if the key does not exist, otherwise a (state bytes, token) pair
+        # where the token is the etcd modified index. Raises RendezvousConnectionError on etcd or timeout errors and
+        # RendezvousStateError if the stored value is not valid base64.
         """See base class."""
         try:
             result = self._client.read(self._key)
@@ -88,12 +100,18 @@ class EtcdRendezvousBackend(RendezvousBackend):
     def set_state(
         self, state: bytes, token: Token | None = None
     ) -> tuple[bytes, Token, bool] | None:
+        # [FUNCTION DOC] Compare-and-set of the state. Without a token the write only succeeds if the key does not exist; with a token
+        # it only succeeds if the key's modified index equals the token. A token that cannot be converted to an integer is treated as stale.
+        # Returns (state, token, True) when the write was applied; on a lost race (already exists / compare failed / stale token)
+        # returns the current state as (state, token, False), or None if the key is gone. Raises RendezvousConnectionError
+        # on etcd or timeout errors. Writes to etcd with the TTL.
         """See base class."""
         base64_state = b64encode(state).decode()
 
         kwargs = {}
 
         def get_state():
+            # [FUNCTION DOC] HELPER: Reads current state and returns it with a False "applied" flag, or None if absent.
             result = self.get_state()
             if result is not None:
                 return *result, False
@@ -126,6 +144,8 @@ class EtcdRendezvousBackend(RendezvousBackend):
         return tmp
 
     def _decode_state(self, result: etcd.EtcdResult) -> tuple[bytes, Token]:
+        # [FUNCTION DOC] HELPER: Decodes the base64 value of an etcd result into bytes and returns it with the modified index as token.
+        # Raises RendezvousStateError if the value is corrupt.
         # pyrefly: ignore [missing-attribute]
         base64_state = result.value.encode()
 
@@ -141,6 +161,9 @@ class EtcdRendezvousBackend(RendezvousBackend):
 
 
 def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
+    # [FUNCTION DOC] HELPER: Builds an etcd client from the endpoint (default port 2379) and params: read_timeout (default 60, must be positive),
+    # protocol (http or https, default http), optional ssl_cert (paired with ssl_cert_key into a tuple) and ca_cert; reconnect allowed.
+    # Raises ValueError for invalid timeout or protocol and RendezvousConnectionError if the client cannot be created.
     host, port = parse_rendezvous_endpoint(params.endpoint, default_port=2379)
 
     # The timeout
@@ -182,6 +205,8 @@ def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
 
 
 def create_backend(params: RendezvousParameters) -> tuple[EtcdRendezvousBackend, Store]:
+    # [FUNCTION DOC] Creates the etcd client from params, an EtcdRendezvousBackend keyed under the rendezvous prefix with the run id,
+    # and an EtcdStore under the store prefix. Returns the (backend, store) pair. Errors propagate from client creation.
     """Create a new :py:class:`EtcdRendezvousBackend` from the specified parameters.
 
     +--------------+-----------------------------------------------------------+

@@ -7,6 +7,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Legacy etcd-based rendezvous ("etcd" scheme): a state machine in etcd (setup, joinable, frozen, final, closed)
+# through which workers agree on a rendezvous version, their rank and the world size. Exports EtcdRendezvousHandler (the
+# RendezvousHandler adapter), EtcdRendezvous (the implementation), two retry exception types and create_rdzv_handler.
+# Import-time side effects: configures this module's logger (stderr stream handler, INFO level, no propagation to parent loggers).
+# Defines TTL and timeout constants (default timeout 600 s, last call 30 s, run-id subroot TTL 2 hours).
 import json
 import logging
 import sys
@@ -56,12 +61,14 @@ logger.addHandler(_log_handler)
 # and should now restart from the beginning.
 # A small delay is recommended to avoid spamming Etcd.
 class EtcdRendezvousRetryableFailure(Exception):
+    # [CLASS DOC] Signal exception: a desired state transition was missed (e.g. a race), so the rendezvous should restart from the beginning after a short delay.
     pass
 
 
 # Similar to retryable failure, but the new state we observed suggests we
 # can re-try immediately, i.e. without a need for "safety delay".
 class EtcdRendezvousRetryImmediately(Exception):
+    # [CLASS DOC] Signal exception: like the retryable failure, but the observed state suggests restarting immediately without a delay.
     pass
 
 
@@ -89,6 +96,10 @@ CONST_RUNID_SUBROOT_TTL = 7200  # 2 hours
 
 
 class EtcdRendezvousHandler(RendezvousHandler):
+    # [CLASS DOC] RendezvousHandler adapter around an EtcdRendezvous implementation. Holds the implementation and the local address
+    # used when building store info. next_rendezvous runs the blocking barrier and builds the store; is_closed, set_closed,
+    # num_nodes_waiting, get_run_id and shutdown delegate to the implementation's etcd state. Configured via a URL with min/max workers,
+    # timeout, last call timeout and etcd prefix parameters (see create_rdzv_handler).
     """
     Implements a
     :py:class:`torch.distributed.elastic.rendezvous.RendezvousHandler` interface
@@ -153,6 +164,7 @@ class EtcdRendezvousHandler(RendezvousHandler):
     """
 
     def __init__(self, rdzv_impl: "EtcdRendezvous", local_addr: str | None):
+        # [FUNCTION DOC] Stores the rendezvous implementation and the local address of this node.
         """
         Args:
             rdzv_impl: the implementation of the rendezvous
@@ -163,13 +175,17 @@ class EtcdRendezvousHandler(RendezvousHandler):
         self._local_addr = local_addr
 
     def __del__(self):
+        # [FUNCTION DOC] HELPER: Destructor; drops the reference to the rendezvous implementation so its own cleanup can run.
         # TODO: look into using weakref here instead.
         del self._rdzv_impl
 
     def get_backend(self) -> str:
+        # [FUNCTION DOC] Returns the backend name "etcd".
         return "etcd"
 
     def next_rendezvous(self):
+        # [FUNCTION DOC] Blocks in the implementation's rendezvous barrier to get the version, rank and world size, builds the EtcdStore
+        # for that version, derives bootstrap store info for the rank and returns a RendezvousInfo. Propagates timeout/closed/rendezvous errors from the barrier.
         rdzv_version, rank, world_size = self._rdzv_impl.rendezvous_barrier()
 
         logger.info("Creating EtcdStore as the c10d::Store implementation")
@@ -181,6 +197,7 @@ class EtcdRendezvousHandler(RendezvousHandler):
         return RendezvousInfo(store, rank, world_size, bootstrap_store_info)
 
     def is_closed(self):
+        # [FUNCTION DOC] Returns true if the stored rendezvous state has status closed; false if no state exists in etcd.
         try:
             _, state = self._rdzv_impl.get_rdzv_state()
             return state["status"] == "closed"
@@ -189,9 +206,11 @@ class EtcdRendezvousHandler(RendezvousHandler):
             return False
 
     def set_closed(self):
+        # [FUNCTION DOC] Marks the rendezvous closed in etcd via the implementation.
         self._rdzv_impl.set_closed()
 
     def num_nodes_waiting(self):
+        # [FUNCTION DOC] Returns the number of workers waiting to join the next rendezvous when the current state is final; otherwise (or if no state exists) returns 0.
         try:
             _, state = self._rdzv_impl.get_rdzv_state()
             if state["status"] == "final":
@@ -201,9 +220,11 @@ class EtcdRendezvousHandler(RendezvousHandler):
         return 0
 
     def get_run_id(self) -> str:
+        # [FUNCTION DOC] Returns the run id held by the implementation.
         return self._rdzv_impl._run_id
 
     def shutdown(self) -> bool:
+        # [FUNCTION DOC] Attempts to close the rendezvous; returns true on success, or logs a warning and returns false on any failure.
         try:
             self.set_closed()
             return True
@@ -219,6 +240,10 @@ class EtcdRendezvousHandler(RendezvousHandler):
 # into auto-retry for these errors?
 #
 class EtcdRendezvous:
+    # [CLASS DOC] Core etcd rendezvous implementation. State: etcd client, key prefix (always ends with a slash), run id, min/max worker counts,
+    # overall timeout, last call timeout, and stop events for the background TTL-refresher threads (run-id directory lease and this rank's
+    # keep-alive). On construction it creates the prefix, a TTL-leased run-id subdirectory, the rdzv directory and a version counter in etcd.
+    # Key methods: rendezvous_barrier (entry point), the phase methods (init, join, confirm), and state helpers that use etcd compare-and-swap.
     """A rendezvous implementation that uses `etcd <https://etcd.io/>`__ as the backend store."""
 
     def __init__(
@@ -231,6 +256,9 @@ class EtcdRendezvous:
         timeout,
         last_call_timeout,
     ):
+        # [FUNCTION DOC] Saves the configuration, normalizes the prefix, creates the permanent prefix directory, leases the run-id subroot
+        # (starting a renewal thread) and creates the rdzv directory and a version counter initialized to zero if missing.
+        # Side effects: writes to etcd, starts a thread. Etcd errors propagate except already-exists.
         self.client = client
         logger.info("Etcd machines: %s", self.client.machines)
 
@@ -270,6 +298,7 @@ class EtcdRendezvous:
             pass
 
     def __del__(self):
+        # [FUNCTION DOC] HELPER: Destructor; signals the lease refresher threads (run id and this rank) to stop if they exist.
         # TODO: look into using weakref here instead.
         if self._lease_run_id_stop is not None:
             self._lease_run_id_stop.set()
@@ -278,6 +307,10 @@ class EtcdRendezvous:
             self._lease_this_rank_stop.set()
 
     def rendezvous_barrier(self):
+        # [FUNCTION DOC] Blocking main entry for a new rendezvous: sets a deadline from the timeout and loops running the init phase.
+        # Stops refreshing the lease of the previous rank first. Retries immediately on the immediate-retry signal, sleeps one second on
+        # retryable failures and general exceptions, and re-raises timeout, closed and other rendezvous errors. Returns a tuple of version, rank, world size.
+        # Raises RendezvousTimeoutError when the deadline passes.
         """
         Main entry point for next rendezvous.
 
@@ -336,6 +369,9 @@ class EtcdRendezvous:
                 time.sleep(1)
 
     def init_phase(self):
+        # [FUNCTION DOC] First phase: tries to create a new rendezvous state; if one already exists reads it. Closed raises RendezvousClosedError;
+        # joinable goes to the join phase and returns its result; final announces this node as waiting and then raises the immediate-retry
+        # signal; any other (transitional) state waits for a change and raises the retryable failure.
         """
         Initially, the rendezvous state is expected to be one of:
 
@@ -378,6 +414,9 @@ class EtcdRendezvous:
         raise EtcdRendezvousRetryableFailure
 
     def join_phase(self, expected_version):
+        # [FUNCTION DOC] Joins the given joinable version and gets a rank. The worker that reaches the min-worker count while the state is still
+        # joinable handles the join "last call" wait. Then waits for the state to freeze, checks the version, and returns the confirm phase result.
+        # Raises AssertionError if the observed version differs from the expected one.
         """
         We observed a rendezvous state in 'joinable' state, and attempt to join this
         particular version, and then wait for all other peers to join.
@@ -418,6 +457,8 @@ class EtcdRendezvous:
         return self.confirm_phase(expected_version, this_rank)
 
     def confirm_phase(self, expected_version, this_rank):
+        # [FUNCTION DOC] Confirms membership (setting up keep-alive keys), waits for every participant to confirm, and returns a tuple of
+        # version, this rank and the number of participants from the final state.
         """
         Once the rendezvous state transitions from 'joinable' to 'frozen',
         we have every participant confirm their membership and setup per-member
@@ -441,6 +482,7 @@ class EtcdRendezvous:
         return state["version"], this_rank, len(state["participants"])
 
     def handle_existing_rendezvous(self, expected_version):
+        # [FUNCTION DOC] Handles an existing final rendezvous: announces this node as waiting, then blocks until the rendezvous state changes or is destroyed, after which the caller retries joining.
         """
         Handle the case when there's an existing (state 'final) rendezvous already
         in place, and we have to announce ourselves waiting, and wait until
@@ -461,6 +503,9 @@ class EtcdRendezvous:
         )
 
     def try_create_rendezvous(self):
+        # [FUNCTION DOC] Creates an ephemeral "setup" state (fails if one exists), increments the version counter, creates the
+        # participant directory for the new version, then compare-and-swaps the state to "joinable" with an empty participant list and the new version.
+        # Returns the etcd result. Raises RendezvousError if the counter is missing or changed concurrently; etcd already-exists errors propagate to the caller.
         """
         Create new rendezvous state or raise an exception that indicates an unexpected state (e.g. already exists).
 
@@ -514,6 +559,10 @@ class EtcdRendezvous:
         )
 
     def join_rendezvous(self, expected_version):
+        # [FUNCTION DOC] Adds this node to the participant list with a compare-and-swap loop (random delay between attempts). The rank is the current participant count.
+        # The state node becomes ephemeral once min workers are reached, and becomes "frozen" (with keep-alive list) at max workers.
+        # Raises the retryable failure if no longer joinable, the immediate-retry signal on a version change, and AssertionError if there is no space.
+        # Returns the new etcd result and the rank on a successful swap; a failed swap is logged and retried.
         """Helper method for the join phase."""
         # Use compare-and-swap to add self to rendezvous state:
         while True:
@@ -564,6 +613,8 @@ class EtcdRendezvous:
                 logger.info("Join rendezvous CAS unsuccessful, retrying")
 
     def wait_for_peers(self, expected_version):
+        # [FUNCTION DOC] Waits for the state of the expected version to become frozen, watching etcd for changes while it is joinable.
+        # Returns the etcd result of the frozen state. Raises the retryable failure if the state moves to anything else.
         """Helper method for the join phase."""
         active_version, state = self.get_rdzv_state()
         while True:
@@ -584,6 +635,10 @@ class EtcdRendezvous:
                 )
 
     def confirm_membership(self, expected_version, this_rank):
+        # [FUNCTION DOC] Compare-and-swap loop that confirms this rank: writes a TTL keep-alive key for the rank under the version directory,
+        # appends it to the state's keep-alive list, and if all participants have confirmed sets the state to final with zero waiting workers
+        # (otherwise keeps it ephemeral as frozen). On success starts lease renewal for the key and returns the new etcd result.
+        # Raises the immediate-retry signal if the state is no longer frozen or the version changed.
         """Helper method for the confirm phase."""
         # Compare-and-swap loop
         while True:
@@ -632,6 +687,8 @@ class EtcdRendezvous:
                 logger.info("Confirm membership CAS unsuccessful, retrying")
 
     def wait_for_final(self, expected_version):
+        # [FUNCTION DOC] Waits until the state of the expected version is final, watching for changes while it is frozen. Returns the etcd result of the final state.
+        # Raises the retryable failure if the state moves to anything else.
         """Helper method for the confirm phase."""
         active_version, state = self.get_rdzv_state()
         while True:
@@ -652,6 +709,8 @@ class EtcdRendezvous:
                 )
 
     def announce_self_waiting(self, expected_version):
+        # [FUNCTION DOC] Compare-and-swap loop incrementing the waiting-workers counter of a final state with the expected version.
+        # Returns the new etcd result. Raises the immediate-retry signal if the state is no longer final or the version changed.
         """
         Announce this worker is waiting (via num_workers_waiting counter) to join next
         rendezvous, but only if state and version match.
@@ -678,6 +737,10 @@ class EtcdRendezvous:
                 logger.info("Announce self as waiting CAS unsuccessful, retrying")
 
     def wait_for_rendezvous_to_free(self, expected_version):
+        # [FUNCTION DOC] Blocks while the final rendezvous of the expected version stays valid, returning when its state changes. Checks every keep-alive key
+        # is still present; if one is missing, deletes the active state node with a compare on its value (destroying the rendezvous) and returns.
+        # Otherwise watches the rdzv directory until a change or the deadline. Raises RendezvousTimeoutError past the deadline;
+        # a failed compare-and-delete propagates an etcd error. Relies on the deadline set by the rendezvous barrier.
         """
         When there's an existing valid rendezvous in state 'final', we have to wait until the next opportunity to join.
 
@@ -746,6 +809,10 @@ class EtcdRendezvous:
             active_version, state = self.get_rdzv_state()
 
     def handle_join_last_call(self, expected_version, deadline):
+        # [FUNCTION DOC] Run by the worker that reached min workers: waits out the last call until the deadline, refreshing the TTL of the
+        # joinable state via compare-and-swap and watching for changes, then transitions the state to frozen (with empty keep-alives).
+        # Returns when frozen (by this or another worker). Raises the retryable failure if the state is no longer joinable for the expected version.
+        # Failed swaps are retried after a random delay.
         """
         After we reach min number of workers, one particular worker takes on the
         responsibility of waiting an additional timeout before closing the join window.
@@ -820,6 +887,8 @@ class EtcdRendezvous:
                 active_version, state = self.get_rdzv_state()
 
     def set_closed(self):
+        # [FUNCTION DOC] Marks the rendezvous closed with a compare-and-swap loop; returns immediately if already closed. Signals other
+        # participants not to re-rendezvous. Retries after a random delay on conflicts; etcd errors (e.g. missing state) propagate.
         """
         Mark rendezvous 'closed' for current run_id, which is used to signal other
         participants to not attempt to perform (re-)rendezvous. This is useful
@@ -846,10 +915,14 @@ class EtcdRendezvous:
                 cas_delay()
 
     def get_rdzv_state(self):
+        # [FUNCTION DOC] Reads the active state node from etcd and returns the etcd result together with the parsed state mapping. Raises etcd key-not-found if no state exists.
         active_version = self.client.get(key=self.get_path("/rdzv/active_version"))
         return active_version, json.loads(active_version.value)
 
     def try_wait_for_state_change(self, etcd_index, timeout=None):
+        # [FUNCTION DOC] Watches the active state node from the given etcd index until it changes or the timeout (capped at the time to the
+        # overall deadline plus one second) passes; ignores watch timeout and index-cleared errors. Raises RendezvousTimeoutError if the deadline has passed.
+        # Returns a fresh (etcd result, state) pair. Relies on the deadline set by the rendezvous barrier.
         # Don't sleep past the overall deadline (at least more than by 1s)
         overall_timeout = max(self._rendezvous_deadline - time.time(), 0.0) + 1.0
         timeout = overall_timeout if timeout is None else min(timeout, overall_timeout)
@@ -868,12 +941,14 @@ class EtcdRendezvous:
         return self.get_rdzv_state()
 
     def get_path(self, path):
+        # [FUNCTION DOC] Builds the full etcd key for a path relative to this run: prefix, run-id specific directory, then the path (leading slash added if missing).
         if not path.startswith("/"):
             path = "/" + path
 
         return f"{self._prefix}run_{self._run_id}{path}"
 
     def create_path_if_not_exists(self, full_path, ttl=None):
+        # [FUNCTION DOC] Creates an etcd directory (optionally with a TTL) if it does not already exist; an already-exists error is ignored.
         try:
             self.client.write(
                 key=full_path, value=None, dir=True, prevExist=False, ttl=ttl
@@ -882,12 +957,15 @@ class EtcdRendezvous:
             pass
 
     def setup_lease_renewal(self, full_path, ttl):
+        # [FUNCTION DOC] Starts a daemon thread that refreshes the TTL of an etcd key every half TTL, and returns the threading event
+        # that stops it. The thread ends if the key disappears, the connection is refused, or the event is set.
         # NOTE: For ephemeral key TTL renewal (~lease) to work correctly,
         # make sure you don't call any long-blocking methods that do not
         # release the Python's GIL! An example of this is calling a pybind11
         # extension function that is blocking / long-running, but is not
         # doing a scoped release of the GIL.
         def lease_worker(client, path, ttl, stop_event):
+            # [FUNCTION DOC] HELPER: Thread body: refresh the key TTL, then wait half the TTL on the stop event; exit on key-not-found, connection refused, or stop.
             while True:
                 try:
                     client.refresh(path, ttl=ttl)
@@ -912,6 +990,8 @@ class EtcdRendezvous:
         return lease_stop_event
 
     def store_extra_data(self, rdzv_version, key, value):
+        # [FUNCTION DOC] Stores a key/value in a JSON mapping in the extra data node of the given rendezvous version. Creates the node on first use,
+        # otherwise updates with a compare-and-swap loop (0.1 s sleep on conflicts) so concurrent stores are not lost. Values must be JSON serializable.
         node = self.get_path(f"/rdzv/v_{rdzv_version}/extra_data")
         try:
             # If first time we are storing anything:
@@ -942,6 +1022,9 @@ class EtcdRendezvous:
                 time.sleep(0.1)
 
     def load_extra_data(self, rdzv_version, key, timeout=None):
+        # [FUNCTION DOC] Blocks until the extra data node of the version exists and contains the key, watching etcd for changes, then returns the value.
+        # Raises AssertionError if more than one matching node is found.
+        # KNOWN ISSUE: the timeout argument is accepted but not implemented (a TODO), so this can wait forever.
         # 'extra_data' node itself, and the directory it is located in:
         node = self.get_path(f"/rdzv/v_{rdzv_version}/extra_data")
         node_dir = self.get_path(f"/rdzv/v_{rdzv_version}")
@@ -971,12 +1054,15 @@ class EtcdRendezvous:
                 pass
 
     def setup_kv_store(self, rdzv_version):
+        # [FUNCTION DOC] Ensures the key-value directory for the rendezvous version exists in etcd and returns an EtcdStore rooted there.
         store_path = self.get_path(f"/rdzv/v_{rdzv_version}/kv")
         self.create_path_if_not_exists(store_path)
         return EtcdStore(etcd_client=self.client, etcd_store_prefix=store_path)
 
 
 def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
+    # [FUNCTION DOC] HELPER: Builds an etcd client from the endpoint (default port 2379) and config entries: protocol (http default, or https), optional cert and key
+    # (combined into a tuple), and cacert; reconnect is allowed. Raises ValueError for an invalid protocol.
     """Create a new ``etcd.Client`` from the specified ``RendezvousParameters``."""
     hostname, port = parse_rendezvous_endpoint(params.endpoint, 2379)
 
@@ -1012,6 +1098,10 @@ def _create_etcd_client(params: RendezvousParameters) -> etcd.Client:
 
 # Handler for torch.distributed "static" registration
 def create_rdzv_handler(params: RendezvousParameters) -> RendezvousHandler:
+    # [FUNCTION DOC] Factory for the etcd rendezvous handler: creates the etcd client, reads the etcd prefix (default /torchelastic/p2p),
+    # builds an EtcdRendezvous with run id, min/max nodes, timeout (default 600) and last call timeout (default 30), and wraps it in an
+    # EtcdRendezvousHandler using the params local address. Side effect: creates etcd directories and a lease thread.
+    # KNOWN ISSUE: the docstring example refers to a function named create_etcd_rendezvous_handler that does not exist, and lists min_workers wording that differs from the min_nodes parameters actually read.
     """
     Usage:
 

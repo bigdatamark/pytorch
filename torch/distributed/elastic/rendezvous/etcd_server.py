@@ -6,6 +6,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Utilities to launch and stop a local standalone etcd server subprocess (EtcdServer), mainly for single-node
+# launches and tests, plus helpers find_free_port and stop_etcd. The etcd python package is imported optionally.
+# No import-time side effects besides creating a logger.
 import atexit
 import logging
 import os
@@ -28,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 def find_free_port():
+    # [FUNCTION DOC] Reserves a free local port by binding and listening on a socket, trying each address family returned for localhost.
+    # Returns the open socket (the caller reads its port and must close it before reuse). Prints a message and closes the socket on
+    # a failed attempt. Raises RuntimeError if no socket could be created.
+    # KNOWN ISSUE: if the very first socket creation fails, the cleanup refers to a socket variable that was never assigned.
     """
     Find a free port and binds a temporary socket to it so that the port can be "reserved" until used.
 
@@ -65,6 +72,8 @@ def find_free_port():
 
 
 def stop_etcd(subprocess, data_dir: str | None = None):
+    # [FUNCTION DOC] Terminates and waits for the given process if it is still running, then deletes the data directory
+    # (ignoring errors) if one is given. Logs both actions. The first parameter shadows the subprocess module name.
     if subprocess and subprocess.poll() is None:
         logger.info("stopping etcd server")
         subprocess.terminate()
@@ -76,6 +85,11 @@ def stop_etcd(subprocess, data_dir: str | None = None):
 
 
 class EtcdServer:
+    # [CLASS DOC] Manages a local standalone etcd server process on random free client and peer ports at localhost.
+    # State: port, host, etcd binary path (env var TORCHELASTIC_ETCD_BINARY_PATH, else a bin/etcd next to this file,
+    # else etcd from PATH), a base data directory (given or a fresh temp dir), and the subprocess handle.
+    # Key methods: start (with retries), stop, get_client, get_port, get_host, get_endpoint.
+    # KNOWN ISSUE: the docstring documents an etcd_binary_path argument, but the constructor only takes data_dir.
     """
     .. note:: tested on etcd server v3.4.3.
 
@@ -108,6 +122,7 @@ class EtcdServer:
     """
 
     def __init__(self, data_dir: str | None = None):
+        # [FUNCTION DOC] Resolves the etcd binary path and the base data directory (created via a temp dir if none given); no process is started.
         self._port = -1
         self._host = "localhost"
 
@@ -126,6 +141,7 @@ class EtcdServer:
         self._etcd_proc: subprocess.Popen | None = None
 
     def _get_etcd_server_process(self) -> subprocess.Popen:
+        # [FUNCTION DOC] HELPER: Returns the running etcd subprocess handle; raises RuntimeError if the server has not been started.
         if not self._etcd_proc:
             raise RuntimeError(
                 "No etcd server process started. Call etcd_server.start() first"
@@ -134,14 +150,17 @@ class EtcdServer:
             return self._etcd_proc
 
     def get_port(self) -> int:
+        # [FUNCTION DOC] Returns the port the server listens on (-1 before start).
         """Return the port the server is running on."""
         return self._port
 
     def get_host(self) -> str:
+        # [FUNCTION DOC] Returns the host name the server listens on.
         """Return the host the server is running on."""
         return self._host
 
     def get_endpoint(self) -> str:
+        # [FUNCTION DOC] Returns the endpoint string host:port.
         """Return the etcd server endpoint (host:port)."""
         return f"{self._host}:{self._port}"
 
@@ -152,6 +171,10 @@ class EtcdServer:
         stderr: int | TextIO | None = None,
     ) -> None:
         """
+        # [FUNCTION DOC] Starts the server and waits until it is ready. Tries up to num_retries times, each with its own numbered
+        # subdirectory of the base data dir; on failure logs, stops the process and retries. After the final failure removes the base data
+        # dir and re-raises the last error (e.g. TimeoutError or RuntimeError). Returns nothing.
+        # KNOWN ISSUE: the atexit registration after the loop is unreachable, since the loop only exits by returning or raising, so no exit handler is installed.
         Start the server, and waits for it to be ready. When this function returns the server is ready to take requests.
 
         Args:
@@ -187,6 +210,8 @@ class EtcdServer:
     def _start(
         self, data_dir: str, timeout: int = 60, stderr: int | TextIO | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Reserves two free ports (client and peer), builds the etcd command line with v2 API enabled and local URLs,
+        # releases the ports, launches the subprocess (stderr as given) and waits for readiness for up to timeout seconds.
         sock = find_free_port()
         sock_peer = find_free_port()
         self._port = sock.getsockname()[1]
@@ -217,12 +242,15 @@ class EtcdServer:
         self._wait_for_ready(timeout)
 
     def get_client(self):
+        # [FUNCTION DOC] Returns a new etcd client for this server (v2 API prefix, 10 second read timeout).
         """Return an etcd client object that can be used to make requests to this server."""
         return etcd.Client(
             host=self._host, port=self._port, version_prefix="/v2", read_timeout=10
         )
 
     def _wait_for_ready(self, timeout: int = 60) -> None:
+        # [FUNCTION DOC] HELPER: Polls once per second until the etcd client can report the server version, or timeout seconds pass.
+        # Raises RuntimeError if the server process exits meanwhile, and TimeoutError on timeout.
         client = etcd.Client(
             host=f"{self._host}", port=self._port, version_prefix="/v2", read_timeout=5
         )
@@ -244,5 +272,6 @@ class EtcdServer:
 
     def stop(self) -> None:
         """Stop the server and cleans up auto generated resources (e.g. data dir)."""
+        # [FUNCTION DOC] Stops the server process and removes the base data directory (via stop_etcd).
         logger.info("EtcdServer stop method called")
         stop_etcd(self._etcd_proc, self._base_data_dir)

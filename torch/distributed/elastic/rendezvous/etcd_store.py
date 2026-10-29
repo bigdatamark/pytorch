@@ -5,6 +5,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Implements a c10d Store on top of etcd (EtcdStore), the store returned by the legacy EtcdRendezvous
+# and by the etcd-v2 backend. Keys and values are base64 encoded so arbitrary bytes can be stored. Falls back to a stub etcd module
+# when the etcd package is missing. Also defines cas_delay, a small random sleep used to reduce compare-and-swap contention.
 import datetime
 import random
 import time
@@ -23,11 +26,15 @@ except ModuleNotFoundError:
 # Delay (sleep) for a small random amount to reduce CAS failures.
 # This does not affect correctness, but will reduce requests to etcd server.
 def cas_delay():
+    # [FUNCTION DOC] HELPER: Sleeps for a random duration between 0 and 0.1 seconds to reduce contention on retried etcd operations.
     time.sleep(random.uniform(0, 0.1))
 
 
 # pyre-fixme[11]: Annotation `Store` is not defined as a type.
 class EtcdStore(Store):
+    # [CLASS DOC] A Store implementation backed by an etcd directory. All keys live under a prefix (a trailing slash is
+    # ensured), and keys/values are base64 encoded. Holds the etcd client and prefix; the optional timeout is applied via
+    # set_timeout. Methods: set, get, add (atomic via compare-and-swap), wait, check; blocking waits use etcd watches.
     """
     Implement a c10 Store interface by piggybacking on the rendezvous etcd instance.
 
@@ -41,6 +48,7 @@ class EtcdStore(Store):
         # Default timeout same as in c10d/Store.hpp
         timeout: datetime.timedelta | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base Store, saves the client and prefix (appending a slash if missing) and sets the store timeout if one is given.
         super().__init__()  # required for pybind trampoline.
 
         self.client = etcd_client
@@ -53,6 +61,7 @@ class EtcdStore(Store):
             self.prefix += "/"
 
     def set(self, key, value):
+        # [FUNCTION DOC] Writes the key/value (str or bytes, both base64 encoded) under the prefix in etcd. Raises ValueError for other types.
         """
         Write a key/value pair into ``EtcdStore``.
 
@@ -61,6 +70,8 @@ class EtcdStore(Store):
         self.client.set(key=self.prefix + self._encode(key), value=self._encode(value))
 
     def get(self, key) -> bytes:
+        # [FUNCTION DOC] Returns the value (bytes) for the key, waiting up to the store timeout for it to be published.
+        # Raises LookupError if the key is still missing after the timeout, ValueError for an unsupported key type.
         """
         Get a value by key, possibly doing a blocking wait.
 
@@ -83,6 +94,8 @@ class EtcdStore(Store):
         return self._decode(kvs[b64_key])
 
     def add(self, key, num: int) -> int:
+        # [FUNCTION DOC] Atomically adds an integer to the decimal-string value at the key and returns the new value. Creates the key with the
+        # amount if absent; otherwise loops reading the value and doing compare-and-swap, sleeping a random delay on conflicts.
         """
         Atomically increment a value by an integer amount.
 
@@ -122,6 +135,8 @@ class EtcdStore(Store):
 
     # pyrefly: ignore [bad-override]
     def wait(self, keys, override_timeout: datetime.timedelta | None = None):
+        # [FUNCTION DOC] Blocks until all keys are present or the timeout (override_timeout if given, else the store timeout) expires.
+        # Returns nothing. Raises LookupError on timeout.
         """
         Wait until all of the keys are published, or until timeout.
 
@@ -135,6 +150,7 @@ class EtcdStore(Store):
         # No return value on success
 
     def check(self, keys) -> bool:
+        # [FUNCTION DOC] Returns true if all keys are currently present, using a near-zero wait; never blocks meaningfully.
         """Check if all of the keys are immediately present (without waiting)."""
         b64_keys = [self.prefix + self._encode(key) for key in keys]
         kvs = self._try_wait_get(
@@ -149,6 +165,7 @@ class EtcdStore(Store):
     # In case of `str`, utf-8 encoding is assumed.
     #
     def _encode(self, value) -> str:
+        # [FUNCTION DOC] HELPER: Base64-encodes a str (as UTF-8) or bytes into a str. Raises ValueError for any other type.
         if type(value) is bytes:
             return b64encode(value).decode()
         elif type(value) is str:
@@ -160,6 +177,7 @@ class EtcdStore(Store):
     # Return type is `bytes`, which is more convenient with the Store interface.
     #
     def _decode(self, value) -> bytes:
+        # [FUNCTION DOC] HELPER: Base64-decodes a str or bytes into bytes. Raises ValueError for any other type.
         if type(value) is bytes:
             return b64decode(value)
         elif type(value) is str:
@@ -175,6 +193,9 @@ class EtcdStore(Store):
     # On timeout, None is returned.
     #
     def _try_wait_get(self, b64_keys, override_timeout=None):
+        # [FUNCTION DOC] HELPER: Fetches the prefix directory from etcd and checks whether all the given encoded keys exist. If so returns a
+        # mapping from etcd key to value; otherwise watches the directory for changes (from the last seen etcd index) and retries until the
+        # deadline, returning None on timeout. Missing directory and cleared-event-index conditions are retried.
         timeout = self.timeout if override_timeout is None else override_timeout  # type: ignore[attr-defined]
         deadline = time.time() + timeout.total_seconds()
 
