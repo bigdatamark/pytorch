@@ -1,5 +1,18 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC]
+# Defines the DTensor placement types: Shard, Replicate, Partial (the public
+# ones, exported via __all__ together with the C++ base Placement) and the
+# internal _StridedShard and _MaskPartial. These are Python subclasses of C++
+# placement classes and implement the tensor-level mechanics: splitting and
+# padding for uneven sharding, scatter/gather/reduce-scatter/all-to-all through
+# functional collectives, and symbolic-shape-aware size computation.
+# Import-time side effects: renames Placement's module, replaces the base
+# Placement eq/hash/fx-repr hooks with error-raising partials, and registers all
+# placement classes as opaque constant objects via _register_placements_as_opaque.
+# KNOWN ISSUE: the base-class hooks are built with a helper that takes the method
+# name as its first positional parameter and is also given it by keyword, so
+# invoking them would fail with a TypeError instead of the intended RuntimeError.
 
 import functools
 from collections.abc import Sequence
@@ -37,6 +50,9 @@ Placement.__module__ = "torch.distributed.tensor.placement_types"
 
 
 def _raise_error(method_name, _):
+    # [FUNCTION DOC] HELPER: always raises RuntimeError stating that the named
+    # placement method must be overridden by a subclass. Intended to be bound
+    # (via partial) to the base Placement eq, hash and fx-repr hooks.
     raise RuntimeError(
         f"Placement method '{method_name}' should not be called as "
         "it should be overridden by the subclass"
@@ -49,12 +65,20 @@ Placement.__fx_repr__ = functools.partial(_raise_error, method_name="__fx_repr__
 
 
 class _StridedShardOffsetMode(IntEnum):
+    # [CLASS DOC] HELPER: integer enum selecting how _StridedShard materializes
+    # shard offsets: FIRST (only the first offset as an int, or minus one when the
+    # shard is empty), ALL (the full list of offsets), NONE (skip offsets).
     FIRST = 0
     ALL = 1
     NONE = 2
 
 
 def _explicit_or_backed_hint(value: IntLikeType) -> int | None:
+    # [FUNCTION DOC] HELPER: returns a concrete integer for value when one is
+    # available: plain ints and int-convertible values directly; symbolic ints via
+    # the shape environment's optimization hint, but only if all of their unbacked
+    # symbols have hint overrides. Returns None when no hint can be determined
+    # (no shape environment, unbacked symbols without overrides, or non-integer).
     from torch.fx.experimental.symbolic_shapes import (
         free_unbacked_symbols,
         optimization_hint,
@@ -79,6 +103,10 @@ def _explicit_or_backed_hint(value: IntLikeType) -> int | None:
 
 
 def _guarded_hint_int(value: IntLikeType, *, reason: str) -> int:
+    # [FUNCTION DOC] HELPER: converts value to a concrete int. For symbolic ints it
+    # obtains a hint, raises RuntimeError (mentioning reason) if none exists, and
+    # registers a deferred runtime assertion that the symbol equals the hint so the
+    # specialization stays sound. Returns the integer.
     if isinstance(value, int):
         return int(value)
     if not isinstance(value, torch.SymInt):
@@ -95,6 +123,11 @@ def _guarded_hint_int(value: IntLikeType, *, reason: str) -> int:
 def _defer_symbolic_equality_assert(
     value: IntLikeType, hint: int, *, reason: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: for a symbolic int with a shape environment, records a
+    # deferred runtime assertion that value equals hint, keyed by the latest
+    # unbacked symbol in the equation, skipping duplicates. Mutates the shape
+    # environment (assert list, counter, version). No-op for plain ints or when
+    # there is no shape environment.
     if not isinstance(value, torch.SymInt):
         return
     shape_env = getattr(value.node, "shape_env", None)
@@ -129,16 +162,25 @@ def _defer_symbolic_equality_assert(
 
 
 def _split_factor_key(value: IntLikeType) -> object:
+    # [FUNCTION DOC] HELPER: returns a hashable, comparable key for a split factor:
+    # the symbolic expression for symbolic ints, otherwise the plain int.
     if isinstance(value, torch.SymInt):
         return value.node.expr
     return int(value)
 
 
 def _sym_mod(left: IntLikeType, right: IntLikeType) -> Any:
+    # [FUNCTION DOC] HELPER: modulo of left by right, typed loosely so that it
+    # works for ints and symbolic ints.
     return cast(Any, left) % cast(Any, right)
 
 
 def _hint_proves_even_shard(size: IntLikeType, num_chunks: IntLikeType) -> bool:
+    # [FUNCTION DOC] HELPER: returns True if size is known to divide evenly by
+    # num_chunks, either provably without guarding or via explicit hints (then it
+    # also adds a check that the remainder is zero). Returns False when
+    # divisibility cannot be established (missing hints, zero chunk hint, or a
+    # nonzero remainder).
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if guard_or_false(_sym_mod(size, num_chunks) == 0):
@@ -160,6 +202,13 @@ def _hint_proves_even_shard(size: IntLikeType, num_chunks: IntLikeType) -> bool:
 
 
 class Shard(torch._C._distributed.Shard):
+    # [CLASS DOC]
+    # Placement for a DTensor dimension sharded over one mesh dimension, with the
+    # tensor dimension index held in the dim attribute (from the C++ base). Uses
+    # chunk semantics: when the size is not divisible, trailing shards are smaller
+    # or empty, and collectives operate on padded equal-size shards that are
+    # unpadded afterwards. Provides splitting, scatter, reduce-scatter,
+    # gather-to-replicate, and shard-dim-change (all-to-all) helpers.
     """
     The ``Shard(dim)`` placement describes the DTensor sharding on tensor dimension
     ``dim`` over a corresponding ``DeviceMesh`` dimension, where each rank on the
@@ -189,6 +238,11 @@ class Shard(torch._C._distributed.Shard):
         with_padding: bool = True,
         contiguous: bool = True,
     ) -> tuple[list[torch.Tensor], list[int]]:
+        # [FUNCTION DOC]
+        # Splits tensor into num_chunks shards along this placement's dim and
+        # returns (shards, pad_sizes), delegating to the static helper. With
+        # padding, shards are padded to equal size and pad_sizes lists the pad per
+        # shard; otherwise pad_sizes is empty. contiguous makes shards contiguous.
         """
         This function uses torch.chunk to split a tensor into num_chunks shards along
         the Shard placement dimension, and return a list of shards with their pad sizes.
@@ -210,6 +264,13 @@ class Shard(torch._C._distributed.Shard):
         contiguous: bool,
         dim: int,
     ) -> tuple[list[torch.Tensor], list[int]]:
+        # [FUNCTION DOC] HELPER: chunks tensor into num_chunks pieces along dim (via
+        # the custom chunk routine, which fills missing trailing chunks with empty
+        # tensors), optionally pads each to the full chunk size and records the
+        # pad amounts, and optionally makes each contiguous. Returns the shard list
+        # and pad size list. Raises AssertionError on an out-of-range dim.
+        # KNOWN ISSUE: the range check uses greater-than, so dim equal to the tensor
+        # rank is not rejected here (it would fail later in the chunk call).
         if dim > tensor.ndim:
             raise AssertionError(
                 f"Sharding dim {dim} greater than tensor ndim {tensor.ndim}"
@@ -244,6 +305,13 @@ class Shard(torch._C._distributed.Shard):
         contiguous: bool = True,
         clone: bool = True,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns the single shard at index of tensor split into num_chunks along
+        # dim, optionally padded, then cloned or made contiguous. For a symbolic
+        # index without padding it computes just that slice directly using a
+        # narrow with symbolic start and length (the last chunk takes the
+        # remainder). Raises AssertionError if dim is out of range. Wrapped to run
+        # per local tensor for local-tensor mode.
         """
         Like _split_tensor() but only returns a single shard at the given index.
 
@@ -297,6 +365,12 @@ class Shard(torch._C._distributed.Shard):
     def _custom_chunk(
         tensor: torch.Tensor, num_chunks: IntLikeType, dim: int
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: returns exactly num_chunks chunks of tensor along
+        # dim. In eager mode (or without unbacked symbols) uses chunk and pads the
+        # list with empty tensors; when tracing with unbacked sizes uses narrow with
+        # symbolic bounds (an even-split fast path when divisibility is provable).
+        # Raises AssertionError for a zero-dimensional tensor or non-positive chunk
+        # count. May register deferred runtime asserts for symbolic counts.
         """
         Returns list of tensor chunks along dim.
         Uses torch.chunk in eager mode, but torch.narrow under tracing to be unbacked-symint safe.
@@ -342,6 +416,13 @@ class Shard(torch._C._distributed.Shard):
         num_chunks: int,
         rank: _RankTypeT,
     ) -> tuple[_RankTypeT, _RankTypeT]:
+        # [FUNCTION DOC]
+        # Static method. Given the current local size and number of chunks, returns
+        # (local shard size, offset) for rank, following chunk semantics: when the
+        # size is provably divisible, size and offset are the full chunk size and
+        # chunk size times rank; otherwise the size is clamped (possibly to zero)
+        # and the offset clamped to the size using symbolic min/max. Offset is
+        # relative to the current local tensor.
         """
         Given the size of the current local tensor (which may already be sharded on some dimensions),
         computes the new local shard size and offset given the desired number of chunks
@@ -380,6 +461,8 @@ class Shard(torch._C._distributed.Shard):
         num_chunks: int,
         rank: RankType,
     ) -> tuple[int, RankType]:
+        # [FUNCTION DOC] HELPER: instance-method wrapper delegating to the static
+        # Shard.local_shard_size_and_offset; returns (size, offset).
         # pyrefly: ignore [bad-argument-type, bad-return]
         return Shard.local_shard_size_and_offset(curr_local_size, num_chunks, rank)
 
@@ -388,6 +471,10 @@ class Shard(torch._C._distributed.Shard):
     def _maybe_unpad_tensor_with_sizes(
         dim, local_tensor, pad_sizes, mesh_dim_local_rank, make_contiguous
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: removes padding along dim from local_tensor if the
+        # pad size recorded for this rank (indexed by mesh_dim_local_rank) is
+        # (or may be, for symbolic sizes) positive; optionally makes the result
+        # contiguous. Returns the possibly-unpadded tensor.
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
         # Only unpad if the local_tensor was padded on the dimension.
@@ -407,6 +494,13 @@ class Shard(torch._C._distributed.Shard):
         mesh_dim: int,
         src_data_rank: int | None = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Produces this rank's local shard of tensor along mesh dimension mesh_dim.
+        # If the rank is not in the mesh, returns an empty tensor. If src_data_rank
+        # is None, just selects the local split with no communication and no
+        # padding. Otherwise splits with padding on every rank, scatters from the
+        # group source rank src_data_rank, and unpads the received shard.
+        # Raises AssertionError if padded shards differ in shape. Collective call.
         """
         Shard and scatter a tensor on a mesh dimension (use coordinate 0 on the
         mesh dimension as source of truth).
@@ -469,6 +563,8 @@ class Shard(torch._C._distributed.Shard):
         mesh_dim: int,
         src_data_rank: int | None = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: class-level convenience that builds a placement of
+        # this class for dim and shards tensor with it; returns the local shard.
         shard_placement = cls(dim)
         return shard_placement._shard_tensor(tensor, mesh, mesh_dim, src_data_rank)
 
@@ -479,6 +575,12 @@ class Shard(torch._C._distributed.Shard):
         reduce_op: str,
         mesh_dim: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Reduces tensor across the mesh dimension with reduce_op and scatters the
+        # result along this placement's dim (reduce-scatter). Pads the input to
+        # equal chunks first if the dim is (or may be) unevenly divisible, then
+        # unpads the output for this rank. If the rank is not in the mesh, returns
+        # tensor unchanged. Collective call.
         """
         reduce and scatter a tensor on a mesh dimension
         """
@@ -525,6 +627,9 @@ class Shard(torch._C._distributed.Shard):
         logical_dim_size: IntLikeType,
         num_chunks: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: if the logical dim size is (or may be) not evenly
+        # divisible by num_chunks, pads local_tensor along dim up to the full chunk
+        # size; always returns a contiguous tensor.
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
         # Assume padding (uneven sharding) as general case for unbacked sizes,
@@ -550,6 +655,12 @@ class Shard(torch._C._distributed.Shard):
         logical_dim_size: IntLikeType,
         num_chunks: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: after a gather of padded shards, removes trailing
+        # padding along dim when padding may have been applied, then narrows the
+        # dim to exactly logical_dim_size (rebinding derived symbolic sizes to the
+        # original symbol, with a check that the size is large enough). Always
+        # returns a contiguous tensor. Raises RuntimeError if the narrow changed
+        # the concrete size unexpectedly.
         from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
         # Assume padding (uneven sharding) as general case for unbacked sizes,
@@ -595,6 +706,11 @@ class Shard(torch._C._distributed.Shard):
         mesh_dim: int,
         current_logical_shape: Sequence[IntLikeType],
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Converts a sharded local tensor to the full replicated tensor along this
+        # dim: pads the local shard to the full chunk size, all-gathers along dim
+        # over (mesh, mesh_dim), then unpads to current_logical_shape at dim.
+        # Returns the replicated tensor. Collective call.
         """
         This function all_gather all shards and return a tensor that
         is replicated on the previously sharded mesh dimension
@@ -623,6 +739,10 @@ class Shard(torch._C._distributed.Shard):
         mesh_dim: int,
         shard_index: IntLikeType,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Local (no communication) conversion of a replicated tensor to this rank's
+        # shard: selects and clones the chunk at shard_index along dim without
+        # padding, with chunk count equal to the mesh dimension size.
         """
         transform from replicated tensor to a sharded tensor on
         the current rank, which would perform a local chunk
@@ -643,6 +763,11 @@ class Shard(torch._C._distributed.Shard):
         mesh_dim: int,
         current_logical_shape: Sequence[IntLikeType],
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Converts a local shard into a Partial(sum) local tensor: allocates a
+        # zero tensor of the full logical size along dim and adds the shard at
+        # this rank's offset via index add. Adds a check that the local size
+        # matches the expected shard size. Returns the zero-padded tensor.
         """Embed a local shard in a zero-filled tensor pending sum reduction."""
         num_chunks = mesh.size(mesh_dim=mesh_dim)
         logical_dim_size = current_logical_shape[self.dim]
@@ -668,6 +793,8 @@ class Shard(torch._C._distributed.Shard):
     def _get_shard_pad_size(
         full_size: int, local_tensor: torch.Tensor, dim: int
     ) -> int:
+        # [FUNCTION DOC] HELPER: returns the amount of padding needed along dim to
+        # bring local_tensor up to full_size (full_size minus current size).
         """
         Get the padding size of the local tensor on the shard dimension.
         """
@@ -680,6 +807,10 @@ class Shard(torch._C._distributed.Shard):
         old_shard_dim: int,
         new_shard_dim: int,
     ) -> tuple[bool, IntLikeType, int, bool, IntLikeType, int]:
+        # [FUNCTION DOC] HELPER: for the old and new shard dims (in that order),
+        # computes whether padding is needed (size not divisible by num_chunks,
+        # decided with an unbacked-safe guard), the logical size, and the full
+        # chunk size. Returns a flat six-tuple: old dim triple then new dim triple.
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
         results = []
@@ -700,6 +831,10 @@ class Shard(torch._C._distributed.Shard):
         old_shard_dim: int,
         new_shard_dim: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: prepares a local tensor for an all-to-all that moves
+        # sharding from old_shard_dim to new_shard_dim: pads the old dim to its full
+        # chunk size and the new dim to chunk size times num_chunks when uneven,
+        # and returns a contiguous tensor.
         (
             old_dim_padding,
             _,
@@ -736,6 +871,10 @@ class Shard(torch._C._distributed.Shard):
         new_shard_dim: int,
         local_rank: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: undoes the padding after an all-to-all that moved
+        # sharding from old_shard_dim to new_shard_dim: removes the old dim padding
+        # (full size minus logical size) and trims the new dim down to this rank's
+        # local shard size (computed from local_rank). Returns the unpadded tensor.
         (
             old_dim_padding,
             _,
@@ -771,6 +910,10 @@ class Shard(torch._C._distributed.Shard):
         current_logical_shape: Sequence[IntLikeType],
         new_shard_dim: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Re-shards the local tensor from this placement's dim to new_shard_dim over
+        # the mesh dimension: pads, performs an all-to-all, then unpads. If the rank
+        # is not in the mesh, returns local_tensor unchanged. Collective call.
         """
         transform from existing sharded tensor to a new sharded tensor on
         that shard on a new dimension, which performs an alltoall
@@ -803,15 +946,19 @@ class Shard(torch._C._distributed.Shard):
         return new_tensor
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash based on the shard dimension only.
         return hash(self.dim)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the machine-readable text naming Shard and its dim.
         """
         machine readable representation of the Shard placement
         """
         return f"Shard(dim={self.dim})"
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] Returns a pair: source text that reconstructs this Shard
+        # (fully-qualified constructor call with dim) and an empty globals mapping.
         """
         Returns FX-evaluable repr and required globals for Shard placement.
         Needed for passing this type as an opaque object input to a custom op.
@@ -819,11 +966,19 @@ class Shard(torch._C._distributed.Shard):
         return f"torch.distributed.tensor.placement_types.Shard(dim={self.dim})", {}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the short human-readable form: S followed by dim.
         """human readable representation of the Shard placement"""
         return f"S({self.dim})"
 
 
 class _StridedShard(torch._C._distributed.StridedShard):
+    # [CLASS DOC]
+    # Internal placement for right-to-left sharding (e.g. FSDP2 plus TP): the dim is
+    # first split into split_factor pieces, each piece is split across the mesh
+    # dimension, and each rank concatenates its parts from every piece. Holds dim,
+    # a split factor (possibly symbolic; the C++ base stores a concrete int and an
+    # optional symbolic value is kept on the Python side). Overrides splitting,
+    # gather-to-replicate, offset computation, and padding for this layout.
     """
     _StridedShard was originally introduced to support 2D FSDP2 + TP sharding where the tensor
     is sharded on the TP mesh dimension first, then sharded on the FSDP mesh dimension.
@@ -891,6 +1046,12 @@ class _StridedShard(torch._C._distributed.StridedShard):
         split_factor: IntLikeType = 1,
         sf: IntLikeType | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Creates the placement for dim with the given split factor; sf is an alias
+        # of split_factor. Raises TypeError if both are given with a non-default
+        # split_factor. The factor is specialized to a concrete int for the C++
+        # base (adding a deferred equality assert for symbolic values, raising
+        # RuntimeError without a hint) and the symbolic value is remembered.
         # The C++ placement stores the unroll count as int64_t, but view
         # propagation may derive the split factor from symbolic shape metadata.
         # Preserve that symbolic value on the Python wrapper and guard the
@@ -908,15 +1069,21 @@ class _StridedShard(torch._C._distributed.StridedShard):
 
     @property
     def split_factor(self) -> IntLikeType:  # pyrefly: ignore [bad-override]
+        # [FUNCTION DOC] Property: the symbolic split factor if one was given at
+        # construction, otherwise the concrete int stored by the C++ base.
         symbolic_split_factor = getattr(self, "_symbolic_split_factor", None)
         if symbolic_split_factor is not None:
             return symbolic_split_factor
         return int(_STRIDED_SHARD_BASE_SPLIT_FACTOR.__get__(self, type(self)))
 
     def _split_factor_int(self) -> int:
+        # [FUNCTION DOC] HELPER: the concrete integer split factor read from the C++
+        # base, ignoring any symbolic value.
         return int(_STRIDED_SHARD_BASE_SPLIT_FACTOR.__get__(self, type(self)))
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a _StridedShard with the same dim and
+        # the same split factor (compared by symbolic expression when symbolic).
         return (
             isinstance(other, _StridedShard)
             and self.dim == other.dim
@@ -925,24 +1092,32 @@ class _StridedShard(torch._C._distributed.StridedShard):
         )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash combining dim and the split factor key.
         return hash((self.dim, _split_factor_key(self.split_factor)))
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the machine-readable text with dim and split factor.
         """
         machine readable representation of the _StridedShard placement
         """
         return f"_StridedShard(dim={self.dim}, sf={self.split_factor})"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the short form: _S with dim and split factor.
         """human readable representation of the _StridedShard placement"""
         return f"_S({self.dim}, {self.split_factor})"
 
     @staticmethod
     @maybe_run_for_local_tensor
     def _select_shard(shards: list[torch.Tensor], shard_index) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: returns a clone of the shard at shard_index.
         return shards[shard_index].clone()
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] Returns a pair: source text that reconstructs this
+        # _StridedShard using the concrete integer split factor, and an empty
+        # globals mapping.
+        # KNOWN ISSUE: the docstring says it is for the Shard placement.
         """
         Returns FX-evaluable repr and required globals for Shard placement.
         Needed for passing this type as an opaque object input to a custom op.
@@ -965,6 +1140,8 @@ class _StridedShard(torch._C._distributed.StridedShard):
         src_data_rank: int | None = 0,
         split_factor: IntLikeType = 1,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: builds a placement for dim with split_factor and
+        # shards tensor with it; returns the local shard.
         strided_shard_placement = cls(dim=dim, split_factor=split_factor)
         return strided_shard_placement._shard_tensor(
             tensor, mesh, mesh_dim, src_data_rank
@@ -977,6 +1154,12 @@ class _StridedShard(torch._C._distributed.StridedShard):
         mesh_dim: int,
         src_data_rank: int | None = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Produces this rank's strided shard of tensor along mesh dimension
+        # mesh_dim. Rank outside the mesh gets an empty tensor. With src_data_rank
+        # None, selects the local strided split without communication. Otherwise
+        # splits with padding, scatters from src_data_rank, and unpads. Raises
+        # AssertionError if padded shards differ in shape. Collective call.
         """
         Shard and scatter a tensor on a mesh dimension (use coordinate 0 on the
         mesh dimension as source of truth).
@@ -1036,6 +1219,15 @@ class _StridedShard(torch._C._distributed.StridedShard):
         with_padding: bool = True,
         contiguous: bool = True,
     ) -> tuple[list[torch.Tensor], list[int]]:
+        # [FUNCTION DOC]
+        # Splits tensor along dim into num_chunks strided shards: first into
+        # split_factor pieces, then each piece into num_chunks, and shard i is the
+        # concatenation of the i-th sub-piece of every piece. Returns (shards,
+        # pad_sizes); with padding, pad_sizes holds each shard's gap to the largest
+        # shard (padding itself is not applied here), otherwise it is empty.
+        # Raises AssertionError on out-of-range dim.
+        # KNOWN ISSUE: the range check uses greater-than, so dim equal to the tensor
+        # rank is not rejected by it.
         if self.dim > tensor.ndim:
             raise AssertionError(
                 f"Sharding dim {self.dim} greater than tensor ndim {tensor.ndim}"
@@ -1087,6 +1279,9 @@ class _StridedShard(torch._C._distributed.StridedShard):
         contiguous: bool = True,
         clone: bool = True,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns only the strided shard at index (computes all splits, then picks
+        # one), cloned if clone is set, else made contiguous if contiguous is set.
         """
         Like _split_tensor() but only returns a single shard at the given index.
 
@@ -1117,6 +1312,13 @@ class _StridedShard(torch._C._distributed.StridedShard):
         mesh_dim: int,
         current_logical_shape: Sequence[IntLikeType],
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Reconstructs the replicated tensor from strided shards: builds an index
+        # tensor and splits it the same way to learn which original positions each
+        # rank holds, pads the local shard to the maximum shard size, all-gathers,
+        # and uses an inverse permutation with an index select to drop padding and
+        # restore original order. Returns a contiguous tensor with the logical
+        # size at dim. Collective call.
         """
         Replay the replicate-to-shard process to understand how to stitch shards back.
 
@@ -1297,6 +1499,10 @@ class _StridedShard(torch._C._distributed.StridedShard):
         mesh_dim: int,
         shard_index: IntLikeType,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Local (no communication) conversion of a replicated tensor to this rank's
+        # strided shard: selects and clones the strided split at shard_index with
+        # chunk count equal to the mesh dimension size, without padding.
         """
         Transform from replicated tensor to a strided-sharded tensor on the current rank.
 
@@ -1326,6 +1532,8 @@ class _StridedShard(torch._C._distributed.StridedShard):
     @staticmethod
     @maybe_run_for_local_tensor
     def _local_shard_size(sharded_indices: list[torch.Tensor], rank: RankType) -> int:
+        # [FUNCTION DOC] HELPER: number of elements in the index list belonging to
+        # rank.
         return len(sharded_indices[rank])
 
     def _local_shard_size_and_offset(
@@ -1335,6 +1543,8 @@ class _StridedShard(torch._C._distributed.StridedShard):
         rank: RankType,
         offset_mode: _StridedShardOffsetMode = _StridedShardOffsetMode.FIRST,
     ) -> tuple[int, int | list[int] | None]:
+        # [FUNCTION DOC] HELPER: instance-method wrapper delegating to
+        # local_shard_size_and_offset with the same arguments; returns (size, offset).
         return self.local_shard_size_and_offset(
             curr_local_size, num_chunks, rank, offset_mode
         )
@@ -1347,6 +1557,14 @@ class _StridedShard(torch._C._distributed.StridedShard):
         rank: RankType,
         offset_mode: _StridedShardOffsetMode = _StridedShardOffsetMode.FIRST,
     ) -> tuple[int, list[int] | int | None]:
+        # [FUNCTION DOC]
+        # Returns (local shard size, offsets) for rank under strided sharding of a
+        # dimension of size curr_local_size across num_chunks. Offsets depend on
+        # offset_mode: a single first index (minus one if empty) for FIRST, the list
+        # of all original indices for ALL, or None for NONE. For symbolic sizes with
+        # unbacked symbols and a non-FIRST mode it computes the size symbolically
+        # (no offsets list). Otherwise it splits an index tensor and reads the
+        # indices of rank. Wrapped to run per local tensor.
         """
         Compute the local shard size and offset(s) for a _StridedShard placement.
 
@@ -1447,6 +1665,12 @@ class _StridedShard(torch._C._distributed.StridedShard):
         shard_dim: int,
         split_factor: int = 1,
     ) -> tuple[bool, int]:
+        # [FUNCTION DOC] HELPER: static method returning (needs_padding, max_chunk_size)
+        # for a dimension of the given logical size split by split_factor and then
+        # num_chunks. With split_factor one it is plain ceiling-division chunking;
+        # otherwise padding is needed if there is a partial or empty first-level
+        # chunk or an uneven second-level split, and max_chunk_size sums the
+        # per-level ceilings. The shard_dim argument is unused.
         """
         Compute padding information for _StridedShard collective operations.
 
@@ -1478,6 +1702,7 @@ class _StridedShard(torch._C._distributed.StridedShard):
         """
 
         def _ceil_div(a: int, b: int) -> int:
+            # [FUNCTION DOC] HELPER: integer ceiling division of a by b.
             return (a + b - 1) // b
 
         if split_factor != 1:
@@ -1529,6 +1754,10 @@ class _StridedShard(torch._C._distributed.StridedShard):
         new_shard_dim: int,
         split_factor: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: pads local_tensor before the all-to-all in a shard
+        # dim change: the old (strided) dim up to its maximum chunk size and the new
+        # dim up to maximum chunk size times num_chunks, only when padding is needed
+        # and positive. Returns a contiguous tensor.
         """
         Pad the local tensor before alltoall for _StridedShard's _to_new_shard_dim operation.
 
@@ -1581,6 +1810,11 @@ class _StridedShard(torch._C._distributed.StridedShard):
         split_factor: int,
         local_rank: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: after the all-to-all, selects the valid elements of
+        # the old dim (dropping padding and restoring the original order via an
+        # inverse permutation index select), then trims the new dim to this rank's
+        # local size when it was padded. Returns the resulting tensor.
+        # KNOWN ISSUE: split_factor is accepted but not used in this method.
         """
         Unpad the local tensor after alltoall for _StridedShard's
         _to_new_shard_dim operation.
@@ -1646,6 +1880,10 @@ class _StridedShard(torch._C._distributed.StridedShard):
         current_logical_shape: list[int],
         new_shard_dim: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Re-shards the local tensor from this strided dim to new_shard_dim over the
+        # mesh dimension: pads (using the concrete split factor), all-to-all, then
+        # unpads. Rank outside the mesh returns local_tensor unchanged. Collective.
         """
         Transform from existing _StridedShard tensor to a new _StridedShard tensor that
         shards on a new dimension, which performs an alltoall.
@@ -1687,6 +1925,8 @@ class _StridedShard(torch._C._distributed.StridedShard):
 
 
 def _is_shard_like(p: "Placement") -> TypeGuard[Shard | _StridedShard]:
+    # [FUNCTION DOC] HELPER: type-narrowing check returning True if p is a Shard or
+    # a _StridedShard.
     """Check if a placement is Shard or _StridedShard.
 
     Use this instead of ``isinstance(p, Shard)`` to avoid silently missing
@@ -1698,6 +1938,10 @@ def _is_shard_like(p: "Placement") -> TypeGuard[Shard | _StridedShard]:
 
 
 class Replicate(torch._C._distributed.Replicate):
+    # [CLASS DOC]
+    # Placement meaning every rank on the mesh dimension holds the full tensor.
+    # Stateless: all instances are equal and hash identically. Provides broadcast
+    # of the source rank's data to the rest of the mesh dimension.
     """
     The ``Replicate()`` placement describes the DTensor replicating on a corresponding
     ``DeviceMesh`` dimension, where each rank on the DeviceMesh dimension holds a
@@ -1706,16 +1950,20 @@ class Replicate(torch._C._distributed.Replicate):
     """
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Constant hash (minus one) since all instances are the same.
         # every replicate placement is the same
         return -1
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the fixed text naming the Replicate placement.
         """
         machine readable representation of the Replicate placement
         """
         return "Replicate()"
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] Returns a pair: fully-qualified constructor source text for
+        # Replicate and an empty globals mapping.
         """
         Returns FX-evaluable repr and required globals for Replicate placement.
         Needed for passing this type as an opaque object input to a custom op.
@@ -1723,6 +1971,7 @@ class Replicate(torch._C._distributed.Replicate):
         return "torch.distributed.tensor.placement_types.Replicate()", {}
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the short human-readable form, the letter R.
         """
         human readable representation of the Replicate placement
         """
@@ -1736,6 +1985,11 @@ class Replicate(torch._C._distributed.Replicate):
         mesh_dim: int,
         src_data_rank: int | None = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Class-level helper: makes tensor replicated along mesh dimension mesh_dim.
+        # A rank outside the mesh gets an empty tensor. Otherwise makes the tensor
+        # contiguous and, unless src_data_rank is None, broadcasts in place from
+        # the group source rank src_data_rank. Returns the tensor. Collective call.
         """
         Replicate (broadcast) a torch.Tensor on a mesh dimension (use
         the first coordinate on the mesh dimension as source of truth)
@@ -1759,10 +2013,21 @@ class Replicate(torch._C._distributed.Replicate):
         mesh_dim: int,
         src_data_rank: int | None = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: instance-method wrapper delegating to the class-level
+        # replicate helper; returns the replicated tensor.
         return Replicate._make_replicate_tensor(tensor, mesh, mesh_dim, src_data_rank)
 
 
 class Partial(torch._C._distributed.Partial):
+    # [CLASS DOC]
+    # Placement meaning each rank holds a partial value that still needs to be
+    # reduced with reduce_op (sum by default) across the mesh dimension. Exposes
+    # the class constants LINEAR_REDUCE_OPS and ALL_REDUCE_OPS and implements the
+    # contract methods: reduce to replicate (all-reduce), reduce to shard
+    # (reduce-scatter), and partitioning a replicated value into partial values.
+    # KNOWN ISSUE: the long descriptive string placed after the class constants is
+    # not the class docstring (it is not the first statement), so it is not
+    # exposed as documentation.
     # reduce_ops that distribute over addition, enabling per-input linearity
     # for bilinear ops like mm: reduce_op(A_i @ B) = reduce_op(A_i) @ B
     LINEAR_REDUCE_OPS: tuple[str, ...] = ("sum", "avg")
@@ -1801,6 +2066,10 @@ class Partial(torch._C._distributed.Partial):
     def _reduce_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Resolves the partial value to a replicated one: all-reduces tensor with
+        # this placement's reduce_op over (mesh, mesh_dim) and returns the result.
+        # Collective call.
         # Partial placement contract #1:
         # _reduce_value: reduce the value of the tensor on the mesh dimension
         return funcol.all_reduce(
@@ -1814,6 +2083,10 @@ class Partial(torch._C._distributed.Partial):
         mesh_dim: int,
         shard_spec: Placement,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Resolves the partial value to a sharded one: delegates to the given Shard
+        # placement's reduce-scatter with this reduce_op and returns this rank's
+        # reduced shard. Collective call.
         # Partial placement contract #2:
         # _reduce_shard_value: reduce_scatter the value of the tensor over the mesh dimension
         shard_spec = cast(Shard, shard_spec)
@@ -1822,6 +2095,11 @@ class Partial(torch._C._distributed.Partial):
     def _partition_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Turns a replicated tensor into per-rank partial values (conjugate of the
+        # reduce): for sum, divides by the mesh dimension size; for avg, min and
+        # max, returns the tensor as is. Raises ValueError for any other reduce_op.
+        # No communication.
         """
         Partition a replicated tensor to create partial values for Replicate → Partial.
 
@@ -1863,15 +2141,20 @@ class Partial(torch._C._distributed.Partial):
             )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of the reduce_op, offset by one.
         return 1 + hash(self.reduce_op)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the machine-readable text naming Partial and its
+        # reduce_op.
         """
         machine readable representation of the Partial placement
         """
         return f"Partial({self.reduce_op})"
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] Returns a pair: constructor source text for Partial with the
+        # quoted reduce_op, and an empty globals mapping.
         """
         Returns FX-evaluable repr and required globals for Partial placement.
         Needed for passing this type as an input to a custom op.
@@ -1882,6 +2165,7 @@ class Partial(torch._C._distributed.Partial):
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the short form: P with the reduce_op.
         """
         human readable representation of the Partial placement
         """
@@ -1894,6 +2178,14 @@ _Partial = Partial
 
 @dataclass(frozen=True)
 class _MaskPartial(Partial):
+    # [CLASS DOC]
+    # Internal frozen-dataclass Partial placement for row-wise sharded embedding:
+    # when partitioning the (index) input it records which entries fall outside the
+    # local embedding shard in a MaskBuffer and shifts indices into local range;
+    # when reducing, it zeroes the masked entries before the reduction. State:
+    # mask_buffer (shared mutable buffer whose lifetime follows the DTensor),
+    # offset_shape and offset_dim (which full-size dimension defines the shard
+    # offsets). Equality compares the buffer by identity.
     """
     A partial mask placement devised for rowwise sharded embedding op, where we need
     to mask and adjust the indices to the local embedding shard, embedding masking
@@ -1918,6 +2210,11 @@ class _MaskPartial(Partial):
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Initializes the Partial base with reduce_op, then sets (bypassing frozen
+        # dataclass protection) mask_buffer (a new MaskBuffer if None), offset_shape
+        # and offset_dim. Extra positional and keyword arguments are accepted and
+        # ignored.
         super().__init__(reduce_op)
         if mask_buffer is None:
             mask_buffer = MaskBuffer()
@@ -1932,6 +2229,11 @@ class _MaskPartial(Partial):
         local_offset_on_dim: IntLikeType,
         local_shard_size: IntLikeType,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: returns (mask, masked_tensor) where mask marks
+        # entries of tensor outside the half-open range starting at
+        # local_offset_on_dim of length local_shard_size, and masked_tensor is a
+        # copy shifted by the offset with masked entries set to zero. Does not
+        # modify the input.
         # Build the input mask and save it for the current partial placement
         # this is so that the output of embedding op can reuse the same partial
         # placement saved mask to perform mask + reduction
@@ -1948,6 +2250,12 @@ class _MaskPartial(Partial):
     def _partition_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Overrides the parent: computes this rank's embedding shard size and offset
+        # from offset_shape at offset_dim, masks/shifts the input tensor, stores the
+        # mask in mask_buffer (side effect), and returns the masked tensor.
+        # Raises AssertionError if the rank is not in the mesh or offset_shape is
+        # unset.
         if not mesh._is_current_rank_part_of_mesh():
             raise AssertionError("rank is not part of mesh")
         # override parent logic to perform partial mask for embedding
@@ -1970,6 +2278,11 @@ class _MaskPartial(Partial):
     def _reduce_value(
         self, tensor: torch.Tensor, mesh: DeviceMesh, mesh_dim: int
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies the saved mask to tensor in place (zeroing masked entries),
+        # releases the mask buffer, and all-reduces with reduce_op over (mesh,
+        # mesh_dim). Raises AssertionError if no mask was saved. Collective call.
+        # KNOWN ISSUE: the inline comment says sum reduction, but reduce_op is used.
         # by the time we need reduction, we should have already saved the mask
         if self.mask_buffer.data is None:
             raise AssertionError
@@ -1992,6 +2305,10 @@ class _MaskPartial(Partial):
         mesh_dim: int,
         shard_spec: Placement,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies the saved mask to tensor in place, releases the mask buffer, and
+        # delegates to the given Shard placement's reduce-scatter with reduce_op.
+        # Raises AssertionError if no mask was saved. Collective call.
         # by the time we need reduction, we should have already saved the mask
         if self.mask_buffer.data is None:
             raise AssertionError
@@ -2007,6 +2324,8 @@ class _MaskPartial(Partial):
         return shard_spec._reduce_shard_tensor(tensor, mesh, self.reduce_op, mesh_dim)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a _MaskPartial with the same reduce_op,
+        # offset_shape, offset_dim and the very same mask buffer object.
         if not isinstance(other, _MaskPartial):
             return False
 
@@ -2018,6 +2337,8 @@ class _MaskPartial(Partial):
         )
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash of reduce_op, offset_shape, offset_dim and the identity
+        # of the mask buffer, offset by one.
         return 1 + hash(
             (
                 self.reduce_op,
@@ -2028,18 +2349,27 @@ class _MaskPartial(Partial):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the machine-readable text with reduce_op,
+        # offset_shape and offset_dim (the mask buffer is omitted).
         """
         machine readable representation of the _MaskPartial placement
         """
         return f"_MaskPartial(reduce_op={self.reduce_op}, offset_shape={self.offset_shape}, offset_dim={self.offset_dim})"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the short form: MaskP with reduce_op, offset_shape
+        # and offset_dim.
         """
         human readable representation of the _MaskPartial placement
         """
         return f"MaskP({self.reduce_op}, {self.offset_shape}, {self.offset_dim})"
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] Returns a pair: constructor source text and an empty globals
+        # mapping.
+        # KNOWN ISSUE: the text names MaskPartial, but the class is _MaskPartial (no
+        # public MaskPartial exists in this module), and reduce_op is not quoted,
+        # so the text cannot be evaluated to rebuild the placement.
         """
         Returns FX-evaluable repr and required globals for Partial placement.
         Needed for passing this type as an input to a custom op.
@@ -2051,6 +2381,11 @@ class _MaskPartial(Partial):
 
 
 def _register_placements_as_opaque():
+    # [FUNCTION DOC] HELPER: registers Placement, Shard, Replicate, Partial,
+    # _StridedShard and _MaskPartial as constant opaque custom classes, allowing
+    # the real implementations of the shard/partial/replicate predicates and
+    # equality, plus dim for the shard types and reduce_op for the partial types.
+    # Side effect: mutates the global opaque-object registry. Called at import.
     from torch._library.opaque_object import MemberType, register_custom_class
 
     allowed_members = {

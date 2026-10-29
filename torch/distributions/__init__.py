@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Package entry point for probability distributions: re-exports all Distribution
+# subclasses, the KL divergence registry (kl_divergence, register_kl), constraints,
+# transforms, and constraint registry. Importing sets up the KL registrations.
 r"""
 The ``distributions`` package contains parameterizable probability distributions
 and sampling functions. This allows the construction of stochastic computation

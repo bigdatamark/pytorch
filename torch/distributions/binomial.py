@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Binomial distribution (number of successes in total_count trials),
+# parameterized by probs or logits, plus a small clamp helper. Exports Binomial
+# via __all__. No import-time side effects.
 
 import torch
 from torch import Tensor
@@ -16,11 +20,20 @@ __all__ = ["Binomial"]
 
 
 def _clamp_by_zero(x):
+    # [FUNCTION DOC] HELPER: elementwise maximum of x and zero computed as the
+    # average of clamp-min-zero plus x minus clamp-max-zero, so that the gradient
+    # at exactly zero is one half. Returns a tensor shaped like x.
     # works like clamp(x, min=0) but has grad at 0 is 0.5
     return (x.clamp(min=0) + x - x.clamp(max=0)) / 2
 
 
 class Binomial(Distribution):
+    # [CLASS DOC]
+    # Binomial distribution with tensor attributes total_count (nonnegative
+    # integer valued, stored in the dtype of the probability parameter) and one
+    # of probs/logits (the other computed lazily and cached). _param tracks the
+    # supplied one and fixes the batch shape. Support depends on total_count;
+    # discrete and enumerable (only for homogeneous total_count), no rsample.
     r"""
     Creates a Binomial distribution parameterized by :attr:`total_count` and
     either :attr:`probs` or :attr:`logits` (but not both). :attr:`total_count` must be
@@ -59,6 +72,11 @@ class Binomial(Distribution):
         logits: Tensor | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts total_count with the supplied probs or logits, casts
+        # total_count to the parameter dtype, and sets the batch shape to the
+        # broadcast parameter shape. Raises ValueError if both or neither of
+        # probs and logits are provided.
         if (probs is None) == (logits is None):
             raise ValueError(
                 "Either `probs` or `logits` must be specified, but not both."
@@ -85,6 +103,10 @@ class Binomial(Distribution):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC]
+        # Returns a new Binomial with total_count and whichever of probs/logits
+        # is materialized expanded to batch_shape; reuses _instance if given.
+        # Preserves the validate_args setting. Does not mutate self.
         new = self._get_checked_instance(Binomial, _instance)
         batch_shape = torch.Size(batch_shape)
         new.total_count = self.total_count.expand(batch_shape)
@@ -99,38 +121,61 @@ class Binomial(Distribution):
         return new
 
     def _new(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: creates a new tensor of the same type and device
+        # as _param, forwarding all arguments to its new method.
         return self._param.new(*args, **kwargs)
 
     @constraints.dependent_property(is_discrete=True, event_dim=0)
     # pyrefly: ignore [bad-override]
     def support(self):
+        # [FUNCTION DOC]
+        # Dependent property: integer interval from zero to total_count inclusive.
         return constraints.integer_interval(0, self.total_count)
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Property: total_count times probs.
         return self.total_count * self.probs
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Property: floor of (total_count plus one) times probs, clamped to at
+        # most total_count.
         return ((self.total_count + 1) * self.probs).floor().clamp(max=self.total_count)
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Property: total_count times probs times one minus probs.
         return self.total_count * self.probs * (1 - self.probs)
 
     @lazy_property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Lazy cached property: converts probs to binary logits when logits were
+        # not supplied at construction.
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Lazy cached property: converts logits to binary probabilities when
+        # probs were not supplied at construction.
         return logits_to_probs(self.logits, is_binary=True)
 
     @property
     def param_shape(self) -> torch.Size:
+        # [FUNCTION DOC]
+        # Property: shape of the stored parameter tensor.
         return self._param.size()
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC]
+        # Draws samples of shape sample_shape plus batch shape using the
+        # binomial sampler on total_count and probs expanded to that shape,
+        # without gradient tracking. Consumes global RNG state.
         shape = self._extended_shape(sample_shape)
         with torch.no_grad():
             return torch.binomial(
@@ -138,6 +183,11 @@ class Binomial(Distribution):
             )
 
     def log_prob(self, value):
+        # [FUNCTION DOC]
+        # Returns the elementwise log probability mass at value, combining the
+        # log binomial coefficient (via log-gamma) with a numerically stable
+        # logit-based form of the success/failure terms. Validates value when
+        # validation is enabled (raises ValueError).
         if self._validate_args:
             self._validate_sample(value)
         log_factorial_n = torch.lgamma(self.total_count + 1)
@@ -158,6 +208,10 @@ class Binomial(Distribution):
         )
 
     def entropy(self):
+        # [FUNCTION DOC]
+        # Returns the entropy by summing probability times log probability over
+        # the full enumerated support. Raises NotImplementedError if total_count
+        # is not the same everywhere in the batch.
         total_count = int(self.total_count.max())
         if not self.total_count.min() == total_count:
             raise NotImplementedError(
@@ -168,6 +222,11 @@ class Binomial(Distribution):
         return -(torch.exp(log_prob) * log_prob).sum(0)
 
     def enumerate_support(self, expand=True):
+        # [FUNCTION DOC]
+        # Returns the integers zero through total_count as a tensor of parameter
+        # dtype/device, with a leading support dimension and singleton batch
+        # dims; expanded to the full batch shape when expand is true. Raises
+        # NotImplementedError if total_count differs across the batch.
         total_count = int(self.total_count.max())
         if not self.total_count.min() == total_count:
             raise NotImplementedError(
