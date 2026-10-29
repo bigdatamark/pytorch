@@ -1,3 +1,11 @@
+# [MODULE DOC] Script that checks operator schema backward and forward compatibility. It loads
+# a text file of schemas dumped from a reference (nightly) build, parses each line, and
+# compares them with the schemas registered in the currently installed torch. Forward
+# compatibility problems are only logged; backward compatibility problems make the process
+# exit with status one. Import-time side effects: configures a non-propagating logger named
+# log at info level with a stream handler, and builds the compiled allowlist, dropping entries
+# whose expiry date has already passed. Contains the allowlist of exempted operators, a list
+# of schema patterns that old parsers cannot read, and the check functions.
 import argparse
 import datetime
 import logging
@@ -174,6 +182,12 @@ ALLOW_LIST_COMPILED = [
 
 
 def allow_listed(schema):
+    # [FUNCTION DOC] Looks up a schema in the compiled allowlist, matching entry name patterns
+    # against the schema text and taking the first entry that matches. If that entry has an
+    # argument pattern, the result also depends on that pattern matching the schema text.
+    # Returns a pair: whether the schema is exempt, and the not-core-ATen trust flag of the
+    # matched entry; returns false and no flag when no entry matches. Note the first matching
+    # name does not fall through to later entries when its argument pattern fails.
     for item in ALLOW_LIST_COMPILED:
         if item[0].search(str(schema)):
             if len(item) > 2 and item[2] is not None:
@@ -195,6 +209,11 @@ dont_parse_list = [
 
 
 def has_valid_upgraders(schema, version_map):
+    # [FUNCTION DOC] HELPER: Reports whether the schema is covered by a registered upgrader.
+    # Looks up the operator name in the processed version map (operator name to overload to
+    # list of old schemas) and returns true only when one of the recorded old schemas equals
+    # the given schema; false if the name is absent or nothing matches. The overload name list
+    # built along the way is unused.
     # we want to parse through the map to find if
     # the schema has valid upgraders. Since the
     # version map has entry for each overload
@@ -224,6 +243,9 @@ def has_valid_upgraders(schema, version_map):
 
 
 def dont_parse(schema_line):
+    # [FUNCTION DOC] HELPER: Returns true if the schema line matches any not-yet-expired
+    # pattern in the do-not-parse list (these are schemas using syntax the reference build
+    # cannot parse); expired entries are skipped. Uses a regex search on the line.
     for item in dont_parse_list:
         if item[1] < datetime.date.today():
             continue
@@ -234,6 +256,10 @@ def dont_parse(schema_line):
 
 
 def load_schemas_to_dict():
+    # [FUNCTION DOC] HELPER: Reads every schema registered in this process (JIT operator
+    # schemas plus custom class schemas) and groups them into a mapping from operator name,
+    # without overload, to the list of schemas of that name. Returns that default-list
+    # mapping.
     new_schemas = torch._C._jit_get_all_schemas()
     new_schemas += torch._C._jit_get_custom_class_schemas()
     new_schema_dict = defaultdict(list)
@@ -243,6 +269,10 @@ def load_schemas_to_dict():
 
 
 def process_version_map(version_map):
+    # [FUNCTION DOC] HELPER: Converts the operator version map from full operator name with
+    # overload to upgrader entries into a mapping from operator name without overload to a
+    # mapping from the full key to the list of parsed old schemas. Each upgrader entry has its
+    # old schema text parsed into a schema object. Returns the nested mapping.
     # version map maps full schema name to
     # list of upgraders. Since we only have
     # the name of the schema (aka no overload)
@@ -259,6 +289,11 @@ def process_version_map(version_map):
 
 
 def is_core_aten_op(schema) -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether the schema belongs to the core ATen opset. False
+    # for names without a namespace separator. Looks up the registered overload by name and
+    # overload; if the operator no longer exists it conservatively returns true (see the note
+    # inside about removed core ops); otherwise returns whether the core tag is among its
+    # tags.
     # Check if the schema is a core ATen op
     if "::" not in schema.name:
         return False
@@ -282,6 +317,16 @@ def is_core_aten_op(schema) -> bool:
 
 
 def check_bc(existing_schemas):
+    # [FUNCTION DOC] Backward compatibility check. Argument: a list of schemas from the
+    # reference build. For each: allowlisted schemas are skipped unless they are core ATen ops
+    # without a trust flag, in which case a log message is emitted and checking continues;
+    # schemas with valid upgraders are skipped unless they are core ATen ops; otherwise at
+    # least one current schema with the same name must be backward compatible with it, else a
+    # warning is logged and the schema is recorded as broken. Logs a summary and returns true
+    # only if nothing broke.
+    # KNOWN ISSUE: the info log message for a core ATen op with a valid upgrader contains a
+    # placeholder but is not given the schema argument, so the logging module reports a
+    # formatting error instead of printing the message.
     new_schema_dict = load_schemas_to_dict()
     version_map = process_version_map(torch._C._get_operator_version_map())
     is_bc = True
@@ -340,6 +385,12 @@ def check_bc(existing_schemas):
 
 
 def check_fc(existing_schemas):
+    # [FUNCTION DOC] Forward compatibility check. Argument: a list of schemas from the
+    # reference build. Allowlisted schemas are skipped; for others, at least one current
+    # schema of the same name must report forward compatibility, otherwise warnings list the
+    # candidates and the collected failure reasons and the schema is recorded as broken. Logs
+    # a summary warning if anything broke. Returns nothing, so the caller cannot act on the
+    # result; it is warn-only by policy.
     new_schema_dict = load_schemas_to_dict()
     is_fc = True
     broken_ops = []

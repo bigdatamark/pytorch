@@ -1,3 +1,6 @@
+# [MODULE DOC] Reference BERT style self attention written with ordinary positional tensor
+# operations (view, permute, matmul, einsum). Counterpart of attn_ft.py, which expresses the
+# same computation with first-class dimensions. No import-time side effects beyond imports.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -10,6 +13,10 @@ from torch import nn
 
 
 class BertSelfAttention(nn.Module):
+    # [CLASS DOC] BERT style multi-head self attention module. State: query, key and value
+    # linear projections, a dropout layer, head count and head size, and, when a relative
+    # position embedding type is configured, a maximum position count and a distance embedding
+    # table. Invariant: hidden size is divisible by the head count.
     def __init__(
         self,
         hidden_size,
@@ -18,6 +25,12 @@ class BertSelfAttention(nn.Module):
         position_embedding_type=None,
         max_position_embeddings=None,
     ):
+        # [FUNCTION DOC] Constructor. Arguments: hidden_size, num_attention_heads, dropout
+        # probability, optional position_embedding_type with max_position_embeddings. Raises
+        # ValueError when hidden size is not a multiple of the head count, and AssertionError
+        # when a position embedding type is given without a maximum position count. Builds the
+        # projections, dropout module and, for relative positions, an embedding of twice the
+        # maximum minus one rows.
         super().__init__()
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
@@ -48,6 +61,9 @@ class BertSelfAttention(nn.Module):
             )
 
     def transpose_for_scores(self, x):
+        # [FUNCTION DOC] Reshapes a tensor of batch, sequence, all-heads features into batch,
+        # heads, sequence, head size by splitting the last axis into heads and head size and
+        # moving the heads axis ahead of the sequence axis. Returns a permuted view.
         new_x_shape = x.size()[:-1] + (
             self.num_attention_heads,
             self.attention_head_size,
@@ -60,6 +76,13 @@ class BertSelfAttention(nn.Module):
         hidden_states,
         past_key_value=None,
     ):
+        # [FUNCTION DOC] Computes self attention for hidden states, with an optional cached
+        # key/value pair past_key_value whose tensors are prepended along the sequence axis.
+        # Scores are the scaled dot product of queries and keys; for the relative key types an
+        # embedding of the query/key position distance (cast to the query dtype) contributes
+        # extra einsum terms. Applies softmax over the last axis, dropout (active only in
+        # training mode), weights the values and merges heads back into a batch by sequence by
+        # hidden tensor which is returned.
         q = self.query(hidden_states)
         k = self.key(hidden_states)
         v = self.value(hidden_states)

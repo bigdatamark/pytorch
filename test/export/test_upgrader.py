@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests for the C++ export schema upgrader machinery exposed through the private
+# export binding module. Each test builds a JSON dictionary imitating a serialized export
+# graph with an older schema version, serializes it to text, runs the upgrade binding
+# targeting major version 2, parses the result and checks the version and transformed fields.
+# The example upgraders (a node metadata stack prefixer for version 0 and field renamers) are
+# registered per test.
 # Owner(s): ["oncall: export"]
 
 import json
@@ -7,16 +13,28 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class TestUpgrader(TestCase):
+    # [CLASS DOC] Test case for schema upgrade chains. Relies on example upgraders registered
+    # in setUp and removed in tearDown: version 0 prefixes the node module stack strings and
+    # renames one graph field, version 1 renames a second field, so upgrading from 0 or 1 to 2
+    # applies the chain suffix.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Calls the base setUp then registers the example upgraders in
+        # the C++ export module, a global side effect undone in tearDown.
         super().setUp()
         # Register example upgraders dynamically
         torch._C._export.register_example_upgraders()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] HELPER: Deregisters the example upgraders from the C++ export module.
+        # Does not call the base tearDown.
         # Clean up registered upgraders
         torch._C._export.deregister_example_upgraders()
 
     def test_nn_module_stack_transformation_from_v0(self):
+        # [FUNCTION DOC] Upgrades a version 0 document with two nodes whose metadata carries a
+        # module stack string. Checks the schema major version becomes 2 and minor 0, that
+        # each node module stack string gets the test_upgrader_ prefix, and that other
+        # metadata entries are unchanged.
         """Test that nn_module_stack strings are prepended with 'test_upgrader_' when upgrading from version 0"""
 
         # Create a mock JSON object that simulates version 0 schema
@@ -78,6 +96,9 @@ class TestUpgrader(TestCase):
         self.assertEqual(second_node_metadata["stack_trace"], "some trace")
 
     def test_nn_module_stack_error_handling_invalid_type(self):
+        # [FUNCTION DOC] Upgrades a version 0 document whose node module stack is an integer.
+        # Expects the upgrade call to raise RuntimeError whose message names the failing
+        # registered version 0 upgrader.
         """Test error handling when nn_module_stack is not a string"""
 
         # Test case: nn_module_stack is not a string
@@ -107,6 +128,10 @@ class TestUpgrader(TestCase):
             torch._C._export.upgrade(serialized_json, 2)
 
     def test_nodes_without_metadata_handled_gracefully(self):
+        # [FUNCTION DOC] Upgrades a version 0 document where one node has no metadata and
+        # another has metadata without a module stack. Expects no error, version 2.0 result,
+        # the first node still lacking metadata, and the second node metadata unchanged with
+        # no module stack added.
         """Test that nodes without metadata or nn_module_stack are handled gracefully"""
 
         mock_json = {
@@ -155,6 +180,11 @@ class TestUpgrader(TestCase):
         self.assertNotIn("nn_module_stack", nodes[1]["metadata"])
 
     def test_field_renaming_chain_from_v0_complete(self):
+        # [FUNCTION DOC] Upgrades a version 0 graph containing the old test field and an
+        # existing field. Checks the old field ends up renamed through the intermediate name
+        # to the final name with its value kept, intermediate and old names absent, unrelated
+        # fields and inputs, outputs, nodes kept, and the node module stack prefixed by the
+        # other upgrader.
         """Test complete field renaming chain from v0: old_test_field -> new_test_field -> new_test_field2"""
 
         mock_json = {
@@ -206,6 +236,9 @@ class TestUpgrader(TestCase):
         )
 
     def test_field_renaming_chain_from_v0_missing_field(self):
+        # [FUNCTION DOC] Upgrades a version 0 graph that lacks the old test field. Checks
+        # version becomes 2.0, no renamed field names appear, and existing field, inputs,
+        # outputs and nodes are preserved.
         """Test that upgraders work gracefully when old_test_field doesn't exist"""
 
         mock_json = {
@@ -242,6 +275,10 @@ class TestUpgrader(TestCase):
         self.assertIn("nodes", graph)
 
     def test_field_renaming_from_v1_partial_chain(self):
+        # [FUNCTION DOC] Upgrades a version 1 graph containing the intermediate field name.
+        # Checks only the version 1 upgrader applies: version becomes 2.0, the field is
+        # renamed to the final name keeping its value, the intermediate name is gone, other
+        # fields preserved.
         """Test partial upgrade chain starting from v1: new_test_field -> new_test_field2"""
 
         mock_json = {

@@ -1,3 +1,10 @@
+# [MODULE DOC] Shared helpers for the export test suite. Defines a list of composite ATen
+# overloads that tests may ask to preserve during decomposition (explicitly not exhaustive), a
+# factory that clones a test class with every test method wrapped so the module level export
+# function used by test_export is patched with a replacement, and a family of decorators that
+# tag a test function with an attribute marking it as an expected failure for one particular
+# export variant. Import-time side effect: resolves the aten op namespace and builds the op
+# list, which requires those overloads to exist.
 import functools
 import unittest
 from unittest.mock import patch
@@ -162,6 +169,16 @@ def make_test_cls_with_mocked_export(
     xfail_prop=None,
     test_only_if_no_xfail=False,
 ):
+    # [FUNCTION DOC] Builds a new test class from cls by creating a type named with cls_prefix
+    # followed by the original name, using the original base classes and an empty namespace,
+    # and setting its qualified name to match. For each attribute of the original class whose
+    # name begins with test_: non-callable ones are copied as is; callables are wrapped so
+    # export is mocked, renamed with fn_suffix appended, and: if xfail_prop is set and the
+    # function carries that attribute it is marked expected failure; otherwise if
+    # test_only_if_no_xfail is true and the function has any attribute starting with
+    # _expected_failure it is skipped with a reason message. Other attributes not already on
+    # the new class are copied across (slots are not handled). Returns the new class; the
+    # original is not modified.
     MockedTestClass = type(f"{cls_prefix}{cls.__name__}", cls.__bases__, {})
     MockedTestClass.__qualname__ = MockedTestClass.__name__
 
@@ -191,8 +208,16 @@ def make_test_cls_with_mocked_export(
 
 
 def _make_fn_with_mocked_export(fn, mocked_export_fn):
+    # [FUNCTION DOC] HELPER: Returns a wrapper around fn that preserves its metadata. The
+    # wrapper, when called, imports test_export (relative import, falling back to a top level
+    # import) and runs fn with the export name inside that module patched to mocked_export_fn
+    # for the duration of the call, returning fn's result.
     @functools.wraps(fn)
     def _fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper body described by the enclosing helper: imports
+        # test_export lazily on each call, patches its export attribute with the mock for the
+        # call duration, forwards all arguments to fn and returns its result. The patch is
+        # undone on exit, also when fn raises.
         try:
             from . import test_export
         except ImportError:
@@ -206,83 +231,138 @@ def _make_fn_with_mocked_export(fn, mocked_export_fn):
 
 # Controls tests generated in test/export/test_export_training_ir_to_run_decomp.py
 def expectedFailureTrainingIRToRunDecomp(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_training_ir_to_run_decomp to true on the given test function and
+    # returns the same function, so the generated training IR to run_decomp test variant is
+    # treated as an expected failure. No other side effects.
     fn._expected_failure_training_ir_to_run_decomp = True
     return fn
 
 
 # Controls tests generated in test/export/test_export_training_ir_to_run_decomp.py
 def expectedFailureTrainingIRToRunDecompNonStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_training_ir_to_run_decomp_non_strict to true on the given test
+    # function and returns the same function, so the generated training IR to run_decomp
+    # non-strict test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_training_ir_to_run_decomp_non_strict = True
     return fn
 
 
 # Controls tests generated in test/export/test_export_strict_v2.py
 def expectedFailureStrictV2(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_strict_v2 to
+    # true on the given test function and returns the same function, so the generated strict
+    # v2 export test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_strict_v2 = True
     return fn
 
 
 # Controls tests generated in test/export/test_export_strict.py
 def expectedFailureStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_strict to true
+    # on the given test function and returns the same function, so the generated strict export
+    # test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_strict = True
     return fn
 
 
 # Controls tests generated in test/export/test_retraceability.py
 def expectedFailureRetraceability(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_retrace to
+    # true on the given test function and returns the same function, so the generated
+    # retraceability test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_retrace = True
     return fn
 
 
 # Controls tests generated in test/export/test_retraceability.py
 def expectedFailureRetraceabilityNonStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_retrace_non_strict to true on the given test function and returns the
+    # same function, so the generated non-strict retraceability test variant is treated as an
+    # expected failure. No other side effects.
     fn._expected_failure_retrace_non_strict = True
     return fn
 
 
 # Controls tests generated in test/export/test_serdes.py
 def expectedFailureSerDer(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_serdes to true
+    # on the given test function and returns the same function, so the generated
+    # serialize/deserialize round trip test variant is treated as an expected failure. No
+    # other side effects.
     fn._expected_failure_serdes = True
     return fn
 
 
 # Controls tests generated in test/export/test_serdes.py
 def expectedFailureSerDerNonStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_serdes_non_strict to true on the given test function and returns the
+    # same function, so the generated non-strict serialize/deserialize round trip test variant
+    # is treated as an expected failure. No other side effects.
     fn._expected_failure_serdes_non_strict = True
     return fn
 
 
 def expectedFailureSerDerPreDispatch(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_serdes_pre_dispatch to true on the given test function and returns the
+    # same function, so the generated pre-dispatch serialize/deserialize round trip test
+    # variant is treated as an expected failure. No other side effects.
     fn._expected_failure_serdes_pre_dispatch = True
     return fn
 
 
 def expectedFailurePreDispatchRunDecomp(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_pre_dispatch
+    # to true on the given test function and returns the same function, so the generated
+    # pre-dispatch run_decomp test variant is treated as an expected failure. No other side
+    # effects (it returns the function unchanged otherwise).
     fn._expected_failure_pre_dispatch = True
     return fn
 
 
 def expectedFailureCppSerDes(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_cpp_serdes to
+    # true on the given test function and returns the same function, so the generated C++
+    # serialization test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_cpp_serdes = True
     return fn
 
 
 def expectedFailureCppRuntime(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_cpp_runtime to
+    # true on the given test function and returns the same function, so the generated C++
+    # runtime test variant is treated as an expected failure. No other side effects.
     fn._expected_failure_cpp_runtime = True
     return fn
 
 
 def expectedFailureCppRuntimeNonStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_cpp_runtime_non_strict to true on the given test function and returns
+    # the same function, so the generated non-strict C++ runtime test variant is treated as an
+    # expected failure. No other side effects.
     fn._expected_failure_cpp_runtime_non_strict = True
     return fn
 
 
 # Controls tests generated in test/export/test_export_legacy.py
 def expectedFailureLegacyExportStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute _expected_failure_legacy_export
+    # to true on the given test function and returns the same function, so the generated
+    # legacy strict export test variant is treated as an expected failure. No other side
+    # effects.
     fn._expected_failure_legacy_export = True
     return fn
 
 
 def expectedFailureLegacyExportNonStrict(fn):
+    # [FUNCTION DOC] Decorator that sets the marker attribute
+    # _expected_failure_legacy_export_non_strict to true on the given test function and
+    # returns the same function, so the generated legacy non-strict export test variant is
+    # treated as an expected failure. No other side effects.
     fn._expected_failure_legacy_export_non_strict = True
     return fn

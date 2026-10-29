@@ -1,3 +1,8 @@
+# [MODULE DOC] Example of the first-class dimensions API from functorch.dim: a BERT style self
+# attention module written with explicit dimension objects instead of positional reshapes,
+# using a linear layer variant also built from dimension objects. Counterpart of
+# attn_positional.py, used by tests and benchmarks to compare the two styles. No import-time
+# side effects beyond imports.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -11,7 +16,18 @@ from torch import nn
 
 
 class Linear(nn.Linear):
+    # [CLASS DOC] Linear layer subclass whose forward is expressed with first-class
+    # dimensions: it binds dimension objects to the input and the weight, multiplies, and
+    # reduces over the input feature dimension. Parameters are inherited unchanged from the
+    # standard linear module.
     def forward(self, input):
+        # [FUNCTION DOC] Computes the linear transformation with first-class dimensions.
+        # Creates a feature-in and feature-out dimension and a list of batch dimensions,
+        # indexes the input by batch and input features, indexes the weight by output and
+        # input features, multiplies, sums over the input features, adds the bias indexed by
+        # output features, then reorders the result back to a regular tensor with batch
+        # dimensions followed by output features. Returns that tensor; accepts any number of
+        # leading batch dimensions.
         ci, co = dims()
         b = dimlists()
         result = (input[b, ci] * self.weight[co, ci]).sum(ci) + self.bias[co]
@@ -19,6 +35,10 @@ class Linear(nn.Linear):
 
 
 class BertSelfAttention(nn.Module):
+    # [CLASS DOC] BERT style self attention implemented with first-class dimensions. Holds
+    # query, key and value projections built by the supplied linear factory, the dropout
+    # probability, optional relative position embedding type and, when that type is given, a
+    # distance embedding table. Invariant: hidden size is divisible by the head count.
     def __init__(
         self,
         hidden_size,
@@ -28,6 +48,13 @@ class BertSelfAttention(nn.Module):
         max_position_embeddings=None,
         linear=Linear,
     ):
+        # [FUNCTION DOC] Constructor. Arguments: hidden_size, num_attention_heads,
+        # attention_probs_dropout_prob, optional position_embedding_type (relative_key or
+        # relative_key_query style) with max_position_embeddings, and a linear factory
+        # defaulting to the dimension based Linear. Raises ValueError if hidden size is not a
+        # multiple of the head count, and AssertionError if a position embedding type is set
+        # without a max length. Creates the three projections and, for relative positions, an
+        # embedding table of twice the max length minus one rows.
         super().__init__()
         if hidden_size % num_attention_heads != 0:
             raise ValueError(
@@ -62,6 +89,16 @@ class BertSelfAttention(nn.Module):
         hidden_states,
         past_key_value=None,
     ):
+        # [FUNCTION DOC] Runs attention on hidden states, with optional cached key/value pair
+        # past_key_value. Projects q, k, v, then binds them to named dimensions, splitting the
+        # hidden axis into heads and features. If a past is given, concatenates cached keys
+        # and values along the key sequence into a longer dimension. Scores are the scaled dot
+        # product over features. For relative position types adds scores derived from an
+        # embedding lookup indexed by query minus key distance, raising AssertionError if the
+        # key length exceeds the maximum positions. Applies softmax over the key sequence,
+        # dropout (applied regardless of training mode, since the training flag is not
+        # passed), weights the values, and returns the context reordered to batch, query
+        # sequence, merged heads and features.
         # first run the encoding linear layers for q, k, v normally
         # the meaning of a linear layer is well understood, so no need to use explicit dimensions
         q = self.query(hidden_states)
