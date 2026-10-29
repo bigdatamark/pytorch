@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Variable-length (packed, ragged batch) attention built on Flash Attention, with an optional
+# cuDNN path. Public API: varlen_attn, varlen_attn_out and the AuxRequest option tuple.
+# Defines private torch_attn custom ops (forward, forward with preallocated output, backward)
+# with fake implementations, and registers an autograd formula for the forward op.
+# Import-time side effects: registers the custom ops, marks the in-place flash forward op as
+# disallowed in dynamo graphs, and registers flop-counter formulas for the three custom ops.
 """
 Variable-length attention implementation using Flash Attention.
 
@@ -18,6 +25,8 @@ __all__ = ["varlen_attn", "varlen_attn_out", "AuxRequest"]
 
 
 def _normalize_window_size(window_size: list[int] | None) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return the window size list, defaulting to no window (minus one,
+    # minus one) when None is given. Raises ValueError if the list length is not 2.
     if window_size is None:
         window_size = [-1, -1]
 
@@ -28,6 +37,9 @@ def _normalize_window_size(window_size: list[int] | None) -> list[int]:
 
 @lru_cache(maxsize=8)
 def _should_use_cudnn(device_index: int) -> bool:
+    # [FUNCTION DOC] HELPER: Cached (per device index) check whether cuDNN varlen attention is
+    # usable: false on ROCm, when cuDNN is missing or older than version 9.18, or when the
+    # device compute capability major version is not 9 or 10. Queries CUDA; no mutation.
     """Cache device capability check to avoid repeated CUDA calls."""
     if torch.version.hip is not None:
         return False
@@ -51,6 +63,10 @@ def _can_use_cudnn(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether the cuDNN backend can handle this call. Returns false
+    # unless: query is on a supported CUDA device, max_q exceeds 128, dtype is half or bfloat16,
+    # head dims of query and value are multiples of 8, no sliding window, no GQA and equal head
+    # counts, no num_splits, and no block_table without seqused_k. Pure check, no side effects.
     if not query.is_cuda or not _should_use_cudnn(query.device.index):
         return False
     if max_q <= 128:
@@ -69,6 +85,8 @@ def _can_use_cudnn(
 
 
 class AuxRequest(NamedTuple):
+    # [CLASS DOC] Immutable named tuple of flags selecting extra outputs from varlen attention.
+    # Single field lse (default false): when true the log-sum-exp tensor is returned too.
     """
     Request which auxiliary outputs to compute from varlen_attn.
 
@@ -95,6 +113,11 @@ def _varlen_attn(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Custom op forward kernel. Normalizes window_size, then dispatches to
+    # the cuDNN attention forward when allowed, else the flash attention forward (dropout is
+    # fixed to zero). Returns a tuple of output, log-sum-exp and a zero-filled two element
+    # uint64 rng state placeholder. Logs the chosen backend; no mutation of inputs.
+    # Raises ValueError for a bad window_size length.
     """
     Private custom op for variable-length attention.
 
@@ -178,6 +201,9 @@ def _varlen_attn_fake(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Fake (shape-only) version of the forward op. Returns an empty tensor
+    # shaped like query, an empty float log-sum-exp of shape heads by total query tokens, and an
+    # empty two element uint64 rng state. Validates window_size length (ValueError).
     """
     Fake implementation for meta tensor computation and tracing.
 
@@ -219,6 +245,12 @@ def varlen_attn(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Public entry point for packed variable-length attention. Validates head
+    # counts (ValueError if query and key/value heads differ without enable_gqa, or if GQA is on
+    # and query heads are not a multiple of kv heads), treats window (-1, 0) as causal, and calls
+    # the private forward op. Returns the output, or (output, log-sum-exp) when return_aux asks
+    # for lse. With block_table the key head count is read from a different dimension (paged).
+    # Supports autograd, but seqused_k and block_table are inference-only (error in backward).
     r"""Compute variable-length attention using Flash Attention.
 
     This function is similar to scaled_dot_product_attention but optimized for
@@ -373,6 +405,9 @@ def _varlen_attn_out(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Custom op that runs the in-place flash attention forward, writing the
+    # result into the mutated out tensor, and returns the log-sum-exp. Dropout fixed to zero.
+    # Always uses flash (never cuDNN). Raises ValueError for a bad window_size length.
     """
     Private custom op for variable-length attention with pre-allocated output.
     Same as _varlen_attn but writes the attention output into the provided out tensor.
@@ -421,6 +456,8 @@ def _varlen_attn_out_fake(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Fake version of the out-variant op; returns an empty float
+    # log-sum-exp of shape heads by total query tokens. Does not touch out.
     """
     Fake implementation for meta tensor computation and tracing.
     """
@@ -451,6 +488,11 @@ def varlen_attn_out(
     block_table: torch.Tensor | None = None,
     num_splits: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Public variant of varlen_attn that writes into the caller-provided out tensor
+    # (mutated in place) and returns it, or (out, log-sum-exp) when return_aux asks for lse.
+    # Performs the same head count validation (ValueError) and causal window handling.
+    # KNOWN ISSUE: the underlying op has no registered autograd formula, so it is not
+    # differentiable, unlike varlen_attn.
     r"""Compute variable-length attention using Flash Attention with a pre-allocated output tensor.
 
     Same as :func:`varlen_attn` but writes the attention output into the provided ``out`` tensor
@@ -495,6 +537,10 @@ def varlen_attn_out(
 
 
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+    # [FUNCTION DOC] HELPER: Autograd setup_context for the forward op. Unpacks inputs and
+    # outputs, raises RuntimeError if seqused_k or block_table is set (inference-only), saves
+    # tensors (query, key, value, cumulative sequences, output, lse, rng state) for backward, and
+    # stores max lengths, causal flag, scale and window size as attributes on ctx.
     (
         query,
         key,
@@ -544,6 +590,12 @@ def _varlen_attn_backward(
     scale: float | None = None,
     window_size: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Custom op backward kernel. Returns gradients for query, key and
+    # value, using the cuDNN backward when allowed, else the flash attention backward (dropout
+    # zero). Raises ValueError for bad window_size length.
+    # KNOWN ISSUE: the cuDNN path's window-size RuntimeError is unreachable because the
+    # eligibility check already rejects windowed calls. Also the check is made without the GQA
+    # flag, so grouped-query inputs are only excluded via differing head counts.
     window_size = _normalize_window_size(window_size)
 
     unused = torch.empty(0, device=query.device)
@@ -615,6 +667,8 @@ def _varlen_attn_backward_fake(
     scale: float | None = None,
     window_size: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Fake version of the backward op; returns empty tensors shaped like
+    # query, key and value. Validates window_size length (ValueError).
     """
     Fake implementation for meta tensor computation and tracing.
     """
@@ -630,6 +684,10 @@ def _varlen_attn_backward_fake(
 def _backward(
     ctx: Any, grad_out: torch.Tensor, grad_lse: torch.Tensor, grad_rng: torch.Tensor
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC] HELPER: Autograd backward for the forward op. Restores saved tensors and ctx
+    # attributes, calls the private backward op, and returns gradients for query, key and value
+    # followed by no-gradient entries for the remaining eleven forward inputs. The lse and rng
+    # gradients are ignored.
     query, key, value, cu_seq_q, cu_seq_k, out, lse, rng_state = ctx.saved_tensors
 
     max_q = ctx.max_q

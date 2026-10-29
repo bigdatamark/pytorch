@@ -1,3 +1,8 @@
+# [MODULE DOC] Type aliases shared by torch.nn modules and functional ops. Provides a generic
+# scalar-or-tuple alias family (any length, and fixed lengths 1 to 6), integer size aliases,
+# optional-size aliases, float ratio aliases, a tensor-sequence alias, and an alias for the
+# value returned by max pooling (tensor or tensor pair). Typing only; the only runtime
+# effect at import is creating a type variable and the aliases.
 from typing import TypeAlias as _TypeAlias, TypeVar
 
 from torch import Tensor
