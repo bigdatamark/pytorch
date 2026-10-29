@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Per-sample-gradient autograd function for group_norm with ExpandedWeight
+# weight/bias. Registers GroupNormPerSampleGrad for the group norm function at import time.
 import operator
 from functools import reduce
 
@@ -16,9 +18,16 @@ from .expanded_weights_utils import (
 
 @implements_per_sample_grads(F.group_norm)
 class GroupNormPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for group norm with expanded weight/bias; forward uses the
+    # native group norm and saves statistics on ctx, backward gives the input gradient and sets
+    # per-sample gradients of weight and bias.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, kwarg_names, _, *expanded_args_and_kwargs):
+        # [FUNCTION DOC] Computes group norm via the native kernel. Args: kwarg_names, an unused
+        # op placeholder and flattened args (input, num_groups plus weight, bias, eps keywords).
+        # Saves input, groups, weight, eps, mean and rstd; saves bias only when it is an
+        # ExpandedWeight. Returns the normalized output.
         expanded_args, expanded_kwargs = standard_kwargs(
             kwarg_names, expanded_args_and_kwargs
         )
@@ -48,6 +57,12 @@ class GroupNormPerSampleGrad(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] Returns the tuple of gradients: the input gradient from the native
+        # group norm backward when the input requires grad, and None for the other arguments.
+        # Side effect: sets per-sample gradients on weight and bias (computed with einsum over
+        # the normalized output times grad).
+        # KNOWN ISSUE: reads the saved bias unconditionally, which fails if bias was not saved
+        # in forward.
         input, num_groups = ctx.input, ctx.num_groups
         weight, bias, eps = ctx.weight, ctx.bias, ctx.eps
         mean, rstd = ctx.mean, ctx.rstd

@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports reference quantized Conv and
+# ConvTranspose classes (including private bases _ConvNd and _ConvTransposeNd) from
+# torch.ao.nn.quantized.reference.modules.conv. No behavior is defined here.
 r"""Quantized Reference Modules.
 
 This module is in the process of migration to

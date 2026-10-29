@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Per-sample-gradient autograd function for instance_norm with ExpandedWeight
+# weight/bias. Registers InstanceNormPerSampleGrad for the instance norm function at import
+# time.
 from functools import partial
 
 import torch
@@ -15,9 +18,14 @@ from .expanded_weights_utils import (
 
 @implements_per_sample_grads(F.instance_norm)
 class InstanceNormPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for instance norm with expanded weight/bias; backward folds
+    # the batch into channels and uses the native batch norm backward.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, kwarg_names, _, *expanded_args_and_kwargs):
+        # [FUNCTION DOC] Runs instance norm (cudnn enabled) through forward_helper and saves
+        # input, running statistics, weight, bias and eps on ctx. Args: kwarg_names, op
+        # placeholder, flattened args. Returns the output.
         instance_norm = partial(torch.instance_norm, cudnn_enabled=True)
         expanded_args, expanded_kwargs = standard_kwargs(
             kwarg_names, expanded_args_and_kwargs
@@ -38,6 +46,10 @@ class InstanceNormPerSampleGrad(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] Reshapes the input and gradient so that batch and channel are merged,
+        # recomputes variance and mean, and calls the native batch norm backward to get the
+        # input gradient (when the input requires grad). Returns a tuple with None for all other
+        # arguments. Side effect: sets per-sample gradients on weight and bias.
         input, running_mean, running_var = ctx.input, ctx.running_mean, ctx.running_var
         weight, bias, eps = ctx.weight, ctx.bias, ctx.eps
 

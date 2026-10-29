@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Deprecated alias package re-exporting dynamically quantized modules from
+# torch.ao.nn.quantized.dynamic.modules: Linear, LSTM, GRU, LSTMCell, RNNCell, GRUCell and
+# Conv/ConvTranspose 1d/2d/3d (see __all__). Also imports the conv, linear and rnn submodules.
 r"""Quantized Dynamic Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized/dynamic`,

@@ -1,3 +1,6 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports dynamically quantized RNN classes
+# (RNNBase, RNNCellBase, RNNCell, LSTM, GRU, LSTMCell, GRUCell, PackedParameter and the
+# pack_weight_bias helper) from torch.ao.nn.quantized.dynamic.modules.rnn.
 r"""Quantized Dynamic Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized/dynamic`,

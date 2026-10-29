@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports quantized activation modules (ELU,
+# Hardswish, LeakyReLU, MultiheadAttention, PReLU, ReLU6, Sigmoid, Softmax) from
+# torch.ao.nn.quantized.modules.activation.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

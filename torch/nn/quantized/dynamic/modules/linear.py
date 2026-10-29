@@ -1,4 +1,6 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports the dynamically quantized Linear from
+# torch.ao.nn.quantized.dynamic.modules.linear. No behavior is defined here.
 r"""Quantized Dynamic Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized/dynamic`,

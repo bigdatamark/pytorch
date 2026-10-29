@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Deprecated alias package re-exporting quantized modules from
+# torch.ao.nn.quantized.modules: BatchNorm, Conv/ConvTranspose, Linear, norms, activations,
+# Dropout, Embedding, EmbeddingBag, LSTM, Quantize/DeQuantize and the functional wrappers
+# (see __all__). Submodules and MaxPool2d are imported but intentionally left out of __all__.
 r"""Quantized Modules.
 
 Note::

@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports ReferenceQuantizedModule and weight
+# quantization helpers (_quantize_weight, _quantize_and_dequantize_weight, _save_weight_qparams,
+# _get_weight_qparam_keys) from torch.ao.nn.quantized.reference.modules.utils.
 r"""Quantized Reference Modules.
 
 This module is in the process of migration to

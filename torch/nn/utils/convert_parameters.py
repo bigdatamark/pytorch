@@ -1,9 +1,15 @@
+# [MODULE DOC] Conversion between a model's parameters and one flat vector (parameters_to_vector
+# and vector_to_parameters), plus a private device-consistency check. No import-time side
+# effects.
 from collections.abc import Iterable
 
 import torch
 
 
 def parameters_to_vector(parameters: Iterable[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] Flattens each parameter and concatenates them into one vector, in iteration
+    # order. Raises TypeError if parameters live on different devices. Raises an error from
+    # concatenation if the iterable is empty.
     r"""Flatten an iterable of parameters into a single vector.
 
     Args:
@@ -26,6 +32,10 @@ def parameters_to_vector(parameters: Iterable[torch.Tensor]) -> torch.Tensor:
 
 
 def vector_to_parameters(vec: torch.Tensor, parameters: Iterable[torch.Tensor]) -> None:
+    # [FUNCTION DOC] Copies consecutive slices of the vector into the parameters' data
+    # (replacing their data in place, in iteration order). Raises TypeError if vec is not a
+    # tensor or parameters are on different devices.
+    # KNOWN ISSUE: it does not check that the vector length matches the total parameter size.
     r"""Copy slices of a vector into an iterable of parameters.
 
     Args:
@@ -55,6 +65,10 @@ def vector_to_parameters(vec: torch.Tensor, parameters: Iterable[torch.Tensor]) 
 
 
 def _check_param_device(param: torch.Tensor, old_param_device: int | None) -> int:
+    # [FUNCTION DOC] HELPER: Returns the device index of the first parameter (-1 for CPU or
+    # other non-accelerator devices) when old_param_device is None; otherwise checks that the
+    # parameter is on the same device and returns the old value. Raises TypeError on a different
+    # device.
     r"""Check if the parameters are located on the same device.
 
     Currently, the conversion between model parameters and single vector form is not supported

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Per-sample-gradient autograd function for layer_norm with ExpandedWeight
+# weight/bias. Registers LayerNormPerSampleGrad for the layer norm function at import time.
 
 import torch
 import torch.nn.functional as F
@@ -15,9 +17,16 @@ from .expanded_weights_utils import (
 
 @implements_per_sample_grads(F.layer_norm)
 class LayerNormPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for layer norm with expanded weight/bias; backward uses the
+    # native layer norm backward and fills per-sample gradients by reducing over non-parameter
+    # dimensions.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, kwarg_names, _, *expanded_args_and_kwargs):
+        # [FUNCTION DOC] Computes layer norm with the native kernel. Raises RuntimeError if the
+        # normalized shape would cover the batch dimension. Saves args, eps, mean, rstd, and
+        # weight/bias when needed. Returns the output.
+        # KNOWN ISSUE: the error message joins two parts without a separating space.
         expanded_args, expanded_kwargs = standard_kwargs(
             kwarg_names, expanded_args_and_kwargs
         )
@@ -44,7 +53,13 @@ class LayerNormPerSampleGrad(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] Returns the gradient tuple: the input gradient from the native layer
+        # norm backward when the input requires grad, None elsewhere. Side effect: sets
+        # per-sample gradients for weight and bias when they were saved.
         def weight_per_sample_grad(weight):
+            # [FUNCTION DOC] HELPER: Per-sample weight gradient: the normalized input times the
+            # output gradient, summed over all dimensions except batch and the weight's own
+            # dimensions.
             return sum_over_all_but_batch_and_last_n(
                 F.layer_norm(input, normalized_shape, eps=ctx.eps) * grad_output,
                 weight.dim(),

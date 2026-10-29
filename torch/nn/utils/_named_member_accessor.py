@@ -1,6 +1,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] HELPER: Utilities for reading and swapping tensors (parameters/buffers) and
+# submodules of an nn.Module by dotted path: free functions set_tensor, swap_tensor and
+# swap_submodule, and NamedMemberAccessor which caches submodule lookups. Used by
+# functional-call style APIs. Defines a private sentinel _MISSING marking absent attributes.
 from collections.abc import Iterable
 
 import torch
@@ -10,6 +14,10 @@ _MISSING: torch.Tensor = object()  # type: ignore[assignment]
 
 
 def set_tensor(module: "torch.nn.Module", name: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Sets a tensor (or None) on a module under a single-level name.
+    # Replaces an existing parameter or buffer entry directly, otherwise sets a plain attribute.
+    # Raises TypeError if module or tensor have the wrong type, KeyError if the name is empty or
+    # contains a dot.
     if not isinstance(module, torch.nn.Module):
         raise TypeError(f"{module} is not an instance of torch.nn.Module")
     if not isinstance(tensor, torch.Tensor) and tensor is not None:
@@ -32,6 +40,11 @@ def swap_tensor(
     tensor: torch.Tensor,
     allow_missing: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Replaces a tensor attribute and returns the previous one. A
+    # _MISSING value deletes the attribute. Validates types and name like set_tensor (TypeError,
+    # KeyError). If the attribute does not exist, raises AttributeError unless allow_missing, in
+    # which case the returned original is _MISSING. Raises TypeError if the existing value is
+    # not a tensor or None.
     if not isinstance(module, torch.nn.Module):
         raise TypeError(f"{module} is not an instance of torch.nn.Module")
     if (
@@ -86,6 +99,9 @@ def swap_submodule(
     name: str,
     submodule: "torch.nn.Module",
 ) -> "torch.nn.Module":
+    # [FUNCTION DOC] HELPER: Replaces a direct child module and returns the old one. Raises
+    # TypeError for non-module arguments or a non-module existing child, KeyError for a bad name
+    # or missing child.
     if not isinstance(module, torch.nn.Module):
         raise TypeError(f"{module} is not an instance of torch.nn.Module")
     if not isinstance(submodule, torch.nn.Module):
@@ -105,6 +121,11 @@ def swap_submodule(
 
 
 class NamedMemberAccessor:
+    # [CLASS DOC] Wraps a module and offers path-based access (dotted names) to its submodules,
+    # parameters and buffers, single or batched, including swapping and rollback on failure.
+    # State: module and memo, a cache from path to submodule used to speed up lookups.
+    # KNOWN ISSUE: the cache is never invalidated, so it can become stale after submodule swaps
+    # performed through this class or directly on the module.
     """
     A class that provides a way to access the submodules and parameters/buffers of a module.
 
@@ -113,12 +134,16 @@ class NamedMemberAccessor:
     """
 
     def __init__(self, module: "torch.nn.Module") -> None:
+        # [FUNCTION DOC] Stores the module and creates an empty submodule cache.
         self.module = module
         self.memo: dict[str, torch.nn.Module] = {}
 
     # Nested attribute access
 
     def get_submodule(self, name: str) -> "torch.nn.Module":
+        # [FUNCTION DOC] Returns the submodule at a dotted path (the module itself for an empty
+        # path), resolving parents recursively and caching results. Raises AttributeError if a
+        # component is missing and TypeError if the attribute is not a module.
         """
         Return the submodule specified by the given path.
 
@@ -153,6 +178,8 @@ class NamedMemberAccessor:
             return submodule
 
     def swap_submodule(self, path: str, value: "torch.nn.Module") -> "torch.nn.Module":
+        # [FUNCTION DOC] Swaps the submodule at a dotted path with a new module and returns the
+        # old one.
         """
         Swap the submodule specified by the given ``path`` to ``value``.
 
@@ -163,6 +190,10 @@ class NamedMemberAccessor:
         return swap_submodule(self.get_submodule(prefix), attr, value)
 
     def get_tensor(self, name: str) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the tensor (or None) at a dotted path. Raises AttributeError if
+        # absent and TypeError if the attribute is neither a tensor nor None.
+        # KNOWN ISSUE: the AttributeError message uses the full path instead of the last
+        # component.
         """
         Get the tensor specified by the given path to value.
 
@@ -185,6 +216,8 @@ class NamedMemberAccessor:
         return tensor  # type: ignore[return-value]
 
     def set_tensor(self, name: str, value: torch.Tensor) -> None:
+        # [FUNCTION DOC] Sets the tensor at a dotted path by resolving the parent and delegating
+        # to set_tensor.
         """
         Set the attribute specified by the given path to value.
 
@@ -195,6 +228,9 @@ class NamedMemberAccessor:
         set_tensor(self.get_submodule(prefix), attr, value)
 
     def del_tensor(self, name: str) -> None:
+        # [FUNCTION DOC] Deletes the attribute at a dotted path. Raises AttributeError if it
+        # does not exist.
+        # KNOWN ISSUE: the error message uses the full path instead of the last component.
         """
         Delete the attribute specified by the given path.
 
@@ -213,6 +249,8 @@ class NamedMemberAccessor:
     def swap_tensor(
         self, name: str, value: torch.Tensor, allow_missing: bool = False
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Swaps the tensor at a dotted path and returns the previous one
+        # (_MISSING if it was absent and allow_missing is true).
         """
         Swap the attribute specified by the given path to value.
 
@@ -227,6 +265,7 @@ class NamedMemberAccessor:
     # Batched operations
 
     def get_tensors(self, names: Iterable[str]) -> list[torch.Tensor]:
+        # [FUNCTION DOC] Returns a list with the tensor at each given path, in order.
         """
         Get the tensors specified by the given paths.
 
@@ -237,6 +276,8 @@ class NamedMemberAccessor:
         return [self.get_tensor(name) for name in names]
 
     def set_tensors(self, names: Iterable[str], values: Iterable[torch.Tensor]) -> None:
+        # [FUNCTION DOC] Sets tensors at the given paths from a parallel sequence of values.
+        # Raises AssertionError if lengths differ.
         """
         Set the attributes specified by the given paths to values.
 
@@ -258,6 +299,7 @@ class NamedMemberAccessor:
             self.set_tensor(name, value)
 
     def set_tensors_dict(self, named_tensors: dict[str, torch.Tensor]) -> None:
+        # [FUNCTION DOC] Sets tensors from a mapping of dotted path to tensor.
         """
         Set the attributes specified by the given paths to values.
 
@@ -271,6 +313,7 @@ class NamedMemberAccessor:
             self.set_tensor(name, value)
 
     def del_tensors(self, names: Iterable[str]) -> None:
+        # [FUNCTION DOC] Deletes the attributes at each given path.
         """
         Delete the attributes specified by the given paths.
 
@@ -287,6 +330,9 @@ class NamedMemberAccessor:
         values: Iterable[torch.Tensor],
         allow_missing: bool = False,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC] Swaps tensors at the given paths with parallel values and returns the
+        # list of previous tensors. Raises AssertionError if lengths differ. No rollback is done
+        # on failure.
         """
         Swap the attributes specified by the given paths to values.
 
@@ -312,6 +358,10 @@ class NamedMemberAccessor:
     def swap_tensors_dict(
         self, named_tensors: dict[str, torch.Tensor], allow_missing: bool = False
     ) -> tuple[dict[str, torch.Tensor], list[str]]:
+        # [FUNCTION DOC] Swaps tensors from a mapping, returning the mapping of originals and
+        # the list of paths that were missing. If any swap raises, or a path is missing while
+        # allow_missing is false, all completed swaps are undone and the error (RuntimeError for
+        # missing keys) is raised.
         """
         Swap the attributes specified by the given paths to values.
 
@@ -342,6 +392,8 @@ class NamedMemberAccessor:
         return orig_named_tensors, missing_keys
 
     def check_keys(self, keys: Iterable[str]) -> tuple[list[str], list[str]]:
+        # [FUNCTION DOC] Compares the given keys with all parameter and buffer names (duplicates
+        # included) and returns the sorted missing keys and the sorted unexpected keys.
         """Check that the given keys are valid."""
         keys = set(keys)
         valid_keys = {name for name, _ in self.named_tensors(remove_duplicate=False)}
@@ -355,6 +407,7 @@ class NamedMemberAccessor:
         self,
         remove_duplicate: bool = True,
     ) -> Iterable[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC] Generator yielding the module's named parameters.
         """Iterate over all the parameters in the module."""
         yield from self.module.named_parameters(remove_duplicate=remove_duplicate)
 
@@ -362,6 +415,7 @@ class NamedMemberAccessor:
         self,
         remove_duplicate: bool = True,
     ) -> Iterable[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC] Generator yielding the module's named buffers.
         """Iterate over all the buffers in the module."""
         yield from self.module.named_buffers(remove_duplicate=remove_duplicate)
 
@@ -369,6 +423,7 @@ class NamedMemberAccessor:
         self,
         remove_duplicate: bool = True,
     ) -> Iterable[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC] Generator yielding all named parameters followed by all named buffers.
         """Iterate over all the tensors in the module."""
         yield from self.module.named_parameters(remove_duplicate=remove_duplicate)
         yield from self.module.named_buffers(remove_duplicate=remove_duplicate)
@@ -377,5 +432,6 @@ class NamedMemberAccessor:
         self,
         remove_duplicate: bool = True,
     ) -> Iterable[tuple[str, "torch.nn.Module"]]:
+        # [FUNCTION DOC] Generator yielding the module's named submodules.
         """Iterate over all the modules in the module."""
         yield from self.module.named_modules(remove_duplicate=remove_duplicate)

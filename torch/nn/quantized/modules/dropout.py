@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports the quantized Dropout from
+# torch.ao.nn.quantized.modules.dropout.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

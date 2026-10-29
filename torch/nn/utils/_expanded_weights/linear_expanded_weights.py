@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Per-sample-gradient autograd function for linear with ExpandedWeight weight/bias.
+# Registers LinearPerSampleGrad for the linear function at import time.
 
 import torch
 import torch.nn.functional as F
@@ -14,9 +16,15 @@ from .expanded_weights_utils import (
 
 @implements_per_sample_grads(F.linear)
 class LinearPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for linear layers with expanded weights; backward computes
+    # the input gradient with a matmul and per-sample weight/bias gradients with einsum.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, _, __, *expanded_args_and_kwargs):
+        # [FUNCTION DOC] Runs linear on the original weights. The first two arguments are unused
+        # placeholders; the rest are input, weight and optional bias. Raises RuntimeError if the
+        # input has rank below two. Saves args, bias and the batch_first flag on ctx. Returns
+        # the output.
         if len(expanded_args_and_kwargs[0].shape) <= 1:
             raise RuntimeError(
                 "Input does not have a batch dimension. Expanded Weights expected input "
@@ -37,6 +45,10 @@ class LinearPerSampleGrad(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] Returns the gradient tuple (None for placeholders, matmul-based input
+        # gradient when the input requires grad, None for weight and bias). Side effect: sets
+        # per-sample gradients for weight and bias, transposing batch and sequence dimensions
+        # first if batch_first is false.
         input, weight = ctx.args
         bias = ctx.kwargs["bias"]
         results: list[torch.Tensor | None] = []

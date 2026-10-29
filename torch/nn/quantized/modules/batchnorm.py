@@ -1,4 +1,6 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports quantized BatchNorm2d and BatchNorm3d
+# from torch.ao.nn.quantized.modules.batchnorm.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

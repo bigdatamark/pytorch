@@ -1,3 +1,6 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports FloatFunctional, FXFloatFunctional and
+# QFunctional (module wrappers for functional ops) from
+# torch.ao.nn.quantized.modules.functional_modules.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

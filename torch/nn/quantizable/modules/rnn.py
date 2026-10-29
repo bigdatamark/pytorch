@@ -1,4 +1,6 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports the quantizable LSTM and LSTMCell from
+# torch.ao.nn.quantizable.modules.rnn. No behavior is defined here.
 r"""Quantizable Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantizable`, and

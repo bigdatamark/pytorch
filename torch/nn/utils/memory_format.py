@@ -1,3 +1,6 @@
+# [MODULE DOC] Utilities to convert convolution weights to a given memory format (e.g. channels
+# last) for 2d and 3d convolutions, applied recursively to a module tree. Both functions are in
+# __all__.
 from __future__ import annotations
 
 from typing import TypeVar
@@ -11,6 +14,10 @@ _M = TypeVar("_M", bound="torch.nn.Module")
 def convert_conv2d_weight_memory_format(
     module: _M, memory_format: torch.memory_format
 ) -> _M:
+    # [FUNCTION DOC] Recursively converts the weight of every Conv2d and ConvTranspose2d in the
+    # module tree (including the module itself) to the given memory format by cloning and
+    # resizing the weight data. Returns the same module; mutates weights in place, leaving other
+    # layers untouched.
     r"""Convert ``memory_format`` of ``nn.Conv2d.weight`` to ``memory_format``.
 
     The conversion recursively applies to nested ``nn.Module``, including ``module``.
@@ -91,6 +98,9 @@ def convert_conv2d_weight_memory_format(
 def convert_conv3d_weight_memory_format(
     module: _M, memory_format: torch.memory_format
 ) -> _M:
+    # [FUNCTION DOC] Same as the 2d variant but for Conv3d and ConvTranspose3d weights.
+    # Recursively converts them to the given memory format in place and returns the same module.
+    # KNOWN ISSUE: the docstring mentions 4d weights where 5d weights are meant.
     r"""Convert ``memory_format`` of ``nn.Conv3d.weight`` to ``memory_format``
     The conversion recursively applies to nested ``nn.Module``, including ``module``.
     Note that it only changes the memory_format, but not the semantics of each dimensions.

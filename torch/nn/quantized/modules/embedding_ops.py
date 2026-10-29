@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports quantized Embedding, EmbeddingBag and
+# EmbeddingPackedParams from torch.ao.nn.quantized.modules.embedding_ops.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

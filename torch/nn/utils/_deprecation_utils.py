@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Provides lazy_deprecated_import, a factory for module-level attribute
+# hooks that warn about moved (deprecated) modules and forward lookups to the new location.
+# Defines the warning message template. No import-time side effects beyond imports.
 import importlib
 import warnings
 from collections.abc import Callable
@@ -13,6 +16,11 @@ def lazy_deprecated_import(
     old_module: str,
     new_module: str,
 ) -> Callable:
+    # [FUNCTION DOC] HELPER: Builds a module-level attribute hook for a deprecated module
+    # location. Args: all is the list of attribute names that may be forwarded, old_module and
+    # new_module are module names used in the warning text. Returns a callable taking an
+    # attribute name that, for a listed name, emits a RuntimeWarning and returns that attribute
+    # from new_module (imported on demand); for any other name it raises an AttributeError.
     r"""Import utility to lazily import deprecated packages / modules / functional.
 
     The old_module and new_module are also used in the deprecation warning defined
@@ -42,6 +50,11 @@ def lazy_deprecated_import(
     )
 
     def getattr_dunder(name: str) -> None:
+        # [FUNCTION DOC] HELPER: Attribute hook returned by lazy_deprecated_import. If the name
+        # is in the allowed list, warns (RuntimeWarning, stack level 2), imports the new module
+        # and returns the attribute; otherwise raises AttributeError.
+        # KNOWN ISSUE: the return annotation says None but the hook returns the looked-up
+        # attribute.
         if name in all:
             # We are using the "RuntimeWarning" to make sure it is not
             # ignored by default.

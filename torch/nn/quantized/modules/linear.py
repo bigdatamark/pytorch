@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports the quantized Linear and
+# LinearPackedParams from torch.ao.nn.quantized.modules.linear.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

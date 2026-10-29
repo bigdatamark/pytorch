@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports dynamically quantized Conv and
+# ConvTranspose 1d/2d/3d from torch.ao.nn.quantized.dynamic.modules.conv.
 r"""Quantized Dynamic Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized/dynamic`,

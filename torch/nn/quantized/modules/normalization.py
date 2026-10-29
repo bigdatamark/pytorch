@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports quantized LayerNorm, GroupNorm and
+# InstanceNorm1d/2d/3d from torch.ao.nn.quantized.modules.normalization.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

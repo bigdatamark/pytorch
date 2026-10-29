@@ -1,4 +1,6 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports QAT Conv1d, Conv2d and Conv3d from
+# torch.ao.nn.qat.modules.conv. No behavior is defined here.
 r"""QAT Modules.
 
 This file is in the process of migration to `torch/ao/nn/qat`, and

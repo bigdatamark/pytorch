@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Public torch.nn.utils namespace: gradient clipping (clip_grad_norm_,
+# clip_grad_value_, clip_grads_with_norm_, get_total_norm), parameter/vector conversion, conv-bn
+# and linear-bn fusion, skip_init, conv weight memory-format conversion, spectral_norm and
+# weight_norm (plus remove_*), and the parametrizations, parametrize, rnn and stateless
+# submodules. Exports are listed in __all__. clip_grads_with_norm_ and get_total_norm are
+# aliases of private functions in clip_grad.
 from . import parametrizations, parametrize, rnn, stateless
 from .clip_grad import (
     _clip_grads_with_norm_ as clip_grads_with_norm_,

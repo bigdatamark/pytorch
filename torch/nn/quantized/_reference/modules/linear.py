@@ -1,4 +1,6 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports the reference quantized Linear from
+# torch.ao.nn.quantized.reference.modules.linear. No behavior is defined here.
 r"""Quantized Reference Modules.
 
 This module is in the process of migration to

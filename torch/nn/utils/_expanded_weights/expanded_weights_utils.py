@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared helpers for the expanded-weights autograd functions: argument splitting,
+# validation and unwrapping of ExpandedWeight objects, per-sample gradient accumulation and a
+# reduction utility. No import-time side effects.
 
 import torch
 
@@ -6,6 +9,10 @@ from .expanded_weights_impl import ExpandedWeight
 
 
 def is_batch_first(expanded_args_and_kwargs):
+    # [FUNCTION DOC] HELPER: Returns the common batch_first flag of all ExpandedWeight items in
+    # the given sequence, or None when there are none. Raises RuntimeError on conflicting flags.
+    # KNOWN ISSUE: the check uses truthiness, so a first flag of False is overwritten by the
+    # next item and a conflict involving False can go undetected.
     batch_first = None
     # pyrefly: ignore [bad-assignment]
     for arg in expanded_args_and_kwargs:
@@ -22,6 +29,10 @@ def is_batch_first(expanded_args_and_kwargs):
 
 
 def standard_kwargs(kwarg_names, expanded_args):
+    # [FUNCTION DOC] Splits a flat argument tuple into positional args and a keyword mapping:
+    # the last len(kwarg_names) values become keyword values paired with the names. Returns the
+    # pair (positional args, keyword mapping). Raises ValueError if lengths mismatch.
+    # KNOWN ISSUE: the docstring ends with a garbled phrase ('linear and convAND').
     r"""Separate args and kwargs from `__torch_function__`s that standardize kwargs.
 
     Most `__torch_function__`s standardize the kwargs that they give, so this will separate
@@ -36,6 +47,9 @@ def standard_kwargs(kwarg_names, expanded_args):
 
 
 def forward_helper(func, expanded_args, expanded_kwargs):
+    # [FUNCTION DOC] Validates the arguments, replaces every ExpandedWeight by its original
+    # weight and calls func with them. Returns whatever func returns. Raises RuntimeError on
+    # invalid inputs (see _check_and_unexpand_args).
     r"""Compute the forward pass for a function that has expanded weight(s) passed to it.
 
     It will run the forward pass where all ExpandedWeights are their original
@@ -60,6 +74,12 @@ def forward_helper(func, expanded_args, expanded_kwargs):
 
 
 def _check_and_unexpand_args(func, expanded_args, expanded_kwargs):
+    # [FUNCTION DOC] HELPER: Validates args (the first must be a Tensor, not an ExpandedWeight,
+    # with a non-zero batch dimension; every ExpandedWeight batch size must match the input, or
+    # not exceed it when smaller batches are allowed; all loss_reduction values must agree) and
+    # returns the pair of args tuple and kwargs mapping with ExpandedWeights replaced by
+    # original weights. Raises RuntimeError on any violation.
+    # KNOWN ISSUE: the loss_reduction error message joins two parts without a space.
     # input must be the first argument passed
     input = expanded_args[0]
     if isinstance(input, ExpandedWeight):
@@ -116,6 +136,8 @@ def _check_and_unexpand_args(func, expanded_args, expanded_kwargs):
 
 
 def maybe_scale_by_batch_size(grad_sample, expanded_weight):
+    # [FUNCTION DOC] HELPER: Multiplies the per-sample gradient by the batch size when the
+    # weight uses mean loss reduction; otherwise returns it unchanged.
     if expanded_weight.loss_reduction == "mean":
         return grad_sample * expanded_weight.batch_size
     else:
@@ -123,6 +145,11 @@ def maybe_scale_by_batch_size(grad_sample, expanded_weight):
 
 
 def set_grad_sample_if_exists(maybe_expanded_weight, per_sample_grad_fn) -> None:
+    # [FUNCTION DOC] If the argument is an ExpandedWeight, computes its per-sample gradient with
+    # the given function, scales it, zero-pads along the batch dimension if the batch is smaller
+    # than the weight's batch size, and adds it into the grad_sample field of the original
+    # weight (creating it if absent). Otherwise does nothing. Returns None; mutates the original
+    # weight.
     unpacked = unpack_expanded_weight_or_tensor(maybe_expanded_weight)
     if isinstance(maybe_expanded_weight, ExpandedWeight):
         grad_sample_contribution = maybe_scale_by_batch_size(
@@ -147,6 +174,10 @@ def set_grad_sample_if_exists(maybe_expanded_weight, per_sample_grad_fn) -> None
 
 
 def unpack_expanded_weight_or_tensor(maybe_expanded_weight, func=lambda x: x):
+    # [FUNCTION DOC] Returns func applied to the original weight if given an ExpandedWeight, or
+    # to the tensor itself if it does not require grad. Raises RuntimeError for a tensor
+    # requiring grad (mixing with normal parameters is unsupported). Returns None for
+    # non-tensors.
     if isinstance(maybe_expanded_weight, ExpandedWeight):
         orig_weight = maybe_expanded_weight.orig_weight
         return func(orig_weight)
@@ -166,6 +197,8 @@ def sum_over_all_but_batch_and_last_n(
     tensor: torch.Tensor,
     n_dims: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Sums a tensor over every dimension except the first (batch) and the last
+    # n_dims, returning the input unchanged when no such middle dimensions exist.
     r"""
     Calculate the sum over all dimensions, except the first (batch dimension), and excluding the last n_dims.
 

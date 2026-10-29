@@ -1,3 +1,6 @@
+# [MODULE DOC] Functions that fold an eval-mode BatchNorm into a preceding convolution or linear
+# layer, either as modules (fuse_conv_bn_eval, fuse_linear_bn_eval) or on raw tensors
+# (fuse_conv_bn_weights, fuse_linear_bn_weights). Defines type variables for the module types.
 from __future__ import annotations
 
 import copy
@@ -22,6 +25,10 @@ def fuse_conv_bn_eval(
     bn: torch.nn.modules.batchnorm._BatchNorm,
     transpose: bool = False,
 ) -> ConvT:
+    # [FUNCTION DOC] Returns a deep copy of the convolution whose weight and bias absorb the
+    # BatchNorm statistics and affine parameters. Args: conv, bn, transpose (whether the conv is
+    # transposed). Raises AssertionError if either module is in training mode or running
+    # statistics are missing.
     r"""Fuse a convolutional module and a BatchNorm module into a single, new convolutional module.
 
     Args:
@@ -65,6 +72,13 @@ def fuse_conv_bn_weights(
     bn_b: torch.Tensor | None,
     transpose: bool = False,
 ) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    # [FUNCTION DOC] Computes fused conv weight and bias from conv weight/bias and BatchNorm
+    # running mean, variance, epsilon, weight and bias (missing ones default to zeros/ones). The
+    # weight is scaled per output channel (per input channel dimension when transpose is true)
+    # and the bias is shifted. Results keep the original dtypes and are returned as a pair of
+    # Parameters.
+    # KNOWN ISSUE: the fused bias requires_grad follows the conv bias, which is a fresh non-grad
+    # tensor when the conv had no bias, even if the weight requires grad.
     r"""Fuse convolutional module parameters and BatchNorm module parameters into new convolutional module parameters.
 
     Args:
@@ -112,6 +126,12 @@ def fuse_linear_bn_eval(
     linear: LinearT,
     bn: torch.nn.modules.batchnorm._BatchNorm,
 ) -> LinearT:
+    # [FUNCTION DOC] Returns a deep copy of the linear layer with the BatchNorm folded into its
+    # weight and bias. Raises AssertionError if either module is in training mode, if the
+    # BatchNorm feature count is neither the output feature count nor one, or if running
+    # statistics are missing.
+    # KNOWN ISSUE: passes the BatchNorm weight and bias directly, which fails for a non-affine
+    # BatchNorm (None values) although the weights function does not accept None.
     r"""Fuse a linear module and a BatchNorm module into a single, new linear module.
 
     Args:
@@ -168,6 +188,10 @@ def fuse_linear_bn_weights(
     bn_w: torch.Tensor,
     bn_b: torch.Tensor,
 ) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    # [FUNCTION DOC] Computes fused linear weight and bias: weight rows are scaled by the
+    # BatchNorm scale (weight over square root of variance plus epsilon) and the bias becomes
+    # the shifted, scaled bias. A missing linear bias is treated as zeros. Dtypes are preserved.
+    # Returns the pair of new Parameters (requires_grad copied from the inputs).
     r"""Fuse linear module parameters and BatchNorm module parameters into new linear module parameters.
 
     Args:

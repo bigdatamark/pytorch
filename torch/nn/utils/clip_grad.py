@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Gradient clipping utilities: computing the total norm of tensors
+# (_get_total_norm), scaling gradients by a precomputed norm (_clip_grads_with_norm_),
+# clip_grad_norm_ (norm clipping), deprecated clip_grad_norm, and clip_grad_value_ (elementwise
+# clamping). Functions run without autograd tracking and use foreach kernels when supported.
+# Exported names are in __all__.
 import functools
 import types
 import typing
@@ -31,12 +36,17 @@ _R = TypeVar("_R")
 
 
 def _no_grad(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] HELPER: Decorator that runs the wrapped function with gradient tracking
+    # disabled while preserving its metadata; written by hand to avoid a circular import with
+    # the no-grad decorator.
     """
     This wrapper is needed to avoid a circular import when using @torch.no_grad on the exposed functions
     clip_grad_norm_ and clip_grad_value_ themselves.
     """
 
     def _no_grad_wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the wrapped function inside a no-grad context and returns
+        # its result.
         with torch.no_grad():
             return func(*args, **kwargs)
 
@@ -52,6 +62,12 @@ def _get_total_norm(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Computes the p-norm of the whole collection of tensors as if concatenated.
+    # Args: tensors (one tensor or an iterable), norm_type, error_if_nonfinite, foreach (None
+    # means auto-select). Groups tensors by device and dtype, computes per-tensor norms (foreach
+    # kernel when allowed), moves them to the first tensor's device and combines them. Returns a
+    # scalar tensor (zero for an empty input). Raises RuntimeError if foreach is forced on an
+    # unsupported device or if error_if_nonfinite is set and the result is nan or inf.
     r"""Compute the norm of an iterable of tensors.
 
     The norm is computed over the norms of the individual tensors, as if the norms of
@@ -123,6 +139,10 @@ def _clip_grads_with_norm_(
     total_norm: torch.Tensor,
     foreach: bool | None = None,
 ) -> None:
+    # [FUNCTION DOC] Scales the existing gradients in place by a coefficient equal to max_norm
+    # divided by (total_norm plus a small epsilon), clamped to at most one so gradients are only
+    # reduced. Parameters without gradients are skipped; returns None. Raises RuntimeError if
+    # foreach is forced on an unsupported device. Mutates gradients.
     r"""Scale the gradients of an iterable of parameters given a pre-calculated total norm and desired max norm.
 
     The gradients will be scaled by the following calculation
@@ -189,6 +209,10 @@ def clip_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Clips the combined gradient norm of the parameters to max_norm: gathers
+    # gradients, computes the total norm and rescales gradients in place. Returns the total norm
+    # before clipping. Warns when given an empty generator; raises RuntimeError for a non-finite
+    # norm when error_if_nonfinite is set or for an invalid foreach request. Mutates gradients.
     r"""Clip the gradient norm of an iterable of parameters.
 
     The norm is computed over the norms of the individual gradients of all parameters,
@@ -244,6 +268,8 @@ def clip_grad_norm(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Deprecated alias that forwards all arguments to clip_grad_norm_ and returns
+    # its result (emits a FutureWarning via the deprecation decorator).
     r"""Clip the gradient norm of an iterable of parameters.
 
     .. warning::
@@ -259,6 +285,10 @@ def clip_grad_value_(
     clip_value: float,
     foreach: bool | None = None,
 ) -> None:
+    # [FUNCTION DOC] Clamps every gradient of the given parameters elementwise to the range from
+    # minus clip_value to clip_value, in place, using foreach kernels when supported. Returns
+    # None. Raises RuntimeError if foreach is forced on an unsupported device. Parameters
+    # without gradients are ignored.
     r"""Clip the gradients of an iterable of parameters at specified value.
 
     Gradients are modified in-place.

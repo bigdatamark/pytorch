@@ -1,3 +1,5 @@
+# [MODULE DOC] Per-sample-gradient autograd function for embedding on ExpandedWeight weights.
+# Registers EmbeddingPerSampleGrad as the handler for the embedding function at import time.
 from typing import Any
 
 import torch
@@ -13,11 +15,18 @@ from .expanded_weights_utils import (
 
 @implements_per_sample_grads(F.embedding)
 class EmbeddingPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for embedding whose weight is an ExpandedWeight. forward
+    # saves input, weight and embedding options on ctx; backward fills the per-sample gradient
+    # of the weight.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
         ctx: Any, kwarg_names: list[str], _: Any, *expanded_args_and_kwargs: Any
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Computes the embedding lookup. Args: kwarg_names, an unused op
+        # placeholder, then flattened arguments. Raises RuntimeError if the index input is
+        # one-dimensional (a batch is required). Saves input, weight, padding_idx,
+        # scale_grad_by_freq and sparse on ctx; returns the output.
         expanded_args, expanded_kwargs = standard_kwargs(
             kwarg_names, expanded_args_and_kwargs
         )
@@ -39,6 +48,10 @@ class EmbeddingPerSampleGrad(torch.autograd.Function):
     def backward(
         ctx: Any, grad_output: torch.Tensor
     ) -> tuple[torch.Tensor | None, ...]:
+        # [FUNCTION DOC] Returns a tuple of gradients: None for the kwarg names and op
+        # placeholders, the input gradient from the aten embedding backward when the input
+        # requires grad (else None), and None for the remaining arguments. Side effect: sets the
+        # per-sample gradient on the expanded weight.
         input, weight = ctx.input, ctx.weight
         padding_idx, scale_grad_by_freq, sparse = (
             ctx.padding_idx,
@@ -47,6 +60,9 @@ class EmbeddingPerSampleGrad(torch.autograd.Function):
         )
 
         def weight_per_sample_grad(weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds the per-sample gradient of a weight: for each batch
+            # element scatter-adds the output gradient rows into a zero tensor shaped (batch,
+            # weight shape) at the looked-up indices. Returns that tensor.
             batch_size = input.shape[0]
             embedding_dim = weight.shape[1]
             index = (

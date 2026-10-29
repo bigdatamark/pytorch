@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Deprecated alias package re-exporting reference quantized modules from
+# torch.ao.nn.quantized.reference.modules: Linear, Conv and ConvTranspose 1d/2d/3d, RNNCell,
+# LSTMCell, GRUCell, LSTM, Embedding and EmbeddingBag (see __all__).
 r"""Quantized Reference Modules.
 
 This module is in the process of migration to

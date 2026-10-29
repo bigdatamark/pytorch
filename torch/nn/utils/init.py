@@ -1,10 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Provides skip_init, which builds a module without running real parameter
+# initialization by constructing it on the meta device. Exported from torch.nn.utils.
 import inspect
 
 import torch
 
 
 def skip_init(module_cls, *args, **kwargs):
+    # [FUNCTION DOC] Instantiates module_cls with the given args on the meta device, then
+    # materializes uninitialized storage on the requested device (default cpu; the device
+    # keyword is removed from kwargs). Returns the module. Raises RuntimeError if the class is
+    # not a Module subclass or its constructor has no device parameter.
     r"""
     Given a module class object and args / kwargs, instantiate the module without initializing parameters / buffers.
 

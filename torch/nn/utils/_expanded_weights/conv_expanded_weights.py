@@ -1,3 +1,5 @@
+# [MODULE DOC] Per-sample-gradient autograd function for conv1d/conv2d/conv3d on ExpandedWeight
+# parameters. Registers ConvPerSampleGrad as the handler for the three functions at import time.
 from collections.abc import Callable
 from typing import Any, TypeVar
 from typing_extensions import ParamSpec
@@ -23,6 +25,10 @@ from .expanded_weights_utils import forward_helper
 @implements_per_sample_grads(F.conv2d)
 @implements_per_sample_grads(F.conv3d)
 class ConvPerSampleGrad(torch.autograd.Function):
+    # [CLASS DOC] Autograd function computing a convolution with ExpandedWeight weight/bias and
+    # storing per-sample gradients in the grad_sample field of the original weight. Registered
+    # for conv1d, conv2d and conv3d. forward saves conv settings on ctx; backward delegates to
+    # conv_backward.
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(
@@ -31,6 +37,13 @@ class ConvPerSampleGrad(torch.autograd.Function):
         conv_fn: Callable[_P, _R],
         *expanded_args_and_kwargs: Any,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Runs the convolution via forward_helper. Args: kwarg_names (names of
+        # trailing keyword values), conv_fn (the functional conv), then the flattened
+        # positional/keyword arguments. If padding is a string it is applied manually first and
+        # padding is then set to zero. Returns the output. Raises RuntimeError for unbatched
+        # input. Side effect: saves shapes, stride, padding, dilation, groups, input, weight and
+        # bias on ctx.
+        # KNOWN ISSUE: the two parts of the error message are joined without a separating space.
         expanded_args, expanded_kwargs = conv_args_and_kwargs(
             kwarg_names, expanded_args_and_kwargs
         )
@@ -79,4 +92,7 @@ class ConvPerSampleGrad(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
+    # [FUNCTION DOC] Computes gradients by calling conv_backward with the saved conv function,
+    # ctx and the first incoming gradient; returns the tuple of gradients (with None for
+    # non-differentiable args).
         return conv_backward(ctx.conv_fn, ctx, grad_outputs[0])

@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated compatibility shim; re-exports QAT Embedding and EmbeddingBag from
+# torch.ao.nn.qat.modules.embedding_ops. No behavior is defined here.
 r"""QAT Modules.
 
 This file is in the process of migration to `torch/ao/nn/qat`, and

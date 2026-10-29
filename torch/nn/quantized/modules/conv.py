@@ -1,4 +1,7 @@
 # flake8: noqa: F401
+# [MODULE DOC] Deprecated compatibility shim; re-exports quantized Conv and ConvTranspose
+# 1d/2d/3d (plus the private helper _reverse_repeat_padding, not in __all__) from
+# torch.ao.nn.quantized.modules.conv.
 r"""Quantized Modules.
 
 This file is in the process of migration to `torch/ao/nn/quantized`, and

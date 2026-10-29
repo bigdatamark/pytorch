@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Entry point for computing per-sample gradients with expanded weights:
+# call_for_per_sample_grads wraps a module so that its parameters are replaced by ExpandedWeight
+# tensors during a functional call. Kept outside the utils exports to avoid a circular
+# dependency.
 import functools
 
 import torch
@@ -15,6 +19,14 @@ def call_for_per_sample_grads(
     loss_reduction="sum",
     batch_first=True,
 ):
+    # [FUNCTION DOC] Validates arguments and returns a wrapper around the module's forward.
+    # Args: module (an nn.Module), batch_size (positive int or None to infer from inputs),
+    # loss_reduction (sum or mean), batch_first. Raises RuntimeError for invalid arguments or if
+    # any parameter already has a non-empty grad_sample. The wrapper, when called, computes the
+    # batch size if needed, wraps parameters requiring grad into ExpandedWeight and runs a
+    # functional call; backward then fills grad_sample on the parameters.
+    # KNOWN ISSUE: the docstring example passes the batch size positionally but it is
+    # keyword-only.
     r"""
     Return a forward function for a module, populating grad_sample with per sample gradients on backward invocation.
 
@@ -60,12 +72,17 @@ def call_for_per_sample_grads(
     """
 
     def maybe_build_expanded_weight(og_tensor, batch_size):
+        # [FUNCTION DOC] HELPER: Wraps a tensor in an ExpandedWeight if it requires grad, else
+        # returns it.
         if og_tensor.requires_grad:
             return ExpandedWeight(og_tensor, batch_size, loss_reduction)
         else:
             return og_tensor
 
     def compute_batch_size(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Infers the batch size from all tensors among the args and
+        # kwargs (first or second dimension depending on batch_first). Raises RuntimeError if
+        # sizes disagree or no tensor is found.
         args_and_kwargs = pytree.arg_tree_leaves(*args, **kwargs)
         batch_size = None
         for arg in args_and_kwargs:
@@ -113,6 +130,9 @@ def call_for_per_sample_grads(
 
     @functools.wraps(module.forward)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] Forward replacement: determines the batch size, builds the parameter
+        # mapping with expanded weights and returns the result of a functional call of the
+        # module with the given args.
         wrapper_batch_size = batch_size
         if wrapper_batch_size is None:
             wrapper_batch_size = compute_batch_size(*args, **kwargs)
