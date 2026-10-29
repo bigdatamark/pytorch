@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Unit tests for small distributed/FSDP utilities: _apply_to_tensors (recursive
+# tensor mapping over nested containers and dataclasses), _replace_by_prefix (state dict key
+# renaming) and the scaling behavior of _get_param_to_fqns. Import-time side effects: exits the
+# process with status 0 if torch.distributed is unavailable or dev-asan is on, picks list_device
+# (hpu, xpu or cuda), and instantiates device-type variants of TestUtils for cuda/hpu/xpu.
 
 import gc
 import random
@@ -45,6 +50,8 @@ else:
 
 
 class TestUtils(TestCase):
+    # [CLASS DOC] Single-process test case covering the helpers in torch.distributed.utils and
+    # the FSDP FQN lookup. Stateless; device variants come from instantiate_device_type_tests.
     @parametrize(
         "device_list",
         [
@@ -55,9 +62,16 @@ class TestUtils(TestCase):
     )
     @skip_if_lt_x_gpu(1)
     def test_apply_to_tensors(self, device_list):
+        # [FUNCTION DOC] Builds a mixed nested structure (sets, dicts, tuples, lists, frozen and
+        # non-frozen dataclasses, an ordered mapping) holding random tensors placed on devices
+        # from device_list, applies a counting function through _apply_to_tensors, and asserts
+        # the total element count visited equals the count created and that each top-level
+        # element keeps its container type.
         expected = 0
 
         def get_a_tensor():
+            # [FUNCTION DOC] HELPER: Returns a random tensor of a random shape on a random
+            # device from device_list and adds its element count to the enclosing expected total.
             """Return a random tensor on random device."""
             dev = random.choice(device_list)
             shape = random.choice(((1), (2, 3), (4, 5, 6), (7, 8, 9, 10)))
@@ -68,12 +82,16 @@ class TestUtils(TestCase):
 
         @dataclass
         class NonFrozenDataClass:
+            # [CLASS DOC] HELPER: Mutable dataclass fixture with a string, a float and a list of
+            # tensors, used to check tensors inside dataclasses are visited.
             some_key: str
             some_float: float
             some_tensor: list[torch.Tensor]
 
         @dataclass(frozen=True)
         class FrozenDataClass:
+            # [CLASS DOC] HELPER: Immutable (frozen) dataclass fixture with the same fields as
+            # the non-frozen one, to check frozen instances are rebuilt rather than mutated.
             some_key: str
             some_float: float
             some_tensor: list[torch.Tensor]
@@ -94,6 +112,8 @@ class TestUtils(TestCase):
         total = 0
 
         def fn(t):
+            # [FUNCTION DOC] HELPER: Adds the tensor's element count to the enclosing total and
+            # returns the tensor unchanged.
             nonlocal total
             total += t.numel()
             return t
@@ -105,6 +125,9 @@ class TestUtils(TestCase):
 
     @skip_if_lt_x_gpu(1)
     def test_replace_by_prefix(self):
+        # [FUNCTION DOC] Renames keys starting with a prefix in a state dict in place, checks
+        # only those keys change (a key containing the prefix mid-string is left alone), then
+        # reverses the rename and checks the original key set is restored. Compares key sets only.
         state_dict = {
             "layer.a": torch.tensor(1),
             "abc.layer.def": torch.tensor(2),
@@ -130,6 +153,9 @@ class TestUtils(TestCase):
 
     @skip_if_lt_x_gpu(1)
     def test_packed_sequence(self):
+        # [FUNCTION DOC] Runs an RNN on a packed padded sequence, zero-fills the packed output
+        # through _apply_to_tensors, unpacks it and asserts the sum is zero, showing the
+        # PackedSequence is traversed and its tensors modified.
         """Test to ensure RNN packed sequences are modified correctly."""
         rnn = nn.RNN(5, 5)
 
@@ -137,6 +163,7 @@ class TestUtils(TestCase):
         seq_length = torch.tensor([4], dtype=torch.int)
 
         def fill_fn(x):
+            # [FUNCTION DOC] HELPER: Fills the given tensor with zeros in place (returns None).
             x.fill_(0)
 
         x = nn.utils.rnn.pack_padded_sequence(x, seq_length)
@@ -146,6 +173,9 @@ class TestUtils(TestCase):
         self.assertEqual(torch.sum(x), 0)
 
     def test_get_param_to_fqns_scales_linearly(self):
+        # [FUNCTION DOC] Regression test timing _get_param_to_fqns on a small and an 8x larger
+        # MoE-style model (best CPU time of several runs, GC disabled and re-enabled afterward)
+        # and asserts the time ratio is below 25, which rules out quadratic scaling.
         """Regression test for https://github.com/pytorch/pytorch/issues/168329.
 
         _apply_to_modules had O(N_submodules * N_params) complexity when
@@ -159,17 +189,25 @@ class TestUtils(TestCase):
         """
 
         class Expert(nn.Module):
+            # [CLASS DOC] HELPER: Module fixture with two bias-free square Linear layers (up,
+            # down); has no forward and exists only to supply parameters.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the up and down Linear layers of size dim.
                 super().__init__()
                 self.up = nn.Linear(dim, dim, bias=False)
                 self.down = nn.Linear(dim, dim, bias=False)
 
         class MoELayer(nn.Module):
+            # [CLASS DOC] HELPER: Module fixture holding a ModuleList of Expert modules, to make
+            # many submodules and parameters.
             def __init__(self, dim, n_experts):
+                # [FUNCTION DOC] HELPER: Creates n_experts Expert modules of width dim.
                 super().__init__()
                 self.experts = nn.ModuleList([Expert(dim) for _ in range(n_experts)])
 
         def make_model(n_layers):
+            # [FUNCTION DOC] HELPER: Returns a Sequential of n_layers MoELayers, each with 128
+            # experts of width 16.
             return nn.Sequential(*[MoELayer(16, 128) for _ in range(n_layers)])
 
         num_iters = 5

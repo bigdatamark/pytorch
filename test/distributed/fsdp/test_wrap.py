@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for FSDP auto-wrapping: the auto_wrap_policy argument (size based,
+# transformer layer, module class, custom and "or" policies), the enable_wrap/wrap context API,
+# ignored modules, already-wrapped submodules, batch norm handling, and validation of mixed
+# frozen/non-frozen parameters (LoRA-style toy models). Defines toy models, an enum of wrap
+# methods, and three test classes: TestFSDPWrap (multi-process), TestAutoWrap (single process with
+# a dummy process group) and TestWrapUtils. Import-time: computes device_type and the default
+# backend, and instantiates the parametrized tests of TestFSDPWrap and TestAutoWrap.
 
 import functools
 import itertools
@@ -60,7 +67,10 @@ backend = torch.distributed.get_default_backend_for_device(device_type)
 
 
 class BatchNormNet(nn.Module):
+    # [CLASS DOC] HELPER: Fixture module with a bias-free Linear plus 1d, 2d, 3d and synchronized
+    # batch norm layers (all 10 features); has no forward, used to inspect wrapping.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the lin, bn1, bn2, bn3 and sync_bn submodules.
         super().__init__()
         self.lin = nn.Linear(10, 10, bias=False)
         self.bn1 = nn.BatchNorm1d(10)
@@ -70,9 +80,13 @@ class BatchNormNet(nn.Module):
 
 
 class LoraModel(nn.Module):
+    # [CLASS DOC] HELPER: Toy LoRA-style model: frozen embedding, four LoraDecoder layers and a
+    # frozen LayerNorm. Used to test mixed frozen/trainable parameter detection; no forward.
     """This is a toy LoRA decoder model."""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the embedding (100 by 32), four decoder layers and a
+        # layer norm, then sets requires_grad to False on the embedding and norm parameters.
         super().__init__()
         self.embed_tokens = nn.Embedding(100, 32)
         self.layers = nn.ModuleList([LoraDecoder() for _ in range(4)])
@@ -83,7 +97,10 @@ class LoraModel(nn.Module):
 
 
 class LoraDecoder(nn.Module):
+    # [CLASS DOC] HELPER: Toy decoder block with a LoraAttention, a LoraMLP and two layer norms
+    # whose parameters are frozen.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates attn, mlp and the two layer norms and freezes the norms.
         super().__init__()
         self.attn = LoraAttention()
         self.mlp = LoraMLP()
@@ -96,7 +113,11 @@ class LoraDecoder(nn.Module):
 
 
 class LoraAttention(nn.Module):
+    # [CLASS DOC] HELPER: Toy attention block mixing frozen projections (q, k, v, o) with
+    # trainable low-rank adapter layers lora_A and lora_B (rank 8).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the projections and adapters, then freezes the four
+        # projection weights, leaving lora_A and lora_B trainable.
         super().__init__()
         self.q_proj = nn.Linear(32, 32, bias=False)
         self.lora_A = nn.Linear(32, 8, bias=False)
@@ -111,7 +132,9 @@ class LoraAttention(nn.Module):
 
 
 class LoraMLP(nn.Module):
+    # [CLASS DOC] HELPER: Toy MLP with two frozen bias-free Linear layers (32 to 128 to 32).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates proj1 and proj2 and freezes both weights.
         super().__init__()
         self.proj1 = nn.Linear(32, 128, bias=False)
         self.proj2 = nn.Linear(128, 32, bias=False)
@@ -120,6 +143,8 @@ class LoraMLP(nn.Module):
 
 
 class WrapMethod(Enum):
+    # [CLASS DOC] HELPER: Enumeration of the two ways tests apply FSDP: the constructor with an
+    # auto wrap policy (FSDP_CTOR) or the enable_wrap context with wrap calls (WRAP_API).
     FSDP_CTOR = auto()
     # FSDP_CTOR is the supported way forward, but keep WRAP_API in case we miss
     # any use cases and fix them to work with FSDP_CTOR over time.
@@ -127,17 +152,25 @@ class WrapMethod(Enum):
 
 
 class TestFSDPWrap(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process (continuous) tests of passing auto_wrap_policy to the FSDP
+    # constructor. Provides the NestedSequentialModel helper class used by TestAutoWrap too, and
+    # helpers to build models that already contain FSDP submodules.
     """
     Tests main API for wrapping FSDP, which is to pass auto_wrap_policy into
     FSDP constructor.
     """
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Only calls the base class setUp; adds nothing.
         super().setUp()
 
     class NestedSequentialModel:
+        # [CLASS DOC] HELPER: Namespace of static helpers for a nested Sequential of four 5 by 5
+        # Linear layers (two plain, two inside an inner Sequential) and checkers for wrapping.
         @staticmethod
         def get_model(device=True):
+            # [FUNCTION DOC] HELPER: Builds the nested Sequential; moves it to device_type if
+            # the device flag is truthy, otherwise leaves it on CPU. Returns the model.
             sequential = nn.Sequential(
                 nn.Linear(5, 5),
                 nn.Linear(5, 5),
@@ -149,6 +182,8 @@ class TestFSDPWrap(FSDPTestContinuous):
 
         @staticmethod
         def verify_model_all_wrapped(cls, model):
+            # [FUNCTION DOC] HELPER: Asserts (via the test case passed as cls) that the root, all
+            # three direct children and both inner Linear layers are FSDP instances.
             cls.assertTrue(isinstance(model, FSDP))
             cls.assertTrue(isinstance(model.module[0], FSDP))
             cls.assertTrue(isinstance(model.module[1], FSDP))
@@ -158,6 +193,8 @@ class TestFSDPWrap(FSDPTestContinuous):
 
         @staticmethod
         def verify_model(cls, model):
+            # [FUNCTION DOC] HELPER: Asserts the root and the inner Sequential are FSDP while the
+            # first two Linear layers and the inner Linear layers are left unwrapped.
             cls.assertTrue(isinstance(model, FSDP))
             cls.assertTrue(isinstance(model.module[0], nn.Linear))
             cls.assertTrue(isinstance(model.module[1], nn.Linear))
@@ -167,15 +204,24 @@ class TestFSDPWrap(FSDPTestContinuous):
             cls.assertTrue(isinstance(model.module[2].module[1], nn.Linear))
 
     def _get_linear(self, fin, fout):
+        # [FUNCTION DOC] HELPER: Returns a bias-free Linear layer of the given sizes.
         return nn.Linear(fin, fout, bias=False)
 
     def _get_already_wrapped_fsdp(
         self, device_init_mode=DEVICEInitMode.DEVICE_BEFORE, nested=False
     ) -> FSDP:
+        # [FUNCTION DOC] HELPER: Returns a module (annotated as FSDP but actually a plain module)
+        # whose children lin1 to lin3 are each already FSDP-wrapped one-by-one Linear layers; with
+        # nested set, lin1 is a Sequential holding a plain Linear and an FSDP-wrapped Linear.
+        # Parameters are moved to the device at construction only for DEVICE_BEFORE.
         fn_self = self
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Chain of three Linear layers, each (or the nested one) wrapped
+            # in FSDP already.
             def __init__(self, nested):
+                # [FUNCTION DOC] HELPER: Builds lin1, lin2 and lin3 as described in the
+                # enclosing function, using the device init mode captured from it.
                 super().__init__()
                 # TODO: test the various init modes.
                 move_to_device = device_init_mode == DEVICEInitMode.DEVICE_BEFORE
@@ -200,6 +246,7 @@ class TestFSDPWrap(FSDPTestContinuous):
                 )
 
             def forward(self, input: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies lin1, lin2, lin3 in sequence and returns it.
                 return self.lin3(self.lin2(self.lin1(input)))
 
         model = MyModel(nested=nested)
@@ -211,6 +258,10 @@ class TestFSDPWrap(FSDPTestContinuous):
         "device_init_mode", [DEVICEInitMode.DEVICE_AFTER, DEVICEInitMode.DEVICE_BEFORE]
     )
     def test_error_already_wrapped(self, nested, device_init_mode):
+        # [FUNCTION DOC] Builds a model with FSDP-wrapped submodules (nested or not, device move
+        # before or after) and asserts that applying FSDP with an auto wrap policy raises a
+        # ValueError naming the first already-wrapped module (lin1.1 when nested, else lin1).
+        # Needs 2 GPUs.
         """
         Test that an error is raised if we attempt to wrap when submodules are
         already FSDP.
@@ -232,7 +283,11 @@ class TestFSDPWrap(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @parametrize("use_or_policy", [True, False])
     def test_wrap_batchnorm_individually(self, use_or_policy):
+        # [FUNCTION DOC] Applies FSDP with a policy that wraps batch norm modules individually
+        # (alone or combined via an or-policy with a never-wrap policy) and asserts the four batch
+        # norm layers become FSDP modules while the Linear layer stays unwrapped. Needs 2 GPUs.
         def never_wrap_policy(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrap-policy stub that ignores its arguments and returns False.
             return False
 
         wrap_batchnorm_individually = functools.partial(
@@ -258,6 +313,9 @@ class TestFSDPWrap(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_bn_always_wrapped_individually(self):
+        # [FUNCTION DOC] Checks that combining a policy that wraps a batch-norm container with the
+        # individual batch norm policy still wraps each inner batch norm layer separately, whereas
+        # the container-only policy leaves inner layers unwrapped. Needs 2 GPUs.
         """
         Ensures that by using _or_policy with _wrap_module_cls_individually, even
         if the other policy results in a module containing a BN unit being
@@ -265,11 +323,15 @@ class TestFSDPWrap(FSDPTestContinuous):
         """
 
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module with a single BatchNormNet child.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bn_container child.
                 super().__init__()
                 self.bn_container = BatchNormNet()
 
         def wrap_bn_container(module, recurse, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrap-policy callable; returns True when asked to recurse,
+            # otherwise True only for BatchNormNet instances.
             if recurse:
                 return True
             return isinstance(module, BatchNormNet)
@@ -332,6 +394,11 @@ class TestFSDPWrap(FSDPTestContinuous):
         forward_prefetch: bool,
         device_init_mode: DEVICEInitMode,
     ):
+        # [FUNCTION DOC] Wraps a small model of four Linear layers (one nested) with a size
+        # policy of zero (wrap everything) under each cpu offload, backward prefetch, forward
+        # prefetch and device init setting; checks every module in graph order is FSDP with the
+        # requested settings, then runs six SGD steps. Returns early for the unsupported
+        # combination of CPU offload with moving to the device after wrapping. Needs 2 GPUs.
         if (
             device_init_mode == DEVICEInitMode.DEVICE_AFTER
             and cpu_offload.offload_params
@@ -342,17 +409,23 @@ class TestFSDPWrap(FSDPTestContinuous):
         move_to_device = device_init_mode == DEVICEInitMode.DEVICE_BEFORE
 
         class Nested(nn.Module):
+            # [CLASS DOC] HELPER: Module holding one 1 by 1 Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates nested_lin, moved to the device if requested.
                 super().__init__()
                 self.nested_lin = _move_to_device(
                     nn.Linear(1, 1, bias=False), move_to_device
                 )
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies nested_lin to the input and returns the result.
                 return self.nested_lin(input)
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Three 1 by 1 Linear layers followed by a Nested module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates lin1 to lin3 and lin4, moved to the device if
+                # requested.
                 super().__init__()
                 self.lin1 = _move_to_device(nn.Linear(1, 1, bias=False), move_to_device)
                 self.lin2 = _move_to_device(nn.Linear(1, 1, bias=False), move_to_device)
@@ -360,6 +433,7 @@ class TestFSDPWrap(FSDPTestContinuous):
                 self.lin4 = Nested()
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies lin1, lin2, lin3, lin4 in order.
                 return self.lin4(self.lin3(self.lin2(self.lin1(input))))
 
         model = MyModel()
@@ -402,12 +476,18 @@ class TestFSDPWrap(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_zero_argument(self):
+        # [FUNCTION DOC] Wraps a module whose forward takes no arguments and returns a stored
+        # tensor, and asserts calling the wrapped module returns that tensor. Needs 1 GPU.
         class ZeroArguModel(nn.Module):
+            # [CLASS DOC] HELPER: Module with a plain tensor attribute and an argument-less
+            # forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores a one-element tensor holding 1.0 as attribute a.
                 super().__init__()
                 self.a = torch.tensor([1.0])
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the stored tensor a.
                 return self.a
 
         model = FSDP(ZeroArguModel())
@@ -415,7 +495,11 @@ class TestFSDPWrap(FSDPTestContinuous):
 
 
 class TestAutoWrap(TestCase):
+    # [CLASS DOC] Single-process tests of wrapping policies and the wrap context API, using a
+    # dummy process group of rank 0 and size 1 (self.process_group). Many tests are skipped
+    # unless at least 2 GPUs (or CUDA/XPU for some) are present.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Creates the fake process group (rank 0, size 1) used by the tests.
         super().setUp()
         # For all the tests here, we use a fake group
         self.process_group = DummyProcessGroup(rank=0, size=1)
@@ -423,6 +507,9 @@ class TestAutoWrap(TestCase):
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     @parametrize("wrap_method", [WrapMethod.FSDP_CTOR, WrapMethod.WRAP_API])
     def test_wrap(self, wrap_method):
+        # [FUNCTION DOC] Wraps a Linear layer either through the wrap context API or the FSDP
+        # constructor with a size policy of one parameter, and asserts the result is FSDP using the
+        # dummy group's rank and size.
         if wrap_method == WrapMethod.WRAP_API:
             with enable_wrap(wrapper_cls=FSDP, process_group=self.process_group):
                 layer = wrap(nn.Linear(5, 5))
@@ -442,10 +529,15 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_wrap_disabled_outside_context(self):
+        # [FUNCTION DOC] Checks that wrap is a no-op outside the enable_wrap context (the inner
+        # Linear stays unwrapped) and wraps only the outer model inside it.
         pg = self.process_group
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Module whose single child is created through wrap outside any
+            # wrap context.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates lin by calling wrap on a Linear layer.
                 super().__init__()
                 self.lin = wrap(nn.Linear(5, 5), process_group=pg)
 
@@ -459,6 +551,9 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_wrap_override_defaults(self):
+        # [FUNCTION DOC] Checks that keyword arguments given to wrap override the defaults from
+        # enable_wrap: the wrapped layer uses the explicitly passed process group (rank 0,
+        # size 2).
         new_process_group = DummyProcessGroup(rank=0, size=2)
         with enable_wrap(wrapper_cls=FSDP, process_group=self.process_group):
             layer = wrap(nn.Linear(5, 5), process_group=new_process_group)
@@ -469,6 +564,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "Test Requires CUDA or XPU")
     def test_always_wrap(self):
+        # [FUNCTION DOC] Applies FSDP with the always-wrap policy to a nested Sequential and
+        # asserts every submodule is wrapped. Needs CUDA or XPU.
         """
         Test to ensure that if `always_wrap_policy` is
         passed into FSDP, all submodules are wrapped.
@@ -481,6 +578,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_transformer_auto_wrap_policy(self):
+        # [FUNCTION DOC] Runs the shared transformer check with a transformer layer policy for
+        # encoder and decoder layer classes.
         """Tests the ``transformer_auto_wrap_policy``."""
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
@@ -490,6 +589,7 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_module_wrap_policy(self):
+        # [FUNCTION DOC] Runs the shared transformer check with a module class wrap policy.
         """Tests the ``ModuleWrapPolicy``."""
         auto_wrap_policy = ModuleWrapPolicy(
             {TransformerEncoderLayer, TransformerDecoderLayer}
@@ -498,6 +598,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_module_wrap_policy_callable(self):
+        # [FUNCTION DOC] Runs the shared transformer check with a module class wrap policy
+        # combined through the or-policy function, to check the policy works as a callable.
         """Tests the ``ModuleWrapPolicy`` as a ``Callable``."""
         auto_wrap_policy = ModuleWrapPolicy(
             {TransformerEncoderLayer, TransformerDecoderLayer}
@@ -506,6 +608,9 @@ class TestAutoWrap(TestCase):
         self._test_transformer_wrapping(callable_policy)
 
     def _test_transformer_wrapping(self, auto_wrap_policy: Callable | _Policy):
+        # [FUNCTION DOC] HELPER: Builds a transformer with shared parameters under recursive FSDP
+        # init using the given policy, and asserts only the root and the encoder and decoder
+        # layers are FSDP modules.
         fsdp_kwargs = {"auto_wrap_policy": auto_wrap_policy}
         fsdp_model = TransformerWithSharedParams.init(
             self.process_group,
@@ -528,6 +633,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_custom_policy(self):
+        # [FUNCTION DOC] Runs the custom policy check twice: with a function returning only
+        # booleans, and with one returning per-module keyword overrides.
         """
         Tests ``CustomPolicy`` with both a lambda function that uses uniform
         kwargs (so only returns ``False`` or ``True``) and a lambda function
@@ -538,6 +645,11 @@ class TestAutoWrap(TestCase):
             self._test_custom_policy(use_uniform_kwargs)
 
     def _test_custom_policy(self, use_uniform_kwargs: bool):
+        # [FUNCTION DOC] HELPER: Wraps a transformer using a custom policy (uniform booleans or
+        # per-module overrides: no shard for batch norm, shard-grad-op with post prefetch for
+        # decoder layers) with a size-2 dummy group and fp16 mixed precision; asserts per-module
+        # sharding strategy, backward prefetch and mixed precision, with batch norm forced to
+        # full precision and all other modules unwrapped. Prints the flag.
         print(f"use_uniform_kwargs={use_uniform_kwargs}")
         model = TransformerWithSharedParams.init(
             self.process_group,
@@ -549,6 +661,8 @@ class TestAutoWrap(TestCase):
         if use_uniform_kwargs:
 
             def lambda_fn(module: nn.Module):
+                # [FUNCTION DOC] HELPER: Policy returning True for the batch norm module and for
+                # transformer encoder or decoder layers, else False.
                 if module is model.bn:
                     return True
                 elif isinstance(
@@ -560,6 +674,9 @@ class TestAutoWrap(TestCase):
         else:
 
             def lambda_fn(module: nn.Module):
+                # [FUNCTION DOC] HELPER: Policy returning a no-shard override for batch norm,
+                # True for encoder layers, a shard-grad-op with post prefetch override for decoder
+                # layers, else False.
                 if module is model.bn:
                     return {"sharding_strategy": ShardingStrategy.NO_SHARD}
                 elif isinstance(module, TransformerEncoderLayer):
@@ -631,6 +748,9 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_auto_wrap_api(self):
+        # [FUNCTION DOC] Applies a size policy (minimum 40 parameters) to the nested Sequential
+        # and verifies the inner Sequential and root become FSDP while single Linear layers
+        # (30 parameters each) stay unwrapped.
         """
         Test to ensure with auto wrap, we wrap child modules correctly based on the min_num_params.
         ``nn.Linear(5, 5)`` does not exceed the bucket size, but combined they do.
@@ -649,6 +769,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_auto_wrap_preset_exclude_wrap(self):
+        # [FUNCTION DOC] Checks the size policy never wraps ModuleList children when the list
+        # itself is excluded: the root is FSDP and both Linear children stay plain.
         """
         Test to ensure excluded modules are not wrapped, regardless if the total param size is greater than the
         min_num_params. the size_based_auto_wrap_policy excludes wrapping for {nn.ModuleList, nn.ModuleDict}
@@ -670,6 +792,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_auto_wrap_preset_exclude_wrap_include_children(self):
+        # [FUNCTION DOC] Checks that an excluded ModuleList root is still wrapped as the root while
+        # its large enough Linear child (110 parameters) is wrapped.
         """
         Test to ensure excluded modules are not wrapped, but children are if param size is greater than
         min_num_params
@@ -689,6 +813,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_auto_wrap_preset_force_leaf(self):
+        # [FUNCTION DOC] Checks the size policy treats MultiheadAttention as a leaf: the large
+        # Linear is wrapped while the attention module and its output projection stay plain.
         """
         Test to ensure force-leaf modules are not wrapped, and children are not wrapped. The
         size_based_auto_wrap_policy forces leaf modules of type {nn.MultiheadAttention} to not be wrapped
@@ -709,6 +835,8 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_auto_wrap_preset_force_leaf_custom(self):
+        # [FUNCTION DOC] Adds Linear to the force-leaf set and checks no inner module is wrapped,
+        # so only the root becomes FSDP.
         """
         Test to ensure force-leaf modules are not wrapped.
         """
@@ -742,6 +870,12 @@ class TestAutoWrap(TestCase):
     )
     @parametrize("use_device_id", [True, False])
     def test_auto_wrap_smoke_test(self, device_init_mode, cpu_offload, use_device_id):
+        # [FUNCTION DOC] End-to-end smoke test on a single real process group: sets MASTER_ADDR and
+        # MASTER_PORT, initializes a one-rank group from a temporary file, wraps the nested
+        # Sequential with a size policy, verifies structure, runs forward and backward with an
+        # MSE loss (moving the model to the device afterward if requested), destroys the group
+        # and removes the file. Returns early for CPU offload with device move after wrapping.
+        # Needs CUDA or XPU.
         # CPU offload and CUDA after don't work together as expected.
         if (
             cpu_offload.offload_params
@@ -804,6 +938,9 @@ class TestAutoWrap(TestCase):
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     @parametrize("wrap_method", [WrapMethod.FSDP_CTOR, WrapMethod.WRAP_API])
     def test_always_wrap_with_ignored_modules(self, wrap_method: WrapMethod):
+        # [FUNCTION DOC] Wraps a nested Sequential with the always-wrap policy while ignoring two
+        # Linear layers (via constructor or wrap context); asserts the ignored ones stay plain and
+        # all others are FSDP.
         sequential = TestFSDPWrap.NestedSequentialModel.get_model(device=False)
         ignored_modules = [sequential[1], sequential[2][0]]
         fsdp_kwargs = {
@@ -829,6 +966,9 @@ class TestAutoWrap(TestCase):
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     @parametrize("wrap_method", [WrapMethod.FSDP_CTOR, WrapMethod.WRAP_API])
     def test_auto_wrap_with_ignored_modules(self, wrap_method: WrapMethod):
+        # [FUNCTION DOC] Same as the always-wrap variant but with a size policy of 40: because
+        # ignored parameters do not count, the remaining Linear layers flatten into the root and
+        # only the root is FSDP.
         sequential = TestFSDPWrap.NestedSequentialModel.get_model(device=False)
         ignored_modules = [sequential[1], sequential[2][0]]
         my_auto_wrap_policy = functools.partial(
@@ -861,6 +1001,9 @@ class TestAutoWrap(TestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "Requires at least 2 GPUs")
     def test_frozen_params(self):
+        # [FUNCTION DOC] Runs the frozen-parameter check over both settings of use_orig_params and
+        # three policies (module class, uniform custom, non-uniform custom with an override for
+        # the attention module).
         """
         Tests that mixing frozen/non-frozen parameters in an FSDP instance
         raises for ``use_orig_params=False`` and warns for ``True``.
@@ -869,9 +1012,13 @@ class TestAutoWrap(TestCase):
         module_wrap_policy = ModuleWrapPolicy(module_classes)
 
         def lambda_fn_uniform(module: nn.Module):
+            # [FUNCTION DOC] HELPER: Returns whether the module is an instance of one of the Lora
+            # attention, MLP or decoder classes.
             return isinstance(module, module_classes)
 
         def lambda_fn_nonuniform(module: nn.Module):
+            # [FUNCTION DOC] HELPER: Returns a shard-grad-op override for attention modules, True
+            # for the other Lora classes, else False.
             if isinstance(module, LoraAttention):
                 return {"sharding_strategy": ShardingStrategy.SHARD_GRAD_OP}
             elif isinstance(module, module_classes):
@@ -892,6 +1039,9 @@ class TestAutoWrap(TestCase):
             self._test_frozen_params(use_orig_params, policy)
 
     def _test_frozen_params(self, use_orig_params: bool, policy: _Policy):
+        # [FUNCTION DOC] HELPER: Wraps a LoRA model with the policy and expects a UserWarning
+        # recommending against wrapping mixed frozen/trainable modules when use_orig_params is
+        # true, or a ValueError for layers.0.attn when it is false.
         model = LoraModel().to(device=device_type)
         msg = "layers.0.attn has both parameters with requires_grad=True and False. "
         if use_orig_params:
@@ -910,12 +1060,21 @@ class TestAutoWrap(TestCase):
 
 
 class TestWrapUtils(TestCase):
+    # [CLASS DOC] Unit tests for the helper that validates frozen versus trainable parameters
+    # of modules chosen for wrapping.
     def test_validate_frozen_params(self):
+        # [FUNCTION DOC] Runs the validation check for both settings of use_orig_params.
         """Tests the method ``_validate_frozen_params()``."""
         for use_orig_params in [True, False]:
             self._test_validate_frozen_params(use_orig_params)
 
     def _test_validate_frozen_params(self, use_orig_params: bool):
+        # [FUNCTION DOC] HELPER: Calls _validate_frozen_params on a LoRA model with growing sets
+        # of modules to wrap (adapters, then attention, then decoders), expecting no message; then
+        # removes the lora_A modules to create a mixed attention module and expects a warning
+        # (use_orig_params true, with gradient numel counts) or a ValueError, matching the full
+        # message listing trainable and frozen parameter names; finally ignores the lora_A
+        # parameters and expects silence.
         model = LoraModel()
         # Wrap only LoRA modules
         modules_to_wrap = {

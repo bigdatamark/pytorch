@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests that FSDP with hybrid sharding on a 2D device mesh produces
+# DTensor-based sharded state dicts and optimizer state dicts (placements replicate then shard on
+# dim 0), that these match the ShardedTensor results of the process-group based setup, and that
+# saved checkpoints round-trip. Contains a small dense model and one DTensor test class; device
+# variants for cuda, hpu and xpu are generated at import time. device_type comes from
+# get_devtype.
 
 import io
 from copy import deepcopy
@@ -32,7 +38,11 @@ device_type = torch.device(get_devtype())
 # Simple and boring model to test interface and some corner cases that do not
 # require complicated wrapping strategy.
 class DenseModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Four-stage feed-forward model (Linear plus ReLU stages) mapping 8
+    # features to 8 outputs through widths 16, 32 and 64; weights are seeded deterministically.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the RNG with 0 and builds the four Sequential stages net1
+        # to net4 (the last one is ReLU then Linear 64 to 8).
         super().__init__()
         torch.manual_seed(0)
         self.net1 = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
@@ -41,15 +51,24 @@ class DenseModel(torch.nn.Module):
         self.net4 = nn.Sequential(nn.ReLU(), nn.Linear(64, 8))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1 through net4 in order to x and returns the result.
         return self.net4(self.net3(self.net2(self.net1(x))))
 
     def get_input(self, device):
+        # [FUNCTION DOC] HELPER: Returns a random 4 by 8 input tensor on the given device.
         return torch.rand(4, 8, device=device)
 
 
 # TODO: Consolidate DeviceMesh based FSDP and HSDP test cases.
 class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
+    # [CLASS DOC] Continuous multi-process test case comparing FSDP HYBRID_SHARD state dicts
+    # built from a 2D DeviceMesh (DTensor values) against the process-group variant
+    # (ShardedTensor values), plus save/load round trips. Uses a (2, world_size/2) mesh.
     def _create_model(self, device, device_mesh=None):
+        # [FUNCTION DOC] HELPER: Wraps a DenseModel in FSDP with hybrid sharding, using the given
+        # device mesh if provided, otherwise a freshly built 2D mesh and its intra/inter-node
+        # process groups. Then trains one step with Adam (learning rate 0.1) on a random input.
+        # Returns the (model, optimizer) pair. The device argument is unused; device_type is used.
         device_id = device_type
         if device_mesh:
             model = FSDP(
@@ -76,6 +95,10 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_hsdp_init_with_device_mesh(self, device):
+        # [FUNCTION DOC] Builds an HSDP model from a 2D mesh and takes sharded model and
+        # optimizer state dicts; asserts every model value and every non-step optimizer value is
+        # a DTensor on that mesh with placements replicate then shard dim 0, and that the
+        # state dict configs have their DTensor flag set automatically. Needs 4 GPUs.
         device_id = device_type
         mesh_2d = init_device_mesh(self.device_type, (2, self.world_size // 2))
         model, optim = self._create_model(device_id, mesh_2d)
@@ -111,6 +134,10 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("offload_to_cpu", [True, False])
     def test_dtensor_sharded_tensor_state_dict_identical(self, device, offload_to_cpu):
+        # [FUNCTION DOC] Compares sharded state dicts of a mesh-based model (DTensor) and a
+        # process-group model (ShardedTensor), with and without CPU offload: same keys in the same
+        # order, equal local tensors on the same device, and for optimizer state the same names
+        # and values, with the step entry compared directly. Needs 4 GPUs.
         device_id = device_type
         mesh_2d = init_device_mesh(self.device_type, (2, self.world_size // 2))
 
@@ -181,6 +208,10 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("offload_to_cpu", [True, False])
     def test_dtensor_sharded_optim_load_state_dict(self, device, offload_to_cpu):
+        # [FUNCTION DOC] Saves a sharded optimizer state dict to an in-memory buffer and a deep
+        # copy, trains another step, reloads the saved dict through optim_state_dict_to_load, and
+        # asserts the new state matches the copy (same FQNs, keys and DTensor values). Needs 4
+        # GPUs.
         device_id = device_type
         mesh_2d = init_device_mesh(self.device_type, (2, self.world_size // 2))
         model, optim = self._create_model(device_id, mesh_2d)
@@ -236,6 +267,9 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("offload_to_cpu", [True, False])
     def test_dtensor_sharded_model_load_state_dict(self, device, offload_to_cpu):
+        # [FUNCTION DOC] Saves a sharded model state dict to a buffer and a deep copy, trains
+        # another step, loads the saved dict back, and asserts keys and DTensor values match the
+        # copy. Needs 4 GPUs.
         device_id = device_type
         mesh_2d = init_device_mesh(self.device_type, (2, self.world_size // 2))
         model, optim = self._create_model(device_id, mesh_2d)
@@ -274,10 +308,19 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_root_module_is_not_FSDP(self, device):
+        # [FUNCTION DOC] Uses a root module that is not FSDP, containing an HSDP-wrapped dense
+        # submodule and a rank-dependent non-FSDP sparse submodule; trains one Adam step and
+        # converts the optimizer state dict in sharded mode. Asserts the dense parameters' Adam
+        # moments become DTensors with replicate then shard placements, while others stay plain
+        # tensors. Needs 4 GPUs.
         device_id = device_type
 
         class FakeMPModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model-parallel-like fixture; an FSDP dense part plus a small
+            # sparse part that exists only on rank 0 (sparse0) or on other ranks (sparse1).
             def __init__(self, device_mesh):
+                # [FUNCTION DOC] HELPER: Seeds the RNG, wraps a DenseModel in hybrid-shard FSDP
+                # using the mesh, and creates a rank-specific sparse Linear plus ReLU block.
                 super().__init__()
                 torch.manual_seed(0)
                 self.dense = FSDP(
@@ -292,6 +335,8 @@ class TestHSDPWithDeviceMeshAndDTensor(DTensorContinuousTestBase):
                     self.sparse1 = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs this rank's sparse block, all-reduces its output
+                # across the default group, then feeds it to the dense FSDP module and returns it.
                 if dist.get_rank() == 0:
                     sparse = self.sparse0(x)
                 else:

@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests of FSDP with use_orig_params=True. Covers: parity with DDP when
+# parameter groups have different hyperparameters or trainability, multiple optimizers,
+# torch.compile of an FSDP model, parity with use_orig_params=False under unshard/reshard flows, access to the
+# sharded original parameters between forward and backward, writeback of user changes to
+# parameters and gradients, named_parameters FQNs, no_sync behavior, non-uniform requires_grad
+# initialization, and a multi-tensor-apply regression for zero-sized tensors. Import-time:
+# exits the process with status 0 if distributed is unavailable or dev-asan is on; computes
+# device_type and instantiates parametrized tests for five of the test classes.
 
 import copy
 import functools
@@ -62,13 +70,21 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
+    # [CLASS DOC] Two-rank tests comparing FSDP (use_orig_params=True) against DDP on a shared
+    # parameter transformer when the optimizer has several parameter groups (weights, biases,
+    # other) with different hyperparameters, frozen biases, or several optimizers. Holds helpers
+    # that build the DDP and FSDP models, optimizers and compare training and parameters.
     """Tests multiple parameter groups."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks to spawn: always 2.
         return 2
 
     def _get_param_groups(self, model: nn.Module) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Splits the model's named parameters into three optimizer groups:
+        # names containing weight (decay 0.1, lr 0.01), names containing bias (decay 0.01, lr
+        # 0.001), and everything else (default options). Returns the list of group dictionaries.
         """
         Constructs separate parameter groups for weights, biases, and other
         parameters.
@@ -93,6 +109,11 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         optim_class: type[torch.optim.Optimizer],
         multi_tensor: bool,
     ) -> torch.optim.Optimizer:
+        # [FUNCTION DOC] HELPER: Builds an optimizer of the given class over the three parameter
+        # groups from _get_param_groups, with default learning rate 0.005 and the foreach flag
+        # set from multi_tensor.
+        # KNOWN ISSUE: the docstring says it constructs an Adam optimizer, but the class is
+        # a parameter.
         """
         Constructs an Adam optimizer with three parameter groups, one for
         weights, one for biases, and one for everything else, each with
@@ -102,6 +123,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         return optim_class(param_groups, lr=5e-3, foreach=multi_tensor)
 
     def _get_ddp_transformer(self, find_unused_params: bool) -> DDP:
+        # [FUNCTION DOC] HELPER: Builds a deterministic transformer with shared parameters on the
+        # device (no FSDP) and wraps it in DDP for this rank, passing find_unused_params through.
         """Returns a transformer with shared parameters wrapped with DDP."""
         model = TransformerWithSharedParams.init(
             self.process_group,
@@ -126,6 +149,11 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         backward_prefetch: BackwardPrefetch | None,
         cpu_offload: CPUOffload,
     ) -> tuple[FSDP, torch.optim.Optimizer]:
+        # [FUNCTION DOC] HELPER: Builds a deterministic shared-parameter transformer wrapped with
+        # FSDP (use_orig_params, encoder and decoder layers wrapped separately) using the given
+        # sharding strategy, prefetch and CPU offload, plus an optimizer made either before or
+        # after wrapping per init_optim_before_wrap. Moves the model to the device afterward for
+        # DEVICE_AFTER unless parameters are offloaded. Returns the (FSDP model, optimizer) pair.
         """
         Returns a transformer with shared parameters wrapped with FSDP and a
         corresponding optimizer.
@@ -173,6 +201,11 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         set_to_none: bool,
         num_iters: int = 10,
     ):
+        # [FUNCTION DOC] HELPER: Trains the DDP and FSDP models in lockstep for num_iters steps,
+        # alternating whether gradients are zeroed before the forward or before the backward
+        # (with set_to_none passed through). Asserts the two losses are close every iteration
+        # (moving the DDP model to CPU for its optimizer step when FSDP offloads parameters), then
+        # compares final parameters.
         """Checks training parity between DDP and FSDP."""
         device = torch.device(device_type)
         for i in range(num_iters):
@@ -200,6 +233,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         self._check_ddp_fsdp_param_parity(ddp_model, fsdp_model)
 
     def _check_ddp_fsdp_param_parity(self, ddp_model: DDP, fsdp_model: FSDP):
+        # [FUNCTION DOC] HELPER: Gathers the full FSDP parameters and asserts each matches the
+        # corresponding DDP parameter in name (after stripping FSDP wrapper prefixes) and value.
         with FSDP.summon_full_params(fsdp_model):
             for (n1, p1), (n2, p2) in zip(
                 ddp_model.module.named_parameters(), fsdp_model.named_parameters()
@@ -211,6 +246,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
     def _get_sharding_strategy_from_str(
         self, sharding_strategy_str: str
     ) -> ShardingStrategy:
+        # [FUNCTION DOC] HELPER: Maps the string no_shard, shard_grad_op or full_shard to the
+        # matching ShardingStrategy member; raises ValueError for any other string.
         if sharding_strategy_str == "no_shard":
             sharding_strategy = ShardingStrategy.NO_SHARD
         elif sharding_strategy_str == "shard_grad_op":
@@ -224,6 +261,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_fsdp_compile(self):
+        # [FUNCTION DOC] Runs the compile check as subtests over three sharding strategies and
+        # with fsdp guards skipped or not. Needs a GPU with Inductor support and 2 GPUs.
         self.run_subtests(
             {
                 "sharding_strategy": [
@@ -239,6 +278,11 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
     def _test_fsdp_compile(
         self, sharding_strategy: ShardingStrategy, skip_fsdp_guards: bool
     ):
+        # [FUNCTION DOC] HELPER: Sets the dynamo option for skipping FSDP guards, wraps copies of
+        # one transformer in FSDP, compiles one of them, and trains both for 10 Adam steps on
+        # identical inputs asserting equal losses.
+        # KNOWN ISSUE: assigns the global dynamo config option without restoring it afterward,
+        # leaking the setting into later tests in the process.
         torch._dynamo.config.skip_fsdp_guards = skip_fsdp_guards
         fsdp_kwargs = {
             "auto_wrap_policy": ModuleWrapPolicy(
@@ -280,6 +324,9 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         ["no_shard", "shard_grad_op", "full_shard"],
     )
     def test_diff_hyperparams(self, sharding_strategy_str: str):
+        # [FUNCTION DOC] Runs the hyperparameter parity check as subtests over device init mode,
+        # optimizer creation order, foreach, zero_grad mode, backward prefetch and writeback
+        # check skipping, without CPU offload, for the given sharding strategy name.
         """
         Tests FSDP parity with DDP when using multiple parameter groups with
         different hyperparameter settings.
@@ -313,6 +360,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         ["no_shard", "shard_grad_op", "full_shard"],
     )
     def test_diff_hyperparams_cpu_offload(self, sharding_strategy_str: str):
+        # [FUNCTION DOC] Runs the hyperparameter parity check with parameter CPU offload for both
+        # settings of the writeback check skip, in a plain loop rather than subtests.
         """
         Tests FSDP parity with DDP when using multiple parameter groups with
         different hyperparameter settings with CPU offloading enabled. This is
@@ -346,6 +395,13 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         sharding_strategy: ShardingStrategy,
         skip_writeback_check: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds DDP and FSDP versions of the transformer with the
+        # three-group optimizer and checks training parity. Returns without testing when the model
+        # is moved to the device after wrapping with parameter CPU offload. When
+        # skip_writeback_check is set, sets the process environment flag that disables the
+        # FSDP writeback check.
+        # KNOWN ISSUE: the environment flag is set and never cleared, so it persists for the rest
+        # of the process.
         """
         Args:
             init_optim_before_wrap (bool): If ``True``, initializes the
@@ -378,6 +434,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_diff_trainability(self):
+        # [FUNCTION DOC] Runs the trainability parity check as subtests over foreach and three
+        # sharding strategies.
         """
         Tests FSDP parity with DDP when using multiple parameter groups and
         freezing the parameters in one parameter group.
@@ -399,6 +457,9 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         multi_tensor: bool,
         sharding_strategy: ShardingStrategy,
     ):
+        # [FUNCTION DOC] HELPER: Builds DDP (with unused-parameter detection) and FSDP models, sets
+        # requires_grad to False on every bias in both, and checks training parity with
+        # gradients set to zero rather than None.
         optim_class = torch.optim.Adam
         ddp_model = self._get_ddp_transformer(find_unused_params=True)
         ddp_optim = self._get_optim(ddp_model, optim_class, multi_tensor)
@@ -422,6 +483,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_multiple_optimizers(self):
+        # [FUNCTION DOC] Runs the multiple-optimizer check as subtests over full shard and
+        # shard-grad-op strategies.
         """
         Tests using two optimizers where only one sets gradients to ``None``.
         """
@@ -436,6 +499,14 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
         )
 
     def _test_multiple_optimizers(self, sharding_strategy: ShardingStrategy):
+        # [FUNCTION DOC] HELPER: Uses one optimizer (Adam, AdamW) per weight and bias group on both
+        # DDP and FSDP models. After one step, zeroes only the weight optimizer's gradients to None
+        # and runs a forward, then (for strategies that reshard after forward) checks gradients are
+        # None for weights and present for biases with matching values, and that parameters match.
+        # Finishes the iteration and runs one more to confirm step-dependent bias correction
+        # agrees.
+        # Raises AssertionError if the group count is not 3 or if no rank-local flat parameter
+        # holds both a weight and a bias.
         ddp_model = self._get_ddp_transformer(find_unused_params=True)
         ddp_param_groups = self._get_param_groups(ddp_model)
         if not (len(ddp_param_groups) == 3):
@@ -507,6 +578,9 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
 
         # Run one iteration to generate gradients
         def run_iter():
+            # [FUNCTION DOC] HELPER: One training iteration of the DDP and FSDP models with the
+            # per-group optimizers: forward, loss, backward and step; asserts equal losses and
+            # matching parameters.
             iter_losses = []
             for model, optims in ((ddp_model, ddp_optims), (fsdp_model, fsdp_optims)):
                 module = model.module
@@ -567,10 +641,14 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
 
 
 class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
+    # [CLASS DOC] Two-rank tests that FSDP with use_orig_params=True matches use_orig_params=False
+    # (same model, deterministic init) across unshard and reshard sequences such as several
+    # forwards before a backward, or a summon of full parameters between forwards.
     """Tests the unshard/reshard flow."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks to spawn: always 2.
         return 2
 
     def _get_fsdp_models_and_optims(
@@ -578,6 +656,10 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
         sharding_strategy: ShardingStrategy,
         cpu_offload: CPUOffload,
     ) -> tuple[FSDP, torch.optim.Optimizer, FSDP, torch.optim.Optimizer]:
+        # [FUNCTION DOC] HELPER: Builds two identical recursively wrapped transformers with the
+        # given sharding strategy and CPU offload, one with use_orig_params False and one True,
+        # each with its own Adam optimizer (learning rate 0.01, foreach off). Returns the model
+        # and optimizer for False, then for True.
         """
         Returns a pair of (FSDP model, optimizer) for ``use_orig_params=False``
         and ``True``, respectively.
@@ -610,6 +692,8 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
         return fsdp_model, optim, fsdp_model_orig_params, optim_orig_params
 
     def _check_fsdp_parameter_parity(self, fsdp1: FSDP, fsdp2: FSDP) -> None:
+        # [FUNCTION DOC] HELPER: Summons the full parameters of both FSDP models and asserts names
+        # are equal and values are close, pairwise.
         """Checks that two FSDP instances have the same model parameters."""
         with FSDP.summon_full_params(fsdp1), FSDP.summon_full_params(fsdp2):
             for (n1, p1), (n2, p2) in zip(
@@ -620,6 +704,8 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
                 torch.testing.assert_close(p1, p2)
 
     def _get_fsdp_parity_subtest_config(self):
+        # [FUNCTION DOC] HELPER: Returns the subtest mapping that sweeps the three sharding
+        # strategies (no shard, shard-grad-op, full shard).
         return {
             "sharding_strategy": [
                 ShardingStrategy.NO_SHARD,
@@ -631,6 +717,8 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("offload_params", [False, True])
     def test_multiple_forward(self, offload_params: bool):
+        # [FUNCTION DOC] Runs the multiple-forward parity check as subtests over the sharding
+        # strategies, with or without parameter CPU offload.
         """
         Tests that ``use_orig_params=True`` has parity with ``False`` when
         running multiple forward passes before a backward pass.
@@ -648,6 +736,10 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
         sharding_strategy: ShardingStrategy,
         cpu_offload: CPUOffload,
     ):
+        # [FUNCTION DOC] HELPER: For 3 iterations, runs two forwards (different inputs) per model
+        # before one backward and optimizer step on both the False and True models; asserts both
+        # forward losses and the total loss are equal, then compares final parameters.
+        # KNOWN ISSUE: this helper carries a GPU-count skip decorator even though it is not a test.
         (
             fsdp_model,
             optim,
@@ -689,6 +781,8 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("offload_params", [False, True])
     def test_summon_between_two_forwards(self, offload_params: bool):
+        # [FUNCTION DOC] Runs the summon-between-forwards parity check as subtests over the
+        # sharding strategies, with or without parameter CPU offload.
         """
         Tests that ``use_orig_params=True`` has parity with ``False`` when
         running a forward pass, :meth:`summon_full_params()`, and another
@@ -706,6 +800,9 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
         sharding_strategy: ShardingStrategy,
         cpu_offload: CPUOffload,
     ):
+        # [FUNCTION DOC] HELPER: For 3 iterations, runs a forward, a parameter parity check (which
+        # summons full parameters), a second forward, then backward and step on both models;
+        # asserts the forward losses match each time and final parameters match.
         (
             fsdp_model,
             optim,
@@ -740,16 +837,23 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
 
 
 class TestFSDPUseOrigParamsParamAccess(FSDPTest):
+    # [CLASS DOC] Two-rank tests that with use_orig_params=True the original (sharded, flattened)
+    # parameters can be read after forward and before backward, matching the expected slice of the
+    # DDP parameters under each sharding strategy.
     """Tests original parameter access."""
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the number of ranks to spawn: always 2 (the tests hard-code the
+        # expected shard layout).
         # Force a world size of 2 since the tests hard code to the FSDP
         # sharding strategy to check sharded parameter parity
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_access_params_after_forward(self):
+        # [FUNCTION DOC] Runs the parameter access check as subtests over the three sharding
+        # strategies.
         """
         Tests that accessing the original parameters after the forward but
         before the backward. Notably, this is not supported when
@@ -771,11 +875,18 @@ class TestFSDPUseOrigParamsParamAccess(FSDPTest):
         self,
         sharding_strategy: ShardingStrategy,
     ):
+        # [FUNCTION DOC] HELPER: Compares DDP parameters with the FSDP original parameters after a
+        # forward, after backward and step, and after another forward, using a toy two-layer model
+        # whose shard layout over 2 ranks is hard-coded. Depends on the current FSDP sharding
+        # algorithm.
         # NOTE: This test needs to be changed if the FSDP sharding algorithm
         # changes. It is still valuable until such a change to sanity check the
         # `use_orig_params=True` implementation.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Toy model of a bias-free 5 by 5 Linear, ReLU and a 5 by 7 Linear
+            # with bias; supplies the input and loss helpers the tests call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and creates lin1 and lin2.
                 super().__init__()
                 torch.manual_seed(42)
                 # 5 * 5 = 25 numel -> pad to 26 -> 13 on each rank
@@ -787,20 +898,29 @@ class TestFSDPUseOrigParamsParamAccess(FSDPTest):
                 self.lin2 = nn.Linear(5, 7)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies lin1, ReLU and lin2 and returns the result.
                 z = self.lin1(x)
                 z = nn.functional.relu(z)
                 z = self.lin2(z)
                 return z
 
             def get_input(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+                # [FUNCTION DOC] HELPER: Returns a one-element tuple with a random 2 by 5 tensor
+                # on the device.
                 return (torch.randn((2, 5)).to(device),)
 
             def get_loss(self, inp, out):
+                # [FUNCTION DOC] HELPER: Returns the sum of the model output as the loss.
                 return out.sum()
 
         def check_parameter_parity(
             ddp_model: DDP, fsdp_model: FSDP, between_fwd_and_bwd: bool
         ):
+            # [FUNCTION DOC] HELPER: Compares each DDP parameter with the FSDP one by name. For
+            # sharded strategies it slices the DDP value to this rank's expected piece (first or
+            # second part of lin1.weight, lin2.weight, or empty/full bias) and asserts closeness;
+            # unflattened (no shard) and no-reshard-between-forward-and-backward cases are skipped.
+            # Raises AssertionError if the rank is not 0 or 1.
             if self.rank not in (0, 1):
                 raise AssertionError(
                     f"Expects world size of 2 but got {self.world_size}"
@@ -871,34 +991,48 @@ class TestFSDPUseOrigParamsParamAccess(FSDPTest):
 
 
 class TestFSDPUseOrigParamsWriteback(FSDPTest):
+    # [CLASS DOC] Two-rank tests that user modifications of original parameters and gradients
+    # (by data or by replacing the variable) are written back into FSDP's flat storage, that shape
+    # mismatches raise, and that changing parameters between forward and backward is rejected for
+    # strategies that skip resharding. Contains the Model fixture class.
     """Tests parameter and gradient writeback."""
 
     class Model(nn.Module):
+        # [CLASS DOC] HELPER: Toy model of two Linear layers with bias (5 to 5, 5 to 7) with a
+        # ReLU in between, built directly on the given device.
         def __init__(self, device: torch.device):
+            # [FUNCTION DOC] HELPER: Seeds the RNG with 42 and creates lin1 and lin2 on device.
             super().__init__()
             torch.manual_seed(42)
             self.lin1 = nn.Linear(5, 5, bias=True, device=device)
             self.lin2 = nn.Linear(5, 7, bias=True, device=device)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Applies lin1, ReLU and lin2 and returns the result.
             z = self.lin1(x)
             z = nn.functional.relu(z)
             z = self.lin2(z)
             return z
 
         def get_input(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+            # [FUNCTION DOC] HELPER: Returns a one-element tuple with a random 2 by 5 tensor on
+            # the device.
             return (torch.randn((2, 5)).to(device),)
 
         def get_loss(self, inp, out):
+            # [FUNCTION DOC] HELPER: Returns the sum of the model output as the loss.
             return out.sum()
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the number of ranks to spawn: always 2.
         # Force a world size of 2 since the tests hard code to the FSDP
         # sharding strategy
         return 2
 
     def _check_param_parity(self, ddp_model: DDP, fsdp_model: FSDP):
+        # [FUNCTION DOC] HELPER: Summons the full FSDP parameters (which triggers a writeback of
+        # user changes) and asserts names are equal and values are close to the DDP parameters.
         with FSDP.summon_full_params(fsdp_model):
             for (n1, p1), (n2, p2) in zip(
                 ddp_model.module.named_parameters(),
@@ -909,6 +1043,8 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_param_writeback(self):
+        # [FUNCTION DOC] Runs the parameter writeback check as subtests over changing the first or
+        # second weight, by setting its data or replacing the parameter.
         """Tests that changes to the original parameters are written back."""
         self.run_subtests(
             {
@@ -919,7 +1055,10 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
         )
 
     def _test_param_writeback(self, change_first_weight: bool, change_data: bool):
+        # [FUNCTION DOC] HELPER: Replaces one weight (data or variable) with a tensor of 2s in both
+        # DDP and FSDP models, then checks parameter parity, which triggers FSDP writeback.
         def transform_param(param: nn.Parameter) -> nn.Parameter:
+            # [FUNCTION DOC] HELPER: Returns a new parameter filled with 2s shaped like param.
             return nn.Parameter(torch.ones_like(param) * 2)
 
         # Check that the writeback propagates
@@ -951,6 +1090,8 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_grad_writeback(self):
+        # [FUNCTION DOC] Runs the gradient writeback check as subtests over which weight's gradient
+        # is changed, data versus variable replacement, and set to None versus a tensor.
         """
         Tests that changes to the original parameters' gradients are written
         back.
@@ -970,10 +1111,16 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
         change_data: bool,
         set_to_none: bool,
     ):
+        # [FUNCTION DOC] HELPER: After one backward, replaces a weight gradient (to 2s or None) in
+        # DDP and FSDP models, steps Adam to surface whether the change was written back, checks
+        # parameter parity, then runs another iteration without zeroing gradients and checks again.
+        # Returns immediately for the ill-defined combination of data change with None.
         if change_data and set_to_none:
             return  # not well-defined
 
         def transform_grad(param: nn.Parameter) -> nn.Parameter:
+            # [FUNCTION DOC] HELPER: Returns None if set_to_none else a gradient of 2s shaped like
+            # param.
             return None if set_to_none else torch.ones_like(param) * 2
 
         ddp_model = DDP(
@@ -1033,6 +1180,9 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_writeback_shape_mismatch(self):
+        # [FUNCTION DOC] On rank 0 replaces lin1.weight and its gradient, and on rank 1 lin2.weight
+        # and its gradient, with tensors one larger in every dimension, and asserts that summoning
+        # full parameters raises a RuntimeError containing the text Cannot writeback.
         fsdp_model = FSDP(
             TestFSDPUseOrigParamsWriteback.Model(torch.device(device_type)),
             use_orig_params=True,
@@ -1075,6 +1225,10 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_writeback_between_fwd_and_bwd_for_no_reshard_raises(self):
+        # [FUNCTION DOC] With the shard-grad-op strategy (no reshard after forward), changes a
+        # parameter between forward and backward, first by replacing its data with a clone, then by
+        # replacing the parameter object, and asserts backward raises an AssertionError saying FSDP
+        # does not support changing the parameters between forward and backward.
         fsdp_kwargs = {
             "sharding_strategy": ShardingStrategy.SHARD_GRAD_OP,
             "auto_wrap_policy": ModuleWrapPolicy({nn.Linear}),
@@ -1110,6 +1264,8 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_no_reshard_and_mixed_precision(self):
+        # [FUNCTION DOC] Runs the no-reshard mixed precision check as subtests with and without the
+        # full-precision-in-eval environment flag.
         """
         Tests that writeback does not falsely get triggered for a few
         configurations (exercising the sharded view skipping logic):
@@ -1123,6 +1279,11 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
         )
 
     def _test_no_reshard_and_mixed_precision(self, use_full_prec_in_eval: bool):
+        # [FUNCTION DOC] HELPER: With fp16 parameter mixed precision and shard-grad-op, runs train
+        # forward, a full-parameter summon and another forward; train then eval forward; and
+        # train forward/backward, eval forward and a sharded state dict save and load; none of
+        # these should falsely trigger writeback errors. Side effect: sets the environment flag for
+        # full precision in eval when requested and does not clear it.
         if use_full_prec_in_eval:
             os.environ[_FSDP_USE_FULL_PREC_IN_EVAL] = "1"
         fsdp_kwargs = {
@@ -1161,8 +1322,13 @@ class TestFSDPUseOrigParamsWriteback(FSDPTest):
 
 
 class TestFSDPUseOrigParamsFQNs(FSDPTest):
+    # [CLASS DOC] Tests that parameter names and shapes seen inside a forward pass under FSDP
+    # with use_orig_params=True are those of the original, unsharded parameters.
     @skip_if_lt_x_gpu(2)
     def test_named_parameters_in_forward(self):
+        # [FUNCTION DOC] Wraps a one-layer model whose forward asserts that named_parameters
+        # yields the cleaned names weight and bias of the layer with the original unsharded
+        # shapes, then runs one forward. Needs 2 GPUs.
         """
         Tests that calling ``named_parameters()`` during forward returns FQNs
         and ``Tensor`` s corresponding to the original parameters.
@@ -1171,11 +1337,17 @@ class TestFSDPUseOrigParamsFQNs(FSDPTest):
         assert_equal_fn = self.assertEqual
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: One 5 by 5 Linear layer whose forward checks parameter names
+            # and shapes against the enclosing test's expectations.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the Linear layer lin.
                 super().__init__()
                 self.lin = nn.Linear(5, 5)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Asserts the parameter names (prefixes stripped) are
+                # lin.weight and lin.bias and their shapes match the saved unsharded shapes, then
+                # returns lin applied to x. Raises AssertionError if shapes were not saved.
                 nonlocal param_shapes
                 # Allow for FSDP prefixes
                 param_names = [
@@ -1206,12 +1378,17 @@ class TestFSDPUseOrigParamsFQNs(FSDPTest):
 
 
 class TestFSDPUseOrigParamsNoSync(FSDPTest):
+    # [CLASS DOC] Two-rank tests of FSDP no_sync with use_orig_params=True: gradient values
+    # versus the flat-parameter mode, and gradient dtypes under mixed precision.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks to spawn: always 2.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_no_sync_correctness(self):
+        # [FUNCTION DOC] Runs the no_sync correctness check as subtests over three sharding
+        # strategies.
         """
         Tests a basic ``no_sync()`` setup by comparing ``use_orig_params=True``
         against ``use_orig_params=False``.
@@ -1228,6 +1405,10 @@ class TestFSDPUseOrigParamsNoSync(FSDPTest):
         )
 
     def _test_no_sync_correctness(self, sharding_strategy: ShardingStrategy):
+        # [FUNCTION DOC] HELPER: Wraps copies of a single-weight Linear layer in FSDP with
+        # use_orig_params False and True and compares output and gradients after one forward and
+        # backward; then repeats a pass inside no_sync and one outside, checking gradient parity
+        # each time and that accumulated gradients equal twice the reference gradients.
         model = nn.Linear(7, 1, bias=False, device=device_type)
         fsdp_kwargs = {
             "sharding_strategy": sharding_strategy,
@@ -1247,6 +1428,10 @@ class TestFSDPUseOrigParamsNoSync(FSDPTest):
             _baseline_model: nn.Module,
             _test_model: nn.Module,
         ):
+            # [FUNCTION DOC] HELPER: Asserts each model has exactly one parameter, that the
+            # baseline (flat) parameter values and gradient, limited to the unpadded element
+            # count, equal the other model's original parameter and gradient. The baseline may
+            # be longer due to padding.
             """
             This assumes that the model is ``nn.Linear(7, 1, bias=False)``
             (i.e. with a single 1D weight parameter) to be able to directly
@@ -1329,6 +1514,8 @@ class TestFSDPUseOrigParamsNoSync(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_no_sync_mixed_precision(self):
+        # [FUNCTION DOC] Runs the no_sync mixed precision check as subtests over three sharding
+        # strategies.
         """
         Tests that dtypes are as expected when using ``no_sync()`` with
         ``use_orig_params=True`` and parameter mixed precision.
@@ -1345,6 +1532,9 @@ class TestFSDPUseOrigParamsNoSync(FSDPTest):
         )
 
     def _test_no_sync_mixed_precision(self, sharding_strategy: ShardingStrategy):
+        # [FUNCTION DOC] HELPER: Wraps a Linear layer with fp16 parameter and fp32 reduce dtypes;
+        # asserts gradients are fp16 after two backward passes inside no_sync and fp32 after one
+        # outside it.
         model = nn.Linear(3, 3, device=device_type)
         mixed_precision = MixedPrecision(
             param_dtype=torch.float16,
@@ -1377,8 +1567,12 @@ class TestFSDPUseOrigParamsNoSync(FSDPTest):
 
 
 class TestFSDPUseOrigParamsInit(FSDPTest):
+    # [CLASS DOC] Tests of FSDP initialization with use_orig_params=True.
     @skip_if_lt_x_gpu(2)
     def test_non_uniform_requires_grad(self):
+        # [FUNCTION DOC] Freezes the biases of a two-layer model, wraps it with FSDP so weights
+        # and biases share one flat parameter, and asserts each original parameter keeps its own
+        # requires_grad value. Needs 2 GPUs.
         model = nn.Sequential(
             nn.Linear(3, 3, device=device_type),
             nn.Linear(3, 3, device=device_type),
@@ -1399,13 +1593,18 @@ NUM_SIZE0_TENSORS = 1000
 
 
 class TestMultiTensorApply(TestCase):
+    # [CLASS DOC] Single-process regression tests that foreach operations on a thousand
+    # zero-sized tensors do not crash (stack corruption in multi-tensor apply).
     def test_multi_tensor_apply_size0_tensors_cpu(self):
+        # [FUNCTION DOC] Runs a foreach multiply on 1000 empty CPU tensors; passes if no crash.
         size0_tensors = [torch.empty(0, device="cpu") for _ in range(NUM_SIZE0_TENSORS)]
         # Check that this does not segfault
         torch._foreach_mul_(size0_tensors, 0.1)
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "no cuda and no xpu")
     def test_multi_tensor_apply_size0_tensors_cuda(self):
+        # [FUNCTION DOC] Runs a foreach multiply on 1000 empty tensors on the accelerator
+        # device; passes if no crash. Skipped without CUDA or XPU.
         size0_tensors = [
             torch.empty(0, device=device_type) for _ in range(NUM_SIZE0_TENSORS)
         ]

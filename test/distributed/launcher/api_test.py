@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
+# [MODULE DOC] Tests for torch.distributed.launcher.api (elastic_launch, launch_agent,
+# LaunchConfig, _get_entrypoint_name). Defines worker entrypoints and helpers (rank-scaling,
+# failing and all-reduce functions, config builder, multi-process wrapper) and ElasticLaunchTest,
+# which starts one shared etcd server and launches real worker processes with the spawn method.
+# Several tests mock the agent, rendezvous handler and event recording. Importing has no side
+# effects, but running the file directly raises an error: it is not run as a script and must be
+# enabled via the test discovery list.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -40,15 +47,20 @@ from torch.testing._internal.common_utils import (
 
 
 def path(script):
+    # [FUNCTION DOC] HELPER: Returns the absolute path of the named file next to this test module.
     return os.path.join(os.path.dirname(__file__), script)
 
 
 def simple_rank_scale():
+    # [FUNCTION DOC] HELPER: Worker entrypoint; reads the RANK environment variable and returns
+    # ten plus that rank. Raises a lookup error if RANK is unset.
     rank = int(os.environ["RANK"])
     return 10 + rank
 
 
 def function_with_bug():
+    # [FUNCTION DOC] HELPER: Worker entrypoint that always raises a RuntimeError with message
+    # "test error". Not used by any test in this file.
     raise RuntimeError("test error")
 
 
@@ -61,6 +73,10 @@ def get_test_launch_config(
     rdzv_backend: str = "etcd",
     config: dict[str, Any] | None = None,
 ) -> LaunchConfig:
+    # [FUNCTION DOC] HELPER: Builds a LaunchConfig for tests with the given node bounds,
+    # processes per node, run id, rendezvous endpoint and backend (default etcd), plus extra
+    # rendezvous configs copied from config. Fixed settings: 0.1s monitor interval, spawn start
+    # method and zero restarts.
     rdzv_configs = {}
     if config:
         rdzv_configs.update(config)
@@ -86,6 +102,10 @@ def elastic_launch_wrapper(
     nproc_per_node: int,
     run_id: str,
 ):
+    # [FUNCTION DOC] HELPER: Process target that launches this script's test_script.py through
+    # elastic_launch with the sys.executable interpreter, touching rank files in test_dir. Used to
+    # simulate extra nodes in separate processes; an exception in the agent ends the process with
+    # a non-zero exit code. Returns nothing.
     """A wrapper function for class `elastic_launch.` in order to make multiprocess returns correct exit code."""
     elastic_launch(
         get_test_launch_config(
@@ -96,6 +116,9 @@ def elastic_launch_wrapper(
 
 
 def _dist_sum(wait=0):
+    # [FUNCTION DOC] HELPER: Worker entrypoint; initializes a gloo process group from the launcher
+    # environment, optionally sleeps wait seconds, all-reduces (sum) a tensor holding this rank
+    # and returns the Python number. Side effect: leaves the default process group initialized.
     rank = int(os.environ["RANK"])
     dist.init_process_group(backend="gloo")
     t = torch.tensor(rank)
@@ -113,16 +136,25 @@ GET_RDZV_HANDLER = (
 
 
 class MockException(Exception):
+    # [CLASS DOC] HELPER: Marker exception raised by mocks to check the launcher re-raises the
+    # original error type.
     pass
 
 
 def short_hash():
+    # [FUNCTION DOC] HELPER: Returns the first dash-separated segment of a random UUID string,
+    # used as a fake run id.
     return str(uuid.uuid4()).split("-")[0]
 
 
 class ElasticLaunchTest(unittest.TestCase):
+    # [CLASS DOC] Test case for elastic_launch and launch_agent. Class state: one standalone etcd
+    # server and its endpoint, shared by all tests. Per test: a temporary directory (test_dir)
+    # where workers touch files named by their global rank, and a clean PET_ environment.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Starts a single-process etcd server and stores the server and its
+        # endpoint on the class for every test to use.
         # start a standalone, single process etcd server to use for all tests.
         cls._etcd_server = EtcdServer()
         cls._etcd_server.start()
@@ -130,10 +162,14 @@ class ElasticLaunchTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Stops the shared etcd server.
         # stop the standalone etcd server.
         cls._etcd_server.stop()
 
     def setUp(self):
+        # [FUNCTION DOC] Creates a fresh temporary test_dir, deletes all environment variables
+        # starting with PET_, and sets TEST_SENTINEL_PARENT and OMP_NUM_THREADS in the parent
+        # environment so child workers can verify propagation.
         super().setUp()
         self.test_dir = tempfile.mkdtemp()
 
@@ -149,9 +185,12 @@ class ElasticLaunchTest(unittest.TestCase):
         os.environ["OMP_NUM_THREADS"] = str(1)
 
     def tearDown(self):
+        # [FUNCTION DOC] Recursively deletes the temporary test_dir.
         shutil.rmtree(self.test_dir)
 
     def check_works_ran(self, world_size: int):
+        # [FUNCTION DOC] HELPER: Asserts the files in test_dir are named exactly the ranks 0 up to
+        # world_size minus one, proving each worker ran once.
         self.assertSetEqual(
             {str(i) for i in range(world_size)}, set(os.listdir(self.test_dir))
         )
@@ -160,6 +199,8 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_script_python(self):
+        # [FUNCTION DOC] Launches 4 workers on one node running test_script.py with the Python
+        # interpreter via etcd rendezvous, then checks every rank touched its file.
         nnodes = 1
         nproc_per_node = 4
 
@@ -177,6 +218,9 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_script_python_local_rank_transfer(self):
+        # [FUNCTION DOC] Same launch and check as test_launch_script_python (4 workers, one node).
+        # KNOWN ISSUE: the body is identical to test_launch_script_python, so despite its name it
+        # does not exercise any local-rank transfer.
         nnodes = 1
         nproc_per_node = 4
 
@@ -194,6 +238,8 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_script_bash(self):
+        # [FUNCTION DOC] Launches 4 workers running the test_script.sh shell script, passing
+        # test_dir as its argument, and checks every rank touched its file.
         nnodes = 1
         nproc_per_node = 4
 
@@ -209,6 +255,8 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_function(self):
+        # [FUNCTION DOC] Launches 4 workers running a Python function and checks the returned
+        # mapping of rank to result, sorted, equals 10 through 13.
         nnodes = 1
         nproc_per_node = 4
 
@@ -225,6 +273,9 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_dist_sum_with_static_rdzv(self):
+        # [FUNCTION DOC] Launches 4 workers with the static rendezvous backend on a free local
+        # port (node rank 0), each all-reducing its rank with gloo, and checks every worker
+        # returned the sum of all ranks.
         nnodes = 1
         nproc_per_node = 4
         sock = get_socket_with_port()
@@ -256,6 +307,8 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_elastic(self):
+        # [FUNCTION DOC] Launches 4 workers with an elastic node range of 1 to 2 nodes and checks
+        # every rank touched its file.
         nproc_per_node = 4
 
         elastic_launch(
@@ -268,6 +321,8 @@ class ElasticLaunchTest(unittest.TestCase):
 
     @mock.patch("torch.distributed.elastic.events.record")
     def test_launch_elastic_worker_raise_exception(self, record_mock):
+        # [FUNCTION DOC] Launches workers whose script is told to fail and asserts the launcher
+        # raises ChildFailedError and records exactly one event (the events record is mocked).
         """
         Asserts that when the worker program fails and lancher raieses exception
         to indicate that worker process failed.
@@ -287,6 +342,11 @@ class ElasticLaunchTest(unittest.TestCase):
         "torch.distributed.elastic.agent.server.local_elastic_agent.LocalElasticAgent.run"
     )
     def test_launch_elastic_agent_raise_exception(self, record_mock, mock_agent_run):
+        # [FUNCTION DOC] Sets a side effect of MockException and expects the launcher to raise it,
+        # with exactly one recorded event.
+        # KNOWN ISSUE: decorator order maps the first argument to the agent run patch and the
+        # second to the events record patch, but the names are swapped; the side effect and the
+        # single-call assertion therefore target the opposite mocks to what the names suggest.
         """
         Asserts that when the agent raises an exception
         the launcher re-raises the original exception.
@@ -303,6 +363,9 @@ class ElasticLaunchTest(unittest.TestCase):
         TEST_WITH_DEV_DBG_ASAN, "test incompatible with dev/dbg asan"
     )
     def test_launch_elastic_multiple_agents(self):
+        # [FUNCTION DOC] Simulates 2 nodes: spawns one extra process that runs the launch wrapper
+        # with a shared run id, runs the wrapper for the other node in this process, joins the
+        # child and asserts it exited with code 0, then checks all 8 global ranks touched files.
         min_nodes = 1
         max_nodes = 2
         nproc_per_node = 4
@@ -349,6 +412,8 @@ class ElasticLaunchTest(unittest.TestCase):
 
     @patch("torch.distributed.launcher.api.LocalElasticAgent")
     def test_launch_shutdown(self, agent_mock_cls):
+        # [FUNCTION DOC] With a mocked agent returning success and a mocked rendezvous handler,
+        # runs elastic_launch and asserts the handler's shutdown was called exactly once.
         agent_mock = Mock()
         agent_mock.run.return_value = RunResult(WorkerState.SUCCEEDED)
         agent_mock_cls.return_value = agent_mock
@@ -365,6 +430,9 @@ class ElasticLaunchTest(unittest.TestCase):
             rdzv_handler_mock.shutdown.assert_called_once()
 
     def test_get_entrypoint_name(self):
+        # [FUNCTION DOC] Checks _get_entrypoint_name: a function gives its own name; a binary
+        # with no args or only flag args gives an empty string; a binary plus a script argument
+        # gives the script name; a missing entrypoint gives an empty string.
         self.assertEqual(
             "simple_rank_scale", _get_entrypoint_name(simple_rank_scale, [])
         )
@@ -379,6 +447,9 @@ class ElasticLaunchTest(unittest.TestCase):
     @patch(ELASTIC_AGENT_RUN)
     @patch(GET_RDZV_HANDLER)
     def test_rdzv_handler_shutdown_on_agent_signal(self, mock_get_rdzv, mock_agent_run):
+        # [FUNCTION DOC] For SIGTERM and SIGINT, makes the mocked agent raise SignalException and
+        # asserts launch_agent re-raises it, does not shut down the rendezvous handler, and
+        # records one event.
         config = get_test_launch_config(
             self._etcd_endpoint, min_nodes=1, max_nodes=1, nproc_per_node=1
         )
@@ -398,6 +469,8 @@ class ElasticLaunchTest(unittest.TestCase):
     @patch(ELASTIC_AGENT_RUN)
     @patch(GET_RDZV_HANDLER)
     def test_rdzv_handler_shutdown_on_agent_error(self, mock_get_rdzv, mock_agent_run):
+        # [FUNCTION DOC] Makes the mocked agent raise a RuntimeError and asserts launch_agent
+        # re-raises it, shuts down the rendezvous handler once, and records one event.
         config = get_test_launch_config(
             self._etcd_endpoint, min_nodes=1, max_nodes=1, nproc_per_node=1
         )
