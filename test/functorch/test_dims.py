@@ -4,6 +4,12 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Tests for functorch.dim (first-class dimensions). Imports the BERT self-attention
+# reference models from sibling test helper modules (attn_ft, attn_positional), optionally
+# torchvision resnet18 and, when the perf flag is enabled, a magic_trace profiler. Defines timing
+# helpers, the TestMin suite exercising Dim/DimList indexing, order, expand, reductions and
+# models, and TestMinFunctorchOnly which reruns the suite with pointwise optimization disabled.
+# Import-time side effect: sets skip stubs on the functorch-only subclass at module end.
 import gc
 import unittest
 from unittest import skip, skipIf
@@ -42,11 +48,15 @@ else:
 
     @contextmanager
     def magic_trace(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: No-op stand-in for the profiler context manager used when perf
+        # measurement is off; accepts any arguments and just yields.
         yield
 
 
 @contextmanager
 def measure(what):
+    # [FUNCTION DOC] HELPER: Context manager that times the enclosed block with a wall clock and
+    # prints the label followed by the elapsed seconds. Nothing is returned.
     b = perf_counter()
     yield
     e = perf_counter()
@@ -54,6 +64,10 @@ def measure(what):
 
 
 def triu(A):
+    # [FUNCTION DOC] HELPER: Builds the upper-triangular part of a 2D tensor using first-class
+    # dims: indexes it with two fresh dims, keeps elements where the first dim is not greater than
+    # the second (others replaced by a zero float scalar), and returns the result ordered back to
+    # the two dims as a regular tensor.
     i, j = dims()
     a = A[i, j]
     zero = torch.tensor(0, dtype=torch.float)  # XXX - torch.where is janky...
@@ -61,6 +75,10 @@ def triu(A):
 
 
 def gpu_time(lmb, name, r=100):
+    # [FUNCTION DOC] HELPER: Measures average GPU time of calling lmb. Runs r untimed
+    # warmup calls, then records a CUDA start event, runs r calls, records an end
+    # event and synchronizes. Prints name and the average per call in milliseconds and
+    # returns that average. Requires CUDA.
     b = torch.cuda.Event(enable_timing=True)
     e = torch.cuda.Event(enable_timing=True)
     # with magic_trace(name + ".fxt"):
@@ -85,7 +103,16 @@ def gpu_time(lmb, name, r=100):
 
 @skipIfTorchDynamo("Bad interaction")
 class TestMin(TestCase):
+    # [CLASS DOC] Main test suite for functorch.dim, skipped under TorchDynamo. setUp
+    # disables the garbage collector and snapshots ids of live Tensor, Dim, functorch Tensor
+    # and DimList objects (plus CUDA memory for cuda tests); tearDown checks that no such
+    # objects or CUDA memory leaked. Test methods cover dim creation, indexing, order,
+    # reductions, attention model equivalence.
     def setUp(self):
+        # [FUNCTION DOC] Calls base setUp, disables and runs garbage collection,
+        # records ids of all live Tensor, Dim, Tensor and DimList objects, and for test
+        # names containing cuda records allocated CUDA memory. KNOWN ISSUE: the
+        # collector is disabled and never re-enabled.
         super().setUp()
         gc.disable()
         gc.collect()
@@ -97,6 +124,11 @@ class TestMin(TestCase):
             self.mem_allocated = torch.cuda.memory_allocated()
 
     def tearDown(self):
+        # [FUNCTION DOC] Leak check run after each test: collects Tensor/Dim/Tensor/DimList
+        # objects not present in the setUp snapshot and, for cuda tests, the CUDA memory growth.
+        # If anything leaked it imports refcycle and exports a garbage image file to the current
+        # directory. Then runs garbage collection and asserts no extra memory and no extra
+        # objects, with explanatory messages.
         interesting = []
         for o in gc.get_objects():
             if (
@@ -131,6 +163,9 @@ class TestMin(TestCase):
         )
 
     def test_manual_stuff(self):
+        # [FUNCTION DOC] Checks first-class dims by hand: matrix multiply via expand, multiply and
+        # sum over a dim matches mm; the helper upper-triangular result matches triu; also
+        # exercises index with a dim list and an index tensor dim (result is discarded).
         A_ = torch.rand(3, 4)
         B_ = torch.rand(4, 5)
         i, j, k = dims()
@@ -156,7 +191,15 @@ class TestMin(TestCase):
         device=None,
         time=False,
     ):
+        # [FUNCTION DOC] HELPER: Compares the first-class-dim BERT self attention (A) against
+        # the positional reference (B) with identical weights, for default, each relative
+        # position embedding approach, and a past key/value pair case, asserting outputs are
+        # close. Args: batch size, sequence length, hidden size, head count, linear layer
+        # class, optional device to move modules and inputs to, and time flag that prints GPU
+        # timings of both models.
         def maybe_to(x):
+            # [FUNCTION DOC] HELPER: Returns x unchanged if no device was
+            # given, else x moved to the device.
             return x if device is None else x.to(device)
 
         attention_probs_dropout_prob = 0.0
@@ -269,9 +312,12 @@ class TestMin(TestCase):
             gpu_time(lambda: A(hidden_state), "first_class", r=3)
 
     def test_attn(self):
+        # [FUNCTION DOC] Runs the attention equivalence helper with default small sizes on CPU.
         self.attn()
 
     def test_inplace(self):
+        # [FUNCTION DOC] Smoke test of in-place augmented assignment into an embedding table
+        # indexed by a tensor-valued dim and a free dim; only checks that it does not raise.
         # some embeddings table
         embeddings = torch.zeros(10, 3)
 
@@ -284,7 +330,10 @@ class TestMin(TestCase):
         embeddings[indices[i], f] += values[i, f]
 
     def test_adapt(self):
+        # [FUNCTION DOC] Regression test that dim names are still inferred correctly when the
+        # nested function is called repeatedly (Python 3.11 adapts bytecode after several runs).
         def f():
+            # [FUNCTION DOC] HELPER: Creates two named dims; used only to exercise name inference.
             ci, co = dims()
 
         # python 3.11 adapts bytecode after a number of iterations
@@ -298,6 +347,9 @@ class TestMin(TestCase):
     )
     @skipIf(not TEST_CUDA, "no CUDA")
     def test_attn_cuda(self):
+        # [FUNCTION DOC] Runs the attention equivalence helper at BERT-sized dimensions on CUDA
+        # with torch Linear, timing only if the perf flag is set. Skipped on Linux, ROCm, slow
+        # mode and Windows (issue 86710 referenced), and when CUDA is unavailable.
         # size from the BERT paper, 90% pretraining of sequence length 128
         self.attn(
             batch_size=256,
@@ -310,6 +362,8 @@ class TestMin(TestCase):
         )
 
     def test_stack(self):
+        # [FUNCTION DOC] Smoke test of the stack function combining a dim-indexed tensor along a
+        # new dim; the result is not checked.
         i, j, d = dims()
         A = torch.rand(4, 5)
         _r = stack([A[i, j]], d, j)
@@ -318,6 +372,8 @@ class TestMin(TestCase):
         # self.assertTrue(torch.allclose(b.order(i, j), j.expand(i).order(i, j)))
 
     def test_max(self):
+        # [FUNCTION DOC] Checks that max over a dim on a dim-indexed tensor returns values
+        # matching the regular max over the last axis.
         ap = torch.rand(2, 3, 2)
         i, j, k = dims()
         a = ap[i, j, k]
@@ -325,6 +381,8 @@ class TestMin(TestCase):
         torch.testing.assert_close(r.order(i, j), ap.max(2)[0])
 
     def test_mm(self):
+        # [FUNCTION DOC] Smoke test of matrix multiply with an extra dim of size one given by
+        # setting its size; the result is not compared.
         i, j, k, q = dims()
         a = torch.rand(3, 4)
         b = torch.rand(4, 5)
@@ -337,6 +395,9 @@ class TestMin(TestCase):
         # print(a @ b)
 
     def test_with_dims_split(self):
+        # [FUNCTION DOC] Checks that indexing with a nested dim list splits a
+        # size-12 axis by a fixed dim size of 4, and that ordering with the same
+        # nested list restores the original tensor.
         a = torch.arange(3 * 12).view(3, 12)
         i, j, k = dims()
         k.size = 4
@@ -345,6 +406,11 @@ class TestMin(TestCase):
         torch.testing.assert_close(a, x)
 
     def test_hello(self):
+        # [FUNCTION DOC] Broad test of dim-indexed operations: matmul, sums over dims and int
+        # tuples, max, sort, renorm, expand, index with tensor and dim lists, ellipsis, dimlists
+        # (bound, empty, too few indexes), arithmetic on dims, split with dim sizes, flatten via
+        # tuple order, and that random_like and dropout preserve dims. Expects IndexError for too
+        # many index elements.
         A = torch.rand(3, 4)
         B = torch.rand(4, 5)
         i, j, k = dims()
@@ -433,6 +499,8 @@ class TestMin(TestCase):
             raise AssertionError("Expected i and k to be in dims")
 
     def test_simple(self):
+        # [FUNCTION DOC] Smoke test of repeated elementwise addition on a dim-indexed tensor and
+        # ordering it back; no values are checked.
         i, j, k = dims()
         x = torch.rand(3, 4)
         z = x[i, j]
@@ -440,6 +508,7 @@ class TestMin(TestCase):
         (z.order(i, j))
 
     def test_mm_fuse(self):
+        # [FUNCTION DOC] Checks that multiply-then-sum over a shared dim equals a matrix product.
         i, j, k = dims()
         A = torch.rand(3, 4)
         B = torch.rand(4, 5)
@@ -448,6 +517,9 @@ class TestMin(TestCase):
         torch.testing.assert_close(C, A @ B)
 
     def test_time_mm_fuse(self):
+        # [FUNCTION DOC] Benchmark-style test: times plain matmul and first-class-dim matmul loops
+        # of 10000 iterations under the timing and profiler context managers, then asserts the dim
+        # result matches matmul. Skipped in the functorch-only subclass.
         i, j, k = dims()
         A = torch.rand(3, 4)
         B = torch.rand(4, 5)
@@ -482,23 +554,30 @@ class TestMin(TestCase):
         torch.testing.assert_close(r1.order(i, j), r0)
 
     def test_compare_dims(self):
+        # [FUNCTION DOC] Smoke test that comparing two sized dims with less-than does not raise.
         i, j = dims()
         i.size = 3
         j.size = 4
         (i < j)  # noqa: B015
 
     def test_seg(self):
+        # [FUNCTION DOC] Smoke test of arithmetic combining two sized dims; no result is checked.
         i, k = dims()
         i.size = 4
         k.size = 3
         i + k - 1
 
     def test_expand(self):
+        # [FUNCTION DOC] Checks that expanding a dim-indexed tensor with extra sizes and ordering
+        # back gives the expected shape.
         A = torch.rand(3, 4)
         i = dims()
         self.assertEqual(list(A[i].expand(2, 4).order(i).size()), [3, 2, 4])
 
     def test_network(self):
+        # [FUNCTION DOC] Compares resnet18 (batch norm without running stats) applied to a tensor
+        # with two dims against the plain batched call, within tight tolerances. Skipped if
+        # torchvision is missing.
         if resnet18 is None:
             self.skipTest("no torchvision")
         rn = resnet18(
@@ -515,6 +594,9 @@ class TestMin(TestCase):
         torch.testing.assert_close(r2, r, atol=1e-6, rtol=1e-7)
 
     def test_dim_args(self):
+        # [FUNCTION DOC] Checks return types and options of the dim creation functions: dimlists
+        # gives a DimList, dims a Dim whose string form is its variable name, and the sizes
+        # argument sets dim sizes, list lengths, and per-element sizes for nested size lists.
         a = dimlists()
         if not isinstance(a, DimList):
             raise AssertionError(f"Expected DimList, got {type(a)}")
@@ -537,11 +619,15 @@ class TestMin(TestCase):
         self.assertEqual(b[1].size, 5)
 
     def test_diag(self):
+        # [FUNCTION DOC] Smoke test of indexing a matrix with the same dim twice (diagonal).
         i = dims()
         A = torch.rand(4, 4)
         (A[i, i])
 
     def test_softmax_split(self):
+        # [FUNCTION DOC] Implements a blocked softmax by splitting a vector into
+        # a group dim and an inner dim, using running maxima and sums per group,
+        # and checks it equals regular softmax.
         a = torch.rand(16)
         g, i = dims(sizes=[2, None])
         a2 = a[[i, g],]
@@ -557,6 +643,9 @@ class TestMin(TestCase):
         torch.testing.assert_close(f / l, torch.nn.functional.softmax(a, dim=0))
 
     def test_index(self):
+        # [FUNCTION DOC] Tests the index method: splitting an axis into dims and
+        # merging back, indexing by a tensor-valued dim, and indexing with a
+        # tuple of positional axes into a new dim.
         A = torch.rand(3, 4)
         i, j, k = dims()
 
@@ -579,6 +668,9 @@ class TestMin(TestCase):
 
     # failures that came up from monkey patching some operators...
     def test_monkey(self):
+        # [FUNCTION DOC] Regression test for operators affected by monkey
+        # patching: plain item and advanced-index assignment and creating a tensor
+        # from a list of scalar tensors; no assertions.
         A = torch.rand(3, 4)
         A[0, 0] = 5
         x = torch.randn(3, 4, 4, 4, 3)
@@ -594,6 +686,8 @@ class TestMin(TestCase):
         # self.assertEqual(x.new([z[2], z[0] + 3]).tolist(), [3, 4])
 
     def test_index_placement(self):
+        # [FUNCTION DOC] Checks that dims offsets used among slices land at the right positions
+        # and that ordering gives the matching permutation of the tensor.
         A = torch.rand(1, 2, 3, 4)
 
         i, j = dims(sizes=[2, 4])
@@ -604,26 +698,36 @@ class TestMin(TestCase):
         torch.testing.assert_close(A.permute(1, 3, 0, 2), r)
 
     def test_order(self):
+        # [FUNCTION DOC] Checks that ordering with a positional axis
+        # and a dim equals a permutation.
         i, j = dims()
         A = torch.rand(3, 4, 5)
         torch.testing.assert_close(A[i].order(1, i), A.permute(2, 0, 1))
 
     def test_mask(self):
+        # [FUNCTION DOC] Smoke test of building a triangular mask from comparing two dims,
+        # multiplying with an indexed vector and summing; no values are checked.
         a = torch.rand(5)
         i, j = dims(sizes=[a.size(0), a.size(0)])
         ((i >= j) * a[i]).sum(j).order(i)
 
     def test_eq(self):
+        # [FUNCTION DOC] Checks that comparing two equal-sized dims
+        # for equality and summing gives 3.
         i, j = dims(sizes=[3, 3])
         self.assertEqual((i == j).sum((i, j)), 3)
 
     def test_dims_with_size(self):
+        # [FUNCTION DOC] Checks that creating dims with a count gives a sequence of that length of
+        # Dim objects, and that names come from variable names and positional placeholders when
+        # assigning to an attribute target.
         x = dims(3)
         self.assertEqual(len(x), 3)
         if not isinstance(x[0], Dim):
             raise AssertionError(f"Expected Dim, got {type(x[0])}")
 
         class Foo:
+            # [CLASS DOC] HELPER: Empty class used only as an object that receives an attribute.
             pass
 
         y = Foo()
@@ -633,13 +737,19 @@ class TestMin(TestCase):
         self.assertEqual(str(q), "d2")
 
     def test_dir(self):
+        # [FUNCTION DOC] Smoke test that listing attributes of a
+        # comparison result of two dims works.
         i, j = dims(sizes=[3, 3])
         dir(i <= j)
 
     def test_doc(self):
+        # [FUNCTION DOC] Checks the wrapped Tensor clamp method has
+        # the same doc string as torch's.
         self.assertEqual(Tensor.clamp.__doc__, torch.Tensor.clamp.__doc__)
 
     def test_embed(self):
+        # [FUNCTION DOC] Compares an embedding lookup written with explicit loops against a single
+        # dim-based lookup and asserts the results are close.
         embeddings = torch.rand(8, 32)
         ids = torch.tensor([1, 0, 3, 4])
 
@@ -656,6 +766,8 @@ class TestMin(TestCase):
         torch.testing.assert_close(values, values_)
 
     def test_functorch(self):
+        # [FUNCTION DOC] Checks that two dim-indexed matrix multiplies combine into the expected
+        # 4D result shape after ordering.
         A = torch.rand(3, 4, 5)
         B = torch.rand(3, 4, 5)
         C = torch.rand(5, 2)
@@ -667,6 +779,8 @@ class TestMin(TestCase):
         self.assertEqual(list(torch.mm(AA.T, BB).order(i, j).shape), [3, 3, 2, 2])
 
     def test_permute_orig(self):
+        # [FUNCTION DOC] Checks that permute with the dims keyword
+        # gives the same shape as positional.
         d = dims(1)
         t_fc = torch.rand(1, 2, 3, 4)[d]
         self.assertEqual(
@@ -674,11 +788,14 @@ class TestMin(TestCase):
         )
 
     def test_order_keyword(self):
+        # [FUNCTION DOC] Checks that order rejects an unknown keyword argument with a TypeError.
         d = dims(1)
         t = torch.rand(3)[d]
         self.assertRaises(TypeError, lambda: t.order(wrong=3))
 
     def test_big_split(self):
+        # [FUNCTION DOC] Builds random chunk sizes summing to at least 6400 and splits a tensor by
+        # them; only checks that it does not raise.
         total = 0
         l = []
         while total < 6400:
@@ -692,11 +809,15 @@ skip_functorch_only = ["test_time_mm_fuse", "test_attn_cuda"]
 
 
 class TestMinFunctorchOnly(TestMin):
+    # [CLASS DOC] Reruns every TestMin test with pointwise optimization in functorch.dim disabled.
+    # Tests listed in skip_functorch_only are replaced by skips after class creation.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setUp and then turns off the POINTWISE_OPTIMIZE flag.
         super().setUp()
         functorch.dim.POINTWISE_OPTIMIZE = False
 
     def tearDown(self):
+        # [FUNCTION DOC] Turns the POINTWISE_OPTIMIZE flag back on, then runs base tearDown.
         functorch.dim.POINTWISE_OPTIMIZE = True
         super().tearDown()
 
