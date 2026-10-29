@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Experimental FP8 scaled dot product attention. Contains the DescaleType enum,
+# a descale-tensor validator, and the private forward-only attention function
+# that dispatches to the Flash Attention 3 quantized ATen operator.
+# No import-time side effects beyond imports.
 """
 This operator implements FP8 scaled dot product attention using Flash Attention 3.
 This operator is experimental and subject to change.
@@ -12,6 +17,8 @@ from torch import Tensor
 
 
 class DescaleType(IntEnum):
+    # [CLASS DOC] Integer enum naming the granularity of FP8 descale factors.
+    # Only PER_HEAD (value 0) exists: one factor per batch entry and kv head.
     """Describes the scaling granularity for FP8 descale tensors.
 
     Used with _scaled_dot_product_attention_quantized to explicitly specify
@@ -32,6 +39,10 @@ def _validate_descale(
     key: Tensor,
     descale_type: DescaleType,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validates an optional descale tensor; returns
+    # immediately if None. Raises ValueError if dtype is not float32, the tensor
+    # is not on CUDA, or (for per-head type) it is not 2D with batch size equal to
+    # the query batch and second size equal to the key's kv head count. No mutation.
     """Validate descale tensor for the specified scaling type.
 
     Args:
@@ -99,6 +110,12 @@ def _scaled_dot_product_attention_quantized(
     k_descale_type: DescaleType = DescaleType.PER_HEAD,
     v_descale_type: DescaleType = DescaleType.PER_HEAD,
 ) -> Tensor:
+    # [FUNCTION DOC] Runs forward-only FP8 attention: validates each optional
+    # descale tensor, warns (UserWarning) if grad mode is on and any input
+    # requires grad, then calls the Flash Attention 3 quantized ATen op with zero
+    # dropout and no return of attention weights. Returns the output tensor
+    # (first element of the op result). Raises ValueError on bad descale tensors.
+    # KNOWN ISSUE: the descale type arguments are validated but not passed to the op.
     r"""Scaled dot product attention for FP8 inputs.
 
     This is a specialized version of scaled_dot_product_attention that supports

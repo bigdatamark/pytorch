@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Experimental paged attention support layered on flex attention. Exports the
+# PagedAttention class, which manages a page table mapping per-batch logical
+# kv blocks to physical pages of a shared kv cache, and converts block masks,
+# mask_mods and score_mods from logical to physical kv indexing.
+# Imports from flex_attention at import time; no other import-time side effects.
 """
 This module implements Paged Attention on top of flex_attention.
 This module is experimental and subject to change.
@@ -18,10 +24,20 @@ __all__ = ["PagedAttention"]
 
 
 def _cdiv(x: int | float | torch.Tensor, multiple: int | float | torch.Tensor):
+    # [FUNCTION DOC] HELPER: Ceiling division of x by multiple using integer floor
+    # division; works elementwise for tensors. Returns the rounded-up quotient.
     return (x + multiple - 1) // multiple
 
 
 class PagedAttention:
+    # [CLASS DOC] Allocator and index translator for a paged kv cache used with
+    # flex attention. State: n_pages and page_size; page_table (batch by page
+    # slot, logical block to physical page, -1 when unallocated); capacity
+    # (per-batch allocated token count); empty_pages (Python list used as a
+    # stack of free physical pages); physical_to_logical (batch by physical page,
+    # inverse of page_table, -1 when unmapped). Methods reserve/erase manage
+    # pages, assign writes kv values into caches, and convert_logical_block_mask /
+    # get_mask_mod / get_score_mod rewrite logical-index callables to physical ones.
     """
     PagedAttention supports flex attention inference with a large batch size.
     With PagedAttention, a batch of key/value tensors with varying kv length
@@ -37,6 +53,10 @@ class PagedAttention:
         max_batch_size: int,
         device: str = "cuda",
     ) -> None:
+        # [FUNCTION DOC] Creates the paging state for max_batch_size sequences
+        # over n_pages physical pages of page_size tokens each, on the given
+        # device. The page table and reverse map start filled with -1, capacities
+        # at zero, and all pages free (popped from the end, lowest index first).
         # number of pages
         self.n_pages = n_pages
 
@@ -60,6 +80,14 @@ class PagedAttention:
         )
 
     def reserve(self, batch_idx: torch.Tensor, seq_len: torch.Tensor) -> None:
+        # [FUNCTION DOC] Grows the allocation of one batch entry so its capacity
+        # covers at least seq_len tokens. Does nothing if capacity already suffices.
+        # Otherwise takes the needed number of pages from the free list, records
+        # them in the page table and reverse map, and raises capacity by whole pages.
+        # Raises an AssertionError if there are not enough free pages.
+        # Mutates page_table, physical_to_logical, capacity and empty_pages.
+        # KNOWN ISSUE: new pages are placed starting at capacity divided by page
+        # size, which assumes capacity is page aligned (true as it only grows by pages).
         """
         Requests the capacity of a given batch to be at least enough to
         hold `seq_len` elements.
@@ -107,6 +135,11 @@ class PagedAttention:
         self.capacity[batch_idx] += num_pages_to_allocate * self.page_size
 
     def erase(self, batch_idx: torch.Tensor) -> None:
+        # [FUNCTION DOC] Frees all pages held by one batch entry: returns them to
+        # the free list, resets capacity to zero, and sets the page table row to -1.
+        # Mutates page_table, capacity, empty_pages and physical_to_logical.
+        # KNOWN ISSUE: the reverse map update indexes with batch_idx first and then
+        # assigns on the result, which may act on a copy and leave stale entries.
         """
         Removes a single batch from paged attention.
 
@@ -133,6 +166,14 @@ class PagedAttention:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] Writes new key and value tensors (batch, heads, seq, dim)
+        # into the shared caches at the physical slots for each batch entry and
+        # input position, found through the page table. Mutates k_cache and v_cache
+        # in place; returns nothing. Raises RuntimeError if k_val requires grad or
+        # if batch size, head count, sequence length or hidden dims mismatch.
+        # KNOWN ISSUE: the docstring names args val/cache but the parameters are
+        # k_val/v_val/k_cache/v_cache; the sequence-length error message reports
+        # the wrong dimension of input_pos; only k_val is checked for requires_grad.
         """
         Assigns new contents `val` to the storage `cache` at the location
         `batch_idx` and `input_pos`.
@@ -197,6 +238,13 @@ class PagedAttention:
         batch_idx: torch.Tensor | None = None,
         kv_len: torch.Tensor | None = None,
     ) -> BlockMask:
+        # [FUNCTION DOC] Builds a physical-index BlockMask from a logical one.
+        # kv_indices (and full_kv_indices if present) are mapped through the page
+        # table rows of batch_idx (default: the first B entries) and padded to n_pages
+        # columns; num_blocks are cloned; the mask_mod is wrapped via get_mask_mod
+        # using the optional kv_len bound. Raises RuntimeError if the block mask
+        # column block size differs from page_size. Returns a new BlockMask whose
+        # kv sequence length is n_pages times page_size.
         """
         Converts a logical block mask by mapping its logical kv indices to the corresponding
         physical kv indices.
@@ -282,6 +330,11 @@ class PagedAttention:
         mask_mod: _mask_mod_signature | None,
         kv_len: torch.Tensor | None = None,
     ) -> _mask_mod_signature:
+        # [FUNCTION DOC] Returns a mask_mod taking physical kv indices. It maps
+        # each physical index to its logical index via physical_to_logical, and
+        # yields false for unallocated pages, negative logical positions, or
+        # positions at or beyond kv_len for that batch (when given); otherwise it
+        # defers to the logical mask_mod (no-op mask if None).
         """
         Converts a mask_mod based on mapping from the physical block index to the logical
         block index.
@@ -299,6 +352,9 @@ class PagedAttention:
             q_idx: torch.Tensor,
             physical_kv_idx: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Translates the physical kv index to a logical
+            # one and returns the wrapped mask_mod result where the position is
+            # valid (live page, within bounds), false elsewhere.
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
             logical_block_idx = self.physical_to_logical[b, physical_kv_block]
@@ -319,6 +375,10 @@ class PagedAttention:
         score_mod: _score_mod_signature | None,
         kv_len: torch.Tensor | None = None,
     ) -> _score_mod_signature:
+        # [FUNCTION DOC] Returns a score_mod taking physical kv indices. Same
+        # index translation and validity rules as get_mask_mod, but invalid
+        # positions get a score of negative infinity; valid ones call the logical
+        # score_mod (identity if None) with the logical kv index.
         """
         Converts a score_mod based on mapping from the physical block index to the logical
         block index.
@@ -338,6 +398,8 @@ class PagedAttention:
             q_idx: torch.Tensor,
             physical_kv_idx: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Translates the physical kv index to a logical
+            # one; returns the wrapped score_mod result where valid, else negative infinity.
             physical_kv_block = physical_kv_idx // self.page_size
             physical_kv_offset = physical_kv_idx % self.page_size
             logical_block_idx = self.physical_to_logical[b, physical_kv_block]
