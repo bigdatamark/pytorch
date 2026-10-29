@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for readable tracebacks: a context manager that makes code built with
+# compile/exec show real source lines in tracebacks (by rebuilding traceback frames backed by
+# a temporary file), short frame formatters, and CapturedTraceback for fast stack capture. No
+# import-time side effects.
 import contextlib
 import inspect
 import os.path
@@ -47,6 +51,11 @@ from types import TracebackType
 
 @contextlib.contextmanager
 def report_compile_source_on_error():
+    # [FUNCTION DOC] Context manager. Runs the body and, if an exception escapes, rewrites its
+    # traceback: frames whose filename is the string marker and whose globals hold the saved
+    # compile source get a stand-in frame pointing at a temporary file containing that source.
+    # Side effects: writes a temporary .py file that is never deleted (one per such frame).
+    # Re-raises the original exception with the rebuilt traceback.
     try:
         yield
     except Exception as exc:
@@ -131,6 +140,11 @@ def report_compile_source_on_error():
 
 
 def shorten_filename(fn, *, base=None):
+    # [FUNCTION DOC] Shorten filename fn by removing the common leading path with base
+    # (default: the torch package directory). Returns fn unchanged if no common path can be
+    # computed.
+    # KNOWN ISSUE: if fn is not under base, the common path may be just the root and the
+    #   result silently drops leading characters of fn.
     """Shorten a source filepath, with the assumption that torch/ subdirectories don't need to be shown to user."""
     if base is None:
         base = os.path.dirname(os.path.dirname(__file__))
@@ -144,6 +158,9 @@ def shorten_filename(fn, *, base=None):
 
 
 def format_frame(frame, *, base=None, line=False) -> str:
+    # [FUNCTION DOC] Format a FrameSummary as one short string of filename:lineno in function
+    # name, optionally prefixed by the source line text when line is true. Uses
+    # shorten_filename with base.
     """
     Format a FrameSummary in a short way, without printing full absolute path or code.
 
@@ -156,21 +173,31 @@ def format_frame(frame, *, base=None, line=False) -> str:
 
 
 def format_traceback_short(tb):
+    # [FUNCTION DOC] Format only the innermost frame of traceback tb as a short single-line
+    # string. Raises IndexError if the traceback has no frames.
     """Format a TracebackType in a short way, printing only the inner-most frame."""
     return format_frame(traceback.extract_tb(tb)[-1])
 
 
 class CapturedTraceback:
+    # [CLASS DOC] Lightweight captured stack. State: tb is the native captured traceback
+    # object (None once cleaned up) and skip is the number of innermost frames to drop when
+    # symbolizing. Pickling drops the native object. Uses slots.
     __slots__ = ["tb", "skip"]
 
     def __init__(self, tb, skip=0) -> None:
+        # [FUNCTION DOC] Store the native traceback tb and the number of frames to skip.
         self.tb = tb
         self.skip = skip
 
     def cleanup(self) -> None:
+        # [FUNCTION DOC] Release the native traceback; later summaries are empty.
         self.tb = None
 
     def summary(self):
+        # [FUNCTION DOC] Symbolize the captured stack and return a StackSummary (outermost
+        # first). Returns an empty summary if the traceback was cleaned up. Requires the torch
+        # profiler extension.
         import torch._C._profiler
 
         if self.tb is None:
@@ -182,6 +209,8 @@ class CapturedTraceback:
         )
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns state with the native traceback replaced by
+        # None (it is not pickleable) and the skip count preserved.
         return (
             None,
             {
@@ -192,6 +221,11 @@ class CapturedTraceback:
 
     @staticmethod
     def extract(*, script=False, cpp=False, skip=0):
+        # [FUNCTION DOC] Capture the current stack quickly (much faster than the standard
+        # extract) and return a CapturedTraceback. Python frames are always included; script
+        # and cpp enable TorchScript and C++ frames. Raises AssertionError if skip is nonzero
+        # with script or cpp. One extra frame (this call) is skipped automatically when only
+        # Python frames are captured.
         """
         Like traceback.extract_stack(), but faster (approximately 20x faster); it
         is fast enough that you can unconditionally log stacks this way as part of
@@ -216,6 +250,8 @@ class CapturedTraceback:
         )
 
     def format(self):
+        # [FUNCTION DOC] Format this capture as a list of strings like the standard
+        # format_list output, via summary. Symbolizes this one traceback alone.
         """
         Formats a single torch._C._profiler.CapturedTraceback into a list of
         strings equivalent to the output of traceback.format_list.  Note that if
@@ -227,6 +263,9 @@ class CapturedTraceback:
 
     @staticmethod
     def format_all(tbs):
+        # [FUNCTION DOC] Format many CapturedTracebacks at once and return a list of lists of
+        # strings (empty list for cleaned-up entries). Symbolizes all live ones in one batch
+        # to amortize cost.
         """
         Bulk version of CapturedTraceback.format.  Returns a list of list of strings.
         """
@@ -250,6 +289,9 @@ class CapturedTraceback:
 
 
 def _extract_symbolized_tb(tb, skip):
+    # [FUNCTION DOC] HELPER: Convert a symbolized traceback (a sequence of frame mappings with
+    # filename, line and name) into a StackSummary, skipping the first skip entries and
+    # reversing the order.
     """
     Given a symbolized traceback from symbolize_tracebacks, return a StackSummary object of
     pre-processed stack trace entries.

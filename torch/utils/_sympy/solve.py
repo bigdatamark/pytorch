@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers to isolate a sub-expression on the left side of a sympy relational
+# expression (equation or inequality), including turning floor-division relations into plain
+# inequalities. Main entry is try_solve. Creates a module logger at import.
 import logging
 
 import sympy
@@ -20,6 +23,9 @@ INEQUALITY_TYPES = (sympy.Gt, sympy.Ge, sympy.Lt, sympy.Le)
 
 
 def mirror_rel_op(type: type) -> type[sympy.Rel] | None:
+    # [FUNCTION DOC] Return the relational class obtained by swapping the two sides of a
+    # relation of the given type (for example less-than becomes greater-than), or None if the
+    # type is not supported.
     return _MIRROR_REL_OP.get(type)
 
 
@@ -43,6 +49,11 @@ def try_solve(
     trials: int = 5,
     floordiv_inequality: bool = True,
 ) -> tuple[sympy.Rel, sympy.Expr] | None:
+    # [FUNCTION DOC] Try to rewrite the relation expr so that thing alone is on its left side.
+    # Returns a pair of the rewritten relation and its right-hand side, or None if expr is not
+    # a supported relation, thing is on both sides, or isolation fails within the given number
+    # of trials. Considers the mirrored relation if thing is on the right. floordiv_inequality
+    # enables rewriting floor division into inequalities. Only logs at debug level.
     mirror = mirror_rel_op(type(expr))
 
     # Ignore unsupported expressions:
@@ -97,6 +108,12 @@ def try_solve(
 def _try_isolate_lhs(
     e: sympy.Basic, thing: sympy.Basic, floordiv_inequality: bool
 ) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Perform one isolation step on e: move additive terms not
+    # containing thing to the right side, divide both sides by multiplicative factors not
+    # containing thing (mirroring inequalities when the factor is negative, skipping when its
+    # sign is unknown), and when enabled rewrite a floor division on the left into
+    # conjunction/disjunction/inequality forms. Returns the new expression, which may be
+    # unchanged.
     op = type(e)
 
     if isinstance(e, sympy.Rel):

@@ -1,3 +1,7 @@
+# [MODULE DOC] Feature detection and small helpers for the optional Triton package: whether it
+# is installed, its version, TMA (tensor memory accelerator) API availability, device support,
+# backend creation and cache hashing. Most queries are memoized. Imports only standard modules
+# at load time.
 import functools
 import hashlib
 import os
@@ -8,6 +12,9 @@ _FAILED_TO_MAP_SEGMENT_FROM_SHARED_OBJECT = "failed to map segment from shared o
 
 
 def _triton_cache_dir_for_error_message() -> str | None:
+    # [FUNCTION DOC] HELPER: Find the Triton cache directory for error messages: the
+    # TRITON_CACHE_DIR environment variable if set, else the Triton knob value, else None if
+    # unavailable.
     if triton_cache_dir := os.environ.get("TRITON_CACHE_DIR"):
         return triton_cache_dir
 
@@ -20,6 +27,9 @@ def _triton_cache_dir_for_error_message() -> str | None:
 
 
 def _raise_triton_cache_load_error(exc: BaseException) -> None:
+    # [FUNCTION DOC] HELPER: Raise ImportError chaining exc, with a message explaining that
+    # the Triton cache directory may be on a noexec filesystem and suggesting
+    # TRITON_CACHE_DIR. Always raises.
     cache_dir = _triton_cache_dir_for_error_message()
     if "TRITON_CACHE_DIR" in os.environ:
         cache_dir_msg = f" (TRITON_CACHE_DIR={cache_dir})"
@@ -35,6 +45,7 @@ def _raise_triton_cache_load_error(exc: BaseException) -> None:
 
 @functools.cache
 def has_triton_package() -> bool:
+    # [FUNCTION DOC] Return True if the triton package can be imported (memoized).
     try:
         import triton  # noqa: F401
 
@@ -45,6 +56,10 @@ def has_triton_package() -> bool:
 
 @functools.cache
 def get_triton_version(fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    # [FUNCTION DOC] Return the Triton major and minor version as a pair of ints, or fallback
+    # if Triton is not importable (memoized).
+    # KNOWN ISSUE: only ImportError is caught; a version string with a non-numeric major or
+    #   minor part would raise ValueError.
     try:
         import triton
 
@@ -56,6 +71,8 @@ def get_triton_version(fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
 
 @functools.cache
 def _device_supports_tensor_descriptor() -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the current device can use tensor descriptors: a
+    # CUDA device with capability 9.0 or higher (not HIP), or a Triton CPU backend (memoized).
     import torch
 
     return (
@@ -67,6 +84,8 @@ def _device_supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def has_triton_cpu_backend() -> bool:
+    # [FUNCTION DOC] Return True if Triton is installed and has a backend named cpu
+    # (memoized).
     if has_triton_package():
         import triton
 
@@ -77,6 +96,9 @@ def has_triton_cpu_backend() -> bool:
 
 @functools.cache
 def has_triton_experimental_host_tma() -> bool:
+    # [FUNCTION DOC] Return True if the experimental host TMA descriptor API is usable: Triton
+    # present, device supports descriptors, and the experimental descriptor module imports
+    # (honoring its enable hook if present). Memoized.
     if has_triton_package():
         if _device_supports_tensor_descriptor():
             try:
@@ -99,6 +121,8 @@ def has_triton_experimental_host_tma() -> bool:
 
 @functools.cache
 def has_triton_tensor_descriptor_host_tma() -> bool:
+    # [FUNCTION DOC] Return True if Triton's host tensor descriptor API is importable and the
+    # device supports descriptors (memoized).
     if has_triton_package():
         if _device_supports_tensor_descriptor():
             try:
@@ -115,11 +139,16 @@ def has_triton_tensor_descriptor_host_tma() -> bool:
 
 @functools.cache
 def has_triton_tma() -> bool:
+    # [FUNCTION DOC] Return True if either the tensor descriptor or the experimental host TMA
+    # API is available (memoized).
     return has_triton_tensor_descriptor_host_tma() or has_triton_experimental_host_tma()
 
 
 @functools.cache
 def has_triton_tma_device() -> bool:
+    # [FUNCTION DOC] Return True if on-device TMA is available: Triton present, a capable
+    # CUDA, XPU or CPU backend exists, and either the old tensormap-create API or the new
+    # make_tensor_descriptor API imports (memoized).
     if has_triton_package():
         import torch
 
@@ -156,6 +185,8 @@ def has_triton_tma_device() -> bool:
 
 @functools.cache
 def has_datacenter_blackwell_tma_device() -> bool:
+    # [FUNCTION DOC] Return True only on datacenter Blackwell GPUs (CUDA capability 10.x, not
+    # HIP) that also have device and host tensor descriptor support (memoized).
     import torch
 
     if (
@@ -171,6 +202,8 @@ def has_datacenter_blackwell_tma_device() -> bool:
 
 @functools.lru_cache(None)
 def has_triton_stable_tma_api() -> bool:
+    # [FUNCTION DOC] Return True if Triton's stable TMA API (make_tensor_descriptor) is
+    # importable on a capable CUDA, XPU or CPU backend (memoized with an unbounded cache).
     if has_triton_package():
         import torch
 
@@ -194,6 +227,8 @@ def has_triton_stable_tma_api() -> bool:
 
 @functools.cache
 def has_triton_reduction_ordering() -> bool:
+    # [FUNCTION DOC] Return True if the installed Triton exposes a ReductionOrdering with an
+    # inner-tree option (memoized).
     """Whether the available Triton exposes inner-tree reduction ordering."""
     if has_triton_package():
         try:
@@ -207,6 +242,10 @@ def has_triton_reduction_ordering() -> bool:
 
 @functools.cache
 def has_triton() -> bool:
+    # [FUNCTION DOC] Return True if Triton is installed, device detection is not disabled in
+    # the inductor config, and some registered non-indexed device is available, Triton capable
+    # and has its Triton backend built (memoized). Skips devices whose backend check raises
+    # TritonUnavailableError; other errors propagate.
     if not has_triton_package():
         return False
 
@@ -241,6 +280,9 @@ def has_triton() -> bool:
 
 @functools.cache
 def triton_backend() -> Any:
+    # [FUNCTION DOC] Create and return the Triton backend object for the currently active
+    # driver target (memoized). If loading fails with a shared-object mapping error, raises
+    # the cache-directory ImportError; other errors propagate.
     from triton.compiler.compiler import make_backend
     from triton.runtime.driver import driver
 
@@ -254,6 +296,8 @@ def triton_backend() -> Any:
 
 
 def _extern_libs_key(backend: Any) -> str:
+    # [FUNCTION DOC] HELPER: Return a cache-key string built from the SHA-256 digests of the
+    # backend's extern library files that exist on disk (empty string if none).
     """Return a cache key fragment for extern libs (e.g. libdevice.10.bc).
 
     These files affect codegen but are not covered by triton_key() (Python
@@ -273,6 +317,8 @@ def _extern_libs_key(backend: Any) -> str:
 
 @functools.cache
 def triton_hash_with_backend() -> str:
+    # [FUNCTION DOC] Return an upper-case SHA-256 hex digest combining the Triton key and the
+    # backend hash (memoized). Creates the backend as a side effect.
     from torch._inductor.runtime.triton_compat import triton_key
 
     backend = triton_backend()

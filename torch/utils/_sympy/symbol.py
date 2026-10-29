@@ -1,3 +1,6 @@
+# [MODULE DOC] Canonical naming conventions for sympy symbols used by symbolic shapes and
+# inductor: an enum of symbol kinds, a mapping from kind to name prefix, and helpers to create
+# and classify symbols by prefix. No import-time side effects.
 """
 This file contains canonical definitions for our symbol naming conventions,
 across torch.fx.experimental.symbolic_shapes and torch._inductor.  The
@@ -18,6 +21,9 @@ import sympy
 
 
 class SymT(Enum):
+    # [CLASS DOC] Enum of symbol kinds (sizes, unbacked values, inductor temporaries, index
+    # variables, block dimensions, and so on); each member maps to a name prefix in
+    # prefix_str.
     SIZE = auto()
     FLOAT = auto()
     UNBACKED_INT = auto()
@@ -80,6 +86,8 @@ prefix_str = {
 
 
 def make_symbol(prefix: SymT, idx: int, **kwargs: bool | None) -> sympy.Symbol:
+    # [FUNCTION DOC] Create a sympy Symbol named by the prefix for the given kind followed by
+    # the integer idx; extra keyword assumptions are passed to the Symbol. Returns the symbol.
     # TODO: maybe put the assumptions here directly
     return sympy.Symbol(f"{prefix_str[prefix]}{idx}", **kwargs)
 
@@ -87,6 +95,12 @@ def make_symbol(prefix: SymT, idx: int, **kwargs: bool | None) -> sympy.Symbol:
 # This type is a little wider than it should be, because free_symbols says
 # that it contains Basic, rather than Symbol
 def symbol_is_type(sym: sympy.Basic, prefix: SymT | Iterable[SymT]) -> bool:
+    # [FUNCTION DOC] Check whether the lowercased name of symbol sym starts with the prefix of
+    # the given kind, or any of several kinds. Raises AssertionError if sym is not a sympy
+    # Symbol.
+    # KNOWN ISSUE: the stated invariant that no prefix is a prefix of another is violated (for
+    #   example the prefix for ZBLOCK is a prefix of the float prefixes, and the INDEX prefix
+    #   is a prefix of the indirect and template index prefixes), so matches can alias.
     if not isinstance(sym, sympy.Symbol):
         raise AssertionError("expected sympy.Symbol")
     name_str = sym.name.lower()  # Match capitalized names like XBLOCK, RBLOCK
@@ -97,4 +111,6 @@ def symbol_is_type(sym: sympy.Basic, prefix: SymT | Iterable[SymT]) -> bool:
 
 
 def free_symbol_is_type(e: sympy.Expr, prefix: SymT | Iterable[SymT]) -> bool:
+    # [FUNCTION DOC] Return True if any free symbol of expression e matches the given kind or
+    # kinds (via symbol_is_type).
     return any(symbol_is_type(v, prefix) for v in e.free_symbols)
