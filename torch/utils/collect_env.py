@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] Environment report tool used when filing bug reports. Runs shell commands and
+# queries torch to collect OS, compiler, CUDA/ROCm/XPU, driver, cuDNN, pip/conda and CPU info,
+# and prints a formatted report. Defines the SystemEnv namedtuple, package-name pattern lists,
+# many get_* collectors, get_env_info, pretty_str, get_pretty_env_info and main.
+# Import-time side effect: tries to import torch and sets TORCH_AVAILABLE accordingly.
+
 # Unlike the rest of the PyTorch this file must be python2 compliant.
 # This script outputs relevant system environment info
 # Run it with `python collect_env.py` or `python -m torch.utils.collect_env`
@@ -118,6 +124,10 @@ PIP_PATTERNS = [
 
 
 def run(command):
+    # [FUNCTION DOC] Runs a command (string via shell, otherwise an argument list) and waits.
+    # Returns (return code, stdout, stderr) decoded with the OEM code page on Windows or the
+    # preferred locale encoding elsewhere, both stripped. Raises OSError if the process
+    # cannot start.
     """Return (return-code, stdout, stderr)."""
     shell = type(command) is str
     p = subprocess.Popen(
@@ -135,6 +145,8 @@ def run(command):
 
 
 def run_and_read_all(run_lambda, command):
+    # [FUNCTION DOC] Runs command through run_lambda; returns the whole output when the return
+    # code is zero, otherwise None.
     """Run command using run_lambda; reads and returns entire output if rc is 0."""
     rc, out, _ = run_lambda(command)
     if rc != 0:
@@ -143,6 +155,8 @@ def run_and_read_all(run_lambda, command):
 
 
 def run_and_parse_first_match(run_lambda, command, regex):
+    # [FUNCTION DOC] Runs command via run_lambda and returns the first capture group of the first
+    # regex match in the output. Returns None on nonzero return code or when nothing matches.
     """Run command using run_lambda, returns the first regex match if it exists."""
     rc, out, _ = run_lambda(command)
     if rc != 0:
@@ -154,6 +168,8 @@ def run_and_parse_first_match(run_lambda, command, regex):
 
 
 def run_and_return_first_line(run_lambda, command):
+    # [FUNCTION DOC] Runs command via run_lambda and returns the first output line, or None if the
+    # return code is nonzero.
     """Run command using run_lambda and returns first line if output is not empty."""
     rc, out, _ = run_lambda(command)
     if rc != 0:
@@ -162,6 +178,9 @@ def run_and_return_first_line(run_lambda, command):
 
 
 def get_conda_packages(run_lambda, patterns=None):
+    # [FUNCTION DOC] Lists conda packages via the conda executable (CONDA_EXE or "conda") and
+    # keeps non-comment lines containing any of the patterns (default: all pattern lists).
+    # Returns the filtered text, or None when the conda command fails.
     if patterns is None:
         patterns = CONDA_PATTERNS + COMMON_PATTERNS + NVIDIA_PATTERNS + ONEAPI_PATTERNS
     conda = os.environ.get("CONDA_EXE", "conda")
@@ -177,20 +196,25 @@ def get_conda_packages(run_lambda, patterns=None):
 
 
 def get_gcc_version(run_lambda):
+    # [FUNCTION DOC] Returns the gcc version text parsed from the gcc version output, or None.
     return run_and_parse_first_match(run_lambda, "gcc --version", r"gcc (.*)")
 
 
 def get_clang_version(run_lambda):
+    # [FUNCTION DOC] Returns the clang version text parsed from the clang version output, or None.
     return run_and_parse_first_match(
         run_lambda, "clang --version", r"clang version (.*)"
     )
 
 
 def get_cmake_version(run_lambda):
+    # [FUNCTION DOC] Returns the cmake version text parsed from the cmake version output, or None.
     return run_and_parse_first_match(run_lambda, "cmake --version", r"cmake (.*)")
 
 
 def get_nvidia_driver_version(run_lambda):
+    # [FUNCTION DOC] Returns the NVIDIA driver version string, or None if unavailable. On macOS it
+    # parses the loaded CUDA kernel extension; elsewhere it parses the nvidia-smi output.
     if get_platform() == "darwin":
         cmd = "kextstat | grep -i cuda"
         return run_and_parse_first_match(
@@ -201,6 +225,9 @@ def get_nvidia_driver_version(run_lambda):
 
 
 def get_gpu_info(run_lambda):
+    # [FUNCTION DOC] Returns a description of the GPUs. On macOS or ROCm builds it uses torch
+    # (device name, plus the gcn architecture name on ROCm) when a device is available, else None.
+    # Otherwise it lists GPUs with nvidia-smi and strips the UUIDs; None if the command fails.
     if get_platform() == "darwin" or (
         TORCH_AVAILABLE
         and hasattr(torch.version, "hip")
@@ -227,10 +254,16 @@ def get_gpu_info(run_lambda):
 
 
 def get_running_cuda_version(run_lambda):
+    # [FUNCTION DOC] Returns the CUDA toolkit version parsed from the nvcc version output, or None.
     return run_and_parse_first_match(run_lambda, "nvcc --version", r"release .+ V(.*)")
 
 
 def get_cudnn_version(run_lambda):
+    # [FUNCTION DOC] Locates cuDNN libraries using a platform-specific search command (where on
+    # Windows, ls on macOS, ldconfig on Linux). Resolves symlinks, keeps existing files and
+    # sorts them.
+    # Returns the single path, or a "Probably one of the following" list for several. Falls back to
+    # the CUDNN_LIBRARY environment variable if the search finds nothing; otherwise returns None.
     """Return a list of libcudnn.so; it's hard to tell which one is being used."""
     if get_platform() == "win32":
         system_root = os.environ.get("SYSTEMROOT", "C:\\Windows")
@@ -268,6 +301,8 @@ def get_cudnn_version(run_lambda):
 
 
 def get_nvidia_smi():
+    # [FUNCTION DOC] Returns the nvidia-smi command string. On Windows it prefers an existing
+    # absolute path (System32, then the legacy NVSMI folder) wrapped in quotes; else the bare name.
     # Note: nvidia-smi is currently available only on Windows and Linux
     smi = "nvidia-smi"
     if get_platform() == "win32":
@@ -286,6 +321,8 @@ def get_nvidia_smi():
 
 
 def _detect_linux_pkg_manager():
+    # [FUNCTION DOC] HELPER: Returns the first available Linux package manager among dpkg, dnf,
+    # yum and zypper (checked with which), or "N/A" when not on Linux or none is found.
     if get_platform() != "linux":
         return "N/A"
     for mgr_name in ["dpkg", "dnf", "yum", "zypper"]:
@@ -296,6 +333,9 @@ def _detect_linux_pkg_manager():
 
 
 def get_linux_pkg_version(run_lambda, pkg_name):
+    # [FUNCTION DOC] Looks up the installed version of a package using the detected Linux package
+    # manager command and a per-manager column index. Returns the version string, or "N/A" if no
+    # manager is found, the command fails or prints nothing, or the output has too few columns.
     pkg_mgr = _detect_linux_pkg_manager()
     if pkg_mgr == "N/A":
         return "N/A"
@@ -332,6 +372,11 @@ def get_linux_pkg_version(run_lambda, pkg_name):
 
 
 def get_intel_gpu_driver_version(run_lambda):
+    # [FUNCTION DOC] Returns text listing Intel GPU driver versions, one bullet per entry. On Linux
+    # it reports versions of known driver packages that are installed; on Windows/Cygwin it queries
+    # PowerShell and parses the JSON. A JSON parse failure appends the raw text and error message.
+    # KNOWN ISSUE: if the PowerShell command fails, the text is None and json.loads raises
+    # TypeError, which is not caught (only ValueError is).
     lst = []
     platform = get_platform()
     if platform == "linux":
@@ -381,6 +426,10 @@ def get_intel_gpu_driver_version(run_lambda):
 
 
 def get_intel_gpu_onboard(run_lambda):
+    # [FUNCTION DOC] Returns text listing Intel GPUs present, one bullet per device. On Linux it
+    # parses xpu-smi discovery JSON; on Windows/Cygwin it queries PowerShell. Reports "N/A" when
+    # the command output is empty or no devices are listed, and appends raw text plus the error
+    # message when parsing fails.
     lst: list[str] = []
     platform = get_platform()
     if platform == "linux":
@@ -420,6 +469,8 @@ def get_intel_gpu_onboard(run_lambda):
 
 
 def get_intel_gpu_detected(run_lambda):
+    # [FUNCTION DOC] Returns a bullet list of XPU devices seen by torch with their properties, or
+    # "N/A" if torch or its xpu module is missing or no device exists. The argument is unused.
     if not TORCH_AVAILABLE or not hasattr(torch, "xpu"):
         return "N/A"
 
@@ -510,6 +561,10 @@ def get_intel_gpu_detected(run_lambda):
 
 
 def get_cpu_info(run_lambda):
+    # [FUNCTION DOC] Returns CPU information text: lscpu output on Linux, a PowerShell processor
+    # query formatted as key-value lines (JSON parsed) on Windows, and the sysctl brand string on
+    # macOS. Returns the command output on success, otherwise the error text. On other platforms
+    # the return code stays zero and the result is empty.
     rc, out, err = 0, "", ""
     if get_platform() == "linux":
         rc, out, err = run_lambda("lscpu")
@@ -544,6 +599,8 @@ def get_cpu_info(run_lambda):
 
 
 def get_platform():
+    # [FUNCTION DOC] Normalizes sys.platform to "linux", "win32", "cygwin" or "darwin"; any other
+    # value is returned unchanged.
     if sys.platform.startswith("linux"):
         return "linux"
     elif sys.platform.startswith("win32"):
@@ -557,10 +614,14 @@ def get_platform():
 
 
 def get_mac_version(run_lambda):
+    # [FUNCTION DOC] Returns the macOS product version string from sw_vers, or None.
     return run_and_parse_first_match(run_lambda, "sw_vers -productVersion", r"(.*)")
 
 
 def get_windows_version(run_lambda):
+    # [FUNCTION DOC] Returns a Windows description "Caption (Version Architecture)" from a
+    # PowerShell query. On JSON parse failure the raw text gets the error message appended.
+    # KNOWN ISSUE: if the query fails the text is None, so json.loads raises an uncaught TypeError.
     ret = run_and_read_all(
         run_lambda,
         'powershell.exe "gwmi -Class Win32_OperatingSystem | Select-Object -Property Caption,\
@@ -575,18 +636,24 @@ def get_windows_version(run_lambda):
 
 
 def get_lsb_version(run_lambda):
+    # [FUNCTION DOC] Returns the distribution description from lsb_release, or None.
     return run_and_parse_first_match(
         run_lambda, "lsb_release -a", r"Description:\t(.*)"
     )
 
 
 def check_release_file(run_lambda):
+    # [FUNCTION DOC] Returns the PRETTY_NAME value from the /etc release files, or None.
     return run_and_parse_first_match(
         run_lambda, "cat /etc/*-release", r'PRETTY_NAME="(.*)"'
     )
 
 
 def get_os(run_lambda):
+    # [FUNCTION DOC] Returns a human-readable OS description. Windows uses PowerShell, macOS uses
+    # sw_vers (None if unavailable), and Linux tries lsb_release, then the /etc release files, then
+    # the bare platform name, appending the machine architecture. Other platforms return
+    # their name.
     from platform import machine
 
     platform = get_platform()
@@ -618,12 +685,14 @@ def get_os(run_lambda):
 
 
 def get_python_platform():
+    # [FUNCTION DOC] Returns the platform description string from the platform module.
     import platform
 
     return platform.platform()
 
 
 def get_libc_version():
+    # [FUNCTION DOC] Returns the libc name and version joined by a dash on Linux, otherwise "N/A".
     import platform
 
     if get_platform() != "linux":
@@ -632,6 +701,10 @@ def get_libc_version():
 
 
 def get_pip_packages(run_lambda, patterns=None):
+    # [FUNCTION DOC] Runs the pip list command through the current interpreter and keeps lines that
+    # contain any pattern (default: all pattern lists). Returns (pip name, filtered text),
+    # where the name is "pip3" on Python 3; the text is None if pip fails. Side effect:
+    # sets the PIP_DISABLE_PIP_VERSION_CHECK environment variable.
     """Return `pip list` output. Note: will also find conda-installed pytorch and numpy packages."""
     if patterns is None:
         patterns = PIP_PATTERNS + COMMON_PATTERNS + NVIDIA_PATTERNS + ONEAPI_PATTERNS
@@ -655,6 +728,8 @@ def get_pip_packages(run_lambda, patterns=None):
 
 
 def get_cachingallocator_config() -> _Dict[str, str]:
+    # [FUNCTION DOC] Returns a mapping of the CUDA, HIP and generic allocator configuration
+    # environment variables that are set and non-empty to their values.
     """Return the caching allocator configuration from environment variables.
     """
     # pyrefly: ignore [bad-return]
@@ -670,6 +745,8 @@ def get_cachingallocator_config() -> _Dict[str, str]:
 
 
 def get_cuda_module_loading_config():
+    # [FUNCTION DOC] Returns the CUDA_MODULE_LOADING setting (empty string if unset) when torch is
+    # present and CUDA is available, initializing CUDA as a side effect; otherwise "N/A".
     if TORCH_AVAILABLE and torch.cuda.is_available():
         torch.cuda.init()
         config = os.environ.get("CUDA_MODULE_LOADING", "")
@@ -679,6 +756,8 @@ def get_cuda_module_loading_config():
 
 
 def is_xnnpack_available():
+    # [FUNCTION DOC] Returns the string form of whether XNNPACK is enabled in torch, or "N/A" when
+    # torch is not importable.
     if TORCH_AVAILABLE:
         import torch.backends.xnnpack
 
@@ -688,6 +767,10 @@ def is_xnnpack_available():
 
 
 def get_env_info():
+    # [FUNCTION DOC] Collects all environment details into a SystemEnv tuple by running the
+    # collectors above. Without torch, torch-derived fields are "N/A". Extends the XPU entry with
+    # driver, onboard and detected device info when XPU is available, and fills ROCm versions from
+    # the torch config when built with HIP. May initialize CUDA and set an environment variable.
     """
     Collects environment information to aid in debugging.
 
@@ -727,6 +810,8 @@ def get_env_info():
         else:  # HIP version
 
             def get_version_or_na(cfg, prefix):
+                # [FUNCTION DOC] HELPER: Returns the last whitespace-separated token of the first
+                # config line containing prefix, or "N/A" if no line matches.
                 _lst = [s.rsplit(None, 1)[-1] for s in cfg if prefix in s]
                 return _lst[0] if _lst else "N/A"
 
@@ -811,7 +896,13 @@ Versions of relevant libraries:
 
 
 def pretty_str(envinfo):
+    # [FUNCTION DOC] Formats a SystemEnv into the report text using env_info_fmt. Applies the
+    # cleanup steps: "No CUDA" markers when torch has no CUDA and the dynamic CUDA fields are
+    # missing, booleans to Yes/No, None to "Could not collect", empty package lists to a notice,
+    # and package lines prefixed with the pip or conda tag. Empty allocator config becomes "N/A".
     def replace_nones(dct, replacement="Could not collect"):
+        # [FUNCTION DOC] HELPER: Replaces None values in the mapping, in place, with the
+        # replacement text.
         for key in dct:
             if dct[key] is not None:
                 continue
@@ -819,6 +910,8 @@ def pretty_str(envinfo):
         return dct
 
     def replace_bools(dct, true="Yes", false="No"):
+        # [FUNCTION DOC] HELPER: Replaces True and False values in the mapping, in place,
+        # with the given strings.
         for key in dct:
             if dct[key] is True:
                 dct[key] = true
@@ -827,16 +920,22 @@ def pretty_str(envinfo):
         return dct
 
     def prepend(text, tag="[prepend]"):
+        # [FUNCTION DOC] HELPER: Prefixes every line of the text with the tag and returns
+        # the joined result.
         lines = text.split("\n")
         updated_lines = [tag + line for line in lines]
         return "\n".join(updated_lines)
 
     def replace_if_empty(text, replacement="No relevant packages"):
+        # [FUNCTION DOC] HELPER: Returns the replacement for an empty string; other values
+        # are returned unchanged.
         if text is not None and len(text) == 0:
             return replacement
         return text
 
     def maybe_start_on_next_line(string):
+        # [FUNCTION DOC] HELPER: Returns the string wrapped in newlines when it has multiple lines,
+        # so it starts on its own line; otherwise returns it unchanged.
         # If `string` is multiline, prepend a \n to it.
         if string is not None and len(string.split("\n")) > 1:
             return "\n{}\n".format(string)
@@ -897,6 +996,7 @@ def pretty_str(envinfo):
 
 
 def get_pretty_env_info():
+    # [FUNCTION DOC] Returns the formatted environment report string for get_env_info.
     """
     Returns a pretty string of environment information.
 
@@ -912,6 +1012,11 @@ def get_pretty_env_info():
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command-line entry: prints a progress line and the report to stdout.
+    # On Linux, if a crash-handler minidump directory exists, prints a notice with the newest
+    # dump path and creation time to stderr.
+    # KNOWN ISSUE: an existing but empty minidump directory makes max raise ValueError on an
+    # empty list.
     print("Collecting environment information...")
     output = get_pretty_env_info()
     print(output)
