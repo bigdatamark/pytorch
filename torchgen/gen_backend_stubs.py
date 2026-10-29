@@ -1,3 +1,8 @@
+# [MODULE DOC] Generates C++ stub files for external (out-of-tree) backends from a backend
+# yaml: the kernel class header and per-dispatch-key registration sources. Contents:
+# parse_backend_yaml (yaml validation and backend index creation), error_on_missing_kernels,
+# header and registration generators, run, and a command line main. Defines the
+# ParsedExternalYaml named tuple at import; no other import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -45,6 +50,18 @@ def parse_backend_yaml(
     grouped_native_functions: Sequence[NativeFunction | NativeFunctionsGroup],
     backend_indices: dict[DispatchKey, BackendIndex],
 ) -> ParsedExternalYaml:
+    # [FUNCTION DOC] Parses an external backend yaml file and registers its backend indices.
+    # Required keys: backend, cpp_namespace. Optional: class_name, use_out_as_primary and
+    # device_guard (booleans), supported, symint, autograd (lists), and full_codegen (added
+    # to supported), non_native and ir_gen (ignored here, re-parsed by the lazy generator).
+    # Creates a BackendIndex for the backend key (when ops are supported) and for the
+    # Autograd-prefixed key (when autograd ops are given), adding them to the passed
+    # backend_indices mapping (mutated in place; duplicate keys raise). Also checks that no op
+    # has kernels under both keys. Returns a ParsedExternalYaml tuple. Raises AssertionError
+    # on any invalid input.
+    # KNOWN ISSUE: valid_keys omits use_out_as_primary and device_guard, so the unexpected-key
+    # message does not list them even though they are accepted; also full_codegen entries
+    # are appended to the supported list in place.
     native_functions_map: dict[OperatorName, NativeFunction] = {
         f.func.name: f
         for f in concatMap(
@@ -143,6 +160,11 @@ def parse_backend_yaml(
         use_out_as_primary: bool,
         use_device_guard: bool,
     ) -> BackendIndex:
+        # [FUNCTION DOC] HELPER: Builds an external BackendIndex for dispatch_key from a list
+        # of operator name strings. Each op must exist among the native functions (else
+        # AssertionError); its kernel name is the dispatcher name, with a symint suffix when
+        # the op is in symint_ops. Metadata is non-structured and uses the enclosing
+        # cpp_namespace.
         metadata: dict[OperatorName, BackendMetadata] = {}
         for op in backend_ops:
             op_name = OperatorName.parse(op)
@@ -273,6 +295,13 @@ def error_on_missing_kernels(
     kernel_defn_file_path: str,
     full_codegen: list[OperatorName] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Checks that the backend's C++ implementation file defines every kernel
+    # the yaml promised. Reads kernel_defn_file_path (AssertionError if unreadable), computes the
+    # expected kernel names per operator for the backend and autograd keys (excluding
+    # full_codegen ops), counts definitions of the form class_name::name( found by a text
+    # pattern (ignoring lines where a colon precedes the class, i.e. calls), and compares
+    # per-name overload counts. Raises AssertionError listing the expected schemas for every
+    # kernel whose count differs. The textual match can miss cases; the linker is the backstop.
     try:
         with open(kernel_defn_file_path) as f:
             backend_defns = f.read()
@@ -335,6 +364,8 @@ def error_on_missing_kernels(
         if expected_overload_count != actual_overload_count:
 
             def create_decl(f: NativeFunction) -> str:
+                # [FUNCTION DOC] HELPER: Returns the dispatcher-style C++ declaration string
+                # of the function, computed inside its native function context.
                 with native_function_manager(f):
                     return DispatcherSignature.from_schema(f.func).decl()
 
@@ -350,6 +381,10 @@ but expected {expected_overload_count} kernel(s). The expected function schemas 
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses options for source yaml, output
+    # directory, dry run and optional kernel implementation file, then calls run.
+    # KNOWN ISSUE: dry-run uses a boolean type converter, so any non-empty string (even
+    # "False") enables it; its help text duplicates the output directory text.
     parser = argparse.ArgumentParser(description="Generate backend stub files")
     parser.add_argument(
         "-s",
@@ -383,6 +418,11 @@ def gen_dispatchkey_nativefunc_headers(
     autograd_dispatch_key: DispatchKey | None,
     backend_name: str = "",
 ) -> None:
+    # [FUNCTION DOC] Writes <backend_dispatch_key>NativeFunctions.h, which declares the kernel
+    # class for the backend. Collects the native function declarations for the backend key (and
+    # the autograd key if given), de-duplicated and sorted so output is deterministic, and
+    # renders them with the namespace wrapper and class name via the template through fm.
+    # Raises AssertionError if class_name is None.
     if class_name is None:
         raise AssertionError("class_name must not be None")
     generated_comment = (
@@ -446,6 +486,14 @@ def gen_dispatcher_registrations(
     backend_name: str = "",
     eager_registration: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Writes Register<dispatch_key>.cpp, the dispatcher registration source for
+    # one dispatch key of an external backend, from the RegisterDispatchKey template.
+    # Registration bodies are generated for every grouped native function, with SymInt enabled.
+    # With eager_registration the registrations go into a static library-impl block; otherwise
+    # into an exported function named after backend_name and the key that the caller invokes
+    # later. build_in_tree selects angle-bracket versus quoted include of the generated
+    # header; per_operator_headers controls the generic ATen include. Side effect: writes a
+    # file through fm. Raises AssertionError if class_name is None.
     headers = [
         f"{output_dir}/{backend_dispatch_key}NativeFunctions.h",
     ]
@@ -549,6 +597,14 @@ TORCH_API void Register${backend_name}${dispatch_key}NativeFunctions() {
 def run(
     source_yaml: str, output_dir: str, dry_run: bool, impl_path: str | None = None
 ) -> None:
+    # [FUNCTION DOC] End-to-end driver for generating external backend stubs.
+    # Parses the in-tree native functions and tags yaml (from the source tree, or the packaged
+    # copy when out of tree), then the backend yaml at source_yaml, which registers the backend
+    # kernels. Returns early without output if the yaml has no supported ops. Resolves the
+    # kernel class name (default derived from the backend index), optionally validates that
+    # impl_path defines all expected kernels, then writes the NativeFunctions header and one
+    # Register<key>.cpp per backend and autograd key into output_dir (nothing written when
+    # dry_run is set). Raises AssertionError on invalid yaml or missing kernels.
     # Assumes that this file lives at torchgen/gen_backend_stubs.py
     root = Path(__file__).absolute().parent.parent
     common_dir = os.path.join(root, "aten/src")  # Assumes root is pytorch_root
@@ -558,6 +614,8 @@ def run(
     template_dir = os.path.join(common_dir, "ATen/templates")
 
     def make_file_manager(install_dir: str) -> FileManager:
+        # [FUNCTION DOC] HELPER: Creates a FileManager writing into install_dir that reads
+        # templates from the template directory and honors the dry_run flag of the outer call.
         return FileManager(
             install_dir=install_dir, template_dir=template_dir, dry_run=dry_run
         )

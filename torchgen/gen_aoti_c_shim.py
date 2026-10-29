@@ -1,3 +1,9 @@
+# [MODULE DOC] Generates the AOTInductor C shim: C ABI wrapper functions (declarations in
+# c_shim_<device>.h and definitions in c_shim_<device>.cpp) around ATen kernels for the
+# fallback ops listed in torchgen/aoti/fallback_ops.py. Main contents: type conversion tables
+# and helpers, per-op declaration/definition generation with versioning, backend selection,
+# and gen_aoti_c_shim_files, which writes or verifies the files. Defines a module-level cache
+# of generated text. No other import-time side effects.
 from __future__ import annotations
 
 import difflib
@@ -86,6 +92,14 @@ def convert_arg_type_and_name(
     name: str,
     is_write: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
+    # [FUNCTION DOC] Maps a schema argument type and name to four parallel lists: C parameter
+    # types, C parameter names, ATen C++ types, and call-site expressions converting the C
+    # values to ATen values. Base types use lookup tables (Device expands to two parameters:
+    # type and index). Optional types add a pointer level and wrap with optional conversions.
+    # List types become a const pointer plus a length parameter named with a _len_ suffix; a
+    # write (out) tensor is passed by dereferenced handle.
+    # Raises NotImplementedError for unsupported types and AssertionError for lists whose
+    # element type needs several parameters or bool lists without a fixed size.
     if isinstance(typ, BaseType):
         if typ.name in base_type_to_c_type:
             if typ.name == BaseTy.Tensor and is_write:
@@ -202,6 +216,8 @@ def convert_arg_type_and_name(
 
 
 def zip_type_and_name(types: list[str], names: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Pairs each type with the name at the same position and returns
+    # "type name" strings; extra items in the longer list are dropped.
     return [typ + " " + name for typ, name in zip(types, names)]
 
 
@@ -209,6 +225,10 @@ def zip_type_and_name(types: list[str], names: list[str]) -> list[str]:
 def gen_arguments(
     flat_arguments: Sequence[Argument], skipped_args: set[str]
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] Builds C parameter declarations and C++ call-site expressions for the
+    # flat argument list. Arguments named in skipped_args get no parameter; their call-site
+    # expression is the schema default converted to C++ when present, else nullopt.
+    # Others are converted with convert_arg_type_and_name. Returns (declarations, expressions).
     types: list[str] = []
     new_names: list[str] = []
     callsite_exprs: list[str] = []
@@ -238,6 +258,12 @@ def gen_arguments(
 # are expected to return AOTITorchError.
 # Generate returns as declarations and callsite expressions
 def gen_returns(schema: FunctionSchema) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] Builds output-pointer parameter declarations (named ret0, ret1, ...) and
+    # the statements that store the call result into them. Each return must be a base type
+    # with a C mapping, else NotImplementedError is raised. Tensors are wrapped in new handles,
+    # SymInt is forced to int, Scalar to double. For a fixed list of ops the output pointers may
+    # be null and the store is guarded by a null check (matched by substring of the op name).
+    # Multiple returns are read from a tuple named tmp_result. Returns (declarations, statements).
     types = []
     names = []
     for idx, ret in enumerate(schema.returns):
@@ -250,6 +276,9 @@ def gen_returns(schema: FunctionSchema) -> tuple[list[str], list[str]]:
             )
 
     def convert_return(typ: BaseType, val: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ expression converting a returned value to its
+        # C representation: tensor handle creation, SymInt to int, Scalar to double, or the
+        # value unchanged.
         if typ.name == BaseTy.Tensor:
             return f"new_tensor_handle(std::move({val}))"
         elif typ.name == BaseTy.SymInt:
@@ -303,6 +332,9 @@ def _get_earliest_torch_version_for_op_variant(
     op_metadata: dict[str, str | dict[str, list[str] | str]],
     op_version: int,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the version macro name gating the given op variant, or
+    # None if ungated. Raises AssertionError if the since value is not a string of the
+    # expected macro form.
     """
     Return the TORCH_VERSION_X_Y_Z macro string at which the given op variant became
     available, or None if the variant is ungated.
@@ -334,6 +366,16 @@ def gen_declaration_and_definition(
     backend_call: str,
     op_metadata: dict[str, str | dict[str, list[str] | str]],
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] Generates the C declaration and definition text for an op on a device.
+    # backend_call is the C++ callee expression; op_metadata is the op's version info (keys
+    # "vN" with new_args and optional since, plus an optional top-level since).
+    # Validates the metadata (AssertionError for bad version keys, duplicates, non-dict
+    # variants or non-list new_args). Generates one function per version, newest first, with
+    # args introduced by newer versions replaced by defaults/nullopt in older ones; versioned
+    # names get a _vN suffix and variants with a since value are wrapped in a feature version
+    # preprocessor guard. Outputs are returned as (declarations, definitions), newline joined.
+    # Side effect: results are memoized in a module-level cache keyed by name, device, call.
+    # Raises NotImplementedError for unsupported types.
     base_name = schema.name.unambiguous_name()
 
     global declaration_definition_cache
@@ -442,6 +484,9 @@ def gen_declaration_and_definition(
 
 
 def gen_static_dispatch_backend_call_signature(f: NativeFunction) -> CppSignature:
+    # [FUNCTION DOC] Returns the C++ API signature (non-method, no fallback binding) of the
+    # function, choosing the SymInt variant when the dispatcher signature is symint and the
+    # schema has SymInt. Raises AssertionError if no such signature exists.
     sig = DispatcherSignature.from_schema(f.func)
     cpp_sigs = CppSignatureGroup.from_native_function(
         f, method=False, fallback_binding=False
@@ -459,6 +504,11 @@ def gen_static_dispatch_backend_call(
     f: NativeFunction,
     backend_index: BackendIndex | None = None,
 ) -> str:
+    # [FUNCTION DOC] Returns the C++ callee expression used by a shim to invoke the function.
+    # With no backend index: the at:: function name, except that method-only functions with
+    # SymInt parameters use the at::symint namespace form with the SymInt template argument
+    # (the _symint suffix is removed). With a backend index: the name qualified by the lowercase
+    # dispatch key namespace under at::.
     sig = DispatcherSignature.from_schema(f.func)
     cpp_sig = gen_static_dispatch_backend_call_signature(f)
 
@@ -489,6 +539,12 @@ def get_backend_index_for_aoti(
     backend_indices: dict[DispatchKey, BackendIndex],
     extend_aoti_c_shim: bool,
 ) -> BackendIndex | None:
+    # [FUNCTION DOC] Chooses the backend index whose kernel the C shim should call.
+    # Returns None when dispatch_key is None (generic aten call). Otherwise prefers the index
+    # of dispatch_key if it has a kernel for the function (directly or through its structured
+    # delegate's group). If not, and extend_aoti_c_shim is false, falls back in order to the
+    # CompositeExplicitAutograd, CompositeExplicitAutogradNonFunctional and
+    # CompositeImplicitAutograd indices; returns None if none has a kernel.
     backend_index = None
 
     if dispatch_key is None:
@@ -531,6 +587,10 @@ def get_header_for_aoti(
     backend_indices: dict[DispatchKey, BackendIndex],
     extend_aoti_c_shim: bool,
 ) -> str | None:
+    # [FUNCTION DOC] Returns the include line for the ATen header needed to call the function's
+    # backend implementation: the per-dispatch-key dispatch header when a backend index is
+    # found, the generic operator header when the dispatch key is None and no index exists,
+    # otherwise None.
     backend_index = get_backend_index_for_aoti(
         func, func_group_mapping, dispatch_key, backend_indices, extend_aoti_c_shim
     )
@@ -543,6 +603,9 @@ def get_header_for_aoti(
 
 
 def get_fallback_op_name(func: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the fully qualified fallback op name used as key in the fallback
+    # ops lists: namespace, base name and overload name joined by dots, with the overload
+    # "default" when the overload name is empty.
     return (
         f"{func.namespace}.{func.func.name.name}.{func.func.name.overload_name}"
         if func.func.name.overload_name
@@ -559,6 +622,11 @@ def gen_c_shim(
     header: bool,
     extend_aoti_c_shim: bool,
 ) -> str | None:
+    # [FUNCTION DOC] Produces the C shim declaration (header true) or definition for one
+    # native function on one backend. Returns None when the backend has no kernel to call for
+    # a non-generic dispatch key, or when an argument or return type is unsupported (the
+    # NotImplementedError from conversion is swallowed). Otherwise returns the text for all
+    # versions of the op as computed by gen_declaration_and_definition (which caches results).
     backend_index = get_backend_index_for_aoti(
         func, func_group_mapping, dispatch_key, backend_indices, extend_aoti_c_shim
     )
@@ -590,6 +658,12 @@ def gen_c_shim(
 
 @dataclass(frozen=True)
 class ShimGenerator:
+    # [CLASS DOC] Immutable callable that generates the C shim text for a single native
+    # function. Fields: the fallback ops metadata mapping (op name to version info), the
+    # mapping from operator name to structured function group, the dispatch key (None for
+    # generic aten), the backend indices, header (true for declarations, false for
+    # definitions) and extend_aoti_c_shim (out-of-tree extension mode).
+    # Intended to be passed to mapMaybe over native functions.
     inductor_fallback_ops: dict[str, dict[str, str | dict[str, list[str] | str]]]
     func_group_mapping: dict[OperatorName, NativeFunctionsGroup]
     dispatch_key: DispatchKey | None
@@ -602,6 +676,10 @@ class ShimGenerator:
         self,
         func: NativeFunction,
     ) -> str | None:
+        # [FUNCTION DOC] Generates the shim declaration or definition for one native function.
+        # Looks up the function's version metadata in the fallback ops mapping by its fallback
+        # op name (raises KeyError if absent) and delegates to gen_c_shim. Returns the text or
+        # None when the function is not supported for this backend.
         version_info = self.inductor_fallback_ops[get_fallback_op_name(func)]
         result = gen_c_shim(
             func,
@@ -625,6 +703,13 @@ def gen_aoti_c_shim(
     extend_aoti_c_shim: bool,
     includes: str = "",
 ) -> str:
+    # [FUNCTION DOC] Builds the full text of one generated C shim file (header or source).
+    # The body is the concatenation of per-function shims produced by ShimGenerator for the
+    # native functions that yield one. For the header (header true) it adds the autogenerated
+    # warning, pragma once, shim include and an extern "C" block. For the source it adds the
+    # warning, includes of the generated header, utils and ATen function headers (the given
+    # includes string is used when per-operator headers are enabled) and a using directive.
+    # Pure function; returns the text.
     body = "\n".join(
         list(
             mapMaybe(
@@ -718,6 +803,15 @@ def gen_aoti_c_shim_files(
     extend_aoti_c_shim: bool,
     update_aoti_c_shim: bool,
 ) -> None:
+    # [FUNCTION DOC] Writes the AOTInductor C shim files for every requested backend.
+    # For each backend (None means the generic aten backend, which uses aten_shimified_ops;
+    # others use inductor_fallback_ops) it selects the native functions listed as fallbacks,
+    # sorted by op name, and builds the header text. If update_aoti_c_shim is true the header
+    # is written through aoti_fm; otherwise the checked-in header under the install dir is
+    # compared with the freshly generated one, and a RuntimeError containing a unified diff and
+    # guidance is raised on mismatch (a missing old header only prints a message). The .cpp
+    # file c_shim_<device>.cpp is always written, with the needed ATen includes plus
+    # extra_cuda_headers for CUDA-like keys. extend_aoti_c_shim selects out-of-tree layout.
     structured_func_group_dict = {}
     for func_group in structured_native_functions:
         for func in func_group.functions():
@@ -801,6 +895,9 @@ https://github.com/pytorch/pytorch/pull/154848 as an example.
 
         # cpp files are always generated on-the-fly
         def headers_for_aoti() -> str:
+            # [FUNCTION DOC] HELPER: Closure over the current loop state. Returns a newline
+            # joined, sorted, de-duplicated list of include lines needed by the fallback
+            # functions for the current dispatch key (functions with no header are skipped).
             headers = []
             for func in fallback_native_functions:
                 header = get_header_for_aoti(

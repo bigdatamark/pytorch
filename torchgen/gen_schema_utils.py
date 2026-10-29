@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities that build torchgen schema objects (types, arguments, returns and
+# function schemas) from real example values rather than from native_functions.yaml text.
+# Not used by the code generators themselves; used e.g. for HigherOrderOperator schemas.
+# No import-time side effects besides imports.
 from typing import Any
 
 from torchgen.model import (
@@ -21,6 +25,8 @@ from torchgen.model import (
 
 
 class TypeGen:
+    # [CLASS DOC] Stateless namespace that infers schema types from example values.
+    # convert_to_base_ty maps the Python scalar types int, float, str, bool to BaseTy members.
     convert_to_base_ty = {
         int: BaseTy.int,
         float: BaseTy.float,
@@ -30,6 +36,13 @@ class TypeGen:
 
     @staticmethod
     def from_example(obj: Any) -> BaseType | ListType | CustomClassType:
+        # [FUNCTION DOC] Infers a schema type from an example runtime value.
+        # GraphModule, Tensor, SymInt and SymBool map to their base types; a script object
+        # maps to a custom class type named after its class; int, float, str and bool map to
+        # the matching base type. A list or tuple maps to a list type carrying the length and
+        # the element type. Imports torch lazily.
+        # Raises AssertionError for an empty sequence, RuntimeError for a sequence whose
+        # elements have differing types, and RuntimeError for any other unsupported type.
         import torch
 
         if isinstance(obj, torch.fx.GraphModule):
@@ -60,30 +73,42 @@ class TypeGen:
 
 
 class ReturnGen:
+    # [CLASS DOC] Stateless namespace that builds schema Return objects from example values.
     @staticmethod
     def from_example(
         name: str | None, obj: Any, annotation: Annotation | None
     ) -> Return:
+        # [FUNCTION DOC] Builds a Return with optional name and annotation, whose type is
+        # inferred from the example value obj. Raises on unsupported values.
         return Return(name, TypeGen.from_example(obj), annotation)
 
 
 class ArgumentGen:
+    # [CLASS DOC] Stateless namespace that builds schema Argument objects from example values.
     @staticmethod
     def from_example(
         name: str, obj: Any, default: str | None, annotation: Annotation | None
     ) -> Argument:
+        # [FUNCTION DOC] Builds an Argument with the given name, default string and annotation,
+        # whose type is inferred from the example value obj. Raises on unsupported values.
         return Argument(
             name, TypeGen.from_example(obj), default=default, annotation=annotation
         )
 
 
 class FunctionSchemaGen:
+    # [CLASS DOC] Stateless namespace that builds a whole FunctionSchema from example values.
     @staticmethod
     def from_example(
         op_name: str,
         example_inputs: tuple[tuple[str, Any], ...],
         example_outputs: tuple[Any, ...],
     ) -> FunctionSchema:
+        # [FUNCTION DOC] Builds a FunctionSchema for an operator from example runtime values.
+        # op_name: operator name. example_inputs: sequence of (argument name, example value)
+        # pairs. example_outputs: sequence of example return values.
+        # All inputs become positional arguments without defaults or alias annotations;
+        # returns are unnamed. Raises whatever the type inference raises for unsupported values.
         args = []
         for name, inp in example_inputs:
             args.append(ArgumentGen.from_example(name, inp, None, None))

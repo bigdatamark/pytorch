@@ -1,3 +1,9 @@
+# [MODULE DOC] Lazy tensor backend code generator. Reads a backend yaml and the ATen native
+# functions and writes the lazy IR header, non-native IR header, native function header and
+# source, and dispatcher registration files. Contents: yaml key parsing, shape inference
+# header validation, helper C++ text, default_args, a command line main, and the
+# run_gen_lazy_tensor driver. Defines a ParsedExternalYaml tuple type at import; no other
+# import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -99,6 +105,10 @@ def parse_native_functions_keys(
     backend_yaml_path: str,
     grouped_native_functions: Sequence[NativeFunction | NativeFunctionsGroup],
 ) -> tuple[list[OperatorName], list[Any], list[OperatorName]]:
+    # [FUNCTION DOC] Reads the backend yaml and extracts the lazy-specific keys.
+    # Returns (full_codegen operator names, non_native entries as raw yaml values, ir_gen
+    # operator names). Each key defaults to an empty list; AssertionError if the file is not a
+    # mapping or a key is not a list. grouped_native_functions is unused.
     with open(backend_yaml_path) as f:
         yaml_values = yaml.load(f, Loader=YamlLoader)
     if not isinstance(yaml_values, dict):
@@ -123,6 +133,10 @@ def parse_native_functions_keys(
 def validate_shape_inference_header(
     shape_inference_hdr: str, expected_shape_infr_decls: list[str]
 ) -> None:
+    # [FUNCTION DOC] Checks that every expected shape inference declaration line appears
+    # verbatim as a line in the header file. Reads shape_inference_hdr (AssertionError if it
+    # cannot be read). Raises a generic Exception listing the missing declarations otherwise.
+    # KNOWN ISSUE: the error message text is garbled ("Please add declare this function").
     try:
         with open(shape_inference_hdr) as f:
             shape_infr_decls = f.read()
@@ -148,6 +162,9 @@ and implement it in the corresponding shape_inference.cpp file.\n
 
 # Some helper functions for the codegen.
 def get_ltc_helper_fns() -> str:
+    # [FUNCTION DOC] HELPER: Returns constant C++ source text defining to_meta overloads that
+    # convert a tensor, optional tensor, or tensor list to meta-device tensors (preserving
+    # the wrapped-number flag); included in the generated native functions file.
     return """\
 at::Tensor to_meta(const at::Tensor& tensor) {
   // undefined tensors can't be converted to the meta device, since they don't have sizes/strides
@@ -180,6 +197,9 @@ std::vector<at::Tensor> to_meta(at::ITensorListRef t_list) {
 
 
 class default_args:
+    # [CLASS DOC] Namespace of default values (class attributes, never instantiated) for the
+    # lazy tensor generator: node base class and header, shape inference header, tensor class
+    # and header, IR and native definition generator classes, and backend name.
     node_base: str = "Node"
     node_base_hdr: str | None = None
     shape_inference_hdr: str = "torch/csrc/lazy/core/shape_inference.h"
@@ -193,6 +213,12 @@ class default_args:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Parses options (source yaml, output dir, dry
+    # run, impl path, TS lowerings flag, node base, headers, tensor class, backend name),
+    # selects the TorchScript IR generator when lowerings are requested, and calls
+    # run_gen_lazy_tensor with the ATen source path derived from this file location.
+    # KNOWN ISSUE: dry-run uses a boolean type converter so any non-empty string enables it,
+    # and its help text duplicates the output directory text.
     parser = argparse.ArgumentParser(description="Generate Lazy Tensor backend files")
     parser.add_argument(
         "-s",
@@ -326,6 +352,19 @@ def run_gen_lazy_tensor(
     lazy_tensor_ptr: str = "LazyTensorPtr",
     get_device_fn: str = "torch::lazy::GetBackendDevice",
 ) -> None:
+    # [FUNCTION DOC] Main driver: generates all lazy tensor backend sources into output_dir.
+    # Sets the global lazy value C++ type from lazy_value_class (side effect), parses native
+    # and backend yaml (sorting groups by base name for deterministic output), optionally
+    # validates kernels in impl_path and the shape inference header, then writes: the
+    # NativeFunctions header, dispatcher registration files (non-eager), the
+    # NativeFunctions source with IR-building definitions for full_codegen ops, LazyIr.h with
+    # IR classes for full_codegen plus ir_gen ops, and LazyNonNativeIr.h for non_native ops.
+    # The many string parameters are C++ names that customize generated code (xla migration
+    # hooks, to be removed). Nothing is written when dry_run is set.
+    # Raises AssertionError for a missing backend key or class name, and Exception when
+    # shape inference declarations are missing.
+    # KNOWN ISSUE: the shape inference header may be None, yet it is still put into the
+    # generated include list.
     lv_tokens = lazy_value_class.split("::")
     lv_class = lv_tokens[-1]
     lv_ns = "::".join(lv_tokens[:-1])
@@ -333,6 +372,8 @@ def run_gen_lazy_tensor(
     template_dir = os.path.join(aten_path, "templates")
 
     def make_file_manager(install_dir: str) -> FileManager:
+        # [FUNCTION DOC] HELPER: Creates a FileManager writing into install_dir using the
+        # template directory and dry_run flag of the enclosing call.
         return FileManager(
             install_dir=install_dir, template_dir=template_dir, dry_run=dry_run
         )
@@ -349,6 +390,8 @@ def run_gen_lazy_tensor(
     grouped_native_functions = get_grouped_native_functions(native_functions)
 
     def sort_native_function(f: NativeFunctionsGroup | NativeFunction) -> str:
+        # [FUNCTION DOC] HELPER: Sort key; returns the base operator name (without overload) of
+        # the group's functional variant, or of the function itself.
         """
         We sort the native function because of the note in concat_map_codegen.
         TODO(alanwaketan): Remove this sorting hack once all ops are grouped properly.
@@ -381,6 +424,9 @@ def run_gen_lazy_tensor(
         xs: Iterable[NativeFunctionsGroup | NativeFunction],
         ops_list: list[OperatorName] = full_codegen,
     ) -> Iterator[str]:
+        # [FUNCTION DOC] HELPER: Generator that flattens groups into individual native
+        # functions (a lone function is used as is) and, for each function whose operator name
+        # is in ops_list (default: the full_codegen list), yields every string func returns.
         """
         We code-gen for the functional variant, which is all we need for IR classes/lowerings/shape inferences, but we
         only code-gen additional entries for the inplace variant for the native functions.
