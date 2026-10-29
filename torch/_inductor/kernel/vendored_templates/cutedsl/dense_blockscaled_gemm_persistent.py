@@ -1,3 +1,13 @@
+# [MODULE DOC] Vendored CuTe DSL kernel for the NVIDIA Blackwell (SM100) persistent batched
+# dense block-scaled GEMM (MXF8 / MXF4 / NVF4 inputs with per-block scale factors).
+# Main contents: the Sm100BlockScaledPersistentDenseGemmKernel class (configuration, host-side
+# launch in __call__, the device kernel with TMA-load, MMA and epilogue warp roles, helper
+# partition methods, and static validity checks such as can_implement), plus the jit helper
+# cvt_sf_MKL_to_M32x4xrm_K4xrk_L that rewrites a scale factor tensor into the MMA layout.
+# This variant extends the upstream example with a TMA prefetch option, an optional global alpha
+# scale, extra epilogue input tensors/outputs, and a grouped local reduction fused in the epilogue.
+# Import-time side effects: imports cutlass / cuda.bindings (must be installed); no global state
+# is modified. The long string after the imports is a free-floating description, not a docstring.
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # ruff: noqa: S101
@@ -125,6 +135,13 @@ Constraints:
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
+    # [CLASS DOC] Configurable SM100 persistent block-scaled batched GEMM: C = (A * SFA) x (B * SFB),
+    # optionally scaled by alpha and post-processed by a fused epilogue (extra input tensors,
+    # multiple outputs, grouped local reduction). Constructor stores static config (tiler, cluster,
+    # warp role ids, barriers, smem capacity, TMEM columns); __call__ derives dtype/layout-dependent
+    # attributes, builds TMA atoms and shared storage, then launches `kernel`. Warp roles: warps 0-3
+    # epilogue, warp 4 MMA, warp 5 TMA load. Most attributes beyond __init__ are set in __call__ and
+    # _setup_attributes, so those must run before `kernel` is used.
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -180,6 +197,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
     ):
+        # [FUNCTION DOC] Store the static kernel configuration: float32 accumulator, scale factor
+        # vector size, 2-CTA mode (when the MMA tiler M is 256), cluster shape, MMA tiler (K filled
+        # in later), CTA group, optional TMA prefetch flag, warp role ids, named barriers for epilogue
+        # sync and TMEM pointer sync, SM100 shared memory capacity and TMEM column count (512).
+        # Pure host-side setup; no validation is performed (see can_implement).
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
         This configuration includes several key aspects:
@@ -242,6 +264,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
     def _setup_attributes(self):
+        # [FUNCTION DOC] HELPER: Derive all input-dependent configuration after dtypes/majors are set:
+        # builds the tiled MMA (and an N-rounded variant for SFB), fills in the K part of the MMA
+        # tiler, CTA tile shapes, cluster layouts, multicast CTA counts, epilogue tile, pipeline
+        # stage counts (via _compute_stages), staged shared memory layouts for A/B/SFA/SFB/C, and the
+        # TMEM column budget. Enables overlapping accumulators when only one accumulator stage fits.
+        # Mutates self only; requires a_dtype, b_dtype, sf_dtype, c_dtype, major modes, c_layout.
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -443,6 +471,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         local_reduce_source: cutlass.Constexpr = "identity",
         local_reduce_feeds_main: cutlass.Constexpr = False,
     ):
+        # [FUNCTION DOC] Jit host entry point: converts torch-convention (L,M,K)/(L,K,N)/(L,M,N)
+        # tensors to CuTe (M,K,L)/(N,K,L)/(M,N,L) layouts (also for epilogue tensors/outputs and the
+        # local reduce tensor), records epilogue/local-reduce options, derives dtypes and majors,
+        # calls _setup_attributes, builds TMA atoms/tensors for A, B, SFA, SFB (load) and C (store),
+        # reshapes the SFB layout for 192-wide N tiles, computes TMA byte counts, tile scheduler
+        # params and grid, defines the SharedStorage struct, then launches `kernel` with
+        # threads_per_cta threads and the cluster shape.
+        # Raises TypeError if A and B element types differ. Optional alpha scales the accumulator.
+        # KNOWN ISSUE: the docstring does not list the many epilogue / local-reduce parameters.
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
         - Setup TMA load/store atoms and tensors
@@ -473,6 +510,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # CUTLASS API passes tensors as A:(L,M,K) B:(L,K,N) C:(L,M,N)
         # but CuTe DSL kernels expect A:(M,K,L) B:(N,K,L) C:(M,N,L).
         def add_batch_mode(tensor: cute.Tensor) -> cute.Tensor:
+            # [FUNCTION DOC] HELPER: Return a view of the tensor with a leading batch mode of size 1
+            # prepended so its rank is 3 (no-op for already rank-3 layouts); shares the iterator.
             return cute.make_tensor(
                 tensor.iterator,
                 cute.prepend(tensor.layout, cute.make_layout(1), up_to_rank=3),
@@ -506,6 +545,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         def epilogue_tensor_to_mnl(tensor: cute.Tensor) -> cute.Tensor:
+            # [FUNCTION DOC] HELPER: Make an epilogue input/output tensor rank 3 and reorder its modes
+            # from (L,M,N) to (M,N,L) to match the C tensor convention.
             tensor = add_batch_mode(tensor)
             return cute.make_tensor(
                 tensor.iterator, cute.select(tensor.layout, [1, 2, 0])
@@ -692,6 +733,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
+            # [CLASS DOC] HELPER: Shared memory struct layout for one CTA: mbarriers for the AB and
+            # accumulator pipelines, TMEM dealloc barrier and TMEM pointer holder, 1024-byte aligned
+            # staged buffers for C, A, B, SFA, SFB, and a small float32 scratch buffer used for
+            # cross-warp local reduction (size 1 when unused). Sizes depend on the enclosing self.
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
@@ -834,8 +879,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epilogue_output2: cute.Tensor,
         local_reduce_tensor: cute.Tensor,
     ):
-        """
-        GPU device kernel performing the Persistent batched GEMM computation.
+        # [FUNCTION DOC] GPU device kernel with warp specialization and a persistent tile loop.
+        # Setup: prefetch TMA descriptors, init AB / accumulator pipelines and the TMEM allocator,
+        # carve shared memory tensors, build multicast masks and partition global/shared/TMEM
+        # tensors. Roles: TMA warp loads A/B/SFA/SFB tiles per k-tile (optional prefetch ahead);
+        # MMA warp (leader CTA) copies scale factors smem->TMEM and issues block-scaled MMAs per
+        # k-block into the accumulator stage; epilogue warps allocate TMEM, read the accumulator in
+        # subtiles, apply alpha, epilogue_op with optional extra input tensors, write extra outputs,
+        # optionally compute grouped local reductions (along N in registers, or along M via warp
+        # shuffles and shared memory), convert to C type, stage through smem and TMA-store to C.
+        # Frees TMEM at the end. Writes C and optional outputs / reduce tensor in global memory.
+        # Out-of-range elements for extra tensors/outputs are guarded by bounds checks.
+        # KNOWN ISSUE: the local_reduce source asserts use plain assert (stripped under -O).
+ performing the Persistent batched GEMM computation.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -2125,6 +2181,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sSF: cute.Tensor,
         tSF: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Build the shared-memory-to-TMEM tiled copy (tcgen05 4x32x128b copy atom) for
+        # a scale factor tensor and partition it. Args: sSF smem scale factor tensor, tSF TMEM
+        # scale factor tensor (zero-stride modes filtered out). Returns (tiled copy, smem source
+        # converted to descriptors, TMEM destination).
         """
         Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
 
@@ -2171,6 +2231,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Build the TMEM-to-register tiled copy for the accumulator and partition for
+        # this thread. Args: tidx epilogue thread index, tAcc staged accumulator tensor, gC_mnl
+        # partitioned global C (used for shape), epi_tile, use_2cta_instrs. Returns (tiled copy,
+        # partitioned TMEM source over all stages/subtiles, register tensor for one subtile).
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
 
@@ -2233,6 +2297,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tidx: cutlass.Int32,
         sC: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Build the register-to-shared-memory tiled copy for C (matching the T2R copy
+        # thread layout) and partition. Args: the T2R tiled copy, register tensor tTR_rC, thread
+        # index, smem tensor sC. Returns (tiled copy, retiled register source, partitioned smem dest).
+        # KNOWN ISSUE: docstring contains a stray ":type sepi" entry for a nonexistent parameter.
         """
         Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
 
@@ -2271,6 +2339,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         sC: cute.Tensor,
     ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Partition shared memory C (source) and global C (destination) for the TMA
+        # store using the given TMA atom (tidx is unused; single-CTA layout). Returns (the atom,
+        # partitioned smem tensor, partitioned global tensor over epilogue subtiles and tile coords).
         """Make tiledCopy for global memory store, then use it to:
         partition shared memory (source) and global memory (destination) for TMA store version.
 
@@ -2324,6 +2395,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         smem_capacity: int,
         occupancy: int,
     ) -> Tuple[int, int, int]:
+        # [FUNCTION DOC] HELPER: Heuristic stage counts. Accumulator stages: 1 if MMA tiler N is 256
+        # else 2. C stages start at 2. A/B/SFA/SFB stages fill the shared memory per CTA left after
+        # 1024 bytes of barrier overhead and the initial C buffers; any leftover smem is added as
+        # extra C stages. Returns (acc stages, ab stages, c stages). Static; no side effects.
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -2428,6 +2503,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+        # [FUNCTION DOC] HELPER: Divide C by the CTA tile to get the CTA count per (M, N, L), build
+        # persistent tile scheduler params with the cluster shape, and derive the launch grid limited
+        # by max_active_clusters. Returns (scheduler params, grid shape).
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
         :param c: The output tensor C
@@ -2465,6 +2543,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
     ) -> bool:
+        # [FUNCTION DOC] Return True only if: A/B dtype is Float4E2M1FN, Float8E5M2 or Float8E4M3FN;
+        # sf_vec_size is 16 or 32; sf dtype is Float8E8M0FNU or Float8E4M3FN; E4M3 scale factors are
+        # not used with vector size 32; fp8 A/B are not used with vector size 16; and the C dtype is
+        # Float32, Float16, BFloat16 or an fp8 type. Pure check.
         """
         Check if the dtypes and sf_vec_size are valid combinations
 
@@ -2524,6 +2606,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Return False when A/B are Float4E2M1FN and either A or B is not K-major
+        # (major strings "k"); otherwise True. c_dtype and c_major are accepted but unused.
         """
         Check if layouts and dtypes are valid combinations
 
@@ -2552,6 +2636,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
     ) -> bool:
+        # [FUNCTION DOC] Return True only if MMA tiler M is 128 or 256, tiler N is 64/128/192/256,
+        # cluster M is even when tiler M is 256, and cluster M and N are positive powers of two,
+        # each at most 4 (scale factor multicast limit), with product at most 16. Pure check.
         """
         Check if the mma tiler and cluster shape are valid
 
@@ -2600,6 +2687,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Return True only if the contiguous (major) dimension of A, B and C is a
+        # multiple of the element count that fills 16 bytes for the respective dtype. Pure check.
+        # KNOWN ISSUE: docstring parameter descriptions for n, k, l are inaccurate (l is batch).
         """
         Check if the tensor alignment is valid
 
@@ -2628,6 +2718,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         is_valid = True
 
         def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
+            # [FUNCTION DOC] HELPER: True if the size of the major dimension (mode 0 or mode 1 of the
+            # shape) is divisible by the number of dtype elements in 16 bytes.
             major_mode_idx = 0 if is_mode0_major else 1
             num_major_elements = tensor_shape[major_mode_idx]
             num_contiguous_elements = 16 * 8 // dtype.width
@@ -2657,6 +2749,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_major: str,
         c_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Combine the dtype/vector-size, layout, MMA tiler/cluster and tensor
+        # alignment checks; return True only if all pass. Pure check; never raises on invalid input.
         """
         Check if the gemm can be implemented
 
@@ -2719,6 +2813,10 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     sf_ref_tensor: cute.Tensor,
     sf_mma_tensor: cute.Tensor,
 ):
+    # [FUNCTION DOC] Jit helper: copy every element of a reference scale factor tensor (logical
+    # MKL layout) into the MMA-layout scale factor tensor, whose flat shape (32, 4, rest_m, 4,
+    # rest_k, l) is regrouped into ((32, 4, rest_m), (4, rest_k), l). Loops over all elements of the
+    # reference, using each hierarchical coordinate to index both tensors. Writes sf_mma_tensor.
     """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
     # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
     # group to ((32, 4, rest_m), (4, rest_k), l)
