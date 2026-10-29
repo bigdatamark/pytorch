@@ -1,4 +1,22 @@
 # mypy: ignore-errors
+# [MODULE DOC] Shared OpInfo support code for PyTorch's operator tests (consumed by test_ops.py,
+# test_unary_ufuncs.py and others). Contents: hundreds of sample-input generators
+# (sample_inputs_*), error-input generators (error_inputs_*), reference-input generators
+# (reference_inputs_*), NumPy/SciPy reference implementations (reference_*), foreach sample-input
+# classes, and the large databases of OpInfo objects: foreach_*_op_db lists, op_db (all operators,
+# sorted alphabetically), dsl_ops_by_dsl (operators for native DSL backends) and python_ref_db
+# (PythonRefInfo entries for torch._refs functions).
+# The generator functions are plain Python generators that take the OpInfo, a device, a dtype and a
+# requires_grad flag and yield SampleInput or ErrorInput objects built with make_tensor; they
+# produce no output and keep no state.
+# At the end it derives filtered lists from op_db and python_ref_db (ops_and_refs, unary_ufuncs,
+# binary_ufuncs, spectral_funcs, shape_funcs, reduction_ops, sparse and masked subsets) and defines
+# small helpers (index_variable, gather_variable, bernoulli_scalar, mask_not_all_zeros).
+# Import time side effects: imports the opinfo helper packages, optionally imports scipy (when
+# TEST_SCIPY is set), builds all the OpInfo databases (slow, populates module globals), reads the
+# environment variable OPINFO_RESTRICT_TO_DSL and, when it is set, validates it against the known
+# DSL backends (raising a ValueError if unknown), prints a message, and replaces op_db with only
+# the entries of that DSL (empty if none); otherwise all DSL entries are appended to op_db.
 
 from functools import wraps, partial
 from itertools import product, chain, islice
@@ -162,11 +180,15 @@ if TEST_SCIPY:
 
 
 def round_up(x: int, y: int) -> int:
+    # [FUNCTION DOC] HELPER: Round the integer x up to the nearest multiple of y and return it.
     return ((x + y - 1) // y) * y
 
 
 # test if a tensor is close to an integer
 def close_to_int(x, eps=0.1):
+    # [FUNCTION DOC] HELPER: Return a boolean tensor, elementwise, that is true where x is within
+    # eps of an integer. For complex input the fractional part is taken separately on the real and
+    # imaginary parts and combined by magnitude. No side effects.
     if x.is_complex():
         y = torch.abs(torch.view_as_complex(torch.frac(torch.view_as_real(x))))
     else:
@@ -175,6 +197,10 @@ def close_to_int(x, eps=0.1):
 
 
 def sample_inputs_slice(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for slice: a 1-D tensor with only a dim
+    # argument, and a 3-D tensor with dim, start, end and optional step keyword arguments,
+    # including negative start and end. The op_info, requires_grad and extra keyword arguments are
+    # accepted for API compatibility; requires_grad is applied to the inputs.
 
     make_input = partial(make_tensor, device=device, dtype=dtype,
                          low=None, high=None, requires_grad=requires_grad)
@@ -189,6 +215,10 @@ def sample_inputs_slice(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_tensor_split(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for tensor_split on a cubic tensor. Cases
+    # cover indices given as tensors (including a zero-dim tensor and a strided one), indices given
+    # as a tuple, and an integer number of sections, each with and without an explicit dim
+    # (positive and negative).
     make_input = partial(make_tensor, device=device, dtype=dtype,
                          low=None, high=None, requires_grad=requires_grad)
 
@@ -213,24 +243,33 @@ def sample_inputs_tensor_split(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_hsplit(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for hsplit: a 1-D tensor split into
+    # equal sections and a 3-D tensor split at a list of indices.
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg(6), 2)
     yield SampleInput(make_arg(S, S, S), [1, 2, 3])
 
 def sample_inputs_vsplit(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for vsplit: a 2-D tensor split into
+    # equal sections and a 3-D tensor split at a list of indices.
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg(6, S), 2)
     yield SampleInput(make_arg(S, S, S), [1, 2, 3])
 
 def sample_inputs_dsplit(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for dsplit: a 3-D tensor split at a
+    # list of indices and a 3-D tensor with last dimension 6 split into equal sections.
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg(S, S, S), [1, 2, 3])
     yield SampleInput(make_arg(S, S, 6), 2)
 
 def error_inputs_hsplit(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for hsplit: a zero-dim tensor (needs at least
+    # one dimension), a split size of zero that does not divide the dimension, and a string where
+    # an integer or index list is expected (expects TypeError).
     make_arg = partial(make_tensor, dtype=torch.float32, device=device)
     err_msg1 = ("torch.hsplit requires a tensor with at least 1 dimension, "
                 "but got a tensor with 0 dimensions!")
@@ -248,6 +287,9 @@ def error_inputs_hsplit(op_info, device, **kwargs):
         error_type=TypeError, error_regex=err_msg3)
 
 def error_inputs_vsplit(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for vsplit: a 1-D tensor (needs at least two
+    # dimensions), a split size of zero that does not divide the dimension, and a string where an
+    # integer or index list is expected (expects TypeError).
     make_arg = partial(make_tensor, dtype=torch.float32, device=device)
     err_msg1 = ("torch.vsplit requires a tensor with at least 2 dimension, "
                 "but got a tensor with 1 dimensions!")
@@ -265,6 +307,8 @@ def error_inputs_vsplit(op_info, device, **kwargs):
                      error_type=TypeError, error_regex=err_msg3)
 
 def error_inputs_dsplit(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for dsplit: a 1-D tensor (needs at least three
+    # dimensions) and a split size of zero that does not divide the split dimension.
     make_arg = partial(make_tensor, dtype=torch.float32, device=device)
     err_msg1 = ("torch.dsplit requires a tensor with at least 3 dimension, "
                 "but got a tensor with 1 dimensions!")
@@ -277,6 +321,11 @@ def error_inputs_dsplit(op_info, device, **kwargs):
 
 
 def sample_inputs_as_strided(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for as_strided: a list of (input shape,
+    # output shape, output stride, storage offset) cases, each passed as positional size and stride
+    # plus a storage_offset keyword argument.
+    # KNOWN ISSUE: the loop variable named kwargs rebinds the function's own **kwargs parameter;
+    # harmless here because the incoming kwargs are not used afterwards.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # input shape, output shape, output stride, output storage offset
@@ -294,7 +343,13 @@ def sample_inputs_as_strided(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input_t, args=(output_shape, stride), kwargs=kwargs)
 
 def sample_inputs_as_strided_partial_views(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for as_strided on a tensor that is a partial
+    # view (a slice of a larger base tensor), so the view has a nonzero storage offset. Yields
+    # calls with no storage_offset, with an explicit offset 0 and with offset 10.
     def make_arg():
+        # [FUNCTION DOC] HELPER: Create a 20-element base tensor, take the slice from index 5 to 15
+        # and set requires_grad on that view according to the enclosing requires_grad flag; returns
+        # the view.
         base = make_tensor((20,), device=device, dtype=dtype)
         return base[5:15].requires_grad_(requires_grad)
 
@@ -304,6 +359,10 @@ def sample_inputs_as_strided_partial_views(op_info, device, dtype, requires_grad
     yield SampleInput(make_arg(), (2, 2), (1, 2), storage_offset=10)
 
 def sample_inputs_as_strided_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for as_strided_scatter: for each (input
+    # shape, source/output shape, stride, storage offset) case it yields an input tensor, a source
+    # tensor of the output shape, and the size, stride and storage_offset arguments, including
+    # scatter into larger or inverted-stride layouts.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # input shape, output shape, output stride, output storage offset
@@ -326,6 +385,9 @@ def sample_inputs_as_strided_scatter(op_info, device, dtype, requires_grad, **kw
 
 
 def error_inputs_as_strided_scatter(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for as_strided_scatter: a 4x4 float tensor
+    # and a 2x2 source scattered with strides that run far past the storage, expecting an
+    # out-of-bounds storage size error message.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32, requires_grad=False)
 
     # Create a small tensor and try to scatter it out of bounds
@@ -338,6 +400,9 @@ def error_inputs_as_strided_scatter(op_info, device, **kwargs):
 
 
 def sample_inputs_combinations(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for combinations: 1-D tensors of 1, 2 and 4
+    # elements crossed with r values 1, 2 and 4 and with_replacement False and True. The tensors
+    # are built from literal data with torch.tensor.
     inputs = (
         (0,),
         (0, 1),
@@ -353,6 +418,11 @@ def sample_inputs_combinations(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input_t, r=r, with_replacement=with_replacement)
 
 def sample_inputs_cartesian_prod(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cartesian_prod: 1-D tensors built with
+    # torch.tensor and passed as one, two or three positional tensors.
+    # KNOWN ISSUE: the tensors are built by calling torch.tensor on tuples such as (0, 1, 2, 3),
+    # which creates 1-D tensors with those values, not tensors of that size; the inline comment
+    # says varying number of elements, which only holds in that sense.
     make_arg = partial(torch.tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # constructs 1-D tensors with varying number of elements
@@ -370,6 +440,9 @@ def sample_inputs_cartesian_prod(op_info, device, dtype, requires_grad, **kwargs
     yield SampleInput(a, b, c)
 
 def sample_inputs_cosine_similarity(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cosine_similarity: pairs of same-shape
+    # tensors with various dim and eps keyword arguments (including a zero-dim case), followed by
+    # three broadcasting cases with different input shapes and negative dims.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as input_shape, dict of dim and eps
@@ -391,6 +464,8 @@ def sample_inputs_cosine_similarity(op_info, device, dtype, requires_grad, **kwa
 
 
 def sample_inputs_item(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for Tensor.item: single-element tensors of
+    # shapes empty (zero-dim), 1 and (1,). requires_grad is forced off.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
 
     cases = (
@@ -404,6 +479,9 @@ def sample_inputs_item(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape))
 
 def error_inputs_item(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for item: float tensors with more than one
+    # element (shapes M, (S,), (S, S), (S, M, L)); each expects a RuntimeError saying the elements
+    # cannot be converted to a Scalar.
     make_arg = partial(make_tensor, dtype=torch.float32, device=device, requires_grad=False)
 
     cases = (
@@ -420,6 +498,13 @@ def error_inputs_item(op, device, **kwargs):
 
 
 def sample_inputs_batch_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for batch_norm. Yields a list of (input
+    # shape, kwargs) cases with training, momentum and eps variations (including empty and 2-D
+    # inputs), where running mean/var are non-grad tensors and weight/bias are created only when
+    # there are channels; then repeats the last case in training/eval modes with weight and bias
+    # set; finally a case with all optional tensors set to None.
+    # KNOWN ISSUE: the second loop reuses input_shape, running_mean, running_var and channels
+    # leaked from the last iteration of the first loop (the 2x1 case), which is easy to miss.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_arg_without_requires_grad = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -474,6 +559,10 @@ def sample_inputs_batch_norm(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((1, 2, 3)), args=(None, None, None, None), kwargs={'training': True})
 
 def sample_inputs_softmax_backward_data(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for softmax_backward_data: for several shapes
+    # and dims, computes a forward softmax of an input to use as the output argument and yields a
+    # fresh gradient tensor, that output, the dim and the input dtype. On CUDA with float32 it also
+    # tries float16 as the input dtype.
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -492,6 +581,10 @@ def sample_inputs_softmax_backward_data(op_info, device, dtype, requires_grad, *
         yield SampleInput(make_arg(shape), output, dim, input_dtype)
 
 def sample_inputs_native_batch_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for native_batch_norm derived from the
+    # batch_norm samples: skips samples with zero elements and reorders the arguments into (weight,
+    # bias, running_mean, running_var, training, momentum, eps), using defaults training=True,
+    # momentum=0.5, eps=1e-5 when absent.
     samples = sample_inputs_batch_norm(op_info, device, dtype, requires_grad, **kwargs)
     for sample in samples:
         # torch.native_batch_norm does not support 0 numel tensors
@@ -506,6 +599,10 @@ def sample_inputs_native_batch_norm(op_info, device, dtype, requires_grad, **kwa
 
 
 def sample_inputs__native_batch_norm_legit(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for _native_batch_norm_legit derived from the
+    # batch_norm samples: skips empty inputs; uses the (weight, bias, running_mean, running_var,
+    # training, momentum, eps) argument order when running stats exist and otherwise the form
+    # without running stats.
     samples = sample_inputs_batch_norm(op_info, device, dtype, requires_grad, **kwargs)
     for sample in samples:
         # torch.native_batch_norm does not support 0 numel tensors
@@ -522,6 +619,9 @@ def sample_inputs__native_batch_norm_legit(op_info, device, dtype, requires_grad
             yield SampleInput(sample.input, args=(args[2], args[3], training, momentum, eps))
 
 def sample_inputs__batch_norm_with_update(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for _batch_norm_with_update derived from the
+    # batch_norm samples: skips empty inputs and any sample where weight, bias or running stats are
+    # None, and yields (weight, bias, running_mean, running_var, momentum, eps) arguments.
     samples = sample_inputs_batch_norm(op_info, device, dtype, requires_grad, **kwargs)
     for sample in samples:
         # torch.native_batch_norm does not support 0 numel tensors
@@ -536,6 +636,8 @@ def sample_inputs__batch_norm_with_update(op_info, device, dtype, requires_grad,
         yield SampleInput(sample.input, args=(args[2], args[3], args[0], args[1], momentum, eps))
 
 def sample_inputs_nn_activation_relu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the nn activation relu: one tensor each
+    # of shapes empty, (S,), (S, S) and (S, M, S).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = (
@@ -549,6 +651,9 @@ def sample_inputs_nn_activation_relu(op_info, device, dtype, requires_grad, **kw
         yield SampleInput(make_arg(shape))
 
 def sample_inputs_prelu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for prelu. First yields the elementwise unary
+    # samples using the op's sample kwargs, then tensors of several shapes with scalar weights (-1,
+    # 0, 0.8, 1) and per-channel weights, and finally two samples that pass the weight by keyword.
     op_kwargs = op_info.sample_kwargs(device, dtype, None)[0]
     yield from sample_inputs_elementwise_unary(op_info, device, dtype, requires_grad,
                                                op_kwargs=op_kwargs)
@@ -576,10 +681,15 @@ def sample_inputs_prelu(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((S, S)), kwargs=dict(weight=make_arg((S,)),))
 
 def reference_inputs_prelu(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for prelu: yields all sample_inputs_prelu
+    # samples followed by the generic elementwise unary reference inputs.
     yield from sample_inputs_prelu(op, device, dtype, requires_grad, **kwargs)
     yield from reference_inputs_elementwise_unary(op, device, dtype, requires_grad, **kwargs)
 
 def sample_kwargs_prelu_scalar_weight(device, dtype, input):
+    # [FUNCTION DOC] HELPER: Build the sample kwargs for prelu with a random scalar weight. Returns
+    # a pair of dicts: one with the torch weight tensor and one with the same value as a NumPy
+    # array (bfloat16 weights are converted to float32 first since NumPy lacks bfloat16).
     weight = torch.rand((), device=device, dtype=dtype)
     # NumPy does not support bfloat16, so we default to float32 (only for NumPy) in that case
     if dtype == torch.bfloat16:
@@ -590,6 +700,11 @@ def sample_kwargs_prelu_scalar_weight(device, dtype, input):
     return ({'weight': weight}, {'weight': np_weight})
 
 def error_inputs_prelu(op, device):
+    # [FUNCTION DOC] Generator of ErrorInput objects for prelu: a zero-dim input with a weight of
+    # more than one element, a weight whose size does not match the channel count, and a weight
+    # that is neither scalar nor 1-D. Each gives the expected error message pattern.
+    # KNOWN ISSUE: a stray comment about src and index tensors having the same number of dimensions
+    # sits at the end of this function and appears to be a leftover from another function.
     # Weight has numel != 1, but self.ndim is zero-dim tensor
     inp = make_tensor((), device=device, dtype=torch.float32)
     weight = make_tensor((2,), device=device, dtype=torch.float32)
@@ -610,6 +725,10 @@ def error_inputs_prelu(op, device):
 
     # src and index tensors must have the same # of dimensions
 def sample_inputs_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for norm with a named case (name field)
+    # for each: a range of finite p values on a matrix, p with dim and keepdim variants on 3-D
+    # inputs and zero-dim inputs, and negated dim variants. Cases with fractional p use inputs
+    # without zeros.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # ord = inf is tested in inputs_norm_inf as it fails on some tests
@@ -661,6 +780,8 @@ def sample_inputs_norm(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_norm_fro(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for norm with Frobenius settings: default
+    # arguments, the string fro, and fro with dims [0, 1], each with a name.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = (
@@ -674,6 +795,8 @@ def sample_inputs_norm_fro(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_norm_nuc(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for norm with the nuclear norm: nuc on a
+    # matrix and nuc with dims [1, 2] on a batch, each with a name.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = (
@@ -686,6 +809,9 @@ def sample_inputs_norm_nuc(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_norm_inf(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for norm with infinite orders: -inf, inf,
+    # and inf with positive and negative dim, each with a name. Kept separate because these fail
+    # some tests.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = (
@@ -700,6 +826,10 @@ def sample_inputs_norm_inf(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_equal(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for equal over pairs of shapes (zero-dim,
+    # 1-D, broadcastable and equal shapes). Sets the broadcasts_input flag when the lhs shape
+    # changes under broadcasting, and for equal shapes also yields a comparison of a tensor with a
+    # detached clone of itself.
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
@@ -723,6 +853,10 @@ def sample_inputs_equal(op, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_jiterator(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for jiterator-defined ops. Requires keyword
+    # arguments num_inputs (total number of tensor inputs) and optionally sample_kwargs; for each
+    # shape pair it creates lhs and num_inputs minus one right-hand tensors of the second shape and
+    # sets broadcasts_input accordingly.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     shapes = (
@@ -748,6 +882,9 @@ def sample_inputs_jiterator(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(lhs, args=tuple(args), kwargs=sample_kwargs, broadcasts_input=broadcasts_input)
 
 def sample_inputs_broadcast_shapes(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for broadcast_shapes where the inputs are
+    # shapes (tuples or integers) not tensors: the first shape is the input and the remaining
+    # shapes are positional arguments.
     shapes = (
         ((), ()),
         ((S,), ()),
@@ -766,6 +903,9 @@ def sample_inputs_broadcast_shapes(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(inp, args=tuple(arg0))
 
 def sample_inputs_add_sub(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for add and sub: all elementwise binary
+    # samples plus two extra samples with an alpha keyword argument (a positive and a negative
+    # alpha, or True and False for bool dtype), using the op's lhs/rhs make_tensor kwargs.
     yield from sample_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs)
 
     # Adds alpha kwarg cases
@@ -786,6 +926,9 @@ def sample_inputs_add_sub(op, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_ldexp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for ldexp: all elementwise binary samples,
+    # plus for floating or complex dtypes a sample pairing a 5-element tensor with an int32
+    # exponent tensor.
     yield from sample_inputs_elementwise_binary(
         op_info, device, dtype, requires_grad, **kwargs
     )
@@ -806,6 +949,9 @@ def sample_inputs_ldexp(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_arange(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for arange: zero step, bounds inconsistent
+    # with the step sign (several variants), and infinite bounds. Each expects a RuntimeError with
+    # a matching message.
     yield ErrorInput(SampleInput(0, args=(3, 0)), error_type=RuntimeError, error_regex='step must be nonzero')
     yield ErrorInput(SampleInput(0, args=(-3, 2)), error_type=RuntimeError,
                      error_regex='upper bound and lower bound inconsistent with step sign')
@@ -817,6 +963,11 @@ def error_inputs_arange(op, device, **kwargs):
     yield ErrorInput(SampleInput(float('-inf'), args=(1, 2)), error_type=RuntimeError, error_regex='unsupported range')
 
 def sample_inputs_arange(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for arange. Builds integer and float (start,
+    # end, step) cases, including None for default start or step, an end-inclusive float case, and
+    # a large range (skipped for int8 and uint8); passes start, end, step positionally or as an end
+    # keyword, with dtype and device keywords. Also yields a few plain calls and, for int32 and
+    # int64, fractional steps and bounds.
     int_samples = (
         # positive direction
         (-1, 2, 2),
@@ -837,6 +988,9 @@ def sample_inputs_arange(op, device, dtype, requires_grad, **kwargs):
     )
 
     def to_float(start, end, step):
+        # [FUNCTION DOC] HELPER: Convert an integer (start, end, step) case into floats by adding
+        # 0.1 to start (when not None) and to end and converting step (when not None) to float;
+        # returns the new triple.
         start = start + 0.1 if start is not None else None
         end = end + 0.1
         step = float(step) if step is not None else None
@@ -882,6 +1036,8 @@ def sample_inputs_arange(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(5, args=(0, -0.5), kwargs={"dtype": dtype, "device": device})
 
 def sample_inputs_randn(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for randn: sizes (M,) and (S, S) passed as
+    # the input with dtype, device and requires_grad keyword arguments.
     shapes = (
         (M,),
         (S, S)
@@ -891,6 +1047,8 @@ def sample_inputs_randn(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input=shape, kwargs=dict(dtype=dtype, device=device, requires_grad=requires_grad))
 
 def sample_inputs_normal(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for normal (in-place style, tensor first)
+    # with (shape, mean, std) cases; the tensor does not require grad.
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
@@ -901,6 +1059,8 @@ def sample_inputs_normal(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(mean, std))
 
 def error_inputs_normal(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for normal: a negative std, expecting a
+    # RuntimeError saying normal expects std >= 0.
     t = torch.zeros([10], device=device)
     invalid_std = -1
     yield ErrorInput(
@@ -910,6 +1070,8 @@ def error_inputs_normal(op, device, **kwargs):
     )
 
 def sample_inputs_cauchy(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cauchy_ with (shape, median, gamma)
+    # cases; the tensor does not require grad.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
         ((M,), 0, 0.5),
@@ -921,6 +1083,8 @@ def sample_inputs_cauchy(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_cauchy(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for cauchy_: a sigma of zero, expecting a
+    # RuntimeError that sigma must be greater than 0.
     t = torch.zeros([10], device=device)
     invalid_scale = 0
     yield ErrorInput(
@@ -931,6 +1095,8 @@ def error_inputs_cauchy(op, device, **kwargs):
 
 
 def sample_inputs_exponential(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for exponential_ with (shape, rate) cases;
+    # the tensor does not require grad.
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
@@ -943,6 +1109,8 @@ def sample_inputs_exponential(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_exponential(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for exponential_: a rate of zero, expecting
+    # a RuntimeError that lambda must be greater than 0.
     t = torch.zeros([10], device=device)
     invalid_rate = 0
     yield ErrorInput(
@@ -953,6 +1121,8 @@ def error_inputs_exponential(op, device, **kwargs):
 
 
 def sample_inputs_geometric(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for geometric_ with (shape, probability)
+    # cases; the tensor does not require grad.
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
@@ -965,6 +1135,8 @@ def sample_inputs_geometric(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_geometric(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for geometric_: a negative probability,
+    # expecting a RuntimeError that p must be in the open interval from 0 to 1.
     t = torch.zeros([10], device=device)
     neg_prob = -1
     yield ErrorInput(
@@ -975,6 +1147,8 @@ def error_inputs_geometric(op, device, **kwargs):
 
 
 def sample_inputs_log_normal(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for log_normal_ with (shape, mean, std)
+    # cases; the tensor does not require grad.
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
@@ -987,6 +1161,8 @@ def sample_inputs_log_normal(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_log_normal(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for log_normal_: a std of zero, expecting a
+    # RuntimeError that std must be greater than 0.
     t = torch.zeros([10], device=device)
     invalid_std = 0
     yield ErrorInput(
@@ -997,6 +1173,10 @@ def error_inputs_log_normal(op, device, **kwargs):
 
 
 def sample_inputs_uniform(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for uniform_ with (shape, first bound, second
+    # bound) cases; the tensor does not require grad.
+    # KNOWN ISSUE: the loop unpacks the two bounds into variables named hi and lo, in that order,
+    # although the values are (low, high) pairs; only the names are misleading.
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=False)
     samples = (
@@ -1008,6 +1188,8 @@ def sample_inputs_uniform(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(hi, lo))
 
 def sample_inputs_ones_zeros(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for ones and zeros: sizes (M,) and (S, S)
+    # passed as a single tuple argument, with dtype and device keyword arguments.
     # this is a bit messy, as we want the args to be tuples
     # so if we pass size as a tuple, we have a tuple containing a tuple
     sizes = (
@@ -1018,7 +1200,12 @@ def sample_inputs_ones_zeros(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(size, kwargs={'dtype': dtype, 'device': device})
 
 def sample_inputs_full(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for full: sizes (M,) and (S, S), each crossed
+    # with two fill values (a random scalar of the test dtype and a random int), passed with dtype
+    # and device keywords.
     def get_val(dtype):
+        # [FUNCTION DOC] HELPER: Return a random Python scalar of the given dtype by creating a
+        # zero-dim CPU tensor with make_tensor and calling item.
         return make_tensor([], dtype=dtype, device="cpu").item()
 
     sizes = (
@@ -1032,6 +1219,8 @@ def sample_inputs_full(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_uniform(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for uniform_: a from bound greater than the
+    # to bound, expecting a RuntimeError describing the invalid range.
     t = torch.zeros([10], device=device)
     yield ErrorInput(
         SampleInput(t, args=(3, -1)),
@@ -1041,6 +1230,9 @@ def error_inputs_uniform(op, device, **kwargs):
 
 
 def error_inputs_linspace(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for linspace: a negative number of steps
+    # (RuntimeError), a float steps argument (TypeError about invalid argument combination), and
+    # 1-D start and end tensors (RuntimeError, only 0-dim tensors are supported).
     yield ErrorInput(SampleInput(0, args=(3, -1)), error_type=RuntimeError, error_regex='number of steps must be non-negative')
     yield ErrorInput(
         SampleInput(0, args=(3, 1.)),
@@ -1055,6 +1247,10 @@ def error_inputs_linspace(op, device, **kwargs):
 
 
 def sample_inputs_linspace(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for linspace over products of starts, ends
+    # and step counts (including 0 and 1 steps) plus an extra case that replicates a CUDA
+    # off-by-one bug. Cases with negative bounds are skipped for uint8. Arguments are passed as
+    # start, (end, steps) with dtype and device keywords; one final plain call is added.
     ends = (-3, 0, 1, 4, 50)
     starts = (-2., 0, 4.3, 50)
     nsteps = (0, 1, 50)
@@ -1069,6 +1265,11 @@ def sample_inputs_linspace(op, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_linspace_tensor_overload(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the linspace overload taking tensor
+    # start and/or end. Uses the same start, end and step grid as the scalar variant,
+    # additionally choosing (tensor, tensor), (tensor, scalar) or (scalar, tensor) forms, where
+    # tensors are created float32 for float values and int64 otherwise. Negative-bound cases are
+    # skipped for uint8.
     ends = (-3, 0, 1, 4, 50)
     starts = (-2., 0, 4.3, 50)
     nsteps = (0, 1, 50)
@@ -1093,6 +1294,13 @@ def sample_inputs_linspace_tensor_overload(op, device, dtype, requires_grad, **k
 
 
 def sample_inputs_logspace(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for logspace over products of starts, ends,
+    # step counts and bases (the base is omitted when None; a smaller base set is used for int8 and
+    # uint8). Skips cases that hit a known issue with a single step and float start on integer
+    # dtypes. Arguments include dtype and device keywords; one final call is added.
+    # KNOWN ISSUE: the skip condition combines the uint8 check with a start-below-zero check
+    # without grouping, so every case with a negative start is skipped for all dtypes, not
+    # only uint8.
     ends = (-3, 0, 1.2, 2, 4)
     starts = (-2., 0, 1, 2, 4.3)
     nsteps = (0, 1, 2, 4)
@@ -1112,6 +1320,12 @@ def sample_inputs_logspace(op, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_logspace_tensor_overload(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the logspace overload with tensor start
+    # and/or end, over the same grid of starts, ends, step counts and bases as the scalar variant,
+    # with tensor-valued start and end chosen from three combinations (float32 tensors for float
+    # values, int64 otherwise).
+    # KNOWN ISSUE: same operator precedence problem as sample_inputs_logspace: every case with a
+    # negative start is skipped for all dtypes, not only for uint8.
     ends = (-3, 0, 1.2, 2, 4)
     starts = (-2., 0, 1, 2, 4.3)
     nsteps = (0, 1, 2, 4)
@@ -1141,6 +1355,9 @@ def sample_inputs_logspace_tensor_overload(op, device, dtype, requires_grad, **k
 
 
 def sample_inputs_isclose(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for isclose: all elementwise binary samples
+    # plus extra samples that vary rtol (0 or 1e-7), atol (0 or 1e-7) and equal_nan (False or True)
+    # on matrices built with the op's lhs/rhs make_tensor kwargs.
     yield from sample_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs)
 
     # Creates additional inputs to test the rtol, atol, and equal_nan params
@@ -1160,6 +1377,9 @@ def sample_inputs_isclose(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_isclose(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for isclose: a negative rtol and a
+    # negative atol on zero-dim float tensors, each expecting a RuntimeError that the value
+    # must be non-negative.
     make_float_arg = partial(make_tensor, device=device, dtype=torch.float, requires_grad=False)
 
     yield ErrorInput(SampleInput(make_float_arg(()), args=(make_float_arg(()),), kwargs={'rtol': -0.4}),
@@ -1172,6 +1392,8 @@ def error_inputs_isclose(op, device, **kwargs):
 
 
 def sample_inputs_t(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for t (transpose of at most 2-D tensors):
+    # shapes (1, 2), (2,) and zero-dim.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     yield SampleInput(make_arg((1, 2)))
     yield SampleInput(make_arg((2,)))
@@ -1179,9 +1401,15 @@ def sample_inputs_t(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_mm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for mm: an (S, M) by (M, S) product, for
+    # complex dtypes a variant where the second operand is a conjugate view that keeps the
+    # requires_grad setting, and two products involving empty matrices (a zero-sized row or
+    # inner dimension).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_arg_conj(size):
+        # [FUNCTION DOC] HELPER: Make a tensor of the given size, take its conjugate view and set
+        # requires_grad on it per the enclosing flag.
         return make_arg(size).conj().requires_grad_(requires_grad)
 
     first_shape, second_shape = (S, M), (M, S)
@@ -1197,6 +1425,14 @@ def sample_inputs_mm(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_addmm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for addmm. Alpha and beta come from the
+    # keyword arguments or dtype-dependent defaults (complex, float or int). Cases cover matching
+    # shapes and broadcast of the bias (1-D and zero-dim), with the broadcasts_input metadata set.
+    # For complex dtypes also yields samples where the second matrix or the third is a
+    # conjugate-transposed (mH) view; for floating dtypes adds empty-matrix products, one with a
+    # broadcast bias.
+    # KNOWN ISSUE: the name kwargs is rebound to a dict holding alpha and beta, shadowing the
+    # function's own **kwargs after the first use.
     alpha_val = kwargs.get('alpha', 2 + 3j if dtype.is_complex else 0.6 if dtype.is_floating_point else 2)
     beta_val = kwargs.get('beta', 1 + 2j if dtype.is_complex else 0.2 if dtype.is_floating_point else 3)
     tests_list = [
@@ -1240,6 +1476,10 @@ def sample_inputs_addmm(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(M), make_arg(S, 0), make_arg(0, M), **kwargs).with_metadata(broadcasts_input=True)
 
 def sample_inputs_sparse_sampled_addmm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for sparse sampled_addmm. For every
+    # combination of m, n, k in {0, 5} it yields a CSR sparse identity-like matrix (eye of m by n,
+    # converted to sparse CSR, optionally requiring grad), dense (m, k) and (k, n) matrices, and
+    # alpha and beta (complex for complex dtypes).
     alpha = 2 + 3j if dtype.is_complex else 0.6
     beta = 1 + 2j if dtype.is_complex else 0.2
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -1257,6 +1497,9 @@ def sample_inputs_sparse_sampled_addmm(op_info, device, dtype, requires_grad, **
         )
 
 def sample_inputs_sparse_mm_reduce(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for sparse mm with reduction. For sizes m in
+    # {5, 7} and k in {3, 11} and each reduction among sum, mean, amax and amin, yields a CSR
+    # sparse identity matrix, a dense (m, k) matrix and the reduce string.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     reductions = ["sum", "mean", "amax", "amin"]
@@ -1272,15 +1515,22 @@ def sample_inputs_sparse_mm_reduce(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_mv(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for mv: a matrix (S, M) and a vector (M,).
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg(S, M), make_arg(M))
 
 def sample_inputs_bmm(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for bmm: batched matrices (M, S, M) and (M,
+    # M, S).
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg(M, S, M), make_arg(M, M, S))
 
 
 def sample_inputs_triton_bmm_outer_product(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the Triton bmm outer-product kernel:
+    # contiguous (B, M, 1) by (B, 1, N) inputs for six batch/M/N configurations, each with default
+    # value ranges, a wide range (-2 to 2) and a positive range (0.1 to 1). No tensors require
+    # grad. The kernel does not accept broadcasting or non-contiguous strides.
     """Generate (B, M, 1) x (B, 1, N) -> (B, M, N) outer-product samples for the
     Triton BMM kernel. The kernel requires contiguous inputs with these exact
     shape contracts; it does not accept broadcasts or non-contiguous strides."""
@@ -1312,14 +1562,22 @@ def sample_inputs_triton_bmm_outer_product(op_info, device, dtype, requires_grad
 
 
 def reference_bmm_outer_product(a, b):
+    # [FUNCTION DOC] HELPER: NumPy reference for the batched outer product: matrix-multiplies the
+    # two ndarray arguments (the test harness converts SampleInput tensors to arrays first) and
+    # returns the result.
     # Inputs are ndarrays: TestCommon.test_numpy_ref calls SampleInput.numpy() first.
     return np.matmul(a, b)
 
 
 def sample_inputs_dot_vdot(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for dot and vdot: two 1-D tensors of length S
+    # and, for complex dtypes, a pair where the second tensor is a conjugate view. Conjugated-input
+    # cases are covered elsewhere (conj view tests).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_arg_conj(size):
+        # [FUNCTION DOC] HELPER: Make a tensor of the given size, take its conjugate view and set
+        # requires_grad on it per the enclosing flag.
         return make_arg(size).conj().requires_grad_(requires_grad)
 
     yield SampleInput(make_arg((S, )), make_arg((S, )))
@@ -1331,6 +1589,9 @@ def sample_inputs_dot_vdot(self, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_dot_vdot(op_info, device, is_ref=False, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for dot and vdot: dtype mismatch, non-1-D
+    # operand, size mismatch, and (when the device is not CPU and is_ref is false) one operand on
+    # CPU and one on the device. Expected error messages are attached to each.
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
 
     yield ErrorInput(SampleInput(make_input(1), args=(make_input(3, dtype=torch.float16),)),
@@ -1345,6 +1606,9 @@ def error_inputs_dot_vdot(op_info, device, is_ref=False, **kwargs):
 
 
 def sample_inputs_addmv(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for addmv with (bias shape, matrix shape,
+    # vector shape, beta, alpha, broadcasts) cases, including broadcast of 1-D and zero-dim bias;
+    # passes beta and alpha as keywords and sets broadcasts_input.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     test_cases = (((S,), (S, M), (M,), 1, 1, False),
@@ -1365,6 +1629,10 @@ def sample_inputs_addmv(op_info, device, dtype, requires_grad, **kwargs):
                           kwargs=dict(beta=beta, alpha=alpha), broadcasts_input=broadcasts_input)
 
 def sample_inputs_addbmm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for addbmm over (input, batch1, batch2, beta,
+    # alpha, broadcasting) cases, including broadcast inputs, empty batches and zero beta. For
+    # complex dtypes it first yields a variant with complex-scaled beta and alpha; then always
+    # yields the real-valued variant.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     beta_f = 0.5 if dtype.is_floating_point or dtype.is_complex else 2
     alpha_f = 1.2 if dtype.is_floating_point or dtype.is_complex else 1
@@ -1390,6 +1658,10 @@ def sample_inputs_addbmm(op_info, device, dtype, requires_grad, **kwargs):
                           kwargs=dict(beta=beta, alpha=alpha), broadcasts_input=is_broadcasting)
 
 def sample_inputs_addcmul_addcdiv(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for addcmul and addcdiv: several broadcasting
+    # shape triples (including zero-dim), each yielded once without value and once with a value
+    # keyword (3.14 for float and complex, 3 otherwise). Tensors are made with zeros excluded to
+    # avoid divide-by-zero in addcdiv.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     test_cases = [(((S, S), (S, S), (S, S)), False),
                   (((S, S), (S, 1), (1, S)), False),
@@ -1417,6 +1689,11 @@ def sample_inputs_addcmul_addcdiv(op_info, device, dtype, requires_grad, **kwarg
         ).with_metadata(broadcasts_input=broadcasts_input)
 
 def reference_inputs_addcmul_addcdiv(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for addcmul and addcdiv: yields the sample
+    # inputs and then type-promotion cases pairing float64/complex128 and bfloat16/float32 second
+    # and third operand dtypes with many scalar values (including bool, int, float, complex and no
+    # value). Pairs not supported by the op on the device are skipped, and complex values are
+    # skipped unless the second dtype is complex128.
     yield from sample_inputs_addcmul_addcdiv(
         op_info, device, dtype, requires_grad, **kwargs)
 
@@ -1460,6 +1737,12 @@ def reference_inputs_addcmul_addcdiv(op_info, device, dtype, requires_grad, **kw
             yield SampleInput(arg1, args=(arg2, arg3))
 
 def sample_inputs_baddbmm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for baddbmm over (input, batch1, batch2,
+    # alpha, beta, broadcasts) cases including an empty batch; for complex dtypes yields extra
+    # samples with complex alpha and beta, and finally a sample with transposed and conjugated
+    # batch operands.
+    # KNOWN ISSUE: the final complex sample uses beta and alpha leaked from the last iteration of
+    # the loop above, and transposes the first operand in place.
     test_cases = [((S, S, M), (S, S, S), (S, S, M), 1, 1, False),
                   ((1,), (S, S, S), (S, S, M), 1, 1, True),
                   ((S, S, M), (S, S, S), (S, S, M), 0.6, 0.2, False),
@@ -1500,6 +1783,10 @@ def sample_inputs_baddbmm(op_info, device, dtype, requires_grad, **kwargs):
 
 # TODO: add reduction kwargs
 def sample_inputs_multilabel_soft_margin_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for multilabel_soft_margin_loss for
+    # shapes (S,) and (S, S): one sample without weight and one with a weight tensor; the
+    # target and weight do not require grad. Reduction keywords are not covered (see the TODO
+    # above the function).
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     shapes = (
@@ -1514,6 +1801,10 @@ def sample_inputs_multilabel_soft_margin_loss(op_info, device, dtype, requires_g
                           kwargs={'weight': _make_tensor(shape, requires_grad=False)})
 
 def sample_inputs_addr(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for addr: a matrix with a vector pair, a
+    # zero-dim (broadcast) input, and variants with dtype-dependent alpha and beta. When the dtype
+    # is floating point and gradients are not required, adds NaN-containing samples with beta and
+    # alpha zero to check NaN handling (these fail gradcheck).
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None
     )
@@ -1558,6 +1849,8 @@ def sample_inputs_addr(op_info, device, dtype, requires_grad, **kwargs):
         ).with_metadata(broadcasts_input=True)
 
 def sample_inputs_zero_(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for zero_: tensors of shape zero-dim, (S, S,
+    # S) and (S,).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = ((), (S, S, S), (S,))
@@ -1566,6 +1859,10 @@ def sample_inputs_zero_(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape))
 
 def sample_inputs_multi_margin_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for multi_margin_loss with (input
+    # shape, target, kwargs) cases covering zero-dim, 1-D and 2-D inputs and the p, margin,
+    # weight and reduction keyword arguments. The target is a long tensor and the weight does
+    # not require grad.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(_make_tensor, dtype=torch.long, requires_grad=False)
     make_weight = partial(_make_tensor, requires_grad=False)
@@ -1588,6 +1885,9 @@ def sample_inputs_multi_margin_loss(op_info, device, dtype, requires_grad, **kwa
 
 
 def reference_inputs_multi_margin_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for multi_margin_loss: yields the regular
+    # samples and then the product of input/target pairs with p in (1, 2), margins, with or without
+    # weight, and each reduction or the default (None). The weight has one entry per class.
     yield from sample_inputs_multi_margin_loss(op_info, device, dtype, requires_grad, **kwargs)
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(_make_tensor, dtype=torch.long, requires_grad=False)
@@ -1615,6 +1915,9 @@ def reference_inputs_multi_margin_loss(op_info, device, dtype, requires_grad, **
 
 
 def error_inputs_multi_margin_loss(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for multi_margin_loss: invalid reduction
+    # string (ValueError), empty input shapes, wrong target shape or dtype, invalid weights
+    # (non-1-D, wrong size) and unsupported p. Each has the expected error type and message regex.
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
     # invalid reduction
     yield ErrorInput(SampleInput(make_input(5, 4), args=(make_input(5,),), kwargs={'reduction': 'abc'}),
@@ -1646,6 +1949,9 @@ def error_inputs_multi_margin_loss(op, device, **kwargs):
 
 
 def sample_inputs_logsumexp(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for logsumexp over (shape, dim, keepdim)
+    # cases, repeated with large value ranges (about 1e3 and 1e6 lower bounds) for floating and
+    # complex dtypes to test numerical stability.
     inputs = (
         ((), (0,), True),
         ((S, S), (1,), True),
@@ -1664,6 +1970,11 @@ def sample_inputs_logsumexp(self, device, dtype, requires_grad, **kwargs):
             yield SampleInput(t, dim, keepdim)
 
 def reference_inputs_logsumexp(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for logsumexp: yields the regular samples plus
+    # three regression cases (large values, an empty tensor, and a CPU scalar infinity tensor to
+    # test masking).
+    # KNOWN ISSUE: the last tensor (infinity) is built without dtype or device arguments, so it is
+    # a default CPU float tensor rather than the test dtype and device.
     yield from sample_inputs_logsumexp(op, device, dtype, requires_grad, **kwargs)
 
     # https://github.com/pytorch/pytorch/issues/91843
@@ -1679,6 +1990,10 @@ def reference_inputs_logsumexp(op, device, dtype, requires_grad, **kwargs):
     yield SampleInput(t, 0, True)
 
 def sample_inputs_like_fns(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the *_like functions: tensors of several
+    # shapes (including empty) with extra keyword arguments that change dtype and/or device
+    # (including CPU and, when available, CUDA).
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     inputs = [
         ((), {}),
         ((S, S), {}),
@@ -1700,6 +2015,9 @@ def sample_inputs_like_fns(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(t, **kwargs)
 
 def reference_inputs_like_fns(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for the *_like functions: yields the regular
+    # samples plus tensors of many shapes in four layouts (contiguous, transposed, noncontiguous,
+    # noncontiguous and transposed).
     yield from sample_inputs_like_fns(op, device, dtype, requires_grad, **kwargs)
 
     # shape
@@ -1715,6 +2033,9 @@ def reference_inputs_like_fns(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape, noncontiguous=True).transpose(0, -1))
 
 def sample_inputs_multilabel_margin_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for multilabel_margin_loss with (shape, long
+    # target, kwargs) cases: random targets for zero-size, 1-D and 2-D inputs, the three
+    # reductions, and a hand-written target with a -1 sentinel which ends the label list.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(_make_tensor, dtype=torch.long, requires_grad=False)
     make_target_tensor = partial(torch.tensor, device=device, dtype=torch.long, requires_grad=False)
@@ -1735,6 +2056,9 @@ def sample_inputs_multilabel_margin_loss(op_info, device, dtype, requires_grad, 
 
 
 def reference_inputs_multilabel_margin_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for multilabel_margin_loss: yields the regular
+    # samples, then cases with random targets that may include -1 and hand-written targets with
+    # repeated labels and -1 sentinels, crossed with each reduction or the default (None).
     yield from sample_inputs_multilabel_margin_loss(op_info, device, dtype, requires_grad, **kwargs)
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_target = partial(_make_tensor, dtype=torch.long, requires_grad=False)
@@ -1760,6 +2084,9 @@ def reference_inputs_multilabel_margin_loss(op_info, device, dtype, requires_gra
 
 
 def error_inputs_multilabel_margin_loss(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for multilabel_margin_loss: invalid reduction
+    # string, empty inputs and inconsistent target shapes. Each has the expected error type and
+    # message regex.
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
     # invalid reduction
     yield ErrorInput(SampleInput(make_input(5, 4), args=(make_input(5, 4),), kwargs={'reduction': 'abc'}),
@@ -1781,9 +2108,15 @@ def error_inputs_multilabel_margin_loss(op, device, **kwargs):
 
 
 def get_independent_tensor(tensor):
+    # [FUNCTION DOC] HELPER: Return a clone of the tensor with requires_grad set to the same value
+    # as the original, giving an independent leaf tensor.
     return tensor.clone().requires_grad_(tensor.requires_grad)
 
 def sample_inputs_randint(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for randint, derived from the
+    # like-function samples: for each sample (with device defaulted in its kwargs) yields a
+    # call with just high and the shape, and a call with low, high and the shape. Bounds are
+    # (2, 10), or (0, 2) for bool.
     low = 2 if dtype != torch.bool else 0
     high = 10 if dtype != torch.bool else 2
 
@@ -1795,6 +2128,9 @@ def sample_inputs_randint(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(low, high, sample.input.shape, *sample.args, **sample.kwargs)
 
 def sample_inputs_randint_like(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for randint_like, derived from the
+    # like-function samples: for each sample yields a call with high only and a call with low and
+    # high (using an independent clone of the input). Bounds are (2, 10), or (0, 2) for bool.
     low = 2 if dtype != torch.bool else 0
     high = 10 if dtype != torch.bool else 2
 
@@ -1814,6 +2150,11 @@ def sample_inputs_randint_like(self, device, dtype, requires_grad, **kwargs):
             **sample.kwargs)
 
 def sample_inputs_margin_ranking_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for margin_ranking_loss over shapes from
+    # zero-dim to 3-D, margins 0 and 1 and reductions sum, mean and none; two target-like tensors
+    # do not require grad.
+    # KNOWN ISSUE: the loop assigns to the name kwargs, shadowing the function's
+    # **kwargs parameter.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     shapes = (
@@ -1835,6 +2176,12 @@ def sample_inputs_margin_ranking_loss(op_info, device, dtype, requires_grad, **k
                               kwargs=kwargs)
 
 def reference_inputs_margin_ranking_loss(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for margin_ranking_loss: yields the regular
+    # samples; then, for each reduction, NaN-containing and Inf-containing inputs (float dtypes
+    # only) and a broadcasting case.
+    # KNOWN ISSUE: in the Inf block, one element is set on the previous second operand before it is
+    # replaced by a new tensor, so that assignment has no effect; the first operand never contains
+    # Inf. The NaN block also sets a NaN on the second operand after creating the target.
     yield from sample_inputs_margin_ranking_loss(op, device, dtype, requires_grad, **kwargs)
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
@@ -1865,6 +2212,8 @@ def reference_inputs_margin_ranking_loss(op, device, dtype, requires_grad, **kwa
         yield SampleInput(inp1, args=(inp2, target), kwargs={'reduction': reduction})
 
 def error_inputs_margin_ranking_loss(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for margin_ranking_loss: an invalid reduction
+    # string (ValueError) and mismatched input shapes (error about all input tensors).
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
     # invalid reduction value.
     yield ErrorInput(SampleInput(make_input(5, 4), args=(make_input(5, 4), make_input(5, 4),), kwargs={'reduction': 'abc'}),
@@ -1874,6 +2223,11 @@ def error_inputs_margin_ranking_loss(op, device, **kwargs):
                      error_regex='margin_ranking_loss : All input tensors should')
 
 def sample_inputs_new_fns(self, device, dtype, requires_grad, *, is_strided=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the new_* factory methods (new_empty,
+    # new_zeros, ...): input tensors of several shapes with output sizes and keywords changing
+    # dtype/device (adding a CUDA case when available). When is_strided is true, strides are passed
+    # as a positional argument too.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     # input_shape, output_shape, strides, kwargs
     # lengths of output_shape and strides must be equal
     inputs = [
@@ -1900,6 +2254,8 @@ def sample_inputs_new_fns(self, device, dtype, requires_grad, *, is_strided=Fals
             yield SampleInput(t, output_shape, **kwargs)
 
 def sample_inputs_empty_strided(op, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for empty_strided: (size, stride) cases
+    # passed with dtype and device keywords and the requires_grad flag.
 
     inputs = [
         ((), (), {'dtype': dtype, 'device': device}),
@@ -1912,6 +2268,8 @@ def sample_inputs_empty_strided(op, device, dtype, requires_grad=False, **kwargs
         yield SampleInput(shape, strides, requires_grad=requires_grad, **kwargs)
 
 def sample_inputs_empty(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for empty: shapes including empty and
+    # zero-sized ones, with device, dtype and requires_grad keywords.
     # shape
     cases = (
         (), (0,), (1,), (1, 3, 5), (5, 3, 1), (1, 0, 5, 1),
@@ -1921,6 +2279,9 @@ def sample_inputs_empty(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(case, device=device, dtype=dtype, requires_grad=requires_grad)
 
 def sample_inputs_empty_permuted(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for empty_permuted: for each of several
+    # shapes, every permutation of dimension indices as the physical layout, with device, dtype and
+    # requires_grad keywords.
     # shape
     cases = (
         (), (0,), (1,), (1, 3, 5), (5, 3, 1), (1, 0, 5, 1),
@@ -1931,6 +2292,9 @@ def sample_inputs_empty_permuted(op, device, dtype, requires_grad, **kwargs):
             yield SampleInput(case, layout, device=device, dtype=dtype, requires_grad=requires_grad)
 
 def error_inputs_empty_permuted(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for empty_permuted: wrong layout length,
+    # out-of-range dimension and duplicate dimension. Each expects a RuntimeError with a
+    # matching message.
     yield ErrorInput(
         SampleInput((2,), args=((0, 1),)),
         error_type=RuntimeError,
@@ -1948,6 +2312,9 @@ def error_inputs_empty_permuted(op_info, device, **kwargs):
     )
 
 def sample_inputs_scalar_tensor(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scalar_tensor with the values -5, 0 and
+    # 1, passed with device, dtype and requires_grad. Scalar tensor input values are not used
+    # because of missing meta support.
     # Not including a scalar tensor in vals because meta tests start failing due to
     # lack of meta support for _local_scalar_dense
     # torch.tensor(2, device=device)
@@ -1957,6 +2324,9 @@ def sample_inputs_scalar_tensor(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(item, device=device, dtype=dtype, requires_grad=requires_grad)
 
 def sample_inputs_eye(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for eye over all pairs of sizes (0, 1, 2, 3,
+    # 4, 7, L, M, S) for n and m, where m may be omitted; n of None is skipped. Passes device,
+    # dtype and requires_grad keywords.
     # only ints >= 0 are allowed for both arguments, unless m is omitted
     sizes = (None, 0, 1, 2, 3, 4, 7, L, M, S)
 
@@ -1972,6 +2342,8 @@ def sample_inputs_eye(op, device, dtype, requires_grad, **kwargs):
             yield SampleInput(n, args=(m,), kwargs=_kwargs)
 
 def error_inputs_eye(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for eye: negative n (with and without m) and
+    # negative m, expecting messages that the value must be greater or equal to 0.
     # TODO: no layout
     _kwargs = {'device': device, 'dtype': torch.float32}
 
@@ -1992,7 +2364,12 @@ def error_inputs_eye(op_info, device, **kwargs):
 
 
 def sample_inputs_new_full(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for new_full, derived from the new_* samples:
+    # appends a random scalar of the dtype that the result will have (honoring a dtype keyword) as
+    # the fill value.
     def get_val(dtype):
+        # [FUNCTION DOC] HELPER: Return a random Python scalar of the given dtype by creating a
+        # zero-dim CPU tensor with make_tensor and calling item.
         return make_tensor([], dtype=dtype, device="cpu").item()
 
     for sample in sample_inputs_new_fns(self, device, dtype, requires_grad, **kwargs):
@@ -2003,7 +2380,11 @@ def sample_inputs_new_full(self, device, dtype, requires_grad, **kwargs):
             sample.input, *sample.args, get_val(use_dtype), **sample.kwargs)
 
 def sample_inputs_full_like(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for full_like, derived from the like-function
+    # samples with a fill value chosen to match the dtype that results.
     def get_val(dtype):
+        # [FUNCTION DOC] HELPER: Return a random Python scalar of the given dtype by creating a
+        # zero-dim CPU tensor with make_tensor and calling item.
         return make_tensor([], dtype=dtype, device="cpu").item()
 
     double_dtype = highest_precision_float(device)
@@ -2035,6 +2416,10 @@ def sample_inputs_full_like(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(t, fill_value, **kwargs)
 
 def sample_inputs_multinomial(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for multinomial: non-negative probability
+    # tensors of 1-D and 2-D shapes with a number of samples and optional replacement keyword
+    # (False or True).
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     cases = [
         ([3], 3, {}),
         ([10], 3, {}),
@@ -2052,7 +2437,13 @@ def sample_inputs_multinomial(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(t, num_samples, **kwargs)
 
 def sample_inputs_normal_common(self, device, dtype, requires_grad, cases, **kwargs):
+    # [FUNCTION DOC] HELPER: Shared generator for normal sample inputs. Takes a list of (mean
+    # spec, std spec, kwargs) cases; each spec that is a list is turned into a non-negative
+    # random tensor of that shape, anything else (a scalar) is passed through. Yields
+    # SampleInput(mean, std, **kwargs).
     def get_value_or_make_tensor(value_or_shape):
+        # [FUNCTION DOC] HELPER: Return a non-negative random tensor if the argument is a list (a
+        # shape), otherwise return the argument unchanged.
         if isinstance(value_or_shape, list):
             return make_tensor(value_or_shape, dtype=dtype, device=device,
                                low=0, high=None,
@@ -2065,6 +2456,9 @@ def sample_inputs_normal_common(self, device, dtype, requires_grad, cases, **kwa
         yield SampleInput(mean, std, **kwargs)
 
 def sample_inputs_normal_tensor_first(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Builds the sample inputs for normal where the mean is a tensor: cases pair
+    # tensor shapes (including a broadcasting pair) or a tensor mean with a float std. Returns the
+    # generator produced by the shared normal helper rather than being a generator function itself.
     # value_or_size, value_or_size, kwargs
     cases = [
         ([], [], {}),
@@ -2077,11 +2471,16 @@ def sample_inputs_normal_tensor_first(self, device, dtype, requires_grad, **kwar
     return sample_inputs_normal_common(self, device, dtype, requires_grad, cases, **kwargs)
 
 def sample_inputs_normal_tensor_second(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding three SampleInput objects for normal with scalar mean and
+    # std plus a size list (with dtype and device, and a strided layout in one), and a scalar mean
+    # with a non-negative tensor std.
     yield SampleInput(1.6, 0.3, [2, 3], dtype=dtype, device=device)
     yield SampleInput(1.6, 0.3, [2, 2, 2], dtype=dtype, layout=torch.strided, device=device)
     yield SampleInput(2.7, make_tensor([4, 3], dtype=dtype, device=device, low=0, high=None, requires_grad=requires_grad))
 
 def sample_inputs_bernoulli(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for bernoulli: probability tensors with
+    # values in 0 to 1 of shapes 1-D, zero-dim, empty first dim and 3-D.
     shapes = [
         [3],
         [],
@@ -2096,6 +2495,9 @@ def sample_inputs_bernoulli(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(t)
 
 def error_inputs_bernoulli(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for bernoulli: writing into an out tensor
+    # that is an expanded view (several elements share one memory location) must raise an error
+    # about an unsupported operation.
     # more than one element of the written-to tensor refers to a single memory location
     x = torch.rand((1,), device=device).expand((6,))
     err_msg = 'unsupported operation'
@@ -2103,6 +2505,9 @@ def error_inputs_bernoulli(op_info, device, **kwargs):
                      error_regex=err_msg)
 
 def sample_inputs_logcumsumexp(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for logcumsumexp over (shape, dim) cases,
+    # once with the first slice along dim 0 set to a very large value (10000) to test numerical
+    # stability, and once without.
     inputs = (
         ((S, S, S), 0),
         ((S, S, S), 1),
@@ -2120,6 +2525,8 @@ def sample_inputs_logcumsumexp(self, device, dtype, requires_grad, **kwargs):
             yield SampleInput(t, dim)
 
 def sample_inputs_trace(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for trace: square, tall, wide and single-row
+    # or single-column matrices.
     make_arg = partial(make_tensor, device=device, dtype=dtype,
                        requires_grad=requires_grad, low=None, high=None)
     # Square, tall (rows > cols), wide (rows < cols), single row/col (#171704)
@@ -2128,10 +2535,14 @@ def sample_inputs_trace(self, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_trace(op, device):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for trace: a 3-D float tensor, expecting the
+    # error that a matrix is required.
     yield ErrorInput(SampleInput(make_tensor((3, 4, 5), dtype=torch.float32, device=device)), error_regex="expected a matrix")
 
 
 def sample_inputs_renorm(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for renorm on a 3-D tensor with (p, dim,
+    # maxnorm) argument cases, including a negative dim and an infinite p.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     cases = (((S, S, S), (2, 1, 0.5)),
              ((S, S, S), (2, -1, 0.5)),
@@ -2144,6 +2555,8 @@ def sample_inputs_renorm(self, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_transpose_swapdims(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for transpose and swapdims with various
+    # (dim0, dim1) pairs, including negative dims, equal dims and zero-dim or 1-D inputs.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((1, 2, 3), (-1, -2)),
@@ -2159,24 +2572,33 @@ def sample_inputs_transpose_swapdims(self, device, dtype, requires_grad, **kwarg
         yield SampleInput(make_arg(shape), args=args)
 
 def _numpy_ref_transpose(a, dim0, dim1):
+    # [FUNCTION DOC] HELPER: NumPy reference for transpose: returns the array unchanged when it has
+    # at most one dimension, otherwise swaps the two given axes.
     if a.ndim <= 1:
         return a
 
     return np.swapaxes(a, dim0, dim1)
 
 def sample_inputs_adjoint(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # adjoint on tensors of 3-D to 4-D shapes.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     shapes = ((1, 2, 3), (M, M), (S, S, S), (S, M, S), (M, S, M, S))
     return (SampleInput(make_arg(shape)) for shape in shapes)
 
 def sample_inputs_T(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for the
+    # T property on two 2-D shapes.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     shapes = ((M, M), (M, L))
     return (SampleInput(make_arg(shape)) for shape in shapes)
 
 def error_inputs_T(self, device, has_ndims_error=False):
+    # [FUNCTION DOC] Generator of ErrorInput objects for the T property. Yields nothing unless
+    # has_ndims_error is true; then yields errors for 1-D and 3-D inputs, since the reference
+    # implementation rejects dimensions other than 0 or 2. Takes no extra keyword arguments.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # Deprecated behavior in regular PyTorch, but throws an error in primTorch:
@@ -2194,6 +2616,9 @@ def error_inputs_T(self, device, has_ndims_error=False):
 
 
 def sample_inputs_singular_matrix_factors(op_info, device, dtype, requires_grad=False):
+    # [FUNCTION DOC] HELPER: Generator of pairs of factor tensors with shapes (batch, m, 2) and
+    # (batch, n, 2) for m and n in (3, 4) and batches of none and 2. Their product gives a rank-2
+    # matrix. Tensors honor requires_grad.
     """
     This function produces two tensors of shape (*, m, k) and (*, n, k) with k <= min(m, n).
     Their matrix product could be used to generate tensor of shape (*, m, n) of rank k.
@@ -2210,8 +2635,16 @@ def sample_inputs_singular_matrix_factors(op_info, device, dtype, requires_grad=
 
 
 def sample_inputs_svd_lowrank(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for svd_lowrank. Built from the singular
+    # matrix factor pairs: the first group passes q equal to the rank and no centering matrix M,
+    # the second passes a random matrix M. Each sample sets an output processing function that
+    # maps (U, S, V) to the product U times V^H and S so that gradients are well defined for
+    # complex inputs.
     # Function that's well defined on the outputs for complex inputs
     def fn(usv):
+        # [FUNCTION DOC] HELPER: Output processing function for gradient checks: takes the (U, S,
+        # V) triple and returns the pair of the reconstruction U times the conjugate transpose of V
+        # and S.
         U, S, V = usv
         return U @ V.mH, S
 
@@ -2235,6 +2668,8 @@ def sample_inputs_svd_lowrank(op_info, device, dtype, requires_grad=False, **kwa
         yield SampleInput(a, b, q=k, M=M).with_metadata(output_process_fn_grad=fn)
 
 def chunk_iter(iterable, size):
+    # [FUNCTION DOC] HELPER: Generator that splits an iterable into tuples of up to size items,
+    # yielding each tuple until the iterable is exhausted.
     it = iter(iterable)
     while True:
         chunk = tuple(islice(it, size))
@@ -2243,6 +2678,9 @@ def chunk_iter(iterable, size):
         yield chunk
 
 def sample_inputs_pca_lowrank(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for pca_lowrank, reusing the svd_lowrank
+    # samples taken in pairs: removes the M keyword argument from both samples, and sets center to
+    # False on the first and True on the second. The samples are mutated in place.
     # we reuse samples from svd_lowrank which come in group of two with
     # kwarg['M'] = None and with kwarg['M'] = <some tensor>
     samples = sample_inputs_svd_lowrank(op_info, device, dtype, requires_grad, **kwargs)
@@ -2255,6 +2693,8 @@ def sample_inputs_pca_lowrank(op_info, device, dtype, requires_grad=False, **kwa
         yield s2
 
 def np_sinc_with_fp16_as_fp32(x):
+    # [FUNCTION DOC] HELPER: Reference sinc for NumPy that evaluates float16 arrays in float32
+    # (NumPy's sinc gives NaN at zero for float16) and returns the result.
     # Wraps numpy's sinc function so that fp16 values are promoted to fp32
     # before sinc is invoked. Context: numpy's sinc returns NaN when evaluated
     # at 0 for fp16.
@@ -2264,6 +2704,8 @@ def np_sinc_with_fp16_as_fp32(x):
         return np.sinc(x)
 
 def sample_inputs_broadcast_to(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # broadcast_to with (input shape, target shape) cases including zero-dim inputs.
     test_cases = (
         ((S, 1, 1), (S, S, S)),
         ((S, 1, S), (S, S, S)),
@@ -2281,6 +2723,8 @@ def sample_inputs_broadcast_to(op_info, device, dtype, requires_grad, **kwargs):
         ) for size, shape in test_cases)
 
 def sample_inputs_broadcast_tensors(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for broadcast_tensors: four tensors of
+    # mutually broadcastable shapes.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     test_cases: tuple[tuple] = (((3,), (1, 2, 1), (1, 1), (5, 1, 1),),)
 
@@ -2288,6 +2732,9 @@ def sample_inputs_broadcast_tensors(op_info, device, dtype, requires_grad, **kwa
         yield SampleInput(make_arg(shape), args=tuple(make_arg(s) for s in other_shapes))
 
 def reference_inputs_broadcast_tensors(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for broadcast_tensors: yields the regular
+    # sample, then two groups of four tensors with broadcastable shapes made once contiguous and
+    # once noncontiguous.
     yield from sample_inputs_broadcast_tensors(op, device, dtype, requires_grad, **kwargs)
 
     m = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
@@ -2303,6 +2750,9 @@ def reference_inputs_broadcast_tensors(op, device, dtype, requires_grad, **kwarg
         yield SampleInput(n(a), args=(n(b), n(c), n(d)))
 
 def sample_inputs_block_diag(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for block_diag with several groups of 1-D and
+    # 2-D tensors. For complex64 and complex32 dtypes also yields samples where the first input is
+    # real (float32, or float64 on non-mps), to cover mixed complex and real inputs.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     test_cases: tuple[tuple] = (
         ((1, S), (2, S), (3, S),),
@@ -2320,6 +2770,10 @@ def sample_inputs_block_diag(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(make_arg_non_complex(shape), args=tuple(make_arg(s) for s in other_shapes))
 
 def sample_inputs_cdist(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cdist: a list of pairs of tensor shapes
+    # (batched, empty and broadcast cases; smaller sizes for 4-D) crossed with p values (1, 2, 3,
+    # 1.5, 2.5, inf) and both compute modes for Euclidean distance. Inputs are always contiguous
+    # because the backward does not support otherwise.
     small_S = 2
     test_cases = (
         ((S, S, 2), (S, S + 1, 2)),
@@ -2350,11 +2804,16 @@ def sample_inputs_cdist(op_info, device, dtype, requires_grad, **kwargs):
                 yield SampleInput(make_arg(t1_size), make_arg(t2_size), p, cm)
 
 def _fill_np(a, value):
+    # [FUNCTION DOC] HELPER: NumPy reference for fill: copies the array, fills the copy with the
+    # value, and returns it.
     a = a.copy()
     a.fill(value)
     return a
 
 def _fill_sample_kwargs(device, dtype, input):
+    # [FUNCTION DOC] HELPER: Sample kwargs provider for fill: returns a pair of identical
+    # dicts with the value True for bool dtype and 3 otherwise (for the torch call and the
+    # NumPy reference).
     if dtype is torch.bool:
         value = True
     else:
@@ -2363,6 +2822,8 @@ def _fill_sample_kwargs(device, dtype, input):
     return ({'value': value}, {'value': value})
 
 def sample_inputs_comparison_ops(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for comparison ops: all elementwise binary
+    # samples plus one where both operands have identical values (a tensor and its clone).
     yield from sample_inputs_elementwise_binary(op, device, dtype, requires_grad, **kwargs)
 
     # Adds a sample input where both tensors have the same values
@@ -2372,6 +2833,9 @@ def sample_inputs_comparison_ops(op, device, dtype, requires_grad, **kwargs):
     yield SampleInput(lhs, args=(lhs.clone(),))
 
 def sample_inputs_stack(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for stack: a list of identical-shape tensors
+    # (counts 1, 3, 2, including zero-size shapes) with each dim from -1 up to one less than the
+    # number of dims.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # shape x number of tensors
@@ -2387,6 +2851,11 @@ def sample_inputs_stack(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_chunk_cat(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for _chunk_cat. Same-ndim cases use several
+    # tensor shape lists with positive and negative dims and a chunk count; different-ndim cases
+    # use dims 0 and 1 and 3 chunks; and a final group makes the last two dims column-major
+    # (noncontiguous). Rules in the comment: dim must be non-negative and in range for every tensor
+    # when ndims differ, leading dims must match, num_chunks positive, and tensors non-empty.
     # 1. If input tensors have different ndims, dim should be non-negative and be less than the ndims of every input tensors.
     #    If all input tensors have the same ndims, we support both negative and non-negative dim.
     # 2. For wrapped_dim, all tensors should have the same size for 0,...,wrapped_dim-1 dimensions.
@@ -2450,6 +2919,10 @@ def sample_inputs_chunk_cat(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(tensors, args=(dim, num_chunks))
 
 def error_inputs_chunk_cat(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for _chunk_cat: negative dim with differing
+    # ndims, dim not below ndim of some tensor, mismatched leading sizes, negative and zero
+    # num_chunks, an empty tensor list, and a tensor with zero elements. Each expects an error
+    # message starting with _chunk_cat expects.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # input tensors have different ndims but dim is negative
@@ -2509,6 +2982,10 @@ def error_inputs_chunk_cat(op_info, device, **kwargs):
 
 
 def sample_inputs_cat_concat(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cat and concat with a list of two tensors
+    # and dim keyword cases (negative dim, different shapes, empty tensors, default dim), plus a
+    # channels-last 4-D single-tensor case along dim 1.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases: tuple[tuple, tuple, dict] = (  # type: ignore[assignment]
@@ -2529,6 +3006,10 @@ def sample_inputs_cat_concat(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput([make_arg((2, 2, 2, 2), memory_format=torch.channels_last)], args=(1,),)
 
 def error_inputs_cat(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for cat: out tensor with overlapping memory,
+    # empty list (ValueError), size and dimension-count mismatches, repeated memory between inputs
+    # and out, tensors on different devices (CUDA only), a None entry (TypeError), zero-dim
+    # tensors, and an out argument of the wrong type. Each has the expected message regex.
 
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
@@ -2598,6 +3079,9 @@ def error_inputs_cat(op_info, device, **kwargs):
                      error_regex='must be tuple of Tensors')
 
 def reference_inputs_cat(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for cat: yields the regular samples, then a mix
+    # of noncontiguous, type-promoting tensors (float16, highest-precision float) joined along dim
+    # 1, and cases with a 1-D tensor of length zero mixed with or without other tensors.
     yield from sample_inputs_cat_concat(op, device, dtype, requires_grad, **kwargs)
 
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -2617,7 +3101,12 @@ def reference_inputs_cat(op, device, dtype, requires_grad, **kwargs):
     yield SampleInput((a, a, a))
 
 def _elementwise_type_promo_np(*args, type_promotion_kind):
+    # [FUNCTION DOC] HELPER: Compute the NumPy dtype that results from elementwise type promotion
+    # of the given arguments (flattened with the pytree utilities, NumPy arrays converted to
+    # tensors) for a given promotion kind; returns it via the torch-to-NumPy dtype map.
     def _maybe_torch(x):
+        # [FUNCTION DOC] HELPER: Convert a NumPy array to a torch tensor, leave other
+        # values unchanged.
         if isinstance(x, np.ndarray):
             return torch.from_numpy(x)
         return x
@@ -2630,6 +3119,9 @@ def _elementwise_type_promo_np(*args, type_promotion_kind):
     return torch_to_numpy_dtype_dict[result_dtype]
 
 def _cat_np(input_seq, dim=0):
+    # [FUNCTION DOC] HELPER: NumPy reference for cat. Drops 1-D empty arrays (matching legacy torch
+    # behavior), concatenates the rest along the axis, and when nothing remains returns an empty
+    # 1-D array of the promoted dtype.
     inputs = tuple(a for a in input_seq if not (a.ndim == 1 and a.size == 0))
 
     if len(inputs) == 0:
@@ -2641,6 +3133,8 @@ def _cat_np(input_seq, dim=0):
     return np.concatenate(inputs, axis=dim)
 
 def _floor_divide_np(a, b):
+    # [FUNCTION DOC] HELPER: NumPy reference for floor_divide: casts array operands to the promoted
+    # dtype and applies NumPy floor_divide.
     dtype = _elementwise_type_promo_np(
         a,
         b,
@@ -2652,6 +3146,9 @@ def _floor_divide_np(a, b):
     return np.floor_divide(a, b)
 
 def sample_inputs_hstack_dstack_vstack(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for hstack, dstack and vstack: tuples
+    # of three tensors that are all 1-D or all 2-D (the 1-D first tensor is a special case
+    # for hstack).
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     tensor_shapes = (
         # First Tensor being 1-D is special
@@ -2664,6 +3161,9 @@ def sample_inputs_hstack_dstack_vstack(op_info, device, dtype, requires_grad, **
         yield SampleInput(tensors)
 
 def sample_inputs_hypot(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for hypot: all elementwise binary samples
+    # plus, for floating dtypes when gradients are not needed, a regression sample with extreme,
+    # infinite and NaN values (gradients would be ill-defined).
     yield from sample_inputs_elementwise_binary(op_info, device, dtype, requires_grad, **kwargs)
 
     if dtype.is_floating_point and not requires_grad:
@@ -2680,6 +3180,8 @@ def sample_inputs_hypot(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(lhs, args=(rhs,))
 
 def error_inputs_hstack_dstack_vstack(op, device):
+    # [FUNCTION DOC] Generator of ErrorInput objects for hstack, dstack and vstack: tensors of
+    # different dimension counts, and an empty tuple of tensors.
     make_arg = partial(make_tensor, dtype=torch.int32, device=device, requires_grad=False)
     tensor_shapes = (
         ((S,), (S, S, S, S), (S,)),
@@ -2693,6 +3195,8 @@ def error_inputs_hstack_dstack_vstack(op, device):
     yield ErrorInput(SampleInput(()), error_regex="expects a non-empty TensorList")
 
 def sample_inputs_unbind(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unbind with (shape, dim) cases including
+    # negative dim; zero-length dims are not unbound since that returns an empty tuple.
     # Note: we don't do any tests where we unbind along 0-length dims
     # because in that case unbind returns and empty tuple, and that breaks
     # some assumptions in some backward tests in test_ops.py
@@ -2709,6 +3213,8 @@ def sample_inputs_unbind(op_info, device, dtype, requires_grad, **kwargs):
                           args=(dim,))
 
 def error_inputs_unbind(op_info, device):
+    # [FUNCTION DOC] Generator of ErrorInput objects for unbind: a zero-dim tensor (IndexError, no
+    # dimensions) and an out-of-range dim (IndexError).
     make_arg = partial(make_tensor, dtype=torch.int32, device=device, requires_grad=False)
     yield ErrorInput(SampleInput(make_arg(()), args=(0,)), error_type=IndexError,
                      error_regex="Dimension specified as 0 but tensor has no dimensions")
@@ -2716,10 +3222,15 @@ def error_inputs_unbind(op_info, device):
                      error_regex="Dimension out of range")
 
 def reference_unbind(t, dim):
+    # [FUNCTION DOC] HELPER: NumPy reference for unbind: splits the array into single slices along
+    # dim and squeezes that dim from each, returning a tuple.
     """A numpy implementation of torch.unbind"""
     return tuple(s.squeeze(dim) for s in np.split(t, t.shape[dim], dim))
 
 def sample_inputs_gather(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for gather: random index tensors (int64 and
+    # int32) along dim 0 and dim 1, empty index tensors, and zero-dim input with 1-element and
+    # zero-dim index tensors.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     yield SampleInput(
         make_arg((M, S)),
@@ -2753,6 +3264,9 @@ def sample_inputs_gather(op_info, device, dtype, requires_grad, **kwargs):
         torch.tensor(0, dtype=torch.int64, device=device))
 
 def _fill_indices(idx, dim, dim_size, elems_per_row, m, n, o):
+    # [FUNCTION DOC] HELPER: Fill index tensor idx in place with random permutation prefixes of
+    # length elems_per_row drawn from range(dim_size), for every position over the other dimensions
+    # of an (m, n, o) shape, writing along dimension dim.
     for i in range(1 if dim == 0 else m):
         for j in range(1 if dim == 1 else n):
             for k in range(1 if dim == 2 else o):
@@ -2761,6 +3275,10 @@ def _fill_indices(idx, dim, dim_size, elems_per_row, m, n, o):
                 idx[tuple(ii)] = torch.randperm(dim_size)[0:elems_per_row]
 
 def error_inputs_gather(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for gather: size mismatch of the index at
+    # dimension 0, wrong out dtype, index with too few dimensions, source with too few dimensions,
+    # out-of-bounds index (CPU only), and out tensors that overlap memory with the inputs. Each has
+    # an expected message.
     # src is [1, 2]
     #        [3, 4]
     src = torch.tensor(((1, 2), (3, 4)), device=device, dtype=torch.float32)
@@ -2821,6 +3339,9 @@ def error_inputs_gather(op_info, device, **kwargs):
                      error_regex='unsupported operation')
 
 def error_inputs_take(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for take: out tensors that share memory
+    # (expanded view, same as input, and an overlapping slice of the index), expecting an
+    # unsupported operation error.
     x = torch.rand((1,), device=device).expand((3,))
     src = torch.rand((6,), device=device)
     ind = torch.tensor([2, 1, 0], device=device, dtype=torch.int64)
@@ -2839,6 +3360,9 @@ def error_inputs_take(op_info, device, **kwargs):
 
 # Error inputs for scatter
 def error_inputs_scatter_and_scatter_add(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for scatter and scatter_add: self and src
+    # dtype mismatch, index with wrong number of dimensions compared to self or to src, and an
+    # out-of-bounds index (CPU only).
     # Error when self.dtype != src.dtype (and src is not a scalar)
     src = make_tensor((2, 5), device=device, dtype=torch.float32)
     idx = torch.tensor(((0, 1), (1, 2)), device=device, dtype=torch.long)
@@ -2870,12 +3394,17 @@ def error_inputs_scatter_and_scatter_add(op_info, device, **kwargs):
                          error_regex="index 34 is out of bounds for dimension 0 with size 3")
 
 def error_inputs_renorm(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for renorm: a zero-dim input, expecting an
+    # error that at least 2 dimensions are needed.
     zero_d = torch.randn((), device=device)
     yield ErrorInput(SampleInput(zero_d, args=(0.5, 0, 1.0)), error_type=RuntimeError,
                      error_regex="needs at least 2 dimensions, got 0 dimensions")
 
 
 def error_inputs_ormqr(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for ormqr: a zero-dim input, and a
+    # regression case where the tau shape does not match min(other rows, input columns) for an
+    # empty-column input.
     zero_d = torch.randn((), device=device)
     yield ErrorInput(SampleInput(zero_d, args=(zero_d, zero_d)), error_type=RuntimeError,
                      error_regex="input must have at least 2 dimensions")
@@ -2891,6 +3420,8 @@ def error_inputs_ormqr(op_info, device, **kwargs):
 
 
 def error_inputs_diag(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for diag: a zero-dim input and a 3-D input,
+    # both expecting an error that 1-D or 2-D input is required.
     zero_d = torch.randn((), device=device)
     yield ErrorInput(SampleInput(zero_d, args=(0,)), error_type=RuntimeError,
                      error_regex="1D or 2D")
@@ -2899,6 +3430,8 @@ def error_inputs_diag(op_info, device, **kwargs):
                      error_regex="1D or 2D")
 
 def error_inputs_embedding(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for embedding: a zero-dim weight and a 3-D
+    # weight with long indices, expecting an error that weight must be 2-D.
     indices = torch.rand(2, 2, device=device).long()
     weights = [
         torch.tensor(1.0, device=device),
@@ -2911,6 +3444,8 @@ def error_inputs_embedding(op_info, device, **kwargs):
 
 
 def error_inputs_t(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for t: a 4-D tensor, expecting the error
+    # that at most 2 dimensions are accepted.
     yield ErrorInput(
         SampleInput(torch.randn(2, 3, 4, 5, device=device)),
         error_regex="expects a tensor with <= 2",
@@ -2918,6 +3453,13 @@ def error_inputs_t(op_info, device, **kwargs):
 
 
 def error_inputs_multinomial(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for multinomial: wrong input dimension,
+    # integer input dtype, wrong out dtype, non-positive number of samples, more samples than
+    # categories without replacement, too many categories (a tensor with 16777217 entries), and
+    # (CPU only) probability vectors containing negative, inf or nan entries or a zero sum with and
+    # without replacement.
+    # KNOWN ISSUE: the CPU-only branch rebinds the name kwargs, shadowing the function's
+    # **kwargs parameter.
     dtype = highest_precision_float(device)
     x = torch.empty(1, 2, 3, dtype=dtype, device=device)
     yield ErrorInput(SampleInput(x, args=(2,)),
@@ -2980,6 +3522,10 @@ def error_inputs_multinomial(op_info, device, **kwargs):
                              error_regex=err_msg2)
 
 def error_inputs_gradient(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for gradient. For each of long, float32 and
+    # complex64 on a 3x3 tensor: spacing list length not matching the dims, unsupported edge_order,
+    # a dim repeated in the dims list, and coordinate tensors on different devices. Each expects a
+    # RuntimeError with a matching message.
     for dtype in [torch.long, torch.float32, torch.complex64]:
         t = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device, dtype=dtype)
 
@@ -3019,6 +3565,8 @@ def error_inputs_gradient(op_info, device, **kwargs):
                          error_regex='torch.gradient expected each dimension size to be at least')
 
 def sample_inputs_rrelu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for rrelu: all elementwise unary samples with
+    # lower 0, upper 1 and training True, plus a plain 1-D sample and one with training False.
     yield from sample_inputs_elementwise_unary(
         op_info, device, dtype, requires_grad, op_kwargs=dict(lower=0., upper=1., training=True))
 
@@ -3027,11 +3575,16 @@ def sample_inputs_rrelu(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg(S), training=False)
 
 def error_inputs_rrelu(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for rrelu: lower bound greater than the
+    # upper bound, expecting the message that the lower bound should not exceed the upper bound.
     input = make_tensor((S, S), device=device, dtype=torch.float32)
     yield ErrorInput(SampleInput(input, kwargs={'lower': 0.3, 'upper': 0.1}),
                      error_regex='Lower bound should be less than or equal to the upper bound')
 
 def error_inputs_masked_select(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for masked_select: out tensors that overlap in
+    # memory (an expanded view, the input itself, and the mask itself), expecting an unsupported
+    # operation error.
     x = torch.rand((1,), device=device).expand((3,))
     y = torch.rand((6,), device=device)
     mask = torch.tensor([True, False, True, True, False, False], device=device)
@@ -3049,6 +3602,11 @@ def error_inputs_masked_select(op_info, device, **kwargs):
                      error_regex='unsupported operation')
 
 def error_inputs_median(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for median: only when the device string equals
+    # cuda it yields one ErrorInput for a 25-dimension-plus tensor, expecting the CUDA
+    # maximum-dimension error; for any other device it yields nothing.
+    # KNOWN ISSUE: the device check is an equality test with the string cuda, so a device string
+    # such as cuda:0 yields no error inputs.
     x = torch.tensor([[[[[[[[[[[[[[[[[[[[[[[[[nan],
                                [nan]]]]]]]]]]]]]]]]]]]]]]]]], device=device)
     if device == 'cuda':
@@ -3060,6 +3618,8 @@ def error_inputs_median(op_info, device, **kwargs):
 
 
 def error_inputs_index_select(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for index_select: out is an expanded view
+    # whose elements share memory, expecting an unsupported operation error.
     x = torch.rand((1, 6), device=device).expand((2, 6))
     y = torch.rand((3, 6), device=device)
     ind = torch.tensor([0, 1], dtype=torch.int64, device=device)
@@ -3069,6 +3629,9 @@ def error_inputs_index_select(op_info, device, **kwargs):
                      error_regex='unsupported operation')
 
 def error_inputs_index_add(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for index_add: a source whose shape does not
+    # match self apart from the indexed dimension, expecting the matching shape error. Tensors are
+    # created on the default (CPU) device.
     result = torch.tensor([[1., 2.], [4., 5.], [7., 8.]])
     source = torch.tensor([2., 4.])
 
@@ -3078,6 +3641,8 @@ def error_inputs_index_add(op_info, device, **kwargs):
                      r'excluding the specified dimension. Got self.shape = \[3, 2\] source.shape = \[2\]')
 
 def error_inputs_logcumsumexp(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for logcumsumexp: a dim of 3 on a non-empty
+    # 2-D tensor and on an empty one, both expecting an IndexError about the dimension range.
     dim = 3
     srcs = [torch.randn(5, 2, device=device), torch.randn(0, 2, device=device)]
     for src in srcs:
@@ -3086,6 +3651,9 @@ def error_inputs_logcumsumexp(op_info, device, **kwargs):
                          error_regex='Dimension out of range')
 
 def sample_inputs_take_along_dim(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for take_along_dim: matching shapes,
+    # broadcast indices, broadcast input, a call without dim, and (unless the keyword is_python_ref
+    # is set) an index tensor with negative indices.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     yield SampleInput(
         make_arg((S, S)), gather_variable((S, S), 1, S, True, device=device), 0)
@@ -3112,6 +3680,10 @@ def sample_inputs_take_along_dim(op_info, device, dtype, requires_grad, **kwargs
 
 
 def error_inputs_aminmax_amax_amin(op_info, device, is_ref=False, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects shared by aminmax, amax and amin (the op name
+    # selects which apply; is_ref selects the reference implementation messages): reduction over an
+    # empty dimension, tensors with more than 64 dims, repeated dims (amax/amin), mismatched out
+    # dtype, and a reduction dim of size zero (IndexError for eager, RuntimeError for refs).
 
     # Error Inputs for zero-dim tensors, when 'dim' arg is not provided.
     shape = (S, 0, S)
@@ -3170,6 +3742,9 @@ def error_inputs_aminmax_amax_amin(op_info, device, is_ref=False, **kwargs):
                      error_type=error_type, error_regex=err_msg3)
 
 def sample_inputs_aminmax(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for aminmax with (shape, kwargs) cases
+    # covering default, dim, keepdim, zero-dim and an empty-dimension reduction.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     test_cases: tuple[tuple, dict] = (  # type: ignore[assignment]
         ((S, S, S), {}),
         ((S, S, S), {'dim': 1}),
@@ -3186,6 +3761,9 @@ def sample_inputs_aminmax(op_info, device, dtype, requires_grad, **kwargs):
             **kwargs)
 
 def error_inputs_diff(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for diff: a negative order n, expecting an
+    # error that the order must be non-negative. The incoming kwargs are forwarded into the
+    # sample's kwargs.
     t = torch.rand((1, 3), device=device)
     n = -1
     yield ErrorInput(SampleInput(t, args=(n, ), kwargs=kwargs),
@@ -3193,6 +3771,9 @@ def error_inputs_diff(op_info, device, **kwargs):
                      error_regex=f'order must be non-negative but got {n}')
 
 def sample_inputs_diff(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for diff with sizes, dims and optional
+    # prepend/append tensors; for each case n runs from 0 up to the total length along dim minus 1.
+    # Also adds samples with n larger than the dimension size.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     test_cases = (
@@ -3225,6 +3806,9 @@ def sample_inputs_diff(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((XS, XS, XS)), S * 3 + 2, 2, make_arg((XS, XS, XS)), make_arg((XS, XS, XS)))
 
 def sample_inputs_histogram(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for histogram over several input shapes, bin
+    # counts 1 to 4, with and without weights and density; each is yielded once with an integer bin
+    # count and once with a sorted random bins tensor.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = ((), (S,), (S, S), (S, S, S), (S, 1, S), (S, 0, S))
@@ -3242,6 +3826,9 @@ def sample_inputs_histogram(op_info, device, dtype, requires_grad, **kwargs):
                           weight=weight_tensor, density=density)
 
 def sample_inputs_histogramdd(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for histogramdd: inputs whose last dimension
+    # is the number of histogram dimensions, bin count patterns, optional weights and density;
+    # yields once with a tuple of bin counts and once with a list of random bin edge tensors.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = ((S, S), (S, S, S), (S, 1, S), (S, 0, S))
@@ -3260,12 +3847,17 @@ def sample_inputs_histogramdd(op_info, device, dtype, requires_grad, **kwargs):
                           weight=weight_tensor, density=density)
 
 def error_inputs_histogramdd(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for histogramdd: a list of bin counts whose
+    # length differs from the input's innermost dimension.
     invalid_bins = [1, 1, 1, 1, 1]
     make_arg = partial(make_tensor, dtype=torch.float, device=device, requires_grad=False)
     msg = "histogramdd: The size of bins must be equal to the innermost dimension of the input."
     yield ErrorInput(SampleInput(make_arg(5, 6), invalid_bins), error_regex=msg)
 
 def sample_inputs_histc(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for histc over input shapes and min/max
+    # ranges (0 to 10, plus -10 to 0 combinations for signed dtypes); each yields a sample without
+    # bins and samples with bins 1, 3 and 10.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = ((), (S,), (S, S), (S, S, S), (S, 1, S), (S, 0, S))
@@ -3286,6 +3878,9 @@ def sample_inputs_histc(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(make_arg(size), bins=bins, min=min, max=max)
 
 def sample_inputs_bincount(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for bincount: random non-negative integer
+    # vectors of sizes S and M, with and without weights, over several minlength values derived
+    # from the maximum value.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     for size, weighted in product((S, M), [False, True]):
@@ -3299,6 +3894,9 @@ def sample_inputs_bincount(op_info, device, dtype, requires_grad, **kwargs):
                 input_tensor, weights=weight_tensor, minlength=minlength)
 
 def sample_inputs_bucketize(op_info, device, dtype, requires_grad, reference_inputs_mode=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for bucketize over input shapes and boundary
+    # sizes with out_int32 and right flags; boundaries are sorted random tensors. When
+    # reference_inputs_mode is true, larger shape pairs are added.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = (((), S), ((S,), S), ((S, S), S), ((S, S, S), S), ((S, 1, S), S), ((S, 0, S), S))
@@ -3316,11 +3914,18 @@ def sample_inputs_bucketize(op_info, device, dtype, requires_grad, reference_inp
 reference_inputs_bucketize = partial(sample_inputs_bucketize, reference_inputs_mode=True)
 
 def error_inputs_bucketize(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for bucketize: a 2-D boundaries tensor,
+    # expecting an error that boundaries must be 1-D.
     make_arg = partial(make_tensor, dtype=torch.float, device=device, requires_grad=False)
     yield ErrorInput(SampleInput(make_arg((S, S, S)), make_arg((S, S))),
                      error_regex="boundaries tensor must be 1 dimension")
 
 def sample_inputs_searchsorted(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for searchsorted over (sorted tensor size,
+    # input sizes, scalar input) cases, contiguous and noncontiguous, with out_int32 and right
+    # flags. For each case yields forms with a sorted boundary tensor using right or side, and
+    # forms with an unsorted tensor with a sorter tensor. For zero-size tensors the sorter is just
+    # a random int64 tensor.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     # (unsorted tensor size, (input sizes,), is_scalar)
@@ -3356,6 +3961,9 @@ def sample_inputs_searchsorted(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(unsorted_tensor, input, out_int32=out_int32, side=side, sorter=sorter)
 
 def sample_inputs_gradient(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for gradient: float spacing and
+    # list-of-scalar spacing cases with optional dims and edge orders, and cases where the spacing
+    # is a list of coordinate tensors.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     test_cases_float = (
         ((S,), None, None, 1),
@@ -3382,6 +3990,9 @@ def sample_inputs_gradient(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(t, dim=dim, spacing=coordinates_tensor_list, edge_order=edge_order)
 
 def sample_inputs_getitem(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the indexing operation (getitem): a list
+    # of index arguments (lists, slices, tuples mixing them, ellipsis, long tensors, an index
+    # variable and a boolean mask) on a 3-D tensor, plus one case on a 4-D tensor.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     test_args = [
         ([1, 2],),
@@ -3407,6 +4018,9 @@ def sample_inputs_getitem(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((S, S, S, S)), args=((slice(None), [0, 1], slice(None), [0, 1]),))
 
 def sample_inputs_index_put(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for index_put, with accumulate False and
+    # True: one sample with a tuple of index tensors (duplicates are allowed only when
+    # accumulating) and values, and one with a boolean mask (an all-zero mask when accumulating).
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     for accumulate in [False, True]:
@@ -3424,12 +4038,20 @@ def sample_inputs_index_put(op_info, device, dtype, requires_grad, **kwargs):
             make_arg((S, S)), (mask, ), make_arg((S,)), accumulate=accumulate)
 
 def sample_inputs_sort(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for sort. Uses permutations of distinct
+    # integers so the order is deterministic: a large 1-D tensor, 3-D tensors across all dims,
+    # descending and stable flags (the stable form only on CPU; the plain form skipped for bool on
+    # CUDA), plus scalar, empty and stable-keyword cases.
     def small_3d_unique():
+        # [FUNCTION DOC] HELPER: Return a 3-D tensor of shape (S, S, S) holding a random
+        # permutation of distinct integers, cast to the test dtype and with requires_grad set.
         res = torch.randperm(S * S * S, dtype=torch.int64, device=device).view(S, S, S)
         res = res.to(dtype).requires_grad_(requires_grad)
         return res
 
     def large_1d_unique():
+        # [FUNCTION DOC] HELPER: Return a 1-D tensor of length L cubed holding a random permutation
+        # of distinct integers, cast to the test dtype and with requires_grad set.
         res = torch.randperm(L * L * L, dtype=torch.int64, device=device)
         res = res.to(dtype).requires_grad_(requires_grad)
         return res
@@ -3469,6 +4091,8 @@ def sample_inputs_sort(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(small_3d_unique(), dim=0, descending=True, stable=True)
 
 def sample_inputs_threshold(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for threshold: tensors of shapes zero-dim to
+    # 3-D with threshold and value arguments taken as Python numbers from random zero-dim tensors.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     sizes = ((), (S,), (S, S), (S, S, S))
     for x_size in sizes:
@@ -3476,6 +4100,12 @@ def sample_inputs_threshold(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(x_size), make_arg(()).item(), make_arg(()).item())
 
 def sample_inputs_unique(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unique over shapes (including an empty
+    # dim), sorted/return_inverse/return_counts flags and dims in (None, -2..2). Invalid dims are
+    # skipped, as are inputs with a zero-size dimension that is not the selected dim. For each
+    # valid case yields all-zero, mixed 0/1 and random inputs.
+    # KNOWN ISSUE: the empty-dimension check compares the index of the first zero with the dim
+    # using an identity test instead of equality; it works for small ints but is fragile.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     sizes = ((), (S,), (S, S), (S, S, S), (S, 1, S), (S, 0, S))
 
@@ -3504,12 +4134,18 @@ def sample_inputs_unique(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), **kwargs)
 
 def sample_inputs_unique_consecutive(*args, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unique_consecutive: takes the unique
+    # samples whose sorted flag is false and removes the sorted keyword from them
+    # (unique_consecutive does not accept it).
     for sample_input in sample_inputs_unique(*args, **kwargs):
         if not sample_input.kwargs["sorted"]:
             sample_input.kwargs.pop("sorted")
             yield sample_input
 
 def sample_inputs_adaptive_avg_pool1d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_avg_pool1d: (input shape, output
+    # size) cases including an empty batch, each yielded as a batched input and an unbatched one
+    # (without the leading dim).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3527,6 +4163,8 @@ def sample_inputs_adaptive_avg_pool1d(op_info, device, dtype, requires_grad, **k
 
 
 def error_inputs_adaptive_avg_pool1d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_avg_pool1d: an empty output_size
+    # and a negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for empty output
@@ -3539,6 +4177,8 @@ def error_inputs_adaptive_avg_pool1d(opinfo, device, **kwargs):
 
 
 def sample_inputs_adaptive_avg_pool2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_avg_pool2d: (input shape, output
+    # size) cases including None entries and an int size, each as batched and unbatched input.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3558,6 +4198,8 @@ def sample_inputs_adaptive_avg_pool2d(op_info, device, dtype, requires_grad, **k
 
 
 def error_inputs_adaptive_avg_pool2d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_avg_pool2d: input with too few
+    # dimensions (ValueError), an empty output_size and a negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for incorrect input dimension
@@ -3574,6 +4216,8 @@ def error_inputs_adaptive_avg_pool2d(opinfo, device, **kwargs):
 
 
 def sample_inputs_adaptive_avg_pool3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_avg_pool3d: (input shape, output
+    # size) cases including an empty batch and None entries, each as batched and unbatched input.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3594,6 +4238,8 @@ def sample_inputs_adaptive_avg_pool3d(op_info, device, dtype, requires_grad, **k
 
 
 def error_inputs_adaptive_avg_pool3d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_avg_pool3d: input with too few
+    # dimensions (ValueError), an empty output_size and a negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for incorrect input dimension
@@ -3610,6 +4256,9 @@ def error_inputs_adaptive_avg_pool3d(opinfo, device, **kwargs):
 
 
 def sample_inputs_adaptive_max_pool1d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_max_pool1d: (input shape, output
+    # size) cases, with return_indices True and False, each as batched and unbatched input. An
+    # empty-batch case is disabled because it does not work.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3629,6 +4278,8 @@ def sample_inputs_adaptive_max_pool1d(op_info, device, dtype, requires_grad, **k
 
 
 def error_inputs_adaptive_max_pool1d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_max_pool1d: an empty output_size
+    # and a negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for empty output
@@ -3640,6 +4291,10 @@ def error_inputs_adaptive_max_pool1d(opinfo, device, **kwargs):
                      error_regex="Trying to create tensor with negative dimension")
 
 def sample_inputs_adaptive_max_pool2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_max_pool2d: (input shape, output
+    # size) cases including None entries and an int size, with return_indices True and False,
+    # batched and unbatched, plus channels-last inputs. An empty-batch case is disabled because it
+    # does not work.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3669,6 +4324,9 @@ def sample_inputs_adaptive_max_pool2d(op_info, device, dtype, requires_grad, **k
         )
 
 def error_inputs_adaptive_max_pool2d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_max_pool2d: input with too
+    # few dimensions (ValueError), an empty output_size (internal error message) and a
+    # negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for incorrect input dimension
@@ -3685,6 +4343,9 @@ def error_inputs_adaptive_max_pool2d(opinfo, device, **kwargs):
 
 
 def sample_inputs_adaptive_max_pool3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for adaptive_max_pool3d: (input shape, output
+    # size) cases including None entries, with return_indices True and False, batched and
+    # unbatched. An empty-batch case is disabled because it does not work.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as (input shape, output size)
@@ -3705,6 +4366,9 @@ def sample_inputs_adaptive_max_pool3d(op_info, device, dtype, requires_grad, **k
         yield SampleInput(make_arg(shapes[0][1:]), args=(shapes[1], return_idx))
 
 def error_inputs_adaptive_max_pool3d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for adaptive_max_pool3d: input with too
+    # few dimensions (ValueError), an empty output_size (internal error message) and a
+    # negative output_size.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for incorrect input dimension
@@ -3721,8 +4385,15 @@ def error_inputs_adaptive_max_pool3d(opinfo, device, **kwargs):
 
 
 class _TestParamsMaxPoolBase:
+    # [CLASS DOC] HELPER: Base class describing the parameter grid used to build max_pool sample
+    # inputs. Holds a mapping of keyword name to candidate values (kernel_size, stride, ceil_mode,
+    # padding, dilation, return_indices) and a list of per-dimension candidate sizes (batch,
+    # channels, signal). Provides generators over shapes with memory format, over keyword
+    # combinations, and over their product. Subclasses add values for 1-D, 2-D or 3-D pooling.
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize the candidate keyword values and the candidate shape
+        # lists (batch size 1, 2 or missing, channels 2, signal sizes 3 and 6).
         self.kwargs = {
             'kernel_size': [3],
             'stride': [2, None],
@@ -3739,6 +4410,10 @@ class _TestParamsMaxPoolBase:
         ]
 
     def _gen_shape(self):
+        # [FUNCTION DOC] HELPER: Generator yielding (shape, memory format) pairs over the product
+        # of the candidate sizes. A leading None means no batch dimension, so it is dropped. Adds a
+        # channels-last variant when the shape has 4 dims and the candidate list has 4 entries (the
+        # 2-D case).
         for shape in product(*self.shapes):
             # shape[0] is None indicates missing batch dimension
             if shape[0] is None:
@@ -3750,16 +4425,24 @@ class _TestParamsMaxPoolBase:
                 yield shape, torch.channels_last
 
     def _gen_kwargs(self):
+        # [FUNCTION DOC] HELPER: Generator yielding one keyword dictionary per combination of the
+        # candidate keyword values.
         keys = self.kwargs.keys()
         for values in product(*self.kwargs.values()):
             yield dict(zip(keys, values, strict=True))
 
     def gen_input_params(self):
+        # [FUNCTION DOC] HELPER: Generator yielding the product of shape/memory-format pairs and
+        # keyword dictionaries.
         yield from product(self._gen_shape(), self._gen_kwargs())
 
 class _TestParamsMaxPool1d(_TestParamsMaxPoolBase):
+    # [CLASS DOC] HELPER: Parameter grid for 1-D max pooling; extends the base grid with tuple
+    # forms of kernel_size, stride, padding and dilation.
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize the base grid and add one-element tuple options for
+        # kernel_size, stride, padding and dilation.
         super().__init__()
         self.kwargs['kernel_size'] += [(3,)]
         self.kwargs['stride'] += [(2,)]
@@ -3767,8 +4450,12 @@ class _TestParamsMaxPool1d(_TestParamsMaxPoolBase):
         self.kwargs['dilation'] += [(1,)]
 
 class _TestParamsMaxPool2d(_TestParamsMaxPoolBase):
+    # [CLASS DOC] HELPER: Parameter grid for 2-D max pooling; extends the base grid with
+    # two-element tuple options and one more spatial size so shapes have up to four dims.
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize the base grid, add two-element tuple options for
+        # kernel_size, stride, padding and dilation, and append one more spatial size list.
         super().__init__()
         self.kwargs['kernel_size'] += [(3, 2)]
         self.kwargs['stride'] += [(2, 1)]
@@ -3778,8 +4465,12 @@ class _TestParamsMaxPool2d(_TestParamsMaxPoolBase):
         self.shapes.append([6])
 
 class _TestParamsMaxPool3d(_TestParamsMaxPoolBase):
+    # [CLASS DOC] HELPER: Parameter grid for 3-D max pooling; extends the base grid with
+    # three-element tuple options (no extra padding option) and two more spatial size lists.
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialize the base grid, add three-element tuple options for
+        # kernel_size, stride and dilation, and append two more spatial size lists.
         super().__init__()
         self.kwargs['kernel_size'] += [(3, 2, 3)]
         self.kwargs['stride'] += [(2, 1, 2)]
@@ -3789,6 +4480,11 @@ class _TestParamsMaxPool3d(_TestParamsMaxPoolBase):
         self.shapes.append([5])
 
 def sample_inputs_max_pool(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the max_pool family. Picks the parameter
+    # grid class from the op name (max_pool1d, max_pool2d, max_pool3d, or the 2-D backward op),
+    # then yields one SampleInput per shape/memory-format and keyword combination, with a
+    # requires_grad leaf converted to that memory format. Raises a KeyError for other op names.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
     params_generator_type_dict = {
@@ -3804,6 +4500,10 @@ def sample_inputs_max_pool(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(arg, kwargs=kwargs)
 
 def max_pool2d_backward(*args, kernel_size=(), stride=(), padding=(0,), dilation=(1,), ceil_mode=False, **kwargs):
+    # [FUNCTION DOC] HELPER: Wrapper computing the gradient of max_pool2d with respect to its input
+    # using the output of max_pool2d_with_indices: runs the forward with indices, builds an
+    # all-ones gradient, replaces a None stride with kernel_size, and calls the aten backward
+    # kernel. Returns the input gradient.
     out, indices = torch.nn.functional.max_pool2d_with_indices(
         *args, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, ceil_mode=ceil_mode, return_indices=True)
     grad_out = torch.ones_like(out)
@@ -3814,6 +4514,10 @@ def max_pool2d_backward(*args, kernel_size=(), stride=(), padding=(0,), dilation
     return out_b
 
 def error_inputs_max_pool1d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for max_pool1d, repeated with requires_grad
+    # True and False (different code paths): negative or too large padding, bad input dims or empty
+    # input, zero stride, dilation or kernel_size, and an invalid computed output size. Each gives
+    # the expected message regex.
     # Toggle requires_grad because `max_pool1d` has different path
     # based on whether `requires_grad` is set or not.
     for requires_grad in (True, False):
@@ -3881,6 +4585,9 @@ def error_inputs_max_pool1d(op_info, device, **kwargs):
 
 
 def error_inputs_max_pool2d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for max_pool2d: negative padding and padding
+    # above half the kernel (int and tuple kernels), batched and unbatched inputs with zero-size
+    # non-batch dims, and a kernel too large for the input.
     make_arg = partial(make_tensor, device=device, dtype=torch.float, requires_grad=False)
     # error inputs when pad is negative
     x = make_arg((0, 1, 49))
@@ -3916,6 +4623,9 @@ def error_inputs_max_pool2d(op_info, device, **kwargs):
 
 
 def error_inputs_max_pool3d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for max_pool3d: negative padding and padding
+    # above half the kernel (int and tuple kernels), batched and unbatched inputs with zero-size
+    # non-batch dims, and a kernel too large for the input.
     make_arg = partial(make_tensor, device=device, dtype=torch.float, requires_grad=False)
     # error inputs when pad is negative
     x = make_arg((0, 1, 49, 50))
@@ -3954,6 +4664,9 @@ def error_inputs_max_pool3d(op_info, device, **kwargs):
 
 
 def sample_inputs_normalize(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for normalize with (shape, kwargs) cases over
+    # p, dim and eps, including a zero-dim input; values are in the range -1 to 1.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, low=-1, high=1, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases: tuple[tuple[int, ...], dict] = (
@@ -3971,6 +4684,11 @@ def sample_inputs_normalize(self, device, dtype, requires_grad, **kwargs):
 
 
 def complex_conv(fn, input_size, weight, grad_output, stride, padding, dilation, groups):
+    # [FUNCTION DOC] HELPER: Compute a complex convolution-related result from a real convolution
+    # function fn by splitting weight and grad_output into real and imaginary parts: with a as
+    # the real parts result, b as the imaginary parts result and c as the sum-parts result, it
+    # returns (a minus b) plus i times (c minus a minus b). Used as a complex reference for
+    # convolution backward.
     # conv(W, x, b) = conv(Wr, xr, br) - conv(Wi, xi, 0) + i(conv(Wi, xr, bi) + conv(Wr, xi, 0))
     # a = conv(Wr, xr, br),
     # b = conv(Wi, xi, 0),
@@ -3995,6 +4713,13 @@ def complex_conv(fn, input_size, weight, grad_output, stride, padding, dilation,
 def conv_transpose_ref(input, weight, bias, stride=1, padding=0,
                        output_padding=0, dilation=1, groups=1,
                        fn=None):
+    # [FUNCTION DOC] HELPER: NumPy-input reference for conv_transpose1d, 2d and 3d (the fn argument
+    # selects which; None raises an AssertionError). Converts the input and weight arrays to
+    # tensors, adds a batch dim if the input is unbatched, and computes the result as the input
+    # gradient of the matching convolution (torch.nn.grad conv input function) with the input as
+    # grad_output; the target output size is found by running fn on meta tensors. Complex weights
+    # use the complex_conv decomposition. The bias, reshaped for broadcasting, is added at the end,
+    # and the batch dim is removed if it was added. Returns a tensor.
     # Derivative of `conv` is `conv_transpose`.
     # To verify the correctness of `conv_transpose`,
     # we rely `torch.nn.grad` implementation (which is tested in test_nn.py)
@@ -4043,6 +4768,11 @@ def conv_transpose_ref(input, weight, bias, stride=1, padding=0,
 
 
 def sample_inputs_conv_transpose1d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv_transpose1d with (input, weight,
+    # bias shapes, keyword dict) cases varying stride, padding, output_padding, groups and
+    # dilation; each is yielded as a batched input and an unbatched one (without the batch dim).
+    # Bias may be None.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias
@@ -4074,6 +4804,10 @@ def sample_inputs_conv_transpose1d(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_conv_transpose2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv_transpose2d with (input, weight,
+    # bias shapes, keyword dict) cases varying stride, padding, output_padding, groups and
+    # dilation; each is yielded as a batched input and an unbatched one. Bias may be None.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias
@@ -4104,6 +4838,10 @@ def sample_inputs_conv_transpose2d(op_info, device, dtype, requires_grad, **kwar
         ), kwargs=kwargs)
 
 def sample_inputs_conv_transpose3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv_transpose3d with (input, weight,
+    # bias shapes, keyword dict) cases varying stride, padding, output_padding, groups and
+    # dilation; each is yielded as a batched input and an unbatched one. Bias may be None.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias
@@ -4135,6 +4873,10 @@ def sample_inputs_conv_transpose3d(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_conv1d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv1d with (input, weight, bias shapes,
+    # keyword dict) cases, including string padding values valid and same, groups, dilation and a
+    # defaults-only case; each is yielded batched and unbatched.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias,
@@ -4162,6 +4904,10 @@ def sample_inputs_conv1d(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_conv1d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for conv1d: int input with float bias and
+    # float input with complex bias (dtype mismatch), non-positive stride, negative padding,
+    # non-positive dilation, a weight with too few dimensions, and weight/group count problems (too
+    # many or non-positive groups). A bias-size check is disabled pending an open issue.
     dtype = highest_precision_float(device)
     cdtype = highest_precision_complex(device)
     make_arg = partial(make_tensor, device=device, dtype=dtype)
@@ -4224,6 +4970,9 @@ def error_inputs_conv1d(opinfo, device, **kwargs):
 
 
 def error_inputs_conv2d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for conv2d: dtype mismatches between input,
+    # weight and bias, non-positive stride, negative padding, non-positive dilation, input and
+    # weight rank mismatch, and invalid groups (too many, negative or zero).
     dtype = highest_precision_float(device)
     cdtype = highest_precision_complex(device)
     make_arg = partial(make_tensor, device=device, dtype=dtype)
@@ -4287,6 +5036,12 @@ def error_inputs_conv2d(opinfo, device, **kwargs):
 
 
 def sample_inputs_conv2d(op_info, device, dtype, requires_grad, jit_fail_sample=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv2d with (input, weight, bias shapes,
+    # keyword dict) cases covering stride, padding (numbers, valid and same), dilation and groups,
+    # including grouped cases taken from the nn tests and a defaults case; each is yielded batched
+    # and unbatched.
+    # KNOWN ISSUE: the jit_fail_sample parameter is never used, one case is listed twice, and the
+    # loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias
@@ -4332,6 +5087,11 @@ def sample_inputs_conv2d(op_info, device, dtype, requires_grad, jit_fail_sample=
 
 
 def sample_inputs_conv3d(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for conv3d with (input, weight, bias shapes,
+    # keyword dict) cases covering padding same and valid, stride, dilation and groups; each is
+    # yielded batched and unbatched.
+    # KNOWN ISSUE: one case (padding valid on a 1x1x1x1x10 input) appears twice, and the loop
+    # variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as shapes for input, weight, bias
@@ -4363,6 +5123,9 @@ def sample_inputs_conv3d(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_conv3d(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for conv3d: dtype mismatches between input,
+    # weight and bias, non-positive stride, negative padding, non-positive dilation, input and
+    # weight rank mismatch, invalid groups, and padding same combined with a strided convolution.
     dtype = highest_precision_float(device)
     cdtype = highest_precision_complex(device)
     make_arg = partial(make_tensor, device=device, dtype=dtype)
@@ -4430,6 +5193,14 @@ def error_inputs_conv3d(opinfo, device, **kwargs):
 
 
 def sample_inputs_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for group_norm. For each (input shape,
+    # num_groups, eps keyword) case it creates weight and bias of the channel size and loops over
+    # the four combinations of weight/bias present or None; it ends with a case with no optional
+    # arguments. Includes a 4-D case to exercise CPU channels-last behavior.
+    # KNOWN ISSUE: inside the combination loop the dictionary of keyword arguments is rebuilt by
+    # merging the previous kwargs after the new weight and bias entries, so the weight and bias
+    # from the first combination are kept and the None combinations are never actually produced;
+    # the loop also rebinds the function's **kwargs name.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as input shape, num groups, and kwargs for eps
@@ -4471,6 +5242,9 @@ def sample_inputs_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_native_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for native_group_norm, derived from the
+    # group_norm samples: converts the input to channels-last on CPU for 4-D inputs, and yields the
+    # positional form (input, weight, bias, N, C, HxW, group, eps) with eps defaulting to 1e-5.
     for si in sample_inputs_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
         inp: torch.Tensor = si.input
         mem_fmt = torch.channels_last if device == "cpu" and inp.ndim == 4 else torch.contiguous_format
@@ -4487,6 +5261,12 @@ def sample_inputs_native_group_norm(opinfo, device, dtype, requires_grad, **kwar
 
 
 def reference_inputs_group_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for group_norm: yields the regular samples plus
+    # larger 4-D cases (20x6x10x10 with 3, 6 and 1 groups, matching instance norm and layer norm
+    # equivalences), each looped over weight/bias present or None.
+    # KNOWN ISSUE: same kwargs merge flaw as sample_inputs_group_norm: the None combinations of
+    # weight and bias are never actually produced because earlier values override the new ones, and
+    # kwargs rebinds the function's **kwargs name.
     yield from sample_inputs_group_norm(
         op_info, device, dtype, requires_grad, **kwargs)
 
@@ -4524,6 +5304,9 @@ def reference_inputs_group_norm(op_info, device, dtype, requires_grad, **kwargs)
 
 
 def reference_inputs_native_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for native_group_norm, derived from the
+    # group_norm reference inputs: converts 4-D inputs to channels-last on CPU and yields the
+    # positional (input, weight, bias, N, C, HxW, group, eps) form.
     for si in reference_inputs_group_norm(opinfo, device, dtype, requires_grad, **kwargs):
         inp: torch.Tensor = si.input
         mem_fmt = torch.channels_last if device == "cpu" and inp.ndim == 4 else torch.contiguous_format
@@ -4540,6 +5323,13 @@ def reference_inputs_native_group_norm(opinfo, device, dtype, requires_grad, **k
 
 
 def sample_inputs_instance_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for instance_norm: (input shape, kwargs)
+    # cases with momentum, eps and use_input_stats; running_mean and running_var are non-grad
+    # tensors, weight and bias require grad. Then yields cases with and without weight, and one
+    # with no optional keyword arguments.
+    # KNOWN ISSUE: the second group of samples reuses channels and input_shape leaked from the
+    # last iteration of the first loop; its bias list is always None, so a weight-with-bias case
+    # is not produced.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_arg_without_requires_grad = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
@@ -4597,24 +5387,38 @@ def sample_inputs_instance_norm(opinfo, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((1, 2, 3)), kwargs={})
 
 def sample_inputs_safe_softmax(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for safe_softmax: tensors with additive float
+    # masks (negative infinity where masked) built from random boolean masks in 1-D to 4-D shapes
+    # with various dims, plus fully masked, unmasked and two-rows-masked cases. Tensors get
+    # requires_grad set after masking.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
 
     def make_bool_mask(*shape):
+        # [FUNCTION DOC] HELPER: Return a random boolean mask tensor of the given shape on
+        # the device.
         return torch.randint(0, 2, shape, device=device, dtype=torch.bool)
 
     def mask_two_rows(rows, cols):
+        # [FUNCTION DOC] HELPER: Return a boolean mask of ones with shape (rows, cols) where the
+        # rows at index rows minus 1 and rows minus 3 are set to False.
         mask_two_rows = torch.ones((rows, cols), dtype=torch.bool, device=device)
         mask_two_rows[rows - 1] = False
         mask_two_rows[rows - 3] = False
         return mask_two_rows
 
     def convert_to_float_mask(mask: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Convert a boolean mask into a float mask that is negative infinity
+        # where the mask is false and zero elsewhere.
         return torch.where(~mask, float('-inf'), 0.0)
 
     def with_requires_grad(tensor):
+        # [FUNCTION DOC] HELPER: Set requires_grad on the tensor according to the enclosing flag
+        # and return it.
         return tensor.requires_grad_(requires_grad)
 
     def generate_input_from_mask(mask_shape, dim):
+        # [FUNCTION DOC] HELPER: Build one SampleInput for the given mask shape and dim: a random
+        # input tensor plus a float mask converted from a random boolean mask.
         mask = make_bool_mask(*mask_shape)
         input_tensor = make_arg(mask_shape)
         masked_input = input_tensor + convert_to_float_mask(mask)
@@ -4662,6 +5466,11 @@ def sample_inputs_safe_softmax(opinfo, device, dtype, requires_grad, **kwargs):
     yield from samples
 
 def sample_inputs_layer_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for layer_norm with (input shape,
+    # normalized_shape, eps keywords) cases, including an empty batch, passing weight and bias,
+    # followed by a case with no optional arguments. Cases with None weight or bias are left
+    # commented out.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as input shape, normalized_shape and a kwarg dict for eps
@@ -4696,6 +5505,9 @@ def sample_inputs_layer_norm(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_native_layer_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for native_layer_norm with (input shape,
+    # normalized_shape, eps) cases; for each yields all four combinations of weight and bias
+    # present or None.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as input shape, normalized_shape, eps
@@ -4729,6 +5541,10 @@ def sample_inputs_native_layer_norm(opinfo, device, dtype, requires_grad, **kwar
         )
 
 def sample_inputs_rms_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for rms_norm with (input shape,
+    # normalized_shape, eps keywords) cases, with a weight, followed by a case with no optional
+    # arguments. Values go up to 1000.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, high=1000)
 
     # Ordered as input shape, normalized_shape and a kwarg dict for eps
@@ -4752,6 +5568,9 @@ def sample_inputs_rms_norm(opinfo, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((1, 2)), args=((2,),))
 
 def sample_inputs_rms_norm_cutedsl(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the CuTe DSL rms_norm override: shapes of
+    # rank 2 or more chosen to hit the supported path (for fp16, bf16 and fp32), including a
+    # multi-dim normalized_shape, a case without eps, and a case without weight.
     # Shapes chosen to land on the quack/cutedsl override's supported path:
     # fp16/bf16/fp32, SM 9.x/10.x, rank >= 2.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -4774,6 +5593,9 @@ def sample_inputs_rms_norm_cutedsl(opinfo, device, dtype, requires_grad, **kwarg
 
 
 def error_inputs_group_norm(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for group_norm: input with fewer than 2 dims,
+    # channels not divisible by num_groups, zero channels and zero spatial size. Each has the
+    # expected message.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32, requires_grad=False)
 
     # check that input has minimum number of dimensions
@@ -4797,6 +5619,9 @@ def error_inputs_group_norm(opinfo, device, **kwargs):
     yield ErrorInput(s4, error_regex=err_msg4)
 
 def error_inputs_native_layer_norm(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for native_layer_norm: empty normalized_shape,
+    # weight or bias shape not matching normalized_shape, and normalized_shape not matching the
+    # trailing input dims.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32, requires_grad=False)
     input_shape = (1, 2, 3)
 
@@ -4828,6 +5653,9 @@ def error_inputs_native_layer_norm(opinfo, device, **kwargs):
     yield ErrorInput(s4, error_regex=err_msg4)
 
 def error_inputs_rms_norm(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for rms_norm: empty normalized_shape,
+    # weight shape not matching normalized_shape, and normalized_shape not matching the
+    # trailing input dims.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32, requires_grad=False)
     input_shape = (1, 2, 3)
 
@@ -4854,6 +5682,10 @@ def error_inputs_rms_norm(opinfo, device, **kwargs):
 
 
 def sample_inputs_local_response_norm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for local_response_norm with (input shape,
+    # size, keyword dict) cases covering subsets of alpha, beta and k, a one-channel input and an
+    # empty batch.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Ordered as input shape, size and a kwarg dict for alpha, beta, and k
@@ -4875,6 +5707,8 @@ def sample_inputs_local_response_norm(opinfo, device, dtype, requires_grad, **kw
         yield SampleInput(make_arg(input_shape), args=(size,), kwargs=kwargs)
 
 def sample_inputs_hardswish(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of four SampleInput objects for
+    # hardswish, each a 10x10 tensor with values from -5 to 5.
     N = 5
     # make sure we are testing -3 -> 3 range. default is -10 -> 10 so maybe unnecessary ?
     make_arg = partial(make_tensor, device=device, dtype=dtype,
@@ -4882,6 +5716,10 @@ def sample_inputs_hardswish(self, device, dtype, requires_grad, **kwargs):
     return (SampleInput(make_arg((N * 2, N * 2))) for _ in range(1, N))
 
 def sample_inputs_linear(self, device, dtype, requires_grad, include_empty=True, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for linear: with and without bias, two
+    # feature size pairs and batch shapes (none, empty, 8 and 2x3), plus two 5-D cases, and, when
+    # include_empty is true, cases with zero input features. Callers feeding forward-mode gradcheck
+    # pass include_empty false because gradcheck tolerance collapses for zero-element inputs.
     features_options = [[3, 4], [8, 8]]
     batch_options: list[list[int]] = [
         [],  # no batch
@@ -4917,6 +5755,8 @@ def sample_inputs_linear(self, device, dtype, requires_grad, include_empty=True,
         yield SampleInput(create_tensor(3, 4, 0), create_tensor(5, 0), create_tensor(5))
 
 def sample_inputs_bilinear(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for bilinear: two input feature sizes and an
+    # output size, with and without bias, over batch shapes (none, empty, 8, 2x3).
     features_options = [[3, 4, 5], [8, 8, 8]]
     batch_options: list[list[int]] = [
         [],  # no batch
@@ -4939,6 +5779,9 @@ def sample_inputs_bilinear(self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input_tensor1, input_tensor2, weight, bias)
 
 def sample_inputs_glu(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for glu: tensors with several feature
+    # shapes and batch shapes; for every dim whose size is positive and even, yields the tensor
+    # and that dim.
     features_options = [[2], [2, 4], [8, 8], [3, 6, 8], [1, 4, 6, 7]]
     batch_options: list[list[int]] = [
         [],  # no batch
@@ -4958,6 +5801,15 @@ def sample_inputs_glu(self, device, dtype, requires_grad, **kwargs):
                 yield SampleInput(input_tensor, dim)
 
 def sample_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for interpolate; the first argument is the
+    # mode string (nearest, nearest-exact, linear, bilinear, bicubic, trilinear or area), which
+    # selects the tensor ranks and the align_corners options (True, False, None for the linear-type
+    # modes, otherwise None only). For bilinear and bicubic with uint8 it first yields large
+    # image-like inputs (270 to 130) in contiguous and channels-last formats. Then for every rank
+    # and align_corners value yields: target sizes 3 and 5, a channels-last-3d nearest regression
+    # case, uneven shapes for floating dtypes with rank above 1, and scale factors 1.7 and 0.6 with
+    # recompute_scale_factor False and True.
+    # The sizes N, C, D, S and L are local constants that shadow the module-level S and L.
     N, C = 2, 3
     D = 4
     S = 3
@@ -4977,11 +5829,16 @@ def sample_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs
     }
 
     def shape(size, rank, with_batch_channel=True):
+        # [FUNCTION DOC] HELPER: Return a shape tuple of the given rank with every spatial
+        # dimension equal to size, preceded by batch and channel dims (N and C) unless
+        # with_batch_channel is false.
         if with_batch_channel:
             return tuple([N, C] + ([size] * rank))
         return tuple([size] * rank)
 
     def uneven_shape(size, rank, with_batch_channel=True):
+        # [FUNCTION DOC] HELPER: Like the plain shape helper, but makes the last dim one larger
+        # and, for rank above 2, the second-to-last dim one smaller.
         rc = list(shape(size, rank, with_batch_channel))
         rc[-1] += 1
         if rank > 2:
@@ -5064,6 +5921,10 @@ def sample_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs
                     )
 
 def reference_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for interpolate: yields all regular interpolate
+    # samples, then, for bilinear and bicubic modes, large image-like inputs (2x3x345x456, in
+    # contiguous and channels-last formats) resized to 270x270 with antialias both True and False.
+    # uint8 inputs use values up to 256.
     yield from sample_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs)
 
     if mode in ('bilinear', 'bicubic'):
@@ -5088,6 +5949,10 @@ def reference_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwa
                 )
 
 def sample_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for upsample ops; the first argument is the
+    # mode (nearest or bilinear, which selects the ranks 1-3 or 2). For each rank yields
+    # target-size samples (sizes 3 and 5) and scale factor samples (1.7 and 0.6) with default other
+    # options. Local constants shadow module-level S and L.
     N, C = 2, 3
     D = 4
     S = 3
@@ -5099,6 +5964,8 @@ def sample_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs):
     }
 
     def shape(size, rank, with_batch_channel=True):
+        # [FUNCTION DOC] HELPER: Return a torch.Size with spatial dims of the given size and rank,
+        # preceded by batch and channel dims (N and C) unless with_batch_channel is false.
         if with_batch_channel:
             return torch.Size([N, C] + ([size] * rank))
         return torch.Size([size] * rank)
@@ -5112,6 +5979,9 @@ def sample_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape(D, rank)), scale_factor=0.6)
 
 def reference_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for upsample: yields the regular upsample
+    # samples and, for bilinear mode, a large image-like input (2x3x345x456) in contiguous and
+    # channels-last formats resized to 270x270. uint8 inputs use values up to 256.
     yield from sample_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs)
 
     if mode == 'bilinear':
@@ -5131,6 +6001,10 @@ def reference_inputs_upsample(mode, self, device, dtype, requires_grad, **kwargs
             )
 
 def sample_inputs_upsample_aa(mode, self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the antialiased upsample (bilinear
+    # anti-aliased) op on a 6x3x10x20 tensor: output_size 3x3 and 5x5, scale_factors lists, and
+    # variants with scales_h and scales_w, with align_corners False or True. The mode argument is
+    # not used.
     N = 6
     C = 3
     H = 10
@@ -5150,6 +6024,8 @@ def sample_inputs_upsample_aa(mode, self, device, dtype, requires_grad, **kwargs
     yield SampleInput(input_tensor, output_size=torch.Size([S, S]), align_corners=True, scales_h=1.7, scales_w=0.9)
 
 def sample_inputs_gelu(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for gelu: four random 10x10 tensors with
+    # values from -3 to 3 for each approximate setting (none and tanh).
     N = 5
     for _ in range(1, N):
         for approximate in ['none', 'tanh']:
@@ -5160,12 +6036,17 @@ def sample_inputs_gelu(self, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_gelu(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for gelu: an unknown approximate string,
+    # expecting an error that the argument must be one of the allowed values.
     # Tests that gelu errors out when passed an approximation we don't know.
     yield ErrorInput(SampleInput(make_tensor((), dtype=torch.float, device=device), kwargs={"approximate": "asdf"}),
                      error_regex="approximate argument must be either")
 
 
 def sample_inputs_max_min_reduction_with_dim(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # max/min reductions with a dim argument: a 3-D tensor with dim 1 (with and without keepdim)
+    # and a zero-dim tensor with dim 0 (with and without keepdim).
     args_for_reduction_with_dim = (
         ((S, S, S), (1,),),
         ((S, S, S), (1, True, ),),
@@ -5179,11 +6060,16 @@ def sample_inputs_max_min_reduction_with_dim(op_info, device, dtype, requires_gr
             for input_tensor, args in args_for_reduction_with_dim)
 
 def sample_inputs_max_min_reduction_no_dim(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for max/min reductions without dim: a 3-D
+    # tensor and a zero-dim tensor.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     yield SampleInput(make_arg((S, S, S)))
     yield SampleInput(make_arg(()))
 
 def _generate_nan_reduction_inputs(device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator of input tensors for NaN-aware reductions: the standard
+    # reduction inputs, plus, for floating and complex dtypes, a 1-D and a 2-D tensor that
+    # contain NaN.
     yield from _generate_reduction_inputs(device, dtype, requires_grad)
     # NaN only exists for floating point numbers
     if dtype.is_complex or dtype.is_floating_point:
@@ -5191,10 +6077,18 @@ def _generate_nan_reduction_inputs(device, dtype, requires_grad, **kwargs):
         yield torch.tensor([[torch.nan, 2], [0, 1]], device=device, dtype=dtype, requires_grad=requires_grad)
 
 def sample_inputs_nan_reduction(supports_multiple_dims):
+    # [FUNCTION DOC] Factory: given whether the op supports reducing over multiple dims, returns a
+    # sample-input generator function. The returned generator (taking op_info, device, dtype,
+    # requires_grad) loops over the NaN-aware reduction inputs and yields each as a sample without
+    # dim and keepdim arguments, then once for every dim and keepdim keyword combination. Meant for
+    # reductions that only take the input, dim and keepdim.
     # Generates sample inputs for reduction ops that contain the input tensor
     # and dim and keepdim kwargs. If a reduction op needs to test additional
     # args/kwargs then create a separate sample_inputs function
     def fn(op_info, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] HELPER: The generator function returned by the sample_inputs_nan_reduction
+        # factory; see the factory for behavior. Each yielded sample uses a clone of the tensor
+        # with requires_grad set.
         for t in _generate_nan_reduction_inputs(device, dtype, requires_grad):
             # Add case without dim and keepdim kwargs
             yield SampleInput(t.clone().requires_grad_(requires_grad))
@@ -5204,6 +6098,12 @@ def sample_inputs_nan_reduction(supports_multiple_dims):
     return fn
 
 def sample_inputs_reduction_quantile(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for quantile-type reductions. For quantile
+    # values 0.5 (a scalar) and a random 2-element tensor in 0 to 1, loops over the standard
+    # reduction inputs, yielding a sample with just the quantile and then, for each dim and keepdim
+    # keyword combination (single dim only) and each interpolation (linear, midpoint), samples with
+    # dim and keepdim defaulted to 0 and False. The interpolation keyword is only supported
+    # together with dim and keepdim.
     test_quantiles = (0.5, make_tensor((2,), dtype=dtype, device=device, low=0, high=1, requires_grad=requires_grad))
     test_interpolations = ['linear', 'midpoint']
 
@@ -5222,6 +6122,8 @@ def sample_inputs_reduction_quantile(op_info, device, dtype, requires_grad, **kw
                     yield SampleInput(input, quantiles, **kwargs)
 
 def sample_inputs_reduction_count_nonzero(*args, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for count_nonzero: takes the standard
+    # reduction samples and removes the keepdim keyword, which count_nonzero does not accept.
     """Sample inputs for count_nonzero"""
     # count_nonzero does not support keepdim yet
     for sample in sample_inputs_reduction(*args, **kwargs):
@@ -5229,11 +6131,17 @@ def sample_inputs_reduction_count_nonzero(*args, **kwargs):
         yield sample
 
 def sample_inputs_leaky_relu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of nine SampleInput objects for
+    # leaky_relu, each a random 10x10 tensor.
     N = 10
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     return (SampleInput(make_arg((N, N))) for _ in range(1, N))
 
 def sample_inputs_fractional_max_pool2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for fractional_max_pool2d: (input shape,
+    # kernel size) cases, each with return_indices False and True and three output specifications
+    # (an int output_size, a tuple output_size, and an output_ratio). Ends with a sample that
+    # passes an explicit _random_samples tensor.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Order: input_shape, kernel_size
@@ -5279,6 +6187,9 @@ def sample_inputs_fractional_max_pool2d(op_info, device, dtype, requires_grad, *
     )
 
 def sample_inputs_fractional_max_pool3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for fractional_max_pool3d: (input shape,
+    # kernel size) cases, including an empty batch, each with return_indices False and True and
+    # three output specifications (an int output_size, a tuple output_size, and an output_ratio).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Order: input_shape, kernel_size
@@ -5318,6 +6229,9 @@ def sample_inputs_fractional_max_pool3d(op_info, device, dtype, requires_grad, *
             )
 
 def sample_inputs_avgpool2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for avg_pool2d: cases with kernel size,
+    # stride, padding, ceil_mode, count_include_pad and divisor_override (including an empty stride
+    # and a negative divisor), followed by one case with only a kernel size.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Order: input_shape, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override
@@ -5335,6 +6249,10 @@ def sample_inputs_avgpool2d(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((1, 3, 9, 9)), args=((3, 3)))
 
 def sample_inputs_avgpool1d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for avg_pool1d: (input shape, kernel size,
+    # keyword dict) cases covering stride, padding, ceil_mode and count_include_pad, including an
+    # empty batch.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Order: input_shape, kernel_size, kwargs
@@ -5354,6 +6272,10 @@ def sample_inputs_avgpool1d(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(input_shape), args=(kernel_size,), kwargs=kwargs)
 
 def sample_inputs_avgpool3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for avg_pool3d: (input shape, kernel size,
+    # keyword dict) cases covering stride, padding, ceil_mode, count_include_pad and
+    # divisor_override (including a negative one), and an empty batch.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # Order: input_shape, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override
@@ -5378,6 +6300,8 @@ def sample_inputs_avgpool3d(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(input_shape), args=(kernel_size,), kwargs=kwargs)
 
 def error_inputs_avg_pool1d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for avg_pool1d: negative padding and padding
+    # above half the kernel, using CPU tensors with an empty batch.
     # error inputs when pad is negative
     x = torch.rand([0, 1, 49], dtype=torch.float32)
     yield ErrorInput(SampleInput(x, kwargs={'kernel_size': 2, 'stride': 50, 'padding': -1}),
@@ -5388,6 +6312,9 @@ def error_inputs_avg_pool1d(op_info, device, **kwargs):
                      error_regex='pad should be at most half of effective kernel size')
 
 def error_inputs_avg_pool2d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for avg_pool2d: negative padding and padding
+    # above half the kernel for int and tuple kernel sizes, and a zero divisor_override. Tensors
+    # are created on the default (CPU) device.
     # error inputs when pad is negative
     x = torch.rand([0, 1, 49], dtype=torch.float32)
     yield ErrorInput(SampleInput(x, kwargs={'kernel_size': 2, 'stride': 50, 'padding': -1}),
@@ -5409,6 +6336,10 @@ def error_inputs_avg_pool2d(op_info, device, **kwargs):
                      error_regex='divisor must be not zero')
 
 def error_inputs_avg_pool3d(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for avg_pool3d: negative padding and
+    # padding above half the kernel for int and tuple kernel sizes, a zero divisor_override,
+    # and a 3-D input (expects a non-empty 4-D or 5-D message). Tensors are created on the
+    # default (CPU) device.
     # error inputs when pad is negative
     x = torch.rand([0, 1, 49, 50], dtype=torch.float32)
     yield ErrorInput(SampleInput(x, kwargs={'kernel_size': 2, 'stride': 50, 'padding': -1}),
@@ -5436,6 +6367,13 @@ def error_inputs_avg_pool3d(op_info, device, **kwargs):
 
 
 def sample_inputs_to(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for Tensor.to covering three overloads:
+    # to(device, dtype, ...), to(dtype, ...) and to(other, ...), crossed with non_blocking, copy
+    # and memory format (preserve or channels-last) options. Devices include CUDA when running on
+    # CPU with CUDA available.
+    # KNOWN ISSUE: the first loop rebinds the parameter device to each loop value (and kwargs
+    # likewise), so later code, including the mps check for other_dtype and the other-tensor
+    # device, sees the last device from that loop rather than the original argument.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     # test_multiple_devices_to_cuda would fail if we use a different device than given
     devices = [device]
@@ -5471,7 +6409,11 @@ def sample_inputs_to(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_topk(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for topk: a 3-D tensor and a zero-dim tensor
+    # with k and each combination of dim (positive and negative), largest and sorted arguments.
     def get_tensor_input(size):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given size with the enclosing dtype,
+        # device and requires_grad.
         return make_tensor(size, dtype=dtype, device=device, requires_grad=requires_grad)
 
     yield SampleInput(get_tensor_input((S, M, S)), 3)
@@ -5491,6 +6433,12 @@ def sample_inputs_topk(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(get_tensor_input(()), 1, -1, True, True)
 
 def sample_inputs_cutedsl_topk(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the CuTe DSL topk override: float inputs
+    # holding distinct values (random permutations) so index comparison is exact. Radix kernel
+    # cases use K in 64..1024 with N large enough for the per-K threshold, and register kernel
+    # cases use K in 16 and 32 with N the top of the supported range; shapes are 2-D and 3-D,
+    # contiguous, using dim -1 by default. Imports the threshold constants from the CuTe DSL
+    # implementation module at call time, so it raises ImportError if that module is unavailable.
     """Samples for the CuTeDSL ``topk`` override.
 
     Constraints (see torch/_native/ops/topk/cutedsl_impl.py):
@@ -5505,6 +6453,8 @@ def sample_inputs_cutedsl_topk(op_info, device, dtype, requires_grad, **kwargs):
     )
 
     def make_arg(shape):
+        # [FUNCTION DOC] HELPER: Return a tensor of the given shape holding a random permutation of
+        # distinct integers, cast to the test dtype (no requires_grad).
         # Generic tests compare indices exactly; tie behavior has dedicated tests.
         values = torch.randperm(math.prod(shape), dtype=torch.int64, device=device)
         return values.reshape(shape).to(dtype)
@@ -5523,6 +6473,8 @@ def sample_inputs_cutedsl_topk(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def _topk_deterministic(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Call topk with deterministic algorithms temporarily enabled; restores
+    # the previous global deterministic setting in a finally clause. Returns the topk result.
     prior = torch.are_deterministic_algorithms_enabled()
     try:
         torch.use_deterministic_algorithms(True)
@@ -5532,6 +6484,9 @@ def _topk_deterministic(*args, **kwargs):
 
 
 def _topk_method_deterministic(self, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Call the topk method on a tensor with deterministic algorithms
+    # temporarily enabled; restores the previous global deterministic setting in a finally clause.
+    # Returns the result.
     prior = torch.are_deterministic_algorithms_enabled()
     try:
         torch.use_deterministic_algorithms(True)
@@ -5541,6 +6496,11 @@ def _topk_method_deterministic(self, *args, **kwargs):
 
 
 def reference_topk(a, k, dim=-1, largest=True, sorted=True):
+    # [FUNCTION DOC] NumPy reference for topk: stable-sorts the array along dim (negated when
+    # largest is true), takes the first k indices and gathers the values; returns (values,
+    # indices). The sorted argument is accepted but ignored.
+    # KNOWN ISSUE: negating the array for the largest case can wrap for unsigned dtypes and is
+    # invalid for bool, so results may be wrong for those dtypes.
     # OpInfo numpy ref hook. NumPy has no direct topk, so we sort the whole
     # axis and take the first k (sample shapes are small enough that this
     # is fine).
@@ -5551,10 +6511,13 @@ def reference_topk(a, k, dim=-1, largest=True, sorted=True):
 
 
 def sample_inputs_outer(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for outer with vectors of size S and M.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     yield SampleInput(make_arg(S), make_arg(M))
 
 def sample_inputs_dist(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for dist over all pairs of shapes (including
+    # broadcasting and zero-dim) and p in (2, 4).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     sizes = ((S, S, S), (S,), (S, 1, S), (), (S, S))
     ps = (2, 4)
@@ -5565,6 +6528,14 @@ def sample_inputs_dist(op_info, device, dtype, requires_grad, **kwargs):
 # Missing to test the nondeterminism of the operation
 # https://github.com/pytorch/pytorch/issues/53352
 def sample_inputs_index(op_info, device, dtype, requires_grad, reference=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for index_add, index_copy and index_fill,
+    # selecting the behavior from the op name. Builds shapes zero-dim, 1-D and 2-D; the index
+    # tensor is a random permutation for add/copy (to be deterministic) and random for fill; add
+    # uses alpha values, fill uses a scalar and a zero-dim tensor value. With reference true, uses
+    # all-ones inputs and all-zero indices to exercise repeated writes. The dim is -1 for 2-D
+    # tensors and 0 otherwise.
+    # KNOWN ISSUE: the local variable named copy shadows the imported copy module, and kwargs is
+    # rebound to the per-sample dict.
     # target.index_add(dim, idx, source, *, alpha=1)
     add = "index_add" in op_info.name
     # target.index_copy(dim, idx, source)
@@ -5584,6 +6555,8 @@ def sample_inputs_index(op_info, device, dtype, requires_grad, reference=False, 
             make_idx = partial(torch.randperm, device=device, dtype=torch.int64)
         else:
             def make_idx(n):
+                # [FUNCTION DOC] HELPER: Return a random int64 index tensor of length n with values
+                # in the range 0 to n.
                 return make_tensor((n,), device=device, dtype=torch.int64, low=0, high=n)
 
     shapes = [(), (1,), (S, S)]
@@ -5626,9 +6599,15 @@ def sample_inputs_index(op_info, device, dtype, requires_grad, reference=False, 
         yield SampleInput(t, args=args, kwargs=kwargs)
 
 def sample_inputs_index_reduce(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for index_reduce; the reduction
+    # (prod, mean, amin or amax) is taken from the op's variant_test_name, otherwise it
+    # raises an AssertionError. Yields shape cases with include_self True and False, and
+    # for prod when gradients are required adds a case with zeros in self and source to
+    # check gradient propagation.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_idx(n, m):
+        # [FUNCTION DOC] HELPER: Return an int64 tensor of n random indices in the range 0 to m.
         return make_tensor((n,), device=device, dtype=torch.int64, low=0, high=m)
 
     shapes = [((), ()), ((1,), (1,)), ((S, S), (S, M)), ((S, S, S), (S, M, S))]
@@ -5666,9 +6645,15 @@ def sample_inputs_index_reduce(op_info, device, dtype, requires_grad, **kwargs):
                           kwargs={'include_self': True})
 
 def sample_inputs__unsafe_masked_index(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for _unsafe_masked_index: tensors of 2-D and
+    # 3-D shapes, per-dimension index tensors shaped for broadcasting (some possibly out of
+    # bounds), a boolean mask combining in-bounds conditions (once with the full range and once
+    # excluding border entries) and a fill value.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_idx(n, m, dim, d):
+        # [FUNCTION DOC] HELPER: Return an index tensor of n random values in the range 0 to m,
+        # viewed so that its length lies along dimension d of a tensor of dim dimensions.
         view_shape = [1] * dim
         view_shape[d] = n
         return make_tensor((n,), device=device, dtype=torch.int64, low=0, high=m).view(view_shape)
@@ -5694,9 +6679,16 @@ def sample_inputs__unsafe_masked_index(op_info, device, dtype, requires_grad, **
         yield SampleInput(make_arg(self_shape), mask, indices, fill_value)
 
 def sample_inputs__unsafe_masked_index_put_accumulate(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for _unsafe_masked_index_put_accumulate:
+    # tensors of 2-D and 3-D shapes, per-dimension index tensors, a boolean mask (full range, and
+    # one excluding border entries) and a values tensor shaped by the index sizes. On mps with half
+    # precision the values are normalized so that unordered accumulation does not diverge from the
+    # CPU result.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_idx(n, m, dim, d):
+        # [FUNCTION DOC] HELPER: Return an index tensor of n random values in the range 0 to m,
+        # viewed so that its length lies along dimension d of a tensor of dim dimensions.
         view_shape = [1] * dim
         view_shape[d] = n
         return make_tensor((n,), device=device, dtype=torch.int64, low=0, high=m).view(view_shape)
@@ -5728,6 +6720,9 @@ def sample_inputs__unsafe_masked_index_put_accumulate(op_info, device, dtype, re
 
 
 def sample_inputs_mode(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # mode: a 3-D tensor with no dim, dim 1 and dim 1 with keepdim, a zero-dim tensor with the same
+    # options, and a 3000-element 1-D tensor that exercises the non-fused CUDA kernel.
     args = (
         ((S, S, S), (),),
         ((S, S, S), (1, ),),
@@ -5746,6 +6741,10 @@ def sample_inputs_mode(op_info, device, dtype, requires_grad, **kwargs):
 # Missing to test the nondeterminism of the operation
 # https://github.com/pytorch/pytorch/issues/53352
 def sample_inputs_put(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for put: random distinct flat indices and
+    # their negative counterparts with accumulate True and False, scalar-shaped tensors, and empty
+    # index and source cases. Local S is set to 3, shadowing the module-level constant.
+    # Nondeterminism of the op is not tested.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     make_idx = partial(make_tensor, low=0, dtype=torch.int64, device=device, requires_grad=False)
 
@@ -5783,6 +6782,9 @@ def sample_inputs_put(op_info, device, dtype, requires_grad, **kwargs):
                                 acc))
 
 def sample_inputs_take(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for take: S random flat indices and their
+    # negative counterparts on a square tensor, scalar-shaped sources, and empty index cases. Local
+    # S is set to 3, shadowing the module-level constant.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     make_idx = partial(make_tensor, low=0, dtype=torch.int64, device=device, requires_grad=False)
 
@@ -5811,11 +6813,16 @@ def sample_inputs_take(op_info, device, dtype, requires_grad, **kwargs):
                           args=(idx.clone(),))
 
 def sample_movedim_moveaxis(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for movedim and moveaxis: a 4-D tensor with
+    # full source and destination dim lists, positive and negative.
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg((4, 3, 2, 1)), [0, 1, 2, 3], [3, 2, 1, 0])
     yield SampleInput(make_arg((4, 3, 2, 1)), [0, -1, -2, -3], [-3, -2, -1, -0])
 
 def reference_movedim_moveaxis(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for movedim and moveaxis: yields the regular
+    # samples plus cases with empty inputs, integer arguments, negative dims, partial permutations,
+    # idempotent moves and reversals.
     yield from sample_movedim_moveaxis(op_info, device, dtype, requires_grad, **kwargs)
 
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -5844,6 +6851,9 @@ def reference_movedim_moveaxis(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(source, destination))
 
 def error_movedim_moveaxis(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for movedim and moveaxis: source and
+    # destination of different lengths, repeated dims (with negative indices), and out-of-range
+    # dims given as lists or ints (IndexError).
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # source length < destination length
@@ -5909,6 +6919,10 @@ def error_movedim_moveaxis(op_info, device, **kwargs):
     )
 
 def sample_repeat_tile(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for repeat and tile: a set of repeat dim
+    # tuples crossed with shapes (including zero-sized dims); uses smaller lists when requires_grad
+    # is set. For repeat ops (by op name) skips combinations where the repeat tuple is shorter than
+    # the tensor rank.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     rep_dims = ((), (0, ), (1, ), (0, 2), (1, 1), (2, 3), (2, 3, 2), (0, 2, 3), (2, 1, 1, 1),)
     shapes = ((), (0,), (2,), (3, 0), (3, 2), (3, 0, 1))
@@ -5930,6 +6944,9 @@ def sample_repeat_tile(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_narrow_narrow_copy(op_info, device, dtype, requires_grad, *, is_narrow, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for narrow and narrow_copy with (shape, dim,
+    # start, length) cases; the keyword-only argument is_narrow adds, for narrow, a second sample
+    # where start is a zero-dim tensor.
     shapes_and_args = (
         ((S, S, S), 1, 2, 2),
         ((S, S, S), -1, 2, 2),
@@ -5947,6 +6964,9 @@ def sample_inputs_narrow_narrow_copy(op_info, device, dtype, requires_grad, *, i
             yield SampleInput(tensor, dim, torch.tensor(start), length)
 
 def reference_inputs_narrow_narrow_copy(op_info, device, dtype, requires_grad, *, is_narrow, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for narrow and narrow_copy: yields the regular
+    # samples plus 1-D, 2-D and 3-D cases that take zero, partial or full elements from the left or
+    # right side; for narrow, also a sample with the start as a tensor.
     yield from sample_inputs_narrow_narrow_copy(op_info, device, dtype, requires_grad, is_narrow=is_narrow, **kwargs)
 
     shapes_and_args = (
@@ -5985,6 +7005,13 @@ def reference_inputs_narrow_narrow_copy(op_info, device, dtype, requires_grad, *
             yield SampleInput(tensor, dim, torch.tensor(start), length)
 
 def error_inputs_narrow_narrow_copy(op_info, device, *, is_narrow, is_ref):
+    # [FUNCTION DOC] Generator of ErrorInput objects for narrow and narrow_copy; the required
+    # keyword-only arguments is_narrow and is_ref select which messages apply. Cases: a zero-dim
+    # input; an out-of-range dim, positive or negative (narrow_copy on CPU, non-ref, gives a
+    # different RuntimeError message than the IndexError of the others); out-of-range start,
+    # positive or negative; length exceeding the dimension; negative length (again a different
+    # message for CPU narrow_copy); and, for narrow only, a start given as a 1-D integer tensor or
+    # a 0-dim bool tensor.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # 0-dim
@@ -6047,6 +7074,9 @@ def error_inputs_narrow_narrow_copy(op_info, device, *, is_narrow, is_ref):
 
 
 def sample_trapezoid(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for trapezoid with (y shape, x shape or None,
+    # kwargs) cases covering explicit x, dim, broadcast x and the dx keyword. Empty inputs are left
+    # out because the result would not require grad (issue 61619).
     y_shape_x_shape_and_kwargs = [
         ((2, 3), (2, 3), {}),
         ((2, 3), (2, 3), {'dim': 1}),
@@ -6072,6 +7102,9 @@ def sample_trapezoid(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(y_tensor, **kwarg)
 
 def sample_cumulative_trapezoid(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cumulative_trapezoid with (y shape, x
+    # shape or None, kwargs) cases covering explicit x, dim, broadcast x and the dx keyword. Empty
+    # inputs are left out because the result would not require grad (issue 61619).
 
     y_shape_x_shape_and_kwargs = [
         ((2, 3), (2, 3), {}),
@@ -6098,6 +7131,8 @@ def sample_cumulative_trapezoid(op_info, device, dtype, requires_grad, **kwargs)
             yield SampleInput(y_tensor, **kwarg)
 
 def sample_unsqueeze(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unsqueeze: 3-D, zero-dim and 1-element
+    # tensors with positive and negative axes.
     shapes_and_axes = [
         ((3, 4, 5), 0),
         ((3, 4, 5), 1),
@@ -6117,6 +7152,9 @@ def sample_unsqueeze(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_nn_unfold(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for nn unfold (im2col): an empty batch and a
+    # normal 4-D input crossed with int and tuple options for kernel size, dilation, padding and
+    # stride, plus a defaults case with only a kernel size.
     shapes = ((0, 1, 5, 5), (2, 3, 5, 5))
     kernel_sizes = (2, (2, 2), (2, 3))
     dilations = (1, 2, (1, 2))
@@ -6134,6 +7172,8 @@ def sample_inputs_nn_unfold(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_squeeze(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for squeeze with optional single dim
+    # argument: shapes with size-one dims, all-ones shape and a zero-dim tensor.
     shapes_and_args = (
         ((S, 1, S, 1), ()),
         ((1, 1, 1, 1), ()),
@@ -6153,6 +7193,9 @@ def sample_inputs_squeeze(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_squeeze_multiple(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for squeeze with multiple dims: a dims
+    # argument that is empty, a single dim, negative, a pair (some not size one) and a
+    # zero-dim case.
     shapes_and_args = (
         ((1, 1, 1, 1), ()),
         ((S, 1, S, 1), (1,)),
@@ -6170,6 +7213,9 @@ def sample_inputs_squeeze_multiple(op_info, device, dtype, requires_grad, **kwar
 
 
 def _squeeze_ref(x, axis=None):
+    # [FUNCTION DOC] HELPER: NumPy reference for squeeze: returns zero-dim arrays unchanged,
+    # filters a sequence of axes down to those with size one, returns the array unchanged if a
+    # single int axis is not size one, otherwise squeezes.
     # NumPy doesn't allow squeezing scalars
     if x.ndim == 0:
         return x
@@ -6184,6 +7230,11 @@ def _squeeze_ref(x, axis=None):
     return np.squeeze(x, axis)
 
 def sample_inputs_nn_pad(op_info, device, dtype, requires_grad, mode, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for nn pad; the extra argument mode must be
+    # one of constant, reflect, replicate or circular (otherwise an AssertionError is raised).
+    # Chooses (shape, pad) cases per mode (reflect and replicate share one list; bool uses a short
+    # list for circular because of an ASAN failure), then yields input, (pad, mode) samples;
+    # constant mode adds a default-args sample and repeats every case with pad values 1.0 and 2.0.
     if mode not in ('constant', 'reflect', 'replicate', 'circular'):
         raise AssertionError(f"Expected mode to be one of 'constant', 'reflect', 'replicate', 'circular', got {mode!r}")
     if mode in ['reflect', 'replicate']:
@@ -6266,6 +7317,8 @@ def sample_inputs_nn_pad(op_info, device, dtype, requires_grad, mode, **kwargs):
                 yield SampleInput(make_inp(shape), args=(pad, mode, pad_value))
 
 def sample_inputs_nn_pad_replicate_negative(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for replicate padding with negative pad
+    # amounts (cropping) on 4-D tensors.
     cases: tuple = (
         ((5, 3, 4, 4), (-4, 5, 0, 0)),
         ((6, 2, 4, 4), (0, 0, 2, -4)),
@@ -6280,6 +7333,9 @@ def sample_inputs_nn_pad_replicate_negative(op_info, device, dtype, requires_gra
         yield SampleInput(make_inp(shape), args=(pad, 'replicate'))
 
 def sample_inputs_constant_pad_nd(op_info, device, dtype, *args, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for constant_pad_nd, derived from the nn pad
+    # samples in constant mode: drops the mode argument and, when a fill value is present, casts it
+    # to the Python scalar type of the dtype (required by the stricter reference implementation).
     # Inherit sample inputs from nn.pad, but transform them to fit
     # constant_pad_nd's interface
     nn_samples = sample_inputs_nn_pad(op_info, device, dtype, *args,
@@ -6291,6 +7347,9 @@ def sample_inputs_constant_pad_nd(op_info, device, dtype, *args, **kwargs):
     scalar_type = dtype_to_type(dtype)
 
     def drop_mode_argument(input, pad, mode=None, value=None):
+        # [FUNCTION DOC] HELPER: Convert one nn pad sample (input, pad, optional mode and value) to
+        # constant_pad_nd form: returns a SampleInput with the pad and, if a value is given, the
+        # value cast to the scalar type.
         if value is None:
             return SampleInput(input, args=(pad,))
         else:
@@ -6300,6 +7359,9 @@ def sample_inputs_constant_pad_nd(op_info, device, dtype, *args, **kwargs):
         yield drop_mode_argument(sample.input, *sample.args, **sample.kwargs)
 
 def sample_inputs_repeat_interleave(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for repeat_interleave: integer repeats on
+    # zero-dim and 3-D inputs, with and without dim, a tensor of repeats along dim 1, and a case
+    # with output_size given.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield SampleInput(make_input(()), repeats=2)
@@ -6310,7 +7372,14 @@ def sample_inputs_repeat_interleave(op_info, device, dtype, requires_grad, **kwa
 
 
 def sample_inputs_stft(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for stft with various n_fft, hop_length,
+    # center, window, onesided and return_complex settings on 1-D and 2-D signals (plain call
+    # without return_complex only for complex dtypes; onesided False only for real dtypes).
+    # KNOWN ISSUE: the two windowed samples and the last onesided sample use the variable center
+    # left over from the earlier loop (value True) rather than a deliberately chosen setting.
     def mt(shape, **kwargs):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with the enclosing dtype,
+        # device and requires_grad; extra keywords are forwarded.
         return make_tensor(shape, device=device, dtype=dtype,
                            requires_grad=requires_grad, **kwargs)
 
@@ -6336,9 +7405,16 @@ def sample_inputs_stft(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_istft(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for istft: spectrogram-like inputs (complex
+    # for complex dtypes, real with a trailing dimension of 2 otherwise) with n_fft, onesided,
+    # center, hop_length, window, win_length and return_complex options.
+    # KNOWN ISSUE: the windowed samples at the end use the variable center left over from the
+    # earlier loop (value True) rather than a deliberately chosen setting.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def mt(shape, **kwargs):
+        # [FUNCTION DOC] HELPER: Make a random spectrogram-shaped tensor: for real dtypes appends a
+        # trailing dimension of 2 to the requested shape so it represents real and imaginary parts.
         real_shape = shape if dtype.is_complex else shape + (2,)
         return make_arg(real_shape, **kwargs)
 
@@ -6360,6 +7436,10 @@ def sample_inputs_istft(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(mt((10, 5, 6)), kwargs=dict(n_fft=8, window=real_window[:8], center=center))
 
 def sample_inputs_ormqr(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for ormqr: computes the QR reflectors and tau
+    # of random matrices with geqrf over batch shapes (none, empty, 2, 2x1), sizes in (5, 2, 0) for
+    # m and n, and left and transpose flags True and False; the other matrix has a shape that
+    # matches left or right multiplication.
     # create a helper function wrapping `make_tensor`
     make_input = partial(make_tensor, dtype=dtype, device=device, low=-1, high=1)
 
@@ -6377,6 +7457,10 @@ def sample_inputs_ormqr(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_cholesky_solve(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cholesky_solve, derived from the
+    # cholesky_inverse samples: each sample's input is replaced with a random right-hand-side
+    # tensor of the same shape and its args set to the positive semi-definite matrix (with
+    # requires_grad set). The samples are modified in place.
     cholesky_inverse_samples = sample_inputs_linalg_cholesky_inverse(
         op_info, device, dtype, requires_grad=False
     )
@@ -6389,6 +7473,9 @@ def sample_inputs_cholesky_solve(op_info, device, dtype, requires_grad=False, **
 
 
 def sample_inputs_lu(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for lu: full-rank matrices with distinct
+    # singular values of shape (S + delta, S) for deltas from -2 to 2 and batch shapes (none, 3,
+    # 3x3), with pivot True and get_infos True or False.
     make_arg = partial(make_fullrank_matrices_with_distinct_singular_values,
                        dtype=dtype, device=device, requires_grad=requires_grad)
 
@@ -6401,7 +7488,13 @@ def sample_inputs_lu(op_info, device, dtype, requires_grad=False, **kwargs):
 
 
 def sample_inputs_lu_unpack(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for lu_unpack, derived from the linalg lu
+    # samples: factorizes each sample input with lu_factor and yields the packed LU data (with
+    # requires_grad set) and the pivots. Sets an output processing function that keeps only the L
+    # and U outputs for gradient checks.
     def out_fn(output):
+        # [FUNCTION DOC] HELPER: Output processing function for gradient checks: returns the second
+        # and third items of the result.
         return output[1], output[2]
 
     for lu_sample in sample_inputs_linalg_lu(op_info, device, dtype, requires_grad, **kwargs):
@@ -6411,6 +7504,9 @@ def sample_inputs_lu_unpack(op_info, device, dtype, requires_grad=False, **kwarg
 
 
 def sample_inputs_roll(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for roll: shift and dim argument forms
+    # (including a large shift, a single shift without dim and tuple shifts) on empty and normal
+    # 3-D tensors, plus a zero-dim tensor.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     args = ((0, 0), (1, 2), (0, 2), (2, 0), (-1, 0), (10000, 1), (2,), ((1, 2, -1), (0, 1, 2)))
@@ -6423,6 +7519,9 @@ def sample_inputs_roll(op_info, device, dtype, requires_grad=False, **kwargs):
     yield SampleInput(make_arg(()), args=(10, ))
 
 def error_inputs_roll(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for roll: empty shifts, shifts and dims of
+    # different lengths, a dim out of range (IndexError), and a dim on a zero-dim tensor that is
+    # out of range (IndexError).
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
     err_msg1 = "`shifts` required"
     s1 = SampleInput(make_arg((S,)), ())
@@ -6441,6 +7540,8 @@ def error_inputs_roll(op_info, device, **kwargs):
     yield ErrorInput(s4, error_regex=err_msg4, error_type=IndexError)
 
 def sample_inputs_rot90(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for rot90: a default call, and every k from
+    # -5 to 5 with dims (0, 1), (1, 2) and (1, -1) on a 3-D tensor.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     args = itertools.product(range(-5, 6), [(0, 1), (1, 2), (1, -1)])
@@ -6451,6 +7552,8 @@ def sample_inputs_rot90(op_info, device, dtype, requires_grad=False, **kwargs):
 
 
 def error_inputs_rot90(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for rot90: wrong number of rotation dims,
+    # input with fewer than two dims, and equal rotation dims.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
     err_msg1 = "expected total rotation dims"
     s1 = SampleInput(make_arg((S, S)), dims=(0,))
@@ -6466,6 +7569,9 @@ def error_inputs_rot90(op_info, device, **kwargs):
 
 
 def sample_inputs_std_var(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for std and var: 3-D and 1-D tensors with
+    # dim, unbiased, keepdim and correction (including fractional, negative and None) arguments;
+    # when gradients are not required, adds empty-input cases.
     tensor_nd = partial(make_tensor, (S, S, S), device=device, dtype=dtype,
                         requires_grad=requires_grad)
     tensor_1d = partial(make_tensor, (S,), device=device, dtype=dtype,
@@ -6494,6 +7600,9 @@ def sample_inputs_std_var(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_std_var_unbiased(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for std/var/std_mean/var_mean forms that
+    # take a positional unbiased flag: a 2-D and a 1-D tensor, plus empty inputs when gradients
+    # are not required.
     make_arg = partial(make_tensor, device=device, dtype=dtype,
                        requires_grad=requires_grad)
 
@@ -6507,21 +7616,30 @@ def sample_inputs_std_var_unbiased(op_info, device, dtype, requires_grad, **kwar
 
 
 def _generate_correlation_inputs(device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator of small random tensors of shapes (2,), (1, 2), (3, 2) and
+    # (2, 3) for correlation and covariance ops.
     shapes = [(2,), (1, 2), (3, 2), (2, 3)]
     for shape in shapes:
         yield make_tensor(shape, dtype=dtype, device=device, requires_grad=requires_grad)
 
 
 def sample_inputs_corrcoef(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # corrcoef, one for each correlation input tensor.
     return (SampleInput(t) for t in _generate_correlation_inputs(device, dtype, requires_grad))
 
 def sample_inputs_copysign(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for copysign: all elementwise binary samples,
+    # and for floating dtypes a sample with a Python scalar -3.14 as the sign source.
     yield from sample_inputs_elementwise_binary(op_info, device, dtype, requires_grad, **kwargs)
     if dtype.is_floating_point:
         yield SampleInput(make_tensor(5, dtype=dtype, device=device, requires_grad=requires_grad), -3.14)
 
 
 def sample_inputs_cov(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cov: each correlation input alone, then
+    # with every correction value up to the number of observations, with None or integer frequency
+    # weights and None or float analytic weights.
     for t in _generate_correlation_inputs(device, dtype, requires_grad):
         yield SampleInput(t)
         num_observations = t.numel() if t.ndimension() < 2 else t.size(1)
@@ -6533,6 +7651,9 @@ def sample_inputs_cov(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_cov(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for cov: input with more than 2 dims, weights
+    # with too many dims, wrong weight dtypes, weights of the wrong length, and negative weights.
+    # Each has the expected message.
     a = torch.rand(S, device=device)
     yield ErrorInput(
         SampleInput(torch.rand(S, S, S, device=device)),
@@ -6564,6 +7685,8 @@ def error_inputs_cov(op_info, device, **kwargs):
 
 
 def sample_inputs_permute(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for permute with a few dim tuples including
+    # negative dims and a zero-dim input; the permutation is passed as one tuple argument.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = [((1, 2, 3, 4), (0, 2, 3, 1)),
@@ -6575,6 +7698,9 @@ def sample_inputs_permute(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(args,))
 
 def reference_inputs_permute(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for permute: yields the regular samples plus,
+    # for several shapes and permutations, tensors that are themselves permuted in every way
+    # (contiguous and noncontiguous) before being permuted by the target permutation.
     yield from sample_inputs_permute(op, device, dtype, requires_grad, **kwargs)
 
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -6600,10 +7726,14 @@ def reference_inputs_permute(op, device, dtype, requires_grad, **kwargs):
             yield SampleInput(a, args=(permutation,))
 
 def error_inputs_softshrink(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for softshrink: a negative lambd, expecting
+    # a message that lambda must be in range.
     yield ErrorInput(SampleInput(make_tensor((1,), dtype=torch.float, device=device), kwargs={"lambd": -0.5}),
                      error_regex=r"lambda must be in range \[0,.*input dtype.*found -0\.5")
 
 def sample_inputs_softshrink(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for softshrink: lambd of 0 and 0.5 on a
+    # matrix, then all elementwise unary samples.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # The additional sample is to check additional values of lambd beyond the default
@@ -6614,6 +7744,8 @@ def sample_inputs_softshrink(op_info, device, dtype, requires_grad=False, **kwar
     yield from sample_inputs_elementwise_unary(op_info, device, dtype, requires_grad)
 
 def sample_inputs_hardshrink(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for hardshrink: lambd of -0.5, 0 and 0.5 on a
+    # matrix (negative values are allowed here), then all elementwise unary samples.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # The additional sample is to check additional values of lambd beyond the default
@@ -6626,6 +7758,8 @@ def sample_inputs_hardshrink(op_info, device, dtype, requires_grad=False, **kwar
 
 
 def sample_inputs_hardtanh(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for hardtanh: (min_val, max_val) pairs (-0.5,
+    # 0.5) and (0, 0) on a matrix, then all elementwise unary samples.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # The additional sample is to check additional values of min_val and max_val beyond the default
@@ -6636,12 +7770,20 @@ def sample_inputs_hardtanh(op_info, device, dtype, requires_grad=False, **kwargs
     yield from sample_inputs_elementwise_unary(op_info, device, dtype, requires_grad)
 
 def error_inputs_hardtanh(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for hardtanh: min_val larger than max_val,
+    # expecting a ValueError.
     # Tests that hardtanh errors out when passed min_val > max_val.
     yield ErrorInput(SampleInput(make_tensor((1,), dtype=torch.float, device=device), kwargs={"min_val": 0.5, "max_val": -0.5}),
                      error_type=ValueError, error_regex="min_val cannot be greater than max_val")
 
 def sample_inputs_einsum(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for einsum: lists of operands with equation
+    # strings covering sums, outer products, matrix products, batch products, a non-contiguous
+    # contraction, a diagonal trace and ellipsis forms. Each operand is a requires_grad clone of a
+    # shared random tensor.
     def c(t):
+        # [FUNCTION DOC] HELPER: Return a clone of the tensor with requires_grad set per the
+        # enclosing flag.
         return t.clone().requires_grad_(requires_grad)
 
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -6678,6 +7820,8 @@ def sample_inputs_einsum(op_info, device, dtype, requires_grad=False, **kwargs):
 
 
 def sample_inputs_flip(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for flip: a 3-D tensor and one with an empty
+    # dimension, with dims given as full, single, pair, negative and empty tuples.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     sizes = ((S, M, S), (S, 0, M))
     all_dims = ((0, 1, 2), (0,), (0, 2), (-1,), ())
@@ -6686,6 +7830,8 @@ def sample_inputs_flip(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(size), kwargs={"dims": dims})
 
 def sample_inputs_fliplr_flipud(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # fliplr and flipud: a 3-D tensor and one with an empty dimension.
     shapes = [
         (S, M, S),
         (S, 0, M),
@@ -6694,14 +7840,21 @@ def sample_inputs_fliplr_flipud(op_info, device, dtype, requires_grad, **kwargs)
     return (SampleInput(make_arg(shape, low=None, high=None)) for shape in shapes)
 
 def error_inputs_fliplr(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for fliplr: a 1-D input, expecting a message
+    # that the input must be at least 2-D.
     yield ErrorInput(SampleInput(make_tensor((1,), dtype=torch.float, device=device)),
                      error_regex="Input must be >= 2-d.")
 
 def error_inputs_flipud(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for flipud: a zero-dim input, expecting a
+    # message that the input must be at least 1-D.
     yield ErrorInput(SampleInput(make_tensor((), dtype=torch.float, device=device)),
                      error_regex="Input must be >= 1-d.")
 
 def sample_inputs_clamp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for clamp with tensor min and max: same
+    # shapes, broadcast shapes, only min or only max being None, and type-promotion cases with
+    # int32 bounds.
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=None, high=None, requires_grad=requires_grad)
     make_integral_arg = partial(make_tensor, dtype=torch.int32, device=device, low=None, high=None, requires_grad=False)
     shape = (S, M, S)
@@ -6716,6 +7869,12 @@ def sample_inputs_clamp(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg(shape), args=(make_arg(shape), make_integral_arg(shape)))
 
 def reference_inputs_elementwise_ternary(op, device, dtype, requires_grad, *, sample_inputs_func, supports_scalars=False, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for elementwise ternary ops. Keyword-only
+    # arguments: sample_inputs_func (generator of the regular samples, yielded first) and
+    # supports_scalars. Adds broadcasting and noncontiguous tensor cases, Python scalar or zero-dim
+    # CPU tensor cases (and a complex case when complex64 is supported) if scalars are supported,
+    # an int by float type promotion case when both dtypes are supported, and a NaN propagation
+    # case for floating and complex dtypes.
     yield from sample_inputs_func(op, device, dtype, requires_grad, **kwargs)
 
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -6788,14 +7947,21 @@ def reference_inputs_elementwise_ternary(op, device, dtype, requires_grad, *, sa
 
 
 def _clamp_min_numpy(a, min=None):
+    # [FUNCTION DOC] HELPER: NumPy reference for clamp_min: elementwise maximum of the array
+    # and min.
     return np.maximum(a, min)
 
 
 def _clamp_max_numpy(a, max=None):
+    # [FUNCTION DOC] HELPER: NumPy reference for clamp_max: elementwise minimum of the array
+    # and max.
     return np.minimum(a, max)
 
 
 def _clamp_numpy(a, min=None, max=None):
+    # [FUNCTION DOC] HELPER: NumPy reference for clamp: applies only the lower or only the
+    # upper bound if the other is None, otherwise elementwise minimum of max and the maximum of
+    # a and min.
     if min is None:
         return np.minimum(a, max)
     if max is None:
@@ -6805,11 +7971,19 @@ def _clamp_numpy(a, min=None, max=None):
 
 
 def sample_inputs_cumprod(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cumprod on values in -1 to 1: each dim of
+    # a cubic tensor, scalar and empty tensors, tensors with zeros placed at several positions
+    # (three dim pairs), and a dtype keyword sample.
     def make_arg(shape):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with values in -1 to 1
+        # (for better gradgradcheck precision), honoring requires_grad.
         # shrink values to be in the interval [-1, +1] for better precision in gradgradcheck
         return make_tensor(shape, dtype=dtype, device=device, low=-1, high=+1, requires_grad=requires_grad)
 
     def prod_zeros(dim_select):
+        # [FUNCTION DOC] HELPER: Make a cubic random tensor and zero out single slices at
+        # three positions, selected along the two given dims (must have length 2,
+        # otherwise AssertionError).
         if len(dim_select) != 2:
             raise AssertionError(f"Expected len(dim_select) to be 2, got {len(dim_select)}")
         result = make_arg(3 * (S,))
@@ -6832,14 +8006,21 @@ def sample_inputs_cumprod(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(prod_zeros([1, 2]), args=(1,), kwargs={'dtype': dtype})
 
 def sample_inputs_view_as_complex(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for view_as_complex: a tensor with trailing
+    # dimension of size 2.
     yield SampleInput(make_tensor((S, 2), dtype=dtype, device=device, requires_grad=requires_grad))
 
 def sample_inputs_view_as_real(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # view_as_real: a matrix and a zero-dim tensor.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     sizes = ((S, S), ())
     return (SampleInput(make_arg(size)) for size in sizes)
 
 def error_inputs_complex(op_info, device, is_ref=False, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for complex: integer operand, mismatched
+    # operand dtypes, and an out tensor of the wrong complex dtype. is_ref selects the reference
+    # implementation messages; mps uses float16 in place of float64.
     make_arg = partial(make_tensor, dtype=torch.float32, device=device)
     other_dtype = torch.float16 if device.startswith("mps") else torch.float64
     other_dtype_name = "Half" if device.startswith("mps") else "Double"
@@ -6864,16 +8045,25 @@ def error_inputs_complex(op_info, device, is_ref=False, **kwargs):
                      error_type=RuntimeError, error_regex=error_out)
 
 def sample_inputs_logaddexp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for logaddexp with two matrices.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     shape = (S, S)
     yield SampleInput(make_arg(shape), make_arg(shape))
 
 def sample_inputs_prod(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for prod on values in -1 to 1: the cumprod
+    # samples with only the tensor argument and with all their arguments, the same with keepdim
+    # True, a tensor with a single zero, 3-D tensors with dim, a tensor with an empty dim, a 1-D
+    # tensor with two zeros, and zero-dim zero tensors (with dim and keepdim).
     def make_arg(shape):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with values in -1 to 1,
+        # honoring requires_grad.
         # shrink values to be in the interval [-1, +1] for better precision in gradgradcheck
         return make_tensor(shape, dtype=dtype, device=device, low=-1, high=+1, requires_grad=requires_grad)
 
     def prod_single_zero():
+        # [FUNCTION DOC] HELPER: Make a square matrix of random values with the element at row 0,
+        # column 1 set to zero.
         result = make_arg(2 * (S,))
         result[0, 1] = 0
         return result
@@ -6906,6 +8096,8 @@ def sample_inputs_prod(op_info, device, dtype, requires_grad, **kwargs):
                       kwargs={'keepdim': True})
 
 def error_inputs_neg(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for neg: a bool tensor, expecting the
+    # message that negation of bool is not supported and suggesting logical_not.
     si = SampleInput(torch.tensor((False, True), device=device))
     msg = ("Negation, the `\\-` operator, on a bool tensor is not supported."
            " If you are trying to invert a mask, use the `\\~` or"
@@ -6913,6 +8105,8 @@ def error_inputs_neg(op_info, device, **kwargs):
     yield ErrorInput(si, error_regex=msg)
 
 def sample_inputs_diag(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for diag: a 1-D tensor, and square, tall and
+    # wide matrices with various offsets (listed twice for offset 2).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     yield SampleInput(make_arg(M))
 
@@ -6928,6 +8122,13 @@ def sample_inputs_diag(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(tensor.clone().requires_grad_(requires_grad), *arg)
 
 def reference_inputs_diagonal_diag_embed(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for diagonal and diag_embed: yields the regular
+    # samples, then 2-D and 3-D shapes with extra keyword settings (reversed, negative and mixed
+    # dims, large offset, non-sequential dims). For the diagonal ops, skips 1-D shapes since they
+    # are error inputs there.
+    # KNOWN ISSUE: the 1-D keyword set is an empty dictionary, so the product with the 1-D shapes
+    # yields nothing and no 1-D samples are produced; the loop variable kwargs also rebinds the
+    # function's **kwargs parameter.
     yield from sample_inputs_diagonal_diag_embed(
         op_info, device, dtype, requires_grad, **kwargs)
 
@@ -6970,6 +8171,9 @@ def reference_inputs_diagonal_diag_embed(op_info, device, dtype, requires_grad, 
 
 
 def sample_inputs_diagonal_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for diagonal_scatter over 2-D and 3-D
+    # shapes and offset or dim arguments; the source tensor shape is derived from the diagonal of
+    # the input.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     # Shapes for 2D Tensors
@@ -6995,12 +8199,22 @@ def sample_inputs_diagonal_scatter(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_to_sparse(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for to_sparse: a dense matrix with
+    # no arguments and one with sparse dim 1. Each sets an output processing function that converts
+    # the sparse result back to dense for gradient checks.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield SampleInput(make_arg((S, S))).with_metadata(output_process_fn_grad=lambda x: x.to_dense())
     yield SampleInput(make_arg((S, S)), 1).with_metadata(output_process_fn_grad=lambda x: x.to_dense())
 
 def sample_inputs_cross_entropy(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cross_entropy on a batch of 2 with 3
+    # classes. Input shapes include extra spatial dims; kwargs cover the three reductions,
+    # class weights and ignore_index. Each is yielded with both class-index targets (long
+    # tensors, ensuring at least one target is not ignored) and probability targets (skipped
+    # when ignore_index is used). Class weight tensors are created once up front and shared
+    # across samples.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     batch_size, num_classes = shape = (2, 3)
     reductions = ("mean", "sum", "none")
 
@@ -7055,6 +8269,19 @@ def sample_inputs_cross_entropy(op_info, device, dtype, requires_grad, **kwargs)
         yield SampleInput(input, target, **kwargs)
 
 def sample_inputs_linear_cross_entropy(op_info, device, dtype, requires_grad, *, chunked=False, chunked_none=False, **kwargs_unused):
+    # [FUNCTION DOC] Generator of SampleInput objects for linear_cross_entropy. Keyword-only
+    # chunked selects the chunked-path samples (using batch chunk size options), chunked_none
+    # restricts those to the reduction-none subset (its backward recomputes from saved inputs and
+    # is not batched-grad compatible); the default emits unchunked samples. Requires a floating
+    # dtype, otherwise raises a ValueError. Builds a list of keyword dictionaries (reductions,
+    # weight, ignore_index, linear_bias, options), crosses it with class-index or probability
+    # targets, reuses the linear samples (swapping the input and weight to get N-D weights where
+    # needed, skipping samples with linear bias, empty targets and ignore_index with probability
+    # targets), fills placeholder entries with real tensors, and ensures a non-ignored target for
+    # mean reduction.
+    # KNOWN ISSUE: the keyword dictionaries are shared across loop iterations and their placeholder
+    # values are replaced in place by tensors; the loop variable kwargs also rebinds the name of
+    # the function's keyword parameter pattern, and extra keyword arguments are silently ignored.
     # ``chunked=True`` filters to chunked-path samples; the scalar
     # (mean/sum) and reduction='none' subsets are surfaced by separate
     # OpInfo variants ("chunked" and "chunked_none") because none's
@@ -7220,14 +8447,22 @@ def sample_inputs_linear_cross_entropy(op_info, device, dtype, requires_grad, *,
 
 
 def sample_inputs_linear_cross_entropy_chunked(op_info, device, dtype, requires_grad, **kw):
+    # [FUNCTION DOC] Generator wrapper that yields the linear_cross_entropy samples restricted to
+    # the chunked path (scalar reductions).
     yield from sample_inputs_linear_cross_entropy(op_info, device, dtype, requires_grad, chunked=True, **kw)
 
 
 def sample_inputs_linear_cross_entropy_chunked_none(op_info, device, dtype, requires_grad, **kw):
+    # [FUNCTION DOC] Generator wrapper that yields the linear_cross_entropy samples restricted to
+    # the chunked path with reduction none.
     yield from sample_inputs_linear_cross_entropy(op_info, device, dtype, requires_grad, chunked=True, chunked_none=True, **kw)
 
 
 def error_inputs_linear_cross_entropy(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for linear_cross_entropy: wrong input
+    # dimensionality, linear_weight with too few dimensions, mismatched feature dimensions,
+    # ignore_index with probability targets, K-dimensional weight with unbatched input, and a
+    # linear_bias of the wrong shape.
     make_arg = partial(make_tensor, device=device, dtype=torch.float)
 
     yield ErrorInput(SampleInput(make_arg(2, 3, 3), make_arg(2, 3), make_arg(3, 2)),
@@ -7251,6 +8486,9 @@ def error_inputs_linear_cross_entropy(op_info, device, **kwargs):
                      error_regex=r"expected linear_bias shape \(2,\), got \(3,\)")
 
 def sample_inputs_logit(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for logit: values inside the op's domain
+    # narrowed by a small epsilon (larger for float16) for floating and complex dtypes, with
+    # default eps, eps 0.2, zero-dim inputs, and eps 0.6 (the branch where the bounds cross).
     low, high = op_info.domain
 
     # Note: Operator is very sensitive at points near the
@@ -7272,6 +8510,8 @@ def sample_inputs_logit(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((S, S, S)), 0.6)
 
 def sample_inputs_isin(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for isin: elements larger than test elements
+    # and the reverse, to cover the two code paths chosen by relative size.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     # isin has two paths based on the size of elements and test_elements.
     # if elements.numel() < 10 * pow(test_elements.numel(), 0.145):
@@ -7280,6 +8520,9 @@ def sample_inputs_isin(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((S,)), args=(make_arg((L,)),))
 
 def sample_inputs_masked_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked_scatter: boolean masks of the same
+    # shape, broadcast from 1-D, a random scalar mask, and a broadcast input case (flagged
+    # broadcasts_input); the source is a matrix.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield SampleInput(make_arg((S, S)), args=(torch.randn(S, S, device=device) > 0, make_arg((S, S))))
@@ -7290,6 +8533,8 @@ def sample_inputs_masked_scatter(op_info, device, dtype, requires_grad, **kwargs
                       broadcasts_input=True)
 
 def error_inputs_masked_scatter(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for masked_scatter: float and uint8 masks,
+    # expecting an error that only boolean masks are supported.
     make_arg = partial(make_tensor, device=device, dtype=torch.float)
     for mask_dtype in [torch.float, torch.uint8]:
         yield ErrorInput(SampleInput(make_arg(1, 3), args=(torch.ones(1, 3, device=device, dtype=mask_dtype),
@@ -7297,6 +8542,9 @@ def error_inputs_masked_scatter(op_info, device, **kwargs):
                          error_regex=r"masked_scatter_ only supports boolean masks")
 
 def sample_inputs_masked_fill(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked_fill with scalar or zero-dim
+    # tensor values, masks of different shapes (including zero-dim) and broadcast cases; on CUDA
+    # also a CPU scalar tensor value.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield SampleInput(make_arg((S, S)), args=(torch.randn(S, S, device=device) > 0, 10))
@@ -7320,6 +8568,9 @@ def sample_inputs_masked_fill(op_info, device, dtype, requires_grad, **kwargs):
                                 make_tensor((), device="cpu", dtype=dtype)))
 
 def error_inputs_masked_fill(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for masked_fill: a value tensor that is not
+    # 0-dim, complex values that cannot be converted to the destination type (scalar and tensor
+    # overloads), and on CUDA CPU tensors with a CUDA value.
     make_arg = partial(make_tensor, device=device, dtype=torch.float, requires_grad=False)
     # `value` is not a 0-D tensor.
     yield ErrorInput(SampleInput(make_arg((2, 2)), args=(make_arg(()) > 0, make_arg((1,)))),
@@ -7341,6 +8592,8 @@ def error_inputs_masked_fill(op_info, device, **kwargs):
 
 
 def sample_inputs_masked_select(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for masked_select with masks of various
+    # shapes, including broadcast cases, a scalar bool mask and a zero-dim input.
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
 
@@ -7358,11 +8611,16 @@ def sample_inputs_masked_select(op_info, device, dtype, requires_grad, **kwargs)
     yield SampleInput(make_arg(()), torch.randn((M, M), device=device) > 0)
 
 def sample_inputs_matrix_exp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for matrix_exp: a square matrix and
+    # a batch of square matrices.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     yield SampleInput(make_arg((S, S)))
     yield SampleInput(make_arg((S, S, S)))
 
 def sample_inputs_matmul(op_info, device, dtype, requires_grad, is_rmatmul=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for matmul over many lhs and rhs shape
+    # pairs (vector, matrix, batched, empty and broadcast). When is_rmatmul is true, the operands
+    # are swapped.
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=None,
                        high=None, requires_grad=requires_grad)
     test_cases = (((L,), (L,)),
@@ -7393,15 +8651,26 @@ def sample_inputs_matmul(op_info, device, dtype, requires_grad, is_rmatmul=False
 def sample_inputs_meshgrid(op_info: OpInfo, device: torch.device, dtype: torch.dtype,
                            requires_grad: bool,
                            *, variant: str, **kwargs) -> list[SampleInput]:
+    # [FUNCTION DOC] Generator of SampleInput objects for meshgrid; the required keyword-only
+    # argument variant selects whether the tensors are passed variadically or as one list (any
+    # other value raises a ValueError). Uses lists of zero-dim and 1-D tensors and both indexing
+    # modes xy and ij.
+    # KNOWN ISSUE: the return annotation says list of SampleInput, but the function is a
+    # generator; the indexing modes are taken from a set so the order of generated samples can
+    # vary between runs.
     if variant == 'variadic':
         def make_inputs(
                 tensors: list[torch.Tensor]) -> tuple[torch.Tensor | list[torch.Tensor],
                                                       tuple[torch.Tensor, ...]]:
+            # [FUNCTION DOC] HELPER: Return the tensors list unchanged, to be passed as variadic
+            # positional arguments.
             return tensors
     elif variant == 'list':
         def make_inputs(
                 tensors: list[torch.Tensor]) -> tuple[torch.Tensor | list[torch.Tensor],
                                                       tuple[torch.Tensor, ...]]:
+            # [FUNCTION DOC] HELPER: Wrap the tensors list in another list so that it is passed as
+            # a single list argument.
             return [tensors]
     else:
         raise ValueError(
@@ -7426,6 +8695,9 @@ def sample_inputs_meshgrid(op_info: OpInfo, device: torch.device, dtype: torch.d
 
 
 def sample_inputs_mvlgamma(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for mvlgamma over shapes (matrix and
+    # zero-dim) and p values 1 to 5, using inputs above the domain bound (p minus 1) / 2 (nudged up
+    # by one for integer dtypes or by a few epsilons for floating dtypes).
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     tensor_shapes = ((S, S), ())
     ns = (1, 2, 3, 4, 5)
@@ -7435,6 +8707,7 @@ def sample_inputs_mvlgamma(op_info, device, dtype, requires_grad, **kwargs):
     # the following function computes the lower bound
     # which we pass to `make_tensor`.
     def compute_min_val(p):
+        # [FUNCTION DOC] HELPER: Return the lower input bound (p minus 1) / 2 for mvlgamma.
         return (p - 1.) / 2
 
     for shape, n in product(tensor_shapes, ns):
@@ -7451,6 +8724,9 @@ def sample_inputs_mvlgamma(op_info, device, dtype, requires_grad, **kwargs):
 # there are multiple common skips for the additional
 # entries. Following function is a helper to that end.
 def skips_mvlgamma(skip_redundant=False):
+    # [FUNCTION DOC] HELPER: Return the tuple of DecorateInfo skips shared by the extra mvlgamma
+    # OpInfo entries (domain tests skipped, extremal numerics expected to fail, selected dtype
+    # skips); with skip_redundant also skips the jit and common tests.
     skips = (
         # outside domain values are hard error for mvlgamma op.
         DecorateInfo(unittest.skip("Skipped!"), 'TestUnaryUfuncs', 'test_float_domains'),
@@ -7476,6 +8752,10 @@ def skips_mvlgamma(skip_redundant=False):
 # we make multiple OpInfo entries with each entry corresponding to different value of p.
 # We run the op tests from test_ops.py only for `p=1` to avoid redundancy in testing.
 def make_mvlgamma_opinfo(variant_test_name, domain, skips, sample_kwargs):
+    # [FUNCTION DOC] HELPER: Build and return a UnaryUfuncInfo for mvlgamma (alias
+    # special.multigammaln) with the given variant name, domain, skips and sample kwargs; the
+    # reference is the scipy-based function only when scipy is available. Used to create one entry
+    # per value of p.
     return UnaryUfuncInfo('mvlgamma',
                           ref=reference_mvlgamma if TEST_SCIPY else None,
                           aliases=('special.multigammaln',),
@@ -7493,7 +8773,12 @@ def make_mvlgamma_opinfo(variant_test_name, domain, skips, sample_kwargs):
 
 
 def sample_inputs_cumulative_ops(op_info, device, dtype, requires_grad, supports_dtype_kwargs=True, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cumulative ops (cumsum and similar): dim
+    # 0 and 1 of a cubic tensor, a zero-dim tensor, and when supports_dtype_kwargs is true a sample
+    # with the dtype keyword.
     def _make_tensor_helper(shape, low=None, high=None):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape and optional value range
+        # using the enclosing dtype, device and requires_grad.
         return make_tensor(shape, dtype=dtype, device=device, low=low, high=high, requires_grad=requires_grad)
 
     yield SampleInput(_make_tensor_helper((S, S, S)), 0)
@@ -7507,6 +8792,8 @@ def sample_inputs_cumulative_ops(op_info, device, dtype, requires_grad, supports
 
 
 def sample_inputs_unfold(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for Tensor.unfold with (shape, (dimension,
+    # size, step)) cases on zero-dim, 4-D, 1-D and 2-D tensors.
     test_cases = (
         ((), (0, 1, 1)),
         ((S, S, S, S), (0, 3, 1)),
@@ -7539,6 +8826,9 @@ def sample_inputs_unfold(op_info, device, dtype, requires_grad, **kwargs):
                           *arguments)
 
 def sample_inputs_split(op_info, device, dtype, requires_grad, *, list_args=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for split. With list_args true, split sizes
+    # are given as a size list (with and without dim); otherwise an integer split size, optionally
+    # with a dim.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     if list_args:
@@ -7558,6 +8848,8 @@ def sample_inputs_split(op_info, device, dtype, requires_grad, *, list_args=Fals
 
 
 def sample_inputs_split_with_sizes(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for split_with_sizes: size lists (including a
+    # zero-size entry) with and without positive and negative dim.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     cases = (((S, S, S), (torch.Size([int(S / 3), S - int(S / 3) * 2, int(S / 3)]),)),
@@ -7571,11 +8863,19 @@ def sample_inputs_split_with_sizes(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_msort(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for msort: a large 1-D tensor holding a
+    # permutation of distinct integers, and a random 3-D tensor. Only floating dtypes (including
+    # half and bfloat16) get requires_grad on the permutation tensor.
     def apply_grad(t):
+        # [FUNCTION DOC] HELPER: Set requires_grad on the tensor if the dtype is a floating type
+        # (including half and bfloat16), in the enclosing requires_grad setting.
         if dtype in floating_types_and(torch.float16, torch.bfloat16):
             t.requires_grad_(requires_grad)
 
     def large_1d_unique(dtype, device):
+        # [FUNCTION DOC] HELPER: Return a 1-D tensor of length L cubed holding a random permutation
+        # of distinct integers, cast to the given dtype, with requires_grad applied when
+        # appropriate. The arguments shadow the enclosing dtype and device.
         res = torch.randperm(L * L * L, dtype=torch.int64, device=device)
         res = res.to(dtype)
         apply_grad(res)
@@ -7589,6 +8889,9 @@ def sample_inputs_msort(op_info, device, dtype, requires_grad, **kwargs):
                                   requires_grad=requires_grad))
 
 def sample_inputs_lerp(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for lerp: many combinations of end tensor
+    # shapes and either scalar weights or weight tensors, with the broadcasts_input flag set when
+    # the input is broadcast; for complex dtypes also complex scalar weights.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     # no broadcast
@@ -7639,6 +8942,8 @@ def sample_inputs_lerp(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg((S, S)), make_arg(()), 1 + 2j)
 
 def sample_inputs_tensordot(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for tensordot with dims given as an integer
+    # or as two lists of dims, on small tensors with values in -1 to 2.
     cases = (
         ((2, 2, 2), (2, 2, 2), (2)),
         ((2, 2, 1), (2, 1, 2), ([0, 1], [2, 0])),
@@ -7652,6 +8957,8 @@ def sample_inputs_tensordot(self, device, dtype, requires_grad, **kwargs):
                           dims=dims)
 
 def sample_inputs_kron(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding one SampleInput for kron: matrices of shape (S, S) and
+    # (M, L).
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad, low=None, high=None)
     test_cases = (
@@ -7664,15 +8971,25 @@ def sample_inputs_kron(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input, other)
 
 def sample_inputs_inner(self, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for inner: two vectors, and a
+    # zero-dim tensor with a matrix.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     yield SampleInput(make_arg(S), make_arg(S))
     yield SampleInput(make_arg(), make_arg(S, S))
 
 def sample_inputs_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scatter: (tensor, (dim, index, source))
+    # cases with int64 and int32 indices, negative dim, a scalar source and a zero-dim case. When
+    # gradients are not required it also yields add reductions, and for floating dtypes multiply
+    # reductions, on clones.
     def _tensor(shape, dtype=dtype, low=None, high=None):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape (dtype defaults to the
+        # enclosing dtype), honoring requires_grad.
         return make_tensor(shape, dtype=dtype, device=device, low=low, high=high, requires_grad=requires_grad)
 
     def _gather(shape, index_dim, max_indices):
+        # [FUNCTION DOC] HELPER: Return a random valid index tensor for gather or scatter with the
+        # given shape, index dim and maximum index.
         return gather_variable(shape, index_dim, max_indices, device=device)
 
     zero = torch.tensor(0, dtype=torch.long, device=device)
@@ -7698,10 +9015,16 @@ def sample_inputs_scatter(op_info, device, dtype, requires_grad, **kwargs):
                 yield SampleInput(tensor.detach().clone(), *args, reduce='multiply')
 
 def sample_inputs_scatter_add(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scatter_add: (tensor, dim, index, source)
+    # cases with positive and negative dim, differently shaped sources and a zero-dim case.
     def _tensor(shape, dtype=dtype, low=None, high=None):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape (dtype defaults to the
+        # enclosing dtype), honoring requires_grad.
         return make_tensor(shape, dtype=dtype, device=device, low=low, high=high, requires_grad=requires_grad)
 
     def _gather(shape, index_dim, max_indices):
+        # [FUNCTION DOC] HELPER: Return a random valid index tensor for gather or scatter with the
+        # given shape, index dim and maximum index.
         return gather_variable(shape, index_dim, max_indices, device=device)
 
     zero = torch.tensor(0, dtype=torch.long, device=device)
@@ -7714,6 +9037,12 @@ def sample_inputs_scatter_add(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(_tensor(()), 0, zero.detach().clone(), _tensor(()))
 
 def sample_inputs_scatter_reduce(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scatter_reduce; the reduction name is
+    # taken from the op's variant_test_name. Yields (tensor, dim, index, source, reduce) with
+    # include_self set from a list of flags, and for prod when gradients are required adds a case
+    # with zeros to check gradient propagation.
+    # KNOWN ISSUE: the list of include_self flags is False, True, False, so the False case is
+    # generated twice, which looks like a typo.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     gather = partial(gather_variable, device=device)
 
@@ -7753,7 +9082,14 @@ def sample_inputs_scatter_reduce(op_info, device, dtype, requires_grad, **kwargs
                           kwargs={'include_self': True})
 
 def sample_inputs_segment_reduce(op_info, device, dtype, requires_grad, *, mode='lengths', **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for segment_reduce. Cases give input shape,
+    # axis, segment lengths and the unsafe flag, crossed with reductions (max, mean, min, sum,
+    # prod) and initial values 1 and 2. The keyword-only mode selects whether lengths or offsets
+    # (computed from lengths by prepending a zero and taking a cumulative sum) are passed; any
+    # other mode raises a RuntimeError.
     def _tensor(shape, dtype=dtype, low=None, high=None):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape (dtype defaults to the
+        # enclosing dtype), honoring requires_grad.
         return make_tensor(shape, dtype=dtype, device=device, low=low, high=high, requires_grad=requires_grad)
 
     test_cases = (
@@ -7791,6 +9127,8 @@ def sample_inputs_segment_reduce(op_info, device, dtype, requires_grad, *, mode=
 
 
 def sample_inputs_ravel(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for ravel: contiguous 3-D, zero-dim and
+    # noncontiguous 3-D tensors.
     make_arg = partial(make_tensor, dtype=dtype, device=device,
                        low=None, high=None, requires_grad=requires_grad)
     yield SampleInput(make_arg((S, S, S)))
@@ -7798,6 +9136,10 @@ def sample_inputs_ravel(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((S, S, S), noncontiguous=True))
 
 def sample_inputs_unravel_index(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unravel_index: flat index tensors (1-D,
+    # 2-D, zero-dim, empty and the dtype's largest values) with shapes given as tuples (including
+    # very large dimensions and an empty shape); also uses NumPy intersect1d to produce realistic
+    # index arrays.
     yield SampleInput(
         torch.tensor(
             [[3, 8, 13], [0, 5, 10]],
@@ -7856,6 +9198,8 @@ def sample_inputs_unravel_index(op_info, device, dtype, requires_grad, **kwargs)
 
 
 def sample_inputs_tril_triu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for tril and triu: 2-D and 3-D/4-D tensors
+    # with optional diagonal offsets.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     cases = (((M, M), ()),
              ((M, M), (2,),),
@@ -7870,12 +9214,17 @@ def sample_inputs_tril_triu(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=args)
 
 def error_inputs_tril_triu(opinfo, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for tril and triu: a 1-D input, expecting an
+    # error that at least 2 dimensions are needed.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     # error inputs for input.ndim <= 2
     yield ErrorInput(SampleInput(make_arg((4,))), error_regex="input tensor must have at least 2 dimensions")
 
 def sample_inputs_trilu_indices(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for tril_indices and triu_indices: (row, col,
+    # offset) arguments, passed with dtype and device keywords. Large cases are commented out to
+    # save CI time and memory.
     # (row, col, offset)
     args_list = ((0, 0),
                  (20, 0),
@@ -7896,12 +9245,18 @@ def sample_inputs_trilu_indices(op_info, device, dtype, requires_grad, **kwargs)
         yield SampleInput(args[0], args=args[1:], kwargs={"dtype": dtype, "device": device})
 
 def sample_inputs_clone_contiguous(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for clone and contiguous: a 3-D
+    # tensor and a zero-dim tensor.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     yield SampleInput(make_arg((S, M, S)))
     yield SampleInput(make_arg(()))
 
 def reference_inputs_clone_contiguous(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for clone and contiguous: the regular samples,
+    # then many shapes (including empty dims) in contiguous, transposed and noncontiguous layouts
+    # with and without the contiguous memory format keyword, strided views, and channels-last 2-D
+    # and 3-D formats. The default format is preserve for clone, and contiguous accepts it too.
     # NOTE: the default memory format for clone is torch.preserve_format, for contiguous it's torch.contiguous_format
     # This exploits that default to test torch.preserve_format for clone, without causing an error when testing contiguous
     yield from sample_inputs_clone_contiguous(op, device, dtype, requires_grad, **kwargs)
@@ -7953,6 +9308,9 @@ def reference_inputs_clone_contiguous(op, device, dtype, requires_grad, **kwargs
 
 
 def sample_inputs_sum_to_size(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for sum_to_size with (input shape, output
+    # shape) cases, passing the output shape as a tuple, as a list and as separate arguments (the
+    # latter two skipped for the empty shape).
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     # list of tuples (shape, shape) defining the shapes of the input and output tensors
@@ -7974,6 +9332,8 @@ def sample_inputs_sum_to_size(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_sum_to_size(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for sum_to_size: target sizes to which the
+    # input shape cannot be expanded.
     shape = (M, S, M)
     err_msg = "is not expandable to size"
     si = SampleInput(make_tensor(shape, device=device, dtype=torch.float32), args=(M, M))
@@ -7986,6 +9346,10 @@ def error_inputs_sum_to_size(op_info, device, **kwargs):
 
 
 def sample_inputs_resize_ops(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for resize_ and resize_as_ (selected by op
+    # name; any other name raises a ValueError): resizing a 3-D tensor to a matrix shape, and
+    # zero-dim tensors to shapes. resize_ gets the shape, resize_as_ gets a template tensor that
+    # does not require grad.
     make_arg = partial(make_tensor, dtype=dtype, device=device)
     cases = (((S, S, S), (S * S, S)),
              ((), ()),
@@ -8006,6 +9370,10 @@ def sample_inputs_resize_ops(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape, requires_grad=requires_grad), args=args)
 
 def sample_inputs_view_reshape(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for view and reshape with (input shape,
+    # target shape, supported with tensor argument) cases, including inferred -1 dims and zero-dim
+    # shapes. If the keyword tensor_arg is truthy, the target shape is passed as a tensor and the
+    # unsupported cases are skipped.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (
@@ -8031,6 +9399,11 @@ def sample_inputs_view_reshape(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(a), args=(b,))
 
 def reference_inputs_view_reshape(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for view and reshape: yields the regular
+    # samples, then many (shape, target shape) pairs in both directions (including empty dims and
+    # unit dims), and irreversible cases with inferred dims. The keyword tensor_arg selects
+    # tensor-valued shapes and skips unsupported cases.
+    # KNOWN ISSUE: the case with input shape (1,) and target shape () appears twice in the list.
     yield from sample_inputs_view_reshape(op, device, dtype, requires_grad, **kwargs)
 
     cases = (
@@ -8083,6 +9456,11 @@ def reference_inputs_view_reshape(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(a), args=(b,))
 
 def error_inputs_view_reshape(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for view and reshape: target shapes with a
+    # different number of elements, no valid inference for -1, two inferred dims, and an ambiguous
+    # inference for zero elements. The expected message is built from the shapes; the error type is
+    # the generic Exception. With the keyword tensor_arg only the cases supported with tensor
+    # shapes are generated.
 
     cases = (
         # a, b, is_tensor_supported
@@ -8126,6 +9504,8 @@ def error_inputs_view_reshape(op, device, **kwargs):
 
 
 def sample_inputs_atleast1d2d3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for atleast_1d, 2d and 3d: tensors of 4-D
+    # down to zero-dim, plus one sample whose input is the list of all those tensors.
     shapes = ((S, S, S, S), (S, S, S), (S, S), (S, ), (),)
     make_tensor_partial = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     for shape in shapes:
@@ -8133,6 +9513,8 @@ def sample_inputs_atleast1d2d3d(op_info, device, dtype, requires_grad, **kwargs)
     yield SampleInput([make_tensor_partial(shape) for shape in shapes])
 
 def sample_inputs_column_stack(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for column_stack: pairs of tensors with
+    # compatible shapes (including 1-D with 2-D and zero-dim with 2-D), each passed as a list.
     cases: tuple[tuple, tuple] = (  # type: ignore[assignment]
         ((S, 2, 1), (S, 3, 1)),
         ((S), (S, 5)), ((), (1, S))
@@ -8142,6 +9524,8 @@ def sample_inputs_column_stack(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput([make_tensor_partial(shape1), make_tensor_partial(shape2)])
 
 def sample_inputs_flatten(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for flatten: tensors of 3-D down to zero-dim,
+    # plus start_dim 1 and end_dim -1 for tensors with more than one dim.
     shapes = ((S, S, S), (S, S), (S, ), (),)
     make_tensor_partial = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
     for shape in shapes:
@@ -8150,6 +9534,9 @@ def sample_inputs_flatten(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(make_tensor_partial(shape), start_dim=1, end_dim=-1)
 
 def reference_inputs_flatten(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for flatten: yields the regular samples plus
+    # many (shape, start_dim, end_dim) cases (including empty and unit dims) as contiguous,
+    # noncontiguous transposed and transposed tensors.
     yield from sample_inputs_flatten(op, device, dtype, requires_grad, **kwargs)
 
     # shape x start_dim x end_dim
@@ -8176,6 +9563,8 @@ def reference_inputs_flatten(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape).transpose(0, -1), args=(start, end,))
 
 def sample_inputs_unflatten(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for unflatten with (input shape, dim, sizes)
+    # cases, including negative dims, an inferred -1 size and zero-sized dims.
     # in_shape, dim, sizes
     args = (((8,), 0, (8,)),
             ((8,), 0, (4, 2)),
@@ -8194,6 +9583,8 @@ def sample_inputs_unflatten(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_select(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for select with (dim, index) arguments,
+    # including negative values.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((S, S, S), (1, 2)),
@@ -8209,6 +9600,8 @@ def sample_inputs_select(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_select_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for select_scatter: the input, a source with
+    # the selected dim removed, and (dim, index) with negative values.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((S, S, S), (S, S), (1, 2)),
@@ -8225,6 +9618,8 @@ def sample_inputs_select_scatter(op_info, device, dtype, requires_grad, **kwargs
 
 
 def sample_inputs_slice_scatter(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for slice_scatter: a cubic input, a source of
+    # the sliced shape and (dim, start, end, step) arguments along each dim with steps 1 and 2.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((L, L, L), (L, L, L,), (0, 0, L, 1)),
@@ -8244,6 +9639,8 @@ def sample_inputs_slice_scatter(op_info, device, dtype, requires_grad, **kwargs)
         yield SampleInput(input_, args=(src, *args))
 
 def sample_inputs_expand(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for expand with (input shape, target size)
+    # cases, including -1 entries, zero-dim inputs and added leading dims.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((S, 1, 1), (S, S, S)),
@@ -8262,6 +9659,9 @@ def sample_inputs_expand(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(args,))
 
 def sample_inputs_conversion(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the type conversion methods: zero-dim
+    # and 2x3 tensors with the memory format keyword absent or contiguous, plus a channels-last
+    # 4-D case.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     shapes = ((),
@@ -8274,6 +9674,9 @@ def sample_inputs_conversion(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((2, 3, 2, 3)), kwargs={'memory_format': torch.channels_last})
 
 def sample_inputs_byte(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for byte: like the conversion samples but
+    # with values in 0 to 255, covering zero-dim and 2x3 tensors with the memory format keyword
+    # absent or contiguous, plus a channels-last 4-D case.
     make_arg = partial(make_tensor, dtype=dtype, device=device, low=0, high=255, requires_grad=requires_grad)
 
     shapes = ((),
@@ -8286,6 +9689,8 @@ def sample_inputs_byte(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_arg((2, 3, 2, 3)), kwargs={'memory_format': torch.channels_last})
 
 def sample_inputs_expand_as(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for expand_as with (shape, other shape)
+    # cases; the other tensor never requires grad.
     make_arg = partial(make_tensor, dtype=dtype, device=device)
 
     cases = (((S, 1, 1), (S, S, S)),
@@ -8299,9 +9704,15 @@ def sample_inputs_expand_as(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_where(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for where in the form (input, condition,
+    # other), with (shape, mask shape, other shape, broadcasts_input) cases. The boolean mask is
+    # forced to contain at least one true entry (unless empty).
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     def make_bool_mask(shape):
+        # [FUNCTION DOC] HELPER: Make a random boolean mask of the given shape and ensure at least
+        # one true element: one-element masks are set to true, and an all-false mask gets one
+        # random position set to true. Empty masks are returned as is.
         # Make sure at least one element is nonzero,
         # except for empty tensor
         mask_t = make_tensor(shape, dtype=torch.bool, device=device, requires_grad=False)
@@ -8314,6 +9725,7 @@ def sample_inputs_where(op_info, device, dtype, requires_grad, **kwargs):
 
         if mask_t.sum() == 0:
             def random_index(shape):
+                # [FUNCTION DOC] HELPER: Return a random index tuple within the given shape.
                 return tuple(random.randrange(0, max_idx) for max_idx in shape)
 
             mask_t[random_index(mask_t.shape)] = True
@@ -8336,6 +9748,13 @@ def sample_inputs_where(op_info, device, dtype, requires_grad, **kwargs):
 
 # TODO: add reference inputs for where(condition) signature
 def reference_inputs_where(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for where: the regular samples, then
+    # noncontiguous operands, int by float type promotion, two Python scalars, a NaN propagation
+    # case for floating and complex dtypes, and cases mixing Python scalars (int, float, complex,
+    # bool) with tensors. Returns early (after the first extra sample) on mps, which lacks float64.
+    # KNOWN ISSUE: other_dtype is computed but never used (a FIXME notes this), and the final
+    # scalar loop reuses the condition and tensors left over from earlier blocks, which for
+    # non-float dtypes are the Python scalar operands.
     yield from sample_inputs_where(op, device, dtype, requires_grad, **kwargs)
 
     make_cond = partial(make_tensor, dtype=torch.bool, device=device, requires_grad=requires_grad)
@@ -8391,6 +9810,9 @@ def reference_inputs_where(op, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_where(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for where: every assignment of cpu or the
+    # given device to the input, condition and other tensors that uses exactly two distinct
+    # devices, expecting a same-device error. Yields nothing when the device is cpu.
     shape = (S,)
     err_msg = "Expected all tensors to be on the same device"
     for devices in product(('cpu', device), repeat=3):
@@ -8401,6 +9823,8 @@ def error_inputs_where(op_info, device, **kwargs):
             yield ErrorInput(si, error_regex=err_msg)
 
 def sample_inputs_nonzero(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for nonzero: all-zero and mixed zero/non-zero
+    # tensors of several shapes (including an empty dim), with as_tuple False and True.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = ((), (S,), (S, S), (S, S, S), (S, 1, S), (S, 0, S))
@@ -8422,6 +9846,8 @@ def sample_inputs_nonzero(op_info, device, dtype, requires_grad, **kwargs):
                           kwargs=dict(as_tuple=as_tuple))
 
 def sample_inputs_nonzero_static(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for nonzero_static: all-zero and mixed
+    # zero/non-zero tensors of several shapes, each with a size keyword from 0, 1, XS, S and M.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     sizes = ((), (S,), (S, S), (S, S, S), (S, 1, S), (S, 0, S))
@@ -8445,6 +9871,8 @@ def sample_inputs_nonzero_static(op_info, device, dtype, requires_grad, **kwargs
                           kwargs=dict(size=nonzero_size))
 
 def sample_inputs_chunk(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for chunk: chunk counts and dims, including a
+    # negative dim.
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
 
     cases = (((S, S, S), (2,)),
@@ -8456,6 +9884,8 @@ def sample_inputs_chunk(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=args)
 
 def reference_inputs_chunk(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for chunk: the regular samples plus (shape,
+    # chunks, dim) cases where the chunk count exceeds or does not divide the size.
     yield from sample_inputs_chunk(op, device, dtype, requires_grad, **kwargs)
 
     make_arg = partial(make_tensor, dtype=dtype, device=device, requires_grad=requires_grad)
@@ -8481,7 +9911,11 @@ def reference_inputs_chunk(op, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make_arg(shape), args=(chunks, dim))
 
 def sample_inputs_kthvalue(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for kthvalue with (k, dim, keepdim) argument
+    # combinations for 3-D, 1-D and zero-dim tensors.
     def _tensor(shape, dtype=dtype, low=None, high=None):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape (dtype defaults to the
+        # enclosing dtype), honoring requires_grad.
         return make_tensor(shape, dtype=dtype, device=device, low=low, high=high, requires_grad=requires_grad)
 
     test_cases = [
@@ -8500,6 +9934,9 @@ def sample_inputs_kthvalue(op_info, device, dtype, requires_grad, **kwargs):
     yield from (SampleInput(_tensor(tensor), *args) for tensor, args in test_cases)
 
 def error_inputs_kthvalue(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for kthvalue: an out tuple that overlaps the
+    # input memory (unsupported operation), and k values larger than the dimension size for 2-D and
+    # zero-dim inputs.
     # tests overlapping output fails
     t = make_tensor(10, dtype=torch.float32, device=device)
     indices = torch.empty((), device=device, dtype=torch.long)
@@ -8516,6 +9953,13 @@ def error_inputs_kthvalue(op_info, device, **kwargs):
 
 def sample_inputs_dropout(op_info, device, dtype, requires_grad, *,
                           train=None, valid_input_dim=None, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for dropout-style ops. Keyword-only
+    # arguments: train (fixes the training flag; when None both True and False are used) and
+    # valid_input_dim (list of ranks, each producing a tensor of that many S-sized dims; default
+    # shapes are a matrix, a vector and a scalar). Crosses shapes with p in 0, 0.5, 1 and ends with
+    # a default-arguments sample.
+    # KNOWN ISSUE: the final default-arguments sample uses the shape variable left over from the
+    # loop (the last shape), and fails with a NameError if there were no cases.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     if valid_input_dim:
@@ -8532,6 +9976,8 @@ def sample_inputs_dropout(op_info, device, dtype, requires_grad, *,
     yield SampleInput(make_arg(case))
 
 def sample_inputs_dropout_backward(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for dropout_backward: gradient tensors of
+    # 4-D, 1-D and zero-dim shapes with a boolean mask and scale 0, 1 or 2.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     make_mask = partial(make_tensor, device=device, dtype=torch.bool, requires_grad=False)
 
@@ -8542,14 +9988,26 @@ def sample_inputs_dropout_backward(op_info, device, dtype, requires_grad, **kwar
         yield SampleInput(make_arg(case), make_mask(case), scale)
 
 def sample_inputs_embedding_bag(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for embedding_bag. For per-sample
+    # weights present or absent and each mode (sum, mean, max; per-sample weights only with
+    # sum): 1-D and 2-D indices (contiguous and noncontiguous), zero-length bags, padding_idx
+    # (negative and positive), include_last_offset, and, when gradients are not required,
+    # max_norm, scale_grad_by_freq and sparse variants that differ from numerical gradients
+    # (checked in test_nn).
     def make_input(shape):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with the enclosing dtype,
+        # device and requires_grad.
         return make_tensor(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_long_input(shape, *, low, high, noncontiguous=False):
+        # [FUNCTION DOC] HELPER: Make a random long index tensor with values in the range low to
+        # high, optionally noncontiguous.
         return make_tensor(shape, device=device, dtype=torch.long, low=low, high=high,
                            noncontiguous=noncontiguous)
 
     def make_per_sample_weight(flag, idx):
+        # [FUNCTION DOC] HELPER: Return a random per-sample-weights tensor shaped like the indices
+        # if flag is true, otherwise None.
         # a tensor of float / double weights, or None
         # to indicate all weights should be taken to be 1
         if flag:
@@ -8676,10 +10134,17 @@ def sample_inputs_embedding_bag(op_info, device, dtype, requires_grad, **kwargs)
 
 
 def sample_inputs_embedding(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for embedding: zero-dim, 1-D and 2-D indices,
+    # and, when gradients are not required, padding_idx (positive and negative), max_norm,
+    # norm_type, scale_grad_by_freq and sparse variants whose gradients differ from numerical ones.
     def make_input(shape):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with the enclosing dtype,
+        # device and requires_grad.
         return make_tensor(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_long_input(shape, *, low, high):
+        # [FUNCTION DOC] HELPER: Make a random long index tensor with values in the range low
+        # to high.
         return make_tensor(shape, device=device, dtype=torch.long, low=low, high=high)
 
     # 0-D index tensor
@@ -8742,7 +10207,12 @@ def sample_inputs_embedding(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_one_hot(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # one_hot: integer tensors of shapes zero-dim, 1-D and 3-D with num_classes -1 (inferred,
+    # values below 10) or 10 (values below 5).
     def make_input(shape, *, low, high):
+        # [FUNCTION DOC] HELPER: Make a random tensor of the given shape with values in the range
+        # low to high using the enclosing dtype and device.
         return make_tensor(shape, device=device, dtype=dtype, low=low, high=high, requires_grad=requires_grad)
 
     shapes = ((), (S,), (L, M, S))
@@ -8762,6 +10232,11 @@ def sample_inputs_one_hot(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for simple loss functions (input, target
+    # pairs) over shapes and reduction keyword options; the target requires grad only when the
+    # kwarg rhs_requires_grad (defaulting to requires_grad) says so.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter, after the
+    # rhs_requires_grad lookup.
     rhs_requires_grad = kwargs.get('rhs_requires_grad', requires_grad)
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
@@ -8782,6 +10257,9 @@ def sample_inputs_loss(op_info, device, dtype, requires_grad, **kwargs):
                           kwargs=kwargs)
 
 def sample_inputs_grid_sample(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for grid_sample in 2-D and 3-D: inputs and
+    # grids with values in -2 to 2 (to mix in-range and out-of-range coordinates) crossed with
+    # modes (bilinear, nearest, and bicubic only for 2-D), padding modes and align_corners.
     # We get better tests if we change the range of the values to something like [-2,2]
     # because for grid (second tensor argument) the "useful" range is [-1,1] and this way
     # you get a better combination of out-of-range and in-range test cases
@@ -8808,6 +10286,10 @@ def sample_inputs_grid_sample(op_info, device, dtype, requires_grad, **kwargs):
             )
 
 def reference_inputs_grid_sample(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for grid_sample: a large uint8-valued image
+    # batch (2x3x345x456) and an affine grid (45 degree rotation with scales) crossed with the
+    # modes bilinear, nearest and bicubic, all padding modes and align_corners values. The mode and
+    # padding are passed as positional arguments.
 
     batch_size = 2
     num_channels = 3
@@ -8846,6 +10328,8 @@ def reference_inputs_grid_sample(op_info, device, dtype, requires_grad, **kwargs
         )
 
 def sample_inputs_grid_sampler_2d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for grid_sampler_2d (integer mode and padding
+    # codes 0 to 2 with align_corners) with random 4-D inputs and 4-D grids.
     # We get better tests if we change the range of the values to something like [-2,2]
     # because for grid (second tensor argument) the "useful" range is [-1,1] and this way
     # you get a better combination of out-of-range and in-range test cases
@@ -8868,6 +10352,9 @@ def sample_inputs_grid_sampler_2d(op_info, device, dtype, requires_grad, **kwarg
         )
 
 def sample_inputs_grid_sampler_3d(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for grid_sampler_3d (mode 0 only, padding
+    # codes 0 to 2, align_corners) with several 5-D input and grid shape pairs; grid values go from
+    # -4 to 4.
     _make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad,
                           low=-1, high=1)
     # Test both out-of-range and in-range grid values
@@ -8898,9 +10385,14 @@ def sample_inputs_grid_sampler_3d(op_info, device, dtype, requires_grad, **kwarg
         )
 
 def sample_inputs_cosine_embedding_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for cosine_embedding_loss: matrix or vector
+    # input pairs with targets of +1 or -1, each reduction and a random margin in -1 to 1. The
+    # target tensor requires grad as requested.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_target(shape):
+        # [FUNCTION DOC] HELPER: Make random +1 or -1 targets in the test dtype: a scalar for 1-D
+        # shapes, otherwise one per batch row; detached and given requires_grad.
         shape = () if len(shape) == 1 else (shape[0], )
         t = torch.randint(0, 2, shape, device=device, dtype=torch.long)
         # Label with -1 or 1
@@ -8918,12 +10410,18 @@ def sample_inputs_cosine_embedding_loss(op_info, device, dtype, requires_grad, *
         )
 
 def sample_inputs_ctc_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for ctc_loss: 50 time steps, batch 16, 20
+    # classes, targets up to length 30, over the three reductions, zero_infinity True and False,
+    # and lengths passed as tensors or lists (lists only for reductions none and sum, as list
+    # lengths are not composite-compliant with mean).
     input_length = 50
     batch = 16
     num_char = 20
     target_length = 30
 
     def make_log_probs(s):
+        # [FUNCTION DOC] HELPER: Make log-probabilities by taking log softmax over dim 2 of a
+        # random tensor, detached and given requires_grad.
         t = make_tensor(s, device=device, dtype=dtype)
         log_probs = t.log_softmax(2).to(device=device, dtype=dtype).detach().requires_grad_(requires_grad=requires_grad)
         return log_probs
@@ -8950,6 +10448,14 @@ def sample_inputs_ctc_loss(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for nll_loss on 3 classes. For batched,
+    # non-batched and 2-D spatial inputs and each reduction, yields: no weight; class weights
+    # (random, non-negative, and for floating and complex dtypes non-positive; weights never
+    # require grad); ignore_index set to the middle class with and without weights (with mean
+    # reduction a target that is all ignored is reset to avoid NaN); and, for non-mean reductions,
+    # a case where every target is ignored. Ends with a sample using ignore_index -1 and a target
+    # containing -1.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     shape = (2, 3)
     num_classes = shape[1]
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -8957,6 +10463,9 @@ def sample_inputs_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
     make_weight = partial(make_tensor, num_classes, device=device, dtype=dtype, requires_grad=False)
 
     def make_target(shape, zeros=False):
+        # [FUNCTION DOC] HELPER: Make an integer target tensor for an input of the given shape
+        # (class index in range, or all zeros when requested), with the batch and spatial dims of
+        # the shape and no class dim.
         s = (shape[0], *shape[2:]) if len(shape) > 1 else ()
         if zeros:
             return torch.zeros(s, device=device, dtype=torch.long)
@@ -8969,6 +10478,8 @@ def sample_inputs_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
 
 
     def gen_shape_kwargs():
+        # [FUNCTION DOC] HELPER: Generator of (shape, keyword dictionary) pairs for nll_loss across
+        # reductions and shapes.
         # Batched, non-batched and 2d
         shapes = (shape, (num_classes,), shape + (2, 2))
         reductions = ('none', 'mean', 'sum')
@@ -9000,11 +10511,19 @@ def sample_inputs_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
 def sample_inputs_binary_cross_entropy_with_logits(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC] Generator of SampleInput objects for binary_cross_entropy_with_logits: input
+    # tensors of shapes zero-dim to 3-D with probability targets in 0 to 1, the three reductions,
+    # weight tensors of several broadcastable shapes, pos_weight, and both together.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter, and one
+    # weight shape is written as a plain integer (S) rather than a tuple.
     make = partial(make_tensor, device=device, dtype=dtype)
     make_prob = partial(make, low=0, high=1)
     reductions = ("mean", "sum", "none")
 
     def make_weight_shape_kwargs():
+        # [FUNCTION DOC] HELPER: Return a list of (shape, keyword dictionary) cases pairing a
+        # matrix shape with each reduction and a weight tensor of one of the shapes (1,), (1, S), S
+        # and (S, S).
         kwargs = []
         for shape in ((1,), (1, S), (S), (S, S)):
             kwargs.extend([((S, S), dict(reduction=reduction, weight=make(shape))) for reduction in reductions])
@@ -9026,6 +10545,9 @@ def sample_inputs_binary_cross_entropy_with_logits(
         )
 
 def sample_inputs_argwhere(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for argwhere: a 1-D tensor with zeros,
+    # matrices with entries zeroed by a fixed boolean mask (contiguous and noncontiguous), an
+    # empty-column matrix, an all-zero vector and a zero-dim tensor.
     yield SampleInput(torch.tensor([1, 0, 2, 0], dtype=dtype, device=device, requires_grad=requires_grad))
     mask = torch.tensor([[0, 1, 0, 1, 0],
                          [1, 1, 1, 1, 0],
@@ -9047,22 +10569,34 @@ def sample_inputs_argwhere(op_info, device, dtype, requires_grad, **kwargs):
     yield SampleInput(make_tensor((), dtype=dtype, device=device, requires_grad=requires_grad))
 
 def _generate_sample_shape_reduction():
+    # [FUNCTION DOC] HELPER: Generator of (shape, reduction) pairs over shapes (S,), (S, S), (S, S,
+    # S) and reductions none, mean and sum.
     shapes = ((S,), (S, S), (S, S, S))
     reductions = ('none', 'mean', 'sum')
     yield from product(shapes, reductions)
 
 def sample_inputs_gaussian_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for gaussian_nll_loss. For shapes and
+    # reductions it creates an input, a target and a positive variance tensor in broadcastable
+    # shape variants (the same shape, with a trailing dim of one, or without the last dim), and
+    # four keyword variants: default, full, random eps, and full with random eps.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     # Set low slightly above 0 so gradcheck doesn't accidentally dip below 0
     make_var = partial(make_tensor, low=0.1, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def gen_shape(shape):
+        # [FUNCTION DOC] HELPER: Generator of the shape itself, then the shape with last dim
+        # replaced by 1, then the shape without its last dim.
         yield shape
         # Broadcast
         yield (*shape[:-1], 1)
         yield shape[:-1]
 
     def gen_shape_kwargs():
+        # [FUNCTION DOC] HELPER: Generator of (input, target, variance, keyword dictionary) tuples
+        # for gaussian_nll_loss over shapes, reductions, target and variance shape variants, and
+        # the full and eps options.
         for s, r in _generate_sample_shape_reduction():
             for t_s, v_s in product(gen_shape(s), gen_shape(s)):
                 yield _make_tensor(s), _make_tensor(t_s), make_var(v_s), dict(reduction=r)
@@ -9083,6 +10617,9 @@ def sample_inputs_gaussian_nll_loss(op_info, device, dtype, requires_grad, **kwa
         yield SampleInput(input, args=(target, var, ), kwargs=kwargs)
 
 def error_inputs_gaussian_nll_loss(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for gaussian_nll_loss: invalid reduction
+    # (ValueError), variance of the wrong shape (ValueError) and a target of the wrong shape
+    # (RuntimeError from broadcasting).
     _make = partial(make_tensor, device=device, dtype=torch.float32)
 
     # invalid reduction value
@@ -9100,12 +10637,18 @@ def error_inputs_gaussian_nll_loss(op_info, device, **kwargs):
                                   r"at non-singleton dimension 2"))
 
 def _generate_sample_inputs_nn_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator of (input, target, reduction dictionary) tuples with
+    # same-shaped random tensors over the shape and reduction combinations, used by simple nn
+    # loss samples.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     for s, r in _generate_sample_shape_reduction():
         yield _make_tensor(s), _make_tensor(s), dict(reduction=r)
 
 def sample_inputs_hinge_embedding_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for hinge_embedding_loss, derived from the
+    # generic loss samples: the target is overwritten in place with random values of 1 or -1, a
+    # random margin in -9 to 9 is added, plus a zero-dim input and target sample.
     for input, target, d in _generate_sample_inputs_nn_loss(op_info, device, dtype, requires_grad, **kwargs):
         # target should contain either 1 or -1 as per docs
         mask = torch.rand_like(target) > 0.5
@@ -9119,12 +10662,17 @@ def sample_inputs_hinge_embedding_loss(op_info, device, dtype, requires_grad, **
     yield SampleInput(_make_tensor(()), args=(_make_tensor(()), ))
 
 def error_inputs_hinge_embedding_loss(op, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for hinge_embedding_loss: an invalid
+    # reduction string, expecting a ValueError.
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
     # invalid reduction value
     yield ErrorInput(SampleInput(make_input(5, 4), args=(make_input(5, 4),), kwargs={'reduction': 'abc'}),
                      error_type=ValueError, error_regex='is not a valid value')
 
 def reference_inputs_hinge_embedding_loss(op, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of reference inputs for hinge_embedding_loss: yields the regular
+    # samples, then for each reduction, NaN and Inf containing inputs (float dtypes only) with
+    # random plus or minus one targets, and a broadcasting case.
     yield from sample_inputs_hinge_embedding_loss(op, device, dtype, requires_grad, **kwargs)
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
@@ -9158,11 +10706,15 @@ def reference_inputs_hinge_embedding_loss(op, device, dtype, requires_grad, **kw
         yield SampleInput(inp, args=(target,), kwargs={'reduction': reduction})
 
 def sample_inputs_huber_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for huber_loss, derived from the generic loss
+    # samples with a random delta in 0.001 to 9 added.
     for input, target, d in _generate_sample_inputs_nn_loss(op_info, device, dtype, requires_grad, **kwargs):
         d['delta'] = random.uniform(1e-3, 9)
         yield SampleInput(input, args=(target, ), kwargs=d)
 
 def error_inputs_huber_loss(op, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for huber_loss: invalid reduction (ValueError)
+    # and non-positive delta values 0 and -1 (RuntimeError).
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
     # invalid reduction value
     err = 'is not a valid value for reduction'
@@ -9175,9 +10727,18 @@ def error_inputs_huber_loss(op, device, **kwargs):
                          error_type=RuntimeError, error_regex=err)
 
 def sample_inputs_poisson_nll_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for poisson_nll_loss: for each shape and
+    # reduction, log_input and full flags, with non-negative targets, absolute-value inputs
+    # when log_input is false, and a second variant with a random eps. For complex dtypes also
+    # yields zero-dim mixed-dtype pairs (bool and int64 with the complex dtype) to test
+    # int-to-float promotion.
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     _make_tensor = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     def gen_shape_kwargs():
+        # [FUNCTION DOC] HELPER: Generator of (input, target, keyword dictionary) tuples for
+        # poisson_nll_loss over shapes, reductions, log_input and full flags, with and without
+        # random eps.
         for s, r in _generate_sample_shape_reduction():
             for li in (True, False):
                 for f in (True, False):
@@ -9217,6 +10778,8 @@ def sample_inputs_poisson_nll_loss(op_info, device, dtype, requires_grad, **kwar
             yield SampleInput(_make_tensor(dtype=d), args=(_make_tensor(dtype=dtype),))
 
 def error_inputs_poisson_nll_loss(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for poisson_nll_loss: invalid reduction
+    # (ValueError) and mismatched input and target shapes (broadcast error).
     make = partial(make_tensor, device=device, dtype=torch.float32)
 
     # invalid reduction value
@@ -9232,6 +10795,8 @@ def error_inputs_poisson_nll_loss(op_info, device, **kwargs):
                                   r'dimension 1)'))
 
 def error_inputs_soft_margin_loss(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for soft_margin_loss: invalid reduction
+    # (ValueError) and mismatched input and target shapes (broadcast error).
     make = partial(make_tensor, device=device, dtype=torch.float32)
 
     # invalid reduction value
@@ -9247,6 +10812,9 @@ def error_inputs_soft_margin_loss(op_info, device, **kwargs):
                                   r'dimension 1)'))
 
 def sample_inputs_triplet_margin_loss(op_info, device, dtype, requires_grad, with_distance=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for triplet_margin_loss: anchor, positive and
+    # negative matrices (S, M) with margins 1e-6, 1 and 10, swap, and the three reductions. When
+    # with_distance is true, also passes a PairwiseDistance module as the distance function.
     make = partial(make_tensor, (S, M), device=device, dtype=dtype, requires_grad=requires_grad)
 
     kwargss = (
@@ -9263,6 +10831,9 @@ def sample_inputs_triplet_margin_loss(op_info, device, dtype, requires_grad, wit
         yield SampleInput(input, args=args, kwargs=kwargs)
 
 def error_inputs_triplet_margin_loss(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for triplet_margin_loss: invalid reduction
+    # (ValueError), negative margin (ValueError), mismatched shapes in each of the three inputs,
+    # and mismatched dimension counts (RuntimeError). Each has the expected message.
     make_input = partial(make_tensor, device=device, dtype=torch.float32)
 
     samples = (
@@ -9324,18 +10895,30 @@ def error_inputs_triplet_margin_loss(op_info, device, **kwargs):
 
 
 def sample_inputs_scaled_mm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scaled_mm: random 15x16 by 16x32 float8
+    # matrices (second matrix column-major) with per-tensor float32 scales for e4m3 by e4m3, e4m3
+    # by e5m2 and e5m2 by e4m3. On ROCm gfx950 it also adds an MXFP4 sample with E8M0 block scales
+    # and bfloat16 output. Local M, N, K shadow the module-level constants.
     def to_fp8_saturated(x: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Clamp a float32 tensor to the finite range of the given float8
+        # format (e4m3 or e5m2) and convert it to that dtype.
         max_val = E4M3_MAX_POS if fp8_dtype == e4m3_type else E5M2_MAX_POS
         x = x.clamp(min=-1 * max_val, max=max_val)
         return x.to(fp8_dtype)
 
     def amax_to_scale(amax: torch.Tensor, float8_dtype: torch.dtype) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return a float32 scale tensor equal to the format's maximum
+        # positive value divided by the absolute maximum (clamped away from zero by 1e-12), on the
+        # enclosing device.
         EPS = 1e-12
         max_pos = E4M3_MAX_POS if float8_dtype == e4m3_type else E5M2_MAX_POS
         scale_val = max_pos / torch.clamp(amax, min=EPS)
         return scale_val.to(dtype=torch.float32, device=device)
 
     def make_scale(x: float, float8_dtype: torch.dtype, dim=None) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return the scale tensor for a given magnitude: from the absolute
+        # value of a scalar, or, if dim is given, from the maximum absolute value over that dim
+        # with keepdim.
         if dim is None:
             amax = torch.tensor(abs(x), dtype=torch.float32, device=device)
         else:
@@ -9345,6 +10928,8 @@ def sample_inputs_scaled_mm(op_info, device, dtype, requires_grad, **kwargs):
         return amax_to_scale(amax, float8_dtype)
 
     def make_mat(size: tuple[int], scale: float, fp8_dtype: torch.dtype) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return a random normal float32 matrix of the given size multiplied
+        # by scale and saturated to the given float8 dtype.
         mat = torch.randn(size, device=device, dtype=torch.float32)
         return to_fp8_saturated(mat * scale, fp8_dtype)
 
@@ -9407,6 +10992,14 @@ def sample_inputs_scaled_mm(op_info, device, dtype, requires_grad, **kwargs):
     yield from samples
 
 def sample_inputs_scaled_mm_v2(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scaled_mm_v2, using the ScalingType and
+    # SwizzleType enums from torch.nn.functional (imported at call time). Always: e4m3 tensorwise
+    # and rowwise scaled products of 15x16 by 16x32 with bfloat16 output. On CUDA with capability 9
+    # (non-ROCm and CUDA at least 12.9) adds 1x128 and 128x128 blockwise combinations on 256x512 by
+    # 512x768; with capability 10 or above adds MXFP8 (1x32 blocks, swizzled), single-level NVFP4
+    # and two-level NVFP4 (with a tensorwise global scale) samples using packed fp4 matrices.
+    # KNOWN ISSUE: the capability is read for the current CUDA device rather than the device
+    # argument, and the device is checked only by type.
     from torch.nn.functional import ScalingType, SwizzleType
     make_mat_e4m3 = partial(make_tensor, device=device, dtype=torch.float8_e4m3fn, requires_grad=requires_grad)
 
@@ -9585,6 +11178,12 @@ def sample_inputs_scaled_mm_v2(op_info, device, dtype, requires_grad, **kwargs):
     yield from samples
 
 def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for scaled_dot_product_attention: 3-D, 4-D
+    # and head-broadcast query/key/value shapes crossed with is_causal, dropout_p (0 and 0.5) and
+    # enable_gqa, plus a sample with an attention mask.
+    # KNOWN ISSUE: a sample with a different value head dimension is built but never added to the
+    # sample list (a FIXME notes this); it also uses is_causal and dropout_p left over from the
+    # loop above.
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     batch, seq_q, seq_kv, num_heads, head_dim = 4, 3, 6, 4, 8
 
@@ -9636,6 +11235,9 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
     yield from samples
 
 def sample_inputs_scaled_dot_product_flash_attention_for_cpu(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the CPU flash attention op: 4-D
+    # query/key/value with is_causal True and False and no dropout, plus a sample with an attention
+    # mask that does not require grad.
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     batch, seq_q, seq_kv, num_heads, head_dim = 4, 3, 6, 4, 8
 
@@ -9670,6 +11272,14 @@ def sample_inputs_scaled_dot_product_flash_attention_for_cpu(op_info, device, dt
     yield from samples
 
 def sample_inputs_efficient_attention_forward(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the memory-efficient attention forward
+    # op: transposed 4-D query/key/value crossed with is_causal, dropout, mask types 1 and 2
+    # (upper-left and lower-right) and scale None or 1; plus a sample with a bias tensor, and a
+    # jagged sample using cumulative sequence-length tensors for query and key. compute_log_sumexp
+    # follows requires_grad.
+    # KNOWN ISSUE: a sample with a different value head dimension is built but never added (a FIXME
+    # notes this); it and the bias sample use dropout_p left over from the loop, and the loop's
+    # is_causal value is unused.
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     batch, num_heads, head_dim = 4, 4, 8
     seq_q = 11
@@ -9764,6 +11374,9 @@ def sample_inputs_efficient_attention_forward(op_info, device, dtype, requires_g
     yield from samples
 
 def sample_inputs_flash_attention_forward(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for the flash attention forward op:
+    # transposed 4-D query/key/value crossed with is_causal, dropout (0 and 0.5) and scale None or
+    # 1, with no cumulative sequence lengths and no debug mask.
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     batch, num_heads, head_dim = 4, 4, 8
     seq_q = 11
@@ -9796,6 +11409,8 @@ def sample_inputs_flash_attention_forward(op_info, device, dtype, requires_grad,
     yield from samples
 
 def sample_inputs_pairwise_distance(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Returns a generator (not a generator function) of SampleInput objects for
+    # pairwise_distance: vector and batched inputs with keepdim, p (5 and -1) and eps options.
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     shape = (3,)
@@ -9815,6 +11430,8 @@ def sample_inputs_pairwise_distance(op_info, device, dtype, requires_grad, **kwa
     )
 
 def sample_inputs_pixel_shuffle(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for pixel_shuffle: a 1x9x2x2 input with
+    # upscale factors 1 and 3, and inputs with a zero-size dim with factor 1.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     yield from (
         SampleInput(make_arg((1, 9, 2, 2)), upscale_factor=upscale_factor)
@@ -9830,6 +11447,8 @@ def sample_inputs_pixel_shuffle(op_info, device, dtype, requires_grad, **kwargs)
     )
 
 def sample_inputs_pixel_unshuffle(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for pixel_unshuffle: a 1x1x6x6 input with
+    # downscale factors 1 and 3, and inputs with a zero-size dim with factor 1.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
     yield from (
         SampleInput(make_arg((1, 1, 6, 6)), downscale_factor=downscale_factor)
@@ -9845,6 +11464,8 @@ def sample_inputs_pixel_unshuffle(op_info, device, dtype, requires_grad, **kwarg
     )
 
 def sample_inputs_channel_shuffle(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for channel_shuffle: 4-D inputs with 2, 3 and
+    # 4 groups.
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     shapes_groups = [
@@ -9859,6 +11480,11 @@ def sample_inputs_channel_shuffle(op_info, device, dtype, requires_grad, **kwarg
     )
 
 def sample_inputs_binary_cross_entropy(op_info, device, dtype, requires_grad, logits=False, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for binary_cross_entropy, and with logits
+    # true for the variant taking raw logits: shapes zero-dim to 3-D, the three reductions,
+    # weights, and (for logits) pos_weight; targets are probabilities with lower bound 1e-6 (above
+    # the gradcheck epsilon to avoid negative perturbations).
+    # KNOWN ISSUE: the loop variable kwargs rebinds the function's **kwargs parameter.
     make = partial(make_tensor, device=device, dtype=dtype)
     # Lower bounds must be greater than 'eps' defined in gradcheck.py::gradgradcheck() -> eps
     # otherwise perturbation calculation causes Tensor value to become negative triggering
@@ -9886,6 +11512,9 @@ def sample_inputs_binary_cross_entropy(op_info, device, dtype, requires_grad, lo
         )
 
 def sample_inputs_allclose(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for allclose: for zero-dim, 1-D and 3-D
+    # shapes, rtol in (0.1, 0.5) and atol in (0.01, 1e-16): a close pair (second tensor is the
+    # first plus atol) and a random pair.
     sample_shapes = [(), (S), (S, S, S)]
     atols = [1e-2, 1e-16]
     rtols = [1e-1, 0.5]
@@ -9902,6 +11531,8 @@ def sample_inputs_allclose(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_l1_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for l1_loss: the generic loss samples, plus
+    # for complex dtypes zero-dim mixed complex and float pairs to test complex-to-float promotion.
     yield from sample_inputs_loss(op_info, device, dtype, requires_grad, **kwargs)
 
     # test COMPLEX_TO_FLOAT promotion
@@ -9912,6 +11543,8 @@ def sample_inputs_l1_loss(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(make(dtype=other_dtype), args=(make(dtype=dtype),))
 
 def error_inputs_l1_loss(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for l1_loss: invalid reduction (ValueError)
+    # and mismatched input and target shapes (broadcast error).
     make = partial(make_tensor, device=device, dtype=torch.float32)
 
     # invalid reduction value
@@ -9928,6 +11561,9 @@ def error_inputs_l1_loss(op_info, device, **kwargs):
                      )
 
 def sample_inputs_smooth_l1_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for smooth_l1_loss: the generic loss samples,
+    # a case where the smooth branch is always taken (beta larger than any difference) and a case
+    # with beta 0.
     yield from sample_inputs_loss(op_info, device, dtype, requires_grad, **kwargs)
 
     make = partial(make_tensor, (S, S), device=device, dtype=dtype, requires_grad=requires_grad)
@@ -9938,16 +11574,23 @@ def sample_inputs_smooth_l1_loss(op_info, device, dtype, requires_grad, **kwargs
     yield SampleInput(make(), args=(make(),), kwargs=dict(beta=0))
 
 def sample_inputs_kl_div(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for kl_div: log-probability inputs and either
+    # log-probability or probability targets (from softmax of random non-negative tensors), for
+    # shapes (2,) and (2, 3) and reductions none, mean, batchmean and sum.
     # kl_div works with inputs in [0, 1] (aka the pdf of a probability measure)
     # Then log [0, 1] = (-inf, 0], so this is the log space
     make_arg = partial(make_tensor, low=0., device=device, dtype=dtype, requires_grad=requires_grad)
 
     def make_log(shape):
+        # [FUNCTION DOC] HELPER: Return log_softmax over the last dim of a random non-negative
+        # tensor, with requires_grad set.
         out = torch.nn.functional.log_softmax(make_arg(shape), -1)
         out.requires_grad_(requires_grad)
         return out
 
     def make_prob(shape):
+        # [FUNCTION DOC] HELPER: Return softmax over the last dim of a random non-negative tensor,
+        # with requires_grad set.
         out = torch.nn.functional.softmax(make_arg(shape), -1)
         out.requires_grad_(requires_grad)
         return out
@@ -9960,6 +11603,9 @@ def sample_inputs_kl_div(op_info, device, dtype, requires_grad, **kwargs):
         yield SampleInput(input, args=(target,), kwargs=dict(reduction=reduction, log_target=log_target))
 
 def sample_inputs_pdist(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for pdist: input matrices with row and column
+    # counts in (1, S) and with p in 1, 2, 10 and infinity. Values of p below 1 are omitted since
+    # they are too singular for second-order gradient checks.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield from (SampleInput(make_input((n, m))) for n, m in itertools.product((1, S), repeat=2))
@@ -9967,6 +11613,10 @@ def sample_inputs_pdist(op_info, device, dtype, requires_grad, **kwargs):
     yield from (SampleInput(make_input((S, S)), kwargs=dict(p=p)) for p in (1.0, 2.0, 10.0, float("inf")))
 
 def reference_pdist(input, p=2):
+    # [FUNCTION DOC] NumPy/SciPy reference for pdist over an ndarray: p equal to 0 uses the hamming
+    # distance scaled by the number of columns, infinity uses the maximum absolute difference,
+    # otherwise the Minkowski distance of order p. Returns the condensed distance array cast back
+    # to the input dtype. Requires scipy.
     pdist = scipy.spatial.distance.pdist
     if p == 0:
         output = pdist(input, "hamming") * input.shape[1]
@@ -9977,6 +11627,8 @@ def reference_pdist(input, p=2):
     return output.astype(input.dtype)
 
 def sample_inputs_diagflat(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for diagflat: zero-dim, 1-D and 2-D inputs,
+    # and 1-D inputs with offsets 1 and -1.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     yield SampleInput(make_input(()))
@@ -9994,6 +11646,9 @@ _UNPOOL_NAME_TO_DIM = {
 
 
 def error_inputs_max_unpool(op_info, device, **kwargs):
+    # [FUNCTION DOC] Generator yielding one ErrorInput for max_unpool 1-D, 2-D or 3-D (chosen from
+    # the op name through the name-to-dimension map): an input and an index tensor of mismatched
+    # shape, expecting a RuntimeError about the expected indices shape. Uses a float32 input.
     """Error inputs for max_unpool: shape mismatch between input and indices."""
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
     pool_dim = _UNPOOL_NAME_TO_DIM[op_info.name]
@@ -10022,6 +11677,11 @@ def error_inputs_max_unpool(op_info, device, **kwargs):
 
 
 def sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for max_unpool 1-D, 2-D and 3-D (selected by
+    # op name). Reuses the max_pool samples (with a copy of the OpInfo renamed to the matching pool
+    # op), keeps only batched full-rank inputs with dilation 1 that return indices, runs the max
+    # pool to get pooled values and indices, and yields the detached pooled leaf, the indices and
+    # kernel_size, stride, padding and the original spatial size as output_size.
     unpool_name_to_pool_method_dict = {
         'nn.functional.max_unpool1d': torch.nn.functional.max_pool1d,
         'nn.functional.max_unpool2d': torch.nn.functional.max_pool2d,
@@ -10066,6 +11726,9 @@ def sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs):
             yield SampleInput(arg, args=(indices,), kwargs=sample_kwargs)
 
 def sample_inputs_max_unpool_grad(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for max_unpool gradient checks: the
+    # max_unpool samples restricted to those whose index tensor has only unique indices, because
+    # repeated indices break finite-difference gradient checks.
     for sample in sample_inputs_max_unpool(op_info, device, dtype, requires_grad, **kwargs):
         indices = sample.args[0]
         # The samples for max_unpool are generated with max_pool.
@@ -10088,6 +11751,12 @@ def sample_inputs_max_unpool_grad(op_info, device, dtype, requires_grad, **kwarg
             yield sample
 
 def sample_inputs_multi_head_attention_forward(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for multi_head_attention_forward over batched
+    # and unbatched inputs, separate or packed projection weights, attention mask types (none, 2-D,
+    # 3-D), embedding sizes, sequence lengths, head counts and dropout values. A single small
+    # configuration is used when gradients are required to keep backward tests short. Query is the
+    # input; key, value, projections, biases and options are the arguments, with training set when
+    # dropout is positive.
     make_input = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
 
     if requires_grad:
@@ -10171,6 +11840,8 @@ _foreach_inputs_default_kwargs = {"noncontiguous": False, "same_size": False, "l
 
 
 class ForeachRightmostArgType(enum.Enum):
+    # [CLASS DOC] Enumeration of the kinds of rightmost argument a foreach op sample can take: a
+    # list of tensors, a list of scalars, a single scalar, or a single tensor.
     TensorList = enum.auto()
     ScalarList = enum.auto()
     Scalar = enum.auto()
@@ -10178,6 +11849,11 @@ class ForeachRightmostArgType(enum.Enum):
 
 
 class ForeachSampleInput(SampleInput):
+    # [CLASS DOC] Sample input type for foreach ops, extending SampleInput. Extra attributes:
+    # ref_args (the arguments converted for computing the reference result, for example a scalar
+    # expanded to a list; defaults to the regular arguments) and disable_fastpath (whether the
+    # fused foreach kernel is expected not to be used). The constructor takes the usual SampleInput
+    # arguments plus disable_fastpath and ref_args keywords.
     # For TensorList <op> Scalar/Tensor, we compute the reference
     # by converting it into TensorList <op> ScalarList/TensorList and
     # then converting into multiple Tensor <op> Scalar/Tensor.
@@ -10186,12 +11862,21 @@ class ForeachSampleInput(SampleInput):
     disable_fastpath: bool
 
     def __init__(self, *args, disable_fastpath=False, ref_args=None, **kwargs):
+        # [FUNCTION DOC] Initialize the sample through the base class, then set ref_args to
+        # the given list or, if empty or None, to the sample's positional arguments, and
+        # store disable_fastpath.
         super().__init__(*args, **kwargs)
         self.ref_args = ref_args or self.args
         self.disable_fastpath = disable_fastpath
 
 
 class foreach_inputs_sample_func:
+    # [CLASS DOC] Callable object that generates foreach SampleInput objects for a ForeachFuncInfo.
+    # State: arity (number of tensor-list-like arguments), the list of supported rightmost argument
+    # types (tensor list always; scalar, scalar list and tensor optional when arity is above 1) and
+    # the flags for interspersing empty tensors. Calling it yields ForeachSampleInput objects over
+    # several tensor counts, rightmost argument types and (for non-CPU devices) empty-tensor
+    # interspersion; a separate method yields zero-size tensor samples.
     def __init__(
         self,
         arity: int,
@@ -10199,6 +11884,8 @@ class foreach_inputs_sample_func:
         rightmost_supports_scalarlist: bool,
         rightmost_supports_tensor: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Store the arity, compute the supported rightmost argument types from the
+        # three support flags, and enable both interspersed-empty-tensors settings.
         self.arity = arity
         self._set_rightmost_arg_types(
             rightmost_supports_scalar, rightmost_supports_scalarlist, rightmost_supports_tensor,
@@ -10211,6 +11898,9 @@ class foreach_inputs_sample_func:
         rightmost_supports_scalarlist: bool,
         rightmost_supports_tensor: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Build the list of supported rightmost argument types: always
+        # a tensor list, and, when arity is above 1, a scalar, a scalar list and/or a tensor
+        # as flagged.
         self._rightmost_arg_types = [ForeachRightmostArgType.TensorList]
         if self.arity > 1:
             if rightmost_supports_scalar:
@@ -10230,6 +11920,13 @@ class foreach_inputs_sample_func:
         allow_higher_dtype_scalars,
         **_foreach_inputs_kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Produce candidate values for the rightmost argument and return
+        # them as a list. Tensor list gives one list of tensors, tensor gives one zero-dim tensor,
+        # scalar list gives lists of ints, floats and (if allowed) complex or mixed-type scalars,
+        # scalar gives an int, optionally a float and a complex value, and a bool. Float and
+        # complex values are used when the dtype allows or when allow_higher_dtype_scalars is true;
+        # for the pow op with half or bfloat16 only simple values (1 or 2) are used. Raises an
+        # AssertionError for an unknown type.
         if rightmost_arg_type == ForeachRightmostArgType.TensorList:
             return [sample_inputs_foreach(None, device, dtype, num_tensors, **_foreach_inputs_kwargs)]
         if rightmost_arg_type == ForeachRightmostArgType.Tensor:
@@ -10241,6 +11938,8 @@ class foreach_inputs_sample_func:
         should_use_simpler_scalars = opinfo.name == "_foreach_pow" and dtype in (torch.float16, torch.bfloat16)
 
         def sample_float():
+            # [FUNCTION DOC] HELPER: Return a random float in 0 to 1 exclusive (as 1 minus a random
+            # sample), or 1 or 2 when simpler scalars are needed for pow with half precision.
             s = random.random()
             if should_use_simpler_scalars:
                 return 1.0 if s > 0.5 else 2.0
@@ -10271,6 +11970,13 @@ class foreach_inputs_sample_func:
         raise AssertionError(f"Invalid rightmost_arg_type of {rightmost_arg_type}")
 
     def _should_disable_fastpath(self, opinfo, rightmost_arg, rightmost_arg_type, dtype):
+        # [FUNCTION DOC] HELPER: Decide whether the fast foreach kernel must be disabled for the
+        # sample. Returns True or False, or None for arity below 2 without a rightmost-type
+        # decision; unary ops disable it for integral and bool dtypes (with exceptions for abs,
+        # neg, zero_ and clone), pow and clamp-like ops disable it for integral dtypes, division
+        # disables it for integral dtypes, and scalar and scalar list arguments disable it when
+        # their Python type is not natively supported by the dtype. Raises an AssertionError for
+        # invalid argument types.
         if self.arity == 1:
             if "foreach_abs" in opinfo.name and dtype in complex_types():
                 return True
@@ -10333,6 +12039,9 @@ class foreach_inputs_sample_func:
             raise AssertionError(f"Invalid rightmost_arg_type of {rightmost_arg_type}")
 
     def _sample_kwargs(self, opinfo, rightmost_arg, rightmost_arg_type, dtype):
+        # [FUNCTION DOC] HELPER: Build the keyword arguments for a sample: an alpha value matching
+        # the dtype (int, complex or float) if the op supports alpha and the rightmost argument is
+        # a tensor list, and, for arity above 1, the disable_fastpath decision.
         kwargs = {}
         if rightmost_arg_type == ForeachRightmostArgType.TensorList and opinfo.supports_alpha_param:
             if dtype in integral_types_and(torch.bool):
@@ -10346,6 +12055,14 @@ class foreach_inputs_sample_func:
         return kwargs
 
     def sample_zero_size_tensor_inputs(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator that yields foreach samples made of NUM_SIZE0_TENSORS zero-size
+        # tensors, one for each supported rightmost argument type; the argument forms are all
+        # tensor lists (the type loop does not vary them). Raises an AssertionError if
+        # num_input_tensors is passed. Honors the common keyword defaults (noncontiguous,
+        # same_size, low, high) and allow_higher_dtype_scalars.
+        # KNOWN ISSUE: the loop variable for the rightmost type is never used, so every iteration
+        # builds equivalent samples that use a tensor list as the rightmost argument; the name
+        # kwargs is also rebound inside the loop.
         if "num_input_tensors" in kwargs:
             raise AssertionError("num_input_tensors should not be in kwargs")
         _foreach_inputs_kwargs = {k: kwargs.pop(k, v) for k, v in _foreach_inputs_default_kwargs.items()}
@@ -10382,6 +12099,17 @@ class foreach_inputs_sample_func:
             yield ForeachSampleInput(input, *args, **kwargs)
 
     def __call__(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator of ForeachSampleInput objects. Optional num_input_tensors (a
+        # list, otherwise the module default list of tensor counts; AssertionError if not a list),
+        # the common keyword defaults and allow_higher_dtype_scalars are taken from kwargs. Loops
+        # over tensor counts, supported rightmost argument types and interspersed-empty-tensor
+        # settings (interspersed only for the largest count and non-CPU devices). Builds the input
+        # list, extra tensor lists, and each candidate rightmost argument with its keyword
+        # arguments; scalar and tensor rightmost arguments are expanded to lists in ref_args. Unary
+        # ops yield one sample per configuration.
+        # KNOWN ISSUE: for tensor-list and scalar-list rightmost arguments, ref_args is the same
+        # list object as the positional argument list, which is popped after each yield, so a
+        # retained sample's ref_args later loses its last element; the name kwargs is also rebound.
         num_input_tensors_specified = "num_input_tensors" in kwargs
         num_input_tensors = kwargs.pop("num_input_tensors") if num_input_tensors_specified else foreach_num_tensors
         if not isinstance(num_input_tensors, list):
@@ -10428,6 +12156,9 @@ class foreach_inputs_sample_func:
 
 
 class foreach_max_sample_func(foreach_inputs_sample_func):
+    # [CLASS DOC] foreach sample generator for max-like ops (such as foreach_max): same as the base
+    # generator but never intersperses empty tensors, never disables the fast path, and produces no
+    # zero-size samples.
     def __init__(
         self,
         arity: int,
@@ -10435,18 +12166,29 @@ class foreach_max_sample_func(foreach_inputs_sample_func):
         rightmost_supports_scalarlist: bool,
         rightmost_supports_tensor: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Initialize the base generator and restrict interspersed-empty-tensors
+        # settings to False only.
         super().__init__(arity, rightmost_supports_scalar, rightmost_supports_scalarlist, rightmost_supports_tensor)
         self._intersperse_empty = (False,)
 
     def sample_zero_size_tensor_inputs(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Return an empty list: no zero-size tensor samples are generated for
+        # this op.
         return []
 
     def _should_disable_fastpath(self, opinfo, rightmost_arg, rightmost_arg_type, dtype):
+        # [FUNCTION DOC] HELPER: Always return False: the fast path is never disabled for this op.
         return False
 
 
 class foreach_norm_sample_func(foreach_inputs_sample_func):
+    # [CLASS DOC] foreach sample generator for foreach_norm: samples are lists of tensors with an
+    # ord argument (0, 1, 2, negative values and infinities) and optional output dtype, rather than
+    # rightmost arguments.
     def sample_zero_size_tensor_inputs(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator yielding foreach_norm samples built from zero-size tensors for
+        # each of the ord values; the fast path is disabled except for orders 0, 1, 2 and infinity
+        # on floating dtypes. Raises an AssertionError if num_input_tensors is passed.
         if "num_input_tensors" in kwargs:
             raise AssertionError("num_input_tensors should not be in kwargs")
         _foreach_inputs_kwargs = {k: kwargs.pop(k, v) for k, v in _foreach_inputs_default_kwargs.items()}
@@ -10459,6 +12201,15 @@ class foreach_norm_sample_func(foreach_inputs_sample_func):
             yield ForeachSampleInput(input, ord=ord, disable_fastpath=disable_fastpath)
 
     def __call__(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator of foreach_norm ForeachSampleInput objects over tensor counts,
+        # orders, output dtypes and empty-tensor interspersion (skipped for infinity and negative
+        # orders, which the reference cannot compute on empty tensors). When gradients are not
+        # required it also yields NaN-containing single-tensor samples. Raises an AssertionError if
+        # num_input_tensors is not a list.
+        # KNOWN ISSUE: the output dtype candidates are built with a conditional expression whose
+        # precedence makes None part of the tuple only for complex dtypes; also the NaN samples use
+        # the variable ord left over from the loop (negative infinity), so their fast path flag is
+        # always True; the allow_higher_dtype_scalars value is read but unused.
         num_input_tensors = kwargs.pop("num_input_tensors", foreach_num_tensors)
         if not isinstance(num_input_tensors, list):
             raise AssertionError(f"Expected num_input_tensors to be a list, got {type(num_input_tensors)}")
@@ -10503,6 +12254,9 @@ class foreach_norm_sample_func(foreach_inputs_sample_func):
 
 
 class foreach_pointwise_sample_func(foreach_inputs_sample_func):
+    # [CLASS DOC] foreach sample generator for pointwise ops (addcmul, addcdiv): two tensor lists
+    # plus a third argument given as a tensor list, a scalar value, or scalars (list or tensor)
+    # passed by keyword.
 
     def __init__(
         self,
@@ -10510,12 +12264,20 @@ class foreach_pointwise_sample_func(foreach_inputs_sample_func):
         rightmost_supports_scalar: bool = False,
         rightmost_supports_scalarlist: bool = False,
     ):
+        # [FUNCTION DOC] Initialize the base generator with arity 3 by default and the given scalar
+        # and scalar-list support flags (tensor support is off).
         super().__init__(arity, rightmost_supports_scalar, rightmost_supports_scalarlist)
 
     def _should_disable_fastpath(self, opinfo, rightmost_arg, rightmost_arg_type, dtype):
+        # [FUNCTION DOC] HELPER: Return True for integral or bool dtypes with the addcmul
+        # reference, otherwise False.
         return dtype in integral_types_and(torch.bool) and opinfo.ref == torch.addcmul
 
     def sample_zero_size_tensor_inputs(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator yielding one foreach sample made of three lists of
+        # NUM_SIZE0_TENSORS zero-size tensors plus keyword arguments from the sample kwargs (alpha
+        # if applicable); any scalars keyword is dropped. Raises an AssertionError if
+        # num_input_tensors is passed.
         if "num_input_tensors" in kwargs:
             raise AssertionError("num_input_tensors should not be in kwargs")
         _foreach_inputs_kwargs = {k: kwargs.pop(k, v) for k, v in _foreach_inputs_default_kwargs.items()}
@@ -10531,6 +12293,11 @@ class foreach_pointwise_sample_func(foreach_inputs_sample_func):
         yield ForeachSampleInput(input, *args, **kwargs)
 
     def __call__(self, opinfo, device, dtype, requires_grad, **kwargs):
+        # [FUNCTION DOC] Generator of foreach pointwise ForeachSampleInput objects over tensor
+        # counts, rightmost argument types and interspersed-empty-tensor settings: an input list
+        # and two other lists (or one plus the rightmost list), and for scalar types the value or
+        # scalars keyword. Raises an AssertionError if num_input_tensors is not a list or if the
+        # argument count is not 2.
         num_input_tensors_specified = "num_input_tensors" in kwargs
         num_input_tensors = kwargs.pop("num_input_tensors") if num_input_tensors_specified else foreach_num_tensors
         if not isinstance(num_input_tensors, list):
@@ -11384,6 +13151,10 @@ foreach_reduce_op_db: list[ForeachFuncInfo] = [
 ]
 
 def _sample_inputs_foreach_mm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] HELPER: Generator of ForeachSampleInput objects for _foreach_mm: lists of 2
+    # and 5 matrices of shapes (32, 16) by (16, 24) and (16, 16) by (16, 16), the second list
+    # passed as the argument; the fast path is flagged as disabled because the op uses grouped GEMM
+    # or a loop of mm rather than the multi tensor apply kernel.
     # _foreach_mm uses grouped GEMM or loop-of-mm, not multi_tensor_apply
     for num_tensors in [2, 5]:
         for m, k, n in [(32, 16, 24), (16, 16, 16)]:
@@ -11428,6 +13199,8 @@ foreach_other_op_db: list[ForeachFuncInfo] = [
 ]
 
 def reference_sign(x):
+    # [FUNCTION DOC] NumPy reference for sign. NumPy's sign does not support bool arrays, so bool
+    # input is computed as uint8 and cast back to bool; other dtypes use numpy sign directly.
     if x.dtype == np.bool_:
         # `np.sign` doesn't support `bool`.
         # >>> np.sign(True)
@@ -11438,6 +13211,9 @@ def reference_sign(x):
 
 
 def reference_sgn(x):
+    # [FUNCTION DOC] NumPy reference for sgn. Non-complex input uses the sign reference. Complex
+    # input returns the value divided by its magnitude with zeros mapped to complex zero (handles
+    # zero-dim arrays separately), unlike NumPy's sign for complex.
     # NumPy doesn't have an equivalent to `torch.sgn` when the dtype is complex.
     # For complex inputs, `np.sign` returns sign(x.real) + 0j if x.real != 0 else sign(x.imag) + 0j.
     # while `torch.sgn` returns, 0 if abs(input) == 0 else input/abs(input)
@@ -11460,6 +13236,8 @@ def reference_sgn(x):
 
 
 def reference_sigmoid(x):
+    # [FUNCTION DOC] NumPy reference for sigmoid: scipy expit for real dtypes, and the direct
+    # formula for complex dtypes (which expit does not support).
     # 'scipy.special.expit' not supported for the input types
     if x.dtype in [np.complex64, np.complex128]:
         return (1 / (1 + np.exp(-x)))
@@ -11467,6 +13245,8 @@ def reference_sigmoid(x):
 
 
 def reference_logsigmoid(x):
+    # [FUNCTION DOC] NumPy reference for logsigmoid using a numerically stable piecewise formula
+    # with log1p.
     return np.where(
         x < 0,
         x - np.log1p(np.exp(x)),
@@ -11474,12 +13254,18 @@ def reference_logsigmoid(x):
 
 
 def reference_hardsigmoid(x):
+    # [FUNCTION DOC] NumPy reference for hardsigmoid: x / 6 + 0.5 clipped to the range 0 to 1, cast
+    # back to the input dtype.
     intermediate = x / 6 + 0.5
     y = np.clip(intermediate, 0, None)
     return np.where(y > 1, 1, y).astype(x.dtype)
 
 
 def reference_lgamma(x):
+    # [FUNCTION DOC] NumPy/SciPy reference for lgamma: replaces negative infinity inputs with
+    # positive infinity first (SciPy returns negative infinity but C, C++ and PyTorch return
+    # positive infinity), applies gammaln, and casts float16 results back to float16 since SciPy
+    # would otherwise return float32.
     # scipy.special.gammaln returns `-inf` when input is `-inf`.
     # While Pytorch, C and C++, all return `inf` when input is `-inf`.
     # Reference:
@@ -11504,22 +13290,34 @@ def reference_lgamma(x):
 
 
 def reference_mvlgamma(x, d):
+    # [FUNCTION DOC] NumPy/SciPy reference for mvlgamma with dimension d via multigammaln; float16
+    # results are cast back to float16.
     if x.dtype == np.float16:
         return scipy.special.multigammaln(x, d).astype(np.float16)
 
     return scipy.special.multigammaln(x, d)
 
 def reference_softplus(input, beta=1, threshold=20):
+    # [FUNCTION DOC] NumPy reference for softplus: applies log(1 + exp(beta * x)) / beta where beta
+    # times x is at or below the threshold, and leaves other elements equal to the input. Returns a
+    # new array.
     non_linear = input * beta <= threshold
     output = input.copy()
     output[non_linear] = np.log(1 + np.exp(beta * input[non_linear])) / beta
     return output
 
 def reference_gelu(X, *, approximate='none'):
+    # [FUNCTION DOC] NumPy/SciPy reference for gelu; the keyword-only approximate argument
+    # selects the tanh approximation, any other value uses the exact form x times the normal CDF
+    # from scipy.stats.
     def _gelu_ref(X):
+        # [FUNCTION DOC] HELPER: Exact gelu: x times the standard normal cumulative
+        # distribution function.
         return X * stats.norm.cdf(X)
 
     def _tanh_gelu_ref(X):
+        # [FUNCTION DOC] HELPER: Tanh approximation of gelu using the constants sqrt(2 / pi)
+        # and 0.044715.
         M_SQRT_2_PI = math.sqrt(2 / math.pi)
         Z = M_SQRT_2_PI * (X + 0.044715 * np.power(X, 3.0))
         return 0.5 * X * (1.0 + np.tanh(Z))
@@ -11531,6 +13329,9 @@ def reference_gelu(X, *, approximate='none'):
 
 
 def reference_one_hot(a: npt.NDArray, num_classes: int = -1) -> npt.NDArray:
+    # [FUNCTION DOC] NumPy reference for one_hot: with num_classes of -1 it is the maximum value
+    # plus one; builds a zero matrix with one row per element, puts ones at the class index of each
+    # row, and reshapes to the input shape with a trailing class dimension.
     if num_classes == -1:
         num_classes = int(np.amax(a) + 1)
 
@@ -11541,6 +13342,8 @@ def reference_one_hot(a: npt.NDArray, num_classes: int = -1) -> npt.NDArray:
 
 
 def reference_mse_loss(input, target, reduction="mean"):
+    # [FUNCTION DOC] NumPy reference for mse_loss: squared difference reduced by mean, sum, or not
+    # at all for reduction none (any other string is treated as none).
     se = (input - target) ** 2
     if reduction == "mean":
         return np.mean(se)
@@ -11551,10 +13354,16 @@ def reference_mse_loss(input, target, reduction="mean"):
 
 
 def reference_layer_norm(inp: npt.NDArray, normalized_shape: tuple[int, ...], weight=None, bias=None, eps=1e-5):
+    # [FUNCTION DOC] NumPy reference for layer_norm: the first output of the native layer
+    # norm reference.
     return reference_native_layer_norm(inp, normalized_shape, weight, bias, eps)[0]
 
 
 def reference_native_layer_norm(inp: npt.NDArray, normalized_shape: tuple[int, ...], weight, bias, eps):
+    # [FUNCTION DOC] NumPy reference for native_layer_norm. Flattens the normalized dims, computes
+    # mean and biased variance per row, normalizes, applies the optional weight and bias, and
+    # returns the tuple of the output (original shape), mean and reciprocal standard deviation,
+    # with the statistics shaped with ones in the normalized dims.
     feature_size = np.prod(normalized_shape)
     inp_view = inp.reshape(-1, feature_size)  # type: ignore[call-overload]
     mean = inp_view.mean(axis=-1, keepdims=True)
@@ -11572,6 +13381,9 @@ def reference_native_layer_norm(inp: npt.NDArray, normalized_shape: tuple[int, .
 
 
 def reference_rms_norm(inp: npt.NDArray, normalized_shape: tuple[int, ...], weight=None, eps=None):
+    # [FUNCTION DOC] NumPy reference for rms_norm: divides by the root mean square over the
+    # normalized dims (plus eps, defaulting to the machine epsilon of the input dtype) and
+    # multiplies by the optional weight. Returns the output with the input shape.
     if eps is None:
         eps = torch.finfo(numpy_to_torch_dtype(inp.dtype)).eps
     feature_size = np.prod(normalized_shape)
@@ -11584,6 +13396,11 @@ def reference_rms_norm(inp: npt.NDArray, normalized_shape: tuple[int, ...], weig
 
 
 def reference_native_group_norm(input: npt.NDArray, weight: npt.NDArray | None, bias: npt.NDArray | None, N: int, C: int, HxW: int, group: int, eps: float) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
+    # [FUNCTION DOC] NumPy reference for native_group_norm taking the explicit N, C, HxW and group
+    # arguments. For N equal to 0 returns empty arrays. Otherwise normalizes over each group using
+    # mean and biased variance, applies optional per-channel weight and bias (broadcast over
+    # spatial dims), and returns the tuple of the output, the per-group mean and the per-group
+    # reciprocal standard deviation.
     if N == 0:
         return (
             np.empty_like(input),
@@ -11611,6 +13428,8 @@ def reference_native_group_norm(input: npt.NDArray, weight: npt.NDArray | None, 
 
 
 def reference_group_norm(inp: npt.NDArray, num_groups: int, weight=None, bias=None, eps=1e-5):
+    # [FUNCTION DOC] NumPy reference for group_norm: calls the native group norm reference with
+    # sizes taken from the input shape and returns only the output.
     return reference_native_group_norm(inp, weight, bias, inp.shape[0], inp.shape[1], math.prod(inp.shape[2:]), num_groups, eps)[0]
 
 
@@ -11618,6 +13437,12 @@ def reference_group_norm(inp: npt.NDArray, num_groups: int, weight=None, bias=No
 # have an out_int32 arg. Additionally, numpy doesn't support searchsorted with ND arrays, so this splits those into
 # stacked 1D cases
 def reference_searchsorted(sorted_sequence, boundary, out_int32=False, right=False, side='left', sorter=None):
+    # [FUNCTION DOC] NumPy reference for searchsorted (the OpInfo uses a custom function since
+    # NumPy has only a side string, no out_int32 option and no N-D support). The side is right if
+    # either right is set or side is right. 1-D sequences are searched directly; N-D inputs are
+    # split into stacked 1-D searches (with the sorter split likewise), with a special case for an
+    # empty leading dim. Results are cast to int32 if out_int32 is set, and returned in the
+    # boundary shape.
     side = 'right' if (right or side == 'right') else 'left'
     if len(sorted_sequence.shape) == 1 :
         ret = np.searchsorted(sorted_sequence, boundary, side=side, sorter=sorter)
@@ -11647,6 +13472,10 @@ def reference_searchsorted(sorted_sequence, boundary, out_int32=False, right=Fal
         return np.stack(split_ret).reshape(orig_shape)
 
 def reference_hash_tensor(tensor, dim=(), keepdim=False, mode=0):
+    # [FUNCTION DOC] NumPy reference for hash_tensor with only mode 0 (xor sum) supported,
+    # otherwise raises an AssertionError. Converts floating inputs to float64 bits viewed as uint64
+    # and other inputs to uint64, then bitwise-xor-reduces over all elements (empty dim) or over
+    # the given dims, optionally keeping dims. Returns the reduced array.
     if mode != 0:
         raise AssertionError(f"Only mode=0 (xor_sum) is supported right now, got mode={mode}")
 
@@ -11668,7 +13497,14 @@ def reference_hash_tensor(tensor, dim=(), keepdim=False, mode=0):
 
 
 def loss_reference_reduction_wrapper(fn):
+    # [FUNCTION DOC] Decorator factory for NumPy loss references: wraps a function computing an
+    # elementwise loss from input and target so that it accepts a reduction keyword (mean, sum or
+    # none; mean and sum reduce the whole result). Passing the deprecated size_average or reduce
+    # arguments raises a RuntimeError. Returns the wrapped function.
     def wrapper(input, target, *, size_average=None, reduce=None, reduction="mean", **other_kwargs):
+        # [FUNCTION DOC] HELPER: The wrapper created by the loss reduction decorator: checks that
+        # deprecated arguments are absent, calls the wrapped function on input, target and the
+        # other keyword arguments, then applies the reduction.
         if size_average is not None or reduce is not None:
             raise RuntimeError(
                 "The keyword arguments 'size_average' and 'reduce' are deprecated and not supported by this wrapper"
@@ -11685,6 +13521,9 @@ def loss_reference_reduction_wrapper(fn):
 
 @loss_reference_reduction_wrapper
 def reference_smooth_l1_loss(input, target, beta=1.0):
+    # [FUNCTION DOC] NumPy reference for the smooth L1 loss elementwise values (wrapped by the
+    # reduction decorator): absolute difference minus half of beta where the absolute difference is
+    # at least beta, and squared difference over twice beta elsewhere.
     diff = input - target
     abs_diff = np.abs(diff)
     above_threshold = abs_diff >= beta
@@ -11696,11 +13535,17 @@ def reference_smooth_l1_loss(input, target, beta=1.0):
     return loss
 
 def reference_std_var(f):
+    # [FUNCTION DOC] Decorator factory for std and var references: wraps a NumPy reduction
+    # reference so that the unbiased and correction keywords are translated into NumPy's ddof
+    # (unbiased as 0 or 1, correction as given). Raises an AssertionError if both unbiased and
+    # correction are passed. Returns the wrapper.
     """Forwards unbiased/correction kwargs as NumPy's equivalent ddof"""
     g = reference_reduction_numpy(f)
 
     @wraps(g)
     def wrapper(x: npt.NDArray, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: The wrapper created by the std/var decorator: converts the
+        # keywords to ddof and calls the wrapped reduction reference.
         if 'unbiased' in kwargs and 'correction' in kwargs:
             raise AssertionError("Cannot specify both 'unbiased' and 'correction' in kwargs")
 
@@ -11714,6 +13559,9 @@ def reference_std_var(f):
     return wrapper
 
 def generate_std_var_kwargs(t: torch.Tensor, **kwargs):
+    # [FUNCTION DOC] Generator of (positional args, keyword args) pairs for std/var: unbiased True
+    # and False; and, when both dim and keepdim are given, correction 0, 1 and half the number of
+    # reduced elements (a tensor).
     """Generates unbiased/correction kwargs for std/var operators"""
     yield ((), {'unbiased': True})
     yield ((), {'unbiased': False})
@@ -11728,6 +13576,9 @@ def generate_std_var_kwargs(t: torch.Tensor, **kwargs):
         yield ((), {'correction': numel // 2})
 
 def error_inputs_mean(op_info, device, is_ref=False, **kwargs):
+    # [FUNCTION DOC] Generator of ErrorInput objects for mean: an integer tensor input, and a float
+    # tensor with an integer dtype argument, each expecting a message that the output dtype cannot
+    # be inferred. The type names in the messages depend on is_ref (torch.int64 versus Long).
     if is_ref:
         err_msg1 = (r"mean\(\): could not infer output dtype. "
                     r"Input dtype must be either a floating point or complex dtype. "
@@ -11760,6 +13611,11 @@ def error_inputs_mean(op_info, device, is_ref=False, **kwargs):
 # numpy implementation of torch.flatten
 # unfortunately there's no np.flatten. we figure out the desired shape and call np.reshape
 def reference_flatten(input, start_dim=0, end_dim=-1):
+    # [FUNCTION DOC] NumPy reference for flatten with start_dim and end_dim defaults: validates the
+    # dims (raising an IndexError if out of range, and a RuntimeError if start_dim comes after
+    # end_dim), handles zero-dim input, and reshapes to the shape with the flattened range merged
+    # into one dim.
+    # KNOWN ISSUE: the IndexError message is missing its closing parenthesis.
     in_shape = input.shape
     in_rank = len(in_shape)
     for d in start_dim, end_dim:
@@ -11777,10 +13633,18 @@ def reference_flatten(input, start_dim=0, end_dim=-1):
 
 
 def sample_inputs_alias_copy(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Generator yielding two SampleInput objects for alias_copy: a 1-D tensor of
+    # size S and a zero-dim tensor.
     yield SampleInput(make_tensor((S,), dtype=dtype, device=device, requires_grad=requires_grad))
     yield SampleInput(make_tensor((), dtype=dtype, device=device, requires_grad=requires_grad))
 
 def sample_inputs_abs(op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs):
+    # [FUNCTION DOC] Generator of SampleInput objects for abs: all elementwise unary samples, a
+    # complex float sample with extreme magnitudes for cfloat, and for int32 and int64 a 2-D
+    # sample with integer values above 2 to the power 24 (to catch precision loss when abs goes
+    # through float32).
+    # KNOWN ISSUE: the op_kwargs parameter is ignored; the elementwise unary samples are always
+    # generated with op_kwargs set to None.
     yield from sample_inputs_elementwise_unary(op_info, device, dtype, requires_grad, op_kwargs=None, **kwargs)
     if dtype == torch.cfloat:
         yield SampleInput(torch.tensor(
@@ -26721,11 +28585,20 @@ sparse_masked_reduction_ops = [op for op in sparse_reduction_ops if op.name.star
 
 
 def index_variable(shape, max_indices, device=torch.device('cpu')):
+    # [FUNCTION DOC] HELPER: Return a random long tensor of indices in the range 0 to max_indices
+    # on the given device. The shape may be an int or a tuple (an int is wrapped into a
+    # one-element tuple).
     if not isinstance(shape, tuple):
         shape = (shape,)
     return torch.testing.make_tensor(*shape, dtype=torch.long, device=device, low=0, high=max_indices)
 
 def gather_variable(shape, index_dim, max_indices, duplicate=False, device=torch.device('cpu')):
+    # [FUNCTION DOC] HELPER: Build a 2-D long index tensor of the given shape for gather and
+    # scatter along index_dim (must be 0 or 1, otherwise an AssertionError; the shape must have
+    # length 2). Each slice along index_dim holds distinct random values drawn from
+    # range(max_indices) (the first batch-size entries of a random permutation, so max_indices must
+    # be at least that large); when duplicate is true, the first slice along the other dim is
+    # overwritten with the second, creating a repeated slice.
     if len(shape) != 2:
         raise AssertionError(f"Expected len(shape) == 2, got {len(shape)}")
     if index_dim >= 2:
@@ -26740,9 +28613,14 @@ def gather_variable(shape, index_dim, max_indices, duplicate=False, device=torch
     return index
 
 def bernoulli_scalar():
+    # [FUNCTION DOC] HELPER: Return a zero-dim bool tensor holding a random True or False drawn
+    # with bernoulli.
     return torch.tensor(0, dtype=torch.bool).bernoulli_()
 
 def mask_not_all_zeros(shape):
+    # [FUNCTION DOC] HELPER: Return a random boolean mask of the given shape (which must be
+    # non-empty, otherwise AssertionError), resampling in a loop until at least one element
+    # is true.
     if len(shape) <= 0:
         raise AssertionError(f"Expected len(shape) > 0, got {len(shape)}")
     while True:
