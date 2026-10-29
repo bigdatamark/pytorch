@@ -1,3 +1,11 @@
+# [MODULE DOC] Provenance and metadata tracking for FX tracing. Holds process-global
+#   tracing state (current_meta, the replay node, should-preserve flags, a thread-local
+#   regional inductor subgraph name, and a registry of per-module FX metadata for the
+#   memory profiler), the NodeSource/NodeSourceAction provenance records, context
+#   managers and helpers that set or restore that state (preserve_node_meta, annotate,
+#   set_current_meta, set_current_replay_node, seq_nr helpers), and utilities that
+#   extract provenance, custom annotations and seq_nr groupings from graphs. Import-time
+#   side effects: creates the module-level globals only.
 import copy
 import logging
 import threading
@@ -64,6 +72,8 @@ _FX_METADATA_REGISTRY: dict[str, dict[str, Any]] = {}
 
 
 def _register_fx_metadata(module_name: str, metadata: dict[str, Any]) -> None:
+    # [FUNCTION DOC] HELPER: Store the given metadata mapping in the global in-memory
+    #   registry under module_name, replacing any previous entry. Mutates global state.
     """
     Register FX metadata in the global in-memory registry.
 
@@ -80,6 +90,8 @@ def _register_fx_metadata(module_name: str, metadata: dict[str, Any]) -> None:
 
 @compatibility(is_backward_compatible=False)
 class NodeSourceAction(Enum):
+    # [CLASS DOC] Enum of actions that can produce a node in provenance tracking: CREATE
+    #   and REPLACE (string values create and replace).
     """Enum representing the action taken to produce a node in provenance tracking."""
 
     CREATE = "create"
@@ -88,13 +100,24 @@ class NodeSourceAction(Enum):
 
 @compatibility(is_backward_compatible=False)
 class NodeSource:
+    # [CLASS DOC] Provenance record for an FX node. Attributes: pass_name, a list of
+    #   NodeSourceAction, from_node (list of earlier NodeSource records, copied from the
+    #   node meta), node_info (name, target string and graph id of the source node, or
+    #   None), and two private caches for the action string and the dictionary form.
+    #   Supports readable printing, dictionary conversion/deserialization, and value
+    #   equality/hashing based on the dictionary form.
+    # KNOWN ISSUE: the caches are never invalidated, so changes to attributes after the
+    #   first to_dict call are not reflected in equality or hashing.
     """
     NodeSource is a data structure that contains the provenance information of a node.
     If node `a` is created from node `b`, then `a.meta["from_node"]` may contain NodeSource(b).
     """
 
     class NodeInfo:
+        # [CLASS DOC] HELPER: Plain holder of a source node's name, target string and
+        #   graph id.
         def __init__(self, name: str, target: str, graph_id: int) -> None:
+            # [FUNCTION DOC] HELPER: Store name, target and graph_id as attributes.
             self.name = name
             self.target = target
             self.graph_id = graph_id
@@ -112,6 +135,13 @@ class NodeSource:
         pass_name: str = "",
         action: Union["NodeSourceAction", list["NodeSourceAction"]] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Build a provenance record. node may be None. action may be
+        #   None, a single NodeSourceAction or a list of them; it is normalized to a
+        #   list and every element is checked, raising AssertionError for a wrong type.
+        #   If node is given, record its name, string form of its target and the id of
+        #   its graph, and deep-copy its existing from_node history from node.meta
+        #   (empty if absent); otherwise node_info is None and history is empty.
+        #   Initializes the caches to empty.
         self.pass_name = pass_name
 
         if action is None:
@@ -141,25 +171,38 @@ class NodeSource:
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Property: the source node name, or an empty string when there
+        #   is no node_info.
         return self.node_info.name if self.node_info else ""
 
     @property
     def target(self) -> str:
+        # [FUNCTION DOC] Property: the source node target string, or an empty string
+        #   when there is no node_info.
         return self.node_info.target if self.node_info else ""
 
     @property
     def graph_id(self) -> int:
+        # [FUNCTION DOC] Property: the source graph id, or -1 when there is no
+        #   node_info.
         return self.node_info.graph_id if self.node_info else -1
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return the multi-line readable form from print_readable.
         return self.print_readable()
 
     def _get_action_string(self) -> str:
+        # [FUNCTION DOC] HELPER: Return (and cache) the actions joined by a plus sign in
+        #   lower case, e.g. create+replace.
         if self._action_string is None:
             self._action_string = "+".join([a.name.lower() for a in self.action])
         return self._action_string
 
     def print_readable(self, indent: int = 0) -> str:
+        # [FUNCTION DOC] Return a text rendering of this record and its history: one
+        #   line per record showing name, pass_name, action string and graph_id,
+        #   indented four spaces per nesting level, recursing into from_node. Returns an
+        #   empty string when indent exceeds 9 (depth cutoff).
         if indent > 9:
             return ""
         result = ""
@@ -173,6 +216,9 @@ class NodeSource:
         return result
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return (and cache) a dictionary with name, target, graph_id,
+        #   pass_name, action string and from_node (list of recursively converted
+        #   dictionaries). The same cached dictionary object is returned on later calls.
         if self._dict is None:
             # Convert the object to a dictionary
             action_string = self._get_action_string()
@@ -190,14 +236,21 @@ class NodeSource:
         return self._dict
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal only to another NodeSource whose dictionary form is
+        #   equal.
         if not isinstance(other, NodeSource):
             return False
         return self.to_dict() == other.to_dict()
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash derived from the dictionary form, converted recursively
+        #   into nested tuples (dictionaries become sorted tuples of pairs, lists become
+        #   tuples).
         # Create a hash based on the dictionary representation
         # We need to convert the dict to a hashable form
         def _make_hashable(obj: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Recursively convert dictionaries and lists into
+            #   hashable sorted tuples, leaving other values unchanged.
             if isinstance(obj, dict):
                 return tuple(sorted((k, _make_hashable(v)) for k, v in obj.items()))
             elif isinstance(obj, list):
@@ -209,6 +262,13 @@ class NodeSource:
 
     @classmethod
     def _from_dict(cls, d: dict[str, Any] | None) -> Optional["NodeSource"]:
+        # [FUNCTION DOC] HELPER: Rebuild a NodeSource from its dictionary form without
+        #   calling the constructor. Returns None for None input; raises AssertionError
+        #   if the input is not a mapping. Restores pass_name, parses the action string
+        #   into enum values (unknown action names are silently dropped), creates
+        #   node_info only if name, target and graph_id keys are all present, and
+        #   recursively rebuilds from_node entries, skipping those that deserialize to
+        #   None.
         """
         Recursively deserialize from_node metadata from dictionary data.
         It is used to deserialize the from_node field from serialized metadata.
@@ -266,6 +326,10 @@ class NodeSource:
 @compatibility(is_backward_compatible=False)
 @contextmanager
 def preserve_node_meta(enable: bool = True) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager (decorated with compatibility): sets the global
+    #   should_preserve_node_meta flag to enable for the body, after saving the flag and
+    #   a shallow copy of current_meta. On exit, in a finally block, restores the flag
+    #   and replaces current_meta with the saved copy.
     global should_preserve_node_meta
     global current_meta
     saved_should_preserve_node_meta = should_preserve_node_meta
@@ -281,6 +345,9 @@ def preserve_node_meta(enable: bool = True) -> Iterator[None]:
 
 @contextmanager
 def _preserve_node_seq_nr(preserve_seq_nr: bool = True) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that sets the private global flag
+    #   controlling preservation of seq_nr node meta to preserve_seq_nr for the body and
+    #   restores the previous value on exit.
     """
     Temporarily enables or disables the preservation of node.meta["seq_nr"] in the
     tracing context.
@@ -297,6 +364,10 @@ def _preserve_node_seq_nr(preserve_seq_nr: bool = True) -> Iterator[None]:
 
 @compatibility(is_backward_compatible=False)
 def set_stack_trace(stack: list[str]) -> None:
+    # [FUNCTION DOC] If node meta preservation is on: set current_meta stack_trace to
+    #   the joined strings of stack when stack is non-empty, otherwise remove the
+    #   stack_trace key. Does nothing when preservation is off. Mutates global
+    #   current_meta.
     global current_meta
 
     if should_preserve_node_meta:
@@ -311,6 +382,11 @@ def set_stack_trace(stack: list[str]) -> None:
 @compatibility(is_backward_compatible=False)
 @contextmanager
 def annotate(annotation_dict: dict[str, Any]) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that merges annotation_dict into the custom entry
+    #   of the global current_meta for the body, creating it if needed, so nodes created
+    #   inside carry the annotations. On exit (even on error) it restores the previous
+    #   custom dictionary, or removes the entry if there was none. Not usable with
+    #   symbolic_trace or jit.trace; meant for PT2 tracers.
     """
     Temporarily adds custom annotations to the current tracing context.
     The fx_node produced from this tracing context will have the
@@ -371,6 +447,9 @@ MEMORY_BUDGET_ANNOTATION_KEY = "_region_activation_memory_budget"
 
 
 def _get_memory_budget_annotation(node: Node) -> float | None:
+    # [FUNCTION DOC] HELPER: Return the activation memory budget stored under the budget
+    #   annotation key in the node's custom meta, or None if custom is missing or not a
+    #   mapping or lacks the key.
     """
     Read the ``region_activation_memory_budget`` annotation off an FX node,
     returning ``None`` if absent. The value is written only by
@@ -387,6 +466,9 @@ def _get_memory_budget_annotation(node: Node) -> float | None:
 def annotate_fn(
     annotation_dict: dict[str, Any],
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Decorator factory: returns a decorator that wraps a function so
+    #   each call runs inside the annotate context manager with annotation_dict. Imports
+    #   the stack-trace anchor registrar lazily.
     """
     A decorator that wraps a function with the annotate context manager.
     Use this when you want to annotate an entire function instead of a specific code block.
@@ -414,6 +496,9 @@ def annotate_fn(
     from torch.fx.proxy import _register_stack_trace_anchor
 
     def decorator(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Decorator body. Registers func as a stack-trace anchor
+        #   (so make_fx keeps its frame in stack_trace meta) and returns a wrapper
+        #   preserving func metadata.
         # Register the wrapped function as a stack-trace anchor so make_fx
         # preserves its frame in node.meta["stack_trace"]. The user
         # explicitly opted into annotating this function, so its frame is a
@@ -425,6 +510,8 @@ def annotate_fn(
         # NB: Do not annotate with _P.args/_P.kwargs here. Dynamo guards on
         # the identity of ParamSpec annotation objects, causing guard failures.
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Call func with all arguments inside
+            #   annotate(annotation_dict) and return its result.
             with annotate(annotation_dict):
                 return func(*args, **kwargs)
 
@@ -435,6 +522,12 @@ def annotate_fn(
 
 @contextmanager
 def _set_autograd_backward(enable: bool = True) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that marks current_meta as being in
+    #   autograd backward when enable is true, and on exit restores the earlier
+    #   autograd_backward value if the key existed, otherwise removes it.
+    # KNOWN ISSUE: when enable is false and the key was absent, exit still calls the
+    #   reset helper, harmless; and when enable is false and the key existed the old
+    #   value is restored.
     global current_meta
 
     had_autograd_backward = "autograd_backward" in current_meta
@@ -453,6 +546,7 @@ def _set_autograd_backward(enable: bool = True) -> Iterator[None]:
 
 @compatibility(is_backward_compatible=False)
 def _mark_autograd_backward() -> None:
+    # [FUNCTION DOC] HELPER: Set the autograd_backward key in current_meta to true.
     global current_meta
 
     current_meta["autograd_backward"] = True
@@ -460,6 +554,8 @@ def _mark_autograd_backward() -> None:
 
 @compatibility(is_backward_compatible=False)
 def _reset_autograd_backward() -> None:
+    # [FUNCTION DOC] HELPER: Remove the autograd_backward key from current_meta if
+    #   present.
     global current_meta
 
     current_meta.pop("autograd_backward", None)
@@ -467,6 +563,9 @@ def _reset_autograd_backward() -> None:
 
 @compatibility(is_backward_compatible=False)
 def set_grad_fn_seq_nr(seq_nr: int) -> None:
+    # [FUNCTION DOC] If node meta preservation is on: append seq_nr to the
+    #   grad_fn_seq_nr list in current_meta and increment the in_grad_fn nesting
+    #   counter. Otherwise does nothing.
     global current_meta
 
     if should_preserve_node_meta:
@@ -479,6 +578,10 @@ def set_grad_fn_seq_nr(seq_nr: int) -> None:
 
 @compatibility(is_backward_compatible=False)
 def reset_grad_fn_seq_nr() -> None:
+    # [FUNCTION DOC] If node meta preservation is on: undo one set_grad_fn_seq_nr.
+    #   Raises AssertionError if the nesting counter is not positive. At level one,
+    #   deletes both in_grad_fn and grad_fn_seq_nr; otherwise decrements the counter and
+    #   drops the last seq_nr.
     # NB: reset state properly, this would be helpful towards supporting
     #     reentrant autograd if we actually wanted to do that.
     global current_meta
@@ -496,6 +599,9 @@ def reset_grad_fn_seq_nr() -> None:
 
 @compatibility(is_backward_compatible=False)
 def format_stack() -> list[str]:
+    # [FUNCTION DOC] Return a list of strings describing the call stack: when meta
+    #   preservation is on, a one-element list holding current_meta stack_trace (or
+    #   empty string); otherwise the formatted Python stack minus the current frame.
     if should_preserve_node_meta:
         return [current_meta.get("stack_trace", "")]
     else:
@@ -505,16 +611,22 @@ def format_stack() -> list[str]:
 
 @compatibility(is_backward_compatible=False)
 def has_preserved_node_meta() -> bool:
+    # [FUNCTION DOC] Return the global should_preserve_node_meta flag.
     return should_preserve_node_meta
 
 
 def _is_preserving_node_seq_nr() -> bool:
+    # [FUNCTION DOC] HELPER: Return the private flag controlling seq_nr preservation.
     return _should_preserve_node_meta
 
 
 @compatibility(is_backward_compatible=False)
 @contextmanager
 def set_current_meta(node: Node, pass_name: str = "") -> Iterator[None]:
+    # [FUNCTION DOC] Context manager: if preservation is on and node.meta is non-empty,
+    #   temporarily replace global current_meta with a copy of node.meta whose from_node
+    #   is a single new NodeSource (action CREATE, with pass_name) built from node, then
+    #   restore the old current_meta on exit. Otherwise just yields with no change.
     global current_meta
     if should_preserve_node_meta and node.meta:
         saved_meta = current_meta
@@ -537,12 +649,16 @@ def set_current_meta(node: Node, pass_name: str = "") -> Iterator[None]:
 
 @compatibility(is_backward_compatible=False)
 def get_current_meta() -> dict[str, Any]:
+    # [FUNCTION DOC] Return the global current_meta dictionary itself (not a copy).
     return current_meta
 
 
 @compatibility(is_backward_compatible=False)
 @contextmanager
 def set_current_replay_node(node: Node | None) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager setting the global current_replay_node to node for
+    #   the body (a non-None value means the node is being regenerated under
+    #   FunctionalTensorMode) and restoring the previous value on exit.
     """
     Set the current replay node. If `current_replay_node` is not None,
     then we're re-generating the `current_replay_node` in FunctionalTensorMode.
@@ -559,6 +675,7 @@ def set_current_replay_node(node: Node | None) -> Iterator[None]:
 
 @compatibility(is_backward_compatible=False)
 def get_current_replay_node() -> Node | None:
+    # [FUNCTION DOC] Return the global current replay node, or None.
     """
     Get the current replay node
     """
@@ -568,6 +685,9 @@ def get_current_replay_node() -> Node | None:
 @compatibility(is_backward_compatible=False)
 @contextmanager
 def _set_regional_inductor_subgraph_name(name: str | None) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager setting the thread-local regional inductor
+    #   subgraph name to name for the body and restoring the previous value (default
+    #   None) on exit. Used to tag structured trace records.
     """
     Set the name of the subgraph currently being sub-compiled by regional
     inductor (a scooped-out region or an invoke_subgraph submodule). Used to
@@ -584,6 +704,8 @@ def _set_regional_inductor_subgraph_name(name: str | None) -> Iterator[None]:
 
 @compatibility(is_backward_compatible=False)
 def _get_regional_inductor_subgraph_name() -> str | None:
+    # [FUNCTION DOC] HELPER: Return the thread-local regional inductor subgraph name, or
+    #   None if unset.
     """
     Get the name of the subgraph currently being sub-compiled by regional
     inductor, or None.
@@ -593,6 +715,10 @@ def _get_regional_inductor_subgraph_name() -> str | None:
 
 @compatibility(is_backward_compatible=False)
 def get_graph_provenance_json(graph: Graph) -> dict[str, Any]:
+    # [FUNCTION DOC] Return a mapping from the name of each call_function node of graph
+    #   to a list of the dictionary forms of its from_node history (empty list when
+    #   absent). Any exception is swallowed: a signpost event is emitted with the
+    #   function name, message and stack trace and an empty mapping is returned.
     """
     Given an fx.Graph, return a json that contains the provenance information of each node.
     """
@@ -622,10 +748,19 @@ def get_graph_provenance_json(graph: Graph) -> dict[str, Any]:
 
 
 def _get_custom_metadata(gm: GraphModule) -> str:
+    # [FUNCTION DOC] HELPER: Return a newline-joined string of custom metadata for a
+    #   GraphModule, one entry per node having non-empty custom meta (tuple of op, name,
+    #   custom), recursing into get_attr nodes that refer to GraphModule submodules.
+    #   Raises AssertionError if gm is not a GraphModule.
+    # KNOWN ISSUE: recursive results are appended as a nested list, so a submodule
+    #   appears as one list entry instead of being flattened.
     if not isinstance(gm, GraphModule):
         raise AssertionError(f"Expected GraphModule, got {type(gm)}")
 
     def helper(gm: GraphModule) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Collect (op, name, custom) tuples for nodes of a
+        #   GraphModule with custom meta, appending a nested list for each GraphModule
+        #   attribute.
         custom_metadata = []
         for node in gm.graph.nodes:
             if hasattr(node, "meta") and node.meta.get("custom", None):
@@ -645,6 +780,9 @@ def _get_custom_metadata(gm: GraphModule) -> str:
 def _get_ordered_seq_nr_groups(
     gm: GraphModule | list[GraphModule],
 ) -> list[list[str]]:
+    # [FUNCTION DOC] HELPER: Group names of call_function nodes by their seq_nr meta
+    #   (ignoring nodes without one) across one GraphModule or a list of them. Returns a
+    #   list of name lists, each sorted alphabetically, ordered by increasing seq_nr.
     """
     Group call_function nodes by seq_nr, order by seq_nr value,
     and return a list of lists of node names (sorted alphabetically).

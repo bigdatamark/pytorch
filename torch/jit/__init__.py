@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public entry point of torch.jit, the (deprecated) TorchScript API.
+#   Re-exports script, trace, trace_module, load, save, freeze, fork/wait, fuser
+#   controls, Future, Attribute, ScriptModule, ScriptFunction and related helpers from
+#   the private torch.jit submodules and torch._jit_internal, defines small wrappers
+#   here (export_opnames, annotate, script_if_tracing, isinstance, strict_fusion, onednn
+#   fusion toggles), exposes torch.jit.Error. Import-time side effects: renames the
+#   JITException to Error under module torch.jit, runs the C++ JIT initialization and
+#   raises RuntimeError if it fails, and deletes the Any name.
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -106,6 +114,11 @@ _set_fusion_strategy = set_fusion_strategy
 
 
 def export_opnames(m):
+    # [FUNCTION DOC] Return the list of operator names used by a script module, computed
+    #   from the current code base, by delegating to the C++ export_opnames on the
+    #   module's underlying C object. Argument m is a ScriptModule.
+    # KNOWN ISSUE: the docstring speaks of generating bytecode but the function returns
+    #   operator names.
     r"""
     Generate new bytecode for a Script module.
 
@@ -127,6 +140,8 @@ Error.__qualname__ = "Error"
 
 # for use in python if using annotate
 def annotate(the_type, the_value):
+    # [FUNCTION DOC] Pass-through type hint for the TorchScript compiler: returns
+    #   the_value unchanged and ignores the_type when run in eager Python.
     """Use to give type of `the_value` in TorchScript compiler.
 
     .. deprecated:: 2.5
@@ -178,6 +193,9 @@ def annotate(the_type, the_value):
 
 
 def script_if_tracing(fn):
+    # [FUNCTION DOC] Return the result of the private script_if_tracing helper for fn: a
+    #   function that is compiled with script on first call during tracing, and runs as
+    #   the original function otherwise.
     """
     Compiles ``fn`` when it is first called during tracing.
 
@@ -203,6 +221,10 @@ def script_if_tracing(fn):
 
 # for torch.jit.isinstance
 def isinstance(obj, target_type):
+    # [FUNCTION DOC] Type-refinement helper for TorchScript: returns True if obj matches
+    #   target_type (including parameterized List, Dict, Tuple, Optional) by delegating
+    #   to the internal isinstance implementation. Shadows the builtin isinstance inside
+    #   this module.
     """
     Provide container type refinement in TorchScript.
 
@@ -249,6 +271,9 @@ def isinstance(obj, target_type):
 
 
 class strict_fusion:
+    # [CLASS DOC] Context manager marker asking the TorchScript compiler to error if
+    #   nodes are not fused (inference) or symbolically differentiated (training). It
+    #   has no runtime effect in eager mode.
     """
     Give errors if not all nodes have been fused in inference, or symbolically differentiated in training.
 
@@ -268,13 +293,17 @@ class strict_fusion:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Emit a warning that the feature only works in script mode when
+        #   not currently scripting.
         if not torch._jit_internal.is_scripting():
             warnings.warn("Only works in script mode", stacklevel=2)
 
     def __enter__(self):
+        # [FUNCTION DOC] No-op context manager entry.
         pass
 
     def __exit__(self, type: Any, value: Any, tb: Any) -> None:
+        # [FUNCTION DOC] No-op context manager exit; does not suppress exceptions.
         pass
 
 
@@ -283,6 +312,9 @@ class strict_fusion:
 # Graph class, so mypy checks need to be skipped.
 @contextmanager
 def _hide_source_ranges() -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager that disables printing of source ranges in
+    #   graph dumps globally. It reads the old setting from the C++ Graph class, sets it
+    #   to off, yields, and restores the old value in a finally block.
     old_enable_source_ranges = torch._C.Graph.global_print_source_ranges  # type: ignore[attr-defined]
     try:
         torch._C.Graph.set_global_print_source_ranges(False)  # type: ignore[attr-defined]
@@ -292,6 +324,8 @@ def _hide_source_ranges() -> Iterator[None]:
 
 
 def enable_onednn_fusion(enabled: bool) -> None:
+    # [FUNCTION DOC] Enable or disable oneDNN (LLGA) JIT fusion globally by calling the
+    #   C++ setter with enabled. Side effect on global JIT state.
     """Enable or disables onednn JIT fusion based on the parameter `enabled`.
 
     .. deprecated:: 2.5
@@ -301,6 +335,8 @@ def enable_onednn_fusion(enabled: bool) -> None:
 
 
 def onednn_fusion_enabled():
+    # [FUNCTION DOC] Return whether oneDNN (LLGA) JIT fusion is currently enabled, from
+    #   the C++ query.
     """Return whether onednn JIT fusion is enabled.
 
     .. deprecated:: 2.5

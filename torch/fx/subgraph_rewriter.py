@@ -1,3 +1,9 @@
+# [MODULE DOC] Subgraph rewriting for torch.fx: find every non-overlapping occurrence of
+#   a pattern (callable, Graph or GraphModule) in a GraphModule graph and substitute a
+#   replacement subgraph. Public API: replace_pattern, replace_pattern_with_filters, and
+#   the result records Match and ReplacedPatterns; shared implementation is
+#   _replace_pattern. Import-time side effects: none beyond imports (the matcher module
+#   is imported lazily inside the implementation).
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +31,9 @@ __all__ = [
 
 @compatibility(is_backward_compatible=True)
 class Match(NamedTuple):
+    # [CLASS DOC] Named tuple result of replace_pattern: anchor is the graph node from
+    #   which the match was found, nodes_map maps pattern nodes to the matched nodes of
+    #   the target graph.
     # Node from which the match was found
     anchor: Node
     # Maps nodes in the pattern subgraph to nodes in the larger graph
@@ -34,6 +43,9 @@ class Match(NamedTuple):
 @compatibility(is_backward_compatible=False)
 @dataclass
 class ReplacedPatterns:
+    # [CLASS DOC] Dataclass result of replace_pattern_with_filters: anchor (node the
+    #   match came from), nodes_map (pattern node to target node mapping) and
+    #   replacements (list of nodes inserted into the graph by the replacement).
     # Node from which the match was found
     anchor: Node
     # Maps nodes in the pattern subgraph to nodes in the larger graph
@@ -43,12 +55,24 @@ class ReplacedPatterns:
 
 
 def _replace_attributes(gm: GraphModule, replacement: torch.nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: After rewriting, make gm hold every module or attribute
+    #   referenced by its call_module and get_attr nodes. First deletes unused
+    #   submodules of gm and lints the replacement graph if it is a GraphModule. For
+    #   each such node: an attribute already on gm wins and is kept; otherwise one found
+    #   on replacement is deep-copied in (added as a submodule if it is a Module, set as
+    #   a plain attribute otherwise); if neither has it, raises RuntimeError. Finishes
+    #   by linting gm.graph. Mutates gm.
+    # KNOWN ISSUE: the RuntimeError is constructed with several separate arguments
+    #   instead of one message string, so the message prints as a tuple.
     gm.delete_all_unused_submodules()
 
     if isinstance(replacement, GraphModule):
         replacement.graph.lint()
 
     def try_get_attr(gm: torch.nn.Module, target: str) -> Any | None:
+        # [FUNCTION DOC] HELPER: Resolve a dotted target path on a module: look up the
+        #   parent submodule and return the final attribute, or None if the submodule
+        #   path does not exist or the attribute is missing.
         module_path, _, attr_name = target.rpartition(".")
         try:
             mod: torch.nn.Module = gm.get_submodule(module_path)
@@ -98,6 +122,10 @@ def replace_pattern(
     pattern: Callable[..., Any] | GraphModule,
     replacement: Callable[..., Any] | GraphModule,
 ) -> list[Match]:
+    # [FUNCTION DOC] Public wrapper: replace all non-overlapping matches of pattern in
+    #   gm with replacement by running the shared implementation with no filters, then
+    #   convert each result record into a Match (anchor and nodes_map only). Returns the
+    #   list of Match, empty if nothing matched. Mutates gm in place and recompiles it.
     """
     Matches all possible non-overlapping sets of operators and their
     data dependencies (``pattern``) in the Graph of a GraphModule
@@ -234,6 +262,12 @@ def replace_pattern_with_filters(
     | None = None,
     node_name_match: str = "",
 ) -> list[ReplacedPatterns]:
+    # [FUNCTION DOC] Experimental variant of replace_pattern that also accepts Graph
+    #   patterns, a list of match_filters (each called with the match, original graph
+    #   and pattern graph; all must return true to keep the match), ignore_literals, an
+    #   optional replacement_callback that builds a replacement graph per match, and
+    #   node_name_match to restrict anchors by name. Returns a list of ReplacedPatterns.
+    #   Delegates entirely to _replace_pattern; mutates gm.
     """
     See replace_pattern for documentation. This function is an overload with an additional match_filter argument.
 
@@ -270,6 +304,19 @@ def _replace_pattern(
     | None = None,
     node_name_match: str = "",
 ) -> list[ReplacedPatterns]:
+    # [FUNCTION DOC] HELPER: Core rewrite routine. Builds the pattern graph (tracing
+    #   callables), matches it against gm.graph with a SubgraphMatcher (no output or
+    #   placeholder matching, overlapping matches removed), and drops matches rejected
+    #   by any filter. Picks the replacement graph (fixed one, or per-match from
+    #   replacement_callback); raises AssertionError if neither is available or if
+    #   placeholder counts or returning-node counts differ. For each match it maps
+    #   replacement placeholders to the matched input nodes (following earlier
+    #   replacements), chooses an insertion point just before the first user of the
+    #   returning nodes (or after them if unused), copies the replacement graph in,
+    #   redirects all uses of the old returning nodes to the copies, and erases the
+    #   matched pattern nodes. Finally recompiles gm and, if replacement is an
+    #   nn.Module, copies missing attributes over. Returns a list of ReplacedPatterns.
+    #   Mutates gm and its graph.
     from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
     if match_filters is None:

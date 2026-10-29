@@ -1,4 +1,15 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Torch Hub: load models and weights from GitHub repositories or local
+#   directories through a hubconf.py entry-point file, and download and cache
+#   checkpoints from URLs. Public API: list, help, load, load_state_dict_from_url,
+#   download_url_to_file, get_dir, set_dir. Also contains the repo cache and trust-list
+#   logic, safe zip extraction, a fallback progress-bar class used when tqdm is missing,
+#   and legacy single-file zip handling. Import-time side effects: tries to import tqdm
+#   and otherwise aliases the fallback class; defines module constants and a
+#   module-level hub directory override (initially unset). Network access, filesystem
+#   writes under the hub directory and user prompts happen only when functions are
+#   called. Note the module defines functions named list and help that shadow builtins
+#   inside this module.
 import contextlib
 import errno
 import hashlib
@@ -23,13 +34,22 @@ from torch.serialization import MAP_LOCATION
 
 
 class _Faketqdm:  # type: ignore[no-redef]
+    # [CLASS DOC] HELPER: Minimal stand-in for tqdm used when tqdm is not installed.
+    #   Tracks total, a disable flag and a running count n, and prints a percentage (or
+    #   byte count if total is unknown) to standard error. Ignores extra arguments.
+    #   Usable as a context manager.
     def __init__(self, total=None, disable=False, unit=None, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Store total, disable and a zero progress counter; extra
+        #   arguments are ignored.
         self.total = total
         self.disable = disable
         self.n = 0
         # Ignore all extra *args and **kwargs lest you want to reinvent tqdm
 
     def update(self, n):
+        # [FUNCTION DOC] HELPER: Advance the counter by n and write a carriage-return
+        #   progress message (percentage or byte count) to standard error, unless
+        #   disabled.
         if self.disable:
             return
 
@@ -42,18 +62,24 @@ class _Faketqdm:  # type: ignore[no-redef]
 
     # Don't bother implementing; use real tqdm if you want
     def set_description(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: No-op placeholder for the tqdm description setter.
         pass
 
     def write(self, s):
+        # [FUNCTION DOC] HELPER: Write the string s and a newline to standard error.
         sys.stderr.write(f"{s}\n")
 
     def close(self):
+        # [FUNCTION DOC] HELPER: Mark the progress bar as disabled.
         self.disable = True
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Return self for use as a context manager.
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] HELPER: Unless disabled, write a newline to standard error to
+        #   finish the progress line.
         if self.disable:
             return
 
@@ -97,6 +123,8 @@ _hub_dir: str | None = None
 
 @contextlib.contextmanager
 def _add_to_sys_path(path):
+    # [FUNCTION DOC] HELPER: Context manager that puts path at the front of sys.path for
+    #   the body and removes it afterwards (also on error).
     sys.path.insert(0, path)
     try:
         yield
@@ -106,6 +134,9 @@ def _add_to_sys_path(path):
 
 # Copied from tools/shared/module_loader to be included in torch package
 def _import_module(name, path):
+    # [FUNCTION DOC] HELPER: Import and execute a Python file as a module with the given
+    #   name and path and return the module. Raises AssertionError if no import spec can
+    #   be built or the loader is not a Loader.
     import importlib.util
     from importlib.abc import Loader
 
@@ -120,6 +151,8 @@ def _import_module(name, path):
 
 
 def _remove_if_exists(path):
+    # [FUNCTION DOC] HELPER: Delete path if it exists, as a file or as a directory tree;
+    #   does nothing otherwise.
     if os.path.exists(path):
         if os.path.isfile(path):
             os.remove(path)
@@ -128,6 +161,12 @@ def _remove_if_exists(path):
 
 
 def _safe_extract_zip(zip_file, extract_to):
+    # [FUNCTION DOC] HELPER: Extract every member of an open zip file into extract_to
+    #   after validating each entry name: raises ValueError for absolute paths,
+    #   drive-letter paths, parent-directory components, or resolved destinations
+    #   outside extract_to. Validation and extraction happen member by member, so
+    #   earlier members may already be extracted when a later one is rejected. Writes
+    #   files.
     """
     Safely extract a zip file, preventing zipslip attacks.
 
@@ -170,11 +209,15 @@ def _safe_extract_zip(zip_file, extract_to):
 
 
 def _git_archive_link(repo_owner, repo_name, ref):
+    # [FUNCTION DOC] HELPER: Return the GitHub zipball download URL for the given owner,
+    #   repo name and ref.
     # See https://docs.github.com/en/rest/reference/repos#download-a-repository-archive-zip
     return f"https://github.com/{repo_owner}/{repo_name}/zipball/{ref}"
 
 
 def _load_attr_from_module(module, func_name):
+    # [FUNCTION DOC] HELPER: Return the named attribute of module if it appears in its
+    #   attribute listing, else None.
     # Check if callable is defined in the module
     if func_name not in dir(module):
         return None
@@ -182,6 +225,9 @@ def _load_attr_from_module(module, func_name):
 
 
 def _get_torch_home():
+    # [FUNCTION DOC] HELPER: Return the torch home directory: the TORCH_HOME environment
+    #   variable if set, otherwise a torch folder under XDG_CACHE_HOME (default
+    #   ~/.cache), with the user directory expanded.
     torch_home = os.path.expanduser(
         os.getenv(
             ENV_TORCH_HOME,
@@ -192,6 +238,13 @@ def _get_torch_home():
 
 
 def _parse_repo_info(github):
+    # [FUNCTION DOC] HELPER: Parse a string of the form owner/name with an optional
+    #   colon-separated ref into (owner, name, ref). If no ref is given, probes GitHub
+    #   for a main branch page, using master on a 404 error; re-raises other HTTP
+    #   errors; if offline, picks main or master from an existing cache directory,
+    #   raising RuntimeError if none exists. Performs network access.
+    # KNOWN ISSUE: a string with more than one colon makes the split fail with an
+    #   unpacking error, and a string without exactly one slash fails likewise.
     if ":" in github:
         repo_info, ref = github.split(":")
     else:
@@ -227,11 +280,20 @@ def _parse_repo_info(github):
 
 
 def _read_url(url):
+    # [FUNCTION DOC] HELPER: Open the url (a string or request) and return the body
+    #   decoded with the response charset (default utf-8).
     with urlopen(url) as r:
         return r.read().decode(r.headers.get_content_charset("utf-8"))
 
 
 def _validate_not_a_forked_repo(repo_owner, repo_name, ref):
+    # [FUNCTION DOC] HELPER: Verify through the GitHub API (paging through branches,
+    #   then tags, 100 per page, using GITHUB_TOKEN if set) that ref is a branch/tag
+    #   name or a commit prefix of the repo; returns None when found and raises
+    #   ValueError if not. On an HTTP error it retries the page without the token.
+    # KNOWN ISSUE: if the request fails with an HTTP error when no token was set,
+    #   deleting the missing Authorization header raises KeyError instead of the HTTP
+    #   error.
     # Use urlopen to avoid depending on local git.
     headers = {"Accept": "application/vnd.github.v3+json"}
     token = os.environ.get(ENV_GITHUB_TOKEN)
@@ -271,6 +333,13 @@ def _get_cache_or_reload(
     verbose=True,
     skip_validation=False,
 ):
+    # [FUNCTION DOC] HELPER: Return the local directory of a cached GitHub repo,
+    #   downloading if needed. Creates the hub directory, resolves the ref, checks the
+    #   trust policy, and uses the cache unless force_reload is set or it is missing.
+    #   Otherwise optionally validates the ref against the original repo, downloads the
+    #   zipball (on HTTP 300 warns and retries with a branch ref), safely extracts it,
+    #   and renames the extracted folder to the owner_name_branch directory. Prints
+    #   progress to standard streams. Raises on network, validation or trust errors.
     # Setup hub_dir to save downloaded files
     hub_dir = get_dir()
     os.makedirs(hub_dir, exist_ok=True)
@@ -353,6 +422,14 @@ def _check_repo_is_trusted(
     owner_name_branch,
     trust_repo,
 ):
+    # [FUNCTION DOC] HELPER: Enforce the trust policy for a repo. Reads the trusted_list
+    #   file in the hub directory (creating it), and treats the repo as trusted if its
+    #   owner/name is listed, an already-downloaded folder exists, or the owner is in
+    #   the built-in allow list. If trust_repo is False, or is the string check and the
+    #   repo is untrusted, prompts on standard input: yes continues, no or empty raises
+    #   Exception, anything else raises ValueError. Finally appends owner/name to the
+    #   trusted list if it was not trusted. Side effects: file writes, input prompt,
+    #   printing.
     hub_dir = get_dir()
     filepath = os.path.join(hub_dir, "trusted_list")
 
@@ -392,12 +469,16 @@ def _check_repo_is_trusted(
 
 
 def _check_module_exists(name):
+    # [FUNCTION DOC] HELPER: Return True if a module with this name can be found by the
+    #   import system.
     import importlib.util
 
     return importlib.util.find_spec(name) is not None
 
 
 def _check_dependencies(m):
+    # [FUNCTION DOC] HELPER: Read the optional dependencies list from a hubconf module
+    #   and raise RuntimeError naming any packages that cannot be found.
     dependencies = _load_attr_from_module(m, VAR_DEPENDENCY)
 
     if dependencies is not None:
@@ -407,6 +488,9 @@ def _check_dependencies(m):
 
 
 def _load_entry_from_hubconf(m, model):
+    # [FUNCTION DOC] HELPER: Return the callable named model from the hubconf module m.
+    #   Raises ValueError if model is not a string, RuntimeError if dependencies are
+    #   missing or the entry is missing or not callable.
     if not isinstance(model, str):
         raise ValueError("Invalid input: model should be a string of function name")
 
@@ -425,6 +509,9 @@ def _load_entry_from_hubconf(m, model):
 
 
 def get_dir() -> str:
+    # [FUNCTION DOC] Return the Torch Hub cache directory: the value set by set_dir if
+    #   any, else the hub folder inside the torch home directory. Warns if the
+    #   deprecated TORCH_HUB environment variable is set.
     r"""
     Get the Torch Hub cache directory used for storing downloaded models & weights.
 
@@ -446,6 +533,8 @@ def get_dir() -> str:
 
 
 def set_dir(d: str | os.PathLike) -> None:
+    # [FUNCTION DOC] Set the module-level hub directory override to d with the user
+    #   directory expanded. Modifies global state.
     r"""
     Optionally set the Torch Hub directory used to save downloaded models & weights.
 
@@ -463,6 +552,11 @@ def list(
     trust_repo="check",
     verbose=True,
 ):
+    # [FUNCTION DOC] List the public callable names (not starting with an underscore)
+    #   defined in the hubconf.py of the GitHub repo github (owner/name with optional
+    #   ref), downloading or using the cache according to force_reload, trust_repo,
+    #   skip_validation and verbose. Imports hubconf.py, which executes repo code.
+    #   Returns a list of names.
     r"""
     List all callable entrypoints available in the repo specified by ``github``.
 
@@ -524,6 +618,11 @@ def list(
 
 
 def help(github, model, force_reload=False, skip_validation=False, trust_repo="check"):
+    # [FUNCTION DOC] Return the docstring of the entry point model defined in the repo's
+    #   hubconf.py (from the GitHub repo, resolved with the same cache, trust and
+    #   validation options as list; verbose is always on). Imports hubconf.py, which
+    #   executes repo code. Raises if the entry point is missing, not callable, or has
+    #   missing dependencies.
     r"""
     Show the docstring of entrypoint ``model``.
 
@@ -584,6 +683,12 @@ def load(
     skip_validation=False,
     **kwargs,
 ):
+    # [FUNCTION DOC] Load an entry point from a GitHub repo or local directory. source
+    #   is lower-cased and must be github or local, else ValueError. For github,
+    #   resolves the repo to a cached local directory first; then calls the local loader
+    #   with the extra positional and keyword arguments and returns whatever the entry
+    #   point returns. Executes repo code. force_reload, verbose and skip_validation
+    #   only matter for github.
     r"""
     Load a model from a github repo or a local directory.
 
@@ -671,6 +776,9 @@ def load(
 
 
 def _load_local(hubconf_dir, model, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Import hubconf.py from hubconf_dir with that directory on
+    #   sys.path, look up the entry point model, call it with the given arguments inside
+    #   the same path context, and return the result.
     r"""
     Load a model from a local directory with a ``hubconf.py``.
 
@@ -710,6 +818,12 @@ def download_url_to_file(
     hash_prefix: str | None = None,
     progress: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Download url to the local file dst. Writes to a uniquely named
+    #   partial file next to dst (raising FileExistsError if no free name is found),
+    #   streams the content in chunks with an optional progress bar, optionally verifies
+    #   that the SHA256 hex digest starts with hash_prefix (raises RuntimeError on
+    #   mismatch), then moves the file to dst. The partial file is always closed and
+    #   removed on failure. The size comes from the Content-Length header when present.
     r"""Download object at the given URL to a local path.
 
     Args:
@@ -791,6 +905,8 @@ def download_url_to_file(
 # The legacy zip format expects only one file from torch.save() < 1.6 in the zip.
 # We should remove this support since zipfile is now default zipfile format for torch.save().
 def _is_legacy_zip_format(filename: str) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if filename is a zip archive containing exactly
+    #   one entry that is not a directory (the pre-1.6 legacy format).
     if zipfile.is_zipfile(filename):
         with zipfile.ZipFile(filename) as zf:
             infolist = zf.infolist()
@@ -810,6 +926,10 @@ def _legacy_zip_load(
     map_location: MAP_LOCATION,
     weights_only: bool,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Deprecated loader (emits a FutureWarning) for legacy zip
+    #   checkpoints: opens the zip, raises RuntimeError unless it holds exactly one
+    #   entry, safely extracts it into model_dir and loads the extracted file with
+    #   torch.load using map_location and weights_only. Returns the loaded dictionary.
     # Note: extractall() defaults to overwrite file if exists. No need to clean up beforehand.
     #       We deliberately don't handle tarfile here since our legacy serialization format was in tar.
     #       E.g. resnet18-5c106cde.pth which is widely used.
@@ -835,6 +955,14 @@ def load_state_dict_from_url(
     file_name: str | None = None,
     weights_only: bool = False,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Download (if not already cached) and load a serialized object from
+    #   url. The model directory defaults to the checkpoints folder under the hub
+    #   directory (created if needed); the file name defaults to the last URL path
+    #   component or file_name. If missing, downloads it, with hash verification when
+    #   check_hash is set (hash taken from the file name pattern, none if it does not
+    #   match). Legacy single-file zips are extracted and loaded; otherwise the file is
+    #   loaded with torch.load using map_location and weights_only. Warns if the
+    #   deprecated TORCH_MODEL_ZOO variable is set. Returns the loaded object.
     r"""Loads the Torch serialized object at the given URL.
 
     If downloaded file is a zip file, it will be automatically
