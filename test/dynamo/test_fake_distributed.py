@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Dynamo tests for compiling distributed code on a single process using the fake
+# process group backend (world size 2 or 4, rank 0). Covers functional collectives
+# (all_to_all_single_autograd, all_gather_single), DeviceMesh queries, and compiled point-to-
+# point operations (isend, irecv, batch_isend_irecv) including sub-group rank translation.
+# Several tests compare the captured graph text with an expected string. The collective imports
+# are done only when torch.distributed is available. Importing also instantiates the
+# parametrized test classes for two of the TestCase classes.
 from unittest import skipIf
 
 import torch
@@ -22,12 +29,21 @@ if dist.is_available():
 
 
 def normalize_graph(gm):
+    # [FUNCTION DOC] HELPER: Renders a GraphModule to its readable source text without printing
+    # and passes it through normalize_gm to make the text stable for expected-output comparison.
     return normalize_gm(gm.print_readable(print_output=False))
 
 
 @skipIf(not dist.is_available(), "requires distributed")
 class TestFakeDistributed(DynamoTestCase):
+    # [CLASS DOC] Dynamo TestCase for single-process fake-distributed compilation of collectives
+    # and device mesh features. Skipped when torch.distributed is unavailable. setUp creates a
+    # fake process group (rank 0, world size 2) and records local_rank and world_size
+    # attributes; tearDown destroys the group.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setUp, initializes the default process group with the fake
+        # backend for rank 0 and world size 2, and stores local_rank (0) and world_size (2) on
+        # the test.
         super().setUp()
         # Use FakeProcessGroup to run tests on a single process
         dist.init_process_group(backend="fake", rank=0, world_size=2)
@@ -35,14 +51,25 @@ class TestFakeDistributed(DynamoTestCase):
         self.world_size = 2
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs base tearDown and then destroys the default process group.
         super().tearDown()
         dist.destroy_process_group()
 
     def test_all_to_all_single_autograd(self):
+        # [FUNCTION DOC] Compiles a function applying all_to_all_single_autograd with equal
+        # splits on the world group, using an AOT backend that records forward and backward
+        # graphs. Runs it first with all dims of an 8x8 input marked dynamic (backed symbols),
+        # then clears the recorded graphs and runs with all dims of an 8x8x8 input marked
+        # unbacked. Each time it asserts one forward and one backward graph were captured and
+        # that their normalized text matches the expected strings (including symbolic split
+        # sizes and runtime asserts for unbacked sizes).
         backend = AotEagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled (full graph, recording backend) function that
+            # returns the all_to_all_single_autograd result for the input with no explicit split
+            # sizes on the world group.
             return all_to_all_single_autograd(
                 x,
                 None,  # Will use equal splits
@@ -123,10 +150,14 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_all_gather_tensor_gather_dim_0(self):
+        # [FUNCTION DOC] Checks that a full-graph eager-compiled all_gather_single with gather
+        # dim 0 produces the same result as calling it uncompiled on the same random 4x4 input.
         """all_gather_single with gather_dim=0 (no _maybe_view_chunk_cat call)."""
 
         @torch.compile(fullgraph=True, backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns all_gather_single of x along dim 0 on the world
+            # group.
             return all_gather_single(x, gather_dim=0, group=dist.group.WORLD)
 
         x = torch.randn(4, 4)
@@ -135,6 +166,8 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(result, expected)
 
     def test_all_gather_tensor_gather_dim_1_view_path(self):
+        # [FUNCTION DOC] Checks compiled versus eager all_gather_single along dim 1 for a 1x4
+        # input, the case where the view-based path is taken; asserts the results are equal.
         """all_gather_single with gather_dim=1 triggers _maybe_view_chunk_cat view path.
 
         Shape [2, 4] with world_size=2: dim 0 == group_size and no dims between
@@ -143,6 +176,8 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(fullgraph=True, backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns all_gather_single of x along dim 1 on the world
+            # group.
             return all_gather_single(x, gather_dim=1, group=dist.group.WORLD)
 
         x = torch.randn(1, 4)
@@ -151,6 +186,9 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(result, expected)
 
     def test_all_gather_tensor_gather_dim_2_chunk_cat_path(self):
+        # [FUNCTION DOC] Checks compiled versus eager all_gather_single along dim 2 for a 1x3x4
+        # input, the case where the chunk-and-concatenate fallback is taken; asserts equal
+        # results.
         """all_gather_single with gather_dim=2 triggers _maybe_view_chunk_cat chunk+cat path.
 
         Shape [2, 3, 4] with world_size=2: dims between 0 and gather_dim=2
@@ -159,6 +197,8 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(fullgraph=True, backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns all_gather_single of x along dim 2 on the world
+            # group.
             return all_gather_single(x, gather_dim=2, group=dist.group.WORLD)
 
         x = torch.randn(1, 3, 4)
@@ -167,6 +207,10 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(result, expected)
 
     def test_device_mesh_get_local_rank(self):
+        # [FUNCTION DOC] Builds a one-dimensional CPU device mesh named dp of size world_size,
+        # then compiles (eager backend, full graph) a function using the mesh's local rank,
+        # global rank and mesh dimension names. Asserts the result for a ones tensor of length
+        # 10 equals the input, i.e. both ranks are zero and the name check holds.
         device_mesh = init_device_mesh(
             device_type="cpu",
             mesh_shape=(self.world_size,),
@@ -175,6 +219,9 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Reads the local and global rank from the captured device
+            # mesh, doubles x only if the name dp is missing from the mesh dimension names (it
+            # is present), and returns x plus both ranks.
             local_rank = device_mesh.get_local_rank()
             global_rank = device_mesh.get_rank()
             if "dp" not in device_mesh.mesh_dim_names:
@@ -186,6 +233,10 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(res, x)
 
     def test_device_mesh_flatten(self):
+        # [FUNCTION DOC] Builds a two-dimensional CPU device mesh (sizes 1 and world_size, names
+        # dp and tp), checks its coordinate list is zero and zero, then compiles a function that
+        # flattens the mesh. Asserts the compiled result is x plus one and a flattened
+        # coordinate list of a single zero.
         device_mesh = init_device_mesh(
             device_type="cpu",
             mesh_shape=(
@@ -198,6 +249,8 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Flattens the captured device mesh and returns x plus one
+            # together with the flattened mesh's coordinate.
             dm = device_mesh._flatten()
             return x + 1, dm.get_coordinate()
 
@@ -206,6 +259,10 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(res, (x + 1, [0]))
 
     def test_device_mesh_init_skip_after_graph_break(self):
+        # [FUNCTION DOC] Regression test for DeviceMesh construction after a graph break: builds
+        # a two-dimensional mesh (dp, tp), compiles a function that graph-breaks and then
+        # creates a sub-mesh for the tp dimension at runtime. Asserts the output equals x plus
+        # world_size.
         device_mesh = init_device_mesh(
             device_type="cpu",
             mesh_shape=(1, self.world_size),
@@ -214,6 +271,9 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Forces a graph break, then builds a sub-mesh layout and
+            # sub-mesh for dimension tp from the captured mesh and returns x plus the sub-mesh
+            # size.
             # Graph break so the subsequent DeviceMesh construction happens
             # at runtime, where eval_frame intercepts DeviceMesh.__init__
             # as a top-level frame.
@@ -232,19 +292,33 @@ instantiate_parametrized_tests(TestFakeDistributed)
 
 @skipIf(not dist.is_available(), "requires distributed")
 class TestFakeDistributedP2P(DynamoTestCase):
+    # [CLASS DOC] Dynamo TestCase for compiling point-to-point communication (send, receive,
+    # batch) under the fake process group with p2p compilation enabled. Skipped without
+    # torch.distributed. Most tests compare normalized captured graph text with expected
+    # strings.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setUp and initializes the fake-backend default process group
+        # with rank 0 and world size 2.
         super().setUp()
         dist.init_process_group(backend="fake", rank=0, world_size=2)
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the default process group.
+        # KNOWN ISSUE: does not call the base class tearDown, unlike the first test class, so
+        #     base cleanup is skipped.
         dist.destroy_process_group()
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_isend_graph(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a function that does an isend to
+        # rank 1 and waits on the request. Asserts a single graph was captured whose normalized
+        # text matches the expected graph (functional isend followed by a wait_tensor).
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Sends the tensor to rank 1 with isend and waits for the
+            # request.
             req = dist.isend(tensor, 1)
             req.wait()
 
@@ -267,10 +341,15 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_fire_and_forget_isend_graph(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a function that issues an isend
+        # without waiting and returns the tensor. Asserts a single graph whose text has the
+        # functional isend and returns the input.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Issues an isend of the tensor to rank 1, ignores the
+            # request, and returns the tensor.
             dist.isend(tensor, 1)
             return tensor
 
@@ -291,10 +370,15 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_irecv_graph(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a function that does an irecv
+        # from rank 1 and waits. Asserts one graph whose normalized text matches the expected
+        # functional irecv followed by wait_tensor calls.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Posts an irecv into the tensor from rank 1 and waits for
+            # the request.
             req = dist.irecv(tensor, 1)
             req.wait()
 
@@ -319,10 +403,16 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_batch_isend_irecv_mixed_graph(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a function that builds an isend
+        # and an irecv P2POp pair, runs batch_isend_irecv, and waits on all returned requests.
+        # Asserts one graph matching the expected batch_p2p_ops text with getitem outputs and
+        # waits.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(send_tensor, recv_tensor):
+            # [FUNCTION DOC] HELPER: Creates two P2P ops (send, receive) with rank 1, runs them
+            # as a batch, and waits for each request.
             ops = [
                 dist.P2POp(dist.isend, send_tensor, 1),
                 dist.P2POp(dist.irecv, recv_tensor, 1),
@@ -357,11 +447,20 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_p2p_interleave_graph(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a function with two successive
+        # batched send/receive rounds where computation on the data is interleaved between
+        # starting the batch and waiting. Peers are rank 1 in a world of size 2. Runs it on
+        # 64x64 tensors and asserts a single graph whose text matches the expected ordering of
+        # batch ops, waits and arithmetic.
         backend = EagerAndRecordGraphs()
         nxt, prv = 1, 1  # rank=0 in world_size=2
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(x0, x1, y0, y1):
+            # [FUNCTION DOC] HELPER: Runs a batched isend/irecv of x0 and y0, computes from x0
+            # while waiting, waits, adds y0, runs a second batch sending that sum and receiving
+            # into y1, scales the sum by a constant slightly above one, waits, and returns y1
+            # plus that scaled value. Argument x1 is unused.
             work = dist.batch_isend_irecv(
                 [
                     dist.P2POp(dist.isend, x0, nxt),
@@ -431,8 +530,13 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_mutating_p2p_op_graph_breaks(self):
+        # [FUNCTION DOC] With p2p compilation enabled, checks that mutating an attribute of a
+        # P2POp inside a full-graph compiled function raises torch._dynamo.exc.Unsupported with
+        # a message mentioning P2POp.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Builds an isend P2POp, sets an extra attribute on it (the
+            # unsupported mutation), then passes it to batch_isend_irecv.
             op = dist.P2POp(dist.isend, tensor, 1)
             op.tag = 1
             dist.batch_isend_irecv([op])
@@ -446,25 +550,39 @@ instantiate_parametrized_tests(TestFakeDistributedP2P)
 
 @skipIf(not dist.is_available(), "requires distributed")
 class TestFakeDistributedP2PSubgroup(DynamoTestCase):
+    # [CLASS DOC] Regression tests that compiled functional p2p ops on a sub-group pass the
+    # group-local peer rank rather than the global rank. setUp creates a fake world of 4 ranks
+    # and a sub-group of global ranks 0 and 2, so group-local rank 1 is global rank 2. Tests
+    # inspect the captured graph text for the expected peer.
     # Regression test: on a sub-group, the functional P2P helpers must pass a
     # GROUP-LOCAL peer rank to the _c10d_functional ops (which, like the eager
     # ProcessGroup send/recv path, expect a group-local rank). Previously a
     # global rank was passed, which is out of range on a proper sub-group.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setUp, initializes the fake-backend default group (rank 0,
+        # world size 4), and stores a new sub-group of global ranks 0 and 2 as the subgroup
+        # attribute.
         super().setUp()
         dist.init_process_group(backend="fake", rank=0, world_size=4)
         # Sub-group [0, 2]: group-local rank 1 corresponds to global rank 2.
         self.subgroup = dist.new_group([0, 2])
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the default process group.
+        # KNOWN ISSUE: does not call the base class tearDown, so base cleanup is skipped.
         dist.destroy_process_group()
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_isend_subgroup_uses_group_local_rank(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles an isend to group-local
+        # destination 1 on the sub-group. Asserts one graph, that the graph text contains the
+        # isend with peer 1, and does not contain peer 2.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Sends the tensor with isend to group destination 1 in the
+            # sub-group and waits for the request.
             req = dist.isend(tensor, group_dst=1, group=self.subgroup)
             req.wait()
 
@@ -476,10 +594,15 @@ class TestFakeDistributedP2PSubgroup(DynamoTestCase):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_irecv_subgroup_uses_group_local_rank(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles an irecv from group-local source
+        # 1 on the sub-group. Asserts one graph whose text contains the irecv with peer 1 and
+        # not peer 2.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(tensor):
+            # [FUNCTION DOC] HELPER: Receives into the tensor from group source 1 in the sub-
+            # group and waits.
             req = dist.irecv(tensor, group_src=1, group=self.subgroup)
             req.wait()
 
@@ -491,10 +614,15 @@ class TestFakeDistributedP2PSubgroup(DynamoTestCase):
 
     @torch._dynamo.config.patch(enable_p2p_compilation=True)
     def test_compiled_batch_isend_irecv_subgroup_uses_group_local_rank(self):
+        # [FUNCTION DOC] With p2p compilation enabled, compiles a batched isend/irecv using
+        # group-local peer 1 on the sub-group. Asserts one graph whose text has both peers
+        # listed as 1 and does not contain a list of two peers.
         backend = EagerAndRecordGraphs()
 
         @torch.compile(fullgraph=True, backend=backend)
         def fn(send_tensor, recv_tensor):
+            # [FUNCTION DOC] HELPER: Builds an isend and an irecv P2POp with group peer 1 on the
+            # sub-group, runs them as a batch, and waits for every returned request.
             ops = [
                 dist.P2POp(dist.isend, send_tensor, group_peer=1, group=self.subgroup),
                 dist.P2POp(dist.irecv, recv_tensor, group_peer=1, group=self.subgroup),
