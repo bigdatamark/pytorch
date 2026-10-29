@@ -1,3 +1,9 @@
+# [MODULE DOC] Heuristic runtime estimation for aten ops on a GPU: compute time from flop
+# counts (flop_registry) and peak TFLOPS, and memory transfer time from tensor byte sizes
+# and DRAM bandwidth. Optionally pins hardware numbers to a named datasheet device for
+# deterministic estimates. Defines OrderedSets of view ops, tensor-creation ops and their
+# union (_IGNORE_OPS) that need no benchmarking. Import-time side effects: none beyond
+# building these constants.
 import torch
 from torch._inductor.analysis.device_info import datasheet_dram_bw_gbs, datasheet_tops
 from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps
@@ -78,6 +84,10 @@ _IGNORE_OPS = _VIEW_OPS | _CREATE_OPS
 def flops_to_ns(
     flops: float | int, dtype: "torch.dtype", gpu_type: str | None = None
 ) -> float:
+    # [FUNCTION DOC] Convert a flop count to estimated nanoseconds for the given dtype.
+    # Uses datasheet TFLOPS for gpu_type if given (tf32 chosen from the matmul fp32 precision
+    # setting), else the current device's TFLOPS. Assumes 75 percent of peak and halves flops
+    # to MACs. Returns 0.0 if peak is zero. Raises ValueError if gpu_type has no datasheet entry.
     """Convert a FLOPs count to estimated nanoseconds on the GPU.
 
     Uses 75% of theoretical peak and converts FLOPs to MACs (divide by 2).
@@ -105,6 +115,11 @@ def flops_to_ns(
 def get_compute_time(
     func_packet, args, kwargs, out, out_dtypes, node_meta=None, gpu_type=None
 ) -> float:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Estimate compute time in ns of an aten op. If the op packet is in
+    # flop_registry: requires exactly one entry in out_dtypes (raises AssertionError
+    # otherwise), pops it (mutating the set), calls the registered flop formula with args,
+    # kwargs, out_val and optional _node_meta, and converts flops via flops_to_ns.
+    # Ops not in the registry return 0.0.
     """
     Estimates the compute time of an aten operator.
 
@@ -139,6 +154,9 @@ def get_compute_time(
 
 
 def get_num_bytes(t: torch.Tensor) -> int:
+    # [FUNCTION DOC] Bytes actually touched by tensor t: product of sizes over dims whose
+    # stride is not statically known to be zero (broadcast dims count as one element), with
+    # symbolic sizes resolved via optimization_hint (fallback 0), times element size.
     """
     Calculates the memory consumption of a tensor.
 
@@ -158,6 +176,10 @@ def get_num_bytes(t: torch.Tensor) -> int:
 
 
 def get_transfer_time(flat_args_kwargs, flat_outs, gpu_type=None) -> float:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Estimate memory transfer time in ns: total bytes of all tensors among
+    # the flat inputs plus flat outputs divided by DRAM bandwidth (GB/s equals bytes per ns).
+    # Bandwidth comes from the datasheet for gpu_type, else from the current device.
+    # Raises ValueError if gpu_type is not in the datasheet. Non-tensor entries are ignored.
     """
     Estimates the memory transfer time of input and output tensors.
 
