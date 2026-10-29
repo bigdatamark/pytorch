@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that builds a libtorch C++ distribution zip from a
+# pre-built PyTorch wheel. It unpacks the wheel, copies libraries, headers, CMake files
+# and (on Windows) DLLs into a libtorch directory, optionally bundles CUDA or ROCm
+# runtime dependencies and rewrites RPATHs on Linux, writes version and hash metadata,
+# splits debug symbols into a separate zip, and zips the result with a latest symlink.
+# No import-time side effects; the work happens in main when run as a script.
 """Extract libtorch package from a PyTorch wheel.
 
 Creates a libtorch zip from a pre-built wheel by copying the C++ libraries,
@@ -22,6 +28,10 @@ from pathlib import Path
 
 
 def find_wheel(wheel_dir: str) -> Path:
+    # [FUNCTION DOC] Locate the single wheel file in a directory.
+    # Args: wheel_dir, directory searched for files ending in .whl (non-recursive).
+    # Returns the path of the one wheel. Raises FileNotFoundError when none exist and
+    # RuntimeError when more than one exists.
     wheels = glob.glob(os.path.join(wheel_dir, "*.whl"))
     if not wheels:
         raise FileNotFoundError(f"No .whl files found in {wheel_dir}")
@@ -31,6 +41,9 @@ def find_wheel(wheel_dir: str) -> Path:
 
 
 def parse_version_from_wheel(wheel_path: Path) -> str:
+    # [FUNCTION DOC] Extract the version field from a wheel filename.
+    # Splits the file stem on dashes and returns the second field. Raises ValueError
+    # if the stem has fewer than three dash separated fields.
     # Wheel filename format: {name}-{version}(-{build})?-{python}-{abi}-{platform}.whl
     name = wheel_path.stem
     parts = name.split("-")
@@ -40,6 +53,9 @@ def parse_version_from_wheel(wheel_path: Path) -> str:
 
 
 def extract_wheel(wheel_path: Path, extract_dir: Path) -> Path:
+    # [FUNCTION DOC] Unzip a wheel into extract_dir (side effect: writes all members).
+    # Returns the path of the torch package directory inside it; raises
+    # FileNotFoundError if the extracted tree has no torch directory.
     with zipfile.ZipFile(wheel_path, "r") as zf:
         zf.extractall(extract_dir)
     # Find the torch directory
@@ -52,6 +68,11 @@ def extract_wheel(wheel_path: Path, extract_dir: Path) -> Path:
 
 
 def should_exclude_lib(filename: str) -> bool:
+    # [FUNCTION DOC] Decide whether a file name must be left out of libtorch.
+    # Excludes names starting with libtorch_python, names matching the _C cpython
+    # extension pattern, and Python source or bytecode files. Pure function.
+    # KNOWN ISSUE: the check for the name __init__.py is unreachable because every
+    # such name already ends with the py suffix handled just before it.
     """Return True for files that should not go into the libtorch package."""
     if filename.startswith("libtorch_python"):
         return True
@@ -65,6 +86,9 @@ def should_exclude_lib(filename: str) -> bool:
 
 
 def _is_lib_file(name: str, platform: str) -> bool:
+    # [FUNCTION DOC] HELPER: Platform specific test for library file names.
+    # Linux accepts names containing .so or ending in .a; macOS accepts dylib and .a;
+    # Windows accepts dll, lib and pdb. Unknown platforms yield False.
     """Return True if the file looks like a library or header to include."""
     if platform == "linux":
         return ".so" in name or name.endswith(".a")
@@ -76,6 +100,11 @@ def _is_lib_file(name: str, platform: str) -> bool:
 
 
 def copy_libraries(torch_dir: Path, libtorch_lib: Path, platform: str) -> None:
+    # [FUNCTION DOC] Copy shared libraries from the wheel torch/lib into libtorch/lib.
+    # Subdirectories are copied whole; files are copied (with metadata) only if not
+    # excluded and recognised as libraries for the platform. On macOS also copies
+    # non-excluded dylibs from the .dylibs directory. Raises FileNotFoundError when
+    # torch/lib is missing. Side effect: writes into libtorch_lib.
     """Copy libraries from torch/lib/ to libtorch/lib/."""
     torch_lib = torch_dir / "lib"
     if not torch_lib.is_dir():
@@ -101,6 +130,10 @@ def copy_libraries(torch_dir: Path, libtorch_lib: Path, platform: str) -> None:
 
 
 def fix_rpath(libtorch_lib: Path) -> None:
+    # [FUNCTION DOC] Rewrite the RPATH of every shared object in libtorch_lib to the
+    # origin-relative form using patchelf (forced RPATH, not RUNPATH), printing each
+    # fixed file. Raises RuntimeError off Linux or when patchelf fails on a file, and
+    # FileNotFoundError when patchelf is not on the path. Modifies files in place.
     # Wheel RPATHs are relative to pip's site-packages layout; rewrite to
     # $ORIGIN for the flat libtorch lib/ directory. Requires patchelf
     # (available in manylinux2_28-builder containers).
@@ -136,10 +169,14 @@ _CUDA_LIB_DIRS = ("/usr/local/cuda/lib64", "/usr/local/cuda/extras/CUPTI/lib64")
 
 
 def _is_cuda_variant(desired_cuda: str) -> bool:
+    # [FUNCTION DOC] HELPER: True when the variant string starts with cu.
     return desired_cuda.startswith("cu")
 
 
 def _is_rocm_sdk_wheel_variant(desired_cuda: str) -> bool:
+    # [FUNCTION DOC] HELPER: True when the variant starts with rocm and the current
+    # interpreter has a pip package named rocm installed (checked by running pip show
+    # in a subprocess and testing for a zero exit status).
     """True for TheRock pip-SDK ROCm; legacy /opt/rocm bundles deps in-wheel."""
     if not desired_cuda.startswith("rocm"):
         return False
@@ -154,6 +191,8 @@ def _is_rocm_sdk_wheel_variant(desired_cuda: str) -> bool:
 
 
 def _needed(patchelf: str, so: Path) -> list[str]:
+    # [FUNCTION DOC] HELPER: List the NEEDED sonames of a shared object by running
+    # patchelf in print-needed mode. Returns an empty list if patchelf fails.
     r = subprocess.run(
         [patchelf, "--print-needed", str(so)], capture_output=True, text=True
     )
@@ -161,6 +200,11 @@ def _needed(patchelf: str, so: Path) -> list[str]:
 
 
 def bundle_cuda_deps(libtorch_lib: Path) -> None:
+    # [FUNCTION DOC] Make libtorch_lib self-contained for CUDA by copying missing
+    # NVIDIA runtime libraries from the CUDA toolkit directories. Walks the NEEDED
+    # sonames of every shared object transitively (work queue), copying each soname
+    # found in the toolkit dirs and not already present. Unresolvable names are
+    # skipped silently. Raises FileNotFoundError without patchelf or toolkit dirs.
     """Copy the NVIDIA runtime deps the small CUDA wheel omits into lib/ so the
     shared-with-deps tarball is self-contained (pytorch/pytorch#183971). Resolves
     NEEDED transitively from the torch libs; fix_rpath then adds $ORIGIN so the
@@ -188,6 +232,10 @@ def bundle_cuda_deps(libtorch_lib: Path) -> None:
 
 
 def _resolve_needed_lib(search: list[Path], needed: str) -> Path | None:
+    # [FUNCTION DOC] HELPER: Find the file providing a NEEDED soname in the search
+    # directories. First tries an exact file name match; otherwise, for names with a
+    # shared object suffix, takes the first (sorted) file whose name starts with the
+    # base name plus .so. Returns None when nothing matches.
     for lib_dir in search:
         direct = lib_dir / needed
         if direct.is_file():
@@ -204,6 +252,9 @@ def _resolve_needed_lib(search: list[Path], needed: str) -> Path | None:
 
 
 def _rocm_sdk_search_dirs(site_packages: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Return the existing library directories of the ROCm pip
+    # SDK packages (core, its sysdeps, host-math and llvm subdirs, and libraries)
+    # under the given site-packages root, in lookup priority order.
     core = site_packages / "_rocm_sdk_core" / "lib"
     libs = site_packages / "_rocm_sdk_libraries" / "lib"
     candidates = [
@@ -217,6 +268,9 @@ def _rocm_sdk_search_dirs(site_packages: Path) -> list[Path]:
 
 
 def _installed_rocm_site_packages() -> Path:
+    # [FUNCTION DOC] HELPER: Run pip show for the rocm package and return the path in
+    # its Location line. Raises CalledProcessError if pip fails and FileNotFoundError
+    # if no Location line is present.
     """Return the site-packages root for the SDK baked into the ROCm image."""
     result = subprocess.run(
         [sys.executable, "-m", "pip", "show", "rocm"],
@@ -231,6 +285,11 @@ def _installed_rocm_site_packages() -> Path:
 
 
 def bundle_rocm_deps(libtorch_lib: Path) -> None:
+    # [FUNCTION DOC] ROCm counterpart of bundle_cuda_deps: copies the transitive
+    # closure of missing NEEDED libraries from the pip installed ROCm SDK package
+    # directories into libtorch_lib, printing each one. Raises FileNotFoundError when
+    # patchelf or the SDK library directories cannot be found. Unresolved names are
+    # skipped silently.
     """Copy ROCm runtime deps from TheRock pip packages into lib/ for shared-with-deps.
 
     Wheel-based ROCm manywheels point RPATH at sibling _rocm_sdk_* packages under
@@ -271,6 +330,9 @@ def bundle_rocm_deps(libtorch_lib: Path) -> None:
 
 
 def copy_includes(torch_dir: Path, libtorch_include: Path) -> None:
+    # [FUNCTION DOC] Copy the C++ headers into libtorch/include. Uses torch/include,
+    # falling back to torch/lib/include for older wheels; merges into an existing
+    # destination. Raises FileNotFoundError if neither location exists.
     torch_include = torch_dir / "include"
     if not torch_include.is_dir():
         # Some older wheels might have include under torch/lib/include
@@ -281,6 +343,9 @@ def copy_includes(torch_dir: Path, libtorch_include: Path) -> None:
 
 
 def copy_cmake(torch_dir: Path, libtorch_share: Path) -> None:
+    # [FUNCTION DOC] Copy torch/share/cmake into the cmake subdirectory of the share
+    # destination. If the source is missing, prints a warning to stderr and returns
+    # without error.
     torch_cmake = torch_dir / "share" / "cmake"
     if not torch_cmake.is_dir():
         print(f"Warning: share/cmake/ not found at {torch_cmake}", file=sys.stderr)
@@ -290,6 +355,8 @@ def copy_cmake(torch_dir: Path, libtorch_share: Path) -> None:
 
 
 def copy_bin(torch_dir: Path, libtorch_bin: Path, platform: str) -> None:
+    # [FUNCTION DOC] On Windows only, copy the non-excluded DLLs from torch/lib into
+    # the bin directory; does nothing on other platforms or when torch/lib is absent.
     """Copy binary executables (mainly relevant for Windows)."""
     if platform == "windows":
         torch_lib = torch_dir / "lib"
@@ -300,11 +367,16 @@ def copy_bin(torch_dir: Path, libtorch_bin: Path, platform: str) -> None:
 
 
 def write_metadata(libtorch_dir: Path, version: str, git_hash: str) -> None:
+    # [FUNCTION DOC] Write the files build-version and build-hash into libtorch_dir,
+    # each containing the given string followed by a newline.
     (libtorch_dir / "build-version").write_text(version + "\n")
     (libtorch_dir / "build-hash").write_text(git_hash + "\n")
 
 
 def get_git_hash(torch_dir: Path) -> str:
+    # [FUNCTION DOC] Read the git_version assignment from torch/version.py, parsing
+    # the right hand side as a literal. Returns the string "unknown" if the file is
+    # missing, no such line exists, or the value cannot be parsed.
     """Read git_version from the wheel's torch/version.py."""
     version_file = torch_dir / "version.py"
     if not version_file.exists():
@@ -323,6 +395,13 @@ def get_git_hash(torch_dir: Path) -> str:
 def split_debug_symbols(
     libtorch_dir: Path, output_dir: Path, zip_prefix: str, version: str
 ) -> None:
+    # [FUNCTION DOC] Move debug info of lib/libtorch_cpu.so into a separate zip.
+    # Copies the library to a debug directory next to libtorch_dir, keeps only debug
+    # sections in the copy, strips debug info from the original, adds a gnu debuglink
+    # to it, derives the CRC from the link section via a bash subprocess (falls back
+    # to "unknown"), and writes debug-<prefix>-<version>-<crc>.zip into output_dir.
+    # If the library is missing, warns on stderr and returns. Raises on strip or
+    # objcopy failure. Modifies the library in place.
     """Split debug symbols from libtorch_cpu.so (Linux only)."""
     libtorch_cpu = libtorch_dir / "lib" / "libtorch_cpu.so"
     if not libtorch_cpu.exists():
@@ -388,6 +467,10 @@ def create_libtorch_zip(
     zip_prefix: str,
     version: str,
 ) -> Path:
+    # [FUNCTION DOC] Zip the whole libtorch directory (entries relative to its parent,
+    # so paths start with libtorch/) into <prefix>-<version>.zip in output_dir, then
+    # create a <prefix>-latest.zip symlink pointing at it. Prints both names and
+    # returns the zip path. Raises FileExistsError if the latest symlink exists.
     zip_path = output_dir / f"{zip_prefix}-{version}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(libtorch_dir):
@@ -407,6 +490,9 @@ def create_libtorch_zip(
 def compute_zip_prefix(
     platform: str, desired_cuda: str, libtorch_variant: str, arch: str
 ) -> str:
+    # [FUNCTION DOC] Build the zip name prefix from platform, variant and arch: macOS
+    # is fixed, Windows adds win (and arm64 when arch is arm64), others use libtorch
+    # plus the variant. The desired_cuda argument is accepted but unused.
     """Compute the zip filename prefix matching existing naming conventions.
 
     Linux:  libtorch-shared-with-deps
@@ -427,6 +513,12 @@ def compute_zip_prefix(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses options (wheel dir, output dir, platform,
+    # CUDA variant, libtorch variant, arch, optional git hash), extracts the wheel
+    # into a temporary directory, assembles the libtorch tree (libs, optional CUDA or
+    # ROCm dependency bundling and RPATH fix on Linux, includes, cmake, bin, metadata),
+    # splits debug symbols on Linux, writes the zip, and always removes the temporary
+    # directory. Creates the output directory; prints progress; errors propagate.
     parser = argparse.ArgumentParser(description="Extract libtorch from PyTorch wheel")
     parser.add_argument(
         "--wheel-dir", required=True, help="Directory containing the .whl file"

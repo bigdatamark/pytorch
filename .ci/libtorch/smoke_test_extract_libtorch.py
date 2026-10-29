@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Script that smoke tests a libtorch zip produced by the extraction tool:
+# it unpacks the zip and fully loads libtorch.so with the dynamic loader to prove the
+# bundled dependency chain resolves. No import-time side effects.
 """Smoke test for extracted libtorch: fully load libtorch.so via its $ORIGIN RPATH."""
 
 import argparse
@@ -10,6 +13,11 @@ from pathlib import Path
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Takes the output directory option, requires exactly
+    # one libtorch zip there (ignoring names containing latest; raises RuntimeError
+    # otherwise), extracts it to a temporary directory, loads lib/libtorch.so through
+    # ctypes (raises OSError if loading fails), prints a success line, and always
+    # deletes the temporary directory.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-dir",

@@ -1,3 +1,6 @@
+# [MODULE DOC] Library functions for the torchtitan CI test runner: loading the YAML test
+# library that sits next to this file, cloning torchtitan at its pinned commit, and
+# running a named test plan as a series of shell steps. Requires PyYAML at import time.
 import logging
 import os
 from pathlib import Path
@@ -14,6 +17,9 @@ _TORCHTITAN_TEST_LIBRARY_PATH = Path(__file__).parent / "torchtitan_test_library
 
 
 def _load_torchtitan_test_library_yaml() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Parse the torchtitan test library YAML file and return its
+    # mapping of test plan names to plan definitions. Raises FileNotFoundError if the
+    # file is missing.
     if not _TORCHTITAN_TEST_LIBRARY_PATH.exists():
         raise FileNotFoundError(
             f"torchtitan test library YAML not found: {_TORCHTITAN_TEST_LIBRARY_PATH}"
@@ -23,10 +29,14 @@ def _load_torchtitan_test_library_yaml() -> dict[str, Any]:
 
 
 def load_torchtitan_test_library() -> dict[str, Any]:
+    # [FUNCTION DOC] Public entry for loading the torchtitan test library; reads the
+    # YAML file on every call (no caching) and returns the parsed mapping.
     return _load_torchtitan_test_library_yaml()
 
 
 def clone_torchtitan(dst: str = "torchtitan"):
+    # [FUNCTION DOC] Clone the torchtitan GitHub repository into dst (replacing any
+    # existing directory) at the commit pinned in the repo, and return that commit id.
     _, commit = clone_external_repo(
         target="torchtitan",
         repo="https://github.com/pytorch/torchtitan.git",
@@ -39,6 +49,11 @@ def run_test_plan(
     test_plan: str,
     tests_map: dict[str, Any],
 ):
+    # [FUNCTION DOC] Run every shell step of the named plan from tests_map. A plan may
+    # give a title, environment variables and a working directory. When RUNNER_TEMP is
+    # set, OUTPUT_DIR defaults to an artifacts directory under it. Steps run in order
+    # inside the temporary directory and environment; all steps run even if one fails.
+    # Raises RuntimeError for an unknown plan or if any step exits non-zero.
     logger.info("Running torchtitan test plan: %s", test_plan)
     if test_plan not in tests_map:
         raise RuntimeError(

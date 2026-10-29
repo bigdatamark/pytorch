@@ -1,3 +1,6 @@
+# [MODULE DOC] General helpers for lumen CLI tasks: running subprocess commands, string
+# to boolean conversion, context managers that temporarily change environment variables
+# or the working directory, and discovery of wheel files. No import-time side effects.
 """
 General Utility helpers for CLI tasks.
 """
@@ -24,6 +27,11 @@ def run_command(
     env: dict | None = None,
     check: bool = True,
 ) -> int:
+    # [FUNCTION DOC] Run a command string, streaming output to the current stdout and
+    # stderr. Without use_shell the string is split shell style and executed directly;
+    # with it, it runs under bash. The environment is the current one overlaid with env.
+    # Logs the command unless log_cmd is false. Returns the exit code; when check is
+    # true a non-zero exit is logged and raises CalledProcessError.
     """Run a command with optional shell execution."""
     if use_shell:
         args = cmd
@@ -63,6 +71,10 @@ def run_command(
 
 
 def str2bool(value: str | None) -> bool:
+    # [FUNCTION DOC] Parse a truthy or falsy word case-insensitively after trimming.
+    # Empty or None gives False. Accepted true words include 1, true, yes, on, enabled
+    # and found; false words include 0, false, no, off and disable. Raises ValueError
+    # for a non-string value or an unknown word.
     """Convert environment variables to boolean values."""
     if not value:
         return False
@@ -84,6 +96,9 @@ def str2bool(value: str | None) -> bool:
 
 @contextmanager
 def temp_environ(updates: dict[str, str]):
+    # [FUNCTION DOC] Context manager that sets the given variables in the process
+    # environment for the duration of the block, then restores prior values or removes
+    # variables that did not exist, even if the block raises. Mutates os.environ.
     """
     Temporarily set environment variables and restore them after the block.
     Args:
@@ -104,6 +119,9 @@ def temp_environ(updates: dict[str, str]):
 
 @contextmanager
 def working_directory(path: str):
+    # [FUNCTION DOC] Context manager that changes the process working directory to path
+    # for the block and restores the previous one afterwards (even on error). An empty
+    # path does nothing. Raises OSError if the directory cannot be entered.
     """
     Temporarily change the working directory inside a context.
     """
@@ -123,6 +141,11 @@ def get_wheels(
     output_dir: Path,
     max_depth: int | None = None,
 ) -> list[str]:
+    # [FUNCTION DOC] Walk output_dir and collect every file ending in .whl, skipping
+    # directories deeper than max_depth when given. Returns a list of mappings with the
+    # package name (file name up to the first dash) and the path relative to
+    # output_dir; an empty list if the directory is missing.
+    # KNOWN ISSUE: the return annotation says list of strings but mappings are returned.
     """Return a list of wheels found in the given output directory."""
     root = Path(output_dir)
     if not root.exists():

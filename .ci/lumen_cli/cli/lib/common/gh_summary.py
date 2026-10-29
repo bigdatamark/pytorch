@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for writing Markdown to the GitHub Actions step summary file
+# (named by the GITHUB_STEP_SUMMARY environment variable): Jinja templates for content
+# blocks, lists and tables, small Markdown builders, and summarizers for files and
+# wheel listings. Import compiles the module level templates.
 from __future__ import annotations
 
 import logging
@@ -53,12 +57,18 @@ _TPL_TABLE = Template(
 
 
 def gh_summary_path() -> Path | None:
+    # [FUNCTION DOC] Read GITHUB_STEP_SUMMARY and return it as a Path, or None when it
+    # is unset or empty.
     """Return the Path to the GitHub step summary file, or None if not set."""
     p = os.environ.get("GITHUB_STEP_SUMMARY")
     return Path(p) if p else None
 
 
 def write_gh_step_summary(md: str, *, append_content: bool = True) -> bool:
+    # [FUNCTION DOC] Write dedented, stripped Markdown plus a trailing newline to the
+    # step summary file, appending by default or truncating when append_content is
+    # false (UTF-8). Returns False after logging when the variable is unset, else True.
+    # I/O errors propagate.
     """
     Write Markdown content to the GitHub Step Summary file if GITHUB_STEP_SUMMARY is set.
     append_content: default true, if True, append to the end of the file, else overwrite the whole file
@@ -81,11 +91,14 @@ def write_gh_step_summary(md: str, *, append_content: bool = True) -> bool:
 
 
 def md_heading(text: str, level: int = 2) -> str:
+    # [FUNCTION DOC] Return a Markdown heading line; level is clamped to 1 through 6.
     """Generate a Markdown heading string with the given level (1-6)."""
     return f"{'#' * max(1, min(level, 6))} {text}\n"
 
 
 def md_details(summary: str, content: str) -> str:
+    # [FUNCTION DOC] Return a collapsible details block with the given summary line and
+    # body text (no escaping is applied).
     """Generate a collapsible <details> block with a summary and inner content."""
     return f"<details>\n<summary>{summary}</summary>\n\n{content}\n\n</details>\n"
 
@@ -96,6 +109,10 @@ def summarize_content_from_file(
     title: str = "Content from file",
     code_lang: str = "",  # e.g. "text" or "ini"
 ) -> bool:
+    # [FUNCTION DOC] Append the stripped text of a file in output_dir to the step
+    # summary as a titled fenced block with the given language tag. Returns False if
+    # the file does not exist; otherwise the result of the summary write (False when
+    # not running in GitHub Actions).
     f = Path(output_dir) / freeze_file
     if not f.exists():
         return False
@@ -105,6 +122,9 @@ def summarize_content_from_file(
 
 
 def summarize_wheels(path: Path, title: str = "Wheels", max_depth: int = 3):
+    # [FUNCTION DOC] Find wheels under path (up to max_depth levels, via get_wheels)
+    # and append a titled bullet list of them to the step summary. Returns False when
+    # no wheels are found, else the summary write result.
     items = get_wheels(path, max_depth=max_depth)
     if not items:
         return False
@@ -113,6 +133,9 @@ def summarize_wheels(path: Path, title: str = "Wheels", max_depth: int = 3):
 
 
 def md_kv_table(rows: Iterable[Mapping[str, str | int | float]]) -> str:
+    # [FUNCTION DOC] Render mappings as a Markdown table whose columns are the union of
+    # all keys; missing cells are empty. Returns a placeholder line when there are no
+    # rows. KNOWN ISSUE: column order comes from a set, so it is not deterministic.
     """
     Render a list of dicts as a Markdown table using Jinja template.
     """
@@ -127,6 +150,9 @@ def render_list(
     *,
     title: str = "List",
 ) -> str:
+    # [FUNCTION DOC] Render a titled bullet list where each item shows its pkg and
+    # relpath attributes (a placeholder line when empty). KNOWN ISSUE: the annotation
+    # says strings but the template needs objects with those two attributes.
     tpl = _TPL_LIST_ITEMS
     md = tpl.render(title=title, items=items)
     return md
@@ -138,6 +164,8 @@ def render_content(
     title: str = "Content",
     lang: str = "text",
 ) -> str:
+    # [FUNCTION DOC] Render a titled heading followed by the content in a fenced code
+    # block tagged with lang.
     tpl = _TPL_CONTENT
     md = tpl.render(title=title, content=content, lang=lang)
     return md

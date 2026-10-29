@@ -1,5 +1,8 @@
 # main.py
 
+# [MODULE DOC] Entry point of the lumen CLI (run as a module with python -m cli.run).
+# Builds the top-level argument parser, lets the build and test packages register their
+# subcommands, then dispatches to the selected runner. No import-time side effects.
 import argparse
 import logging
 
@@ -12,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    # [FUNCTION DOC] Parse the command line (global log level option plus the build and
+    # test command trees), configure logging at the requested level (falls back to INFO
+    # for unknown names) and call the handler stored on the parsed arguments; prints the
+    # help text if no handler exists. Exits via argparse on invalid arguments.
     # Define top-level parser
     parser = argparse.ArgumentParser(description="Lumos CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)

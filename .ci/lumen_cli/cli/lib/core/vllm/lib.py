@@ -1,3 +1,8 @@
+# [MODULE DOC] Shared functions for the vLLM CI targets: loading the YAML test library,
+# merging the lists of disabled tests from a local YAML file and a GitHub issue,
+# validating sharding, running a test plan with retry and deselect flags injected into
+# pytest commands, cloning vLLM, and writing a build summary. Import compiles a Jinja
+# template and defines constants only.
 from __future__ import annotations
 
 import json
@@ -29,6 +34,9 @@ _DISABLED_VLLM_TESTS_ISSUE = 175899
 
 
 def _load_vllm_test_library_yaml() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Parse the vLLM test library YAML next to this module and
+    # return it. Raises FileNotFoundError if missing. Despite the local variable name,
+    # nothing is cached; the file is read on every call.
     """
     Load the VLLM test library configuration from YAML file.
 
@@ -58,6 +66,8 @@ _TPL_VLLM_INFO = Template(
 
 
 def sample_vllm_test_library() -> dict[str, Any]:
+    # [FUNCTION DOC] Return the parsed vLLM test library mapping (test plan name to plan
+    # definition with title, steps, packages, environment and optional parallelism).
     """
     Load the VLLM test library configuration from YAML file.
 
@@ -72,6 +82,12 @@ def sample_vllm_test_library() -> dict[str, Any]:
 
 
 def check_parallelism(tests: Any, title: str, shard_id: int = 0, num_shards: int = 0):
+    # [FUNCTION DOC] Decide whether a plan is sharded: true when its parallelism value
+    # exceeds one. In that case validate the request: raises RuntimeError if shard_id
+    # is greater than num_shards or if num_shards differs from the plan's parallelism.
+    # Returns False for non-parallel plans.
+    # KNOWN ISSUE: the shard id check uses greater-than, so an id equal to the shard
+    # count passes although valid ids would be below it.
     """
     a method to check if the test plan is parallelism or not.
     """
@@ -95,6 +111,9 @@ def check_parallelism(tests: Any, title: str, shard_id: int = 0, num_shards: int
 
 
 def _load_disabled_vllm_tests_from_yaml() -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Read the disabled tests list from the local YAML file.
+    # Returns an empty list when the file, the key or the entries are missing. Raises
+    # ValueError if an entry lacks the test or issue key.
     if not _DISABLED_VLLM_TESTS_PATH.exists():
         return []
     with open(_DISABLED_VLLM_TESTS_PATH, encoding="utf-8") as f:
@@ -113,6 +132,8 @@ def _load_disabled_vllm_tests_from_yaml() -> list[dict[str, Any]]:
 
 
 def _parse_disabled_tests_from_issue_body(body: str) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Find the first fenced yaml block in an issue body, parse it
+    # and return its disabled tests list; empty list if there is no block or key.
     match = re.search(r"```yaml\s*\n(.*?)```", body, re.DOTALL)
     if not match:
         return []
@@ -124,6 +145,10 @@ def _parse_disabled_tests_from_issue_body(body: str) -> list[dict[str, Any]]:
 
 
 def _load_disabled_vllm_tests_from_github() -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Fetch the tracking GitHub issue through the REST API
+    # (30 second timeout, optional token from the environment) and parse its disabled
+    # tests; entries without a test key are dropped and a missing issue field defaults
+    # to the issue URL. Any failure is logged as a warning and yields an empty list.
     if not _DISABLED_VLLM_TESTS_ISSUE:
         return []
     url = f"https://api.github.com/repos/pytorch/pytorch/issues/{_DISABLED_VLLM_TESTS_ISSUE}"
@@ -153,6 +178,8 @@ def _load_disabled_vllm_tests_from_github() -> list[dict[str, Any]]:
 
 
 def _load_disabled_vllm_tests() -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Merge disabled tests from the YAML file and the GitHub
+    # issue, de-duplicated by test identifier with the file entries taking priority.
     yaml_entries = _load_disabled_vllm_tests_from_yaml()
     github_entries = _load_disabled_vllm_tests_from_github()
     seen = {e["test"] for e in yaml_entries}
@@ -167,6 +194,10 @@ def _load_disabled_vllm_tests() -> list[dict[str, Any]]:
 def _build_disabled_test_flags(
     disabled_tests: list[dict[str, Any]], test_plan: str
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build a space separated string of pytest options for the
+    # disabled tests that apply to the plan (entries with a configs list apply only if
+    # it contains the plan). Identifiers containing a double colon become deselect
+    # options; others become ignore options.
     flags = []
     for entry in disabled_tests:
         configs = entry.get("configs")
@@ -187,6 +218,15 @@ def run_test_plan(
     shard_id: int = 0,
     num_shards: int = 0,
 ):
+    # [FUNCTION DOC] Run the shell steps of a test plan. Raises RuntimeError for an
+    # unknown plan. Validates sharding and substitutes the shard placeholders in the
+    # title and steps. Installs the plan's packages with uv preferred, then in the plan
+    # working directory (default tests) and environment runs each step through the
+    # shell. In steps containing the word pytest, injects disabled-test flags and
+    # rerun options (count and delay from environment variables with defaults). All
+    # steps run; raises RuntimeError at the end if any failed.
+    # KNOWN ISSUE: the match is a plain substring, so any step mentioning pytest
+    # anywhere (for example installing it) is rewritten at its first occurrence.
     """
     a method to run list of tests based on the test plan.
     """
@@ -262,6 +302,8 @@ def run_test_plan(
 
 
 def clone_vllm(dst: str = "vllm"):
+    # [FUNCTION DOC] Clone the vLLM repository with submodules into dst at the pinned
+    # commit (replacing an existing directory) and return the commit id.
     _, commit = clone_external_repo(
         target="vllm",
         repo="https://github.com/vllm-project/vllm.git",
@@ -272,6 +314,9 @@ def clone_vllm(dst: str = "vllm"):
 
 
 def replace_buildkite_placeholders(step: str, shard_id: int, num_shards: int) -> str:
+    # [FUNCTION DOC] Replace the Buildkite parallel job count and parallel job index
+    # placeholders in a step with the given numbers, handling the longer placeholder
+    # first so the shorter one does not clobber it. Returns the new string.
     mapping = {
         "$$BUILDKITE_PARALLEL_JOB_COUNT": str(num_shards),
         "$$BUILDKITE_PARALLEL_JOB": str(shard_id),
@@ -282,6 +327,9 @@ def replace_buildkite_placeholders(step: str, shard_id: int, num_shards: int) ->
 
 
 def summarize_build_info(vllm_commit: str) -> bool:
+    # [FUNCTION DOC] Append a Markdown summary with links to the vLLM commit and, if
+    # GITHUB_SHA is set, the PyTorch commit to the GitHub step summary. Returns whether
+    # it was written (False outside GitHub Actions).
     torch_sha = os.getenv("GITHUB_SHA")
     md = (
         _TPL_VLLM_INFO.render(vllm_commit=vllm_commit, torch_sha=torch_sha).strip()

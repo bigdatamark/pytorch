@@ -1,3 +1,6 @@
+# [MODULE DOC] Registers the build subcommand of the lumen CLI. Holds a mapping from
+# external target names (currently vllm) to runner specs and a function that wires
+# them into an argparse subparser tree. Import has no side effects beyond a logger.
 from __future__ import annotations
 
 import argparse  # noqa: TC003
@@ -21,6 +24,10 @@ _TARGETS: dict[str, TargetSpec] = {
 
 
 def register_build_commands(subparsers: argparse._SubParsersAction) -> None:
+    # [FUNCTION DOC] Add the build command to the given subparsers object, with a
+    # required nested build_command choice. Adds an external subcommand whose help
+    # lists the known targets, then registers each target of the mapping under it.
+    # Mutates the parser tree only; returns nothing.
     build_parser = subparsers.add_parser(
         "build",
         help="Build related commands",

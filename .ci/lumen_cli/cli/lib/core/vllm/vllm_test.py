@@ -1,3 +1,7 @@
+# [MODULE DOC] Test runner for the vLLM CI target: parameters for locating torch and vLLM
+# wheels, the runner that clones vLLM, installs wheels and test dependencies, sets the
+# required environment and runs a test plan, plus helpers to rewrite the test
+# requirements and check installed versions. Import computes the repository scripts path.
 import logging
 import os
 import re
@@ -31,6 +35,9 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[6] / ".github" / "scripts"
 
 
 def _stable_torch_backend() -> str:
+    # [FUNCTION DOC] HELPER: Return the uv torch backend name (cu plus the stable CUDA
+    # version without dots), importing CUDA_STABLE from the repository scripts
+    # directory, which is added to the module search path as a side effect.
     # The uv --torch-backend channel must match the CUDA toolchain of the
     # build, so reuse CUDA_STABLE from generate_binary_build_matrix.py (the
     # single source of truth for the stable CUDA version, e.g. "13.0" -> cu130)
@@ -44,6 +51,9 @@ def _stable_torch_backend() -> str:
 
 @dataclass
 class VllmTestParameters:
+    # [CLASS DOC] Dataclass of vLLM test inputs read from environment variables at
+    # creation: torch wheel directory, vLLM wheel directory, CUDA arch list and the
+    # cleaning script path. Invariant: both wheel directories exist (checked on creation).
     """
     Parameters defining the vllm external test input
 
@@ -65,6 +75,7 @@ class VllmTestParameters:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC] Raise ValueError if the torch or vLLM wheel directory is missing.
         if not self.torch_whls_path.exists():
             raise ValueError("missing torch_whls_path")
         if not self.vllm_whls_path.exists():
@@ -72,12 +83,23 @@ class VllmTestParameters:
 
 
 class TestInpuType(Enum):
+    # [CLASS DOC] Enumeration of how the test input is given: a named test plan or
+    # unknown. KNOWN ISSUE: the name is misspelled and the Test prefix may make test
+    # collectors pick it up.
     TEST_PLAN = "test_plan"
     UNKNOWN = "unknown"
 
 
 class VllmTestRunner(BaseRunner):
+    # [CLASS DOC] Runner for the vllm test target. State: work_directory, test_plan,
+    # test_type, shard_id and num_shards from the arguments, and glob patterns for the
+    # torch, torchvision, torchaudio and vLLM wheels. Key methods: prepare builds the
+    # environment, run executes the plan, with install helpers underneath.
     def __init__(self, args: Any):
+        # [FUNCTION DOC] Store shard settings and the test plan from the parsed
+        # arguments (type becomes test plan only if a plan is given) and define the
+        # wheel glob patterns and extra torch package. Does not call the base
+        # initializer, so args itself is not stored (KNOWN ISSUE).
         self.work_directory = "vllm"
         self.test_plan = ""
         self.test_type = TestInpuType.UNKNOWN
@@ -103,6 +125,10 @@ class VllmTestRunner(BaseRunner):
         ]
 
     def prepare(self):
+        # [FUNCTION DOC] Build the test environment: read parameters, set environment
+        # variables, clone vLLM, copy the cleaning script, then in the checkout remove
+        # its source package directory, install wheels and dependencies; finally log
+        # package versions. Raises on invalid parameters or missing secrets.
         """
         prepare test environment for vllm. This includes clone vllm repo, install all wheels, test dependencies and set env
         """
@@ -121,6 +147,9 @@ class VllmTestRunner(BaseRunner):
         check_versions()
 
     def run(self):
+        # [FUNCTION DOC] Prepare, then in the checkout run the selected test plan
+        # (sharded arguments passed only if more than one shard). Raises ValueError for
+        # an unknown input type. Package versions are logged afterwards even on failure.
         """
         main function to run vllm test
         """
@@ -147,11 +176,16 @@ class VllmTestRunner(BaseRunner):
             check_versions()
 
     def cp_torch_cleaning_script(self, params: VllmTestParameters):
+        # [FUNCTION DOC] Copy the cleaning script into the checkout root as
+        # use_existing_torch.py.
         script = get_path(params.cleaning_script, resolve=True)
         vllm_script = Path(f"./{self.work_directory}/use_existing_torch.py")
         copy(script, vllm_script)
 
     def _install_wheels(self, params: VllmTestParameters):
+        # [FUNCTION DOC] HELPER: Install torch (with its extra package) from the local
+        # wheel directory if torch is not already installed, then the torchvision and
+        # torchaudio wheels and the vLLM wheel, each the first match of its pattern.
         logger.info("Running vllm test with inputs: %s", params)
         if not pkg_exists("torch"):
             # install torch from local whls if it's not installed yet.
@@ -176,6 +210,10 @@ class VllmTestRunner(BaseRunner):
         logger.info("Done. Installed vllm wheels")
 
     def _install_test_dependencies(self):
+        # [FUNCTION DOC] HELPER: Rewrite the CUDA test requirements input to pin the
+        # local torch wheels, save the existing compiled requirements as a constraint
+        # snapshot, compile a new requirements file with uv using the stable torch
+        # backend, and install it. Runs subprocess commands.
         """
         This method replaces torch dependencies with local torch wheel info in
         requirements/test/cuda.in file from vllm repo. then generates the test.txt
@@ -198,6 +236,10 @@ class VllmTestRunner(BaseRunner):
         logger.info("Done. installed requirements for test dependencies")
 
     def _install_dependencies(self):
+        # [FUNCTION DOC] HELPER: Install the vLLM test utilities and hf_transfer, enable
+        # fast Hugging Face transfers through the process environment, run the vLLM
+        # script that strips torch from requirement files, install the common and build
+        # requirements, then the test dependencies.
         pip_install_packages(packages=["-e", "tests/vllm_test_utils"], prefer_uv=True)
         pip_install_packages(packages=["hf_transfer"], prefer_uv=True)
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -215,6 +257,10 @@ class VllmTestRunner(BaseRunner):
         self._install_test_dependencies()
 
     def _set_envs(self, inputs: VllmTestParameters):
+        # [FUNCTION DOC] HELPER: Set process environment variables: CUDA arch list, the
+        # inductor custom-op aliasing check off, and the Hugging Face token copied from
+        # a dedicated variable. Warns on unsupported arch values. Raises ValueError if
+        # the token or arch list is empty, or on CI when the Hugging Face home is unset.
         os.environ["TORCH_CUDA_ARCH_LIST"] = inputs.torch_cuda_arch_list
         # vLLM has known third-party custom ops with aliasing schemas.
         os.environ["TORCHINDUCTOR_ERROR_ON_CUSTOM_OP_ALIASING"] = "0"
@@ -246,6 +292,11 @@ def preprocess_test_in(
     target_file: str = "requirements/test/cuda.in",
     additional_packages: Iterable[str] = (),
 ):
+    # [FUNCTION DOC] Rewrite a requirements input file in place: drop lines pinning
+    # torch, torchvision, torchaudio or the extra packages (matched at line start with
+    # equals, at or greater-equal), and prepend the local file-URL pins for the torch
+    # packages found in the installed package listing from a pip subprocess.
+    # KNOWN ISSUE: the extra packages are inserted into a regex unescaped.
     """
     This modifies the target_file file in place in vllm work directory.
     It removes torch and unwanted packages in target_file and replace with local torch whls
@@ -289,11 +340,16 @@ def preprocess_test_in(
 
 
 def validate_cuda(value: str) -> bool:
+    # [FUNCTION DOC] True when every whitespace separated entry is a supported arch
+    # (8.0, 8.9 or 9.0); an empty string passes. KNOWN ISSUE: a semicolon separated
+    # list, as shown in the build docs, is rejected.
     VALID_VALUES = {"8.0", "8.9", "9.0"}
     return all(v in VALID_VALUES for v in value.split())
 
 
 def check_versions():
+    # [FUNCTION DOC] Log whether torch, torchvision, torchaudio and vllm are installed
+    # and their versions. Informational only; never fails.
     """
     check installed packages version
     """

@@ -1,3 +1,6 @@
+# [MODULE DOC] Registers the test subcommand of the lumen CLI. Holds the mapping of
+# external test targets (vllm, torchtitan) to their runners, the shared test options, and
+# the function wiring them into an argparse subparser tree. No import-time side effects.
 from __future__ import annotations
 
 import argparse  # noqa: TC003
@@ -25,6 +28,10 @@ _TARGETS: dict[str, TargetSpec] = {
 
 
 def common_args(parser: argparse.ArgumentParser) -> None:
+    # [FUNCTION DOC] Add the options shared by all test targets: shard id and number of
+    # shards (integers, both default 1) and a required test plan name (short and long
+    # form) placed in a mutually exclusive group. Mutates the parser only.
+    # KNOWN ISSUE: the shard id help suggests ids starting at zero, yet the default is 1.
     """
     Add common CLI arguments to the given parser.
     """
@@ -50,6 +57,10 @@ def common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def register_test_commands(subparsers: argparse._SubParsersAction) -> None:
+    # [FUNCTION DOC] Add the test command to the given subparsers object with a required
+    # nested test_command choice, an external subcommand whose help lists the known
+    # targets, and each target registered under it with the shared options. Mutates the
+    # parser tree only.
     build_parser = subparsers.add_parser(
         "test",
         help="test related commands",

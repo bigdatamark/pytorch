@@ -1,3 +1,5 @@
+# [MODULE DOC] Unit tests for docker_helper using mock clients: image existence results
+# for found, not-found and API-error cases, and the lazily created shared client.
 import unittest
 from unittest import mock
 from unittest.mock import MagicMock
@@ -7,13 +9,18 @@ from cli.lib.common.docker_helper import _get_client, local_image_exists
 
 
 class TestDockerImageHelpers(unittest.TestCase):
+    # [CLASS DOC] Test case for the docker helper functions; every test starts with the
+    # module level client singleton reset to unset.
     def setUp(self):
+        # [FUNCTION DOC] Patch the singleton client variable to None for the test and
+        # register cleanup to restore it.
         # Reset the singleton in the target module
         patcher = mock.patch("cli.lib.common.docker_helper._docker_client", None)
         self.addCleanup(patcher.stop)
         patcher.start()
 
     def test_local_image_exists_true(self):
+        # [FUNCTION DOC] A client whose lookup succeeds yields True.
         # Mock a docker client whose images.get returns an object (no exception)
         mock_client = MagicMock()
         mock_client.images.get.return_value = object()
@@ -21,6 +28,7 @@ class TestDockerImageHelpers(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_local_image_exists_not_found_false(self):
+        # [FUNCTION DOC] A client whose lookup raises the not-found error yields False.
         mock_client = MagicMock()
         # Raise docker.errors.NotFound
         mock_client.images.get.side_effect = derr.NotFound("nope")
@@ -28,6 +36,7 @@ class TestDockerImageHelpers(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_local_image_exists_api_error_false(self):
+        # [FUNCTION DOC] A client whose lookup raises a Docker API error yields False.
         mock_client = MagicMock()
         mock_client.images.get.side_effect = derr.APIError("boom", None)
 
@@ -35,6 +44,8 @@ class TestDockerImageHelpers(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_local_image_exists_uses_lazy_singleton(self):
+        # [FUNCTION DOC] With the environment client factory mocked, calling the client
+        # getter twice must create the client once and return the same cached object.
         # Patch docker.from_env used by _get_client()
         with mock.patch(
             "cli.lib.common.docker_helper.docker.from_env"
@@ -53,6 +64,9 @@ class TestDockerImageHelpers(unittest.TestCase):
             mock_from_env.assert_called_once()  # still once
 
     def test_local_image_exists_without_client_param_calls_get_client_once(self):
+        # [FUNCTION DOC] With the client getter mocked, two image checks without an
+        # explicit client must each call the getter and look up each image name once.
+        # KNOWN ISSUE: the test name says called once but the assertion expects two calls.
         # Ensure _get_client is called and cached; local_image_exists should reuse it
         with mock.patch("cli.lib.common.docker_helper._get_client") as mock_get_client:
             mock_client = MagicMock()

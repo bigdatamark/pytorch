@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers that install Python packages with pip or uv, run the current
+# interpreter, test whether a package is installed, and pick a wheel file by glob.
+# Commands run through run_command; no import-time side effects.
 from __future__ import annotations
 
 import glob
@@ -22,6 +25,10 @@ def pip_install_packages(
     constraints: str | None = None,
     prefer_uv: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Run an install command with the current interpreter, using uv if
+    # prefer_uv is set and uv is on the path, else pip. Adds optional requirements and
+    # constraints files and the package names, logs the quoted command and runs it with
+    # the optional extra environment. Raises CalledProcessError on failure.
     use_uv = prefer_uv and shutil.which("uv") is not None
     base = (
         [sys.executable, "-m", "uv", "pip", "install"]
@@ -39,6 +46,8 @@ def pip_install_packages(
 
 
 def pip_install_first_match(pattern: str, extras: str | None = None, pref_uv=False):
+    # [FUNCTION DOC] Install the first (alphabetically) file matching the glob pattern,
+    # optionally with an extras suffix. Raises FileNotFoundError if nothing matches.
     wheel = first_matching_pkg(pattern)
     target = f"{wheel}[{extras}]" if extras else wheel
     logger.info("Installing %s...", target)
@@ -46,6 +55,8 @@ def pip_install_first_match(pattern: str, extras: str | None = None, pref_uv=Fal
 
 
 def run_python(args: str | list[str], env=None):
+    # [FUNCTION DOC] Run the current interpreter with args (a string is split shell
+    # style) and optional extra environment; raises CalledProcessError on failure.
     """
     Run the python in the current environment.
     """
@@ -56,6 +67,8 @@ def run_python(args: str | list[str], env=None):
 
 
 def pkg_exists(name: str) -> bool:
+    # [FUNCTION DOC] Report (and log) whether the distribution is installed, by looking
+    # up its metadata version; returns True or False.
     try:
         pkg_version = version(name)
         logger.info("%s already exist with version: %s", name, pkg_version)
@@ -66,6 +79,8 @@ def pkg_exists(name: str) -> bool:
 
 
 def first_matching_pkg(pattern: str) -> str:
+    # [FUNCTION DOC] Return the alphabetically first path matching the glob pattern;
+    # raises FileNotFoundError when there is no match.
     matches = sorted(glob.glob(pattern))
     if not matches:
         raise FileNotFoundError(f"No wheel matching: {pattern}")

@@ -1,3 +1,7 @@
+# [MODULE DOC] Build runner for vLLM: a parameter dataclass populated from environment
+# variables and a runner that prepares the vLLM checkout (torch cleaning script, optional
+# Dockerfile and torch wheels) and runs a docker buildx build, then writes a GitHub
+# step summary. No import-time side effects beyond constants and a logger.
 from __future__ import annotations
 
 import logging
@@ -42,6 +46,11 @@ _VLLM_TEMP_FOLDER = "tmp"
 
 @dataclass
 class VllmBuildParameters:
+    # [CLASS DOC] Dataclass of vLLM build inputs. Each field default is read from an
+    # environment variable when an instance is created: torch wheel usage and path,
+    # local base image, local Dockerfile, cleaning script, output directory and the
+    # docker build arguments (target stage, tag, CUDA and Python versions, job count,
+    # sccache bucket and region, CUDA arch list). Invariant: validated on creation.
     """
     Parameters defining the vllm external input configurations.
     Combine with VllmDockerBuildArgs to define the vllm build environment
@@ -93,6 +102,11 @@ class VllmBuildParameters:
     torch_cuda_arch_list: str = env_str_field("TORCH_CUDA_ARCH_LIST", "8.9")
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validate inputs after creation. For each enabled flag (torch
+        # wheels, local base image, local Dockerfile) the matching resource must be
+        # set and exist (path exists, or image exists locally), otherwise raises
+        # ValueError with a message; disabled flags only log. Also raises ValueError
+        # if the output directory is empty.
         checks = [
             (
                 self.use_torch_whl,  # flag
@@ -129,6 +143,11 @@ class VllmBuildParameters:
 
 @with_params_help(VllmBuildParameters)
 class VllmBuildRunner(BaseRunner):
+    # [CLASS DOC] Runner for the vllm build target. State: work_directory (the vllm
+    # checkout directory). The decorator appends a table of VllmBuildParameters
+    # defaults to the docstring. Key methods: run orchestrates the build, the cp_*
+    # methods stage files into the checkout, and the underscore methods build the
+    # docker command.
     """
     Build vLLM using docker buildx.
 
@@ -153,9 +172,18 @@ class VllmBuildRunner(BaseRunner):
     """
 
     def __init__(self, args=None):
+        # [FUNCTION DOC] Set the work directory name to vllm; args are ignored.
+        # KNOWN ISSUE: does not call the base initializer, so args is never stored.
         self.work_directory = "vllm"
 
     def run(self):
+        # [FUNCTION DOC] Run the whole build: read and validate parameters from the
+        # environment, clone vLLM, stage the cleaning script, Dockerfile and torch
+        # wheels into the checkout, ensure the output directory exists, and run the
+        # docker buildx command in the checkout. A summary is always attempted
+        # afterwards. Raises on invalid inputs or build failure.
+        # KNOWN ISSUE: the command runs in a hard coded directory named vllm rather
+        # than the work_directory attribute.
         """
         main function to run vllm build
         1. prepare vllm build environment
@@ -185,6 +213,10 @@ class VllmBuildRunner(BaseRunner):
     def genearte_vllm_build_summary(
         self, vllm_commit: str, inputs: VllmBuildParameters
     ):
+        # [FUNCTION DOC] Write the GitHub step summary: commit info, the build summary
+        # text file from the output wheels directory, and lists of torch and vLLM
+        # wheels. Skips with a log message when no summary file variable is set.
+        # KNOWN ISSUE: the method name is misspelled (genearte).
         if not gh_summary_path():
             return logger.info("Skipping, not detect GH Summary env var....")
         logger.info("Generate GH Summary ...")
@@ -204,6 +236,9 @@ class VllmBuildRunner(BaseRunner):
         summarize_wheels(vllm_artifact_dir, max_depth=3, title="Vllm Wheels Artifacts")
 
     def cp_torch_whls_if_exist(self, inputs: VllmBuildParameters) -> str:
+        # [FUNCTION DOC] When local torch wheels are enabled, recreate an empty temp
+        # folder inside the checkout and copy the wheels directory into it; returns
+        # that folder path, or an empty string when disabled. Deletes the old folder.
         if not inputs.use_torch_whl:
             return ""
         tmp_dir = f"./{self.work_directory}/{_VLLM_TEMP_FOLDER}"
@@ -213,11 +248,15 @@ class VllmBuildRunner(BaseRunner):
         return tmp_dir
 
     def cp_torch_cleaning_script(self, inputs: VllmBuildParameters):
+        # [FUNCTION DOC] Copy the torch-dependency cleaning script into the checkout
+        # root under the name use_existing_torch.py. Raises if the script is missing.
         script = get_path(inputs.cleaning_script, resolve=True)
         vllm_script = Path(f"./{self.work_directory}/use_existing_torch.py")
         copy(script, vllm_script)
 
     def cp_dockerfile_if_exist(self, inputs: VllmBuildParameters):
+        # [FUNCTION DOC] If a local Dockerfile is enabled, copy it over the checkout's
+        # nightly torch Dockerfile; otherwise log that the vLLM default is used.
         if not inputs.use_local_dockerfile:
             logger.info("using vllm default dockerfile.torch_nightly for build")
             return
@@ -228,6 +267,8 @@ class VllmBuildRunner(BaseRunner):
         copy(dockerfile_path, vllm_torch_dockerfile)
 
     def get_result_path(self, path):
+        # [FUNCTION DOC] Return the absolute resolved form of path, defaulting to the
+        # shared results directory when empty. Not used elsewhere in this module.
         """
         Get the absolute path of the result path
         """
@@ -237,11 +278,17 @@ class VllmBuildRunner(BaseRunner):
         return abs_path
 
     def _get_torch_wheel_path_arg(self, torch_whl_dir: Path | None) -> str:
+        # [FUNCTION DOC] HELPER: Return the docker build argument pointing at the temp
+        # folder for torch wheels, or an empty string when no wheel directory is given.
         if not torch_whl_dir:
             return ""
         return f"--build-arg TORCH_WHEELS_PATH={_VLLM_TEMP_FOLDER}"
 
     def _get_base_image_args(self, inputs: VllmBuildParameters) -> tuple[str, str, str]:
+        # [FUNCTION DOC] HELPER: Compute docker arguments for a local base image: the
+        # build base and final base image arguments and a no-pull flag when the image
+        # exists locally. Returns three empty strings when local base image is off.
+        # KNOWN ISSUE: the log call formats a one element set instead of the name.
         """
         Returns:
             - base_image_arg: docker buildx arg string for base image
@@ -269,6 +316,11 @@ class VllmBuildRunner(BaseRunner):
         self,
         inputs: VllmBuildParameters,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Assemble the multi-line docker buildx command text:
+        # local exporter output to the output directory, the nightly torch Dockerfile,
+        # pull flag, torch and base image arguments, build args for jobs, CUDA, Python,
+        # sccache (enabled only when both bucket and region are set) and arch list,
+        # target stage, tag and plain progress. Returns it dedented and stripped.
         base_image_arg, final_base_image_arg, pull_flag = self._get_base_image_args(
             inputs
         )
