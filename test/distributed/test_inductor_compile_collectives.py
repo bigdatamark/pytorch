@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the Inductor collective-functionalization passes
+# (_functionalize_inplace_collectives, _unbox_process_group_torchbinds) and the deepcopy hook
+# that shares process groups. Exits the process at import if torch.distributed is unavailable.
+# Tests use a single-rank gloo group backed by a FileStore.
 
 import copy
 import os
@@ -24,17 +28,28 @@ if not dist.is_available():
 
 
 def _f(t):
+    # [FUNCTION DOC] HELPER: Test function: clones the input, all-reduces the clone in place
+    # via dist.all_reduce on the default group, and returns the result plus one.
     t = t.clone()
     dist.all_reduce(t)
     return t + 1
 
 
 def _make_fx_with_allreduce():
+    # [FUNCTION DOC] HELPER: Traces the function _f with make_fx on a ones tensor of
+    # size 4 and returns the resulting GraphModule (contains in-place c10d allreduce_
+    # with torchbind objects).
     return make_fx(_f)(torch.ones(4))
 
 
 class TestInductorCompileCollectives(TestCase):
+    # [CLASS DOC] Tests the Inductor passes that turn in-place c10d collectives in traced FX
+    # graphs into functional collectives. Each test runs with a world-size-1 gloo process
+    # group created in setUp (file store in a temp file) and destroyed in tearDown.
     def setUp(self):
+        # [FUNCTION DOC] Sets default MASTER_ADDR/MASTER_PORT env vars, creates a temp file
+        # for a FileStore (path kept in _store_path), and initializes a gloo process group
+        # with rank 0 and world size 1.
         super().setUp()
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29516")
@@ -50,6 +65,9 @@ class TestInductorCompileCollectives(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the process group (ignoring an AssertionError if
+        # already destroyed), removes the temp store file if it exists, then calls
+        # the parent tearDown.
         try:
             dist.destroy_process_group()
         except AssertionError:
@@ -59,6 +77,10 @@ class TestInductorCompileCollectives(TestCase):
         super().tearDown()
 
     def test_functionalize_inplace_allreduce(self):
+        # [FUNCTION DOC] Checks the graph code of a make_fx-traced all_reduce before and after
+        # _functionalize_inplace_collectives: the in-place allreduce_ call becomes functional
+        # all_reduce + wait_tensor + copy_, with the reduce op baked in as the string sum and
+        # the dead ReduceOp torchbind attribute removed (the process group get_attr remains).
         gm = _make_fx_with_allreduce()
         self.assertExpectedInline(
             gm.code.strip(),
@@ -95,6 +117,9 @@ def forward(self, t_1):
         )
 
     def test_unbox_process_group_torchbinds(self):
+        # [FUNCTION DOC] Verifies _unbox_process_group_torchbinds replaces the module
+        # attribute from a torch.ScriptObject with a Python dist.ProcessGroup, and the module
+        # still computes the same result as the eager function on a sample input.
         # ``_unbox_process_group_torchbinds`` flips the gm attr from a
         # torchbind ScriptObject to a Python ``dist.ProcessGroup`` (the
         # form Inductor's collective lowering and runtime ops accept).
@@ -111,6 +136,9 @@ def forward(self, t_1):
         self.assertEqual(gm(x), _f(x))
 
     def test_post_pass_gm_deepcopy(self):
+        # [FUNCTION DOC] Verifies that after functionalize and unbox, a deepcopy of the
+        # GraphModule made inside _share_torchbind_and_process_group_on_deepcopy shares the
+        # same process group object (identity) with the original.
         # After functionalize + unbox the gm holds a Python ``dist.ProcessGroup``
         # — still not pickleable, but ``_share_torchbind_and_process_group_on_deepcopy()``
         # makes the gm deepcopy-safe by sharing the PG by reference.
@@ -125,12 +153,18 @@ def forward(self, t_1):
         self.assertIs(gm._torchbind_obj0, gm2._torchbind_obj0)
 
     def test_multi_allreduce_make_fx_and_compile(self):
+        # [FUNCTION DOC] Checks two all_reduce calls: make_fx plus the functionalize pass
+        # yields two independent functional all_reduce chains (golden code), and torch.compile
+        # with an aot_autograd backend capturing the forward graph (fullgraph) yields the same
+        # per-call structure, with the captured graph count being exactly one.
         # Two ``dist.all_reduce`` calls. Verify that:
         #   1) our pass on a make_fx-traced graph produces N independent
         #      ``_c10d_functional.all_reduce`` chains, and
         #   2) Dynamo + AOT autograd produce the same per-call structure
         #      (the canonical shape — no batched form).
         def g(t0, t1):
+            # [FUNCTION DOC] HELPER: Clones both inputs, all-reduces each in place,
+            # returns their sum.
             t0 = t0.clone()
             t1 = t1.clone()
             dist.all_reduce(t0)
@@ -165,6 +199,8 @@ def forward(self, t0_1, t1_1):
         captured: list[str] = []
 
         def fw_compiler(fx_g, _):
+            # [FUNCTION DOC] HELPER: AOT forward compiler hook: records the stripped graph
+            # code in the enclosing captured list and returns the graph module unchanged.
             captured.append(fx_g.code.strip())
             return fx_g
 
@@ -193,6 +229,10 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_regional_inductor_with_dist_all_reduce(self):
+        # [FUNCTION DOC] End-to-end check: marks every non-placeholder/output node of the
+        # traced graph with custom compile_with_inductor metadata, runs regional_inductor
+        # under a TracingContext using the placeholder's fake mode, and asserts the compiled
+        # module output equals the eager result.
         # End-to-end via ``regional_inductor`` → ``standalone_compile``,
         # which now wires functionalize + unbox + the deepcopy hook.
         gm = _make_fx_with_allreduce()

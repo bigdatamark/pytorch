@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test for torch.distributed.launch: launches a 4-process single-node job with
+# the spawn start method on a free local port, running bin/test_script.py. Exits at import if
+# distributed is unavailable or when running under dev-dbg ASAN.
 
 import os
 import sys
@@ -21,6 +24,8 @@ from torch.testing._internal.common_utils import (
 
 
 def path(script):
+    # [FUNCTION DOC] HELPER: Returns the absolute path of a script name relative to this
+    # test file's directory.
     return os.path.join(os.path.dirname(__file__), script)
 
 
@@ -33,6 +38,10 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 class TestDistributedLaunch(TestCase):
     def test_launch_user_script(self):
+        # [FUNCTION DOC] Picks a free port by binding a socket and closing it, then calls
+        # torch.distributed.launch main with arguments for 1 node, 4 processes per node, spawn
+        # start, localhost master, node rank 0 and the use-env flag, running
+        # bin/test_script.py. Passes if the launcher returns without raising.
         nnodes = 1
         nproc_per_node = 4
         sock = get_socket_with_port()

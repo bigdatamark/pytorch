@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for LocalTensor and LocalTensorMode (torch.distributed._local_tensor),
+# which simulate multiple ranks inside one process using a fake process group. Covers
+# LocalTensor construction rules, LocalIntNode symbolic ints, rank_map and tensor_map,
+# collectives (all_reduce, broadcast, all_gather, all_to_all_single, reduce_scatter,
+# all_gather_into_tensor), DTensor operations under the mode, compile_on_one_rank, and
+# LocalRunnerMode with point-to-point pipeline communication. Defines base classes that run
+# per-rank or whole-world tests for several world sizes.
 
 from contextlib import nullcontext
 
@@ -35,7 +42,18 @@ from torch.testing._internal.distributed._tensor.common_dtensor import reduce_lo
 
 
 class LocalTensorTestBase(TestCase):
+    # [CLASS DOC] Base test case for LocalTensor tests. Overrides assertEqual to compare
+    # LocalTensors per rank (with the active LocalTensorMode disabled) and requires subclasses
+    # to define world_size.
     def assertEqual(self, lhs, rhs, **kwargs):
+        # [FUNCTION DOC] Compares lhs and rhs with LocalTensorMode temporarily disabled if one
+        # is active. Two LocalTensors must have equal rank sets and equal local tensors on
+        # each rank; a LocalTensor vs a plain value is compared per rank against that value;
+        # otherwise defers to the normal assertEqual with the extra keyword arguments (only
+        # that final path forwards them and returns its result).
+        # KNOWN ISSUE: the inner check that both operands are LocalTensor in the first branch
+        #   can never fail because the branch condition already guarantees it; extra keyword
+        #   arguments are ignored for LocalTensor comparisons.
         mode = local_tensor_mode()
         with nullcontext() if mode is None else mode.disable():
             if isinstance(lhs, LocalTensor) and isinstance(rhs, LocalTensor):
@@ -59,29 +77,48 @@ class LocalTensorTestBase(TestCase):
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Abstract property: raises NotImplementedError; subclasses override it
+        # (typically with a class attribute).
         raise NotImplementedError("override world-size in your subclass")
 
     def build_device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Builds a CPU device mesh with a single dimension of size world_size
+        # via init_device_mesh and returns it.
         return init_device_mesh("cpu", (self.world_size,))
 
 
 class LocalTensorRankTest(LocalTensorTestBase):
+    # [CLASS DOC] Base for tests where a real fake-backend process group is re-initialized for
+    # every rank and the test body then sees a plain rank (self.rank), without
+    # LocalTensorMode. State: _current_rank. Cleans up the process group on tearDown.
     def setUp(self):
+        # [FUNCTION DOC] Runs the parent setUp and sets the current rank to 0.
         super().setUp()
         self._current_rank = 0
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the parent tearDown and destroys the default process group if
+        # one is initialized.
         super().tearDown()
         if dist.is_initialized():
             dist.destroy_process_group()
 
     def run(self, result=None):
+        # [FUNCTION DOC] Overrides unittest run: replaces the test method on the instance with
+        # a wrapper that, for each rank in the world size, destroys any existing process
+        # group, initializes a fake-backend group with that rank and records the rank, then
+        # runs the original test once; then calls the parent run with the result.
+        # KNOWN ISSUE: the original test call is outside the rank loop, so the test body runs
+        #   only once, with the last rank, not once per rank as the comment suggests.
         # save the original test method
         test_name = self.id().split(".")[-1]
         original_test = getattr(self, test_name)
 
         # replace the original test with new test that loops ranks
         def rank_loop_wrapper():
+            # [FUNCTION DOC] HELPER: The replacement test body described in run:
+            # initializes the fake process group for each rank in turn, then invokes the
+            # saved original test method.
             for rank in range(self.world_size):
                 if dist.is_initialized():
                     dist.destroy_process_group()
@@ -96,6 +133,10 @@ class LocalTensorRankTest(LocalTensorTestBase):
 
     @property
     def rank(self):
+        # [FUNCTION DOC] Property: returns the current simulated rank. Raises
+        # AssertionError if no process group is initialized. Uses the stored value because
+        # dist.get_rank is patched inside LocalTensorMode to return a multi-rank symbolic
+        # int that cannot index dictionaries.
         if not dist.is_initialized():
             raise AssertionError("Process group is not initialized!")
         # Can't use dist.get_rank() because it is patched inside LocalTensorMode
@@ -105,7 +146,12 @@ class LocalTensorRankTest(LocalTensorTestBase):
 
 
 class LocalTensorWorldTest(LocalTensorTestBase):
+    # [CLASS DOC] Base for tests that initialize a single fake-backend process group (rank 0,
+    # world size from the subclass) in setUp and tear it down afterwards; tests typically
+    # enter LocalTensorMode themselves.
     def setUp(self):
+        # [FUNCTION DOC] Runs the parent setUp and initializes a fake process group with rank
+        # 0 and the subclass world size.
         super().setUp()
         torch.distributed.init_process_group(
             "fake",
@@ -114,6 +160,8 @@ class LocalTensorWorldTest(LocalTensorTestBase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the parent tearDown and destroys the process group, ignoring an
+        # AssertionError if there is none.
         super().tearDown()
         try:
             dist.destroy_process_group()
@@ -122,9 +170,14 @@ class LocalTensorWorldTest(LocalTensorTestBase):
 
 
 class TestLocalTensorWorld2(LocalTensorWorldTest):
+    # [CLASS DOC] LocalTensorMode tests with world size 2, covering LocalTensor validation,
+    # mode behavior, DTensor reductions on uneven and even shards, LocalIntNode operations,
+    # data_ptr and rank_map/tensor_map.
     world_size = 2
 
     def test_local_tensor_dtype_consistency(self):
+        # [FUNCTION DOC] Builds a LocalTensor from per-rank tensors with different dtypes and
+        # asserts AssertionError is raised.
         """Test that LocalTensor enforces dtype consistency."""
         device = torch.device("cpu")
         shape = (2, 3)
@@ -140,6 +193,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             LocalTensor(inconsistent_tensors)
 
     def test_local_tensor_creation_fails_with_grad_tensors(self):
+        # [FUNCTION DOC] Builds a LocalTensor from per-rank tensors that require grad and
+        # asserts AssertionError is raised.
         """Test that LocalTensor creation fails when local tensors have requires_grad=True."""
         device = torch.device("cpu")
         shape = (2, 3)
@@ -155,6 +210,9 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             LocalTensor(local_tensors)
 
     def test_local_tensor_mode(self):
+        # [FUNCTION DOC] Inside LocalTensorMode over the ranks of a LocalTensor, adding a
+        # scalar to it yields a LocalTensor, and a freshly created plain tensor and its result
+        # are also LocalTensors.
         """Test LocalTensorMode functionality."""
         device = torch.device("cpu")
         shape = (2, 3)
@@ -179,11 +237,15 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             self.assertIsInstance(regular_result, LocalTensor)
 
     def test_empty_local_tensors(self):
+        # [FUNCTION DOC] Constructing a LocalTensor from an empty mapping raises ValueError.
         """Test behavior with empty local tensors dict."""
         with self.assertRaises(ValueError):
             LocalTensor({})
 
     def test_scalar_mul_reduction_bug(self):
+        # [FUNCTION DOC] Regression smoke test: under LocalTensorMode, shards tensors on a
+        # mesh and computes sums multiplied by scalars (the last is printed, including a
+        # requires-grad input). It has no assertions beyond not raising.
         with LocalTensorMode(self.world_size):
             mesh = self.build_device_mesh()
 
@@ -197,6 +259,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             print(dt.sum() * 1, dt.sum() * 2, dt.sum() * 3)
 
     def test_uneven_sharding_mean_bug(self):
+        # [FUNCTION DOC] Shards a 3x4 tensor unevenly over two ranks; the mean of the DTensor
+        # has Replicate placement and its full tensor equals the plain mean.
         with LocalTensorMode(self.world_size):
             mesh = self.build_device_mesh()
             tensor = torch.arange(12).reshape(-1, 4).float()
@@ -209,6 +273,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             self.assertEqual(tensor.mean(), full)
 
     def test_uneven_sharding_prod(self):
+        # [FUNCTION DOC] Shards a 3x4 tensor of 1..12 unevenly; the DTensor prod's full tensor
+        # equals the plain product.
         with LocalTensorMode(self.world_size):
             mesh = self.build_device_mesh()
             tensor = (torch.arange(12) + 1).reshape(-1, 4).float()
@@ -220,6 +286,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             self.assertEqual(tensor.prod(), full)
 
     def test_even_sharding_mean_is_partial(self):
+        # [FUNCTION DOC] Shards a 4x4 tensor evenly; the mean's full tensor equals the plain
+        # mean and its placement is Partial with avg reduction.
         with LocalTensorMode(self.world_size):
             mesh = self.build_device_mesh()
             tensor = torch.arange(16).reshape(4, 4).float()
@@ -232,6 +300,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             self.assertEqual(mean.placements, [Partial("avg")])
 
     def test_local_int_node_sym_min(self):
+        # [FUNCTION DOC] sym_min of two LocalIntNodes gives the per-rank minimum (rank 0: 7,
+        # rank 1: 5).
         node1 = LocalIntNode({0: 10, 1: 5})
         node2 = LocalIntNode({0: 7, 1: 8})
         result = node1.sym_min(node2)
@@ -239,12 +309,16 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
         self.assertEqual(result._local_ints[1], 5)
 
     def test_local_int_node_le(self):
+        # [FUNCTION DOC] The le comparison of two LocalIntNodes, true on every
+        # rank, is truthy.
         node1 = LocalIntNode({0: 3, 1: 4})
         node2 = LocalIntNode({0: 10, 1: 10})
         result = node1.le(node2)
         self.assertTrue(bool(result))
 
     def test_data_ptr_raises(self):
+        # [FUNCTION DOC] Asserts data_ptr on a LocalTensor raises RuntimeError, while an add
+        # inside LocalTensorMode still returns a LocalTensor.
         """data_ptr() on a LocalTensor should raise instead of returning 0."""
         local_tensors = {
             0: torch.randn(4),
@@ -260,6 +334,8 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
             self.assertIsInstance(result, LocalTensor)
 
     def test_sym_and_sym_or(self):
+        # [FUNCTION DOC] Wraps a LocalIntNode comparison in a SymBool and checks the and/or
+        # operators with True and False give truthy/falsy results as expected.
         node1 = LocalIntNode({0: 3, 1: 4})
         node2 = LocalIntNode({0: 10, 1: 10})
         sym_true = torch.SymBool(node1.le(node2))
@@ -268,6 +344,9 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
         self.assertTrue(bool(sym_true | False))
 
     def test_standalone_rank_map_and_tensor_map(self):
+        # [FUNCTION DOC] Inside LocalTensorMode, rank_map creates a per-rank tensor filled
+        # with the rank and tensor_map doubles it; afterwards checks each rank's local tensor
+        # in the original and the scaled results.
         with LocalTensorMode(self.world_size):
             lt = rank_map(lambda r: torch.full((2, 3), float(r)))
             scaled = tensor_map(lt, lambda r, t: t * 2)
@@ -277,9 +356,15 @@ class TestLocalTensorWorld2(LocalTensorWorldTest):
 
 
 class TestLocalTensorRankWorld2(LocalTensorRankTest):
+    # [CLASS DOC] Per-rank (non-mode) tests with world size 2: rank_map outside the mode
+    # and LocalTensor flatten, arithmetic, view ops, mixing with plain tensors and
+    # collectives within LocalTensorMode.
     world_size = 2
 
     def test_standalone_rank_map_and_tensor_map(self):
+        # [FUNCTION DOC] Outside LocalTensorMode, rank_map invokes the callback with the real
+        # rank and returns a plain (non-Local) tensor; tensor_map likewise adds one to the
+        # plain tensor. Compares against the current rank.
         # Real-dist path: rank_map should call cb with dist.get_rank()
         t = rank_map(lambda r: torch.full((2, 3), float(r)))
         self.assertNotIsInstance(t, LocalTensor)
@@ -288,6 +373,9 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
         self.assertEqual(t2, torch.full((2, 3), float(self.rank) + 1))
 
     def test_flatten_unflatten(self):
+        # [FUNCTION DOC] For two sample sets of local tensors (equal and unequal shapes),
+        # flattens a LocalTensor, rebuilds it with the unflatten method and compares the
+        # current rank's local tensor.
         """Test that LocalTensor can be flattened and unflattened correctly."""
         device = torch.device("cpu")
         dtype = torch.float32
@@ -316,6 +404,8 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
             )
 
     def test_basic_arithmetic_operations(self):
+        # [FUNCTION DOC] Checks that adding two LocalTensors and multiplying one by a scalar
+        # yields LocalTensors whose current-rank local tensor equals the per-rank computation.
         """Test basic arithmetic operations on LocalTensors."""
         device = torch.device("cpu")
         shape = (2, 3)
@@ -349,6 +439,10 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
         self.assertEqual(result_mul._local_tensors[self.rank], expected)
 
     def test_view_ops(self):
+        # [FUNCTION DOC] For several view-like functions (flip, fliplr, flipud, flatten,
+        # ravel, reshape, transpose, t, squeeze, unsqueeze), checks the result on a
+        # LocalTensor is a LocalTensor and its current-rank shard equals the function applied
+        # to the plain shard.
         """Test that view operations work correctly on LocalTensor (standard subclass style)."""
         device = torch.device("cpu")
         base_tensor = torch.arange(8, device=device).reshape(2, 4).float()
@@ -383,6 +477,8 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
                 self.assertEqual(result._local_tensors[self.rank], expected)
 
     def test_mixed_operations_with_regular_tensors(self):
+        # [FUNCTION DOC] Adding a plain tensor to a LocalTensor returns a LocalTensor whose
+        # current-rank shard is the sum.
         """Test operations between LocalTensors and regular tensors."""
         device = torch.device("cpu")
         shape = (2, 3)
@@ -406,6 +502,9 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
         self.assertEqual(result._local_tensors[self.rank], expected)
 
     def test_collectives_within_local_tensor_mode(self):
+        # [FUNCTION DOC] Inside LocalTensorMode, all_reduce on a LocalTensor gives the sum on
+        # the current rank, and broadcast from the current rank copies its shard to the other
+        # ranks; a regular operation still returns a LocalTensor.
         """Test that collective operations work within LocalTensorMode context."""
         test_tensors = {
             0: torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
@@ -441,9 +540,14 @@ class TestLocalTensorRankWorld2(LocalTensorRankTest):
 
 @instantiate_parametrized_tests
 class TestLocalTensorRankWorld3(LocalTensorRankTest):
+    # [CLASS DOC] Per-rank tests with world size 3 for LocalTensor collectives (all_reduce
+    # with SUM/MAX/MIN, broadcast, all_gather, all_to_all_single including uneven and
+    # mismatched split sizes).
     world_size = 3
 
     def test_collective_reduction_operations(self):
+        # [FUNCTION DOC] all_reduce with SUM, MAX and MIN over three per-rank tensors;
+        # compares the current rank's shard with the elementwise reduction.
         """Test different reduction operations for all_reduce."""
         # Create different tensors for each rank with simple values for testing
         test_tensors = {
@@ -473,6 +577,8 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
         self.assertEqual(lt_min._local_tensors[self.rank], expected_min)
 
     def test_all_reduce_collective(self):
+        # [FUNCTION DOC] all_reduce (default sum) on three per-rank tensors each incremented
+        # by one; the current rank's shard equals the sum.
         """Test that all_reduce collective operation works correctly with LocalTensor."""
         # Create different tensors for each rank
         different_tensors = {
@@ -493,6 +599,8 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
         self.assertEqual(lt_sum._local_tensors[self.rank], expected_sum)
 
     def test_broadcast_collective(self):
+        # [FUNCTION DOC] Broadcast from the current rank; every other rank's shard equals the
+        # source's original tensor.
         """Test that broadcast collective operation works correctly with LocalTensor."""
         # Create different tensors for each rank
         different_tensors = {
@@ -515,6 +623,8 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
             self.assertEqual(lt_broadcast._local_tensors[rank], expected_broadcast)
 
     def test_all_gather_collective(self):
+        # [FUNCTION DOC] all_gather of per-rank tensors into a list; checks the entry at the
+        # current rank equals that rank's tensor.
         """Test that all_gather collective operation works correctly with LocalTensor."""
         # Create different tensors for each rank
         different_tensors = {
@@ -535,6 +645,9 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
         self.assertEqual(tensor_list[self.rank], different_tensors[self.rank])
 
     def test_all_to_all_single_collective(self):
+        # [FUNCTION DOC] Uses the functional all_to_all_single with equal splits inside
+        # LocalTensorMode on tensors filled with the rank; the result (after wait) is a
+        # LocalTensor with shard zeros, ones, twos in pairs on the current rank.
         """Test that all_to_all_single collective operation works correctly with LocalTensor."""
         from torch.distributed._functional_collectives import all_to_all_single
 
@@ -580,6 +693,9 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
             self.assertEqual(result._local_tensors[self.rank], expected_output)
 
     def test_all_to_all_single_uneven_splits(self):
+        # [FUNCTION DOC] Regression test (gh-177371): all_to_all_single with unequal per-
+        # source output sections; each destination must receive the matching chunk from every
+        # source concatenated in source order.
         """all_to_all_single with unequal per-source sections (gh-177371)."""
         # Rank src holds world_size sections of output_split_sizes[src] rows and
         # sends one to each destination, so every section it sends matches the
@@ -624,6 +740,9 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
     def test_all_to_all_single_mismatched_splits_error(
         self, input_split_sizes, output_split_sizes
     ):
+        # [FUNCTION DOC] Parametrized by two inconsistent split-size pairs; asserts
+        # all_to_all_single raises ValueError mentioning the input split from rank 0 to rank 0
+        # instead of silently reshaping.
         """Split sizes that do not describe a valid exchange raise, not reshape."""
         with LocalTensorMode(self.world_size):
             lt_input = LocalTensor(
@@ -644,9 +763,14 @@ class TestLocalTensorRankWorld3(LocalTensorRankTest):
 
 
 class TestLocalTensorWorld3(LocalTensorWorldTest):
+    # [CLASS DOC] Whole-world tests with world size 3 for reduce_scatter and all_gather into a
+    # tensor under LocalTensorMode.
     world_size = 3
 
     def test_reduce_scatter_tensor_collective(self):
+        # [FUNCTION DOC] reduce_scatter_single of three per-rank 3x2 tensors into per-rank 1x2
+        # outputs; expected shard for rank r is the elementwise sum of the r-th rows (111/222,
+        # 333/444, 555/666). Also prints the output.
         """Test that reduce_scatter_tensor collective operation works correctly with LocalTensor."""
         # Create different tensors for each rank
         different_tensors = {
@@ -683,6 +807,8 @@ class TestLocalTensorWorld3(LocalTensorWorldTest):
             self.assertEqual(lt_output_tensor, expected_output)
 
     def test_all_gather_into_tensor_collective(self):
+        # [FUNCTION DOC] all_gather_single of per-rank 2x3 tensors into a 6x3 output; compares
+        # with the concatenation of the inputs.
         """Test that all_gather_into_tensor collective operation works correctly with LocalTensor."""
         # Create different tensors for each rank
         different_tensors = {
@@ -713,9 +839,14 @@ class TestLocalTensorWorld3(LocalTensorWorldTest):
 
 @instantiate_parametrized_tests
 class TestLocalTensorWorld4(LocalTensorWorldTest):
+    # [CLASS DOC] Whole-world tests with world size 4: symbolic rank behavior of dist.get_rank
+    # under the mode, DTensor cat, compiled all_gather, compile_on_one_rank functional
+    # collectives and device mesh coordinate computation.
     world_size = 4
 
     def test_dist_get_rank_default_group(self):
+        # [FUNCTION DOC] Inside the mode, dist.get_rank returns a SymInt backed by
+        # LocalIntNode whose per-rank values equal the ranks.
         with LocalTensorMode(self.world_size):
             rank = dist.get_rank()
             self.assertIsInstance(rank, torch.SymInt)
@@ -724,6 +855,9 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
                 self.assertEqual(rank.node._local_ints[r], r)
 
     def test_dist_get_rank_sub_group(self):
+        # [FUNCTION DOC] For a subgroup of ranks 0 and 2, get_rank in the mode returns a
+        # LocalIntNode-backed SymInt with entries for all four ranks: group-local ranks
+        # 0,0,1,1 for ranks 0..3 (the complement group is covered too).
         sub_ranks = [0, 2]
         sub_pg = dist.new_group(ranks=sub_ranks)
         with LocalTensorMode(self.world_size):
@@ -743,6 +877,8 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
             self.assertEqual(rank.node._local_ints[3], 1)
 
     def test_dist_get_rank_unpatched_outside_mode(self):
+        # [FUNCTION DOC] Asserts dist.get_rank is the original function again
+        # after leaving LocalTensorMode.
         # Verify that dist.get_rank is restored after exiting
         orig_get_rank = dist.get_rank
         with LocalTensorMode(self.world_size):
@@ -750,6 +886,8 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
         self.assertIs(dist.get_rank, orig_get_rank)
 
     def test_dtensor_cat(self):
+        # [FUNCTION DOC] Under the mode, concatenates a replicated and a sharded DTensor along
+        # the last dim and compares its full tensor to the plain concatenation.
         with LocalTensorMode(self.world_size):
             device_mesh = self.build_device_mesh()
 
@@ -764,10 +902,15 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
             self.assertEqual(full_tensor, local_res)
 
     def test_compile_all_gather(self):
+        # [FUNCTION DOC] Compiles (eager backend, full graph) a function doing
+        # all_gather_tensor over the fake group, applies it to a LocalTensor in the mode, and
+        # checks the result shape is 8 by 3.
         fake_pg = dist.distributed_c10d._get_default_group()
 
         @torch.compile(backend="eager", fullgraph=True)
         def my_func(x):
+            # [FUNCTION DOC] HELPER: Compiled function: gathers the input over dimension 0 on
+            # the fake process group.
             return all_gather_tensor(x, gather_dim=0, group=fake_pg)
 
         different_tensors = {r: torch.randn(2, 3) + r for r in range(self.world_size)}
@@ -781,6 +924,11 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
         ["all_gather", "reduce_scatter", "all_to_all_single", "shard_dim_alltoall"],
     )
     def test_functional_collective_with_pg_compile_on_one_rank(self, op_name):
+        # [FUNCTION DOC] Parametrized by op name (all_gather, reduce_scatter,
+        # all_to_all_single, shard_dim_alltoall). With compile_on_one_rank enabled and the
+        # process group (not a name) passed to the functional collective, checks the result is
+        # a LocalTensor of the expected shape with the expected per-rank values. Raises
+        # ValueError for an unknown op name.
         # Under compile_on_one_rank=True, _group_or_group_name passes the
         # ProcessGroup straight through to the functional collective op, so the
         # LocalTensorMode implementations must accept either a string group
@@ -860,6 +1008,9 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
                 self.assertEqual(result._local_tensors[r], expected_per_rank[r])
 
     def test_compile_on_one_rank_e2e_torch_compile(self):
+        # [FUNCTION DOC] With the mode and compile_on_one_rank enabled, a compiled function
+        # doing all_gather_tensor with a process group returns a LocalTensor of shape 2*ws by
+        # 3 whose per-rank shards equal the concatenation of all inputs.
         # End-to-end coverage: under LocalTensorMode + compile_on_one_rank=True,
         # a torch.compile'd graph that issues a functional collective should
         # both (a) survive the ProcessGroup-as-group_name path through
@@ -871,6 +1022,8 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
 
         @torch.compile(backend="eager", fullgraph=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function: all_gather_tensor over dimension 0 on
+            # the fake group.
             return all_gather_tensor(x, gather_dim=0, group=fake_pg)
 
         ws = self.world_size
@@ -891,6 +1044,9 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
 
     @parametrize("call_style", ["positional", "kwargs"])
     def test_runtime_compute_coordinate_on_dim_per_rank(self, call_style):
+        # [FUNCTION DOC] Parametrized by positional vs keyword call. Under the mode, calls the
+        # device_mesh runtime compute-coordinate-on-dim op for dim 0 and checks it returns a
+        # SymInt backed by a LocalIntNode whose per-rank values are the ranks (mesh is 1-D).
         # Under LocalTensorMode the device_mesh op must return per-rank
         # coordinates wrapped in a LocalIntNode-backed SymInt, instead of
         # falling back to dist.get_rank() (which is always 0 under the fake
@@ -917,9 +1073,12 @@ class TestLocalTensorWorld4(LocalTensorWorldTest):
 
 
 class TestLocalTensorWorld8(LocalTensorWorldTest):
+    # [CLASS DOC] Whole-world test class with world size 8 for DTensor addmm under the mode.
     world_size = 8
 
     def test_dtensor_addmm(self):
+        # [FUNCTION DOC] Shards a 12x8 matrix on dim 0, replicates the other operands, runs
+        # addmm on DTensors and compares the full tensor with the plain addmm.
         with LocalTensorMode(self.world_size):
             device_mesh = self.build_device_mesh()
 
@@ -943,10 +1102,16 @@ from torch.distributed._local_tensor._c10d import local_p2p_op, wait_all
 
 
 class TestLocalRunner(LocalTensorWorldTest):
+    # [CLASS DOC] Tests LocalRunnerMode with 6 ranks arranged as a data-parallel by pipeline-
+    # parallel mesh, using point-to-point send/recv between pipeline stages.
     world_size = 6
 
     @staticmethod
     def _get_pp_peer(pp_index, mesh, dim, dir):
+        # [FUNCTION DOC] HELPER: Static. With the mode temporarily disabled, maps every
+        # pipeline submesh's global rank at the given pp index to the peer at offset dir
+        # (wrapping) along the dimension, and returns a LocalIntNode-backed SymInt of
+        # that rank-to-peer mapping.
         with maybe_disable_local_tensor_mode():
             pp_meshes = mesh._get_all_submeshes(dim)
             pp_ret = {}
@@ -964,6 +1129,12 @@ class TestLocalRunner(LocalTensorWorldTest):
         actual: list[torch.Tensor | None],
         expected: list[torch.Tensor | None],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Body run per pipeline stage under a LocalTensorMode over the
+        # mesh size. Builds a dp-sharded random input times two; if not the last stage, sends
+        # it to the next stage with an isend and records the expected received tensor (data
+        # on the receiving ranks, zeros elsewhere); if not the first stage, receives into a
+        # zero DTensor, waits for completion, and stores its full tensor in the actual list
+        # at the stage index.
         ltm = LocalTensorMode(mesh.size())
         with ltm:
             dp_mesh = mesh["dp"]
@@ -997,6 +1168,9 @@ class TestLocalRunner(LocalTensorWorldTest):
                 actual[pp_index] = y
 
     def test_dp_pp(self):
+        # [FUNCTION DOC] Creates a 2 by 3 (dp, pp) device mesh and runs the per-stage function
+        # for each of the three pipeline indices via LocalRunnerMode, then asserts the actual
+        # received tensors equal the expected ones.
         pp_size = 3
         mesh = init_device_mesh(
             "cpu", (self.world_size // pp_size, pp_size), mesh_dim_names=("dp", "pp")
