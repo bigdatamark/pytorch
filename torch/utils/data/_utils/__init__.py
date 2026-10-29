@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Internal support package for the data loader. Defines shared constants (IS_WINDOWS, HAS_NUMPY,
+# the worker status check interval) and the python_exit_status flag, re-exports
+# ExceptionWrapper for backward compatibility, and imports the collate, fetch, pin_memory,
+# signal_handling and worker submodules. Import-time side effect: registers an exit hook
+# that sets python_exit_status when the interpreter shuts down.
 r"""Utility classes & functions for data loading. Code in this folder is mostly used by ../dataloader.py.
 
 A lot of multiprocessing is used in data loading, which only supports running
@@ -43,6 +49,8 @@ except ModuleNotFoundError:
 
 
 def _set_python_exit_flag() -> None:
+    # [FUNCTION DOC] HELPER: Exit hook that sets the module-level python_exit_status flag to
+    # true. Takes no arguments, returns nothing, raises nothing.
     global python_exit_status
     python_exit_status = True
 

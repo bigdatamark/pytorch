@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# Public entry point of the data loading package. Re-exports DataLoader and its helpers
+# (default_collate, default_convert, get_worker_info), the dataset classes (Dataset,
+# IterableDataset, TensorDataset, ConcatDataset, ChainDataset, StackDataset, Subset,
+# random_split), the samplers (Sampler, SequentialSampler, RandomSampler, BatchSampler, etc.),
+# DistributedSampler, and the datapipe classes and decorators. Importing has no side effects
+# beyond the imports; at import time it checks that the export list is sorted and raises an
+# error otherwise.
 from torch.utils.data.dataloader import (
     _DatasetKind,
     DataLoader,
