@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for Dynamo recompilation user experience: recompile limits, guard-failure
+# log messages, the per-compile recompile_limit keyword, and isolate_recompiles cache buckets
+# (per-region caches, limits, LRU order, reset and GC behavior). Defines three TestCase classes
+# and small graph-counting helpers; the parametrized tests are instantiated at import time. Run
+# as a script it calls the Dynamo test runner.
 import operator
 import unittest
 import weakref
@@ -28,28 +33,46 @@ device_type = (
 
 
 class RecompileUxTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests of global recompile-limit behavior and guard-failure reporting. The
+    # class attribute cache_limit is 1 and setUpClass patches the recompile_limit config to that
+    # value for every test via the shared exit stack. Tests use compile counters, assertLogs on
+    # the torch._dynamo logger, and guard-failure callbacks.
     # TODO(whc) dynamo actually recompiles one more time than the cache limit
     cache_limit = 1
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class setup hook: runs the parent setup, then enters a config
+        # patch on recompile_limit set to the class cache_limit, registered on the exit stack so
+        # it is undone at class teardown.
         super().setUpClass()
         cls._exit_stack.enter_context(
             torch._dynamo.config.patch("recompile_limit", cls.cache_limit)
         )
 
     def test_drop_cache_on_skip(self):
+        # [FUNCTION DOC] Checks that the compiled-code cache is dropped when recompile limits
+        # cause a skip, so the backend graph function becomes garbage. The backend attaches a
+        # finalizer to the compiled forward and fails if called twice on an attached state; the
+        # model is compiled twice with a new int argument, and the test asserts the finalizer
+        # fired.
         def model(x, i):
+            # [FUNCTION DOC] HELPER: Model under test: adds its second argument to the tensor.
             return x + i
 
         attached = False
         triggered = False
 
         def trigger():
+            # [FUNCTION DOC] HELPER: Finalizer callback: sets the enclosing flag showing the
+            # compiled function was collected.
             nonlocal triggered
             triggered = True
 
         def compiler(gm, input):
+            # [FUNCTION DOC] HELPER: Custom backend: raises an error if a graph was already
+            # attached, otherwise registers a weakref finalizer on the graph module forward,
+            # marks attached, and returns the forward unchanged.
             nonlocal attached
             f = gm.forward
             if attached:
@@ -68,7 +91,13 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(triggered)
 
     def test_loop_torture(self):
+        # [FUNCTION DOC] Compiles a function with a data-dependent Python loop count ten times
+        # (fresh compile wrapper and random iteration tensor each time) and asserts the backend
+        # saw only as many frames as the recompile limit. Commented-out counter assertions are
+        # left disabled.
         def loop_torture(input, iters):
+            # [FUNCTION DOC] HELPER: Loop body under test: adds the input to itself in place for
+            # the given number of iterations and returns it.
             out = input
             # randint itself causes one graph break
             for _ in range(iters):
@@ -94,8 +123,13 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(compile_counter.frame_count, self.cache_limit)
 
     @torch._dynamo.config.patch("automatic_dynamic_shapes", False)
+        # [FUNCTION DOC] With automatic dynamic shapes disabled and recompile_limit set to 2,
+        # runs a model on tensors whose leading size changes every iteration. Asserts the
+        # backend compiled exactly two frames and that exactly one warning was logged, starting
+        # with the recompile-limit-hit message. Also prints the log record.
     def test_dynamic_input(self):
         def model(input):
+            # [FUNCTION DOC] HELPER: Model under test: doubles the input by adding it to itself.
             return input + input
 
         expected_recompiles = 2
@@ -122,10 +156,15 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         "requires cuda or xpu",
     )
     def test_nvfuser_guards(self):
+        # [FUNCTION DOC] Skipped unless CUDA or XPU is available. With recompile_limit 2, checks
+        # recompile counts on an accelerator: identical inputs and a view with the same strides
+        # do not recompile, while a permuted (non-contiguous) input forces a second compile.
         # we may want to model dynamo's guards sufficiently after nvfuser's ProfilingExecutor guards
         # such that we ensure dynamo is in charge of all the recompilations at the top level,
         # and we could thus simplify the underlying torchscript executor
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Function under test: elementwise multiply of the last two
+            # args plus the first.
             return a + b * c
 
         a = torch.rand(3, 4, 5, device=device_type)
@@ -150,6 +189,8 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(compile_counter.frame_count, 2)
 
     def assert_single_log_contains(self, logs, contains_str):
+        # [FUNCTION DOC] HELPER: Assertion helper: asserts exactly one log record was captured
+        # and that its message contains the given substring at a position after the start.
         self.assertEqual(len(logs.records), 1)
         self.assertTrue(
             logs.records[0].getMessage().find(contains_str) > 0,
@@ -157,13 +198,22 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_verbose_tensor_check(self):
+        # [FUNCTION DOC] Checks the text of guard-failure warnings for tensor property
+        # mismatches: size, stride, rank, dispatch key set, dtype and requires_grad. Each case
+        # uses the nested helper to compile with one input then call with a mismatched one.
         def func(a):
+            # [FUNCTION DOC] HELPER: Function under test: adds 4 to the tensor, chosen so the
+            # meta implementation is pure C++.
             # Warning: choose a function here whose meta implementation lives
             # entirely in C++.  If you do a Python one, Dynamo will dive into
             # torch._refs which is OK but it will muddy up the warnings
             return torch.add(a, 4)
 
         def cache_fail_test(cached_input, missed_input, expected_failure):
+            # [FUNCTION DOC] HELPER: Resets Dynamo and counters, compiles with the eager backend
+            # on the cached input, then calls a freshly wrapped function on the missed input
+            # under assertLogs and asserts a single warning containing the expected failure
+            # text.
             # TODO(whc) maybe its hacky to have a 'test within a test' but this seemed convenient
             torch._dynamo.reset()
             torch._dynamo.utils.counters.clear()
@@ -203,10 +253,14 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_mismatched_type(self):
+        # [FUNCTION DOC] Compiles an add on two tensors, then calls again with an int for the
+        # second arg and asserts a single warning that the expected type of the argument was
+        # Tensor but an int was found.
         a = torch.rand(3, 4, 5)
         b = torch.rand(3, 4, 5)
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Function under test: returns the sum of its two arguments.
             return a + b
 
         opt_func = torch.compile(func, backend="eager")
@@ -222,11 +276,15 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_mismatched_tensor_type(self):
+        # [FUNCTION DOC] Compiles with a Parameter as the second arg, then calls with a plain
+        # Tensor and asserts a single warning naming Parameter as expected type and Tensor as
+        # found type.
         a = torch.rand(3, 4, 5)
         b_parameter = torch.nn.Parameter(torch.rand(3, 4, 5))
         b_tensor = torch.rand(3, 4, 5)
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Function under test: returns the sum of its two arguments.
             return a + b
 
         opt_func = torch.compile(func, backend="eager")
@@ -243,8 +301,13 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=1, fail_on_recompile_limit_hit=True)
     def test_fail_on_recompile_limit_hit(self):
+        # [FUNCTION DOC] With recompile_limit 1 and fail_on_recompile_limit_hit enabled, a
+        # compiled function is run with a Python bool True, then False; the second call must
+        # raise FailOnRecompileLimitHit.
         @torch.compile(backend="eager")
         def func(b, a):
+            # [FUNCTION DOC] HELPER: Function under test: branches on the boolean second
+            # argument, returning the tensor times two or plus one.
             if a:
                 return b * 2
             else:
@@ -256,12 +319,19 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch("recompile_limit", 32)
     def test_multiple_guard_fails(self):
+        # [FUNCTION DOC] With recompile_limit 32, calls an optimized relu on tensors of sizes 8
+        # to 12 using static shapes and a guard-failure callback that collects reasons. After
+        # the last call, asserts the failure text includes size-mismatch messages comparing
+        # sizes 11, 10, 9 and 8 against 12.
         failure_reasons = []
 
         def guard_fail_fn(failure):
+            # [FUNCTION DOC] HELPER: Guard-failure callback: appends the first element of the
+            # failure record (the reason text) to the shared list.
             failure_reasons.append(failure[0])
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: relu of the input.
             return torch.relu(x)
 
         opt_f = torch._dynamo.optimize(
@@ -286,13 +356,21 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch("recompile_limit", 32)
     def test_multiple_guard_fails_report_all(self):
+        # [FUNCTION DOC] With recompile_limit 32 and verbose recompile logging enabled,
+        # optimizes a function of a list and calls it with lists of length 3, 2 and 1. After
+        # each recompile, asserts the collected reasons (minus type-id check lines) mention the
+        # length guards of all earlier entries.
         with log_settings(kwargs_to_settings(recompiles_verbose=True)):
             failure_reasons = []
 
             def guard_fail_fn(failure):
+                # [FUNCTION DOC] HELPER: Guard-failure callback: appends the first element of
+                # the failure record to the shared list.
                 failure_reasons.append(failure[0])
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Function under test: builds a ones tensor with the list
+                # length rows and last list element columns.
                 return torch.ones(len(x), x[-1])
 
             opt_f = torch._dynamo.optimize(
@@ -302,6 +380,8 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
             opt_f([4, 5, 6])
 
             def filter_reasons():
+                # [FUNCTION DOC] HELPER: Joins collected failure reasons into one text, dropping
+                # lines that start with the type-id check marker.
                 return "\n".join(
                     [
                         line
@@ -324,18 +404,27 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=1)
     def test_recompile_child_run_only(self):
+        # [FUNCTION DOC] With recompile_limit 1, the child function g is compiled first alone,
+        # then the outer f is compiled. Because f hits the limit it runs eagerly while g runs
+        # its compiled version and h runs eagerly; asserts the result equals the input plus 3.
         def f(x, n):
+            # [FUNCTION DOC] HELPER: Outer function: adds 1 only when compiling, then applies g,
+            # then h, then adds n.
             if torch.compiler.is_compiling():
                 x = x + 1
             x = g(x)
             return h(x) + n
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Adds 2 only when compiling, else returns the input
+            # unchanged.
             if torch.compiler.is_compiling():
                 return x + 2
             return x
 
         def h(x):
+            # [FUNCTION DOC] HELPER: Adds 4 only when compiling, else returns the input
+            # unchanged.
             if torch.compiler.is_compiling():
                 return x + 4
             return x
@@ -352,14 +441,22 @@ class RecompileUxTests(torch._dynamo.test_case.TestCase):
 
 
 class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for the recompile_limit keyword of torch.compile, which overrides the
+    # global limit per compiled function. Provides a helper that counts cache entries of a code
+    # object.
     @staticmethod
     def _num_cache_entries(code):
+        # [FUNCTION DOC] HELPER: Static helper: returns how many cache entries Dynamo holds for
+        # the given function or code object.
         return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
 
     def test_recompile_limit_basic(self):
+        # [FUNCTION DOC] With recompile_limit 2 on torch.compile, checks cache entries grow to 1
+        # then 2 for float32 then float64 inputs, and stay at 2 for a third dtype (float16).
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the two args.
             return x + y
 
         opt_f = torch.compile(f, backend=cnt, recompile_limit=2)
@@ -375,9 +472,13 @@ class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(self._num_cache_entries(f), 2)
 
     def test_recompile_limit_none_uses_global(self):
+        # [FUNCTION DOC] Without the keyword, the global limit applies: runs ten dtypes through
+        # a compiled add and asserts the cache entry count equals the configured global
+        # recompile_limit.
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the two args.
             return x + y
 
         # Without recompile_limit kwarg, uses global config (default 8)
@@ -403,11 +504,14 @@ class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_recompile_limit_fullgraph_raises(self):
+        # [FUNCTION DOC] With fullgraph and recompile_limit 1, a second dtype must raise
+        # FailOnRecompileLimitHit after the first compile succeeded (one backend frame).
         """With fullgraph=True, hitting the recompile_limit kwarg raises
         FailOnRecompileLimitHit, consistent with the fullgraph contract."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_f = torch.compile(f, backend=cnt, fullgraph=True, recompile_limit=1)
@@ -420,6 +524,11 @@ class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=True)
     def test_recompile_limit_resume_function_auto_dynamic(self):
+        # [FUNCTION DOC] With automatic dynamic shapes and recompile_limit 2, a function with a
+        # graph break reads a tensor from a dict. Changing that tensor dims across calls makes
+        # the resume function recompile until it holds two entries and then stop, with no extra
+        # frames; the main function keeps one entry. Resume code objects are found through the
+        # ContinueExecutionCache.
         """With automatic dynamic shapes and recompile_limit=2, the resume
         function recompiles via dimension changes on a global tensor while
         the main function gets cache hits. The resume function should stop
@@ -429,6 +538,8 @@ class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
         y_holder = {"tensor": torch.randn(4, 8, 2)}
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: computes sine of the input, prints
+            # (graph break), then returns cosine of the tensor in the shared dict.
             x.sin()
             print("graph break")
             return y_holder["tensor"].cos()
@@ -466,6 +577,8 @@ class RecompileLimitKwargTests(torch._dynamo.test_case.TestCase):
 
 
 def _count_graphs(graphs, node_op, target):
+    # [FUNCTION DOC] HELPER: Counts graphs in the list that contain at least one node with the
+    # given op kind and target.
     return sum(
         any(n.op == node_op and n.target == target for n in gm.graph.nodes)
         for gm in graphs
@@ -473,16 +586,24 @@ def _count_graphs(graphs, node_op, target):
 
 
 def _count_sin_graphs(graphs):
+    # [FUNCTION DOC] HELPER: Counts graphs containing a method call node for sin.
     # Graphs with a `call_method` "sin" node (`x.sin()`, the main frame).
     return _count_graphs(graphs, "call_method", "sin")
 
 
 def _count_add_graphs(graphs):
+    # [FUNCTION DOC] HELPER: Counts graphs containing an add function call node (the resume
+    # frame in graph-break tests).
     # Graphs with an `operator.add` call_function node (`a + 1`, the resume frame).
     return _count_graphs(graphs, "call_function", operator.add)
 
 
 class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for torch.compile isolate_recompiles=True, where each compile call gets
+    # its own cache bucket (region id) in the code object extra state, with its own recompile
+    # limit and run-only strategy. The default bucket has id minus one. Covers limits,
+    # accumulated limit, LRU ordering, resets, GC, logging and introspection. Registered as
+    # parametrized tests at import.
     """Tests for isolate_recompiles=True on torch.compile().
 
     Each torch.compile() call with isolate_recompiles=True gets its own
@@ -493,6 +614,8 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
     """
 
     @staticmethod
+        # [FUNCTION DOC] HELPER: Static helper: returns the total number of cache entries for
+        # the code object across all regions.
     def _num_cache_entries(code):
         return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
 
@@ -504,10 +627,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_basic(self):
+        # [FUNCTION DOC] Two isolated regions of one function have distinct region ids. Region A
+        # exhausts its limit of 1 (raises FailOnRecompileLimitHit on a new shape) while region B
+        # still compiles; cache entry counts per region are 1 and 1 and the default bucket is
+        # empty.
         """Each isolated region has its own recompile limit: region A hitting
         its limit (recompile_limit=1) does not consume region B's budget."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -538,11 +666,14 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_same_function_different_regions(self):
+        # [FUNCTION DOC] Two isolated compile calls of the same function, each compiled once
+        # with different shapes, do not hit the limit; the backend sees two frames.
         """Two compile calls on the same function get independent caches.
         Each can compile once without the other's entry causing a limit hit."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=cnt, dynamic=False, isolate_recompiles=True)
@@ -559,16 +690,24 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_factory_pattern(self):
+        # [FUNCTION DOC] A cached factory builds a fullgraph, static, isolated compile wrapper
+        # per key; three keys are called with different tensor sizes under limit 1 with fail-on-
+        # limit, and none may raise.
         """Factory creates multiple torch.compile wrappers around the same
         inner function. Each gets its own isolated cache bucket."""
 
         def core(x):
+            # [FUNCTION DOC] HELPER: Inner function: sum of the tensor.
             return x.sum()
 
         @cache
         def factory(key):
+            # [FUNCTION DOC] HELPER: Cached factory: returns a new isolated compiled wrapper
+            # function for the key (the key itself is unused).
             @torch.compile(fullgraph=True, dynamic=False, isolate_recompiles=True)  # noqa: UNSPECIFIED_BACKEND
             def frontend(x, n):
+                # [FUNCTION DOC] HELPER: Compiled wrapper body: adds the integer to the core sum
+                # of the tensor.
                 return core(x) + n
 
             return frontend
@@ -579,6 +718,9 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=False)
     def test_isolate_recompiles_same_backend_different_regions(self):
+        # [FUNCTION DOC] Two isolated regions sharing one compile counter backend each compile
+        # separately for the same input (2 frames), hit their own caches, and recompile
+        # independently for a new shape (4 frames), all with correct outputs.
         """Two isolated regions sharing the SAME CompileCounter backend.
         Without per-region bucketing, the second region would get a cache
         hit from the first (same backend, same guards). Verifies the
@@ -588,6 +730,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=cnt, dynamic=False, isolate_recompiles=True)
@@ -616,10 +759,13 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @parametrize("backend", ["eager", "aot_eager"])
     def test_isolate_recompiles_string_backends(self, backend):
+        # [FUNCTION DOC] Parametrized over eager and aot_eager string backends: two isolated
+        # regions each get their own cache entry (total 2) and later calls hit the cache.
         """Two isolated regions with the same string backend compile
         independently — verified by total cache entry count."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=backend, isolate_recompiles=True)
@@ -639,12 +785,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=False)
     def test_isolate_recompiles_static_and_dynamic(self):
+        # [FUNCTION DOC] One static and one dynamic isolated region on the same function: checks
+        # frame counts for cache hits and a static recompile, and that per-region entry counts
+        # are 2 and 1 with nothing in the default bucket.
         """Two regions on the same function: one static, one dynamic.
         isolate_recompiles keeps their cache entries separate so static
         recompiles don't count against the dynamic region."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt_static = torch.compile(
@@ -689,12 +839,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=False)
     def test_isolate_recompiles_mark_dynamic_vs_static(self):
+        # [FUNCTION DOC] Two isolated regions, one fed tensors marked static on dim 0 and one
+        # marked dynamic. Same-shape and different-dynamic-shape calls hit cache, a new static
+        # shape recompiles; per-region entry counts are 2 and 1 and the default bucket is empty.
         """Two regions: one with mark_static, one with mark_dynamic.
         Their guards don't interfere across regions."""
         cnt_static = torch._dynamo.testing.CompileCounter()
         cnt_dynamic = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_static = torch.compile(f, backend=cnt_static, isolate_recompiles=True)
@@ -743,6 +897,10 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=True)
     def test_isolate_recompiles_auto_dynamic_shared_pgo(self):
+        # [FUNCTION DOC] With automatic dynamic shapes, profile-guided frame state is shared
+        # across regions: region A compiles twice (static then dynamic), while region B compiles
+        # once as dynamic immediately and then cache hits. Region B has one entry in its own
+        # bucket.
         """PGO (frame_state) is shared across isolated regions. Region B
         benefits from region A's shape observations — compiles with dynamic
         shapes immediately without redundant static-then-dynamic recompilation."""
@@ -750,6 +908,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         cnt_b = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=cnt_a, isolate_recompiles=True)
@@ -780,11 +939,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_same_backend_different_dynamic_independent_limits(self):
+        # [FUNCTION DOC] With limit 2 and fail-on-limit, a static and a dynamic isolated region
+        # share a backend but have independent limits: the static one fills and then raises on a
+        # third shape, while the dynamic one compiles once and keeps serving other shapes.
         """Two regions with the same backend, one static and one dynamic.
         Each exhausts its recompile_limit independently."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_static = torch.compile(
@@ -817,12 +980,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=1)
     def test_isolate_recompiles_fullgraph_raises(self):
+        # [FUNCTION DOC] With fullgraph and limit 1, exceeding a region limit raises
+        # FailOnRecompileLimitHit mentioning fullgraph even without the fail-on-limit flag;
+        # region B can still compile its first graph. Checks bucket sizes.
         """With fullgraph=True, hitting a region's recompile limit raises
         FailOnRecompileLimitHit regardless of fail_on_recompile_limit_hit. The
         limit is per-region: region A raising does not stop region B from
         compiling its first graph."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -846,12 +1013,17 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=False)
     def test_isolate_recompiles_graph_break_independent_regions(self):
+        # [FUNCTION DOC] A function with an explicit graph break and two isolated regions, each
+        # called with two shapes, yields eight recorded graphs: four main frames (sine) and four
+        # resume frames (add).
         """fullgraph=False with isolate_recompiles=True and a graph break:
         each region keeps independent buckets for both the main frame and
         the resume frame."""
         backend = torch._dynamo.testing.EagerAndRecordGraphs()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine, then a graph break, then add
+            # one.
             a = x.sin()
             torch._dynamo.graph_break()
             return a + 1
@@ -882,6 +1054,9 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=2, automatic_dynamic_shapes=False)
     def test_isolate_recompiles_graph_break_per_region_limit(self):
+        # [FUNCTION DOC] With limit 2, region a is filled with two shapes (4 graphs), a third
+        # shape produces no new graphs because the region goes run-only, and region b still
+        # compiles main and resume frames (6 graphs, 3 of each).
         """Graph-break function with two regions: each region independently
         tracks and limits both its main frame (sin) and its resume frame (add).
         Region a exhausts its per-region recompile_limit; region b continues
@@ -890,6 +1065,8 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         backend = torch._dynamo.testing.EagerAndRecordGraphs()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine, then a graph break, then add
+            # one.
             a = x.sin()
             torch._dynamo.graph_break()
             return a + 1
@@ -930,6 +1107,10 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_accumulated_limit(self):
+        # [FUNCTION DOC] With accumulated limit 6 and per-region limit 4, three regions with 2
+        # entries each reach the global cap; new shapes in any region then run eagerly with
+        # correct results while cached shapes still hit. Checks region entry counts and total
+        # count.
         """accumulated_recompile_limit is a global safety cap across all
         regions on the same code object. Three regions collectively contribute
         6 entries (2 each), hitting the global cap even though each region
@@ -937,6 +1118,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         to eager via RUN_ONLY."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -1002,10 +1184,14 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         fail_on_recompile_limit_hit=True,
     )
     def test_isolate_recompiles_accumulated_limit_hard_fail(self):
+        # [FUNCTION DOC] With accumulated limit 4, per-region limit 8 and fail-on-limit, two
+        # regions with 2 entries each reach the cap; a further new shape in either region raises
+        # FailOnRecompileLimitHit.
         """With fail_on_recompile_limit_hit=True, exceeding accumulated_recompile_limit
         across isolated regions raises FailOnRecompileLimitHit."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: cosine of the input.
             return x.cos()
 
         opt_a = torch.compile(
@@ -1038,10 +1224,14 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_limit_does_not_skip_other_regions(self):
+        # [FUNCTION DOC] When one region hits limit 1 and stops compiling, another isolated
+        # region and the non-isolated default bucket can still compile; entry counts per bucket
+        # are checked.
         """When one region hits its recompile limit and goes RUN_ONLY,
         other regions (both isolated and non-isolated) can still compile."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -1077,12 +1267,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_isolate_recompiles_region_run_only_persists(self):
+        # [FUNCTION DOC] After a region reaches its limit, run-only is remembered per region:
+        # later new shapes do not call the backend or add entries, the cached shape still gives
+        # correct output, and another region still compiles.
         """After hitting the recompile limit, RUN_ONLY is persisted per-region
         in ExtraState.region_strategy_map. Subsequent calls skip the callback
         entirely (no repeated limit-hit warnings). Cached shapes still work."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=cnt, dynamic=False, isolate_recompiles=True)
@@ -1118,6 +1312,9 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
     # ===== Default strategy × region: SKIP inherited, RUN_ONLY not =====
 
     def test_isolate_recompiles_inherits_default_skip(self):
+        # [FUNCTION DOC] A code object marked as skipped via the skip_code facility is not
+        # compiled by either the default or an isolated wrapper: zero frames and no entries,
+        # results still correct (isolated regions inherit the global skip).
         """Global SKIP (from skip_code / @torch._dynamo.skip / FX plumbing /
         TorchScript __init__ / etc.) is a correctness decision — the code
         must not be traced. Isolated regions inherit this SKIP, so neither
@@ -1127,6 +1324,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         torch._dynamo.eval_frame.skip_code(f.__code__)
@@ -1148,6 +1346,9 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(len(_get_cache_entries_for_region(f, id_iso)), 0)
 
     def test_isolate_recompiles_ignores_default_run_only(self):
+        # [FUNCTION DOC] Regression test: a run-only state caused by a non-isolated limit hit
+        # (limit 1, static shapes) must not carry into a later isolated region, which compiles
+        # normally (frame count goes from 1 to 2, one entry in its bucket).
         """Regression for the RUN_ONLY-bleed case: a prior non-isolated
         recompile-limit hit sets RUN_ONLY on extra->strategy. A later
         isolated region on the same code object must not inherit that
@@ -1155,6 +1356,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         # Trip the non-isolated recompile limit so RUN_ONLY is persisted
@@ -1179,11 +1381,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=2, automatic_dynamic_shapes=False)
     def test_isolate_recompiles_insertion_order_per_region(self):
+        # [FUNCTION DOC] With limit 2, interleaved compilations in two regions give 4 entries in
+        # total; in each region the newest entry has the larger frame compile id and is first.
+        # Extra shapes at the limit add nothing.
         """New entries are added at the front of their region's list.
         Interleaved compilations across regions don't mix ordering.
         After hitting recompile_limit, entries are frozen."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -1228,11 +1434,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(automatic_dynamic_shapes=False)
     def test_isolate_recompiles_lru_move_to_front(self):
+        # [FUNCTION DOC] Checks LRU behavior: a cache hit on the oldest entry of region A moves
+        # it to the front and shifts the rest back without adding entries, while region B order
+        # is unchanged.
         """On a cache hit, the matched entry moves to the front of its
         region's list (LRU). Verify by inspecting compile_id ordering
         before and after the hit. Also verify cross-region independence."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(
@@ -1280,12 +1490,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_non_isolated_entries_visible_to_isolated(self):
+        # [FUNCTION DOC] Entries in the default bucket are visible to an isolated region with
+        # the same backend as a read-only fallback: the isolated call reuses the compile (frame
+        # count stays 1), adds no entry to its own bucket, and the default bucket keeps one.
         """Non-isolated entries (bucket -1) are visible to isolated regions
         via read-only fallback when the backend matches. BC friendly —
         isolated compiles reuse existing non-isolated compilations."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: exponential of the input.
             return x.exp()
 
         opt_global = torch.compile(f, backend=cnt)
@@ -1308,6 +1522,10 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=8)
     def test_isolate_recompiles_reasons_include_default_bucket(self):
+        # [FUNCTION DOC] Recompile-reason logging for an isolated region must also include guard
+        # failures from default-bucket entries. Populates default (shape 3) and region (shape
+        # 4), then recompiles the region with shape 5, and asserts both callbacks received
+        # reasons and bucket sizes are 1 and 2.
         """Recompile-reason logging for an isolated region must also walk
         the default (-1) bucket. lookup() checks default entries as a
         fallback for isolated regions, so their guard failures are real
@@ -1316,12 +1534,17 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         region_fails: list[str] = []
 
         def record_default(failure):
+            # [FUNCTION DOC] HELPER: Guard-failure callback for the default bucket: records the
+            # reason string.
             default_fails.append(failure.reason)
 
         def record_region(failure):
+            # [FUNCTION DOC] HELPER: Guard-failure callback for the region: records the reason
+            # string.
             region_fails.append(failure.reason)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt_default = torch._dynamo.optimize(
@@ -1363,12 +1586,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=8)
     def test_non_isolated_reasons_unchanged(self):
+        # [FUNCTION DOC] Regression test: a non-isolated optimized function still logs guard
+        # failure reasons after a recompile for a new shape.
         """Regression: recompile-reason logging for non-isolated compiles
         (id=-1) must still work. The split between cache_entries and
         cache_entries_for_reasons should not have changed this path."""
         fails: list[str] = []
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt = torch._dynamo.optimize(
@@ -1385,12 +1611,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=8)
     def test_isolate_recompiles_reasons_include_all_default_entries(self):
+        # [FUNCTION DOC] With two entries in the default bucket and one primed region entry, a
+        # region recompile must report guard failures for both default entries (at least two
+        # reasons). The default bucket keeps two entries.
         """When the default bucket has multiple entries, recompile-reason
         logging from an isolated region must report guard failures from
         each of them, not just one."""
         default_fails: list[str] = []
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt_default = torch._dynamo.optimize(
@@ -1426,12 +1656,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(len(_get_cache_entries_for_region(f, -1)), 2)
 
     def test_isolate_recompiles_reset_clears_region_strategy(self):
+        # [FUNCTION DOC] After a region persisted run-only at its limit, resetting Dynamo must
+        # clear that state so a new isolated region compiles (frame count goes to 2). Both ids
+        # differ from the default id.
         """torch._dynamo.reset() must clear region_strategy_map on
         ExtraState. Otherwise a RUN_ONLY persisted by a prior region
         would survive reset and prevent the new region from compiling."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         with torch._dynamo.config.patch(
@@ -1460,11 +1694,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_non_isolated_compiles_share_cache(self):
+        # [FUNCTION DOC] Without isolation, two compiled wrappers share the default bucket: they
+        # share cache hits and the limit of 2, and a third new shape raises
+        # FailOnRecompileLimitHit.
         """Without isolate_recompiles, two compile calls share bucket -1.
         They share cache hits AND recompile limits."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: exponential of the input.
             return x.exp()
 
         opt_a = torch.compile(f, backend=cnt, dynamic=False)
@@ -1494,12 +1732,16 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_different_backends_shared_cache_without_isolate(self):
+        # [FUNCTION DOC] Baseline without isolation: entries from one backend count against
+        # another backend limit, so the second backend raises FailOnRecompileLimitHit on a new
+        # shape after the first filled the limit.
         """Baseline: without isolate_recompiles, different backends share the
         cache. Entries from backend A count against backend B's limit."""
         cnt_a = torch._dynamo.testing.CompileCounter()
         cnt_b = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt_a = torch.compile(f, backend=cnt_a, dynamic=False)
@@ -1518,11 +1760,14 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         automatic_dynamic_shapes=False,
     )
     def test_different_backends_independent_with_isolate(self):
+        # [FUNCTION DOC] With isolation, wrappers with different backends have independent
+        # buckets: backend B compiles twice after A filled its own limit, without error.
         """With isolate_recompiles, different backends get independent buckets."""
         cnt_a = torch._dynamo.testing.CompileCounter()
         cnt_b = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sum of the input.
             return x.sum()
 
         opt_a = torch.compile(f, backend=cnt_a, dynamic=False, isolate_recompiles=True)
@@ -1541,11 +1786,15 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
     # ===== Lifecycle: reset, resume functions, GC =====
 
     def test_isolate_recompiles_reset(self):
+        # [FUNCTION DOC] Resetting Dynamo clears all regions: after reset both wrappers
+        # recompile (frame counts become 2). Before reset each has one entry and none sit in the
+        # default bucket.
         """torch._dynamo.reset() clears all regions."""
         cnt_a = torch._dynamo.testing.CompileCounter()
         cnt_b = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: cosine of the input.
             return x.cos()
 
         opt_a = torch.compile(f, backend=cnt_a, isolate_recompiles=True)
@@ -1574,6 +1823,10 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch(recompile_limit=3)
     def test_isolate_recompiles_resume_function(self):
+        # [FUNCTION DOC] A function with a graph break and a mutable mode selects a different
+        # post-break branch. In region A each new mode recompiles only the resume frame until
+        # its limit of 3 is hit and a fourth mode runs eagerly; region B compiles main and
+        # resume again independently (frame counts 2, 3, 4, 4, 6).
         """Resume functions from a graph break are bucketed by their region's
         isolate_recompiles_id, both for cache lookup and for the per-region
         recompile limit. Region A exhausting its resume-frame limit leaves
@@ -1584,6 +1837,8 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         mode = {"value": "a"}
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine, a graph break, then cosine,
+            # tangent, exponential or add one depending on the shared mode value.
             a = x.sin()
             torch._dynamo.graph_break()
             if mode["value"] == "a":
@@ -1622,6 +1877,9 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnt.frame_count, 6)
 
     def test_isolate_recompiles_gc_wrapper(self):
+        # [FUNCTION DOC] After deleting an isolated wrapper and collecting garbage, its cache
+        # entry stays (orphaned). A new isolated wrapper compiles anew (2 entries), and
+        # resetting Dynamo clears all entries.
         """When an isolated compile wrapper is GC'd, orphaned cache entries
         remain. A new torch.compile gets a fresh region and compiles
         independently. reset() clears everything including orphans."""
@@ -1630,6 +1888,7 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opt_a = torch.compile(f, backend=cnt, isolate_recompiles=True)
@@ -1655,11 +1914,14 @@ class IsolateRecompilesTests(torch._dynamo.test_case.TestCase):
     # ===== Debug / introspection =====
 
     def test_isolate_recompiles_debug_cache_entry_list_deterministic_order(self):
+        # [FUNCTION DOC] Creates six isolated wrappers, calls them in reverse order, and asserts
+        # the debug cache entry list has six entries sorted by isolate_recompiles_id.
         """_debug_get_cache_entry_list returns entries sorted by
         isolate_recompiles_id for deterministic output."""
         cnt = torch._dynamo.testing.CompileCounter()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test: sine of the input.
             return x.sin()
 
         opts = [
