@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the trace_wrapped higher-order op, which wraps a tensor hook function
+# so that a gradient hook can be traced into backward graphs. Covers eager use, torch.compile
+# with several backends, make_fx tracing, and compiled autograd (including a stateful hook and
+# a hook that graph-breaks). Defines two module-level hook helpers; no import-time side effects.
 
 import functools
 import itertools
@@ -16,15 +20,25 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 
 def _multiply(x):
+    # [FUNCTION DOC] HELPER: Returns x multiplied elementwise by itself (the squared tensor).
     return x * x
 
 
 def _multiply_invoke(grad):
+    # [FUNCTION DOC] HELPER: Gradient hook; returns trace_wrapped applied to grad with _multiply
+    # as the wrapped function, so the hook result is grad squared.
     return trace_wrapped(grad, fn=_multiply)
 
 
 class BackwardHigherOrderOpTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo TestCase for the trace_wrapped backward hook op across eager, make_fx,
+    # compile backends and compiled autograd. Tests keep no shared state; each resets Dynamo
+    # where it loops over backends.
     def test_invoke_in_eager(self):
+        # [FUNCTION DOC] Eager (uncompiled) run: registers _multiply_invoke as a hook on x,
+        # backpropagates a gradient of 2s through x * y with both inputs 0.5, and asserts
+        # x.grad equals y * grad_out. The hook squares the incoming gradient (which is 1.0),
+        # so the squaring does not change the value here.
         x = torch.tensor([0.5, 0.5], requires_grad=True)
         y = torch.tensor([0.5, 0.5], requires_grad=True)
 
@@ -38,12 +52,16 @@ class BackwardHigherOrderOpTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(x.grad, y * grad_out)
 
     def test_invoke_in_pt2(self):
+        # [FUNCTION DOC] For each of the eager, aot_eager and inductor backends: resets Dynamo,
+        # compiles a function that registers the _multiply_invoke hook on x and returns x * y,
+        # runs backward with a gradient of 2s, and asserts x.grad equals grad_out * y.
         for backend in ["eager", "aot_eager", "inductor"]:
             torch._dynamo.reset()
             x = torch.tensor([0.5, 0.5], requires_grad=True)
             y = torch.tensor([0.5, 0.5], requires_grad=True)
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Registers the _multiply_invoke hook on x; returns x * y.
                 x.register_hook(_multiply_invoke)
                 return x * y
 
@@ -54,6 +72,9 @@ class BackwardHigherOrderOpTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(x.grad, grad_out * y)
 
     def test_invoke_make_fx_forward_contrived(self):
+        # [FUNCTION DOC] Traces _multiply_invoke with make_fx on a requires-grad input, checks
+        # the traced module returns the squared values (0.25) and that its normalized readable
+        # code equals an expected string holding a single trace_wrapped call node.
         x = torch.tensor([0.5, 0.5], requires_grad=True)
         out = make_fx(_multiply_invoke)(x)
         self.assertEqual(out(x), torch.tensor([0.25, 0.25]))
@@ -69,9 +90,13 @@ class _multiply_invoke(torch.nn.Module):
         )
 
     def test_invoke_make_bw(self):
+        # [FUNCTION DOC] Runs a small eager forward/backward (z = x*x; z + z) to get x.grad,
+        # then make_fx traces _multiply_invoke on that gradient. Asserts the traced module
+        # returns the squared gradient (4.0 each) and matches the expected readable code.
         x = torch.tensor([0.5, 0.5], requires_grad=True)
 
         def fwd(x):
+            # [FUNCTION DOC] HELPER: Returns x*x added to itself.
             z = x * x
             return z + z
 
@@ -96,10 +121,19 @@ class _multiply_invoke(torch.nn.Module):
         "torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count
     )
     def test_invoke_in_pt2_compiled_autograd(self, _):
+        # [FUNCTION DOC] The patched AOT_COUNTER (second argument, unused) makes graph names
+        # deterministic. For each backend, compiles a forward registering the hook on x and
+        # returning x + y, then runs backward under compiled autograd with a compiler that
+        # captures the single backward graph via inductor. Asserts x.grad equals grad_out
+        # squared and, for aot_eager and inductor, that the captured graph text matches.
         graph = None
 
         def compiler_fn(gm):
+            # [FUNCTION DOC] HELPER: Compiled-autograd compiler; returns gm compiled
+            # fullgraph and dynamic with inner_compiler as the backend.
             def inner_compiler(gm_, example_inputs_):
+                # [FUNCTION DOC] HELPER: Backend; asserts no graph captured yet, stores gm_
+                # in the enclosing graph variable, returns inductor.compile of it.
                 nonlocal graph
                 self.assertEqual(graph, None)
                 graph = gm_
@@ -115,6 +149,7 @@ class _multiply_invoke(torch.nn.Module):
             y = torch.tensor([0.5, 0.5], requires_grad=True)
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Registers _multiply_invoke on x; returns x + y.
                 x.register_hook(_multiply_invoke)
                 return x + y
 
@@ -195,17 +230,28 @@ class GraphModule(torch.nn.Module):
         "torch._functorch.aot_autograd.AOT_COUNTER", new_callable=itertools.count
     )
     def test_invoke_in_pt2_compiled_autograd_side_effect(self, _):
+        # [FUNCTION DOC] The patched AOT_COUNTER (second argument, unused) fixes graph names.
+        # Registers on x a hook (built with functools.partial) that increments counter on a
+        # plain object and squares the gradient, compiles x + y fullgraph on inductor, and runs
+        # backward under compiled autograd. Asserts the counter is 1 and x.grad is 4.0, the
+        # graph matches the expected text, and two further backward runs bring the counter to 3.
         def _side_effect_stateful_fn2(x, obj):
+            # [FUNCTION DOC] HELPER: Increments obj.counter by one and returns x squared.
             obj.counter = obj.counter + 1
             return _multiply(x)
 
         def _side_effectful_invoke2(grad, fn):
+            # [FUNCTION DOC] HELPER: Returns trace_wrapped of grad with fn as the wrapped function.
             return trace_wrapped(grad, fn=fn)
 
         graph = None
 
         def compiler_fn(gm):
+            # [FUNCTION DOC] HELPER: Compiled-autograd compiler; compiles gm fullgraph and
+            # dynamic using inner_compiler as backend.
             def inner_compiler(gm_, example_inputs_):
+                # [FUNCTION DOC] HELPER: Backend; asserts no graph captured yet, stores gm_
+                # in the enclosing graph variable, returns inductor.compile of it.
                 nonlocal graph
                 self.assertEqual(graph, None)
                 graph = gm_
@@ -221,7 +267,9 @@ class GraphModule(torch.nn.Module):
             y = torch.tensor([0.5, 0.5], requires_grad=True)
 
             class MyObj:
+                # [CLASS DOC] HELPER: Mutable holder with an integer counter attribute.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Sets counter to 0.
                     self.counter = 0
 
             obj = MyObj()
@@ -230,6 +278,7 @@ class GraphModule(torch.nn.Module):
             x.register_hook(hook_fn)
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Returns x + y.
                 return x + y
 
             fn = torch.compile(fn, backend=backend, fullgraph=True)
@@ -285,14 +334,23 @@ class GraphModule(torch.nn.Module):
             graph = None
 
     def test_invoke_in_pt2_compiled_autograd_graph_breaks(self):
+        # [FUNCTION DOC] For each backend, registers a hook whose wrapped function calls print
+        # (a graph break), compiles x + y with fullgraph, and asserts that running backward
+        # under compiled autograd (inductor, fullgraph, dynamic) raises
+        # torch._dynamo.exc.Unsupported with a message matching "print".
         def _graph_breaking_fn(x):
+            # [FUNCTION DOC] HELPER: Prints a message (unsupported in a fullgraph trace), then
+            # returns x squared.
             print("Boo!")
             return _multiply(x)
 
         def _graph_break_invoke(grad):
+            # [FUNCTION DOC] HELPER: Returns trace_wrapped of grad wrapping _graph_breaking_fn.
             return trace_wrapped(grad, fn=_graph_breaking_fn)
 
         def compiler_fn(gm):
+            # [FUNCTION DOC] HELPER: Compiled-autograd compiler; compiles gm with inductor,
+            # fullgraph and dynamic.
             return torch.compile(gm, backend="inductor", fullgraph=True, dynamic=True)
 
         for backend in ["eager", "aot_eager", "inductor"]:
@@ -301,6 +359,7 @@ class GraphModule(torch.nn.Module):
             y = torch.tensor([0.5, 0.5], requires_grad=True)
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Registers _graph_break_invoke on x; returns x + y.
                 x.register_hook(_graph_break_invoke)
                 return x + y
 
