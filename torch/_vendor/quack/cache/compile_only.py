@@ -1,3 +1,7 @@
+# [MODULE DOC] Tooling for compile-only cache warming: a FakeTensorMode wrapper that returns sentinel scalars for
+# data-dependent scalar extraction, a context manager that enables compile-only mode, and a live query function.
+# In this mode kernels are compiled and exported to the persistent cache but not launched.
+# No import-time side effects besides defining the sentinel constants.
 # Copyright (c) 2026, Tri Dao.
 """Tooling for ``--compile-only`` cache warming.
 
@@ -96,6 +100,9 @@ _FLOAT_SENTINEL = 1.0
 
 
 class _LocalScalarDenseSentinel(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode that intercepts the local-scalar-dense op (behind item, tolist, int and float conversions)
+    # and returns a fixed sentinel (float sentinel for floating dtypes, integer sentinel otherwise).
+    # All other ops are forwarded to the next mode in the stack.
     """Internal: intercept ``aten._local_scalar_dense`` and return a sentinel.
 
     Implemented as a separate :class:`TorchDispatchMode` rather than as a
@@ -115,6 +122,8 @@ class _LocalScalarDenseSentinel(TorchDispatchMode):
     """
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: If func is the local-scalar-dense op return the sentinel matching the first argument's dtype kind;
+        # otherwise call func with the given args and kwargs (kwargs defaults to empty) and return its result.
         kwargs = kwargs or {}
         if func is torch.ops.aten._local_scalar_dense.default:
             t = args[0]
@@ -123,6 +132,9 @@ class _LocalScalarDenseSentinel(TorchDispatchMode):
 
 
 class CompileOnlyFakeTensorMode:
+    # [CLASS DOC] Context manager combining a stock FakeTensorMode (constructor kwargs are forwarded to it) with the
+    # sentinel dispatch mode, so test setup using data-dependent scalars can proceed to kernel dispatch under fake tensors.
+    # State: the inner fake mode and the sentinel override. Entering returns self; exiting unwinds in reverse order.
     """Context manager: stock :class:`FakeTensorMode` + sentinel override.
 
     The override (:class:`_LocalScalarDenseSentinel`) returns a sentinel value
@@ -138,15 +150,18 @@ class CompileOnlyFakeTensorMode:
     """
 
     def __init__(self, **fake_kwargs):
+        # [FUNCTION DOC] Create the inner FakeTensorMode from the forwarded keyword arguments and the sentinel override mode.
         self._fake_mode = FakeTensorMode(**fake_kwargs)
         self._override = _LocalScalarDenseSentinel()
 
     def __enter__(self):
+        # [FUNCTION DOC] Enter the fake tensor mode first, then the sentinel override; return self.
         self._fake_mode.__enter__()
         self._override.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Exit the sentinel override first, then the fake mode (reverse order), passing the exception info to both.
         # Exit inner override first, then outer FakeTensorMode (LIFO).
         self._override.__exit__(exc_type, exc_val, exc_tb)
         self._fake_mode.__exit__(exc_type, exc_val, exc_tb)
@@ -154,6 +169,10 @@ class CompileOnlyFakeTensorMode:
 
 @contextlib.contextmanager
 def compile_only_mode() -> Iterator[CompileOnlyFakeTensorMode]:
+    # [FUNCTION DOC] Context manager enabling compile-only mode. Increments the context-variable depth counter, enters a new
+    # CompileOnlyFakeTensorMode and yields it; on exit (including on exceptions) leaves the fake mode and resets the counter
+    # to its previous value, so nesting is safe. While active, jit_cache returns a no-op kernel instead of the real one.
+    # KNOWN ISSUE: the docstring refers to a helper in the cache package for the no-op launch, but the no-op kernel is defined in the jit submodule.
     """Enter the QuACK compile-only cache-warming context.
 
     Inside the ``with`` block:
@@ -197,6 +216,7 @@ def compile_only_mode() -> Iterator[CompileOnlyFakeTensorMode]:
 
 
 def is_compile_only() -> bool:
+    # [FUNCTION DOC] Return true if compile-only mode is currently active (depth counter above zero). Reads live state on every call.
     """Return ``True`` if the QuACK compile-only mode is currently active.
 
     Always returns the live stack depth as a bool; no capture-at-import

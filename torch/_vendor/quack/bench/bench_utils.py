@@ -1,3 +1,6 @@
+# [MODULE DOC] Shared helpers for triton perf_report-based benchmarks: running a benchmark Mark and printing/saving
+# results as a table, plus L2-cold CUDA-graph timing utilities (input cloning, buffer-count selection).
+# No import-time side effects beyond imports (pandas/triton only for type checking).
 """Shared helpers for triton perf_report-based benchmarks."""
 
 from __future__ import annotations
@@ -14,6 +17,9 @@ if TYPE_CHECKING:
 
 
 def run_and_print(mark, save_path=None):
+    # [FUNCTION DOC] Run every Benchmark of a triton Mark, print each result table and optionally save CSVs.
+    # Args: mark (perf_report result), save_path (directory, created if missing; one CSV per plot_name).
+    # Side effects: prints to stdout, creates directory and writes CSV files. Raises ImportError via _run_one if pandas is missing.
     """Run a triton ``Mark`` (from ``perf_report``) and print/save results.
 
     Each runner is expected to return a ``dict[str, Any]`` mapping stat name to
@@ -34,6 +40,11 @@ def run_and_print(mark, save_path=None):
 
 
 def _run_one(fn, bench: Benchmark) -> pd.DataFrame:
+    # [FUNCTION DOC] HELPER: Execute one triton Benchmark and return a pandas DataFrame.
+    # For each x value and each line value calls the runner, which must return a mapping of stat name to value;
+    # the key set is locked from the first result and must be identical afterwards (else ValueError; non-mapping
+    # result raises TypeError). Columns are the x names followed by one column per line name and stat.
+    # Raises ImportError with install hint if pandas is unavailable.
     try:
         import pandas as pd
     except ImportError as e:
@@ -75,6 +86,11 @@ def _bench_cuda_graph_l2_rotate(
     n_timed_calls: int = 200,
     quantiles=None,
 ):
+    # [FUNCTION DOC] HELPER: Time fn in milliseconds per call with cold L2 using a single CUDA graph replay.
+    # Steps: three priming launches, probe one launch with events to size a time-based warmup (at least 50 calls),
+    # warm up round-robin over the pre-cloned arg/kwarg sets, capture a graph of rounds of calls over all sets
+    # (timed call count rounded to a multiple of the set count), replay once and divide by total calls.
+    # Returns a float, or a list repeating it per quantile if quantiles is given. Requires CUDA; synchronizes the device.
     """L2-cold single-replay CUDA-graph benchmark.
 
     Warmup is time-based: probe a single kernel launch to estimate the
@@ -156,6 +172,9 @@ def _bench_cuda_graph_l2_rotate(
 
 
 def _clone_l2_rotate_inputs(args, kwargs, n_buffers: int):
+    # [FUNCTION DOC] HELPER: Make n_buffers copies of the call inputs for round-robin L2 rotation.
+    # Tensor positional args and tensor kwargs are cloned each time; other values are shared.
+    # Returns a pair (list of arg tuples, list of kwarg mappings).
     """Clone tensor args AND tensor kwargs ``n_buffers`` times.
 
     Returns ``(arg_sets, kwarg_sets)``: ``arg_sets[i]`` is a tuple matching
@@ -179,6 +198,9 @@ def _clone_l2_rotate_inputs(args, kwargs, n_buffers: int):
 def _pick_l2_rotate_count(
     args, kwargs, target_ratio: int = 3, min_buffers: int = 4, max_buffers: int = 16
 ):
+    # [FUNCTION DOC] HELPER: Choose how many input copies to rotate through so the cloned bytes exceed target_ratio times
+    # the L2 size, bounded by half of free GPU memory and by [min_buffers, max_buffers].
+    # Returns min_buffers when CUDA is unavailable or there are no tensor bytes.
     """Pick ``n_bufs`` so cloned input bytes per round exceed
     ``target_ratio * L2_size`` (defeats L2 reuse), capped by HBM headroom and
     [min_buffers, max_buffers]. Counts tensor bytes across both ``args`` and

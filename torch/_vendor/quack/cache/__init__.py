@@ -1,3 +1,10 @@
+# [PACKAGE DOC] Persistent kernel-cache and compile-only cache-warming package for the vendored quack kernels.
+# Defines the runtime configuration state (CACHE_ENABLED and CACHE_DIR from environment variables, a context-scoped
+# cache directory override, EXTRA_SOURCE_DIRS, and a context-variable depth counter for compile-only mode) BEFORE
+# importing the jit and compile_only submodules, because jit imports this package partially initialized.
+# Re-exports jit_cache, CacheInfo, FileLock, get_cache_path, EXPORT_FUNC_NAME, LOCK_TIMEOUT, CompileOnlyFakeTensorMode,
+# compile_only_mode and is_compile_only. Import-time side effects: reads environment variables, replaces this module's
+# class so that assigning COMPILE_ONLY raises, and installs a module attribute hook for live COMPILE_ONLY reads.
 # Copyright (c) 2025-2026, Tri Dao.
 """Persistent kernel-cache + compile-only utilities for QuACK.
 
@@ -101,6 +108,9 @@ _CACHE_DIR_OVERRIDE: contextvars.ContextVar[Optional[str]] = contextvars.Context
 
 @contextmanager
 def cache_dir_override(cache_dir: Optional[str]) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that sets a context-local cache directory override for its scope.
+    # Args: cache_dir, a path string or None (None means no override). Restores the previous override on exit,
+    # even if an exception occurs.
     token = _CACHE_DIR_OVERRIDE.set(cache_dir)
     try:
         yield
@@ -109,6 +119,8 @@ def cache_dir_override(cache_dir: Optional[str]) -> Iterator[None]:
 
 
 def get_cache_dir() -> Optional[str]:
+    # [FUNCTION DOC] Return the effective cache directory: the active override if set, otherwise the CACHE_DIR setting
+    # from the environment (which may be None, meaning use the default temp location).
     override = _CACHE_DIR_OVERRIDE.get()
     return CACHE_DIR if override is None else override
 
@@ -137,6 +149,8 @@ EXTRA_SOURCE_DIRS: List[Path] = []
 
 
 def __getattr__(name: str):
+    # [FUNCTION DOC] Module attribute hook: reading COMPILE_ONLY returns a live bool (true when the compile-only depth
+    # counter is above zero). Any other missing name raises AttributeError.
     """Resolve legacy ``COMPILE_ONLY`` attribute reads to a live boolean.
 
     Triggers on attribute access \u2014 ``quack.cache.COMPILE_ONLY``, the
@@ -157,6 +171,8 @@ def __getattr__(name: str):
 
 
 class _CacheModule(types.ModuleType):
+    # [CLASS DOC] HELPER: Module subclass installed as this package's class. Its attribute setter raises AttributeError with
+    # migration advice when COMPILE_ONLY is assigned, and otherwise behaves normally. Keeps the live-read hook from being shadowed.
     """Custom module class that forbids assignment to ``COMPILE_ONLY``.
 
     Without this guard, ``quack.cache.COMPILE_ONLY = True`` would place a
@@ -167,6 +183,7 @@ class _CacheModule(types.ModuleType):
     """
 
     def __setattr__(self, name: str, value) -> None:
+        # [FUNCTION DOC] HELPER: Reject assignment to COMPILE_ONLY by raising AttributeError; delegate all other names to the base class.
         if name == "COMPILE_ONLY":
             raise AttributeError(
                 "quack.cache.COMPILE_ONLY is now a read-only stack-backed flag. "
@@ -181,6 +198,8 @@ sys.modules[__name__].__class__ = _CacheModule
 
 
 class CompileOnlyStrictError(RuntimeError):
+    # [CLASS DOC] Runtime error raised by precompile helpers when strict compile-only mode is requested through the
+    # environment. It is a distinct type so the pytest plugin's blanket exception swallowing can let strict failures surface.
     """Raised by precompile helpers under ``QUACK_COMPILE_ONLY_STRICT=1``.
 
     Wraps the underlying exception so the reusable pytest plugin's blanket

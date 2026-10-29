@@ -1,3 +1,9 @@
+# [MODULE DOC] Kernel autotuner adapted from triton's autotuner for the vendored quack kernels. Provides the autotune decorator,
+# the Autotuner wrapper (config pruning, per-argument-shape result caching in memory and optionally on disk, benchmarking
+# either with an L2-cold CUDA-graph round-robin timer or a triton-style do_bench), AutotuneConfig (a hashable set of kernel
+# keyword arguments), and an asynchronous subprocess pool that precompiles configs into the persistent kernel cache while
+# benchmarking proceeds. Environment variables (prefixed with the upper-cased package name) control cache dir, printing,
+# forced cache refresh and autotune caching; QUACK_COMPILE_WORKERS sets pool size. Import-time side effects: none beyond imports.
 # Adapted from https://github.com/triton-lang/triton/blob/main/python/triton/runtime/autotuner.py
 # Copyright (C) 2025, Tri Dao.
 from __future__ import annotations
@@ -38,6 +44,8 @@ _TENSOR_META_TAG = "__quack_tensor_meta__"
 
 
 def _serialize_precompile_value(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively convert a value for sending to a compile worker: tensors become a mapping holding shape, stride and
+    # dtype string plus a marker tag; tuples, lists and dicts are converted element-wise; other values pass through.
     if isinstance(value, Tensor):
         return {
             _TENSOR_META_TAG: True,
@@ -55,6 +63,8 @@ def _serialize_precompile_value(value: Any) -> Any:
 
 
 def _get_current_cuda_device() -> str | None:
+    # [FUNCTION DOC] HELPER: Return the physical CUDA device identifier (as a string) of the current device, mapping the logical index
+    # through CUDA_VISIBLE_DEVICES when set. Returns None if CUDA is not available or initialized, or the index is out of range.
     """Return the physical CUDA device identifier for the current process.
 
     Maps the logical ``torch.cuda.current_device()`` index through
@@ -78,15 +88,21 @@ def _get_current_cuda_device() -> str | None:
 
 
 def get_home_dir():
+    # [FUNCTION DOC] Return the home directory used for caches: the package-specific HOME environment variable if set, else the user home.
     return os.getenv(f"{PACKAGE_NAME.upper()}_HOME", Path.home())
 
 
 def default_cache_dir():
+    # [FUNCTION DOC] Return the default autotune cache directory, a hidden package folder with a cache subfolder under the home dir.
     return os.path.join(get_home_dir(), f".{PACKAGE_NAME}", "cache")
 
 
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
+    # [CLASS DOC] Triton file cache manager whose cache root comes from the package CACHE_DIR environment variable (or the default
+    # cache dir), with a subdirectory per key. Creates the directory and lock path on construction.
     def __init__(self, key):
+        # [FUNCTION DOC] Initialize the base manager, compute the per-key cache directory and lock path, and create the directory.
+        # Raises RuntimeError if no cache directory can be determined.
         super().__init__(key)
         self.cache_dir = (
             os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
@@ -100,11 +116,14 @@ class FileCacheManager(triton.runtime.cache.FileCacheManager):
 
 
 def _base32(key):
+    # [FUNCTION DOC] HELPER: Encode a hex-string key as unpadded base32 text (used for filesystem-friendly cache folder names).
     # Assume key is a hex string.
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
 
 
 def _gpu_warmup(duration_ms=200):
+    # [FUNCTION DOC] HELPER: Run repeated large bfloat16 matrix multiplications on the GPU for duration_ms milliseconds, then synchronize,
+    # so the GPU reaches steady-state clocks before timing the first config. Allocates a 4096 by 4096 tensor.
     """Saturate the GPU to reach thermal steady-state before benchmarking.
 
     Without this, the first autotuning config gets artificially good numbers
@@ -149,6 +168,9 @@ def _gpu_warmup(duration_ms=200):
 
 @dataclass
 class _PrecompileHandle:
+    # [CLASS DOC] HELPER: Handle for an asynchronous precompile pool. Holds per-config completion events, a mapping of failed config
+    # indices to messages, the worker processes, reader threads and a lock guarding failures. May be empty (no-op) when
+    # precompilation was skipped, in which case waiting returns immediately. Methods: wait_for, is_failed, shutdown.
     """Per-config completion handle returned by :meth:`Autotuner._precompile`.
 
     Empty / no-op when the subprocess pool was skipped (cache hit, disabled,
@@ -163,6 +185,8 @@ class _PrecompileHandle:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def wait_for(self, config_idx: int, timeout: Optional[float] = None) -> None:
+        # [FUNCTION DOC] Block until the compile for config_idx finishes (or fails), up to an optional timeout in seconds.
+        # No-op for unknown indices.
         """Block until ``config_idx``'s compile completes (or failed).
 
         No-op for indices that were never registered (e.g. the entire handle
@@ -174,6 +198,7 @@ class _PrecompileHandle:
             evt.wait(timeout=timeout)
 
     def is_failed(self, config_idx: int) -> bool:
+        # [FUNCTION DOC] Return true if the pool failed to compile the given config index (thread-safe check of the failures mapping).
         """True if the subprocess pool failed to compile this config.
 
         Use after :meth:`wait_for` returns. Failed configs need an in-process
@@ -184,6 +209,8 @@ class _PrecompileHandle:
             return config_idx in self.failures
 
     def shutdown(self) -> None:
+        # [FUNCTION DOC] Close worker stdin pipes, wait up to 5 s per worker (killing stragglers), then join reader threads (1 s each).
+        # Idempotent; ignores broken pipes and OS errors.
         """Close stdins, wait for workers and reader threads to exit.
 
         Idempotent. Safe to call even if ``__init__`` failed midway through
@@ -209,6 +236,9 @@ class _PrecompileHandle:
 
 
 def _reader_thread_main(handle, worker, config_indices):
+    # [FUNCTION DOC] HELPER: Thread body for one worker. Reads one reply per assigned config in dispatch order; an error-prefixed string reply
+    # records a failure. If the worker's output ends early (crash), marks it and all of its remaining configs failed and
+    # sets their events so waiters wake. Always sets the event of each config it handles.
     """Drain replies from one worker's stdout and signal per-config events.
 
     Replies arrive in dispatch order (length-prefixed pickled strings:
@@ -239,6 +269,8 @@ def _reader_thread_main(handle, worker, config_indices):
 
 
 def _recv_from_worker(stream):
+    # [FUNCTION DOC] HELPER: Read one length-prefixed (4-byte little-endian) pickled message from a binary stream and return the object.
+    # Returns None on end of stream, zero length, or a truncated body. Same wire protocol as the compile worker.
     """Read a length-prefixed pickled message. Returns None on EOF or partial body.
 
     Mirrors ``_compile_worker._recv`` so the parent and worker speak the
@@ -279,6 +311,11 @@ def _recv_from_worker(stream):
 
 
 class Autotuner:
+    # [CLASS DOC] Callable wrapper that autotunes a kernel function over a list of AutotuneConfig objects. On first call for a given
+    # key (selected argument values plus tensor shapes, coarse strides and dtypes) it prunes configs, optionally precompiles
+    # them in a subprocess pool, benchmarks each and stores the best in an in-memory mapping (optionally persisted to disk);
+    # later calls reuse it. Attributes: fn, configs, keys, cache, restore_value hooks, perf model and top-k pruning settings,
+    # best_config, configs_timings, bench_time and transient nargs / L2-cold input sets used during a call.
     def __init__(
         self,
         fn,
@@ -290,6 +327,9 @@ class Autotuner:
         cache_results=False,
         precompile_configs=True,
     ):
+        # [FUNCTION DOC] Store the wrapped function and configs (a single default config if none given), key argument names, optional
+        # restore-value pre/post hooks (clone then copy back the named tensors), pruning options (perf_model, top_k,
+        # early_config_prune), disk-cache flag (also enabled by environment variable), precompile flag and custom do_bench.
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -316,6 +356,7 @@ class Autotuner:
         if len(self.restore_value) > 0:
 
             def _pre_hook(kwargs):
+                # [FUNCTION DOC] HELPER: Clone the named restore_value tensors from kwargs into restore_copies before a benchmarked call.
                 self.restore_copies = {name: kwargs[name].clone() for name in self.restore_value}
 
             self.pre_hook = _pre_hook
@@ -325,6 +366,7 @@ class Autotuner:
         if len(self.restore_value) > 0:
 
             def _post_hook(kwargs, exception):
+                # [FUNCTION DOC] HELPER: Copy the saved tensors back into the named kwargs after a benchmarked call and clear the saved copies.
                 for name in self.restore_value:
                     kwargs[name].copy_(self.restore_copies[name])
                 self.restore_copies = {}
@@ -348,11 +390,18 @@ class Autotuner:
 
     @cached_property
     def do_bench(self):
+        # [FUNCTION DOC] Property (cached): the benchmark function, the user-supplied one or triton do_bench with warmup 5 and rep 25.
         if self._do_bench is None:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
 
     def _precompile(self, *args, configs, **kwargs) -> _PrecompileHandle:
+        # [FUNCTION DOC] HELPER: Start parallel precompilation of configs in persistent worker subprocesses and return a _PrecompileHandle.
+        # Returns an empty handle if precompile or the kernel cache is disabled, at most one worker is allowed (pool size is the
+        # minimum of config count and a worker-count environment value), calling the function with the first config in-process
+        # finishes quickly (under 0.5 s, i.e. already cached), or no worker becomes ready. Otherwise spawns workers pinned to the
+        # current CUDA device, sends each config round-robin with serialized tensor metadata, and starts a daemon reader thread per
+        # worker. Side effects: subprocesses, threads, optional printing; exceptions from the probe call are swallowed.
         """Pre-compile all configs in parallel subprocesses to populate .o cache.
 
         cute.compile() is not thread-safe (MLIR thread-local state) and fork after
@@ -403,6 +452,7 @@ class Autotuner:
         import struct
 
         def _send(stream, msg):
+            # [FUNCTION DOC] HELPER: Write one length-prefixed pickled message to a stream and flush.
             data = pickle.dumps(msg)
             stream.write(struct.pack("<I", len(data)))
             stream.write(data)
@@ -494,6 +544,10 @@ class Autotuner:
         return handle
 
     def _bench(self, *args, config, **meta):
+        # [FUNCTION DOC] HELPER: Time one config and return a list of three timings (median, low, high quantiles) in ms. Raises ValueError if the
+        # config repeats a kwarg already supplied. Uses the L2-cold CUDA-graph timer when prepared input sets exist, no custom
+        # do_bench and no hooks; otherwise runs the kernel (with hooks) under do_bench. GPU-side failures (runtime or memory
+        # errors) yield infinite timings instead of raising.
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
         if verbose:
             print(f"Autotuning kernel {self.fn.__name__} with config {config}")
@@ -550,6 +604,8 @@ class Autotuner:
         # ``do_bench=`` arg, or (b) pre/post hooks are configured (the
         # clone/restore inside hooks doesn't work under CUDA graph capture).
         def kernel_call():
+            # [FUNCTION DOC] HELPER: Run the pre hook, call the wrapped function with the config kwargs, then run the post hook; if the call raises,
+            # the post hook is given the exception and the exception is re-raised.
             if self.pre_hook is not None:
                 self.pre_hook(full_nargs)
             try:
@@ -577,6 +633,10 @@ class Autotuner:
 
     @torch.compiler.disable
     def check_disk_cache(self, tuning_key, configs, bench_fn):
+        # [FUNCTION DOC] Run bench_fn, or load results from the on-disk JSON cache. If tuning_key is empty just benchmarks. The cache key hashes
+        # the package version, tuning key and config strings (which must be unique, asserted). A hit (unless a force-update
+        # environment variable is set) sets the best config, config timings and zero bench time; a miss benchmarks then writes the
+        # timings file. Excluded from torch compile tracing.
         if not tuning_key:
             bench_fn()
             return
@@ -615,6 +675,11 @@ class Autotuner:
         )
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Autotune (if needed) and invoke the wrapped function. Builds a key from selected arguments and tensor shape, coarse
+        # stride pattern and dtype; for multiple configs and an unseen key prunes configs and benchmarks them (via disk cache if
+        # enabled), storing the best. Then calls the function with the chosen config's kwargs and returns its result. Sets
+        # best_config and prints a summary if printing is enabled. Prints a stderr warning when some configs failed.
+        # KNOWN ISSUE: the key uses printable argument values, and the temporary nargs field is not reset if the call raises.
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -635,6 +700,10 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
+                    # [FUNCTION DOC] HELPER: Benchmark all pruned configs: start precompilation, warm the GPU, prepare L2-cold cloned input sets (skipped with
+                    # hooks or custom do_bench; failure to clone falls back to the legacy path), then per config wait for its compile (compiling
+                    # in-process if the pool failed) and time it. Always frees input sets and shuts down the pool. Records the best config,
+                    # all timings and elapsed time on the tuner.
                     # Two new mechanisms cooperate here:
                     #   (a) ``_precompile`` returns a ``_PrecompileHandle``
                     #       whose ``wait_for(i)`` blocks until config i is
@@ -757,6 +826,8 @@ class Autotuner:
         return ret
 
     def prune_configs(self, kwargs: Dict) -> List[Any]:
+        # [FUNCTION DOC] Return the configs to benchmark: apply early_config_prune, then if a perf_model exists keep the top_k lowest predicted
+        # times (top_k may be a fraction of config count or an integer). Raises TypeError for an invalid top_k.
         pruned_configs = self.configs
         if self.early_config_prune:
             pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
@@ -784,6 +855,8 @@ class Autotuner:
 
 
 class AutotuneConfig:
+    # [CLASS DOC] A candidate kernel configuration: a mapping of keyword arguments passed to the kernel. Hashable and comparable by
+    # its items, printable as comma-separated name: value pairs, so it can key timing mappings.
     """
     An object that represents a possible kernel configuration for the auto-tuner to try.
 
@@ -792,24 +865,30 @@ class AutotuneConfig:
     """
 
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] Store the keyword arguments as the config mapping.
         self.kwargs = kwargs
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restore from pickle state, taking the kwargs entry or an empty mapping.
         self.kwargs = state.get("kwargs", {})
 
     def all_kwargs(self):
+        # [FUNCTION DOC] Return the mapping of config keyword arguments.
         return self.kwargs
 
     def __str__(self):
+        # [FUNCTION DOC] Return the kwargs as comma-separated name: value text.
         res = []
         for k, v in self.kwargs.items():
             res.append(f"{k}: {v}")
         return ", ".join(res)
 
     def __hash__(self):
+        # [FUNCTION DOC] Hash of the tuple of kwargs items.
         return hash(tuple(self.all_kwargs().items()))
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Equal if the kwargs items tuples are equal. KNOWN ISSUE: assumes other has an all_kwargs method; comparing with other types raises AttributeError.
         self_tuple = tuple(self.all_kwargs().items())
         other_tuple = tuple(other.all_kwargs().items())
         return self_tuple == other_tuple
@@ -824,6 +903,10 @@ def autotune(
     cache_results=True,
     precompile_configs=True,
 ):
+    # [FUNCTION DOC] Decorator factory that wraps a function in an Autotuner with the given configs, key argument names, pruning options,
+    # restore_value names, custom do_bench, disk-cache flag and precompile flag. A missing key becomes an empty list.
+    # KNOWN ISSUE: the string after the signature is an f-string, so it is not a real docstring; it also claims the
+    # cache_results default is False while the signature default is True and has a malformed type directive for it.
     f"""
     Decorator for auto-tuning a function function.
 
@@ -854,6 +937,7 @@ def autotune(
         key = []
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Build and return the Autotuner for fn using the enclosing arguments.
         return Autotuner(
             fn,
             key,

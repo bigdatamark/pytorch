@@ -1,3 +1,8 @@
+# [MODULE DOC] Device-side (CuTe DSL) activation functions and their backward passes for float32 values or packed pairs of
+# float32 values: sigmoid, relu, relu squared, gelu (tanh approximation), softplus, silu, glu, reglu, geglu, swiglu and the
+# gpt-oss swiglu variant, with tanh-based fast variants. Backward functions generally return the input gradient(s)
+# together with the recomputed forward output. Ends with four lookup maps from activation name to function
+# (act_fn_map, dact_fn_map, gate_fn_map, dgate_fn_map). Import-time side effects: defines the packed subtract helper.
 # Copyright (c) 2025, Tri Dao.
 
 import math
@@ -22,6 +27,7 @@ sub_packed_f32x2 = partial(
 
 @dsl_user_op
 def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] Hardware approximate tanh of a float32 scalar via inline PTX assembly (no side effects). Returns Float32.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -36,6 +42,8 @@ def tanh(a: float | Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def sigmoid_tanh(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] Sigmoid computed as 0.5 plus 0.5 times tanh of half the input, so only one tanh is needed.
+    # Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     if const_expr(not isinstance(x, tuple)):
         # return 0.5 + 0.5 * cute.math.tanh(0.5 * x, fastmath=True)
         return 0.5 + 0.5 * tanh(0.5 * x)
@@ -47,6 +55,8 @@ def sigmoid_tanh(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 def sigmoid(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] Sigmoid computed as the approximate reciprocal of one plus exp of the negated input (the packed path uses exp2 with a
+    # log2(e) scale). Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     if const_expr(not isinstance(x, tuple)):
         return cute.arch.rcp_approx(1.0 + cute.math.exp(-x, fastmath=True), loc=loc, ip=ip)
     else:
@@ -62,12 +72,14 @@ def sigmoid(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 def dsigmoid_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] Sigmoid gradient from the forward output: dout times out times (1 minus out), computed as dout times (out minus out squared).
     # return dout * out * (1.0 - out)
     return dout * (out - out * out)
 
 
 @dsl_user_op
 def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] max(x, 0). Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     if const_expr(not isinstance(x, tuple)):
         return cute.arch.fmax(x, Float32(0.0))
     else:
@@ -79,6 +91,8 @@ def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 def drelu(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] ReLU backward. Returns (dx, relu(x)) where dx equals dout where x is positive and zero elsewhere. Operates on scalars or
+    # pairs; inputs x and dout must have the same form.
     if const_expr(not isinstance(x, tuple)):
         x_pos = Boolean(x > 0)
         return dout if x_pos else Float32(0.0), cute.arch.fmax(x, Float32(0.0))
@@ -91,6 +105,7 @@ def drelu(
 
 @dsl_user_op
 def relu_sq(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] Relu squared forward: max(x, 0) times x. Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     if const_expr(not isinstance(x, tuple)):
         return cute.arch.fmax(x, Float32(0.0)) * x
     else:
@@ -103,6 +118,8 @@ def relu_sq(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 def drelu_sq(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] Relu squared backward. Returns (dx, relu_sq_out) where dx is 2 times dout times relu(x) (zero for non-positive x).
+    # Scalar or pair form.
     """
     ReLU squared backward pass: computes gradient w.r.t. x and recomputes forward
     Given: relu_sq_out = max(x, 0) * x, and dout = grad w.r.t. relu_sq_out
@@ -125,6 +142,8 @@ def drelu_sq(
 
 @dsl_user_op
 def gelu_tanh_approx(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] GELU with the tanh approximation, using a factored polynomial form of the inner argument and the fast tanh.
+    # Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     """
     gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
             = 0.5 * x * (1 + tanh(x * (0.797885 + 0.0356774 * x * x)))
@@ -153,6 +172,8 @@ def gelu_tanh_approx(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 def dgelu_tanh_approx(
     x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] GELU (tanh approximation) backward. Returns (dx, gelu_out): the derivative via the chain rule through the tanh
+    # argument, multiplied by dout, plus the recomputed forward value. Scalar or pair form.
     """
     GELU tanh approximation backward pass: computes gradient w.r.t. x and recomputes forward
     Given: gelu_out = 0.5 * x * (1 + tanh(x * (c1 + c2 * x^2))), and dout = grad w.r.t. gelu_out
@@ -215,6 +236,7 @@ def dgelu_tanh_approx(
 @dsl_user_op
 @cute.jit
 def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] Softplus log(1 + exp(x)) using fast math, returning x unchanged where x exceeds 20 to avoid overflow. Scalar or pair form.
     if const_expr(not isinstance(x, tuple)):
         use_linear = Boolean(x > 20.0)
         return (
@@ -244,6 +266,7 @@ def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 @dsl_user_op
 @cute.jit
 def dsoftplus_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] Softplus backward from the forward output: dout times (1 minus exp(-out)), or dout unchanged where out exceeds 20.
     use_linear = Boolean(out > 20.0)
     # dx = dout * (1.0 - cute.math.exp(-out, fastmath=True)) if not use_linear else dout
     dx = dout - dout * cute.math.exp(-out, fastmath=True)
@@ -252,6 +275,7 @@ def dsoftplus_from_output(out: Float32, dout: Float32, *, loc=None, ip=None) -> 
 
 @dsl_user_op
 def silu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] SiLU: x times sigmoid(x). Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     """
     silu(x) = x * sigmoid(x) = x * rcp(1 + exp(-x)).
     """
@@ -263,6 +287,8 @@ def silu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 def silu_tanh(x: F32_or_F32x2, *, already_halved: bool = False, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] SiLU via the tanh identity (half-x times tanh of half-x plus half-x). If already_halved is true the input is taken to be
+    # already multiplied by 0.5. Operates on a single float32 value or a pair (tuple of two) for packed two-lane arithmetic.
     """
     silu(x) = x * sigmoid(x) = x * (1 + tanh(x / 2)) / 2 = (0.5 * x) * tanh(0.5 * x) + (0.5 * x)
     This compiles down to 3 SASS instructions: FMUL to get 0.5 * x, MUFU.TANH, and FFMA.
@@ -285,6 +311,7 @@ def dsilu(
     loc=None,
     ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] SiLU backward. Returns (d_silu(x) times dout, silu(x)) computed with fused multiply-add friendly expansion. Scalar or pair form.
     """
     SiLU backward pass: computes d_silu(x) * dout and recomputes silu(x).
 
@@ -319,6 +346,8 @@ def dsilu_tanh(
     loc=None,
     ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] SiLU backward using the tanh-based sigmoid; already_halved indicates x is pre-multiplied by 0.5.
+    # Returns (d_silu(x) times dout, silu(x)). Scalar or pair form.
     """
     SiLU backward using sigmoid(x) = 0.5 * (1 + tanh(0.5 * x)).
     """
@@ -358,6 +387,7 @@ def dsilu_tanh(
 
 @dsl_user_op
 def swiglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] SwiGLU forward: silu(x) times y (x is the gate, y the up projection). Scalar or pair form.
     if const_expr(not isinstance(x, tuple)):
         return silu(x) * y
     else:
@@ -366,6 +396,7 @@ def swiglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32
 
 @dsl_user_op
 def swiglu_tanh(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] SwiGLU forward using the tanh-based silu. Scalar or pair form.
     if const_expr(not isinstance(x, tuple)):
         return silu_tanh(x) * y
     else:
@@ -381,6 +412,8 @@ def dswiglu(
     loc=None,
     ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] SwiGLU backward. Returns (dx, dy, swiglu_out) with dx = dout times y times d_silu(x), dy = dout times silu(x),
+    # and swiglu_out = silu(x) times y, arranged to minimize instruction count. Scalar or pair form.
     """
     SwiGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
     Given: swiglu_out = silu(x) * y, and dout = grad w.r.t. swiglu_out
@@ -434,6 +467,8 @@ def dswiglu_tanh(
     loc=None,
     ip=None,
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] SwiGLU backward using the tanh-based sigmoid; already_halved indicates x is pre-multiplied by 0.5.
+    # Returns (dx, dy, swiglu_out). Scalar or pair form.
     """
     SwiGLU backward using sigmoid(x) = 0.5 * (1 + tanh(0.5 * x)).
     """
@@ -478,6 +513,7 @@ def dswiglu_tanh(
 def swiglu_oai(
     x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
 ) -> F32_or_F32x2:
+    # [FUNCTION DOC] gpt-oss SwiGLU variant: x times sigmoid(alpha times x) times (y + 1), default alpha 1.702. Scalar or pair form.
     """The swiglu variant used in gpt-oss, which has a scaling factor on x and bias of 1 to y.
     https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
     x * sigmoid(alpha * x) * (y + 1)
@@ -497,6 +533,7 @@ def swiglu_oai(
 def swiglu_oai_tanh(
     x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
 ) -> F32_or_F32x2:
+    # [FUNCTION DOC] Tanh-based version of swiglu_oai kept for instruction-level and accuracy comparison. Scalar or pair form.
     """Tanh-based swiglu_oai kept for SASS/accuracy comparison."""
     if const_expr(not isinstance(x, tuple)):
         x_half = 0.5 * x
@@ -514,6 +551,7 @@ def swiglu_oai_tanh(
 def dswiglu_oai(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] Backward of swiglu_oai. Returns (dx, dy, swiglu_oai_out) given x, y, dout and alpha. Scalar or pair form.
     """
     Swiglu OAI backward pass: computes gradients w.r.t. x and y
     Given: swiglu_oai_out = x * sigmoid(alpha * x) * (y + 1), and dout = grad w.r.t. swiglu_oai_out
@@ -553,6 +591,7 @@ def dswiglu_oai(
 def dswiglu_oai_tanh(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] Tanh-based backward of swiglu_oai kept for comparison. Returns (dx, dy, swiglu_oai_out). Scalar or pair form.
     """Tanh-based dswiglu_oai kept for SASS/accuracy comparison."""
     if const_expr(not isinstance(x, tuple)):
         alpha_x_half = (0.5 * alpha) * x
@@ -585,6 +624,7 @@ def dswiglu_oai_tanh(
 
 @dsl_user_op
 def glu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] Gated linear unit: sigmoid(x) times y. Scalar or pair form.
     """GLU: Gated Linear Unit
     glu(x, y) = sigmoid(x) * y
     """
@@ -600,6 +640,9 @@ def glu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 def dglu(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] GLU backward. Returns (dx, dy, glu_out) with dy = dout times sigmoid(x) and dx = (y minus glu_out) times dy.
+    # Scalar or pair form (the pair path uses the packed subtract).
+    # KNOWN ISSUE: an inline comment mentions a tanh instruction in the total instruction count, but sigmoid here uses exp and reciprocal.
     """
     GLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
     Given: glu_out = sigmoid(x) * y, and dout = grad w.r.t. glu_out
@@ -633,6 +676,7 @@ def dglu(
 
 @dsl_user_op
 def reglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] ReGLU forward: max(x, 0) times y. Scalar or pair form.
     """ReGLU: ReLU Gated Linear Unit
     reglu(x, y) = relu(x) * y = max(x, 0) * y
     """
@@ -648,6 +692,8 @@ def reglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x
 def dreglu(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] ReGLU backward. Returns (dx, dy, reglu_out): dx is dout times y where x is positive else zero, dy is dout times relu(x),
+    # reglu_out is relu(x) times y. Scalar or pair form.
     """
     ReGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
     Given: reglu_out = relu(x) * y, and dout = grad w.r.t. reglu_out
@@ -676,6 +722,7 @@ def dreglu(
 
 @dsl_user_op
 def geglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
+    # [FUNCTION DOC] GeGLU forward: tanh-approximate gelu(x) times y. Scalar or pair form.
     """GeGLU: GELU Gated Linear Unit
     geglu(x, y) = gelu(x) * y
     Uses the tanh approximation of GELU
@@ -690,6 +737,8 @@ def geglu(x: F32_or_F32x2, y: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x
 def dgeglu(
     x: F32_or_F32x2, y: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
 ) -> Tuple[F32_or_F32x2, F32_or_F32x2, F32_or_F32x2]:
+    # [FUNCTION DOC] GeGLU backward built on dgelu_tanh_approx. Returns (dx, dy, geglu_out) with dx = d_gelu(x)*dout*y, dy = gelu(x)*dout,
+    # geglu_out = gelu(x)*y. Scalar or pair form.
     """
     GeGLU backward pass: computes gradients w.r.t. x (gate) and y (up projection)
     Given: geglu_out = gelu(x) * y, and dout = grad w.r.t. geglu_out

@@ -1,3 +1,7 @@
+# [MODULE DOC] Persistent object-file cache for CuTe DSL compiled kernels. Provides the jit_cache decorator (in-memory plus
+# on-disk caching keyed by function name and arguments), an advisory file lock, cache path resolution and a source
+# fingerprint (hash of the quack sources, extra source dirs, and python, cutlass and tvm_ffi versions) that namespaces
+# cache directories. Imports the package itself as a state holder for live flag reads. No other import-time side effects.
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 """Persistent ``.o`` cache for CuTe DSL compiled kernels.
 
@@ -42,10 +46,13 @@ CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
 def _noop_kernel(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Placeholder kernel accepting any arguments and doing nothing; returned in compile-only mode.
     pass
 
 
 def get_cache_path() -> Path:
+    # [FUNCTION DOC] Return the cache root directory as a Path, creating it (with parents) if missing.
+    # Uses the configured cache dir or override if any, else a per-user folder under the system temp directory.
     if (cache_dir_override := _state.get_cache_dir()) is not None:
         cache_dir = Path(cache_dir_override)
     else:
@@ -55,6 +62,8 @@ def get_cache_path() -> Path:
 
 
 def _hash_source_dir(h, root: Path) -> None:
+    # [FUNCTION DOC] HELPER: Feed every python file under root (sorted, recursive) into the hash object h: relative path,
+    # an 8-byte little-endian length, then contents. Non-files are skipped.
     """Hash all Python sources under *root* into *h*."""
     for src in sorted(root.rglob("*.py")):
         if not src.is_file():
@@ -67,6 +76,9 @@ def _hash_source_dir(h, root: Path) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _compute_source_fingerprint() -> str:
+    # [FUNCTION DOC] HELPER: Compute (once per process, memoized) a sha256 hex digest over the python minor version, cutlass
+    # version, tvm_ffi version, all sources of the quack package, and every directory in EXTRA_SOURCE_DIRS.
+    # Extra dirs added after the first call are ignored.
     """Hash quack + extra source dirs plus runtime ABI stamps into a fingerprint."""
     h = hashlib.sha256()
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
@@ -84,6 +96,7 @@ def _compute_source_fingerprint() -> str:
 
 
 def _key_to_hash(key: tuple) -> str:
+    # [FUNCTION DOC] HELPER: Return the sha256 hex digest of the pickled key tuple.
     return hashlib.sha256(pickle.dumps(key)).hexdigest()
 
 
@@ -93,15 +106,20 @@ def _key_to_hash(key: tuple) -> str:
 
 
 class FileLock:
+    # [CLASS DOC] Advisory inter-process file lock (flock) usable as a context manager, shared or exclusive.
+    # State: lock_path, exclusive flag, timeout in seconds, and the open descriptor (-1 when not held).
     """Advisory file lock using fcntl.flock with timeout."""
 
     def __init__(self, lock_path: Path, exclusive: bool, timeout: float = 15):
+        # [FUNCTION DOC] Store the lock path, exclusive flag and timeout; the file is not opened until entry.
         self.lock_path = lock_path
         self.exclusive = exclusive
         self.timeout = timeout
         self._fd: int = -1
 
     def __enter__(self) -> "FileLock":
+        # [FUNCTION DOC] Open (creating) the lock file and poll a non-blocking flock every 0.1 s until acquired or the timeout elapses.
+        # Returns self on success. On timeout closes the descriptor and raises RuntimeError.
         flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
         lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
         self._fd = os.open(str(self.lock_path), flags)
@@ -117,6 +135,7 @@ class FileLock:
         raise RuntimeError(f"Timed out waiting for lock: {self.lock_path}")
 
     def __exit__(self, *exc) -> None:
+        # [FUNCTION DOC] If held, release the flock and close the descriptor. Does not suppress exceptions.
         if self._fd >= 0:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
             os.close(self._fd)
@@ -129,6 +148,13 @@ class FileLock:
 
 
 def jit_cache(fn):
+    # [FUNCTION DOC] Decorator caching the compiled kernel returned by the wrapped function, in memory and on disk.
+    # Key is the positional args plus sorted kwargs. Flow: in-memory hit; cache disabled means compile in process only;
+    # otherwise shared-lock load of an existing object file; otherwise compile under an exclusive per-key lock, export the
+    # object file (export failures are printed, not raised) and cache it. Lock timeouts fall back to an uncached compile.
+    # In compile-only mode every path returns a no-op kernel instead of the real one. The wrapper gains cache (the mapping),
+    # cache_clear and cache_info attributes.
+    # KNOWN ISSUE: any RuntimeError raised by the wrapped function inside the exclusive lock is treated as a lock timeout, causing a second compile attempt.
     """Decorator that caches compiled CuTe DSL kernels in-memory and on disk.
 
     The decorated function should return a compiled kernel (i.e. call cute.compile).
@@ -159,6 +185,8 @@ def jit_cache(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Cached call entry point described under jit_cache; updates hit/miss counters and returns a compiled
+        # callable (or the no-op kernel in compile-only mode).
         nonlocal hits, misses
         cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
 
@@ -197,6 +225,7 @@ def jit_cache(fn):
         lock_path = cache_path / f"{sha}.lock"
 
         def _load_cached() -> object:
+            # [FUNCTION DOC] HELPER: Load the exported object file via the cute runtime with tvm ffi enabled and return its exported function.
             """Load the .o into a callable; caller guarantees existence."""
             m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
             return m[EXPORT_FUNC_NAME]
@@ -253,12 +282,14 @@ def jit_cache(fn):
             return _noop_kernel if compile_only else compiled_fn
 
     def cache_clear():
+        # [FUNCTION DOC] HELPER: Empty the in-memory cache and reset hit and miss counters (disk files untouched).
         nonlocal hits, misses
         cache.clear()
         hits = 0
         misses = 0
 
     def cache_info():
+        # [FUNCTION DOC] HELPER: Return a CacheInfo tuple of hits, misses, unbounded maxsize (None) and current in-memory size.
         return CacheInfo(hits=hits, misses=misses, maxsize=None, currsize=len(cache))
 
     wrapper.cache = cache

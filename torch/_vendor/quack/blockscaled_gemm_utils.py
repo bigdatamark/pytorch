@@ -1,3 +1,8 @@
+# [MODULE DOC] Test/benchmark utilities for SM100 block-scaled GEMMs (MXFP8, MXFP4, NVFP4): dtype maps between cutlass and torch,
+# FP4 E2M1 value table and packing, generators of random (optionally quantized) operands and scale tensors in the blocked
+# 512-element swizzled layout shared with cuBLAS, varlen-M / varlen-K operand builders with padded scale storage, a compile
+# helper that builds a runnable GEMM through tvm ffi, and a dense einsum reference. Operand generators allocate on CUDA.
+# Import-time side effects: builds a CPU lookup table of FP4 values and the dtype constants.
 # Copyright (c) 2026, Tri Dao.
 
 import itertools
@@ -59,16 +64,19 @@ FP4_E2M1FN_VALUES = (
 
 
 def ceil_div(a: int, b: int) -> int:
+    # [FUNCTION DOC] Integer ceiling division of a by b.
     return (a + b - 1) // b
 
 
 def torch_dtype_for_cutlass(dtype: Type[cutlass.Numeric]) -> torch.dtype:
+    # [FUNCTION DOC] Map a cutlass numeric type to its torch dtype via TORCH_DTYPE_MAP. Raises TypeError for unsupported types.
     if dtype not in TORCH_DTYPE_MAP:
         raise TypeError(f"Unsupported dtype: {dtype}")
     return TORCH_DTYPE_MAP[dtype]
 
 
 def _make_fake_tensor_like(tensor: torch.Tensor, dtype: Type[cutlass.Numeric]) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Make a fake cute tensor with the given cutlass dtype and the torch tensor's shape and strides, assumed 16-byte aligned.
     return cute.runtime.make_fake_tensor(
         dtype,
         tensor.shape,
@@ -78,6 +86,7 @@ def _make_fake_tensor_like(tensor: torch.Tensor, dtype: Type[cutlass.Numeric]) -
 
 
 def _leading_dim_from_stride(tensor: torch.Tensor) -> int:
+    # [FUNCTION DOC] HELPER: Return the index of the first dimension with stride 1. Raises ValueError if none exists.
     for i, stride in enumerate(tensor.stride()):
         if stride == 1:
             return i
@@ -89,6 +98,8 @@ def _leading_dim_from_stride(tensor: torch.Tensor) -> int:
 def _make_compile_tensor_like(
     tensor: torch.Tensor, dtype: Type[cutlass.Numeric], dynamic_layout: bool = False
 ) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Wrap a torch tensor as a cute tensor via dlpack with element type overridden to dtype; if dynamic_layout is true,
+    # mark the layout dynamic with the unit-stride dim as leading dim (when marking returns a result).
     compile_tensor = cute.runtime.from_dlpack(tensor)
     compile_tensor.element_type = dtype
     if dynamic_layout:
@@ -101,6 +112,8 @@ def _make_compile_tensor_like(
 def _make_fake_compact_tensor(
     shape: Tuple[int, ...], dtype: Type[cutlass.Numeric], leading_dim: int
 ) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Build a symbolic fake tensor for a shape and dtype with the given leading dim; for packed Float4 the logical
+    # leading extent is doubled (two values per stored element). Divisibility is chosen by dtype.
     logical_shape = list(shape)
     if dtype == cutlass.Float4E2M1FN:
         logical_shape[leading_dim] *= 2
@@ -113,10 +126,13 @@ def _make_fake_compact_tensor(
 
 
 def _fp4_e2m1fn_value_table(device: torch.device) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the 16 FP4 E2M1 code values as a float32 tensor on the given device.
     return torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32, device=device)
 
 
 def _pack_fp4_e2m1fn_codes(codes: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Pack a 3D uint8 tensor of 4-bit codes (batch, mode, l) along dim 1 into float4 x2 storage; even index in the low
+    # nibble, odd in the high nibble (odd tail padded with zero). Raises TypeError if codes are not uint8.
     """Pack logical FP4 codes into torch.float4_e2m1fn_x2 storage."""
     if codes.dtype != torch.uint8:
         raise TypeError(f"Expected uint8 FP4 codes, got {codes.dtype}")
@@ -138,6 +154,9 @@ def _create_fp4_operand_tensor(
     *,
     init: str,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Allocate a packed FP4 operand of shape (mode0, ceil(mode1/2), l) on CUDA. Raises ValueError if mode0-major is requested
+    # or init is unsupported. Init empty returns (None, zeroed tensor); init normal fills random codes and returns the float32
+    # reference with the packed tensor.
     if is_mode0_major:
         raise ValueError("Float4E2M1FN blockscaled operands must be K-major")
     tensor = torch.empty(
@@ -167,6 +186,9 @@ def create_blockscaled_operand_tensor(
     *,
     init: str = "normal",
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    # [FUNCTION DOC] Create a random operand on CUDA for blockscaled tests; returns (reference float tensor or None, operand tensor) shaped
+    # (mode0, mode1, l) with the unit-stride dim at mode0 (if mode0 major) or mode1. init normal fills with scaled normals; empty
+    # leaves it uninitialized with no reference. Float4 delegates to the FP4 path. Raises ValueError for unsupported init.
     if dtype == cutlass.Float4E2M1FN:
         return _create_fp4_operand_tensor(l, mode0, mode1, is_mode0_major, init=init)
     shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
@@ -188,6 +210,8 @@ def create_blockscaled_operand_tensor(
 
 
 def _pack_blockscaled_scales(ref_blocks: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Rearrange float32 scales shaped (mn, sf_k, l) into the blocked (l, rm, rk, 512) layout of 128 rows by 4 scales per tile
+    # with a 32 by 4 by 4 inner swizzle, zero-padding to tile multiples.
     """Rearrange (mn, sf_k, l) scales into the (l, rm, rk, 512) blocked layout."""
     mn, sf_k, l = ref_blocks.shape
     rm = ceil_div(mn, 128)
@@ -215,6 +239,8 @@ def create_blockscaled_scale_tensor(
     sf_vec_size: int,
     dtype: Type[cutlass.Numeric],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Make random scale factors for an operand. Returns (reference scales expanded to (mn, k, l), packed scales in the blocked
+    # layout with the given cutlass dtype). E8M0 scales are random powers of two; others are small random integers.
     sf_k = ceil_div(k, sf_vec_size)
     if dtype == cutlass.Float8E8M0FNU:
         exponents = torch.randint(0, 2, (mn, sf_k, l), device="cuda", dtype=torch.int32)
@@ -236,6 +262,10 @@ def create_blockscaled_scale_tensor(
 
 
 def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Convert a (mn, sf_k) or (l, mn, sf_k) e8m0 scale tensor to the contiguous (l, rm, rk, 512) blocked swizzled layout used by
+    # the kernel and cuBLAS, zero-padding mn to 128 and sf_k to 4 multiples. Returns same dtype as input. Asserts rank is 3 after
+    # expansion.
+    # KNOWN ISSUE: the docstring says e8m0 only, but the code operates on raw bytes of any one-byte dtype (also used for e4m3 scales).
     """Rearrange a (l, mn, sf_k) or (mn, sf_k) e8m0 scale tensor into the
     contiguous (l, rm, rk, 512) blocked layout shared by the quack kernel and
     cuBLAS's block-scaling. Each 512 B inner block holds one 128 MN × 4 K
@@ -264,6 +294,7 @@ def pack_scale_2d_to_blocked_contig(scale_2d: torch.Tensor) -> torch.Tensor:
 
 
 def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int) -> torch.Tensor:
+    # [FUNCTION DOC] Assert that a scale tensor has shape (l, rm, rk, 512) and unit innermost stride, then return it unchanged.
     """Validate a (l, rm, rk, 512) scale tensor and return it unchanged.
     Only the innermost 512-B tile must be contiguous (stride 1, size 512);
     outer (L, rm, rk) strides are free — the kernel reads them from the
@@ -283,6 +314,8 @@ def scale_view_for_kernel(scale_contig: torch.Tensor, mn: int, sf_k: int, l: int
 def scale_blocked_for_cublas(
     scale_contig: torch.Tensor, mn: int, sf_k: int, l_idx: int = 0
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Return the l_idx slice of a contiguous 4D blocked scale tensor flattened to 1D for the cuBLAS scaled matmul. Asserts contiguity and rank.
+    # KNOWN ISSUE: the mn and sf_k arguments are unused.
     """Flatten a (l, rm, rk, 512) scale tensor to the 1D swizzled layout
     torch._scaled_mm expects. Uses a single l slice."""
     assert scale_contig.is_contiguous() and scale_contig.dim() == 4
@@ -293,6 +326,7 @@ _FP4_E2M1_CODE_TO_VALUE = torch.tensor(FP4_E2M1FN_VALUES, dtype=torch.float32)
 
 
 def _fp4_unpacked_to_value(codes_u8: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Look up float values for FP4 E2M1 codes (sign in bit 3, magnitude index in low bits) in a uint8 tensor.
     """Convert FP4 E2M1 codes in [0,16) to signed float values via table lookup.
     Code layout: bit 3 = sign, bits 0-2 = magnitude index into {0,.5,1,1.5,2,3,4,6}."""
     table = _FP4_E2M1_CODE_TO_VALUE.to(codes_u8.device)
@@ -300,6 +334,8 @@ def _fp4_unpacked_to_value(codes_u8: torch.Tensor) -> torch.Tensor:
 
 
 def _blockscaled_format_of(ab_dtype, sf_dtype, sf_vec_size) -> str:
+    # [FUNCTION DOC] HELPER: Name the blockscaled format for (operand dtype, scale dtype, vector size): mxfp8, mxfp4 or nvfp4.
+    # Raises ValueError for other combinations.
     """Identify which blockscaled format the (ab, sf, vec) tuple corresponds to."""
     if ab_dtype == cutlass.Float8E4M3FN and sf_dtype == cutlass.Float8E8M0FNU and sf_vec_size == 32:
         return "mxfp8"
@@ -324,6 +360,10 @@ def create_blockscaled_operand_quantized(
     *,
     randn_std: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Generate random bf16 data on CUDA, quantize it to MXFP8, MXFP4 or NVFP4 and return (float32 dequantized reference of shape
+    # (mn, k, l), quantized operand in the kernel's layout, blocked scale tensor). Raises NotImplementedError if mn-major is
+    # requested for FP4; ValueError for unsupported dtype combos; asserts k divisible by the scale vector size.
+    # Std defaults to k to the minus one half.
     """Generate bf16 randn, quantize to MXFP8/MXFP4/NVFP4 and produce:
     ref:   (mn, k, l) float32 dequantized reference
     q_mkl: (mn, k, l) operand tensor in the layout the quack kernel consumes
@@ -400,6 +440,10 @@ def create_blockscaled_varlen_m_operands(
     seqlens_m: Optional[list] = None,
     b_major: str = "k",
 ):
+    # [FUNCTION DOC] Build operands for a variable-length-M (grouped experts) MXFP8 GEMM: random A of total_m rows and per-expert B, quantized, with
+    # SFA stored in padded per-expert tiles. Returns (a_ref, b_ref, qa, qb, a_sc_contig, b_sc_contig, cu_seqlens_m). b_major picks
+    # k-major or n-major B. Raises NotImplementedError for non-MXFP8 formats; asserts lengths and b_major.
+    # KNOWN ISSUE: the docstring gives a different padded-offset formula in terms of rows than the code, which pads by whole 128-row tiles.
     """Generate bf16 randn + quantize for a varlen_m blockscaled GEMM.
 
     Per-expert seqlens may be arbitrary (not required to be multiples of 128).
@@ -499,6 +543,9 @@ def create_blockscaled_varlen_k_operands(
     randn_std: Optional[float] = None,
     seqlens_k: Optional[list] = None,
 ):
+    # [FUNCTION DOC] Build operands for a variable-length-K MXFP8 GEMM: per-expert slices of A (m by k_i) and B (n by k_i) are quantized, packed along K
+    # as M-major / N-major operands, and scales are padded per expert to 128-wide K tiles. Returns (a_ref_list, b_ref_list, qa, qb,
+    # a_sc_contig, b_sc_contig, cu_seqlens_k). Raises NotImplementedError for non-MXFP8; asserts seqlens divisible by the vector size.
     """Generate bf16 randn + quantize for a varlen_k blockscaled GEMM.
 
     Per-expert `k_i` must be a multiple of `sf_vec_size` (quantization chunk)
@@ -609,6 +656,9 @@ def compile_blockscaled_gemm_tvm_ffi(
     varlen_m: bool = False,
     varlen_k: bool = False,
 ) -> Callable:
+    # [FUNCTION DOC] Compile the SM100 blockscaled GEMM with tvm ffi and return a python runner. Operand layouts (leading dim) are taken from the
+    # example tensors; shapes are symbolic. Raises RuntimeError unless the device is compute capability 10 or 11, and asserts that not
+    # both varlen modes are set. The returned run takes (a, b, d, sfa, sfb) or, in varlen modes, an extra cu_seqlens tensor.
     """Compile the SM100 blockscaled GEMM.
 
     When varlen_m: mA is (total_m, k) K-major, mD is (total_m, n) N-major,
@@ -709,6 +759,7 @@ def compile_blockscaled_gemm_tvm_ffi(
         varlen_args,
         stream,
     ):
+        # [FUNCTION DOC] HELPER: Jitted wrapper that invokes the configured GEMM with the epilogue and scheduler arguments fixed and the given scale tensors.
         gemm(a, b, d, None, compile_epi_args, scheduler_args, varlen_args, stream, sfa, sfb, None)
 
     compiled = cute.compile(
@@ -726,6 +777,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     if varlen_m or varlen_k:
 
         def run(a, b, d, sfa, sfb, cu_seqlens):
+            # [FUNCTION DOC] HELPER: Call the compiled kernel with a varlen-arguments object carrying the cumulative sequence lengths in the M or K slot.
             varlen_args = VarlenArguments(
                 mCuSeqlensM=cu_seqlens if varlen_m else None,
                 mCuSeqlensK=cu_seqlens if varlen_k else None,
@@ -734,6 +786,7 @@ def compile_blockscaled_gemm_tvm_ffi(
     else:
 
         def run(a, b, d, sfa, sfb):
+            # [FUNCTION DOC] HELPER: Call the compiled kernel with default (empty) varlen arguments.
             compiled(a, b, d, sfa, sfb, VarlenArguments())
 
     return run
@@ -745,6 +798,8 @@ def blockscaled_gemm_reference(
     sfa_ref: torch.Tensor,
     sfb_ref: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Dense reference result: multiply A and B by their expanded scale tensors elementwise, then contract over K per batch.
+    # Inputs shaped (m, k, l) and (n, k, l); returns (m, n, l).
     return torch.einsum(
         "mkl,nkl->mnl",
         torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref),
