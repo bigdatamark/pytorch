@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper utilities for rendezvous implementations: parsing of rendezvous config strings and endpoints, hostname matching, randomized delays, and a periodic background timer.
+# Public export is only parse_rendezvous_endpoint. No import-time side effects.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -21,6 +23,9 @@ __all__ = ["parse_rendezvous_endpoint"]
 
 
 def _parse_rendezvous_config(config_str: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Parse a comma separated string of key=value options into a mapping of str to str.
+    # Surrounding whitespace is stripped; an empty string yields an empty mapping. Later duplicate keys overwrite earlier ones.
+    # Raises ValueError if a key is empty or an option has no (or an empty) value.
     """Extract key-value pairs from a rendezvous configuration string.
 
     Args:
@@ -59,6 +64,7 @@ def _parse_rendezvous_config(config_str: str) -> dict[str, str]:
 
 
 def _try_parse_port(port_str: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the port as an int if the string is one to five digits, else None. No range check is done here.
     """Try to extract the port number from ``port_str``."""
     if port_str and re.match(r"^[0-9]{1,5}$", port_str):
         return int(port_str)
@@ -68,6 +74,9 @@ def _try_parse_port(port_str: str) -> int | None:
 def parse_rendezvous_endpoint(
     endpoint: str | None, default_port: int
 ) -> tuple[str, int]:
+    # [FUNCTION DOC] Split a rendezvous endpoint of the form hostname[:port] into (hostname, port).
+    # A missing/blank endpoint gives ("localhost", default_port); a missing port gives default_port. Bracketed IPv6 hosts are supported and the brackets are removed from the returned host.
+    # Raises ValueError if the port is not an integer below 65536 or the host contains characters other than word chars, dots, colons and dashes.
     """Extract the hostname and the port number from a rendezvous endpoint.
 
     Args:
@@ -115,6 +124,8 @@ def parse_rendezvous_endpoint(
 
 
 def _matches_machine_hostname(host: str) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if host refers to this machine: "localhost", a loopback IP, this machine's hostname/FQDN, or an IP matching one of this machine's resolved addresses.
+    # Performs DNS/address lookups. May give false negatives (extra CNAMEs, secondary NICs). Name resolution failure of host is tolerated; failure resolving the local hostname propagates.
     """Indicate whether ``host`` matches the hostname of this machine.
 
     This function compares ``host`` to the hostname as well as to the IP
@@ -167,6 +178,7 @@ def _matches_machine_hostname(host: str) -> bool:
 
 
 def _delay(seconds: float | tuple[float, float]) -> None:
+    # [FUNCTION DOC] HELPER: Sleep the current thread. seconds is either a fixed delay or a (low, high) tuple from which a uniform random delay is drawn. Delays under 10 ms are skipped.
     """Suspend the current thread for ``seconds``.
 
     Args:
@@ -182,6 +194,8 @@ def _delay(seconds: float | tuple[float, float]) -> None:
 
 
 class _PeriodicTimer:
+    # [CLASS DOC] HELPER: Timer that runs a function every interval on a daemon background thread until cancelled or garbage collected.
+    # State lives in a shared _Context object (interval, function, args, kwargs, stop_event) so the thread does not reference the timer, avoiding a reference cycle. Key methods: set_name, start, cancel.
     """Represent a timer that periodically runs a specified function.
 
     Args:
@@ -194,6 +208,7 @@ class _PeriodicTimer:
     # The state of the timer is held in a separate context object to avoid a
     # reference cycle between the timer and the background thread.
     class _Context:
+        # [CLASS DOC] HELPER: Plain attribute holder for the timer state shared with the background thread (interval in seconds, function, args, kwargs, stop_event).
         interval: float
         function: Callable[..., None]
         args: tuple[Any, ...]
@@ -214,6 +229,7 @@ class _PeriodicTimer:
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Create an unstarted timer. interval is a timedelta; function is called with the given args/kwargs on every tick. No thread is created until start().
         self._name = None
 
         self._ctx = self._Context()
@@ -228,10 +244,12 @@ class _PeriodicTimer:
 
     @property
     def name(self) -> str | None:
+        # [FUNCTION DOC] HELPER: Property returning the timer name, or None if unset.
         """Get the name of the timer."""
         return self._name
 
     def set_name(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Set the name used for the background thread. Raises RuntimeError if the timer was already started.
         """Set the name of the timer.
 
         The specified name will be assigned to the background thread and serves
@@ -243,6 +261,8 @@ class _PeriodicTimer:
         self._name = name
 
     def start(self) -> None:
+        # [FUNCTION DOC] HELPER: Start the daemon thread running _run, and register a weakref finalizer (not run at interpreter exit) that stops and joins the thread when the timer is collected.
+        # Raises RuntimeError if already started.
         """Start the timer."""
         if self._thread:
             raise RuntimeError("The timer has already started.")
@@ -269,17 +289,20 @@ class _PeriodicTimer:
         self._thread.start()
 
     def cancel(self) -> None:
+        # [FUNCTION DOC] HELPER: Stop the timer by invoking the finalizer (sets the stop event and joins the thread). No-op if not started; safe to call repeatedly.
         """Stop the timer at the next opportunity."""
         if self._finalizer:
             self._finalizer()
 
     @staticmethod
     def _run(ctx) -> None:
+        # [FUNCTION DOC] HELPER: Thread body. Waits interval seconds on the stop event and calls the function each time the wait times out; returns once the event is set.
         while not ctx.stop_event.wait(ctx.interval):
             ctx.function(*ctx.args, **ctx.kwargs)
 
     @staticmethod
     def _stop_thread(thread, stop_event):
+        # [FUNCTION DOC] HELPER: Finalizer callback that sets the stop event and blocks until the thread exits.
         stop_event.set()
 
         thread.join()

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers for creating the TCPStore used by elastic rendezvous and finding free local ports: create_c10d_store, get_free_port and get_socket_with_port (public via __all__). Creates a module logger at import; defines constants for error message matching.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -36,6 +37,10 @@ def create_c10d_store(
     retries=3,
     use_libuv: bool | None = None,
 ):
+    # [FUNCTION DOC] Create a TCPStore (c10d) as server or client, optionally retrying on port collisions, and return it.
+    # Args: is_server, server_addr, server_port (-1 means pick a free port; required when world_size > 1), world_size, timeout seconds, wait_for_workers (if true, also verifies all members joined via a barrier), retries, use_libuv (deprecated, ignored with a warning; libuv is controlled by the USE_LIBUV environment variable, default on).
+    # Raises ValueError for the invalid port/world size combination, TimeoutError if workers did not all join, and DistNetworkError on bind failure after retries or other network errors.
+    # # KNOWN ISSUE: when server_port is -1 the attempt counter starts at retries, so the less-than check against retries is never true and an address-in-use error is raised on the first attempt without retrying.
     if use_libuv is not None:
         logger.warning(
             "argument use_libuv is deprecated and ignored. Set USE_LIBUV environment "
@@ -110,6 +115,7 @@ def create_c10d_store(
 
 
 def _check_full_rank(store, world_size, timeout):
+    # [FUNCTION DOC] HELPER: Verify that all world_size members have joined by running a store barrier with the given timeout. Converts the barrier's socket timeout RuntimeError into a TimeoutError; other errors propagate.
     try:
         barrier(store, world_size, key_prefix=_TCP_STORE_INIT, barrier_timeout=timeout)
     except RuntimeError as e:
@@ -122,6 +128,7 @@ def _check_full_rank(store, world_size, timeout):
 
 
 def get_free_port():
+    # [FUNCTION DOC] Return an unused TCP port number on localhost by binding a temporary socket and closing it. The port is not reserved and may be taken afterwards (race). Raises RuntimeError if no socket can be made.
     """
     Returns an unused port on localhost.
 
@@ -146,6 +153,7 @@ def get_free_port():
 
 
 def get_socket_with_port() -> socket.socket:
+    # [FUNCTION DOC] Return a listening localhost TCP socket bound to an OS-chosen free port, trying each address family from name resolution and logging failed attempts. The caller must close the socket. Raises RuntimeError if none can be created.
     """
     Returns a free port on localhost that is "reserved" by binding a temporary
     socket on it. Close the socket before passing the port to the entity

@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Builds the flat analysis database from flight recorder dumps: process groups and memberships, matched collectives and per-rank NCCL calls. Public: build_groups_memberships, build_collectives, transform_ft, build_db.
+# Import-time side effects: creates the shared FlightRecorderLogger and tries to import tabulate, logging a warning and defining a pass-through fallback when it is missing.
 import argparse
 import ast
 import copy
@@ -57,6 +59,7 @@ except ModuleNotFoundError:
 
     # Define a no-op tabulate function
     def _tabulate(data: Any, headers: Any = None) -> Any:  # type: ignore[misc]
+    # [FUNCTION DOC] HELPER: Fallback used when tabulate is not installed; ignores headers and returns data unchanged.
         return data
 
 
@@ -74,6 +77,10 @@ def build_groups_memberships(
     dict[str, set[Any]],
     dict[tuple[str, int], str],
 ]:
+    # [FUNCTION DOC] Convert the per-rank process group config (mapping of global rank to pg uid to a record with a desc and a string form of the rank list) into flat tables.
+    # Returns a tuple of: list of Group rows, mapping of pg guid to Group, list of Membership rows, mapping of pg guid to set of member ranks, and mapping of (pg uid, global rank) to pg guid. The guid is the pg uid plus a hash of the rank set, so split groups sharing a name stay distinct.
+    # Raises AssertionError if the same guid has a different desc or member set on different ranks.
+    # # KNOWN ISSUE: the guid hash is computed before the check that converts a string rank list to a real list, so in that case the hash covers characters instead of ranks.
     """
     pg_config: {
         global_rank: {
@@ -146,6 +153,11 @@ def build_collectives(
     version: str,
     mismatch_cap: int = 10,
 ) -> tuple[list[Traceback], list[Collective], list[NCCLCall]]:
+    # [FUNCTION DOC] Greedily match per-rank trace entries into collectives and NCCL call rows. all_entries (mapping of rank to list of entry mappings) is consumed/mutated: matched entries are popped.
+    # Loop: take the first entry of the first rank with entries; find the group and expected ranks; if it starts a coalesced group (rules depend on the dump version: p2p-only matching below 2.7, otherwise a variant including non-p2p), gather each peer rank's coalesced entries and match them as a single collective; otherwise check the entry against other ranks, run error analysis, and emit either a complete Collective or a non-matching one with errors, plus NCCL calls.
+    # After a mismatch in a group, no more pairing is done there (counts per group); the loop stops once a group exceeds mismatch_cap mismatches.
+    # Returns (tracebacks (always empty), collectives, nccl_calls). Raises AssertionError on inconsistent send/recv source or destination ranks.
+    # # KNOWN ISSUE: the peer discovery for coalesced groups skips a peer whose rank is 0 because of a truthiness test, so rank 0 may not be explored as a peer.
     """
     groups, memberships are the non-flat dicts that are indexable
     all_entries is a raw dict from the original dumps:
@@ -394,6 +406,8 @@ def build_collectives(
 def transform_ft(
     details: dict[str, dict[str, Any]], group_world_size: int
 ) -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC] Adjust dumps from torchft runs so default process group ranks are global: for every dump and every pg config whose desc is default_pg, shift each rank by the first global rank of the dump's replica group (rank divided by group_world_size, times group_world_size).
+    # Mutates details in place and returns it.
     for dump_key, dump in details.items():
         rank = dump["rank"]
         for key, pg_config in dump["pg_config"].items():
@@ -410,6 +424,9 @@ def transform_ft(
 def build_db(
     details: dict[str, dict[str, Any]], args: argparse.Namespace, version: str
 ) -> Database:
+    # [FUNCTION DOC] Build the Database from loaded dumps. Collects entries, pg configs and versions per rank, checks version consistency, aligns traces to start together, optionally adds stack ids, builds groups and memberships, then builds collectives and NCCL calls using args.mismatch_cap.
+    # Side effects: sets the environment variable FR_TRACE_VERBOSE_OUTPUT when args.verbose; with args.just_print_entries it prints entries and terminates the process with exit status 0 instead of returning; unless args.allow_incomplete_ranks it verifies that no dump files are missing (the check may raise). In verbose mode logs tables of all rows at debug level.
+    # Returns a Database with tracebacks, collectives, ncclcalls, groups and memberships.
     if args.verbose:
         os.environ["FR_TRACE_VERBOSE_OUTPUT"] = "1"
     # temporary state used for building database

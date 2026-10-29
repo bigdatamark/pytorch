@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Logger setup helpers for elastic: get_logger returns a stdlib logger whose level comes from the LOGLEVEL environment variable (default from get_log_level) and whose name defaults to the caller's module name. No import-time side effects.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -15,6 +16,7 @@ from torch.distributed.elastic.utils.log_level import get_log_level
 
 
 def get_logger(name: str | None = None) -> logging.Logger:
+    # [FUNCTION DOC] Return a logger for name, or for the calling module's name when name is not given (derived from the call stack, two frames up). Sets the logger level from LOGLEVEL or the default WARNING. Side effect: mutates the shared logger's level.
     """
     Util function to set up a simple logger that writes
     into stderr. The loglevel is fetched from the LOGLEVEL
@@ -32,12 +34,14 @@ def get_logger(name: str | None = None) -> logging.Logger:
 
 
 def _setup_logger(name: str | None = None) -> logging.Logger:
+    # [FUNCTION DOC] HELPER: Get the stdlib logger with the given name and set its level from the LOGLEVEL environment variable, falling back to the default log level. Returns the logger.
     logger = logging.getLogger(name)
     logger.setLevel(os.environ.get("LOGLEVEL", get_log_level()))
     return logger
 
 
 def _derive_module_name(depth: int = 1) -> str | None:
+    # [FUNCTION DOC] HELPER: Return the name of the module that owns the stack frame at the given depth, or the file base name without extension if the module cannot be found. On any failure emits a RuntimeWarning and returns None.
     """
     Derives the name of the caller module from the stack frames.
 

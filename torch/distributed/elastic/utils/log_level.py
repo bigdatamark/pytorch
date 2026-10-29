@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Provides the default log level for elastic loggers. No import-time side effects.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -8,6 +9,7 @@
 
 
 def get_log_level() -> str:
+    # [FUNCTION DOC] Return the default log level name, the string WARNING.
     """
     Return default log level for pytorch.
     """

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers built on a c10d store for coordinating elastic agents: store_timeout context manager, get_all, synchronize and barrier (with optional detection of ranks that failed to arrive). Aliases the C++ DistStoreError exception and defines key suffix constants at import.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -28,6 +29,8 @@ __all__ = ["store_timeout", "get_all", "synchronize", "barrier"]
 
 @contextmanager
 def store_timeout(store, timeout: float):
+    # [FUNCTION DOC] Context manager that temporarily sets the store timeout to the given seconds and restores the previous one afterwards.
+    # # KNOWN ISSUE: there is no try/finally, so the old timeout is not restored if the guarded block raises.
     """
     This sets the timeout and then restores the old timeout when the context
     manager exits.
@@ -44,6 +47,8 @@ def store_timeout(store, timeout: float):
 
 
 def get_all(store, rank: int, prefix: str, world_size: int):
+    # [FUNCTION DOC] Fetch the values of keys prefix0 .. prefix(world_size-1) with a multi-get and return them as a list. Then performs a non-blocking barrier on a finished-key; rank 0 waits for all ranks to finish so the store host exits last.
+    # # KNOWN ISSUE: the docstring example calls it without the rank argument.
     r"""
     Given a store and a prefix, the method goes through the array of keys
     of the following format: ``{prefix}{idx}``, where idx is in a range
@@ -86,6 +91,7 @@ def synchronize(
     key_prefix: str,
     timeout: float = 300,
 ) -> list[bytes]:
+    # [FUNCTION DOC] Share data between all agents: with the store timeout temporarily set, writes this rank's data under key_prefix plus rank, then gathers every rank's data via get_all. Returns the list of byte values ordered by rank. Keys are never deleted, so reusing a prefix can read stale data.
     """
     Synchronizes ``world_size`` agents between each other using the underlying c10d store.
     The ``data`` will be available on each of the agents.
@@ -109,9 +115,11 @@ def _try_detecting_missing_ranks(
     rank_decoder: Callable[[int], str],
     trace_timeout: float,
 ) -> Iterable[str] | None:
+    # [FUNCTION DOC] HELPER: After a barrier timeout, try to find which ranks never checked in. Each rank writes a trace key. Rank 0 waits per rank (full trace_timeout for the first miss, 1 ms afterwards, stopping after 16 missing ranks), then sets a gate key and returns the set of decoded missing rank names. Other ranks wait on the gate and return a placeholder list pointing to rank 0, or None if the gate wait itself times out.
     store.set(f"{key_prefix}{rank}{_TRACE}", "<val_ignored>")
 
     def _find_missing_ranks():
+        # [FUNCTION DOC] HELPER: Rank 0 only. Scan ranks 1..world_size-1 for trace keys and return the set of decoded names of ranks whose key did not appear in time; the first miss uses trace_timeout, later ones a 1 ms timeout, capped at the max count.
         missing_rank_info = set()
         ranks_missing = 0
         for i in range(1, world_size):
@@ -133,6 +141,7 @@ def _try_detecting_missing_ranks(
         return missing_rank_info
 
     def _checkin():
+        # [FUNCTION DOC] HELPER: Non-zero ranks. Wait for rank 0's gate key and return a one-item list telling the reader to check rank 0; return None if the wait raises a store error.
         try:
             store.wait([f"{key_prefix}{_TRACING_GATE}"])
             return [f"[<check rank 0 ({rank_decoder(0)}) for missing rank info>]"]
@@ -149,6 +158,7 @@ def _try_detecting_missing_ranks(
 
 
 def _barrier_nonblocking(store, world_size: int, key_prefix: str) -> str:
+    # [FUNCTION DOC] HELPER: Atomically increment the member counter; the rank that reaches world_size sets the last-member key. Returns the last-member key to wait on. Does not block.
     """
     Does all the non-blocking operations for a barrier and returns the final key
     that can be waited on.
@@ -172,6 +182,9 @@ def barrier(
     rank_tracing_decoder: Callable[[int], str] | None = None,
     trace_timeout: float = 10,
 ) -> None:
+    # [FUNCTION DOC] Block until world_size participants have called it with the same key_prefix (usable once per prefix), using barrier_timeout seconds as the store timeout.
+    # On a store timeout: re-raise the original error if rank is None; otherwise try to detect missing ranks (rank_tracing_decoder maps a rank to a label, default its string form) and raise a DistStoreError listing them, or the original error if detection returns nothing.
+    # Raises AssertionError if a tracing decoder is given without a rank.
     """
     A global lock between agents. This will pause all workers until at least
     ``world_size`` workers respond.

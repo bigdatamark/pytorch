@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# [PACKAGE DOC] Data loading utilities for elastic training: re-exports CyclingIterator (repeats an iterator over several epochs) and ElasticDistributedSampler (distributed sampler that can start from a given dataset index).
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #

@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Data types for flight recorder analysis: the flat database schema as named tuples (Group, Membership, Traceback, Collective, NCCLCall, Database), the match-state enum and MatchInfo, and classes used while matching entries across ranks (EntryState, Op, MatchStateRecord). Also defines the COLLECTIVES and P2P operation name sets.
+# Import-time side effect: builds the module-level list named types holding a TypeInfo (name and field types) for each schema tuple; this list is pickled with the database output.
 import math
 import os
 from enum import auto, Enum
@@ -39,15 +41,18 @@ T = TypeVar("T", bound=NamedTuple)
 
 
 class Ref(Generic[T]):
+    # [CLASS DOC] HELPER: Empty generic marker used to annotate a field as a reference to a row of another table.
     pass
 
 
 class TypeInfo(NamedTuple):
+    # [CLASS DOC] Named tuple describing a schema type: name (str) and fields (list of field name and type pairs). Built from a named tuple class with from_type.
     name: str
     fields: list[tuple[str, type]]  # type: ignore[type-arg]
 
     @classmethod
     def from_type(cls, c: T) -> "TypeInfo":
+        # [FUNCTION DOC] Class method: build a TypeInfo from a named tuple class. The name is the class name (or its string form), and each field type is resolved by evaluating the annotation in this module's global namespace. Raises if an annotation cannot be evaluated.
         if hasattr(c, "__name__"):
             name = c.__name__
         else:
@@ -59,6 +64,7 @@ class TypeInfo(NamedTuple):
 
 
 class MatchState(Enum):
+    # [CLASS DOC] Enum of the possible outcomes when matching a collective across ranks: FULLY_MATCHED, COLLECTIVE_TYPE_MISMATCH, SIZE_OR_SYNTAX_MISMATCH, COLLECTIVE_STATE_MISMATCH, COLLECTIVE_DTYPE_MISMATCH and UNDECIDED (cannot decide yet, e.g. all_to_all).
     """
     Enum representing the possible states of matching for collective operations.
 
@@ -81,21 +87,25 @@ class MatchState(Enum):
 
 
 class MatchInfo:
+    # [CLASS DOC] Result of a match check: a MatchState plus an optional culprit message string describing the mismatch. State is read through the read-only state property; printing gives a short error text.
     """
     Aside from the match state, we also store some dynamic info for the match such as the culprit rank
     or collective state that caused the mismatch.
     """
 
     def __init__(self, state: MatchState, culprit: str | None = None) -> None:
+        # [FUNCTION DOC] Store the match state and optional culprit description.
         self._state = state
         self.culprit = culprit
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return text of the form "Error type: <state name>" followed by the culprit message when one is set.
         details = f", {self.culprit}" if getattr(self, "culprit", None) else ""
         return f"Error type: {self._state.name}{details}"
 
     @property
     def state(self) -> MatchState:
+        # [FUNCTION DOC] Property returning the MatchState.
         return self._state
 
 
@@ -123,22 +133,26 @@ NCCLOp:
 
 
 class Group(NamedTuple):
+    # [CLASS DOC] Row of the groups table: id (unique pg guid string), desc (user description) and size (number of ranks).
     id: str
     desc: str
     size: int
 
 
 class Membership(NamedTuple):
+    # [CLASS DOC] Row of the memberships table: group_id and global_rank of one member of the group.
     group_id: str
     global_rank: int
 
 
 class Traceback(NamedTuple):
+    # [CLASS DOC] Row of the tracebacks table: id and frames text. Currently unused; always empty in output.
     id: int
     frames: str
 
 
 class Collective(NamedTuple):
+    # [CLASS DOC] Row of the collectives table. Required fields: id, group_id, pass_check (whether all ranks matched), collective_seq_id, p2p_seq_id, record_id, pg_desc, collective_name, input_sizes, output_sizes, expected_ranks, collective_state, collective_frames. Optional fields: input_numel, output_numel, missing_ranks, mismatch_collectives (mapping of rank to the Collective seen on that rank) and type_of_mismatch (a MatchInfo).
     id: int
     group_id: str
     pass_check: bool
@@ -160,6 +174,7 @@ class Collective(NamedTuple):
 
 
 class NCCLCall(NamedTuple):
+    # [CLASS DOC] Row of the NCCL calls table: id, collective_id (reference to the Collective, or None when unmatched), group_id, global_rank, traceback_id, collective_type and sizes.
     id: int
     # pyrefly: ignore [bad-specialization]
     collective_id: Ref[Collective]
@@ -172,6 +187,7 @@ class NCCLCall(NamedTuple):
 
 
 class Database(NamedTuple):
+    # [CLASS DOC] The flat database: lists of groups, memberships, tracebacks, collectives and ncclcalls.
     groups: list[Group]
     memberships: list[Membership]
     tracebacks: list[Traceback]
@@ -240,12 +256,15 @@ P2P = {
 
 
 class EntryState:
+    # [CLASS DOC] Tracks the state of one trace entry (the reference entry chosen for matching) and standardizes how it is logged and converted to database rows.
+    # State copied from the entry: pg_name, desc, pg_desc (name:desc unless desc is undefined), profiling_name, collective_seq_id, p2p_seq_id, record_id, input_sizes, output_sizes, collective_state, collective_frames, plus expected_ranks. Optional attributes set later by log: missing_ranks, input_numel, output_numel, errors. Key methods: log, to_collective, to_nccl_call.
     """
     Util class to keep track of the state of an entry and standardize the way we
     log the error info during analysis.
     """
 
     def __init__(self, entry: dict[str, Any], expected_ranks: set[int]) -> None:
+        # [FUNCTION DOC] Copy the relevant fields from the entry mapping (process_group pair, profiling_name, sequence ids, record_id, sizes, state, optional frames) and store the expected ranks. Raises KeyError if required keys are missing.
         self.pg_name = entry["process_group"][0]
         self.desc = entry["process_group"][1]
         self.pg_desc = (
@@ -274,6 +293,8 @@ class EntryState:
         errors: set[tuple[int, MatchInfo]] | None = None,
         missing_ranks: set[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Write a multi-line report about this entry through the logger at info level: the message with sequence id, record id, group, collective name, optional missing ranks and total numel, sizes, world size, expected ranks, state, optional error messages and the stack trace rendered by frame_formatter.
+        # Side effect: stores missing_ranks, input_numel/output_numel (from total_numel pair) and errors on self when those arguments are given.
         logger.info(
             logger_msg,
             self.collective_seq_id,
@@ -311,6 +332,7 @@ class EntryState:
         idx_map: dict[int, int] | None = None,
         all_entries: dict[int, list[dict[str, Any]]] | None = None,
     ) -> Collective:
+        # [FUNCTION DOC] Build a Collective row with the given id. Without errors, returns a passing collective (pass_check true) including any missing ranks recorded. With errors, requires idx_map and all_entries (raises AssertionError if missing); builds a per-rank Collective for each erroring rank from the entry at the mapped index, and returns a failing collective carrying numel/missing-rank info when set and the mismatch_collectives mapping.
         if not errors:
             return Collective(
                 id=id,
@@ -386,6 +408,7 @@ class EntryState:
         nccl_call_id: int,
         collective_id: Any,
     ) -> list[NCCLCall]:
+        # [FUNCTION DOC] Convert the matched entries into NCCLCall rows, one per rank in idx_map (rank to index of entry in that rank's list), numbering ids from nccl_call_id and linking collective_id. Side effect: pops each referenced entry from all_entries. Returns the list of rows. Traceback id is always 0.
         result = []
         for i, k in idx_map.items():
             all_entries[i].pop(k)
@@ -405,6 +428,8 @@ class EntryState:
 
 
 class Op:
+    # [CLASS DOC] Parsed view of one trace event. Parses the profiling name of the form backend:op or backend:op src->dst / dst<-src into type, source and destination (group-local indexes, then mapped to global ranks), and keeps state, process group names, sizes, dtypes, sequence ids, stack id, creation time, frames and the verbose-output flag from FR_TRACE_VERBOSE_OUTPUT.
+    # Key methods: match (compare with the same operation on another rank), dtype_mismatch, src, dst, repr.
     """Parses relevant info about operation out of 'event' dict
 
     examples of supported `profiling_name`s:
@@ -416,6 +441,8 @@ class Op:
     def __init__(
         self, event: dict[Any, Any], memberships: dict[str, set[Any]], pg_name: str
     ):
+        # [FUNCTION DOC] Parse the event mapping. pg_name is the hashed group key used to look up memberships.
+        # Raises AssertionError if the backend is not a supported one (nccl, ncclx, xccl, gloo, rccl, rcclx, mccl, hccl) or the operation is not a known collective, p2p op or coalesced. A profiling name not containing exactly one colon raises ValueError. Sizes are None for coalesced ops; src/dst default to minus one for non-p2p ops.
         self.profiling_name = event["profiling_name"]
         comm_lib_backend, name = self.profiling_name.split(":")
         _SUPPORTED_BACKENDS = {
@@ -471,23 +498,28 @@ class Op:
         self.is_verbose = os.getenv("FR_TRACE_VERBOSE_OUTPUT", "0") == "1"
 
     def _init_global_src_dst(self, pg_ranks: set[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Translate the group-local source and destination indexes into global ranks using the sorted member ranks.
+        # # KNOWN ISSUE: the not-None checks are always true, so for non-p2p ops (indexes of minus one) the global src and dst become the last member rank instead of None.
         pg_ranks_sorted = sorted(pg_ranks)
         self._src_g = pg_ranks_sorted[self._src] if self._src is not None else None
         self._dst_g = pg_ranks_sorted[self._dst] if self._dst is not None else None
 
     @property
     def src(self) -> int:
+        # [FUNCTION DOC] Property returning the group-local source index. Raises AssertionError for non-p2p ops.
         if self.type not in P2P:
             raise AssertionError("can't get src of non-p2p op")
         return self._src
 
     @property
     def dst(self) -> int:
+        # [FUNCTION DOC] Property returning the group-local destination index. Raises AssertionError for non-p2p ops.
         if self.type not in P2P:
             raise AssertionError("can't get dst of non-p2p op")
         return self._dst
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a readable summary string: operation type with sizes and state (and for p2p the global source and destination); in verbose mode a longer list including timestamps, dtypes, sequence id, group name/description/size and stack id.
         p2p_info = ""
         if self.type in P2P:
             p2p_info = f"s={self._src_g} d={self._dst_g}"
@@ -513,6 +545,7 @@ class Op:
         )
 
     def dtype_mismatch(self, other: "Op") -> bool:
+        # [FUNCTION DOC] Return True if this op and the other op have conflicting dtypes: input vs output dtype sets differ (except scatter, gather and broadcast), input dtype sets differ across ranks (except scatter, broadcast), or output dtype sets differ (except gather), each only when the relevant first size entry is non-empty.
         if (
             (
                 self.type not in ["scatter", "gather", "broadcast"]
@@ -537,6 +570,8 @@ class Op:
         return False
 
     def match(self, other: "Op") -> MatchInfo:
+        # [FUNCTION DOC] Compare this op (the reference) with the same op from another rank and return a MatchInfo. Send is matched with a recv of equal src, dst and sizes (and vice versa); collectives are checked in order for type, input sizes, output sizes, all_reduce input vs output sizes, all_gather and reduce_scatter numel relations with pg size, dtype conflicts and state; all_to_all yields UNDECIDED; coalesced-type ops need the same type. Otherwise FULLY_MATCHED.
+        # # KNOWN ISSUE: the all_gather numel check lists all_gather_base without the leading underscore, so the underscore-named base op in the COLLECTIVES set is never checked by it.
         # TODO: I think this can validly not match,
         # e.g. if one PG was used for p2p ops between only some of the peers?
         # if self.seq_id != other.seq_id:
@@ -656,6 +691,8 @@ class Op:
 
 
 class MatchStateRecord:
+    # [CLASS DOC] Mutable record of the in-progress matching of one reference entry across ranks.
+    # Attributes: expected_ranks, other_ranks, entry_state, candidate_ranks and candidate_idx (ranks and entry index with a candidate for the match), found_ranks and found_idx (ranks with a confirmed match), errors (set of rank and MatchInfo pairs) and has_undecided_case flag (initially false). Key method: reset_for_coalesced.
     def __init__(
         self,
         expected_ranks: set[int],
@@ -667,6 +704,7 @@ class MatchStateRecord:
         found_idx: dict[int, int],
         errors: set[tuple[int, MatchInfo]],
     ) -> None:
+        # [FUNCTION DOC] Store all the given matching state; sets has_undecided_case to false.
         self.expected_ranks = expected_ranks
         self.other_ranks = other_ranks
         self.entry_state = entry_state
@@ -680,6 +718,7 @@ class MatchStateRecord:
     def reset_for_coalesced(
         self, entry_state: EntryState, candidate_ranks: set[int]
     ) -> None:
+        # [FUNCTION DOC] Reset the record for a coalesced group: set a new entry state and candidate ranks, and clear candidate and found indexes, found ranks and errors.
         self.entry_state = entry_state
         self.candidate_ranks = candidate_ranks
         self.candidate_idx = {}

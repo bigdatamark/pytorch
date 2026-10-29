@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # mypy: allow-untyped-defs
+# [MODULE DOC] Linux-only helpers to read a process state letter from /proc and test for uninterruptible sleep (state D). Agent-agnostic. No import-time side effects.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
@@ -20,6 +21,7 @@ __all__ = ["read_proc_state", "is_uninterruptible_state"]
 
 
 def read_proc_state(pid: int) -> str | None:
+    # [FUNCTION DOC] Return the single-letter process state from /proc/<pid>/stat (parsed after the last closing parenthesis since the command name may contain spaces/parens), or None if the file cannot be read (non-Linux, process gone, permissions) or is malformed.
     """Read the process state char from ``/proc/<pid>/stat``. Linux-only.
 
     Returns the single-letter state (e.g. ``'R'``, ``'S'``, ``'D'``,
@@ -45,6 +47,7 @@ def read_proc_state(pid: int) -> str | None:
 
 
 def is_uninterruptible_state(state: str | None) -> bool:
+    # [FUNCTION DOC] Return True if the state is not None and starts with the letter D (uninterruptible sleep, including a D plus variant), else False.
     """Return True if ``state`` is Linux uninterruptible sleep ('D').
 
     Includes the ``'D+'`` (foreground) variant; the state field is

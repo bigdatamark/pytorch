@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [PACKAGE DOC] Expiration timers for elastic workers: lets a worker acquire a countdown timer around a code block so that the agent-side timer server can kill it if it gets stuck.
+# Re-exports the abstract API (configure, expires, TimerClient, TimerRequest, TimerServer), the file-based implementation (FileTimerClient, FileTimerRequest, FileTimerServer) and the multiprocessing-queue implementation (LocalTimerClient, LocalTimerServer). The module docstring holds a usage example.
 """
 Expiration timers are set up on the same process as the agent and
 used from your script to deal with stuck workers. When you go into

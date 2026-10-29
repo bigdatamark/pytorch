@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Defines ElasticDistributedSampler, a DistributedSampler variant that begins sampling at a given dataset offset so training can resume mid-epoch after elastic restarts. No import-time side effects.
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
@@ -21,6 +22,8 @@ __all__ = ["ElasticDistributedSampler"]
 
 
 class ElasticDistributedSampler(DistributedSampler[T]):
+    # [CLASS DOC] DistributedSampler subclass that samples only dataset indices from start_index onward, split across replicas.
+    # State: start_index, num_samples (per-replica count, rounded up), total_size (num_samples times replicas), plus inherited epoch/rank/num_replicas. Assumes a constant-size dataset.
     """
     Sampler that restricts data loading to a subset of
     the dataset for elastic training.
@@ -48,6 +51,8 @@ class ElasticDistributedSampler(DistributedSampler[T]):
         rank: int | None = None,
         start_index: int = 0,
     ):
+        # [FUNCTION DOC] Initialize the base sampler, then compute per-replica num_samples as the ceiling of remaining items (dataset length minus start_index) over num_replicas and total_size.
+        # Raises TypeError if the dataset is not Sized and ValueError if start_index is not less than the dataset length.
         super().__init__(dataset=dataset, num_replicas=num_replicas, rank=rank)
         if not isinstance(dataset, Sized):
             raise TypeError("Dataset must be an instance of collections.abc.Sized")
@@ -69,6 +74,8 @@ class ElasticDistributedSampler(DistributedSampler[T]):
         self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self) -> Iterator[T]:
+        # [FUNCTION DOC] Return an iterator of indices for this rank. Builds a permutation of the indices from start_index on, seeded deterministically by the current epoch, pads by repeating from the beginning to reach total_size, then takes every num_replicas-th element starting at rank.
+        # Raises AssertionError if internal length checks fail. Does not honor the base class shuffle flag (always shuffles).
         # deterministically shuffle based on epoch
         g = torch.Generator()
         g.manual_seed(self.epoch)
@@ -92,4 +99,5 @@ class ElasticDistributedSampler(DistributedSampler[T]):
         return iter(indices)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of samples for this rank (num_samples).
         return self.num_samples

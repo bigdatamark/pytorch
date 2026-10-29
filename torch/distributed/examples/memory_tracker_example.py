@@ -1,9 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Example script showing how to use MemoryTracker on one training iteration of a model (resnet34 on random CUDA input when run as main). Importing has no side effects beyond imports; running as main requires torchvision and a CUDA device.
 import torch
 from torch.distributed._tools import MemoryTracker
 
 
 def run_one_model(net: torch.nn.Module, input: torch.Tensor, device: str = "cuda"):
+    # [FUNCTION DOC] Move the network and input to the device, start a MemoryTracker monitor on the network, run one forward/backward pass (the output is the model output, or its out entry when a dict; summed to a scalar for backward), clear gradients, then stop the tracker, print its summary and show operator-level memory traces. Returns None; side effects are printing and plotting.
     net.to(device)
     input = input.to(device)
 
