@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the LogisticNormal distribution: a Normal base pushed through a
+# stick-breaking transform to yield points on the simplex. Exports LogisticNormal.
+# No import-time side effects.
 
 from torch import Tensor
 from torch.distributions import constraints, Independent
@@ -11,6 +15,10 @@ __all__ = ["LogisticNormal"]
 
 
 class LogisticNormal(TransformedDistribution):
+    # [CLASS DOC] Distribution over the simplex obtained by applying a
+    # stick-breaking transform to independent normals with parameters loc and
+    # scale. The event dimension is the simplex (one longer than the normal
+    # vector); the base distribution is wrapped as an independent event. Supports rsample.
     r"""
     Creates a logistic-normal distribution parameterized by :attr:`loc` and :attr:`scale`
     that define the base `Normal` distribution transformed with the
@@ -47,6 +55,9 @@ class LogisticNormal(TransformedDistribution):
         scale: Tensor | float,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds a Normal base from loc and scale; if it is a
+        # scalar (empty batch shape) it is expanded to one element so there is a
+        # vector to transform. Initializes the parent with a stick-breaking transform.
         base_dist = Normal(loc, scale, validate_args=validate_args)
         if not base_dist.batch_shape:
             base_dist = base_dist.expand([1])
@@ -55,13 +66,16 @@ class LogisticNormal(TransformedDistribution):
         )
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns an expanded LogisticNormal of batch_shape via the parent expand.
         new = self._get_checked_instance(LogisticNormal, _instance)
         return super().expand(batch_shape, _instance=new)
 
     @property
     def loc(self) -> Tensor:
+        # [FUNCTION DOC] Property: loc of the underlying normal, read through the independent wrapper.
         return self.base_dist.base_dist.loc
 
     @property
     def scale(self) -> Tensor:
+        # [FUNCTION DOC] Property: scale of the underlying normal, read through the independent wrapper.
         return self.base_dist.base_dist.scale

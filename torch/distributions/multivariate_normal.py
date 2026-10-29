@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines MultivariateNormal, parameterized by a mean vector and exactly one of a
+# covariance matrix, precision matrix or lower Cholesky factor; all computation is
+# based on the Cholesky factor. Also holds private batched helpers (matrix-vector
+# product, Mahalanobis distance, precision to Cholesky conversion) reused by other
+# distributions. Exports MultivariateNormal. No import-time side effects.
 import math
 
 import torch
@@ -13,6 +19,8 @@ __all__ = ["MultivariateNormal"]
 
 
 def _batch_mv(bmat, bvec):
+    # [FUNCTION DOC] HELPER: Batched matrix-vector product; bmat (batch + (n, n))
+    # and bvec (batch + (n,)) have broadcastable batch shapes. Returns batch + (n,).
     r"""
     Performs a batched matrix-vector product, with compatible but different batch shapes.
 
@@ -27,6 +35,11 @@ def _batch_mv(bmat, bvec):
 
 
 def _batch_mahalanobis(bL, bx):
+    # [FUNCTION DOC] HELPER: Squared Mahalanobis distance of bx under covariance
+    # L times L transposed, where bL holds lower Cholesky factors. The batch shape
+    # of bL may be a broadcast-compatible suffix of bx's batch shape. Reshapes and
+    # permutes bx so one batched triangular solve handles all combinations, squares
+    # and sums the solution, then restores the layout. Returns bx's batch shape.
     r"""
     Computes the squared Mahalanobis distance :math:`\mathbf{x}^\top\mathbf{M}^{-1}\mathbf{x}`
     for a factored :math:`\mathbf{M} = \mathbf{L}\mathbf{L}^\top`.
@@ -77,6 +90,10 @@ def _batch_mahalanobis(bL, bx):
 
 
 def _precision_to_scale_tril(P):
+    # [FUNCTION DOC] HELPER: Converts a positive definite precision matrix P to the
+    # lower Cholesky factor of its inverse, by factoring the doubly flipped matrix,
+    # flipping and transposing back, and inverting via a triangular solve against
+    # identity. Raises a linear algebra error if P is not positive definite.
     # Ref: https://nbviewer.jupyter.org/gist/fehiepsi/5ef8e09e61604f10607380467eb82006#Precision-to-scale_tril
     Lf = torch.linalg.cholesky(torch.flip(P, (-2, -1)))
     L_inv = torch.transpose(torch.flip(Lf, (-2, -1)), -2, -1)
@@ -86,6 +103,11 @@ def _precision_to_scale_tril(P):
 
 
 class MultivariateNormal(Distribution):
+    # [CLASS DOC] Multivariate normal over vectors of length n. State: loc expanded
+    # to the batch shape, an unbroadcast lower Cholesky factor of the covariance
+    # (the basis of all math), and whichever of covariance_matrix / precision_matrix
+    # / scale_tril was supplied; the others are lazily derived. Batch shape is the
+    # broadcast of loc and matrix batch shapes; event shape is (n,). Supports rsample.
     r"""
     Creates a multivariate normal (also called Gaussian) distribution
     parameterized by a mean vector and a covariance matrix.
@@ -140,6 +162,12 @@ class MultivariateNormal(Distribution):
         scale_tril: Tensor | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: loc (batch + (n,)) and exactly one of covariance_matrix,
+        # precision_matrix, scale_tril (each batch + (n, n)). Raises ValueError if
+        # loc is a scalar, if not exactly one matrix is given, or if the given
+        # matrix has fewer than two dims. Broadcasts batch shapes, stores expanded
+        # views, and sets the unbroadcast Cholesky factor (taken directly, or by
+        # Cholesky of the covariance, or from the precision via a conversion helper).
         if loc.dim() < 1:
             raise ValueError("loc must be at least one-dimensional.")
         if (covariance_matrix is not None) + (scale_tril is not None) + (
@@ -196,6 +224,9 @@ class MultivariateNormal(Distribution):
             self._unbroadcasted_scale_tril = _precision_to_scale_tril(precision_matrix)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new MultivariateNormal (or _instance) with loc
+        # and any already-materialized matrices expanded to batch_shape; shares the
+        # unbroadcast Cholesky factor. Copies the validation flag.
         new = self._get_checked_instance(MultivariateNormal, _instance)
         batch_shape = torch.Size(batch_shape)
         loc_shape = batch_shape + self.event_shape
@@ -216,32 +247,41 @@ class MultivariateNormal(Distribution):
 
     @lazy_property
     def scale_tril(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): the Cholesky factor expanded to batch + (n, n).
         return self._unbroadcasted_scale_tril.expand(
             self._batch_shape + self._event_shape + self._event_shape
         )
 
     @lazy_property
     def covariance_matrix(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): Cholesky factor times its
+        # transpose, expanded to batch + (n, n).
         return torch.matmul(
             self._unbroadcasted_scale_tril, self._unbroadcasted_scale_tril.mT
         ).expand(self._batch_shape + self._event_shape + self._event_shape)
 
     @lazy_property
     def precision_matrix(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): inverse covariance via the
+        # Cholesky-based inverse, expanded to batch + (n, n).
         return torch.cholesky_inverse(self._unbroadcasted_scale_tril).expand(
             self._batch_shape + self._event_shape + self._event_shape
         )
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Property: the mean, equal to loc.
         return self.loc
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Property: the mode, equal to loc.
         return self.loc
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Property: per-coordinate variance, the sum of squares of
+        # each Cholesky factor row, expanded to batch + (n,).
         return (
             self._unbroadcasted_scale_tril.pow(2)
             .sum(-1)
@@ -249,11 +289,17 @@ class MultivariateNormal(Distribution):
         )
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Draws reparameterized samples of shape sample_shape +
+        # batch + (n,): loc plus the Cholesky factor applied to standard normal
+        # noise. Consumes RNG state.
         shape = self._extended_shape(sample_shape)
         eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
         return self.loc + _batch_mv(self._unbroadcasted_scale_tril, eps)
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log density at value (batch + (n,)): minus half
+        # of n log(2 pi) plus the Mahalanobis distance of value minus loc, minus the
+        # sum of logs of the Cholesky diagonal. Validates value when enabled (may raise).
         if self._validate_args:
             self._validate_sample(value)
         diff = value - self.loc
@@ -264,6 +310,8 @@ class MultivariateNormal(Distribution):
         return -0.5 * (self._event_shape[0] * math.log(2 * math.pi) + M) - half_log_det
 
     def entropy(self):
+        # [FUNCTION DOC] Returns the differential entropy from n and the sum of
+        # logs of the Cholesky diagonal, expanded to the batch shape (scalar when batch is empty).
         half_log_det = (
             self._unbroadcasted_scale_tril.diagonal(dim1=-2, dim2=-1).log().sum(-1)
         )

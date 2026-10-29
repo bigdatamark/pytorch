@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines LKJCholesky, a distribution over lower Cholesky factors of correlation
+# matrices (LKJ prior), sampled with the vectorized onion method and ported from
+# NumPyro. Exports LKJCholesky. No import-time side effects.
 """
 This closely follows the implementation in NumPyro (https://github.com/pyro-ppl/numpyro).
 
@@ -21,6 +25,11 @@ __all__ = ["LKJCholesky"]
 
 
 class LKJCholesky(Distribution):
+    # [CLASS DOC] Distribution over dim-by-dim lower-triangular Cholesky factors
+    # of correlation matrices, with positive concentration (eta). Batch shape is
+    # the concentration shape; event shape is (dim, dim). State: dim, concentration
+    # and a private Beta distribution (one beta per row) used by the onion sampler.
+    # Not reparameterized (sample only). Support is the corr_cholesky constraint.
     r"""
     LKJ distribution for lower Cholesky factor of correlation matrices.
     The distribution is controlled by ``concentration`` parameter :math:`\eta`
@@ -69,6 +78,11 @@ class LKJCholesky(Distribution):
         concentration: Tensor | float = 1.0,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: dim, matrix size (must be at least 2); concentration,
+        # float or tensor that sets the batch shape. Raises ValueError if dim is
+        # below 2. Precomputes the per-row Beta parameters (first-row offset is
+        # zero, later rows increase by one) stored as a private Beta distribution
+        # with a trailing dimension of size dim, then initializes the base class.
         if dim < 2:
             raise ValueError(
                 f"Expected dim to be an integer greater than or equal to 2. Found dim={dim}."
@@ -91,6 +105,9 @@ class LKJCholesky(Distribution):
         super().__init__(batch_shape, event_shape, validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new LKJCholesky (or _instance) with dim kept,
+        # concentration expanded to batch_shape and the internal Beta expanded to
+        # batch_shape plus a trailing dim axis; copies the validation flag.
         new = self._get_checked_instance(LKJCholesky, _instance)
         batch_shape = torch.Size(batch_shape)
         new.dim = self.dim
@@ -103,6 +120,12 @@ class LKJCholesky(Distribution):
         return new
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] Draws Cholesky factors of shape sample_shape + batch +
+        # (dim, dim) with a vectorized onion method: sample a Beta radius per row,
+        # sample a random direction from the normalized strictly-lower-triangular
+        # Gaussian rows (first row zeroed to remove nan), scale it, then fill the
+        # diagonal so each row has unit norm (clamped to the smallest float for
+        # stability). Consumes RNG state; does not track gradients through Beta.
         # This uses the Onion method, but there are a few differences from [1] Sec. 3.2:
         # - This vectorizes the for loop and also works for heterogeneous eta.
         # - Same algorithm generalizes to n=1.
@@ -124,6 +147,12 @@ class LKJCholesky(Distribution):
         return w
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log density of Cholesky factors in value
+        # (shape batch + (dim, dim)). Sums, over diagonal entries after the first,
+        # an exponent depending on concentration and row index times the log of the
+        # entry, then subtracts the log normalization constant (multivariate
+        # log-gamma based, with a pi correction). Validates value when enabled
+        # (may raise). Result has the batch shape.
         # See: https://mc-stan.org/docs/2_25/functions-reference/cholesky-lkj-correlation-distribution.html
         # The probability of a correlation matrix is proportional to
         #   determinant ** (concentration - 1) = prod(L_ii ^ 2(concentration - 1))

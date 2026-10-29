@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines LowRankMultivariateNormal, a multivariate normal whose covariance is a
+# low-rank factor product plus a positive diagonal, with log-density and entropy
+# computed through the Woodbury identity and matrix determinant lemma on a small
+# capacitance matrix. Also holds private batched helpers for the capacitance
+# Cholesky factor, log determinant and Mahalanobis distance. Exports
+# LowRankMultivariateNormal. No import-time side effects.
 import math
 
 import torch
@@ -14,6 +21,10 @@ __all__ = ["LowRankMultivariateNormal"]
 
 
 def _batch_capacitance_tril(W, D):
+    # [FUNCTION DOC] HELPER: Given a batch of factor matrices W (n by m) and
+    # diagonal vectors D (length n), builds the capacitance matrix (identity plus
+    # W transposed times inverse D times W) and returns its lower Cholesky factor,
+    # shape batch + (m, m). Raises a linear algebra error if not positive definite.
     r"""
     Computes Cholesky of :math:`I + W.T @ inv(D) @ W` for a batch of matrices :math:`W`
     and a batch of vectors :math:`D`.
@@ -26,6 +37,9 @@ def _batch_capacitance_tril(W, D):
 
 
 def _batch_lowrank_logdet(W, D, capacitance_tril):
+    # [FUNCTION DOC] HELPER: Returns the log determinant of the covariance (W times
+    # W transposed plus diagonal D) per batch element, as twice the sum of logs of
+    # the capacitance Cholesky diagonal plus the sum of logs of D.
     r"""
     Uses "matrix determinant lemma"::
         log|W @ W.T + D| = log|C| + log|D|,
@@ -38,6 +52,10 @@ def _batch_lowrank_logdet(W, D, capacitance_tril):
 
 
 def _batch_lowrank_mahalanobis(W, D, x, capacitance_tril):
+    # [FUNCTION DOC] HELPER: Returns the squared Mahalanobis distance of x under
+    # the low-rank covariance: the diagonal-only term (sum of x squared over D)
+    # minus the Mahalanobis term of the projected vector under the capacitance
+    # Cholesky factor (Woodbury identity). Batch shapes broadcast; result drops the last dim.
     r"""
     Uses "Woodbury matrix identity"::
         inv(W @ W.T + D) = inv(D) - inv(D) @ W @ inv(C) @ W.T @ inv(D),
@@ -52,6 +70,12 @@ def _batch_lowrank_mahalanobis(W, D, x, capacitance_tril):
 
 
 class LowRankMultivariateNormal(Distribution):
+    # [CLASS DOC] Multivariate normal with covariance equal to cov_factor times its
+    # transpose plus a diagonal cov_diag. State: broadcast loc, cov_factor,
+    # cov_diag (public, batch-expanded), the original unbroadcast factor and
+    # diagonal, and the capacitance Cholesky factor computed once in the
+    # constructor. Event shape is the vector length; supports rsample. Dense
+    # covariance_matrix, precision_matrix, scale_tril and variance are lazily computed.
     r"""
     Creates a multivariate normal distribution with covariance matrix having a low-rank form
     parameterized by :attr:`cov_factor` and :attr:`cov_diag`::
@@ -101,6 +125,12 @@ class LowRankMultivariateNormal(Distribution):
         cov_diag: Tensor,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: loc (batch + (n,)), cov_factor (batch + (n, rank)),
+        # cov_diag (batch + (n,)). Raises ValueError if loc is a scalar, cov_factor
+        # has fewer than two dims or its row count differs from n, cov_diag's last
+        # dim differs from n, or batch shapes do not broadcast. Stores broadcast
+        # copies, keeps the unbroadcast factor/diagonal for efficient math, and
+        # precomputes the capacitance Cholesky factor from them.
         if loc.dim() < 1:
             raise ValueError("loc must be at least one-dimensional.")
         event_shape = loc.shape[-1:]
@@ -139,6 +169,9 @@ class LowRankMultivariateNormal(Distribution):
         super().__init__(batch_shape, event_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new LowRankMultivariateNormal (or _instance)
+        # with loc, cov_diag and cov_factor expanded to batch_shape; the unbroadcast
+        # tensors and capacitance factor are shared. Copies the validation flag.
         new = self._get_checked_instance(LowRankMultivariateNormal, _instance)
         batch_shape = torch.Size(batch_shape)
         loc_shape = batch_shape + self.event_shape
@@ -156,20 +189,28 @@ class LowRankMultivariateNormal(Distribution):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Property: the mean, equal to loc.
         return self.loc
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Property: the mode, equal to loc.
         return self.loc
 
     @lazy_property
     def variance(self) -> Tensor:  # type: ignore[override]
+        # [FUNCTION DOC] Lazy property (cached): per-coordinate variance, the sum
+        # of squares of each factor row plus the diagonal, expanded to batch + event shape.
         return (
             self._unbroadcasted_cov_factor.pow(2).sum(-1) + self._unbroadcasted_cov_diag
         ).expand(self._batch_shape + self._event_shape)
 
     @lazy_property
     def scale_tril(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): lower Cholesky factor of the dense
+        # covariance, computed stably by scaling with the diagonal square root and
+        # factoring an identity-plus-scaled-factor matrix (eigenvalues at least 1).
+        # Result is expanded to batch + (n, n). Costs cubic time in n.
         # The following identity is used to increase the numerical computation stability
         # for Cholesky decomposition (see http://www.gaussianprocess.org/gpml/, Section 3.4.3):
         #     W @ W.T + D = D1/2 @ (I + D-1/2 @ W @ W.T @ D-1/2) @ D1/2
@@ -187,6 +228,8 @@ class LowRankMultivariateNormal(Distribution):
 
     @lazy_property
     def covariance_matrix(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): dense covariance, factor times its
+        # transpose plus a diagonal matrix, expanded to batch + (n, n).
         covariance_matrix = torch.matmul(
             self._unbroadcasted_cov_factor, self._unbroadcasted_cov_factor.mT
         ) + torch.diag_embed(self._unbroadcasted_cov_diag)
@@ -196,6 +239,9 @@ class LowRankMultivariateNormal(Distribution):
 
     @lazy_property
     def precision_matrix(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): dense inverse covariance via the
+        # Woodbury identity, using a triangular solve with the capacitance factor;
+        # expanded to batch + (n, n).
         # We use "Woodbury matrix identity" to take advantage of low rank form::
         #     inv(W @ W.T + D) = inv(D) - inv(D) @ W @ inv(C) @ W.T @ inv(D)
         # where :math:`C` is the capacitance matrix.
@@ -212,6 +258,10 @@ class LowRankMultivariateNormal(Distribution):
         )
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Draws reparameterized samples of shape sample_shape +
+        # batch + (n,): loc plus factor times rank-sized standard normal noise plus
+        # square root of the diagonal times n-sized standard normal noise.
+        # Consumes RNG state.
         shape = self._extended_shape(sample_shape)
         W_shape = shape[:-1] + self.cov_factor.shape[-1:]
         eps_W = _standard_normal(W_shape, dtype=self.loc.dtype, device=self.loc.device)
@@ -223,6 +273,9 @@ class LowRankMultivariateNormal(Distribution):
         )
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log density at value (batch + (n,)): minus half
+        # of n log(2 pi) plus the low-rank log determinant plus the low-rank
+        # Mahalanobis distance of value minus loc. Validates value when enabled (may raise).
         if self._validate_args:
             self._validate_sample(value)
         diff = value - self.loc
@@ -240,6 +293,8 @@ class LowRankMultivariateNormal(Distribution):
         return -0.5 * (self._event_shape[0] * math.log(2 * math.pi) + log_det + M)
 
     def entropy(self):
+        # [FUNCTION DOC] Returns the differential entropy from n and the low-rank
+        # log determinant, expanded to the batch shape (scalar when batch is empty).
         log_det = _batch_lowrank_logdet(
             self._unbroadcasted_cov_factor,
             self._unbroadcasted_cov_diag,

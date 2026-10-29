@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Student's t distribution with degrees of freedom, location and
+# scale, with reparameterized sampling via a normal over a chi-squared variable.
+# Exports StudentT. No import-time side effects.
 import math
 
 import torch
@@ -13,6 +17,9 @@ __all__ = ["StudentT"]
 
 
 class StudentT(Distribution):
+    # [CLASS DOC] Student's t distribution with positive df and scale and real
+    # loc, broadcast together; batch shape is their common shape. State: df, loc,
+    # scale tensors and an internal Chi2(df) used for sampling. Supports rsample.
     r"""
     Creates a Student's t-distribution parameterized by degree of
     freedom :attr:`df`, mean :attr:`loc` and scale :attr:`scale`.
@@ -41,16 +48,21 @@ class StudentT(Distribution):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Property: a copy of loc with nan where df is at most 1 (mean undefined).
         m = self.loc.clone(memory_format=torch.contiguous_format)
         m[self.df <= 1] = nan
         return m
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Property: the mode, equal to loc.
         return self.loc
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Property: scale squared times df over (df - 2) where df
+        # exceeds 2; infinity where df is in (1, 2]; nan where df is at most 1.
+        # Built from a copy of df, so parameters are not mutated.
         m = self.df.clone(memory_format=torch.contiguous_format)
         m[self.df > 2] = (
             self.scale[self.df > 2].pow(2)
@@ -68,12 +80,17 @@ class StudentT(Distribution):
         scale: Tensor | float = 1.0,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Broadcasts df, loc (default 0) and scale (default 1) to
+        # common tensors, builds the internal Chi2 on df, and uses df's shape as
+        # batch shape. Initializes the base class with optional validation.
         self.df, self.loc, self.scale = broadcast_all(df, loc, scale)
         self._chi2 = Chi2(self.df)
         batch_shape = self.df.size()
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new StudentT (or _instance) with df, loc, scale
+        # and the internal Chi2 expanded to batch_shape; copies the validation flag.
         new = self._get_checked_instance(StudentT, _instance)
         batch_shape = torch.Size(batch_shape)
         new.df = self.df.expand(batch_shape)
@@ -85,6 +102,9 @@ class StudentT(Distribution):
         return new
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Draws reparameterized samples: a standard normal divided
+        # by the square root of a chi-squared draw over df, then scaled and shifted
+        # by scale and loc. Consumes RNG state.
         # NOTE: This does not agree with scipy implementation as much as other distributions.
         # (see https://github.com/fritzo/notebooks/blob/master/debug-student-t.ipynb). Using DoubleTensor
         # parameters seems to help.
@@ -99,6 +119,9 @@ class StudentT(Distribution):
         return self.loc + self.scale * Y
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log density at value from the standardized
+        # deviation, a log1p term weighted by (df + 1) / 2, and a normalizer built
+        # from log scale, log df and log-gamma terms. Validates value when enabled (may raise).
         if self._validate_args:
             self._validate_sample(value)
         y = (value - self.loc) / self.scale
@@ -112,6 +135,8 @@ class StudentT(Distribution):
         return -0.5 * (self.df + 1.0) * torch.log1p(y**2.0 / self.df) - Z
 
     def entropy(self):
+        # [FUNCTION DOC] Returns the differential entropy using the log Beta
+        # function of (df/2, 1/2), digamma terms, log scale and log df.
         lbeta = (
             torch.lgamma(0.5 * self.df)
             + math.lgamma(0.5)

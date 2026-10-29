@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the NegativeBinomial distribution (count of successes before a given
+# number of failures), parameterized by total_count and either probs or logits;
+# sampling uses a Gamma-Poisson mixture. Exports NegativeBinomial. No import-time
+# side effects.
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +23,11 @@ __all__ = ["NegativeBinomial"]
 
 
 class NegativeBinomial(Distribution):
+    # [CLASS DOC] Negative binomial distribution over non-negative integers with
+    # non-negative (possibly real) total_count and success probability given as
+    # probs or logits (only one stored eagerly, the other computed lazily). All
+    # parameters are broadcast to one shape which is the batch shape. State:
+    # total_count, probs/logits, and _param (whichever was supplied). Not reparameterized.
     r"""
     Creates a Negative Binomial distribution, i.e. distribution
     of the number of successful independent and identical Bernoulli trials
@@ -47,6 +57,10 @@ class NegativeBinomial(Distribution):
         logits: Tensor | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: total_count (float or tensor), and exactly one of
+        # probs or logits. Raises ValueError if both or neither are given. Broadcasts
+        # total_count with the chosen parameter, casts total_count to its dtype,
+        # remembers the chosen parameter as _param and uses its shape as batch shape.
         if (probs is None) == (logits is None):
             raise ValueError(
                 "Either `probs` or `logits` must be specified, but not both."
@@ -73,6 +87,9 @@ class NegativeBinomial(Distribution):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new NegativeBinomial (or _instance) with
+        # total_count and whichever of probs/logits were already materialized
+        # expanded to batch_shape; _param points at the last one set. Copies the validation flag.
         new = self._get_checked_instance(NegativeBinomial, _instance)
         batch_shape = torch.Size(batch_shape)
         new.total_count = self.total_count.expand(batch_shape)
@@ -87,34 +104,47 @@ class NegativeBinomial(Distribution):
         return new
 
     def _new(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Creates a new tensor with the dtype/device of _param.
         return self._param.new(*args, **kwargs)
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Property: total_count times the odds of success (exponential of logits).
         return self.total_count * torch.exp(self.logits)
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Property: floor of (total_count - 1) times the odds,
+        # clamped to be at least zero.
         return ((self.total_count - 1) * self.logits.exp()).floor().clamp(min=0.0)
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Property: mean divided by the failure probability (sigmoid of minus logits).
         return self.mean / torch.sigmoid(-self.logits)
 
     @lazy_property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (computed once, then cached): logits
+        # derived from probs using the binary conversion.
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (computed once, then cached): probabilities
+        # derived from logits using the binary conversion.
         return logits_to_probs(self.logits, is_binary=True)
 
     @property
     def param_shape(self) -> torch.Size:
+        # [FUNCTION DOC] Property: size of the stored parameter tensor.
         return self._param.size()
 
     @lazy_property
     def _gamma(self) -> Gamma:
+        # [FUNCTION DOC] HELPER: Lazy cached Gamma mixing distribution with
+        # concentration total_count and rate exp(-logits); argument validation is
+        # disabled because total_count may be zero.
         # Note we avoid validating because self.total_count can be zero.
         return Gamma(
             concentration=self.total_count,
@@ -123,11 +153,19 @@ class NegativeBinomial(Distribution):
         )
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] Draws a gamma rate for each element, then a Poisson count
+        # with that rate (gamma-Poisson mixture). Runs without gradient tracking and
+        # consumes RNG state. Returns a tensor of sample_shape + batch shape.
         with torch.no_grad():
             rate = self._gamma.sample(sample_shape=sample_shape)
             return torch.poisson(rate)
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log probability mass at value: log-sigmoid
+        # terms for failures and successes minus a log-gamma based normalization.
+        # The case of zero total_count and zero value is masked to a zero
+        # normalization to avoid infinite log-gamma, without in-place mutation.
+        # Validates value when enabled (may raise).
         if self._validate_args:
             self._validate_sample(value)
 

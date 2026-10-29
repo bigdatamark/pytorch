@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Concrete/relaxed Bernoulli family: LogitRelaxedBernoulli (samples
+# are logits of relaxed values) and RelaxedBernoulli (sigmoid-transformed, values
+# in (0, 1), reparameterized). No import-time side effects.
 
 import torch
 from torch import Tensor
@@ -20,6 +24,10 @@ __all__ = ["LogitRelaxedBernoulli", "RelaxedBernoulli"]
 
 
 class LogitRelaxedBernoulli(Distribution):
+    # [CLASS DOC] Distribution of the logit of a relaxed Bernoulli variable, with
+    # a relaxation temperature tensor and success probs or logits (one stored
+    # eagerly, the other computed lazily). Batch shape is the parameter shape
+    # (empty for a plain number). Supports rsample; real-valued support.
     r"""
     Creates a LogitRelaxedBernoulli distribution parameterized by :attr:`probs`
     or :attr:`logits` (but not both), which is the logit of a RelaxedBernoulli
@@ -50,6 +58,10 @@ class LogitRelaxedBernoulli(Distribution):
         logits: Tensor | Number | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: temperature (tensor, stored as is, not broadcast
+        # with the parameters), and exactly one of probs or logits (number or
+        # tensor). Raises ValueError if both or neither are given. Sets _param to the
+        # supplied one and batch shape to empty for numbers, else its size.
         self.temperature = temperature
         if (probs is None) == (logits is None):
             raise ValueError(
@@ -73,6 +85,9 @@ class LogitRelaxedBernoulli(Distribution):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new LogitRelaxedBernoulli (or _instance) sharing
+        # temperature, with whichever of probs/logits are materialized expanded to
+        # batch_shape; copies the validation flag.
         new = self._get_checked_instance(LogitRelaxedBernoulli, _instance)
         batch_shape = torch.Size(batch_shape)
         new.temperature = self.temperature
@@ -87,21 +102,29 @@ class LogitRelaxedBernoulli(Distribution):
         return new
 
     def _new(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Creates a new tensor with the dtype/device of _param.
         return self._param.new(*args, **kwargs)
 
     @lazy_property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): logits derived from probs (binary conversion).
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC] Lazy property (cached): probs derived from logits (binary conversion).
         return logits_to_probs(self.logits, is_binary=True)
 
     @property
     def param_shape(self) -> torch.Size:
+        # [FUNCTION DOC] Property: size of the stored parameter tensor.
         return self._param.size()
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Draws reparameterized samples of shape sample_shape +
+        # batch: clamps probs and a uniform draw away from 0 and 1, computes the
+        # sum of the logistic noise logit and the probs logit, divided by temperature.
+        # Consumes RNG state.
         shape = self._extended_shape(sample_shape)
         probs = clamp_probs(self.probs.expand(shape))
         uniforms = clamp_probs(
@@ -112,6 +135,10 @@ class LogitRelaxedBernoulli(Distribution):
         ) / self.temperature
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Returns the log density of logit-space value: log
+        # temperature plus the difference between logits and temperature times
+        # value, minus twice the softplus of that difference. Validates value when
+        # enabled (may raise).
         if self._validate_args:
             self._validate_sample(value)
         logits, value = broadcast_all(self.logits, value)
@@ -120,6 +147,9 @@ class LogitRelaxedBernoulli(Distribution):
 
 
 class RelaxedBernoulli(TransformedDistribution):
+    # [CLASS DOC] Relaxed Bernoulli (Concrete) distribution on (0, 1): a
+    # LogitRelaxedBernoulli base passed through a sigmoid transform. Reparameterized.
+    # temperature, probs and logits are read-only views of the base distribution.
     r"""
     Creates a RelaxedBernoulli distribution, parametrized by
     :attr:`temperature`, and either :attr:`probs` or :attr:`logits`
@@ -154,21 +184,28 @@ class RelaxedBernoulli(TransformedDistribution):
         logits: Tensor | Number | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the LogitRelaxedBernoulli base from temperature
+        # and exactly one of probs/logits and initializes the parent with a sigmoid transform.
+        # KNOWN ISSUE: validate_args is not forwarded to the base distribution.
         base_dist = LogitRelaxedBernoulli(temperature, probs, logits)
         super().__init__(base_dist, SigmoidTransform(), validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns an expanded RelaxedBernoulli of batch_shape via the parent expand.
         new = self._get_checked_instance(RelaxedBernoulli, _instance)
         return super().expand(batch_shape, _instance=new)
 
     @property
     def temperature(self) -> Tensor:
+        # [FUNCTION DOC] Property: relaxation temperature of the base distribution.
         return self.base_dist.temperature
 
     @property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC] Property: logits of the base distribution.
         return self.base_dist.logits
 
     @property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC] Property: probs of the base distribution.
         return self.base_dist.probs

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines MixtureSameFamily, a (batch of) mixture distribution built from a
+# Categorical selector and a component distribution whose rightmost batch
+# dimension indexes the mixture components. Exports MixtureSameFamily. No
+# import-time side effects.
 
 import torch
 from torch import Tensor
@@ -11,6 +16,11 @@ __all__ = ["MixtureSameFamily"]
 
 
 class MixtureSameFamily(Distribution):
+    # [CLASS DOC] Mixture of k components of one distribution family. State: the
+    # mixture Categorical, the component distribution (batch shape ends in k),
+    # component count and the number of event dims. Batch shape is the component
+    # batch shape without its last dim; event shape is the component event shape.
+    # No rsample. Provides mean, variance (total variance law), cdf, log_prob and sample.
     r"""
     The `MixtureSameFamily` distribution implements a (batch of) mixture
     distribution where all components are from different parameterizations of
@@ -62,6 +72,12 @@ class MixtureSameFamily(Distribution):
         component_distribution: Distribution,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Args: mixture_distribution (must be a Categorical) and
+        # component_distribution (any Distribution whose last batch dim is the
+        # component index). Raises ValueError if the types are wrong, if the
+        # mixture batch shape is incompatible with the component batch shape
+        # (ignoring its last dim), or if the component counts differ. Records the
+        # component count and event dim count, then initializes the base class.
         self._mixture_distribution = mixture_distribution
         self._component_distribution = component_distribution
 
@@ -109,6 +125,9 @@ class MixtureSameFamily(Distribution):
         )
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new MixtureSameFamily (or _instance) with the
+        # component distribution expanded to batch_shape plus the component axis and
+        # the mixture expanded to batch_shape; copies counts and the validation flag.
         batch_shape = torch.Size(batch_shape)
         batch_shape_comp = batch_shape + (self._num_component,)
         new = self._get_checked_instance(MixtureSameFamily, _instance)
@@ -128,18 +147,22 @@ class MixtureSameFamily(Distribution):
     @constraints.dependent_property
     # pyrefly: ignore [bad-override]
     def support(self):
+        # [FUNCTION DOC] Property: mixture constraint wrapping the component support.
         return MixtureSameFamilyConstraint(self._component_distribution.support)
 
     @property
     def mixture_distribution(self) -> Categorical:
+        # [FUNCTION DOC] Property: the Categorical selecting distribution.
         return self._mixture_distribution
 
     @property
     def component_distribution(self) -> Distribution:
+        # [FUNCTION DOC] Property: the component distribution.
         return self._component_distribution
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Property: mixture-weighted sum of component means over the component axis.
         probs = self._pad_mixture_dimensions(self.mixture_distribution.probs)
         return torch.sum(
             probs * self.component_distribution.mean, dim=-1 - self._event_ndims
@@ -147,6 +170,9 @@ class MixtureSameFamily(Distribution):
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Property: variance by the law of total variance, the
+        # weighted mean of component variances plus the weighted squared deviation
+        # of component means from the mixture mean.
         # Law of total variance: Var(Y) = E[Var(Y|X)] + Var(E[Y|X])
         probs = self._pad_mixture_dimensions(self.mixture_distribution.probs)
         mean_cond_var = torch.sum(
@@ -159,6 +185,10 @@ class MixtureSameFamily(Distribution):
         return mean_cond_var + var_cond_mean
 
     def cdf(self, x):
+        # [FUNCTION DOC] Returns the mixture cdf at x: component cdfs (x padded with
+        # a component axis) weighted by mixture probabilities and summed.
+        # KNOWN ISSUE: does not validate x, and the weights are not padded for event
+        # dims, so it only works for scalar-event components.
         x = self._pad(x)
         cdf_x = self.component_distribution.cdf(x)
         mix_prob = self.mixture_distribution.probs
@@ -166,6 +196,10 @@ class MixtureSameFamily(Distribution):
         return torch.sum(cdf_x * mix_prob, dim=-1)
 
     def log_prob(self, x):
+        # [FUNCTION DOC] Returns the mixture log density at x: component log
+        # probabilities (x padded with a component axis) plus log-softmaxed mixture
+        # logits, combined with log-sum-exp over components. Validates x when
+        # enabled (may raise).
         if self._validate_args:
             self._validate_sample(x)
         x = self._pad(x)
@@ -176,6 +210,10 @@ class MixtureSameFamily(Distribution):
         return torch.logsumexp(log_prob_x + log_mix_prob, dim=-1)  # [S, B]
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] Draws a component index from the mixture and samples from
+        # all components, then gathers the chosen component per draw and removes
+        # the component axis. Runs without gradient tracking; consumes RNG state.
+        # Result shape is sample_shape + batch + event shape.
         with torch.no_grad():
             sample_len = len(sample_shape)
             batch_len = len(self.batch_shape)
@@ -201,9 +239,15 @@ class MixtureSameFamily(Distribution):
             return samples.squeeze(gather_dim)
 
     def _pad(self, x):
+        # [FUNCTION DOC] HELPER: Inserts a size-one axis just before the event
+        # dims of x, where the component axis sits.
         return x.unsqueeze(-1 - self._event_ndims)
 
     def _pad_mixture_dimensions(self, x):
+        # [FUNCTION DOC] HELPER: Reshapes mixture-shaped x (batch + (k,)) by
+        # inserting size-one axes so it aligns with component statistics: extra
+        # batch axes before the component axis (none if the mixture has exactly one
+        # batch dim) and size-one axes for event dims after it.
         dist_batch_ndims = len(self.batch_shape)
         cat_batch_ndims = len(self.mixture_distribution.batch_shape)
         pad_ndims = 0 if cat_batch_ndims == 1 else dist_batch_ndims - cat_batch_ndims
@@ -217,6 +261,8 @@ class MixtureSameFamily(Distribution):
         return x
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a multi-line string naming the class followed by
+        # the repr of the mixture and component distributions.
         args_string = (
             f"\n  {self.mixture_distribution},\n  {self.component_distribution}"
         )
