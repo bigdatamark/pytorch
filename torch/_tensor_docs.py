@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Attaches documentation strings to the methods of the Tensor base class.
+# Defines the shared argument-description mappings (common_args, new_common_args, and
+# others built with parse_kwargs) and then calls add_docstr_all once per Tensor method
+# name with its docstring text. Import-time side effect: mutates the docstrings of
+# torch._C.TensorBase methods; raises an error if a named method does not exist or
+# already has a docstring.
 """Adds docstrings to Tensor functions"""
 
 import torch._C
@@ -7,6 +13,9 @@ from torch._torch_docs import parse_kwargs, reproducibility_notes
 
 
 def add_docstr_all(method: str, docstr: str) -> None:
+    # [FUNCTION DOC] Looks up the attribute named by method on torch._C.TensorBase and
+    # sets its docstring to docstr via the C-level add_docstr. Returns nothing; raises
+    # an error if the attribute is missing or already documented. Mutates global state.
     add_docstr(getattr(torch._C.TensorBase, method), docstr)
 
 
