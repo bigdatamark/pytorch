@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Prototype executor for traced prim graphs: execute runs a GraphModule and
+# make_traced wraps a function so it is traced under TorchRefsMode before execution.
 from collections.abc import Callable
 from typing import Any, TypeVar
 from typing_extensions import ParamSpec, TypeVarTuple, Unpack
@@ -18,6 +21,9 @@ def execute(
     executor: str = "aten",
     executor_parameters: dict | None = None,
 ) -> Any:
+    # [FUNCTION DOC] Runs graph module gm on args. Only the "aten" executor is supported
+    # (calls the module forward directly); executor_parameters is unused.
+    # Raises ValueError for any other executor name.
     """
     Prototype ATen executor.
 
@@ -32,6 +38,9 @@ def execute(
 
 
 def make_traced(fn: Callable[P, T]) -> Callable[P, T]:
+    # [FUNCTION DOC] Returns a wrapper of fn that, when called, traces fn with make_fx under
+    # TorchRefsMode and runs the resulting graph through execute. The wrapper accepts an
+    # optional executor keyword (default "aten") which is removed from the kwargs.
     """
     Returns a function that, when called, will
     trace its torch operations to prims and then
@@ -56,6 +65,8 @@ def make_traced(fn: Callable[P, T]) -> Callable[P, T]:
     """
 
     def _traced(*args: P.args, **kwargs: P.kwargs) -> T:
+        # [FUNCTION DOC] HELPER: Wrapper body. Pops the executor name, builds the make_fx
+        # wrapper and flat args, traces under TorchRefsMode, then executes the graph.
         executor = str(kwargs.pop("executor", "aten"))
 
         # TODO: caching

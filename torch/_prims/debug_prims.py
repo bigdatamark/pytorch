@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Debug prims: defines the debugprims::load_tensor operator, which materializes a
+# tensor either randomly (rand_strided) or from a ContentStoreReader. Holds the
+# module-level LOAD_TENSOR_READER global set by load_tensor_reader.
 import contextlib
 from collections.abc import Generator, Sequence
 
@@ -10,6 +14,10 @@ LOAD_TENSOR_READER: ContentStoreReader | None = None
 
 @contextlib.contextmanager
 def load_tensor_reader(loc: str) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that installs a ContentStoreReader (no caching, so
+    # every load returns fresh storage) at location loc as the global LOAD_TENSOR_READER
+    # for the duration of the block, then resets it to None. Raises AssertionError if a
+    # reader is already installed.
     global LOAD_TENSOR_READER
     if LOAD_TENSOR_READER is not None:
         raise AssertionError("LOAD_TENSOR_READER is already set")
@@ -27,6 +35,8 @@ def load_tensor_reader(loc: str) -> Generator[None, None, None]:
 
 
 def register_debug_prims() -> None:
+    # [FUNCTION DOC] Defines the debugprims::load_tensor operator schema and registers its
+    # BackendSelect implementation. Side effect: mutates the global torch.library registry.
     torch.library.define(
         "debugprims::load_tensor",
         "(str name, int[] size, int[] stride, *, ScalarType dtype, Device device) -> Tensor",
@@ -40,6 +50,10 @@ def register_debug_prims() -> None:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Implementation of load_tensor. With no reader installed returns a
+        # random tensor of the given size/stride/dtype/device. Otherwise reads the named
+        # tensor from the reader and checks size, stride and device match (AssertionError
+        # on mismatch); a dtype mismatch is resolved by cloning to the requested dtype.
         if LOAD_TENSOR_READER is None:
             from torch._dynamo.testing import rand_strided
 

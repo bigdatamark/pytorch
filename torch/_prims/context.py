@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Context utilities for running torch.* calls through PrimTorch references.
+# Provides cached lookups (torch_to_refs_map, all_prims) and TorchRefsMode, a
+# TorchFunctionMode that redirects torch functions to torch._refs or decompositions.
+# Import-time side effect: imports torch._refs submodules and torch._decomp.
 from __future__ import annotations
 
 import functools
@@ -26,6 +31,10 @@ _R = TypeVar("_R")
 
 @functools.cache
 def torch_to_refs_map() -> dict[Any, Any]:
+    # [FUNCTION DOC] Builds (once, cached) the mapping from torch API functions and Tensor
+    # methods to their torch._refs equivalents. Combines explicit dunder/method entries,
+    # the __all__ lists of paired torch/_refs modules, Tensor methods named in refs, and
+    # conversion functions. Returns a dict keyed by torch callables; no side effects.
     """
     Mapping of torch API functions to torch._refs functions.
     E.g. torch_to_refs_map()[torch.add] == torch._refs.add
@@ -81,6 +90,7 @@ def torch_to_refs_map() -> dict[Any, Any]:
 
 @functools.cache
 def all_prims() -> set[Any]:
+    # [FUNCTION DOC] Returns (cached) the set of all prim functions listed in torch._prims.__all__.
     """
     Set of all prim functions, e.g., torch._prims.add in all_prims()
     """
@@ -88,6 +98,10 @@ def all_prims() -> set[Any]:
 
 
 class TorchRefsMode(torch.overrides.TorchFunctionMode):
+    # [CLASS DOC] TorchFunctionMode that reroutes torch functions to PrimTorch refs or
+    # registered aten decompositions. State: strict (error when no ref exists),
+    # should_fallback_fn (callback deciding to use the original function even if a ref
+    # exists), prims_mode_cls (context manager class entered around prim calls).
     """
     Switches the interpretation of torch.* functions and Tensor methods to
     use PrimTorch refs in torch._refs.  (Direct calls to _refs are unaffected.)
@@ -108,6 +122,7 @@ class TorchRefsMode(torch.overrides.TorchFunctionMode):
         should_fallback_fn: Callable[..., bool] = lambda *_: False,
         prims_mode_cls: type = nullcontext,
     ) -> None:
+        # [FUNCTION DOC] Stores the strict flag, fallback predicate and prims mode class.
         self.strict = strict
         self.should_fallback_fn = should_fallback_fn
         self.prims_mode_cls = prims_mode_cls
@@ -119,6 +134,12 @@ class TorchRefsMode(torch.overrides.TorchFunctionMode):
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Intercepts a torch function call. Prims and passthrough functions
+        # run directly inside a prims_mode_cls context. Otherwise looks up a ref (or an aten
+        # decomposition for OpOverload / OpOverloadPacket) and, unless should_fallback_fn
+        # says otherwise, calls it with this mode active so nested calls are also rewritten.
+        # Falls back to the original function if no ref exists.
+        # Raises RuntimeError in strict mode when no ref is found.
         if kwargs is None:
             kwargs = {}
         # For primitive operations, run them as is without interception

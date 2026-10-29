@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# RNG prims and higher-order operators used to functionalize random ops: the rngprims::philox_rand
+# custom op, run_and_save_rng_state, run_with_rng_state, graphsafe_run_with_rng_state and
+# run_dtensor_rng_op. Import-time side effects: registers these operators, registers CUDA as a
+# graphsafe RNG dispatch key, sets CustomClassBaseMeta as the Generator metaclass and registers
+# torch._C.Generator as an opaque custom class.
 from typing import cast
 
 import torch
@@ -17,6 +23,8 @@ from torch.types import _device, _dtype
 
 
 def throw_on_non_cuda(device):
+    # [FUNCTION DOC] Always raises RuntimeError explaining that functionalizing RNG operators on
+    # non-Philox devices (given device) is unsupported.
     raise RuntimeError(
         f"You are trying to functionalize a {device.type} RNG operator but {device.type} does not "
         f"use Philox/counter-based RNG. Therefore, functionalizing a {device.type} RNG operator is "
@@ -25,6 +33,10 @@ def throw_on_non_cuda(device):
 
 
 def register_rng_prim(name, schema, impl_aten, impl_meta, doc, tags=None):
+    # [FUNCTION DOC] Defines a custom op rngprims::<name> with the given schema and eager
+    # implementation, registers impl_meta as its fake implementation, optionally sets tags, and
+    # attaches doc, return_type NEW, schema, impl_aten and prim_meta_impl attributes to both the
+    # op packet and its default overload. Side effect: mutates the global op registry.
     rngprim_def = torch.library.custom_op(
         "rngprims::" + name, impl_aten, mutates_args=(), schema=schema
     )
@@ -50,12 +62,18 @@ def register_rng_prim(name, schema, impl_aten, impl_meta, doc, tags=None):
 def philox_rand_offset_meta(
     shape: torch.Size,
 ):
+    # [FUNCTION DOC] HELPER: Meta version of philox_rand_offset; returns a TensorLike wrapping a
+    # scalar int64 zero tensor regardless of shape.
     return _prims.TensorLike(torch.tensor(0, dtype=torch.int64))
 
 
 def philox_rand_offset(
     shape: torch.Size,
 ):
+    # [FUNCTION DOC] Computes how far the Philox offset advances after generating a tensor of
+    # the given shape, mirroring the CUDA calc_execution_policy logic (256 threads per block,
+    # unroll 4, 4 curand calls) using the current CUDA device properties. Returns an int.
+    # Requires CUDA to be available (queries device properties).
     # For impl, look at the function calc_execution_policy in the file
     # aten/src/ATen/native/cuda/DistributionTemplates.h. The impl was copied at
     # commit hash 72aa0667bd16707d50eb8fa337092a1f5d11dfb6
@@ -76,6 +94,8 @@ def philox_rand_offset(
 
 
 def register_philox_rand():
+    # [FUNCTION DOC] Registers the rngprims::philox_rand op (stateless Philox-based uniform rand
+    # returning values and the next offset) with eager and meta implementations.
     name = "philox_rand"
     schema = "(SymInt[] size, Tensor seed, Tensor offset, int[]? stride, Device? device=None, ScalarType? dtype=None) -> (Tensor, Tensor)"
 
@@ -87,6 +107,9 @@ def register_philox_rand():
         device: _device,
         dtype: _dtype,
     ):
+        # [FUNCTION DOC] HELPER: Fake/meta implementation of philox_rand. Requires stride to be
+        # None (AssertionError otherwise); returns a contiguous TensorMeta for the random values
+        # and a meta offset tensor.
         # stride arg will be useful for distributed usecase. Currently, it's unused.
         if stride is not None:
             raise AssertionError(f"stride must be None, got {stride}")
@@ -105,6 +128,12 @@ def register_philox_rand():
         device: _device,
         dtype: _dtype,
     ):
+        # [FUNCTION DOC] HELPER: Eager implementation of philox_rand. Requires stride None
+        # (AssertionError otherwise) and a CUDA device (RuntimeError via throw_on_non_cuda).
+        # Inside a forked RNG scope, sets the CUDA Philox state from seed and offset, draws
+        # uniform values, and returns them with the advanced offset from philox_rand_offset.
+        # KNOWN ISSUE: the CPU branch building the device list is unreachable in effect, since
+        # non-CUDA devices raise right after.
         # stride arg will be useful for distributed usecase. Currently, it's unused.
         if stride is not None:
             raise AssertionError(f"stride must be None, got {stride}")
@@ -133,6 +162,9 @@ def register_philox_rand():
 
 
 def get_device(args, kwargs):
+    # [FUNCTION DOC] Infers the device type string (e.g. cuda, cpu) from the device keyword
+    # (string or torch.device) if given and truthy, else from the first tensor or device
+    # positional argument. Returns None if none is found.
     if kwargs.get("device"):
         device = kwargs.get("device")
         if isinstance(device, str):
@@ -148,11 +180,18 @@ def get_device(args, kwargs):
 
 
 def register_run_and_save_rng_state_op():
+    # [FUNCTION DOC] Creates and configures the run_and_save_rng_state higher-order operator,
+    # which runs op and returns (rng_state_before, op_result). Registers Autograd (deferred
+    # error), CUDA, CPU, HPU, XPU, BackendSelect, fake and proxy-tracing implementations.
+    # Returns the operator instance.
     class RunAndSaveRngState(HigherOrderOperator):
+        # [CLASS DOC] Higher-order operator wrapper named run_and_save_rng_state (cacheable).
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the operator with its name and cacheable=True.
             super().__init__("run_and_save_rng_state", cacheable=True)
 
         def __call__(self, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards the call (op and arguments) to the base class.
             # pyrefly: ignore [missing-attribute]
             return super().__call__(op, *args, **kwargs)
 
@@ -164,24 +203,30 @@ def register_run_and_save_rng_state_op():
 
     @run_and_save_rng_state.py_impl(DispatchKey.CUDA)
     def impl_cuda(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Returns the CUDA RNG state captured before running op, plus op's result.
         return torch.cuda.get_rng_state(), op(*args, **kwargs)
 
     @run_and_save_rng_state.py_impl(DispatchKey.CPU)
     def impl_cpu(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Returns the CPU RNG state captured before running op, plus op's result.
         return torch.get_rng_state(), op(*args, **kwargs)
 
     @run_and_save_rng_state.py_impl(DispatchKey.HPU)
     def impl_hpu(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: HPU variant: returns (rng state, op result); raises RuntimeError if torch.hpu is missing.
         if hasattr(torch, "hpu"):
             return torch.hpu.get_rng_state(), op(*args, **kwargs)
         raise RuntimeError("functionalize a hpu RNG operator is not supported.")
 
     @run_and_save_rng_state.py_impl(DispatchKey.XPU)
     def impl_xpu(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Returns the XPU RNG state captured before running op, plus op's result.
         return torch.xpu.get_rng_state(), op(*args, **kwargs)
 
     @run_and_save_rng_state.py_impl(DispatchKey.BackendSelect)
     def impl_backend_select(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Picks the per-device implementation (cuda, cpu, hpu, xpu) from the
+        # device inferred via get_device and calls it; AssertionError for unsupported devices.
         impl_map = {
             "cuda": impl_cuda,
             "cpu": impl_cpu,
@@ -196,11 +241,14 @@ def register_run_and_save_rng_state_op():
 
     @register_fake(run_and_save_rng_state, skip_cache=True)
     def impl_fake_tensor_mode(op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake tensor implementation; delegates to the backend-select dispatch.
         # Check device to call the right impl
         return impl_backend_select(op, *args, **kwargs)
 
     @run_and_save_rng_state.py_impl(ProxyTorchDispatchMode)
     def impl_proxy_dispatch_mode(mode, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Proxy tracing implementation. Runs the real op, records a
+        # call_function node for the operator in the tracer, and attaches the proxy to the outputs.
         out = impl_backend_select(op, *args, **kwargs)
         proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, (op, *args))
         proxy_kwargs = pytree.tree_map(mode.tracer.unwrap_proxy, kwargs)
@@ -213,11 +261,18 @@ def register_run_and_save_rng_state_op():
 
 
 def register_run_with_rng_state_op():
+    # [FUNCTION DOC] Creates and configures the run_with_rng_state higher-order operator, which
+    # runs op under a given RNG state and restores the previous state afterwards. Registers
+    # Autograd (deferred error), CUDA, CPU, HPU, XPU, proxy, BackendSelect, fake and functionalize
+    # implementations. Returns the operator instance.
     class RunWithRngState(HigherOrderOperator):
+        # [CLASS DOC] Higher-order operator wrapper named run_with_rng_state (cacheable).
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the operator with its name and cacheable=True.
             super().__init__("run_with_rng_state", cacheable=True)
 
         def __call__(self, rng_state, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards the call (rng_state, op and arguments) to the base class.
             # pyrefly: ignore [missing-attribute]
             return super().__call__(rng_state, op, *args, **kwargs)
 
@@ -229,6 +284,7 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(DispatchKey.CUDA)
     def impl_cuda(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Saves the CUDA RNG state, installs rng_state, runs op, restores the saved state, returns op's result.
         current_state = torch.cuda.get_rng_state()
         torch.cuda.set_rng_state(rng_state.cpu())
         out = op(*args, **kwargs)
@@ -237,6 +293,7 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(DispatchKey.CPU)
     def impl_cpu(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Saves the CPU RNG state, installs rng_state, runs op, restores the saved state, returns op's result.
         current_state = torch.get_rng_state()
         torch.set_rng_state(rng_state)
         out = op(*args, **kwargs)
@@ -245,6 +302,7 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(DispatchKey.HPU)
     def impl_hpu(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: HPU variant of the save/set/run/restore sequence; raises RuntimeError if torch.hpu is missing.
         if hasattr(torch, "hpu"):
             current_state = torch.hpu.get_rng_state()
             torch.hpu.set_rng_state(rng_state)
@@ -255,6 +313,7 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(DispatchKey.XPU)
     def impl_xpu(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: XPU variant of the save/set/run/restore sequence.
         current_state = torch.xpu.get_rng_state()
         torch.xpu.set_rng_state(rng_state)
         out = op(*args, **kwargs)
@@ -263,6 +322,8 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(ProxyTorchDispatchMode)
     def impl_proxy_dispatch_mode(mode, rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Proxy tracing implementation. Runs the operator with proxy tracing
+        # disabled, records a call_function node in the tracer, and attaches it to the outputs.
         # TODO: you don't need to do this, the dispatch here already disabled
         # it
         with disable_proxy_modes_tracing():
@@ -276,6 +337,7 @@ def register_run_with_rng_state_op():
 
     @run_with_rng_state.py_impl(DispatchKey.BackendSelect)
     def impl_backend_select(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Dispatches to the per-device implementation chosen by get_device; AssertionError if unsupported.
         impl_map = {
             "cuda": impl_cuda,
             "cpu": impl_cpu,
@@ -290,12 +352,15 @@ def register_run_with_rng_state_op():
 
     @register_fake(run_with_rng_state, skip_cache=True)
     def impl_fake_tensor_mode(rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake tensor implementation; runs op directly without touching RNG state.
         # Skip setting the set_rng_state as it does not work well with fake tensors.
         # And it does not matter for the fake tensor mode.
         return op(*args, **kwargs)
 
     @run_with_rng_state.py_functionalize_impl
     def impl_functional(ctx, rng_state, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Functionalization implementation: unwraps tensors, redispatches
+        # the operator to the next key, and re-wraps the result.
         unwrapped_rng_state = ctx.unwrap_tensors(rng_state)
         unwrapped_args = ctx.unwrap_tensors(args)
         unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
@@ -314,6 +379,9 @@ run_with_rng_state = register_run_with_rng_state_op()
 
 
 def _impl_graphsafe_rng(op, *args, rng_state=None, **kwargs):
+    # [FUNCTION DOC] HELPER: Runs op with the default generator of rng_state's device temporarily
+    # set to the graph-safe state rng_state, then restores the previous state; returns op's result.
+    # Raises AssertionError if the device module has no default_generators.
     # pyrefly: ignore [missing-attribute]
     device_idx = rng_state.device.index
     device_type = rng_state.device.type  # pyrefly: ignore [missing-attribute]
@@ -333,11 +401,18 @@ def _impl_graphsafe_rng(op, *args, rng_state=None, **kwargs):
 
 
 def register_graphsafe_run_with_rng_state_op():
+    # [FUNCTION DOC] Creates and configures the graphsafe_run_with_rng_state higher-order operator
+    # (runs op using a graph-safe generator state passed as the rng_state keyword). Registers
+    # Autograd (deferred error), BackendSelect, fake, proxy and functionalize implementations.
+    # Returns the operator instance.
     class GraphSafeRunWithRngState(HigherOrderOperator):
+        # [CLASS DOC] Higher-order operator wrapper named graphsafe_run_with_rng_state (cacheable).
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the operator with its name and cacheable=True.
             super().__init__("graphsafe_run_with_rng_state", cacheable=True)
 
         def __call__(self, op, *args, rng_state=None, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards the call (op, args, rng_state keyword) to the base class.
             # pyrefly: ignore [missing-attribute]
             return super().__call__(op, *args, rng_state=rng_state, **kwargs)
 
@@ -349,6 +424,8 @@ def register_graphsafe_run_with_rng_state_op():
 
     @graphsafe_run_with_rng_state.py_impl(DispatchKey.BackendSelect)
     def impl_backend_select(op, *args, rng_state=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Infers the device and checks graph-safe RNG support for it
+        # (AssertionError if unsupported), then runs op via _impl_graphsafe_rng.
         from torch._functorch._aot_autograd.utils import supports_graphsafe_rng
 
         device = get_device(args, kwargs)
@@ -361,10 +438,13 @@ def register_graphsafe_run_with_rng_state_op():
 
     @register_fake(graphsafe_run_with_rng_state, skip_cache=True)
     def impl_fake_tensor_mode(op, *args, rng_state=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake tensor implementation; runs op directly, ignoring rng_state.
         return op(*args, **kwargs)
 
     @graphsafe_run_with_rng_state.py_impl(ProxyTorchDispatchMode)
     def impl_proxy_dispatch_mode(mode, op, *args, rng_state=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Proxy tracing implementation: runs the operator with tracing
+        # disabled, records a call_function node (rng_state passed as a keyword), attaches it to outputs.
         with disable_proxy_modes_tracing():
             out = graphsafe_run_with_rng_state(op, *args, rng_state=rng_state, **kwargs)
         proxy_args = pytree.tree_map(mode.tracer.unwrap_proxy, (op, *args))
@@ -378,6 +458,8 @@ def register_graphsafe_run_with_rng_state_op():
 
     @graphsafe_run_with_rng_state.py_functionalize_impl
     def impl_functional(ctx, op, *args, rng_state=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Functionalization implementation: unwraps tensors (rng_state may be
+        # None), redispatches the operator to the next key, and re-wraps the result.
         unwrapped_rng_state = (
             ctx.unwrap_tensors(rng_state) if rng_state is not None else None
         )
@@ -399,6 +481,8 @@ _registered_graphsafe_dispatch_keys: set["DispatchKey"] = set()
 
 
 def register_graphsafe_rng_dispatch(dispatch_key: "DispatchKey") -> None:
+    # [FUNCTION DOC] Registers the graph-safe RNG implementation for a dispatch key on the
+    # graphsafe operator, once per key (idempotent via a module-level set of registered keys).
     """Register graphsafe_run_with_rng_state py_impl for a dispatch key."""
     if dispatch_key in _registered_graphsafe_dispatch_keys:
         return
@@ -431,6 +515,9 @@ torch._library.opaque_object.register_custom_class(
 
 
 def register_run_dtensor_rng_op():
+    # [FUNCTION DOC] Creates and configures the run_dtensor_rng_op higher-order operator (CUDA
+    # only, not cacheable). Registers Autograd (deferred error), CUDA, BackendSelect, fake,
+    # proxy and functionalize implementations. Returns the operator instance.
     """
     Register a higher-order operator for DTensor distributed random operations.
     Takes pre-computed integer offsets (start_offset_incr, end_offset_incr), an op,
@@ -442,7 +529,10 @@ def register_run_dtensor_rng_op():
     """
 
     class RunDTensorRngOp(HigherOrderOperator):
+        # [CLASS DOC] Higher-order operator wrapper named run_dtensor_rng_op; not cacheable
+        # because compiled graphs bake in rank-dependent device and offsets.
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the operator with its name and cacheable=False.
             # Not cacheable: the compiled wrapper bakes in the current device
             # (torch.cuda.set_device(N)) and the rank-dependent start/end offset
             # ints; sharing the cached graph across ranks routes every rank's
@@ -451,6 +541,7 @@ def register_run_dtensor_rng_op():
             super().__init__("run_dtensor_rng_op", cacheable=False)
 
         def __call__(self, start_offset_incr, end_offset_incr, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards the call (both offsets, op, arguments) to the base class.
             # pyrefly: ignore [missing-attribute]
             return super().__call__(
                 start_offset_incr, end_offset_incr, op, *args, **kwargs
@@ -464,6 +555,10 @@ def register_run_dtensor_rng_op():
 
     @run_dtensor_rng_op.py_impl(DispatchKey.CUDA)
     def impl_cuda(start_offset_incr, end_offset_incr, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Reads the CUDA Philox state, advances its offset by
+        # start_offset_incr, runs op in a forked RNG scope on the device of the first argument
+        # (or the current CUDA device), then sets the global CUDA state offset to the old offset
+        # plus end_offset_incr. Mutates the CUDA RNG state; returns op's result.
         from torch.distributed.tensor._random import _PhiloxState
 
         state = _PhiloxState(torch.cuda.get_rng_state())
@@ -487,6 +582,7 @@ def register_run_dtensor_rng_op():
 
     @run_dtensor_rng_op.py_impl(DispatchKey.BackendSelect)
     def impl_backend_select(start_offset_incr, end_offset_incr, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Requires a CUDA device (RuntimeError otherwise) and calls impl_cuda.
         device = get_device(args, kwargs)
         if device != "cuda":
             raise RuntimeError(
@@ -497,12 +593,15 @@ def register_run_dtensor_rng_op():
 
     @register_fake(run_dtensor_rng_op, skip_cache=True)
     def impl_fake_tensor_mode(start_offset_incr, end_offset_incr, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake tensor implementation; runs op directly, ignoring offsets.
         return op(*args, **kwargs)
 
     @run_dtensor_rng_op.py_impl(ProxyTorchDispatchMode)
     def impl_proxy_dispatch_mode(
         mode, start_offset_incr, end_offset_incr, op, *args, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: Proxy tracing implementation: runs the operator with tracing
+        # disabled, records a call_function node including the offsets, attaches it to outputs.
         with disable_proxy_modes_tracing():
             out = run_dtensor_rng_op(
                 start_offset_incr, end_offset_incr, op, *args, **kwargs
@@ -518,6 +617,8 @@ def register_run_dtensor_rng_op():
 
     @run_dtensor_rng_op.py_functionalize_impl
     def impl_functional(ctx, start_offset_incr, end_offset_incr, op, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Functionalization implementation: unwraps tensors, redispatches
+        # the operator to the next key, and re-wraps the result.
         unwrapped_args = ctx.unwrap_tensors(args)
         unwrapped_kwargs = ctx.unwrap_tensors(kwargs)
 
@@ -538,4 +639,5 @@ run_dtensor_rng_op = register_run_dtensor_rng_op()
 
 
 def register_rng_prims():
+    # [FUNCTION DOC] Registers all RNG prims; currently only philox_rand.
     register_philox_rand()
