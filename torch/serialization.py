@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Implements torch.save and torch.load and their support machinery: the zip-based checkpoint
+# format (data pickle plus per-storage records) and the older legacy formats; a registry of
+# location taggers and deserializers that maps storages to and from device tags; map_location
+# handling; endianness, crc32, alignment and mmap configuration accessors; weights_only safe
+# globals management; and the skip_data context manager.
+# Import-time side effects: registers the built-in cpu, cuda, mps, meta, privateuse1, hpu, xpu and
+# mtia taggers and deserializers, registers a pickle reducer for layout objects, and creates the
+# module-level thread-local serialization state.
 import copyreg
 import difflib
 import functools
@@ -87,6 +96,9 @@ else:
 
 
 def _default_to_weights_only(pickle_module):
+    # [FUNCTION DOC] HELPER: Decides the default for weights_only loading. Returns true only when
+    # no custom pickle module was passed and torch is not an internal fbcode build (detected by
+    # the absence of a git_version attribute on the version module). No side effects.
     is_fbcode = not hasattr(torch.version, "git_version")
     return pickle_module is None and not is_fbcode
 
@@ -97,7 +109,13 @@ def _default_to_weights_only(pickle_module):
 # (2) skip_data (needed for torch.Tensor.__reduce_ex__ for skip_data ctx)
 # (3) materialize_fake_tensors (needed for torch.Tensor.__reduce_ex__ for skip_data ctx)
 class _SerializationLocal(threading.local):
+    # [CLASS DOC] HELPER: Thread-local holder of serialization state shared with other modules.
+    # Attributes: map_location (the active load remapping or none), skip_data (flag set by the
+    # skip_data context manager), materialize_fake_tensors (flag set along with it). Each thread
+    # sees its own defaults. A single module-level instance, _serialization_tls, is used.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Runs per thread on first access; sets map_location to none and
+        # both boolean flags to false.
         super().__init__()
         self.map_location: MAP_LOCATION | None = None
         self.skip_data: bool = False
@@ -108,11 +126,16 @@ _serialization_tls = _SerializationLocal()
 
 
 class SourceChangeWarning(Warning):
+    # [CLASS DOC] Warning category for saved module source code that differs from the current
+    # source. Carries no extra state or behavior.
     pass
 
 
 @contextmanager
 def mkdtemp():
+    # [FUNCTION DOC] Context manager that creates a temporary directory, yields its path, and
+    # recursively deletes it on exit even if the body raised. Side effects: filesystem create
+    # and delete.
     path = tempfile.mkdtemp()
     try:
         yield path
@@ -130,12 +153,16 @@ _package_registry: list[
 
 
 class LoadEndianness(Enum):
+    # [CLASS DOC] Enumeration of byte orders used as the fallback when a checkpoint has no byte
+    # order record: NATIVE (1), LITTLE (2), BIG (3).
     NATIVE = 1
     LITTLE = 2
     BIG = 3
 
 
 def get_default_load_endianness() -> LoadEndianness | None:
+    # [FUNCTION DOC] Returns the global fallback byte order for loading checkpoints without a
+    # byte order record, read from the serialization config (none means native order).
     """
     Get fallback byte order for loading files
 
@@ -152,6 +179,8 @@ def get_default_load_endianness() -> LoadEndianness | None:
 
 
 def set_default_load_endianness(endianness):
+    # [FUNCTION DOC] Sets the global fallback byte order in the serialization config. Accepts a
+    # LoadEndianness member or none; any other type raises TypeError. Mutates global config.
     """
     Set fallback byte order for loading files
 
@@ -170,6 +199,8 @@ def set_default_load_endianness(endianness):
 
 
 def get_crc32_options() -> bool:
+    # [FUNCTION DOC] Returns the global flag saying whether save computes CRC32 per record
+    # (default true), read from the serialization config.
     """
     Get whether :func:`torch.save` computes and writes crc32 for each record.
 
@@ -181,6 +212,8 @@ def get_crc32_options() -> bool:
 
 
 def set_crc32_options(compute_crc32: bool):
+    # [FUNCTION DOC] Sets the global flag controlling CRC32 computation during save. Mutates the
+    # serialization config; no validation of the value; returns nothing.
     """
     Set whether :func:`torch.save` computes and writes crc32 for each record.
 
@@ -198,6 +231,8 @@ def set_crc32_options(compute_crc32: bool):
 
 
 def get_default_mmap_options() -> int | None:
+    # [FUNCTION DOC] Returns the global mmap flags used by load when memory mapping is requested
+    # (private mapping by default), read from the serialization config.
     """
     Get default mmap options for :func:`torch.load` with ``mmap=True``.
 
@@ -213,6 +248,8 @@ def get_default_mmap_options() -> int | None:
 
 
 def _get_storage_alignment() -> int:
+    # [FUNCTION DOC] HELPER: Returns the byte alignment for storage records written by save
+    # (default 64), read from the serialization config.
     """
     Gets alignment for storages in torch.save files/
 
@@ -227,6 +264,9 @@ def _get_storage_alignment() -> int:
 
 
 class set_default_mmap_options:
+    # [CLASS DOC] Usable as a plain call or as a context manager. Construction immediately sets
+    # the global default mmap flags; state: prev (the flags before the change). Exiting the
+    # context restores prev. Only the private or shared mapping constants are accepted.
     """
     Context manager or function to set default mmap options for :func:`torch.load` with ``mmap=True`` to flags.
 
@@ -241,6 +281,9 @@ class set_default_mmap_options:
     """
 
     def __init__(self, flags: int) -> None:
+        # [FUNCTION DOC] Records the current global mmap flags in prev and installs flags.
+        # Raises RuntimeError on Windows and ValueError if flags is neither the private nor the
+        # shared mapping constant. Side effect: mutates global config at construction time.
         if IS_WINDOWS:
             raise RuntimeError(
                 "Changing the default mmap options is currently not supported for Windows"
@@ -257,15 +300,19 @@ class set_default_mmap_options:
         config.load.mmap_flags = flags
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] No-op; the new flags were already applied at construction.
         pass
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Restores the global mmap flags saved in prev. Does not suppress errors.
         from torch.utils.serialization import config
 
         config.load.mmap_flags = self.prev
 
 
 def clear_safe_globals() -> None:
+    # [FUNCTION DOC] Empties the user-added allowlist of globals for weights_only unpickling by
+    # delegating to the weights-only unpickler module. Mutates global state.
     """
     Clears the list of globals that are safe for ``weights_only`` load.
     """
@@ -273,6 +320,8 @@ def clear_safe_globals() -> None:
 
 
 def get_safe_globals() -> list[Callable | tuple[Callable, str]]:
+    # [FUNCTION DOC] Returns the user-added allowlisted globals for weights_only loading, as
+    # kept by the weights-only unpickler module.
     """
     Returns the list of user-added globals that are safe for ``weights_only`` load.
     """
@@ -280,6 +329,9 @@ def get_safe_globals() -> list[Callable | tuple[Callable, str]]:
 
 
 def add_safe_globals(safe_globals: list[Callable | tuple[Callable, str]]) -> None:
+    # [FUNCTION DOC] Adds each given function or class (or pair of callable and explicit full
+    # path string) to the weights_only allowlist by delegating to the unpickler module.
+    # Mutates global state; returns nothing.
     """
     Marks the given globals as safe for ``weights_only`` load. For example, functions
     added to this list can be called during unpickling, classes could be instantiated
@@ -316,6 +368,9 @@ def add_safe_globals(safe_globals: list[Callable | tuple[Callable, str]]) -> Non
 
 
 class safe_globals(_weights_only_unpickler._safe_globals):
+    # [CLASS DOC] Context manager that temporarily allowlists the given globals for weights_only
+    # loading. All behavior (adding on enter, removing on exit) is inherited from the unpickler
+    # module's base class; this subclass only supplies the public name and documentation.
     r"""Context-manager that adds certain globals as safe for ``weights_only`` load.
 
     Args:
@@ -341,6 +396,10 @@ class safe_globals(_weights_only_unpickler._safe_globals):
 
 
 def get_unsafe_globals_in_checkpoint(f: FileLike) -> list[str]:
+    # [FUNCTION DOC] Statically scans the pickle record of a zip-format checkpoint and returns
+    # the global names it references that are neither default-allowlisted nor user-allowlisted.
+    # Raises ValueError if the input is not a zip file or is a TorchScript archive. Opens and
+    # reads the file; no execution of the pickle. Order of the result is unspecified.
     """Returns a list of strings of functions/classes in a ``torch.save`` object that are not safe for ``weights_only``.
 
     For a given function or class ``f``, the corresponding string will be of the form
@@ -383,6 +442,10 @@ def get_unsafe_globals_in_checkpoint(f: FileLike) -> list[str]:
 
 
 class skip_data:
+    # [CLASS DOC] Context manager that makes save write empty space instead of storage bytes and
+    # makes load leave storages unpopulated. State: materialize_fake_tensors, plus the previous
+    # thread-local flag values saved on enter and restored on exit. Uses the module's thread-local
+    # state, so it affects only the current thread.
     """
     Context-manager that skips writing/reading storage bytes for ``torch.save`` / ``torch.load`` calls.
 
@@ -410,9 +473,14 @@ class skip_data:
     """
 
     def __init__(self, materialize_fake_tensors: bool = False):
+        # [FUNCTION DOC] Stores the materialize_fake_tensors option; no global side effects yet.
         self.materialize_fake_tensors = materialize_fake_tensors
 
     def __enter__(self):
+        # [FUNCTION DOC] Saves the current thread-local skip_data and materialize flags on the
+        # instance, then sets skip_data true and materialize to the configured value.
+        # KNOWN ISSUE: saved flags live on the instance, so re-entering the same instance while
+        # active overwrites them and exit would restore the wrong values.
         global _serialization_tls
         self._old_skip_data = _serialization_tls.skip_data
         self._old_materialize_fake_tensors = _serialization_tls.materialize_fake_tensors
@@ -420,12 +488,15 @@ class skip_data:
         _serialization_tls.materialize_fake_tensors = self.materialize_fake_tensors
 
     def __exit__(self, type, value, tb):
+        # [FUNCTION DOC] Restores the thread-local flags saved by enter; exceptions propagate.
         global _serialization_tls
         _serialization_tls.skip_data = self._old_skip_data
         _serialization_tls.materialize_fake_tensors = self._old_materialize_fake_tensors
 
 
 def _is_zipfile(f) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the stream starts, at its current position, with the
+    # zip local-file header magic bytes. Reads a few bytes then seeks back to the start position.
     # This is a stricter implementation than zipfile.is_zipfile().
     # zipfile.is_zipfile() is True if the magic number appears anywhere in the
     # binary. Since we expect the files here to be generated by torch.save or
@@ -446,6 +517,10 @@ def register_package(
     tagger: Callable[[STORAGE], str | None],
     deserializer: Callable[[STORAGE, str], STORAGE | None],
 ):
+    # [FUNCTION DOC] Appends a (priority, tagger, deserializer) entry to the module registry and
+    # re-sorts it so lower priority numbers come first. Taggers map a storage to a location
+    # string or none; deserializers map a storage and location to a storage or none. Mutates
+    # global state; returns nothing.
     """
     Registers callables for tagging and deserializing storage objects with an associated priority.
     Tagging associates a device with a storage object at save time while deserializing moves a
@@ -491,6 +566,11 @@ def check_module_version_greater_or_equal(
     req_version_tuple,
     error_if_malformed=True,
 ):
+    # [FUNCTION DOC] Compares a module's dotted version string to a required tuple, converting
+    # each leading field to the type of the corresponding required field. Returns true if the
+    # module version is at least the requirement. If parsing fails: raises RuntimeError when
+    # error_if_malformed, otherwise warns and returns true.
+    # KNOWN ISSUE: the docstring says "error and exit" but the code raises RuntimeError.
     """
     Check if a module's version satisfies requirements
 
@@ -534,21 +614,28 @@ def check_module_version_greater_or_equal(
 
 
 def _cpu_tag(obj):
+    # [FUNCTION DOC] HELPER: Tagger returning the cpu location string for cpu storages, else none.
     if obj.device.type == "cpu":
         return "cpu"
 
 
 def _mps_tag(obj):
+    # [FUNCTION DOC] HELPER: Tagger returning the mps location string for mps storages, else none.
     if obj.device.type == "mps":
         return "mps"
 
 
 def _meta_tag(obj):
+    # [FUNCTION DOC] HELPER: Tagger returning the meta location string for meta storages, else
+    # none.
     if obj.device.type == "meta":
         return "meta"
 
 
 def _backend_tag(backend_name, obj):
+    # [FUNCTION DOC] HELPER: Tagger for an accelerator backend. Resolves the privateuse1 alias to
+    # the registered custom backend name, then returns the bare name, or name plus colon and
+    # index when the storage device has an index, if the storage is on that backend; else none.
     if backend_name == "privateuse1":
         backend_name = torch._C._get_privateuse1_backend_name()
     if obj.device.type == backend_name:
@@ -559,21 +646,28 @@ def _backend_tag(backend_name, obj):
 
 
 def _cpu_deserialize(obj, location):
+    # [FUNCTION DOC] HELPER: Returns the storage unchanged if location is exactly cpu, else none.
     if location == "cpu":
         return obj
 
 
 def _mps_deserialize(obj, location):
+    # [FUNCTION DOC] HELPER: If location starts with mps, returns the storage moved to mps; else
+    # none.
     if location.startswith("mps"):
         return obj.mps()
 
 
 def _meta_deserialize(obj, location):
+    # [FUNCTION DOC] HELPER: If location is meta, returns a new data-less meta storage of the same
+    # byte size (the input contents are dropped); else none.
     if location == "meta":
         return torch.UntypedStorage(obj.nbytes(), device="meta")
 
 
 def _is_meta_location(map_location):
+    # [FUNCTION DOC] HELPER: Returns true only if map_location is the string meta or a device of
+    # type meta. None, dicts and callables yield false since the target cannot be known cheaply.
     """
     Check if map_location specifies the meta device.
 
@@ -599,6 +693,10 @@ def _is_meta_location(map_location):
 
 
 def _validate_device(location, backend_name):
+    # [FUNCTION DOC] HELPER: Validates that a location string names a usable device of a backend
+    # and returns a device object. Raises RuntimeError if the backend module is not registered
+    # on torch, reports unavailable, or the device index is not below the device count. Index
+    # comes from the backend utils helper when present, else from parsing the location (default 0).
     """
     Check whether the device index of specified backend is valid
 
@@ -651,14 +749,22 @@ def _validate_device(location, backend_name):
 
 
 def validate_cuda_device(location):
+    # [FUNCTION DOC] Validates a cuda location string and returns its integer device index.
+    # Raises RuntimeError per the shared device validation.
     return _validate_device(location, "cuda").index
 
 
 def validate_hpu_device(location):
+    # [FUNCTION DOC] Validates an hpu location string and returns its integer device index.
+    # Raises RuntimeError per the shared device validation.
     return _validate_device(location, "hpu").index
 
 
 def _deserialize(backend_name, obj, location):
+    # [FUNCTION DOC] HELPER: Generic deserializer for an accelerator backend. Resolves the
+    # privateuse1 alias; if location starts with the backend name (optionally followed by an
+    # index), validates the device and returns the storage moved there; otherwise returns none.
+    # Raises RuntimeError from device validation.
     if backend_name == "privateuse1":
         backend_name = torch._C._get_privateuse1_backend_name()
     if location == backend_name or bool(
@@ -701,6 +807,8 @@ register_package(
 def location_tag(
     storage: Storage | torch.storage.TypedStorage | torch.UntypedStorage,
 ):
+    # [FUNCTION DOC] Returns the location tag of a storage using the first registered tagger (in
+    # priority order) that gives a truthy result. Raises RuntimeError if none can tag it.
     for _, tagger, _ in _package_registry:
         location = tagger(storage)
         if location:
@@ -711,6 +819,8 @@ def location_tag(
 
 
 def default_restore_location(storage, location):
+    # [FUNCTION DOC] Tries registered deserializers in priority order and returns the first
+    # non-none result for the storage and location tag. Raises RuntimeError if none succeeds.
     """
     Restores `storage` using a deserializer function registered for the `location`.
 
@@ -744,16 +854,21 @@ def default_restore_location(storage, location):
 
 
 def normalize_storage_type(storage_type):
+    # [FUNCTION DOC] Maps a storage class to the same-named class exposed on the torch package.
+    # Raises AttributeError if torch has no such attribute.
     return getattr(torch, storage_type.__name__)
 
 
 def storage_to_tensor_type(storage):
+    # [FUNCTION DOC] Maps a storage instance to the matching tensor class by importing the
+    # storage type's module and replacing Storage with Tensor in the class name.
     storage_type = type(storage)
     module = _import_dotted_name(storage_type.__module__)
     return getattr(module, storage_type.__name__.replace("Storage", "Tensor"))
 
 
 def _is_path(name_or_buffer: object) -> TypeIs[str | os.PathLike]:
+    # [FUNCTION DOC] HELPER: Returns true if the argument is a string or path-like object.
     return isinstance(name_or_buffer, (str, os.PathLike))
 
 
@@ -761,36 +876,55 @@ T = TypeVar("T")
 
 
 class _opener(Generic[T]):
+    # [CLASS DOC] HELPER: Minimal context-manager base wrapping a file-like object. State:
+    # file_like (the wrapped object). Entering yields file_like; exit does nothing by default.
+    # Subclasses override exit to close, flush or finalize.
     def __init__(self, file_like: T) -> None:
+        # [FUNCTION DOC] HELPER: Stores the wrapped object in file_like.
         self.file_like: T = file_like
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Returns the wrapped object.
         return self.file_like
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] HELPER: No-op; exceptions propagate.
         pass
 
 
 class _open_file(_opener[IO[bytes]]):
+    # [CLASS DOC] HELPER: Opener that opens a file path in the given mode and closes it on exit.
     def __init__(self, name: str | os.PathLike[str], mode: str) -> None:
+        # [FUNCTION DOC] HELPER: Opens the path with the given mode and wraps the handle.
+        # Raises the usual OS errors if the file cannot be opened.
         super().__init__(open(name, mode))  # noqa: SIM115
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] HELPER: Closes the wrapped file handle.
         self.file_like.close()
 
 
 class _open_buffer_reader(_opener[IO[bytes]]):
+    # [CLASS DOC] HELPER: Opener for a caller-owned readable buffer; it is not closed on exit
+    # and must support seek and tell.
     def __init__(self, buffer: IO[bytes]) -> None:
+        # [FUNCTION DOC] HELPER: Wraps the buffer and verifies it is seekable; the check
+        # raises an error with a hint to pre-load data into an in-memory buffer if not.
         super().__init__(buffer)
         _check_seekable(buffer)
 
 
 class _open_buffer_writer(_opener[IO[bytes]]):
+    # [CLASS DOC] HELPER: Opener for a caller-owned writable buffer; flushes but never closes it.
     def __exit__(self, *args):
+        # [FUNCTION DOC] HELPER: Flushes the wrapped buffer.
         self.file_like.flush()
 
 
 def _open_file_like(name_or_buffer: FileLike, mode: str) -> _opener[IO[bytes]]:
+    # [FUNCTION DOC] HELPER: Chooses an opener: a path gives a file opener; a buffer gives a
+    # writer opener if the mode has w, a reader opener if it has r (w is checked first).
+    # Raises RuntimeError if the mode has neither letter and the input is not a path.
     if _is_path(name_or_buffer):
         return _open_file(name_or_buffer, mode)
     else:
@@ -803,12 +937,20 @@ def _open_file_like(name_or_buffer: FileLike, mode: str) -> _opener[IO[bytes]]:
 
 
 class _open_zipfile_reader(_opener[torch._C.PyTorchFileReader]):
+    # [CLASS DOC] HELPER: Opener wrapping a native zip-format checkpoint reader.
     def __init__(self, name_or_buffer: str | IO[bytes]) -> None:
+        # [FUNCTION DOC] HELPER: Creates the native reader from a path or buffer and wraps it.
         super().__init__(torch._C.PyTorchFileReader(name_or_buffer))
 
 
 class _open_zipfile_writer_file(_opener[torch._C.PyTorchFileWriter]):
+    # [CLASS DOC] HELPER: Opener wrapping a native zip checkpoint writer targeting a file path.
+    # State: name, and file_stream (a Python-opened handle used only for non-ASCII paths, else
+    # none). On exit it finalizes the archive and closes the handle if it owns one.
     def __init__(self, name: str) -> None:
+        # [FUNCTION DOC] HELPER: Creates the native writer with the current crc32 option and
+        # storage alignment. ASCII paths are given to the writer directly; non-ASCII paths are
+        # opened by Python in binary write mode and the stream is passed instead. Creates a file.
         self.file_stream = None
         self.name = name
         try:
@@ -831,13 +973,20 @@ class _open_zipfile_writer_file(_opener[torch._C.PyTorchFileWriter]):
             )
 
     def __exit__(self, *args) -> None:
+        # [FUNCTION DOC] HELPER: Writes the archive trailer, then closes the owned stream if any.
+        # Also runs when the body raised, so a partial archive may be finalized.
         self.file_like.write_end_of_file()
         if self.file_stream is not None:
             self.file_stream.close()
 
 
 class _open_zipfile_writer_buffer(_opener[torch._C.PyTorchFileWriter]):
+    # [CLASS DOC] HELPER: Opener wrapping a native zip checkpoint writer that writes into a
+    # caller-owned buffer. State: buffer. On exit it finalizes the archive and flushes the buffer.
     def __init__(self, buffer: IO[bytes]) -> None:
+        # [FUNCTION DOC] HELPER: Requires the buffer to have a callable write method: raises
+        # AttributeError if write is missing, TypeError if present but not callable. Then creates
+        # the native writer with the current crc32 option and storage alignment.
         if not callable(getattr(buffer, "write", None)):
             msg = f"Buffer of {str(type(buffer)).strip('<>')} has no callable attribute 'write'"
             if not hasattr(buffer, "write"):
@@ -851,11 +1000,14 @@ class _open_zipfile_writer_buffer(_opener[torch._C.PyTorchFileWriter]):
         )
 
     def __exit__(self, *args) -> None:
+        # [FUNCTION DOC] HELPER: Writes the archive trailer, then flushes the buffer.
         self.file_like.write_end_of_file()
         self.buffer.flush()
 
 
 def _open_zipfile_writer(name_or_buffer: str | IO[bytes]) -> _opener:
+    # [FUNCTION DOC] HELPER: Returns a zip writer opener: file-based for a string or path-like
+    # input, buffer-based otherwise.
     container: type[_opener]
     if _is_path(name_or_buffer):
         container = _open_zipfile_writer_file
@@ -865,6 +1017,8 @@ def _open_zipfile_writer(name_or_buffer: str | IO[bytes]) -> _opener:
 
 
 def _is_compressed_file(f) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the object's defining module is in a short list of
+    # compression modules (only gzip); false if it has no module attribute.
     compress_modules = ["gzip"]
     try:
         return f.__module__ in compress_modules
@@ -873,6 +1027,8 @@ def _is_compressed_file(f) -> bool:
 
 
 def _should_read_directly(f):
+    # [FUNCTION DOC] HELPER: Returns true if f is backed by a real file descriptor (non-negative
+    # file number) and is not compressed; false if it is compressed or has no usable descriptor.
     """
     Checks if f is a file that should be read directly. It should be read
     directly if it is backed by a real file (has a fileno) and is not
@@ -889,7 +1045,13 @@ def _should_read_directly(f):
 
 
 def _check_seekable(f) -> bool:
+    # [FUNCTION DOC] HELPER: Verifies f supports seek and tell by seeking to its current position.
+    # Returns true on success. On an unsupported-operation or missing-attribute error, the error
+    # is re-raised (with an explanatory hint appended if its text mentions seek or tell).
+    # KNOWN ISSUE: the final return of false is unreachable since the error path always raises.
     def raise_err_msg(patterns, e):
+        # [FUNCTION DOC] HELPER: Raises a new error of the same type with a hint appended when
+        # the original message contains any pattern; otherwise re-raises the original error.
         for p in patterns:
             if p in str(e):
                 msg = (
@@ -910,6 +1072,8 @@ def _check_seekable(f) -> bool:
 
 
 def _check_dill_version(pickle_module) -> None:
+    # [FUNCTION DOC] HELPER: If the pickle module is dill, requires version 0.3.1 or newer and
+    # raises ValueError otherwise. A malformed version string only warns. No-op for other modules.
     """Checks if using dill as the pickle module, and if so, checks if it is the correct version.
     If dill version is lower than 0.3.1, a ValueError is raised.
 
@@ -934,6 +1098,8 @@ def _check_dill_version(pickle_module) -> None:
 
 
 def _check_save_filelike(f):
+    # [FUNCTION DOC] HELPER: Raises AttributeError unless f is a string, path-like, or has a
+    # write attribute.
     if not _is_path(f) and not hasattr(f, "write"):
         raise AttributeError(
             "expected 'f' to be string, path, or a file-like object with "
@@ -949,6 +1115,11 @@ def save(
     _use_new_zipfile_serialization: bool = True,
     _disable_byteorder_record: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Public save: writes obj to a path or writable file-like object. Logs API
+    # usage, checks dill version and the target, converts path-likes to strings. With the new zip
+    # format (default) it writes via the zip writer and the internal save routine; otherwise it
+    # uses the legacy format, raising RuntimeError if skip_data is active. Raises AttributeError
+    # for an invalid target. Side effects: creates or writes the file or buffer.
     # Reference: https://github.com/pytorch/pytorch/issues/54354
     # The first line of this docstring overrides the one Sphinx generates for the
     # documentation. We need it so that Sphinx doesn't leak `pickle`s path from
@@ -1019,6 +1190,13 @@ def save(
 
 
 def _legacy_save(obj, f, pickle_module, pickle_protocol) -> None:
+    # [FUNCTION DOC] HELPER: Writes the old non-zip format to the open file f: a magic number,
+    # protocol version and system info record, then the pickled object (storages and nn.Module
+    # classes replaced by persistent ids), the sorted list of storage keys, then each storage's
+    # raw bytes. Raises RuntimeError if one storage is saved under two dtypes and TypeError for
+    # unrecognized storage types. Flushes f.
+    # KNOWN ISSUE: the view check compares a storage's address with itself, so it is always false
+    # and view metadata is never produced.
     import torch.nn as nn
 
     serialized_container_types = {}
@@ -1031,6 +1209,11 @@ def _legacy_save(obj, f, pickle_module, pickle_protocol) -> None:
     storage_dtypes: dict[int, torch.dtype] = {}
 
     def persistent_id(obj: Any) -> tuple | None:
+        # [FUNCTION DOC] HELPER: Pickler hook. For an nn.Module subclass seen the first time,
+        # returns a module record with its source file and source text (warning if the source
+        # cannot be read). For a storage, records it for later writing and returns a storage
+        # record (type, key, location, element count, view info); raises RuntimeError on dtype
+        # conflicts. Returns none for all other objects.
         # FIXME: the docs say that persistent_id should only return a string
         # but torch store returns tuples. This works only in the binary protocol
         # see
@@ -1161,7 +1344,9 @@ def _legacy_save(obj, f, pickle_module, pickle_protocol) -> None:
     pickle_module.dump(sys_info, f, protocol=pickle_protocol)
 
     class PyTorchLegacyPickler(pickle_module.Pickler):
+        # [CLASS DOC] HELPER: Pickler subclass whose persistent id hook defers to the closure.
         def persistent_id(self, obj):
+            # [FUNCTION DOC] HELPER: Delegates to the enclosing persistent_id closure.
             return persistent_id(obj)  # noqa: F821
 
     pickler = PyTorchLegacyPickler(f, protocol=pickle_protocol)
@@ -1187,6 +1372,12 @@ def _save(
     pickle_protocol,
     _disable_byteorder_record,
 ):
+    # [FUNCTION DOC] HELPER: Writes obj into an open zip writer. Pickles obj to memory with
+    # storages replaced by persistent ids, writes the data record, a format version record, a
+    # storage alignment record and (unless disabled) a byte order record, then one record per
+    # storage keyed by its id. Under skip_data only record metadata is written; non-CPU storages
+    # are copied to CPU (via pinned memory when configured) first. Raises RuntimeError if one
+    # storage is saved under two dtypes and ValueError for unknown host endianness.
     serialized_storages: dict[str, torch.storage.UntypedStorage] = {}
     id_map: dict[int, str] = {}
 
@@ -1197,6 +1388,11 @@ def _save(
     storage_dtypes: dict[int, torch.dtype] = {}
 
     def persistent_id(obj):
+        # [FUNCTION DOC] HELPER: Pickler hook. For a storage, checks dtype consistency per data
+        # address (raises RuntimeError on conflict, skipped for meta or unallocated storages),
+        # assigns a sequential string key per distinct storage, picks its location (fake device
+        # if set, else the registered tag), records it for writing and returns a storage record
+        # of type, key, location and element count. Returns none for other objects.
         # FIXME: the docs say that persistent_id should only return a string
         # but torch store returns tuples. This works only in the binary protocol
         # see
@@ -1246,7 +1442,9 @@ def _save(
     data_buf = io.BytesIO()
 
     class PyTorchPickler(pickle_module.Pickler):  # type: ignore[name-defined]
+        # [CLASS DOC] HELPER: Pickler subclass whose persistent id hook defers to the closure.
         def persistent_id(self, obj):
+            # [FUNCTION DOC] HELPER: Delegates to the enclosing persistent_id closure.
             return persistent_id(obj)  # noqa: F821
 
     pickler = PyTorchPickler(data_buf, protocol=pickle_protocol)
@@ -1321,6 +1519,17 @@ def load(
     mmap: bool | None = None,
     **pickle_load_args: Any,
 ) -> Any:
+    # [FUNCTION DOC] Public load: reads an object saved by save from a path or readable seekable
+    # file-like object. Resolves weights_only (explicit argument, else a default, overridden by
+    # the force environment variables; setting both variables raises RuntimeError). An explicit
+    # pickle module with weights_only raises RuntimeError. Paths ending in the safetensors
+    # suffix go to the safetensors library (RuntimeError if missing or if map_location is a
+    # mapping or callable). Otherwise dispatches to zip-format, TorchScript-archive (refused
+    # under weights_only) or legacy loading, honoring map_location and mmap (mmap needs a path
+    # and zip format, else ValueError or RuntimeError). Weights-only unpickling errors are
+    # re-raised with guidance text. Side effects: file reads, optional mmap, warnings, usage log.
+    # KNOWN ISSUE: for safetensors, a bytes map_location is converted with a string conversion
+    # of the bytes object, yielding a device name with a bytes-literal wrapper.
     # Reference: https://github.com/pytorch/pytorch/issues/54354
     # The first line of this docstring overrides the one Sphinx generates for the
     # documentation. We need it so that Sphinx doesn't leak `pickle`s path from
@@ -1448,6 +1657,10 @@ def load(
     )
 
     def _get_wo_message(message: str) -> str:
+        # [FUNCTION DOC] HELPER: Builds the user-facing error text for a weights-only failure by
+        # classifying the unpickler message (disallowed global, blocked module, or missing
+        # import) and prefixing explanations and options, then appending a docs pointer
+        # (the missing-import case returns earlier without the docs pointer).
         unsafe_global_pattern = r"GLOBAL (\S+) was not an allowed global by default."
         has_unsafe_global = re.search(unsafe_global_pattern, message) is not None
         blocklist_pattern = r"whose module (\S+) is blocked"
@@ -1650,6 +1863,9 @@ def load(
 # Register pickling support for layout instances such as
 # torch.sparse_coo, etc
 def _get_layout(name):
+    # [FUNCTION DOC] HELPER: Maps a layout's string form to the layout object, using a lazily
+    # filled cache built from all layout values found in the torch namespace. Raises KeyError
+    # for an unknown name. Used as the unpickling factory registered for layout objects.
     """Get layout extension object from its string representation."""
     cache = _get_layout.cache  # type: ignore[attr-defined]
     if not cache:
@@ -1672,12 +1888,23 @@ def _legacy_load(
     weights_only=False,
     **pickle_load_args,
 ):
+    # [FUNCTION DOC] HELPER: Loads the legacy (pre-zip) formats from an open seekable file. If
+    # the file is at offset zero and has a real descriptor, first tries the older tar layout; a
+    # tar failure on a zip archive raises RuntimeError suggesting the TorchScript loader. Else
+    # reads and checks the magic number and protocol version (RuntimeError on mismatch), the
+    # system info record, unpickles the object (storages via persistent load), then reads raw
+    # storage bytes for each listed key. Refuses the weights-only unpickler for tar files.
+    # Validates sparse tensors at the end. Returns the loaded object.
     deserialized_objects: dict[int, Any] = {}
 
     restore_location = _get_restore_location(map_location)
 
     class UnpicklerWrapper(pickle_module.Unpickler):  # type: ignore[name-defined]
+        # [CLASS DOC] HELPER: Unpickler that resolves storage class names to dtype-carrying
+        # placeholder types instead of importing them.
         def find_class(self, mod_name, name):
+            # [FUNCTION DOC] HELPER: For names containing Storage, returns a storage type
+            # placeholder if the name is recognized; otherwise defers to the base lookup.
             if type(name) is str and "Storage" in name:
                 try:
                     return StorageType(name)
@@ -1686,6 +1913,11 @@ def _legacy_load(
             return super().find_class(mod_name, name)
 
     def _check_container_source(container_type, source_file, original_source):
+        # [FUNCTION DOC] HELPER: Compares the saved source of a module class with its current
+        # source and emits a SourceChangeWarning if different. If the class asks for patch
+        # dumping, writes a reverse patch file in the working directory (or reports that it
+        # could not). Warns instead if the current source is unavailable. Side effects: warnings,
+        # possible file creation.
         try:
             current_source = "".join(get_source_lines_and_file(container_type)[0])
         except Exception:  # saving the source is optional, so we can ignore any errors
@@ -1738,9 +1970,15 @@ def _legacy_load(
             warnings.warn(msg, SourceChangeWarning, stacklevel=2)
 
     def legacy_load(f):
+        # [FUNCTION DOC] HELPER: Reads the tar-based legacy layout: extracts storages and tensors
+        # records into a temporary directory, rebuilds storages and tensors, then unpickles the
+        # object from the pickle member. Raises RuntimeError if the weights-only unpickler is
+        # in use. Side effects: temporary files; may raise tar errors for non-tar input.
         deserialized_objects: dict[int, Any] = {}
 
         def persistent_load(saved_id):
+            # [FUNCTION DOC] HELPER: Resolves persistent ids: a tuple means a module class (after
+            # a source check if sources were saved); otherwise looks up the rebuilt object by key.
             if isinstance(saved_id, tuple):
                 # Ignore containers that don't have any sources saved
                 if all(saved_id[1:]):
@@ -1818,6 +2056,11 @@ def _legacy_load(
     deserialized_objects = {}
 
     def persistent_load(saved_id):
+        # [FUNCTION DOC] HELPER: Resolves persistent ids of the non-tar legacy format. A module
+        # record returns the class (after a source check when sources exist). A storage record
+        # returns a typed storage, creating it once per root key (meta under fake mode, plain or
+        # uninitialized-flagged otherwise, relocated via map_location) and optionally a view of it.
+        # Raises AssertionError for non-tuple ids and RuntimeError for unknown record types.
         if not isinstance(saved_id, tuple):
             raise AssertionError(
                 f"saved_id must be a tuple, got {type(saved_id).__name__}"
@@ -1938,6 +2181,8 @@ def _legacy_load(
 
 
 def _maybe_decode_ascii(bytes_str: bytes | str) -> str:
+    # [FUNCTION DOC] HELPER: Decodes bytes as ASCII, returns strings unchanged. Used for internal
+    # keys that may load as bytes when a bytes encoding was requested.
     # When using encoding='bytes' in Py3, some **internal** keys stored as
     # strings in Py2 are loaded as bytes. This function decodes them with
     # ascii encoding, one that Py3 uses by default.
@@ -1950,27 +2195,37 @@ def _maybe_decode_ascii(bytes_str: bytes | str) -> str:
 
 
 def _get_restore_location(map_location):
+    # [FUNCTION DOC] HELPER: Builds the function used to relocate each loaded storage, based on
+    # map_location: none uses the default restore; a mapping renames the saved location tag
+    # first; a string or device forces one target for every storage; any other value is called
+    # with the storage and tag and may return none to fall back to the default restore.
     if map_location is None:
         restore_location = default_restore_location
     elif isinstance(map_location, dict):
 
         def restore_location(storage, location):
+            # [FUNCTION DOC] HELPER: Remaps the tag through the mapping (unmapped tags stay) and
+            # restores the storage there.
             location = map_location.get(location, location)
             return default_restore_location(storage, location)
 
     elif isinstance(map_location, (str, bytes)):
 
         def restore_location(storage, location):
+            # [FUNCTION DOC] HELPER: Ignores the saved tag; restores onto the fixed target.
             return default_restore_location(storage, map_location)
 
     elif isinstance(map_location, torch.device):
 
         def restore_location(storage, location):
+            # [FUNCTION DOC] HELPER: Ignores the saved tag; restores onto the fixed device.
             return default_restore_location(storage, str(map_location))
 
     else:
 
         def restore_location(storage, location):
+            # [FUNCTION DOC] HELPER: Calls the user callable; if it returns none, falls back to
+            # the default restore for the saved tag.
             result = map_location(storage, location)
             if result is None:
                 result = default_restore_location(storage, location)
@@ -1980,14 +2235,20 @@ def _get_restore_location(map_location):
 
 
 class StorageType:
+    # [CLASS DOC] Lightweight placeholder for a pickled storage class name. State: _dtype, the
+    # element dtype derived from the name. Used by unpicklers in place of real storage classes.
     def __init__(self, name):
+        # [FUNCTION DOC] Derives the dtype from the pickled storage type name; raises KeyError
+        # for an unrecognized name.
         self._dtype = _get_dtype_from_pickle_storage_type(name)
 
     @property
     def dtype(self):
+        # [FUNCTION DOC] Returns the element dtype of this storage type.
         return self._dtype
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a readable string showing the dtype.
         return f"StorageType(dtype={self.dtype})"
 
 
@@ -2001,6 +2262,15 @@ def _load(
     weights_only=False,
     **pickle_load_args,
 ):
+    # [FUNCTION DOC] HELPER: Loads the zip-format checkpoint from an open reader. Determines the
+    # byte order (record, else configured fallback; ValueError if unknown), storage alignment and
+    # whether storage offsets can be computed; warns for big-endian hosts with no record and
+    # no configured default. Unpickles the pickle record with storage ids resolved by reading
+    # each storage (meta, skipped, mmap slice, or read from the archive; byte-swapped if needed;
+    # relocated via map_location). Temporarily publishes map_location in thread-local state,
+    # validates sparse tensors, logs metadata and returns the object.
+    # KNOWN ISSUE: the thread-local map_location is cleared only on success, so a failing unpickle
+    # leaves it set.
     restore_location = _get_restore_location(map_location)
 
     loaded_storages = {}
@@ -2064,6 +2334,11 @@ def _load(
     offsets: dict[str, int] = dict()
 
     def _get_offset(key, name, numel):
+        # [FUNCTION DOC] HELPER: Returns the byte offset of a storage record's data inside the
+        # archive without reading it, caching results by record name. The first call (key must be
+        # zero, else AssertionError) asks the reader; later calls compute from the running offset
+        # of the next header, then advance it by the data size plus a data descriptor (larger
+        # form for 64-bit sizes). Depends on the writer's layout. Mutates the running offset.
         """
         Return the offset of the storage associated with key with record name `name` and size numel.
         It is expected that the zipfile header of this storage starts at current_offset.
@@ -2111,6 +2386,11 @@ def _load(
         return storage_offset
 
     def load_tensor(dtype, nbytes, key, location):
+        # [FUNCTION DOC] HELPER: Materializes one storage record as a typed storage. Chooses the
+        # source: a meta storage (fake mode or meta target), an empty one (skip_data), a slice of
+        # the mapped file, or data read from the archive; byte-swaps if the file endianness
+        # differs from the host; relocates it (or tags a fake device under fake mode). Caches it
+        # by key when it holds data. Raises RuntimeError if debug offset checks disagree.
         name = f"data/{key}"
         if torch._guards.detect_fake_mode(None) is not None or is_meta_map_location:
             storage = torch.UntypedStorage(nbytes, device="meta")
@@ -2181,6 +2461,10 @@ def _load(
         return typed_storage
 
     def persistent_load(saved_id):
+        # [FUNCTION DOC] HELPER: Resolves a storage persistent id (type, key, location, element
+        # count) to a typed storage, reusing a cached one for the same key or loading it.
+        # Untyped storage records use a byte dtype. Raises AssertionError for non-tuple ids or
+        # record kinds other than storage.
         if not isinstance(saved_id, tuple):
             raise AssertionError(
                 f"saved_id must be a tuple, got {type(saved_id).__name__}"
@@ -2217,10 +2501,14 @@ def _load(
     # because it's marked readonly in pickle.
     # The type: ignore is because mypy can't statically determine the type of this class.
     class UnpicklerWrapper(pickle_module.Unpickler):  # type: ignore[name-defined]
+        # [CLASS DOC] HELPER: Unpickler that maps storage class names to dtype placeholders and
+        # rewrites legacy module paths using a small mapping for backward compatibility.
         # from https://stackoverflow.com/questions/13398462/unpickling-python-objects-with-a-changed-module-path/13405732
         # Lets us override the imports that pickle uses when unpickling an object.
         # This is useful for maintaining BC if we change a module path that tensor instantiation relies on.
         def find_class(self, mod_name, name):
+            # [FUNCTION DOC] HELPER: Returns a storage placeholder for recognized storage names;
+            # otherwise remaps the module path via the mapping and defers to the base lookup.
             if type(name) is str and "Storage" in name:
                 try:
                     return StorageType(name)
@@ -2249,4 +2537,6 @@ def _load(
 
 
 def _is_torchscript_zip(zip_file):
+    # [FUNCTION DOC] HELPER: Returns true if the archive has a constants record, which marks a
+    # TorchScript archive rather than a torch.save checkpoint.
     return "constants.pkl" in zip_file.get_all_records()

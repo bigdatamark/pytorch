@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Window functions for signal processing (exponential, cosine, gaussian, kaiser, hamming, hann,
+# blackman, bartlett, nuttall, general_cosine, general_hamming). Each returns a 1-D tensor of
+# length M, either symmetric (filter design) or periodic (spectral analysis). Only strided
+# layout and float32/float64 dtypes are supported. Also defines the shared docstring argument
+# table window_common_args and the decorator that attaches formatted docstrings.
+# Import-time side effects: builds window_common_args and sets __doc__ on every public function.
 from collections.abc import Callable, Iterable
 from math import sqrt
 from typing import TypeVar
@@ -42,6 +49,9 @@ window_common_args = merge_dicts(
 
 
 def _add_docstr(*args: str) -> Callable[[_T], _T]:
+    # [FUNCTION DOC] HELPER: Decorator factory. Takes docstring fragments, returns a decorator that
+    # joins the fragments into one string, assigns it as the decorated object's __doc__ (mutation),
+    # and returns the same object unchanged otherwise.
     r"""Adds docstrings to a given decorated function.
 
     Specially useful when the docstrings need string interpolation, e.g., with
@@ -54,6 +64,7 @@ def _add_docstr(*args: str) -> Callable[[_T], _T]:
     """
 
     def decorator(o: _T) -> _T:
+        # [FUNCTION DOC] HELPER: Sets the joined docstring on o and returns o.
         o.__doc__ = "".join(args)
         return o
 
@@ -63,6 +74,9 @@ def _add_docstr(*args: str) -> Callable[[_T], _T]:
 def _window_function_checks(
     function_name: str, M: int, dtype: torch.dtype, layout: torch.layout
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validates window arguments shared by all windows. Raises ValueError if
+    # M is negative, if layout is not strided, or if dtype is not float32 or float64; the message
+    # starts with function_name. Returns nothing and has no side effects.
     r"""Performs common checks for all the defined windows.
     This function should be called before computing any window.
 
@@ -141,6 +155,11 @@ def exponential(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Exponential (Poisson) window of length M: exp(-|n - center| / tau) sampled at
+    # integer points. center defaults to the middle of the window (shifted for periodic windows);
+    # tau is the decay constant. Defaults dtype to the global default dtype. Returns a 1-D tensor
+    # (empty if M is 0). Raises ValueError for invalid M/layout/dtype, non-positive tau, or when
+    # center is given with sym=True.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -225,6 +244,9 @@ def cosine(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Cosine (sine) window of length M: a half sine wave sampled at half-integer
+    # offsets, matching SciPy. sym selects symmetric versus periodic spacing. Returns a 1-D
+    # tensor (empty if M is 0). Raises ValueError for invalid M, layout or dtype.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -299,6 +321,9 @@ def gaussian(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Gaussian window of length M with standard deviation std, centered in the
+    # window, peak value 1. sym selects symmetric versus periodic spacing. Returns a 1-D tensor
+    # (empty if M is 0). Raises ValueError for invalid M/layout/dtype or non-positive std.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -378,6 +403,10 @@ def kaiser(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Kaiser window of length M with shape parameter beta, using the modified
+    # Bessel function of order zero, normalized to peak 1. Returns a 1-D tensor: empty for M of 0,
+    # a single one for M of 1. beta is cast to the output dtype to avoid NaNs. Raises ValueError
+    # for invalid M/layout/dtype or negative beta.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -470,6 +499,8 @@ def hamming(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Hamming window: delegates to general_hamming with its default alpha of 0.54.
+    # Returns a 1-D tensor of length M; errors come from the delegate.
     return general_hamming(
         M,
         sym=sym,
@@ -524,6 +555,8 @@ def hann(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Hann window: delegates to general_hamming with alpha of 0.5. Returns a 1-D
+    # tensor of length M; errors come from the delegate.
     return general_hamming(
         M,
         alpha=0.5,
@@ -578,6 +611,8 @@ def blackman(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Blackman window: general cosine window with coefficients 0.42, 0.5, 0.08.
+    # Returns a 1-D tensor of length M. Raises ValueError for invalid M, layout or dtype.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -639,6 +674,9 @@ def bartlett(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Bartlett (triangular) window of length M with zero endpoints: one minus the
+    # absolute normalized distance from the center. Returns a 1-D tensor: empty for M of 0, a
+    # single one for M of 1. Raises ValueError for invalid M, layout or dtype.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -715,6 +753,12 @@ def general_cosine(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Generalized cosine window: sum over i of (-1)^i * a_i * cos(i * k) where k
+    # spans 0 to 2*pi across M points. a is an iterable of coefficients. Returns a 1-D tensor:
+    # empty for M of 0, a single one for M of 1. Raises ValueError for invalid M/layout/dtype or
+    # empty a; raises TypeError if a is not iterable.
+    # KNOWN ISSUE: the M of 0 and M of 1 early returns happen before the coefficient checks, so
+    # invalid a is silently accepted for those lengths.
     if dtype is None:
         dtype = torch.get_default_dtype()
 
@@ -808,6 +852,8 @@ def general_hamming(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Generalized Hamming window: general cosine window with coefficients alpha and
+    # one minus alpha. Returns a 1-D tensor of length M; errors come from general_cosine.
     return general_cosine(
         M,
         a=[alpha, 1.0 - alpha],
@@ -872,6 +918,8 @@ def nuttall(
     device: torch.device | None = None,
     requires_grad: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Nuttall window (minimum 4-term Blackman-Harris): general cosine window with
+    # four fixed coefficients. Returns a 1-D tensor of length M; errors come from general_cosine.
     return general_cosine(
         M,
         a=[0.3635819, 0.4891775, 0.1365995, 0.0106411],
