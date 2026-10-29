@@ -1,11 +1,16 @@
 # Owner(s): ["oncall: export"]
+# [MODULE DOC] Unit tests for the dimension hint objects in torch.export.dynamic_shapes: their
+# string form and their factory-call behavior for attaching min and max bounds.
 
 from torch._dynamo.test_case import run_tests, TestCase
 from torch.export.dynamic_shapes import _DimHint, _DimHintType, Dim
 
 
 class TestDimHint(TestCase):
+    # [CLASS DOC] Test case for the _DimHint helper type (repr and factory semantics).
     def test_dimhint_repr(self):
+        # [FUNCTION DOC] Checks the repr of a hint: type only, type with min and max bounds,
+        # and a non-factory hint that prints only the bounds that were given.
         hint = _DimHint(_DimHintType.DYNAMIC)
         self.assertEqual(repr(hint), "DimHint(DYNAMIC)")
 
@@ -16,6 +21,10 @@ class TestDimHint(TestCase):
         self.assertEqual(repr(non_factory_hint), "DimHint(STATIC, min=16)")
 
     def test_dimhint_factory(self):
+        # [FUNCTION DOC] Checks that a factory hint, when called with bounds, returns a new
+        # non-factory hint with the same type and the given min and max; that calling the
+        # result raises TypeError mentioning not callable; that the Dim.DYNAMIC factory yields
+        # the expected repr; and that a negative min raises AssertionError.
         factory = _DimHint(_DimHintType.AUTO)
         self.assertTrue(factory._factory)
 
