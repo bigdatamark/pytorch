@@ -1,4 +1,14 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Common c10d test infrastructure shared by the backend-specific distributed test
+# files: timeout tests, backend registration and entry point tests, default backend type
+# selection tests, small nn.Module models used by DDP tests, a mixin of DDP helpers and
+# checkpointing tests, abstract communication test mixins (sequence numbers, group membership,
+# dtype checks, new_group sync), a dummy Python ProcessGroup/Work with extension tests, ReduceOp
+# tests, local rank tests, record-comm tests and a lint that forbids non-trivial thread locals in
+# c10d C++ sources. Import-time side effects: exits silently (sys.exit 0) if torch.distributed is
+# unavailable or when running under dev/dbg ASAN; defines LOOPBACK ("lo0" on macOS else "lo") and
+# device_type (current accelerator type or cpu); and applies instantiate_parametrized_tests to
+# some classes. setUpModule/tearDownModule are defined for the unittest runner.
 
 import copy
 import os
@@ -70,6 +80,9 @@ _PRIOR_FP32_PRECISION: str | None = None
 
 
 def setUpModule():
+    # [FUNCTION DOC] HELPER: unittest module fixture. Saves the current CUDA matmul
+    # fp32_precision setting into the module global _PRIOR_FP32_PRECISION and then disables TF32
+    # matmul via allow_tf32, so numerics comparisons are exact. Mutates global backend state.
     global _PRIOR_FP32_PRECISION
     # Snapshot fp32_precision (not allow_tf32) so tearDownModule restores the
     # exact original; writing allow_tf32 back can't reproduce the "none" default.
@@ -78,6 +91,9 @@ def setUpModule():
 
 
 def tearDownModule():
+    # [FUNCTION DOC] HELPER: unittest module fixture. If a precision was saved by setUpModule,
+    # restores the CUDA matmul fp32_precision setting and clears the saved global; otherwise does
+    # nothing.
     global _PRIOR_FP32_PRECISION
     if _PRIOR_FP32_PRECISION is not None:
         torch.backends.cuda.matmul.fp32_precision = _PRIOR_FP32_PRECISION
@@ -88,26 +104,41 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class MultiProcContinuousSkipTest(MultiProcContinuousTest):
+    # [CLASS DOC] Two-process (world_size 2) continuous multi-process test over the gloo backend
+    # on cpu, used to check that a skip raised inside a worker does not stop the workers from
+    # running later tests. Class methods backend_str and device_type supply "gloo" and "cpu".
     world_size = 2
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] Classmethod returning the backend name "gloo" for the continuous test
+        # harness.
         return "gloo"
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] Classmethod returning the device type "cpu" for the continuous test
+        # harness.
         return "cpu"
 
     def test_1_worker_skip(self) -> None:
+        # [FUNCTION DOC] Calls skipTest from inside the worker; the test is expected to be
+        # reported as skipped and not break later tests in the same worker processes.
         self.skipTest("skip from worker")
 
     def test_2_worker_continues_after_skip(self) -> None:
+        # [FUNCTION DOC] Runs after the skipped test: each rank all-reduces (sum) a scalar tensor
+        # holding rank + 1 and asserts the result is 3, which checks the workers and process
+        # group are still usable after a skip.
         tensor = torch.tensor(self.rank + 1)
         dist.all_reduce(tensor)
         self.assertEqual(tensor, 3)
 
 
 def gpus_for_rank(world_size):
+    # [FUNCTION DOC] Splits the visible accelerator devices (by torch.accelerator.device_count)
+    # evenly into world_size contiguous index lists, each of device_count // world_size entries,
+    # and returns the list of lists indexed by rank. Leftover devices are not assigned to anyone.
     """Multigpu tests are designed to simulate the multi nodes with multi
     GPUs on each node. Nccl backend requires equal #GPUs in each process.
     On a single node, all visible GPUs are evenly
@@ -125,7 +156,16 @@ def gpus_for_rank(world_size):
 
 
 class AbstractTimeoutTest:
+    # [CLASS DOC] Mixin (not a test case itself) with helpers for checking that the default store
+    # of a process group honours the init timeout, to be mixed into backend-specific test cases
+    # that provide assertion methods.
     def _test_store_timeout(self, backend, init_method, c2p):
+        # [FUNCTION DOC] HELPER: Intended to run in a thread. Initializes a world_size 1 process
+        # group on the given backend and init_method with a 1 second timeout, then times a get of
+        # a nonexistent key on the default store, which must raise a RuntimeError matching
+        # "timeout", destroys the group and appends the elapsed seconds (float) to the list c2p.
+        # If initialization (or the check) raises a RuntimeError, the exception object itself is
+        # appended instead so the caller can report it, for example for address in use.
         try:
             dist.init_process_group(
                 backend=backend,
@@ -147,6 +187,9 @@ class AbstractTimeoutTest:
             c2p.append(e)
 
     def _init_methods(self):
+        # [FUNCTION DOC] HELPER: Generator that creates a temporary file (not deleted) and yields
+        # a file:// init method for it; on non-Windows platforms it also yields a tcp:// init
+        # method on 127.0.0.1 with a free port.
         with tempfile.NamedTemporaryFile(delete=False) as f:
             f.close()
             if sys.platform == "win32":
@@ -156,6 +199,11 @@ class AbstractTimeoutTest:
                 yield f"tcp://127.0.0.1:{common.find_free_port():d}"
 
     def _test_default_store_timeout(self, backend):
+        # [FUNCTION DOC] HELPER: For each init method from _init_methods, runs
+        # _test_store_timeout in a daemon thread (joined for up to 5 seconds) and checks exactly
+        # one result was appended. A float result must be below 3 seconds (the wait should be
+        # about 1 second); a RuntimeError result is re-raised so retry_on_connect_failures can
+        # handle it; any other type raises RuntimeError.
         for init_method in self._init_methods():
             c2p = []
             t = threading.Thread(
@@ -177,13 +225,25 @@ class AbstractTimeoutTest:
 
 
 class TimeoutTest(TestCase):
+    # [CLASS DOC] Tests for timeouts in c10d store based rendezvous helpers.
     @retry_on_connect_failures
     def test_store_based_barrier(self):
+        # [FUNCTION DOC] Spawns 4 threads per init type (file, tcp, hash store) that call the
+        # private store based barrier with a 3 second timeout, with the last rank deliberately
+        # not participating. Asserts that world_size - 1 threads fail with DistStoreError (a
+        # DistError) whose message says it timed out initializing the process group in the store
+        # based barrier. Retried on connect failures. Creates a temporary file and finds a free
+        # port.
         f = tempfile.NamedTemporaryFile(delete=False)  # noqa: SIM115
         f.close()
         port = common.find_free_port()
 
         def thread_work(timeout, init_type, world_size, rank, error_list):
+            # [FUNCTION DOC] HELPER: Thread body. Builds a barrier store of the requested
+            # init_type (FileStore, TCPStore on the shared port with rank 0 as master, or
+            # HashStore); then, unless this is the last rank, calls the store based barrier with
+            # logging every half timeout. A DistStoreError is checked to be a DistError and
+            # appended to error_list.
             # we need to create a separate store just for the store barrier test
             if init_type == "file":
                 barrier_store = dist.FileStore(f.name)
@@ -245,7 +305,14 @@ class TimeoutTest(TestCase):
 
 
 class BackendEntryPointTest(TestCase):
+    # [CLASS DOC] Tests registration of distributed backends through plugin entry points and
+    # built-in NCCL registration. setUp snapshots the class level registries of dist.Backend
+    # (plugins, backend list, capabilities, type map, default device map, and whether custom
+    # attributes exist) and tearDown restores them, so registrations made by tests do not leak.
     def setUp(self):
+        # [FUNCTION DOC] Snapshots copies of the dist.Backend registries and records whether the
+        # attributes ENTRYPOINT_TEST and NCCL-LEGACY already exist on dist.Backend, for
+        # restoration in tearDown.
         super().setUp()
         self._plugins = dist.Backend._plugins.copy()
         self._backend_list = dist.Backend.backend_list.copy()
@@ -260,6 +327,9 @@ class BackendEntryPointTest(TestCase):
         }
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved dist.Backend registries and deletes any of the
+        # tracked custom backend attributes that were created during the test, then calls the
+        # parent tearDown.
         dist.Backend._plugins = self._plugins
         dist.Backend.backend_list = self._backend_list
         dist.Backend.backend_capability = self._backend_capability
@@ -271,19 +341,33 @@ class BackendEntryPointTest(TestCase):
         super().tearDown()
 
     def test_backend_entrypoint_loads_on_availability_check(self):
+        # [FUNCTION DOC] Patches importlib.metadata.entry_points to return a fake entry point
+        # whose load returns a function registering a "entrypoint_test" cpu backend. Asserts
+        # is_backend_available triggers exactly one load, that the plugin is registered under the
+        # upper-case name, that BackendConfig stringifies to "cpu:entrypoint_test" and that the
+        # registered creator is the supplied factory (which must never be called).
         load_count = 0
 
         def create_backend(store, rank, world_size, timeout):
+            # [FUNCTION DOC] HELPER: Backend factory that must not run; raises AssertionError if
+            # called.
             raise AssertionError("backend factory should not run in this test")
 
         class EntryPoint:
+            # [CLASS DOC] HELPER: Fake entry point object with a name and a load method that
+            # counts loads in the enclosing test and returns a register function.
             name = "entrypoint_test"
 
             def load(self):
+                # [FUNCTION DOC] HELPER: Increments the enclosing test's load counter and returns
+                # a function that registers the "entrypoint_test" backend (creator
+                # create_backend, devices cpu) with dist.Backend.
                 nonlocal load_count
                 load_count += 1
 
                 def register():
+                    # [FUNCTION DOC] HELPER: Registers the fake "entrypoint_test" backend with
+                    # the cpu device on dist.Backend.
                     dist.Backend.register_backend(
                         "entrypoint_test",
                         create_backend,
@@ -306,19 +390,31 @@ class BackendEntryPointTest(TestCase):
         )
 
     def test_backend_entrypoint_loads_for_backend_config(self):
+        # [FUNCTION DOC] Same fake entry point setup as the availability test, but constructs
+        # dist.BackendConfig directly under the patch. Asserts the entry point was loaded exactly
+        # once, the config string is "cpu:entrypoint_test" and the plugin creator is the supplied
+        # factory.
         load_count = 0
 
         def create_backend(store, rank, world_size, timeout):
+            # [FUNCTION DOC] HELPER: Backend factory that must not run; raises AssertionError if
+            # called.
             raise AssertionError("backend factory should not run in this test")
 
         class EntryPoint:
+            # [CLASS DOC] HELPER: Fake entry point object with a name and a load method that
+            # counts loads in the enclosing test and returns a register function.
             name = "entrypoint_test"
 
             def load(self):
+                # [FUNCTION DOC] HELPER: Increments the enclosing test's load counter and returns
+                # a function that registers the "entrypoint_test" backend with dist.Backend.
                 nonlocal load_count
                 load_count += 1
 
                 def register():
+                    # [FUNCTION DOC] HELPER: Registers the fake "entrypoint_test" backend with
+                    # the cpu device on dist.Backend.
                     dist.Backend.register_backend(
                         "entrypoint_test",
                         create_backend,
@@ -339,6 +435,11 @@ class BackendEntryPointTest(TestCase):
         )
 
     def test_backend_config_device_form_registers_per_pair(self):
+        # [FUNCTION DOC] Spies on dist.Backend._ensure_backend_registered (patched as a
+        # classmethod that records each name and delegates to the original) while constructing
+        # BackendConfig for "cpu:gloo,cuda:nccl". Asserts each backend name was looked up
+        # individually and the whole comma-separated string was not, and that the config
+        # stringifies back to the same string.
         # The "device:backend" form must look up each backend individually, not
         # the whole comma-separated string (which can never match a backend and
         # would waste an entry-point scan on every BackendConfig construction).
@@ -346,6 +447,8 @@ class BackendEntryPointTest(TestCase):
         original = dist.Backend._ensure_backend_registered.__func__
 
         def spy(cls, name):
+            # [FUNCTION DOC] HELPER: Replacement classmethod body that appends the looked-up
+            # backend name to the shared list and calls the original implementation.
             looked_up.append(name)
             return original(cls, name)
 
@@ -361,6 +464,10 @@ class BackendEntryPointTest(TestCase):
 
     @parametrize("use_nccl2", [False, True])
     def test_nccl_backend_registration(self, use_nccl2):
+        # [FUNCTION DOC] Parametrized by use_nccl2. Under a patched copy of os.environ, sets or
+        # removes TORCH_DIST_USE_NCCL2, calls the private built-in NCCL backend registration, and
+        # asserts the registered NCCL creator is the nccl2 process group factory when set and the
+        # regular NCCL factory otherwise, and that the type map maps "nccl" to BackendType.NCCL.
         with unittest.mock.patch.dict(os.environ):
             if use_nccl2:
                 os.environ["TORCH_DIST_USE_NCCL2"] = "1"
@@ -383,6 +490,9 @@ class BackendEntryPointTest(TestCase):
         )
 
     def test_nccl_legacy_backend_registration(self):
+        # [FUNCTION DOC] Calls the private legacy NCCL registration and asserts the "NCCL-LEGACY"
+        # plugin uses the standard NCCL process group factory, that its capability is the cuda
+        # device only, and that its backend type is CUSTOM.
         c10d._register_builtin_nccl_legacy_backend()
 
         self.assertIs(
@@ -400,6 +510,10 @@ instantiate_parametrized_tests(BackendEntryPointTest)
 
 
 class DefaultBackendTypeTest(TestCase):
+    # [CLASS DOC] Tests for the private default-backend-type selection for a BackendConfig. The
+    # default type of a multi-backend group must be one that some device actually registers,
+    # otherwise ProcessGroup default backend lookup fails on the first rank query. Parametrized
+    # tests mock torch.accelerator.current_accelerator.
     """Cover ``_get_default_backend_type_for_backend_config``.
 
     A multi-backend group registers one backend per device, but ``ProcessGroup``
@@ -410,6 +524,9 @@ class DefaultBackendTypeTest(TestCase):
 
     @staticmethod
     def _registrable_backend_types(backend_config):
+        # [FUNCTION DOC] HELPER: Staticmethod. For a BackendConfig returns the set of BackendType
+        # values that would be registered for its device backends, looking each up in the backend
+        # type map and defaulting to CUSTOM.
         """The BackendTypes ``_new_process_group_helper`` would register."""
         return {
             dist.Backend.backend_type_map.get(
@@ -432,6 +549,9 @@ class DefaultBackendTypeTest(TestCase):
     )
     @parametrize("accelerator", [None, "cuda", "xpu"])
     def test_default_backend_type_is_always_registrable(self, backend_str, accelerator):
+        # [FUNCTION DOC] Parametrized over several backend strings and accelerators (none, cuda,
+        # xpu). With current_accelerator mocked, builds the BackendConfig and asserts the
+        # computed default backend type is one of the registrable types.
         """The default type must never name a backend that no device registers,
         regardless of which accelerator the host reports."""
         acc_device = torch.device(accelerator) if accelerator else None
@@ -468,6 +588,10 @@ class DefaultBackendTypeTest(TestCase):
     def test_default_backend_type_prefers_accelerator_backend(
         self, backend_str, accelerator, expected_type
     ):
+        # [FUNCTION DOC] Parametrized over (backend string, accelerator, expected type name).
+        # With the accelerator mocked, asserts the default backend type is the expected
+        # BackendType: the accelerator backend for mixed groups, any non-host device ahead of cpu
+        # when the accelerator has no entry, and the host backend for cpu-only groups.
         acc_device = torch.device(accelerator) if accelerator else None
         with unittest.mock.patch(
             "torch.accelerator.current_accelerator", return_value=acc_device
@@ -479,6 +603,9 @@ class DefaultBackendTypeTest(TestCase):
             )
 
     def test_default_backend_type_honors_bound_device_id(self):
+        # [FUNCTION DOC] With the accelerator mocked to cuda and config
+        # "cpu:gloo,xpu:xccl,cuda:nccl", asserts an explicit device argument wins: xpu:0 yields
+        # XCCL and cpu yields GLOO.
         """An explicit ``device_id=`` outranks the reported accelerator."""
         with unittest.mock.patch(
             "torch.accelerator.current_accelerator",
@@ -503,7 +630,11 @@ instantiate_parametrized_tests(DefaultBackendTypeTest)
 
 
 class Net(nn.Module):
+    # [CLASS DOC] HELPER: Small bias-free MLP (2 -> 10 -> 50 -> 4 linear layers with ReLU
+    # between) whose forward returns softmax over dim 1. Used as the basic DDP test model.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the three bias-free linear layers fc1, fc2, fc3 and a
+        # ReLU.
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False)
         self.fc2 = nn.Linear(10, 50, bias=False)
@@ -511,6 +642,8 @@ class Net(nn.Module):
         self.relu = nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies fc1, ReLU, fc2, ReLU, fc3 and returns the softmax over
+        # dim 1.
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
@@ -518,7 +651,12 @@ class Net(nn.Module):
 
 
 class DoubleGpuNet(nn.Module):
+    # [CLASS DOC] HELPER: Same MLP as Net split across two devices: fc1 on the first device, fc2
+    # and fc3 on the second, plus a non-trainable integer parameter no_grad_param on the first.
+    # The output is returned on the first device.
     def __init__(self, gpus):
+        # [FUNCTION DOC] HELPER: Places the layers and the requires_grad False long parameter on
+        # the devices given in gpus (indexes 0 and 1).
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False).to(gpus[0])
         self.fc2 = nn.Linear(10, 50, bias=False).to(gpus[1])
@@ -529,6 +667,8 @@ class DoubleGpuNet(nn.Module):
         ).to(gpus[0])
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Moves the activations between the weight devices of fc1 and fc2
+        # as needed and returns the softmax of the output on the device of fc1.
         dev0 = self.fc1.weight.device
         dev1 = self.fc2.weight.device
         x = self.relu(self.fc1(x.to(dev0)))
@@ -538,7 +678,12 @@ class DoubleGpuNet(nn.Module):
 
 
 class QuadraGpuNet(nn.Module):
+    # [CLASS DOC] HELPER: Four-layer MLP model-parallel across four devices, one linear layer per
+    # device (2 -> 10 -> 50 -> 4 -> 4), with a non-trainable integer parameter on the first
+    # device. The output is returned on the first device.
     def __init__(self, gpus):
+        # [FUNCTION DOC] HELPER: Places fc1..fc4 on gpus[0..3] and the requires_grad False long
+        # parameter on gpus[0].
         super().__init__()
         self.fc1 = nn.Linear(2, 10, bias=False).to(gpus[0])
         self.fc2 = nn.Linear(10, 50, bias=False).to(gpus[1])
@@ -550,6 +695,8 @@ class QuadraGpuNet(nn.Module):
         ).to(gpus[0])
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Moves activations to each layer's weight device in turn and
+        # returns the softmax of the final output on the device of fc1.
         dev0 = self.fc1.weight.device
         dev1 = self.fc2.weight.device
         dev2 = self.fc3.weight.device
@@ -562,7 +709,13 @@ class QuadraGpuNet(nn.Module):
 
 
 class ConvNet(nn.Module):
+    # [CLASS DOC] HELPER: Four convolution layers (8->16->32->16->8 channels, 2x2 kernels) each
+    # with its own memory format and dtype, optionally on different devices. Records dtypes;
+    # layer_gpus is set only if gpus was a list.
     def __init__(self, gpus, layouts, dtypes):
+        # [FUNCTION DOC] HELPER: Stores dtypes and, when gpus is a list, layer_gpus; otherwise
+        # the single device is repeated four times. Creates conv0..conv3 and moves each to its
+        # device with its memory format and dtype from the layouts and dtypes sequences.
         super().__init__()
         self.dtypes = dtypes
         if isinstance(gpus, list):
@@ -583,6 +736,9 @@ class ConvNet(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Casts the input to dtypes[0], then runs each conv in turn,
+        # moving the result to the next layer's device and dtype (devices come from layer_gpus
+        # when present, else the input's device). Returns the last conv output.
         x = x.to(self.dtypes[0])
         # Could say
         # x = self.conv0(x).to(device=self.conv1.weight.device, dtype=self.dtypes[1])
@@ -597,7 +753,12 @@ class ConvNet(nn.Module):
 
 # A model involving FFTs, used to test DDP with complex tensors
 class FFTModel(nn.Module):
+    # [CLASS DOC] HELPER: Model with a single complex (cfloat) parameter of shape features x
+    # features x hin x (win // 2 + 1) used to test DDP with complex tensors; forward is a
+    # spectral convolution (real FFT, per-frequency channel mixing, inverse FFT).
     def __init__(self, hin, win, n_features):
+        # [FUNCTION DOC] HELPER: Stores hin and win and creates the all-ones complex weight
+        # parameter.
         super().__init__()
         self.hin = hin
         self.win = win
@@ -606,6 +767,9 @@ class FFTModel(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Computes the orthonormal 2D real FFT of the input at size (hin,
+        # win), contracts channels with the weight via an einsum, applies the inverse 2D real FFT
+        # and returns the result.
         xc = torch.fft.rfft2(x, s=(self.hin, self.win), dim=(-2, -1), norm="ortho")
         xcw = torch.einsum("nchw,cohw->nohw", xc, self.weight)
         x = torch.fft.irfft2(xcw, dim=(-2, -1), norm="ortho")
@@ -613,34 +777,55 @@ class FFTModel(nn.Module):
 
 
 class Task(nn.Module):
+    # [CLASS DOC] HELPER: Tiny module holding one 2x2 all-ones parameter p; forward adds p to its
+    # input.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the 2x2 ones parameter p.
         super().__init__()
         self.p = nn.Parameter(torch.ones(2, 2))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the parameter plus the input.
         return self.p + x
 
 
 class ModuleForDdpCommHook(nn.Module):
+    # [CLASS DOC] HELPER: Wrapper module around a Task submodule used for DDP communication hook
+    # tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the Task submodule t0.
         super().__init__()
         self.t0 = Task()
 
     def forward(self, x, rank):
+        # [FUNCTION DOC] HELPER: Returns the output of t0 applied to the input shifted by rank.
         return self.t0(x + rank)
 
 
 class SparseGradientModule(nn.Module):
+    # [CLASS DOC] HELPER: Module with a sparse EmbeddingBag (10 entries, dim 10, sparse
+    # gradients) used to test DDP with sparse gradients; forward returns softmax of the embedding
+    # output over dim 1.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the sparse EmbeddingBag.
         super().__init__()
         self.embedding = nn.EmbeddingBag(10, 10, sparse=True)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the softmax over dim 1 of the embedding bag output.
         return F.softmax(self.embedding(x), dim=1)
 
 
 class CommonDistributedDataParallelTest:
+    # [CLASS DOC] Mixin of DistributedDataParallel test helpers and tests for backend-specific
+    # test cases. The concrete class must provide rank, file_name and _get_process_group (here it
+    # raises NotImplementedError). Contains model preparation helpers, a checkpointing comparison
+    # harness with several nested checkpoint-using modules, comm hook helpers, SyncBatchNorm
+    # empty-input tests and dataclass output tests. world_size is fixed at 2.
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Best-effort removal of the test's file_name (the FileStore file
+        # the DDP tests leave behind). Ignores OSError and AttributeError. It does not call the
+        # parent tearDown.
         # DistributedDataParallel test doesn't seem to call FileStore destructor
         # TODO: investigate this test and the test is known to have issues
         # Use this hack to remove files for that test
@@ -651,6 +836,7 @@ class CommonDistributedDataParallelTest:
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning 2, the number of processes these tests use.
         return 2
 
     def _prepare_single_device_module(
@@ -661,6 +847,12 @@ class CommonDistributedDataParallelTest:
         global_batch_size,
         gradient_as_bucket_view=False,
     ):
+        # [FUNCTION DOC] HELPER: Builds a Net model and a DistributedDataParallel copy (deep-
+        # copied, bucket cap 0.001 MB, given process group, device_ids and
+        # gradient_as_bucket_view). The device is devices[0] if devices is non-empty, else the
+        # accelerator device indexed by rank. Moves the model to that device and creates random
+        # input (global_batch_size x 2) and target (global_batch_size x 4) on it. Returns (model,
+        # ddp_model, input, target).
         model = Net()
         device = devices[0] if devices else torch.device(f"{device_type}:{self.rank:d}")
         ddp_model = DistributedDataParallel(
@@ -686,6 +878,10 @@ class CommonDistributedDataParallelTest:
         global_batch_size,
         gradient_as_bucket_view=False,
     ):
+        # [FUNCTION DOC] HELPER: Asserts devices has 2 or 4 entries, builds DoubleGpuNet or
+        # QuadraGpuNet accordingly, wraps a deep copy in DistributedDataParallel (bucket cap
+        # 0.001 MB, given process group, device_ids, gradient_as_bucket_view) and creates random
+        # input on devices[0] and target on the cpu. Returns (model, ddp_model, input, target).
         self.assertTrue(
             len(devices) == 2 or len(devices) == 4,
             lambda msg: f"{msg}\nunexpected devices for ddp tests {devices}",
@@ -709,14 +905,22 @@ class CommonDistributedDataParallelTest:
         return model, ddp_model, input, target
 
     def _get_store(self):
+        # [FUNCTION DOC] HELPER: Returns a FileStore over the test's file_name for world_size
+        # participants.
         return dist.FileStore(self.file_name, self.world_size)
 
     def _get_process_group(self):
+        # [FUNCTION DOC] HELPER: Abstract hook; raises NotImplementedError and must be overridden
+        # by the concrete test class to return a process group.
         raise NotImplementedError("To be implemented by child class")
 
     def _train_model(
         self, model, input_var, target, loss, run_checkpoint=False, use_reentrant=True
     ):
+        # [FUNCTION DOC] HELPER: Puts the model in train mode, runs it on input_var (through
+        # activation checkpointing with the given use_reentrant flag when run_checkpoint is
+        # true), computes the loss against target and runs backward, accumulating gradients.
+        # Returns nothing.
         model.train()
         if run_checkpoint:
             output = checkpoint(model, input_var, use_reentrant=use_reentrant)
@@ -736,6 +940,13 @@ class CommonDistributedDataParallelTest:
         use_reentrant=True,
         allow_none_grads=False,
     ):
+        # [FUNCTION DOC] HELPER: Core harness comparing local training with DDP training for a
+        # given module. Sets the device to the rank, seeds 31415, makes a local copy and a DDP
+        # copy (bucket cap 1 MB, using the given bucket view, find_unused_parameters,
+        # static_graph and the process group), and asserts the logged static_graph value matches.
+        # Then for 5 iterations zeroes grads, trains both (the local one on the full batch, DDP
+        # on this rank's slice from _prepare_dummy_data) and asserts parameter grads are equal
+        # within tolerance (rtol 1.3e-6, atol 5e-5), and not None unless allow_none_grads is set.
         # to reproduce the same training results
         torch.accelerator.set_device_index(self.rank)
         torch.manual_seed(31415)
@@ -786,22 +997,30 @@ class CommonDistributedDataParallelTest:
     # Most of the tests are referred to
     # https://github.com/facebookresearch/fairscale/blob/main/tests/nn/pipe/test_checkpoint_ddp.py
     class CheckpointOnceModule(nn.Module):
+        # [CLASS DOC] HELPER: Module with two 20x20 linears where only the second layer is run
+        # under activation checkpointing (with the configured use_reentrant flag).
         """
         Runs checkpoint for a single layer in the model.
         """
 
         def __init__(self, use_reentrant=True):
+            # [FUNCTION DOC] HELPER: Creates linears l1 and l2 and stores use_reentrant.
             super().__init__()
             self.l1 = nn.Linear(20, 20)
             self.l2 = nn.Linear(20, 20)
             self.use_reentrant = use_reentrant
 
         def forward(self, inp):
+            # [FUNCTION DOC] HELPER: Applies l1 normally, then l2 through checkpoint, and returns
+            # the result.
             x = self.l1(inp)
             x = checkpoint(self.l2, x, use_reentrant=self.use_reentrant)
             return x
 
     class CheckpointTwiceModule(CheckpointOnceModule):
+        # [CLASS DOC] HELPER: Like CheckpointOnceModule but checkpoints the same layer l2 twice
+        # in a row, simulating cases such as pipeline parallelism where one layer is checkpointed
+        # more than once.
         """
         Runs checkpoint for the same layer twice in a model. This simulates use
         cases such as pipeline parallel where the same layer can be checkpointed
@@ -809,36 +1028,53 @@ class CommonDistributedDataParallelTest:
         """
 
         def __init__(self, use_reentrant=True):
+            # [FUNCTION DOC] HELPER: Forwards use_reentrant to the parent constructor (no other
+            # state).
             super().__init__(use_reentrant=use_reentrant)
 
         def forward(self, inp):
+            # [FUNCTION DOC] HELPER: Applies l1, then runs l2 through checkpoint twice and
+            # returns the result.
             x = self.l1(inp)
             x = checkpoint(self.l2, x, use_reentrant=self.use_reentrant)
             x = checkpoint(self.l2, x, use_reentrant=self.use_reentrant)
             return x
 
     class CheckpointTwiceModuleWeightSharing(CheckpointTwiceModule):
+        # [CLASS DOC] HELPER: Same as CheckpointTwiceModule but l1 and l2 share one weight
+        # parameter.
         """
         Similar to CheckpointTwiceModule but the weights are shared.
         """
 
         def __init__(self, use_reentrant=True):
+            # [FUNCTION DOC] HELPER: Calls the parent constructor and then makes l1.weight the
+            # same parameter as l2.weight.
             super().__init__(use_reentrant=use_reentrant)
             # Share weights
             self.l1.weight = self.l2.weight
 
         def forward(self, inp):
+            # [FUNCTION DOC] HELPER: Applies l1, then runs l2 through checkpoint twice and
+            # returns the result (same as the parent forward).
             x = self.l1(inp)
             x = checkpoint(self.l2, x, use_reentrant=self.use_reentrant)
             x = checkpoint(self.l2, x, use_reentrant=self.use_reentrant)
             return x
 
     class DynamicCheckpointTwiceModule(CheckpointTwiceModule):
+        # [CLASS DOC] HELPER: Module that alternates which layer it checkpoints per call: it
+        # keeps a call counter and checkpoints l2 on even calls and l1 on odd calls, so which
+        # parameters are used varies across iterations.
         def __init__(self, use_reentrant=True):
+            # [FUNCTION DOC] HELPER: Calls the parent constructor and initializes the call
+            # counter count to 0.
             super().__init__(use_reentrant=use_reentrant)
             self.count = 0
 
         def forward(self, inp):
+            # [FUNCTION DOC] HELPER: Checkpoints l1 when the call counter is odd, otherwise l2;
+            # increments the counter (module state mutation) and returns the output.
             if self.count % 2:
                 x = checkpoint(self.l1, inp, use_reentrant=self.use_reentrant)
             else:
@@ -848,12 +1084,20 @@ class CommonDistributedDataParallelTest:
             return x
 
     class DynamicCheckpointTwiceModuleWeightSharing(DynamicCheckpointTwiceModule):
+        # [CLASS DOC] HELPER: DynamicCheckpointTwiceModule whose two linear layers share one
+        # weight parameter.
         def __init__(self, use_reentrant=True):
+            # [FUNCTION DOC] HELPER: Calls the parent constructor and then makes l1.weight the
+            # same parameter as l2.weight.
             super().__init__(use_reentrant=use_reentrant)
             # Share weights
             self.l1.weight = self.l2.weight
 
     def _prepare_dummy_data(self):
+        # [FUNCTION DOC] HELPER: Creates a random input (requires grad) and random target of 16 *
+        # world_size rows by 20 columns on the accelerator device, and slices this rank's 16
+        # rows. Returns (input, ddp_input, target, ddp_target) where the last of each pair is the
+        # per-rank slice.
         ddp_bs = 16
         bs = ddp_bs * self.world_size
         input = torch.rand((bs, 20), device=device_type, requires_grad=True)
@@ -866,6 +1110,11 @@ class CommonDistributedDataParallelTest:
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [True, False])
     def test_ddp_checkpointing_once(self, use_reentrant):
+        # [FUNCTION DOC] Parametrized by use_reentrant, needs at least 2 GPUs. For every
+        # combination of bucket view and static graph, runs the checkpointing comparison with a
+        # module that checkpoints one layer once; for static graph also runs with
+        # find_unused_parameters set (the second run uses the default use_reentrant, not the
+        # parametrized one).
         """
         DDP works as expected when layer is checkpointed only once.
         """
@@ -891,6 +1140,11 @@ class CommonDistributedDataParallelTest:
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [True, False])
     def test_ddp_checkpointing_unused_params(self, use_reentrant):
+        # [FUNCTION DOC] Parametrized by use_reentrant, needs at least 2 GPUs. With
+        # find_unused_parameters and no static graph, expects a RuntimeError "Expected to mark a
+        # variable ready only once." for the reentrant checkpoint implementation and success for
+        # the non-reentrant one; with static graph enabled it must succeed in both cases. Loops
+        # over bucket view on/off.
         """
         With reentrant autograd checkpointing impl, DDP will fail when there are
         unused params in the model and no static graph training. With
@@ -924,6 +1178,10 @@ class CommonDistributedDataParallelTest:
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [True, False])
     def test_ddp_checkpointing_twice(self, use_reentrant):
+        # [FUNCTION DOC] Parametrized by use_reentrant, needs at least 2 GPUs. Checkpointing the
+        # same layer twice without static graph, with and without find_unused_parameters, must
+        # raise RuntimeError "Expected to mark a variable ready only once." for the reentrant
+        # implementation and succeed for the non-reentrant one. Loops over bucket view on/off.
         """
         Checkpointing twice fails for non-static graph with reentrant checkpoint
         implementation, succeeds with non-reentrant checkpoint implementation.
@@ -957,6 +1215,9 @@ class CommonDistributedDataParallelTest:
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [True, False])
     def test_ddp_checkpointing_twice_static_graph(self, use_reentrant):
+        # [FUNCTION DOC] Parametrized by use_reentrant, needs at least 2 GPUs. Checkpointing a
+        # layer twice must work for both implementations when static_graph is enabled; loops over
+        # bucket view on/off.
         """
         Regardless of reentrant or non-reentrant checkpointing impl,
         checkpointing twice works with static graph enabled.
@@ -973,6 +1234,10 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_checkpointing_dynamic_module(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Runs the DDP checkpointing comparison with the
+        # dynamic checkpoint module (non-reentrant, no static graph, find_unused_parameters on),
+        # allowing None grads because some parameters are unused in some iterations; loops over
+        # bucket view on/off.
         """
         Dynamic module can be checkpointed, multiple times, with non-reentrant
         checkpointing implementation.
@@ -992,6 +1257,9 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_checkpointing_dynamic_weight_sharing(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Same as the dynamic module test but with the
+        # weight-sharing dynamic module (non-reentrant, find_unused_parameters, None grads
+        # allowed); loops over bucket view on/off.
         """
         Dynamic module can be checkpointed multiple times with weight sharing
         using non-reentrant checkpointing implementation.
@@ -1013,6 +1281,10 @@ class CommonDistributedDataParallelTest:
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [True, False])
     def test_ddp_checkpointing_weight_sharing(self, use_reentrant):
+        # [FUNCTION DOC] Parametrized by use_reentrant, needs at least 2 GPUs. Builds a
+        # sequential model of two linears sharing one weight (seeded identically each time) and
+        # runs the checkpointing comparison with the whole model checkpointed, for all
+        # combinations of bucket view and static graph.
         """
         Test that checkpointing with weight sharing works.
         """
@@ -1035,6 +1307,9 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_checkpointing_twice_weight_sharing(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Runs the checkpointing comparison with the
+        # weight-sharing twice-checkpointed module under static graph, looping over bucket view
+        # on/off.
         """
         Checkpointing should work with static graph in the case of checkpointing
         same layer twice and having weights shared across layers.
@@ -1050,6 +1325,11 @@ class CommonDistributedDataParallelTest:
             )
 
     def test_invalid_powerSGD_state(self):
+        # [FUNCTION DOC] Loops over start_powerSGD_iter in 0 and 1, use_error_feedback and
+        # warm_start flags. Whenever error feedback or warm start is enabled (i.e. not both off),
+        # constructing PowerSGDState must raise ValueError saying start_powerSGD_iter must be
+        # above 1 because PowerSGD only applies after the first two iterations. Combinations with
+        # both flags off are skipped.
         for start_powerSGD_iter, use_error_feedback, warm_start in product(
             [0, 1], [True, False], [True, False]
         ):
@@ -1076,6 +1356,14 @@ class CommonDistributedDataParallelTest:
         multi_device=False,
         gradient_as_bucket_view=False,
     ):
+        # [FUNCTION DOC] HELPER: Trains a plain local model and a DDP model over 2 iterations
+        # with local batch size equal to the number of devices (1 if devices is None) and global
+        # batch size world_size times that. Builds the pair via the multi-device or single-device
+        # helper (checking the logged is_multi_device_module flag). Each iteration runs
+        # forward/backward with MSE loss locally on the full batch and under DDP on this rank's
+        # slice, applies a plain gradient step of the full gradient to each (clearing grads),
+        # asserts parameters match within tolerance, then reshuffles the input with a seeded
+        # permutation.
         """
         Note: we pass down `device_ids` all the way to DistributedDataParallel
         as part of the test. Below you find tests that either use a list of
@@ -1108,12 +1396,16 @@ class CommonDistributedDataParallelTest:
             self.assertFalse(ddp_logging_data.get("is_multi_device_module"))
 
         def step_model(model, input, target):
+            # [FUNCTION DOC] HELPER: Puts the model in train mode, runs forward, computes MSE
+            # loss against the target (moved to the output device) and runs backward.
             model.train()
             output = model(input)
             loss = F.mse_loss(output, target.to(output.device))
             loss.backward()
 
         def update_parameters(model):
+            # [FUNCTION DOC] HELPER: Subtracts each parameter's gradient from the parameter
+            # without autograd tracking (learning rate 1) and clears the gradient to None.
             for param in model.parameters():
                 with torch.no_grad():
                     param -= param.grad
@@ -1151,6 +1443,10 @@ class CommonDistributedDataParallelTest:
     def _gpu_model_with_ddp_comm_hook(
         self, process_group, hook=None, gradient_as_bucket_view=False, state=None
     ):
+        # [FUNCTION DOC] HELPER: Builds a ModuleForDdpCommHook on this rank's first GPU (from
+        # gpus_for_rank), wraps it in DistributedDataParallel with the process group and
+        # gradient_as_bucket_view, and registers the given hook with the given state if hook is
+        # not None. Returns the DDP model.
         device_id = gpus_for_rank(self.world_size)[self.rank][0]
         gpu_model = DistributedDataParallel(
             ModuleForDdpCommHook().to(device_id),
@@ -1168,6 +1464,9 @@ class CommonDistributedDataParallelTest:
     def _gpu_model_with_builtin_ddp_comm_hook(
         self, process_group, hook=None, gradient_as_bucket_view=False
     ):
+        # [FUNCTION DOC] HELPER: Same as the custom hook variant but registers a built-in DDP
+        # comm hook (through the private register method) when hook is not None. Returns the DDP
+        # model.
         device_id = gpus_for_rank(self.world_size)[self.rank][0]
         gpu_model = DistributedDataParallel(
             ModuleForDdpCommHook().to(device_id),
@@ -1183,6 +1482,8 @@ class CommonDistributedDataParallelTest:
         return gpu_model
 
     def _run_and_verify_hook(self, model, input, expected_grad):
+        # [FUNCTION DOC] HELPER: Runs forward with the rank as extra argument, backward on the
+        # mean of the output, and asserts every parameter's gradient equals expected_grad.
         # Run forward
         output = model(input, self.rank)
 
@@ -1194,10 +1495,15 @@ class CommonDistributedDataParallelTest:
     def _simple_hook(
         self, state: object, bucket: dist.GradBucket
     ) -> torch.futures.Future[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Example DDP comm hook. Creates a future already completed with a
+        # ones tensor shaped like the bucket buffer, and returns a continuation that adds one to
+        # it, so the reduced gradient is a tensor of twos. The state argument is ignored.
         fut = torch.futures.Future()
         fut.set_result(torch.ones_like(bucket.buffer()))
 
         def fut_then(fut):
+            # [FUNCTION DOC] HELPER: Continuation for the hook future; returns the future value
+            # plus ones.
             # Add ones to fut's result.
             t = fut.value()
             return t + torch.ones_like(t)
@@ -1205,6 +1511,8 @@ class CommonDistributedDataParallelTest:
         return fut.then(fut_then)
 
     def _test_not_nan(self, model, x):
+        # [FUNCTION DOC] HELPER: Runs the model on x, asserts the output has no NaN,
+        # backpropagates the sum and asserts no parameter gradient has NaN.
         y = model(x)
         self.assertFalse(y.isnan().any().item())
         y.sum().backward()
@@ -1213,6 +1521,10 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_sync_batch_norm_only_empty_input(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Wraps a BatchNorm2d model in DDP and converts it
+        # to SyncBatchNorm on the process group, then checks outputs and grads are NaN-free when
+        # only rank 0 gets an empty batch and when all ranks get empty batches, with the input
+        # requiring grad and not requiring grad.
         pg = self._get_process_group()
 
         model = torch.nn.Sequential(
@@ -1260,6 +1572,9 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_sync_batch_norm_empty_input(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Same check with a conv, batchnorm and linear
+        # stack: NaN-free output and grads when only rank 0 has an empty batch and when all ranks
+        # have empty batches.
         pg = self._get_process_group()
 
         model = torch.nn.Sequential(
@@ -1294,6 +1609,9 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_buffer_sync_multi_forward_with_batchnorm(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Runs two forward passes in one iteration on a DDP
+        # model containing BatchNorm1d with buffer broadcasting enabled and backpropagates the
+        # sum of both means; passes if nothing raises (no value assertions).
         pg = self._get_process_group()
 
         model = nn.Sequential(
@@ -1317,11 +1635,18 @@ class CommonDistributedDataParallelTest:
 
     @dataclass
     class CustomOutput:
+        # [CLASS DOC] HELPER: Dataclass test output with an optional tensor o1 and a mapping o2
+        # from names to tensors.
         o1: torch.Tensor | None
         o2: dict[str, torch.Tensor]
 
     class DataclassOutputModule(nn.Module):
+        # [CLASS DOC] HELPER: Module with two 3-layer linear stacks seq1 and seq2 (10 features)
+        # and a ReLU; its forward returns a CustomOutput. If skip_o1 is set seq1 is not used so
+        # its parameters receive no gradient.
         def __init__(self, skip_o1):
+            # [FUNCTION DOC] HELPER: Builds the two linear stacks and the ReLU and stores
+            # skip_o1.
             super().__init__()
             self.seq1 = nn.Sequential(*[nn.Linear(10, 10) for _ in range(3)])
             self.relu = nn.ReLU()
@@ -1329,11 +1654,19 @@ class CommonDistributedDataParallelTest:
             self.skip_o1 = skip_o1
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Returns a CustomOutput whose o1 is None when skip_o1 is set,
+            # else ReLU of seq1 applied to x, and whose o2 maps "a" to seq2(x) and "b" to ReLU of
+            # seq2(x).
             o1 = None if self.skip_o1 else self.relu(self.seq1(x))
             o2 = {"a": self.seq2(x), "b": self.relu(self.seq2(x))}
             return CommonDistributedDataParallelTest.CustomOutput(o1=o1, o2=o2)
 
     def _test_dataclass_output(self, skip_o1):
+        # [FUNCTION DOC] HELPER: Compares a local model on the concatenated batch with a DDP copy
+        # (find_unused_parameters on, no static graph) on this rank's batch, where the module
+        # returns a dataclass. Builds an MSE loss from the sum of the output fields,
+        # backpropagates both, and asserts the parameter grads match (allclose for tensors,
+        # equality otherwise).
         net_x = torch.cat([torch.ones(4, 10) * i for i in range(self.world_size)]).to(
             self.rank
         )
@@ -1381,15 +1714,23 @@ class CommonDistributedDataParallelTest:
 
     @skip_if_lt_x_gpu(2)
     def test_dataclass_output(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Runs the dataclass output comparison with all
+        # outputs used.
         self._test_dataclass_output(skip_o1=False)
 
     @skip_if_lt_x_gpu(2)
     def test_dataclass_output_unused_param(self):
+        # [FUNCTION DOC] Needs at least 2 GPUs. Runs the dataclass output comparison with the
+        # first output skipped so some parameters are unused.
         self._test_dataclass_output(skip_o1=True)
 
 
 class ComputeBucketAssignmentTest(TestCase):
+    # [CLASS DOC] Tests the private bucket assignment function that groups tensors into reducer
+    # buckets by byte size limits and dtype.
     def test_single_limit_single_dtype(self):
+        # [FUNCTION DOC] Four float tensors (400, 800, 400, 200 bytes) with a single 400 byte
+        # limit: asserts each lands in its own bucket and all per-bucket limits are 400.
         tensors = [
             torch.empty([100], dtype=torch.float),
             torch.empty([200], dtype=torch.float),
@@ -1403,6 +1744,9 @@ class ComputeBucketAssignmentTest(TestCase):
         self.assertEqual([[0], [1], [2], [3]], result)
 
     def test_single_limit_multi_dtype(self):
+        # [FUNCTION DOC] Interleaved float and double tensors with a single 400 byte limit:
+        # asserts buckets never mix dtypes, grouping indices as [0,2], [1,3], [4], [5] with all
+        # limits 400.
         tensors = [
             torch.empty([50], dtype=torch.float),
             torch.empty([25], dtype=torch.double),
@@ -1418,6 +1762,8 @@ class ComputeBucketAssignmentTest(TestCase):
         self.assertEqual([[0, 2], [1, 3], [4], [5]], result)
 
     def test_multi_limit_single_dtype(self):
+        # [FUNCTION DOC] Four 40 byte float tensors with limits [40, 80]: asserts buckets [0],
+        # [1,2], [3] and per-bucket limits [40, 80, 80] (the last limit repeats).
         tensors = [
             torch.empty([10], dtype=torch.float),
             torch.empty([10], dtype=torch.float),
@@ -1431,6 +1777,8 @@ class ComputeBucketAssignmentTest(TestCase):
         self.assertEqual([[0], [1, 2], [3]], result)
 
     def test_multi_limit_multi_dtype(self):
+        # [FUNCTION DOC] Interleaved float and double tensors with limits [200, 400]: asserts
+        # buckets [0], [1], [2,4], [3,5] and limits [200, 200, 400, 400].
         tensors = [
             torch.empty([50], dtype=torch.float),
             torch.empty([25], dtype=torch.double),
@@ -1447,19 +1795,31 @@ class ComputeBucketAssignmentTest(TestCase):
 
 
 class AbstractCommTest:
+    # [CLASS DOC] Mixin of backend-agnostic communication tests that backend test cases run via
+    # private _test_* helpers taking a backend name. Needs rank and file_name from the concrete
+    # test case and overridden device. Covers sequence number tracking, warnings for ranks
+    # outside a group, rank membership lookups, dtype mismatch checks, complex dtype all_gather
+    # and bool tensor broadcast. world_size is 2.
     @property
     def op_timeout_sec(self):
+        # [FUNCTION DOC] HELPER: Property returning 1, the per-operation timeout in seconds.
         return 1
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning 2, the test world size.
         return 2
 
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Property that fails the test with a message; subclasses must
+        # override it to return the device.
         self.fail("test subclass didn't override device")
 
     def _verify_sequence_number_across_pg(self, pg, verify_pg):
+        # [FUNCTION DOC] HELPER: Reads the sequence number of process group pg, all-gathers it as
+        # an object over the separate group verify_pg (so the verification does not alter pg's
+        # counter), asserts all ranks report the same value and returns it.
         seq_num = pg._get_sequence_number_for_group()
         obj_list = [None for _ in range(dist.get_world_size(verify_pg))]
         # We use a separate pg to verify the sequence numbers, otherwise these
@@ -1469,6 +1829,13 @@ class AbstractCommTest:
         return obj_list[0]
 
     def _test_sequence_num_incremented(self, process_group, ranks):
+        # [FUNCTION DOC] HELPER: Creates a gloo verification group over ranks and checks both
+        # groups have equal world size (raises AssertionError otherwise). Records the initial
+        # sequence number agreed across ranks of process_group (or -1 for a rank not in the
+        # group), then runs 10 all_reduce calls on process_group, after each asserting the agreed
+        # sequence number grew by exactly one. For groups larger than 2, ranks other than 0 and 2
+        # issue one extra async all_reduce, and the test asserts the sequence numbers form two
+        # distinct values: ranks 0 and 2 equal and one behind the others, which are all equal.
         # verify initial sequence numbers. Use a distinct process group for
         # verification to keep counts as expected with respect to process_group.
         verify_pg = dist.new_group(
@@ -1520,6 +1887,9 @@ class AbstractCommTest:
                 self.assertEqual(rank_to_seq_num[0] + 1, rank_to_seq_num[1])
 
     def _test_sequence_num_incremented_default_group(self, backend_name):
+        # [FUNCTION DOC] HELPER: Sets the accelerator device to this rank, initializes the
+        # default process group on backend_name via a FileStore, and runs the sequence number
+        # increment check over the whole world.
         torch.accelerator.set_device_index(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -1534,6 +1904,11 @@ class AbstractCommTest:
         )
 
     def _test_sequence_num_incremented_subgroup(self, backend_name):
+        # [FUNCTION DOC] HELPER: Sets the accelerator device to this rank, initializes the
+        # default group on backend_name via a FileStore, creates a subgroup of ranks 0, 1 and 2
+        # and runs the sequence number increment check on it.
+        # KNOWN ISSUE: the subgroup contains rank 2, which does not exist when world_size is 2
+        # (the mixin default), so it only works with a larger world size.
         torch.accelerator.set_device_index(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
@@ -1547,6 +1922,9 @@ class AbstractCommTest:
         self._test_sequence_num_incremented(subgroup, subgroup_ranks)
 
     def _test_sequence_num_set_default_pg(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group on the backend via a FileStore and
+        # asserts the default group's sequence number is identical on all ranks (all-gathered as
+        # objects).
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1562,6 +1940,9 @@ class AbstractCommTest:
         self.assertEqual(len(set(obj_list)), 1)
 
     def _test_sequence_num_set_new_group(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, creates a subgroup of ranks 0 and
+        # 1, and on member ranks asserts the subgroup's sequence number is identical across the
+        # subgroup.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1579,6 +1960,10 @@ class AbstractCommTest:
             self.assertEqual(len(set(obj_list)), 1)
 
     def _test_warn_not_in_group(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, creates a group of the even
+        # ranks, and for ranks outside it asserts that all_gather, all_reduce, barrier and
+        # broadcast on that group each emit a UserWarning (once) matching "does not belong to";
+        # ranks inside the group simply run the four collectives.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1608,6 +1993,11 @@ class AbstractCommTest:
             dist.broadcast(x, src=0, group=group)
 
     def _test_rank_membership(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, creates a group containing only
+        # rank 1 and asserts group rank and global rank translation (global 1 is group rank 0 and
+        # back), the list of group ranks, and that looking up a rank outside the group raises
+        # ValueError "not part of group" and passing an unregistered DummyProcessGroup raises
+        # ValueError "not registered".
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1633,6 +2023,12 @@ class AbstractCommTest:
         self.assertEqual(dist.get_process_group_ranks(group), [1])
 
     def _test_tensor_dtype_mismatch(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, then checks that collectives
+        # given a mix of float32 and half tensors (all_gather, coalesced variants,
+        # reduce_scatter, all_to_all_single, all_to_all, scatter, gather) each raise ValueError
+        # "tensors with different dtypes".
+        # KNOWN ISSUE: in the all_gather_coalesced block the second call is never reached because
+        # the first one raises inside the same assertRaises context.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1690,6 +2086,9 @@ class AbstractCommTest:
             dist.scatter(tensor_h, tensor_list)
 
     def _test_tensor_dtype_complex(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group and calls all_gather with real and
+        # complex-view (view_as_complex) tensors for input and output lists in all four
+        # combinations; passes if nothing raises (no value assertions).
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1712,6 +2111,9 @@ class AbstractCommTest:
         dist.all_gather(tensor_list_c, tensor_c)
 
     def _test_bool_tensors(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, picks the device from the backend
+        # (cuda for nccl, xpu for xccl, else cpu), and broadcasts a bool tensor from rank 0
+        # (other ranks start with zeros); asserts the result equals rank 0's tensor.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1730,19 +2132,30 @@ class AbstractCommTest:
 
 # Variant of AbstractCommTest that expects world size of 4
 class AbstractLargeCommTest:
+    # [CLASS DOC] Variant of AbstractCommTest mixin with world_size 4, containing helper tests
+    # for new_group with local synchronization and with explicit rank ordering. Concrete classes
+    # must supply rank, file_name and device.
     @property
     def op_timeout_sec(self):
+        # [FUNCTION DOC] HELPER: Property returning 1, the per-operation timeout in seconds.
         return 1
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning 4, the test world size.
         return 4
 
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Property that raises RuntimeError; subclasses must override it.
         raise RuntimeError("Implement me")
 
     def _test_new_group_local_sync(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, then each rank creates a group of
+        # itself and the rank two positions ahead (modulo world size) using local
+        # synchronization. Asserts that creating a group for the other ranks returns the non-
+        # member sentinel, that the new group is a ProcessGroup, and that group rank follows the
+        # sorted order of global ranks and get_process_group_ranks returns the sorted list.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1774,6 +2187,10 @@ class AbstractLargeCommTest:
         )
 
     def _test_new_group_local_sync_sanity_check(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, splits 4 ranks into two pairs,
+        # creates the pair group with local synchronization, all-gathers (pair index, rank)
+        # tensors within it and asserts the gathered list equals the tensors of both pair
+        # members.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1804,6 +2221,10 @@ class AbstractLargeCommTest:
         self.assertEqual(output_tensor_list, expected)
 
     def _test_new_group_local_sync_duplicate_pg(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, splits ranks into pairs, creates
+        # two distinct groups with the same member set using local synchronization (no group name
+        # conflict), and checks that an all_gather in each gives the expected (pair index, rank)
+        # tensors.
         """
         We should support users create multiple PGs with the same set of
         members, and no conflict in group name
@@ -1843,6 +2264,10 @@ class AbstractLargeCommTest:
             self.assertEqual(output_tensor_list, expected)
 
     def _test_new_group_ordered(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group and creates a group with ranks in
+        # reverse order and sort_ranks False. Asserts this rank's group rank equals its index in
+        # the reversed list, that get_process_group_ranks returns the reversed list, and that
+        # all_gather output follows the reversed rank order.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -1880,11 +2305,17 @@ class AbstractLargeCommTest:
 
 
 class CommTest(AbstractCommTest, MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case (AbstractCommTest on MultiProcessTestCase) that spawns
+    # worker processes in setUp and removes the store file in tearDown. Holds the debug level
+    # test.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and then removes the test's file_name,
+        # ignoring OSError.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -1892,6 +2323,12 @@ class CommTest(AbstractCommTest, MultiProcessTestCase):
             pass
 
     def test_debug_level(self):
+        # [FUNCTION DOC] Deletes TORCH_DISTRIBUTED_DEBUG from the environment (if set) and checks
+        # the default debug level is OFF. Then for each case-variant spelling of OFF, INFO and
+        # DETAIL sets the environment variable and asserts the debug level read back matches, and
+        # for invalid values ("foo", 0, 1, -1) asserts set_debug_level_from_env raises ValueError
+        # "The value of TORCH_DISTRIBUTED_DEBUG must". Side effect: leaves the last invalid value
+        # in the environment variable and does not restore it.
         try:
             del os.environ["TORCH_DISTRIBUTED_DEBUG"]
         except KeyError:
@@ -1933,14 +2370,30 @@ class CommTest(AbstractCommTest, MultiProcessTestCase):
 
 
 class DummyWork(dist._Work):
+    # [CLASS DOC] HELPER: Minimal Work subclass for DummyProcessGroup whose wait synchronizes the
+    # current accelerator stream (when one is available) and returns True.
     def wait(self, timeout=5.0):
+        # [FUNCTION DOC] HELPER: Synchronizes the current accelerator stream if an accelerator is
+        # available and returns True; the timeout argument is ignored.
         if torch.accelerator.is_available():
             torch.accelerator.current_stream().synchronize()
         return True
 
 
 class DummyProcessGroup(dist.ProcessGroup):
+    # [CLASS DOC] HELPER: In-Python ProcessGroup used to test the Python extension path. Stores
+    # rank and size from the first two positional constructor arguments, a bound device, abort
+    # and shutdown flags, and collectives_called, a set of names of collectives dispatched to it.
+    # Collectives apply fake arithmetic in place instead of communicating: allgather and gather
+    # copy the input into every output; allreduce adds 2; broadcast adds 1; reduce adds 3;
+    # recvAnysource adds 4; reduce_scatter and scatter copy the entry for this rank;
+    # all_gather_single copies the input into each chunk; reduce_scatter_single copies this
+    # rank's chunk; alltoall copies pairwise. send adds 1 and recv adds 2 (these two are not
+    # recorded). All return DummyWork.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the parent constructor, then records global_rank and
+        # group_size from the first two positional args, initializes bound device None, aborted
+        # and shutdown flags False and an empty collectives_called set.
         super().__init__(*args, **kwargs)
         self._bound_device_id = None
         self.global_rank = args[0]
@@ -1952,39 +2405,55 @@ class DummyProcessGroup(dist.ProcessGroup):
         self.collectives_called = set()
 
     def rank(self):
+        # [FUNCTION DOC] HELPER: Returns the rank given at construction.
         return self.global_rank
 
     def size(self):
+        # [FUNCTION DOC] HELPER: Returns the group size given at construction.
         return self.group_size
 
     @property
     def supports_splitting(self):
+        # [FUNCTION DOC] HELPER: Property always returning True: this group claims to support
+        # splitting.
         return True
 
     @property
     def bound_device_id(self):
+        # [FUNCTION DOC] HELPER: Property returning the stored bound device id (initially None).
         return self._bound_device_id
 
     @bound_device_id.setter
     def bound_device_id(self, device):
+        # [FUNCTION DOC] HELPER: Property setter storing the bound device id.
         self._bound_device_id = device
 
     def eager_connect_single_device(self, device=None):
+        # [FUNCTION DOC] HELPER: Records the given device as the bound device; no connection is
+        # made.
         self._bound_device_id = device
 
     def _get_backend(self, device):
+        # [FUNCTION DOC] HELPER: Returns self for any device, so this group serves as its own
+        # backend.
         return self
 
     def comm_split_count(self):
+        # [FUNCTION DOC] HELPER: Always returns 0 (no communicator splits are performed).
         return 0
 
     def perform_nocolor_split(self, device):
+        # [FUNCTION DOC] HELPER: No-op split implementation.
         pass
 
     def getBackendName(self):
+        # [FUNCTION DOC] HELPER: Returns the backend name "Dummy".
         return "Dummy"
 
     def allgather(self, output_tensor_lists, input_tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "allgather"; copies each input tensor into every tensor
+        # of the corresponding output list (pairing lists by position) in place. Returns a
+        # DummyWork.
         self.collectives_called.add("allgather")
         for output_tensor_list, input_tensor in zip(
             output_tensor_lists, input_tensor_list
@@ -1995,6 +2464,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def allreduce(self, tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "allreduce"; adds 2 in place to each tensor and returns
+        # a DummyWork.
         self.collectives_called.add("allreduce")
         for tensor in tensor_list:
             tensor.add_(2)
@@ -2002,6 +2473,10 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def barrier(self, opts=None):
+        # [FUNCTION DOC] HELPER: Store-based barrier over the default store using a fixed key.
+        # Rank 0 spins reading the counter (add of 0) until size - 1 other ranks have incremented
+        # it, so it stays alive while others use the store; other ranks increment the counter by
+        # 1. Returns a DummyWork. Not recorded in collectives_called.
         store = c10d._get_default_store()
         key = "TEST:DummyProcessGroup:barrier"
         if self.rank() == 0:
@@ -2021,6 +2496,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def broadcast(self, tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "broadcast"; adds 1 in place to each tensor and returns
+        # a DummyWork.
         self.collectives_called.add("broadcast")
         for tensor in tensor_list:
             tensor.add_(1)
@@ -2028,6 +2505,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def reduce_scatter(self, output_tensor_list, input_tensor_lists, opts=None):
+        # [FUNCTION DOC] HELPER: Records "reduce_scatter"; for each output tensor copies the
+        # entry at this rank's index from the matching input list, in place. Returns a DummyWork.
         self.collectives_called.add("reduce_scatter")
         for output_tensor, input_tensor_list in zip(
             output_tensor_list, input_tensor_lists
@@ -2037,6 +2516,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def all_gather_single(self, output_tensor, input_tensor, opts=None):
+        # [FUNCTION DOC] HELPER: Records "all_gather_single"; copies the input tensor into each
+        # of the size equal chunks of the output tensor. Returns a DummyWork.
         self.collectives_called.add("all_gather_single")
         for chunk in output_tensor.chunk(self.size()):
             chunk.copy_(input_tensor)
@@ -2044,12 +2525,16 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def reduce_scatter_single(self, output_tensor, input_tensor, opts=None):
+        # [FUNCTION DOC] HELPER: Records "reduce_scatter_single"; copies this rank's chunk of the
+        # input (split into size chunks) into the output tensor. Returns a DummyWork.
         self.collectives_called.add("reduce_scatter_single")
         output_tensor.copy_(input_tensor.chunk(self.size())[self.rank()])
 
         return DummyWork()
 
     def reduce(self, tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "reduce"; adds 3 in place to each tensor and returns a
+        # DummyWork.
         self.collectives_called.add("reduce")
         for tensor in tensor_list:
             tensor.add_(3)
@@ -2057,6 +2542,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def gather(self, output_tensor_lists, input_tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "gather"; copies each input tensor into every tensor of
+        # the corresponding output list in place. Returns a DummyWork.
         self.collectives_called.add("gather")
         for output_tensor_list, input_tensor in zip(
             output_tensor_lists, input_tensor_list
@@ -2067,6 +2554,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def scatter(self, output_tensor_list, input_tensor_lists, opts=None):
+        # [FUNCTION DOC] HELPER: Records "scatter"; for each output tensor copies the entry at
+        # this rank's index from the matching input list. Returns a DummyWork.
         self.collectives_called.add("scatter")
         for output_tensor, input_tensor_list in zip(
             output_tensor_list, input_tensor_lists
@@ -2076,6 +2565,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def alltoall(self, output_tensor_list, input_tensor_list, opts=None):
+        # [FUNCTION DOC] HELPER: Records "alltoall"; copies each input tensor into the matching
+        # output tensor. Returns a DummyWork.
         self.collectives_called.add("alltoall")
         for output_tensor, input_tensor in zip(output_tensor_list, input_tensor_list):
             output_tensor.copy_(input_tensor)
@@ -2083,6 +2574,8 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def recvAnysource(self, tensor_list, tag):
+        # [FUNCTION DOC] HELPER: Records "recvAnysource"; adds 4 in place to each tensor and
+        # returns a DummyWork.
         self.collectives_called.add("recvAnysource")
         for tensor in tensor_list:
             tensor.add_(4)
@@ -2090,26 +2583,40 @@ class DummyProcessGroup(dist.ProcessGroup):
         return DummyWork()
 
     def send(self, tensor_list, dst, tag=0):
+        # [FUNCTION DOC] HELPER: Adds 1 in place to each tensor (fake send; dst and tag ignored,
+        # nothing recorded) and returns a DummyWork.
         for tensor in tensor_list:
             tensor.add_(1)
 
         return DummyWork()
 
     def recv(self, tensor_list, src, tag=0):
+        # [FUNCTION DOC] HELPER: Adds 2 in place to each tensor (fake recv; src and tag ignored,
+        # nothing recorded) and returns a DummyWork.
         for tensor in tensor_list:
             tensor.add_(2)
 
         return DummyWork()
 
     def abort(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the aborted flag.
         self._aborted = True
 
     def shutdown(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the shutdown flag.
         self._shutdown = True
 
 
 class BackendRegistrationTest(TestCase):
+    # [CLASS DOC] Tests for registering custom backends with the dist.Backend registry.
     def test_register_backend_with_single_device_string(self):
+        # [FUNCTION DOC] Registers a backend named "_test_fake_backend" for the single device
+        # string "custom_device" and asserts the default device map points that device to the
+        # backend, the capability is the one-element list holding the device (not a per-character
+        # split of the string), and parsing the backend name against that device set yields the
+        # device mapping; also asserts no single character of the device name was registered as a
+        # device. Snapshots all dist.Backend registries and the upper-case attribute beforehand
+        # and restores them in a finally block.
         name = "_test_fake_backend"
         device = "custom_device"
         backend_attr = name.upper()
@@ -2124,6 +2631,7 @@ class BackendRegistrationTest(TestCase):
         try:
 
             def create_backend(*_args, **_kwargs):
+                # [FUNCTION DOC] HELPER: Dummy backend factory returning None.
                 return None
 
             dist.Backend.register_backend(name, create_backend, devices=device)
@@ -2151,11 +2659,19 @@ class BackendRegistrationTest(TestCase):
 
 
 class PythonProcessGroupExtensionTest(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test (world size from the harness) for Python-defined process
+    # group backends, using DummyProcessGroup registered as the "dummy" backend via the static
+    # factories create_dummy and create_dummy_ext. Many tests set MASTER_ADDR and MASTER_PORT
+    # (localhost, 6789) in os.environ and initialize and destroy the default group. Nested
+    # Options is an inert stand-in for group options.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and removes the test's file_name, ignoring
+        # OSError.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -2163,6 +2679,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
             pass
 
     def test_get_backend_name(self):
+        # [FUNCTION DOC] Asserts a DummyProcessGroup of rank 0 and size 1 reports its name as
+        # "Dummy". (The rest of the body is commented-out code.)
         dpg = DummyProcessGroup(0, 1)
         self.assertEqual("Dummy", dpg.name())
 
@@ -2182,6 +2700,11 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         # _canonicalize_group_rank(dpg, group_rank=123, return_global=True)
 
     def test_get_backend_impl(self):
+        # [FUNCTION DOC] Registers the dummy backend and initializes the default group with it
+        # (sets MASTER_ADDR/MASTER_PORT). Asserts get_backend_impl returns the DummyProcessGroup,
+        # that it is the same object as the group's backend for the cpu device (with and without
+        # a device argument), and that looking it up by group name gives a backend named "Dummy".
+        # Destroys the group.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2204,6 +2727,13 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.destroy_process_group()
 
     def test_canonicalize_helper(self):
+        # [FUNCTION DOC] Initializes a default group with the dummy backend, then checks the
+        # private rank canonicalization helper on a separate DummyProcessGroup of size 124: a
+        # group rank 123 passes through unchanged, global rank 0 maps to 0, and converting group
+        # rank 123 to a global rank raises ValueError.
+        # KNOWN ISSUE: per the in-test TODO the ValueError actually comes from the group not
+        # being registered, not from the rank being absent from the global mapping. Destroys the
+        # group.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2234,6 +2764,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.destroy_process_group()
 
     def test_backend_class_attr(self):
+        # [FUNCTION DOC] Registers the dummy backend and asserts the class attribute
+        # Backend.DUMMY equals "dummy" and the plugin entry's creator is create_dummy. Does not
+        # restore the registration afterwards.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2244,6 +2777,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         )
 
     def test_is_backend_available(self):
+        # [FUNCTION DOC] Asserts is_ucc_available matches is_backend_available for "ucc", that
+        # "dummy" is unavailable before registration and available after registering it. Leaves
+        # the registration in place.
         self.assertEqual(dist.is_ucc_available(), dist.is_backend_available("ucc"))
         self.assertFalse(dist.is_backend_available("dummy"))
         dist.Backend.register_backend(
@@ -2252,6 +2788,11 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         self.assertTrue(dist.is_backend_available("dummy"))
 
     def test_backend_config(self):
+        # [FUNCTION DOC] Registers the dummy backend and checks the string form of BackendConfig
+        # for plain backend names (default device mapping, with the accelerator replaced on Intel
+        # GPU runs), upper/lower-case dummy names and explicit device:backend lists, each in a
+        # subTest. Also asserts that a trailing comma or a repeated device type raises
+        # ValueError.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2305,6 +2846,12 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
                     dist.BackendConfig(config_str)
 
     def test_parse_backend_string(self):
+        # [FUNCTION DOC] Exercises the private backend string parser with an available device set
+        # of cpu, cuda, xpu and mps. Checks that a bare backend name maps to the devices where it
+        # is the registered default (case-insensitive; gloo gives cpu and mps), that
+        # device:backend lists are parsed case-insensitively and whitespace-tolerantly and accept
+        # unknown device types, and that errors are raised as ValueError for an unknown backend,
+        # a malformed pairing (extra colon or missing device) and a duplicate device type.
         from torch.distributed.distributed_c10d import _parse_backend_string
 
         all_devices = {"cpu", "cuda", "xpu", "mps"}
@@ -2354,6 +2901,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
             _parse_backend_string("cpu:gloo,cpu:dummy", available_devices=all_devices)
 
     def test_init_process_group_with_multiple_backends(self):
+        # [FUNCTION DOC] Registers the dummy backend, initializes the default group with a
+        # backend string naming dummy for cpu, cuda and xpu, runs an all_gather on cpu tensors
+        # and a barrier, and destroys the group; passes if nothing raises.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2373,26 +2923,40 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.destroy_process_group()
 
     class Options:
+        # [CLASS DOC] HELPER: Inert placeholder for process group options with class attributes
+        # group_name, split_from, split_color and global_ranks_in_group all None; its constructor
+        # and create do nothing.
         group_name = None
         split_from = None
         split_color = None
         global_ranks_in_group = None
 
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: No-op constructor.
             pass
 
         def create(self):
+            # [FUNCTION DOC] HELPER: No-op.
             pass
 
     @staticmethod
     def create_dummy(store, group_rank, group_size, timeout):
+        # [FUNCTION DOC] HELPER: Staticmethod backend factory with the legacy signature (store,
+        # rank, size, timeout); returns a DummyProcessGroup for that rank and size.
         return DummyProcessGroup(group_rank, group_size)
 
     @staticmethod
     def create_dummy_ext(dist_opts, pg_options=None):
+        # [FUNCTION DOC] HELPER: Staticmethod backend factory for the extended API; returns a
+        # DummyProcessGroup built from the group_rank and group_size of the options object
+        # (pg_options is ignored).
         return DummyProcessGroup(dist_opts.group_rank, dist_opts.group_size)
 
     def test_collectives(self):
+        # [FUNCTION DOC] Registers and initializes the dummy backend, then checks the fake
+        # collective semantics end to end: all_gather copies the input into each output,
+        # all_reduce adds 2, an async broadcast adds 1 after waiting, reduce_scatter copies this
+        # rank's entry; then barrier and destroy.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2429,6 +2993,10 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.destroy_process_group()
 
     def test_send_recv(self):
+        # [FUNCTION DOC] Initializes the dummy backend and checks send adds 1 to the tensor and
+        # recv adds 2. Asserts ValueError for send to self rank, send with only group_dst equal
+        # to self rank, with both dst and group_dst, or with neither, and for recv with both src
+        # and group_src. Ends with a barrier and intentionally does not destroy the group.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2464,6 +3032,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         # user applications would explicitly that.
 
     def test_shutdown(self) -> None:
+        # [FUNCTION DOC] Initializes the dummy backend, destroys the default group and asserts
+        # the dummy group's shutdown method was called.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2479,6 +3049,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         self.assertTrue(pg._shutdown)
 
     def test_abort(self) -> None:
+        # [FUNCTION DOC] Initializes the dummy backend, calls the private abort-process-group
+        # function and asserts the dummy group's abort method was called.
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
@@ -2494,6 +3066,12 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         self.assertTrue(pg._aborted)
 
     def test_new_group_delegates_to_pg(self):
+        # [FUNCTION DOC] Defines a DummyProcessGroup subclass whose new_group method records the
+        # call (ranks, backend) and returns a dummy sub-group for member ranks or None otherwise.
+        # Registers it as a "delegating" extended-API backend, initializes the default group and
+        # asserts dist.new_group delegates to it with the given ranks and the backend name
+        # "delegating"; rank 0 gets a real group, other ranks get None or the non-member
+        # sentinel. Destroys the group in a finally block.
         """dist.new_group delegates to default_pg.new_group if available."""
 
         new_group_called = False
@@ -2501,6 +3079,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         new_group_backend = None
 
         class _DelegatingPG(DummyProcessGroup):
+            # [CLASS DOC] HELPER: DummyProcessGroup subclass adding a new_group method that records
+            # its arguments in the enclosing test and returns a dummy sub-group.
             def new_group(
                 self,
                 ranks,
@@ -2510,6 +3090,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
                 group_name=None,
                 group_desc=None,
             ):
+                # [FUNCTION DOC] HELPER: Records in the enclosing test that it was called with
+                # the ranks and backend; returns None if this rank is not in ranks, else a
+                # DummyProcessGroup with the rank's index and the number of ranks.
                 nonlocal new_group_called, new_group_ranks, new_group_backend
                 new_group_called = True
                 new_group_ranks = list(ranks)
@@ -2553,6 +3136,10 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
             dist.destroy_process_group()
 
     def test_new_group_delegates_to_pg_explicit_backend(self):
+        # [FUNCTION DOC] Same delegating setup but registered for devices cpu and cuda:
+        # initializes the default group, calls dist.new_group with the explicit backend string
+        # "cpu:delegating,cuda:delegating" and asserts the delegated new_group received that
+        # exact string. Destroys the group in a finally block.
         """dist.new_group forwards an explicit multi-backend string to the
         delegated default_pg.new_group."""
 
@@ -2560,6 +3147,8 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         new_group_backend = None
 
         class _DelegatingPG(DummyProcessGroup):
+            # [CLASS DOC] HELPER: DummyProcessGroup subclass adding a new_group method that records
+            # its arguments in the enclosing test and returns a dummy sub-group.
             def new_group(
                 self,
                 ranks,
@@ -2569,6 +3158,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
                 group_name=None,
                 group_desc=None,
             ):
+                # [FUNCTION DOC] HELPER: Records in the enclosing test that it was called and the
+                # backend it received; returns None if this rank is not in ranks, else a
+                # DummyProcessGroup with the rank's index and the number of ranks.
                 nonlocal new_group_called, new_group_backend
                 new_group_called = True
                 new_group_backend = backend
@@ -2605,8 +3197,17 @@ instantiate_parametrized_tests(CommonDistributedDataParallelTest)
 
 
 class SplitGroupOptionsTest(TestCase):
+    # [CLASS DOC] Tests how ProcessGroup.split_group passes options to the backends it splits.
+    # Nested _SplittingBackend is a Python Backend whose split records the options it receives
+    # and returns a child backend; _make_group builds a group of two such backends.
     class _SplittingBackend(C10DBackend):
+        # [CLASS DOC] HELPER: Python Backend subclass with a name, a fixed options object (111
+        # second timeout) and split_opts recording the options passed to its split method; it
+        # reports that it supports splitting.
         def __init__(self, rank, size, name):
+            # [FUNCTION DOC] HELPER: Calls the Backend constructor, stores the name, creates
+            # options with that name and an 111 second timeout, and initializes split_opts to
+            # None.
             super().__init__(rank, size)
             self._name = name
             self._options = C10DBackend.Options(name, timeout=timedelta(seconds=111))
@@ -2614,22 +3215,32 @@ class SplitGroupOptionsTest(TestCase):
 
         @property
         def supports_splitting(self):
+            # [FUNCTION DOC] HELPER: Property always returning True.
             return True
 
         @property
         def options(self):
+            # [FUNCTION DOC] HELPER: Property returning the backend's own options object.
             return self._options
 
         def getBackendName(self):
+            # [FUNCTION DOC] HELPER: Returns the backend name given at construction.
             return self._name
 
         def split(self, store, ranks, opts):
+            # [FUNCTION DOC] HELPER: Stores the options it was given in split_opts and returns a
+            # new _SplittingBackend for this rank's index within ranks, sized to the rank list
+            # and named with the "-child" suffix added to its own name.
             self.split_opts = opts
             return SplitGroupOptionsTest._SplittingBackend(
                 ranks.index(self.rank()), len(ranks), f"{self._name}-child"
             )
 
     def _make_group(self):
+        # [FUNCTION DOC] HELPER: Builds a one-rank ProcessGroup over a HashStore with two Python
+        # backends: "cpu-backend" registered for the cpu device (GLOO type tag) and "default-
+        # backend" for cuda (NCCL tag), makes NCCL the default backend type and sets the group
+        # name. Returns (pg, cpu_backend, default_backend).
         # Shaped like a "cpu:gloo,cuda:nccl" group: two distinct backends, the
         # accelerator one being the group's default. The backend type tags are
         # just map keys here, the backends themselves are Python ones.
@@ -2647,6 +3258,10 @@ class SplitGroupOptionsTest(TestCase):
         return pg, cpu_backend, default_backend
 
     def test_split_group_clones_parent_options(self):
+        # [FUNCTION DOC] Splits the group with a new timeout and group name and asserts that for
+        # both backends the options passed to split are a different object from the backend's own
+        # options, that the parent's options keep an empty group name and the original 111 second
+        # timeout, and that the split options carry the new name and 222 second timeout.
         # getBackendOptions() returns the backend's live options_, and split()
         # implementations write into what they are given, so splitGroup used to
         # rewrite the parent's group_name/timeout and hand the child an object
@@ -2662,6 +3277,11 @@ class SplitGroupOptionsTest(TestCase):
             self.assertEqual(backend.split_opts._timeout, timedelta(seconds=222))
 
     def test_split_group_opts_apply_to_default_backend_only(self):
+        # [FUNCTION DOC] Splits the group passing an explicit options object plus a timeout and
+        # asserts the explicit options are used only for the default backend (its split options
+        # carry the caller's backend name) while the cpu backend gets its own options. Also
+        # asserts the caller's object is a different object from what was passed and is not
+        # mutated (group name stays empty, timeout stays 5 seconds).
         # An explicit `opts` describes the group's default backend, the same way
         # pg_options does for init_process_group. Handing it to every device's
         # backend made the others reject it (and silently fall back to their
@@ -2679,15 +3299,22 @@ class SplitGroupOptionsTest(TestCase):
 
 
 class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
+    # [CLASS DOC] Single-process (world size 1) multi-process tests checking that process group
+    # initialization and collectives dispatch for various backends. The _test_* helpers are
+    # called from backend-specific subclasses with a backend name.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning 1.
         return 1
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and removes the test's file_name, ignoring
+        # OSError.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -2695,6 +3322,8 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             pass
 
     def test_init_process_group_optional_backend(self):
+        # [FUNCTION DOC] When both gloo and nccl are available, initializes the default group
+        # without naming a backend (using a FileStore) and destroys it; does nothing otherwise.
         store = dist.FileStore(self.file_name, self.world_size)
         # creates both gloo and nccl backend
         if dist.is_gloo_available() and dist.is_nccl_available():
@@ -2706,6 +3335,12 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             dist.destroy_process_group()
 
     def test_init_process_group_for_all_backends(self):
+        # [FUNCTION DOC] Loops over every name in the Backend registry list, skipping undefined
+        # and backends unavailable on the system (mpi, nccl without cuda, gloo, ucc, xccl).
+        # Initializes a group with each on a FileStore and asserts rank, size and that the group
+        # name equals the backend name, except that unrecognized plugin names are expected to
+        # report "custom" (the "threaded" backend reports its own name). Destroys the group after
+        # each.
         for backend in dist.Backend.backend_list:
             excepted_backend = backend
             # skip if the backend is not available on the system
@@ -2748,6 +3383,11 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
 
     @unittest.skipIf(IS_FBCODE or IS_SANDCASTLE, "subprocess test fails in fbcode")
     def test_default_process_group(self):
+        # [FUNCTION DOC] Skipped under fbcode or sandcastle. Runs a child Python process, with
+        # GPU visibility disabled through environment variables, that initializes the default
+        # process group with a HashStore and no backend, expecting it to fall back to CPU. Fails
+        # the test on a 20 second timeout or a non-zero exit, including the process output in the
+        # failure message.
         script = """
 # Hide all GPUs
 import os
@@ -2778,6 +3418,11 @@ dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
             self.fail(f"""Subprocess failed with {e.output.decode("utf-8")}""")
 
     def _call_collective_with_varying_tensors(self, backend, collective, *args):
+        # [FUNCTION DOC] HELPER: Calls the given collective function with a zero 2x2 tensor on
+        # the device matching the backend (cuda for nccl, xpu for xccl, else cpu), shaping
+        # arguments per collective: barrier takes none, all_gather and gather take lists, scatter
+        # takes a list input, reduce_scatter and all_to_all are only called when the backend is
+        # not gloo, anything else takes the tensor plus the extra args.
         # call collective with varying tensors to ensure that the tensors are
         # correctly dispatched
 
@@ -2804,6 +3449,10 @@ dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
 
     # TODO: backend will be replaced with a non specified backend
     def _test_collectives(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group on the backend with a FileStore,
+        # then in a subTest for each of reduce, broadcast, all_reduce, all_gather,
+        # reduce_scatter, barrier, all_to_all and scatter calls the collective with varying
+        # tensors, checking only that dispatch does not raise.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -2826,6 +3475,9 @@ dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
                 self._call_collective_with_varying_tensors(backend, collective, *args)
 
     def _test_allreduce_coalesced(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, runs all_reduce_coalesced with a
+        # sum on a 10x10 ones tensor on the backend's device and asserts each tensor equals ones
+        # times the world size.
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -2841,6 +3493,9 @@ dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
             self.assertEqual(tensor, torch.ones(10, 10) * self.world_size)
 
     def _test_all_to_all_single(self, backend):
+        # [FUNCTION DOC] HELPER: Initializes the default group, runs all_to_all_single on 2x2
+        # tensors on the backend's device, then asserts that a non-contiguous (transposed) input
+        # raises ValueError "Tensors must be contiguous".
         store = dist.FileStore(self.file_name, self.world_size)
         dist.init_process_group(
             backend,
@@ -2860,8 +3515,13 @@ dist.init_process_group(rank=0, world_size=1, store=dist.HashStore())
 
 
 class ReduceOpTest(TestCase):
+    # [CLASS DOC] Tests of ReduceOp objects: isinstance relations, copy, pickle and equality for
+    # all built-in ops and premul-sum ops.
     # Ref: https://github.com/pytorch/pytorch/issues/87191
     def test_op_isinstance_of_reduceop(self):
+        # [FUNCTION DOC] Asserts every built-in op is an instance of ReduceOp, and for tensor and
+        # float scale factors that the private premul-sum constructor and PREMUL_SUM call return
+        # ReduceOp instances whose factor equals the scale.
         for reduce_op in (
             c10d.ReduceOp.SUM,
             c10d.ReduceOp.AVG,
@@ -2881,6 +3541,9 @@ class ReduceOpTest(TestCase):
 
     # Ref: https://github.com/pytorch/pytorch/pull/87303#discussion_r1002879700
     def test_reduceop_copyable(self):
+        # [FUNCTION DOC] Asserts shallow and deep copies (of the op and of a ReduceOp wrapped
+        # around it) equal the original for every built-in op, and the same for premul-sum ops
+        # with tensor and float scales.
         for reduce_op in (
             c10d.ReduceOp.SUM,
             c10d.ReduceOp.AVG,
@@ -2902,6 +3565,8 @@ class ReduceOpTest(TestCase):
             self.assertEqual(copy.deepcopy(reduce_op), reduce_op)
 
     def test_reduceop_pickle(self):
+        # [FUNCTION DOC] Asserts every built-in op can be pickled and unpickled, and a ReduceOp
+        # wrapping the op and premul-sum ops round trip to an equal object.
         for reduce_op in (
             c10d.ReduceOp.SUM,
             c10d.ReduceOp.AVG,
@@ -2921,6 +3586,11 @@ class ReduceOpTest(TestCase):
 
     # Ref: https://github.com/pytorch/pytorch/issues/90072
     def test_reduceop_equal(self):
+        # [FUNCTION DOC] For each built-in op wrapped in ReduceOp, asserts the wrapper equals
+        # itself and the raw op, differs from a non-op string, and that the raw op is not equal
+        # to the wrapper. Also asserts membership checks against None or the string are false.
+        # KNOWN ISSUE: per the in-test TODO the comparison is not symmetric (raw op vs wrapper is
+        # not equal while wrapper vs raw is), asserted as current behavior.
         not_reduceop = "abc"
         for reduce_op in (
             c10d.ReduceOp.SUM,
@@ -2949,15 +3619,21 @@ class ReduceOpTest(TestCase):
 
 
 class LocalRankTest(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test (world size 4) for the node local rank lookup, which reads
+    # the LOCAL_RANK environment variable.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning 4.
         return 4
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and removes the test's file_name, ignoring
+        # OSError.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -2965,23 +3641,34 @@ class LocalRankTest(MultiProcessTestCase):
             pass
 
     def testWithoutEnv(self):
+        # [FUNCTION DOC] Asserts that get_node_local_rank with no fallback raises RuntimeError
+        # mentioning LOCAL_RANK when that variable is not set.
         with self.assertRaisesRegex(RuntimeError, "LOCAL_RANK"):
             dist.get_node_local_rank()
 
     def testWithoutEnvWithFallback(self):
+        # [FUNCTION DOC] Asserts that with no LOCAL_RANK set the fallback rank argument (2) is
+        # returned.
         self.assertEqual(dist.get_node_local_rank(fallback_rank=2), 2)
 
     def testNodeLocalRankOverridesFallback(self):
+        # [FUNCTION DOC] Sets LOCAL_RANK to this rank and asserts the value is returned even
+        # though a fallback of 123 is given.
         os.environ["LOCAL_RANK"] = str(self.rank)
         self.assertEqual(dist.get_node_local_rank(fallback_rank=123), self.rank)
 
     def testNodeLocalRank(self):
+        # [FUNCTION DOC] Sets LOCAL_RANK to this rank and asserts get_node_local_rank returns it.
         os.environ["LOCAL_RANK"] = str(self.rank)
         self.assertEqual(dist.get_node_local_rank(), self.rank)
 
 
 class RecordCommTest(TestCase):
+    # [CLASS DOC] Tests the record_comm context manager that sets a profiling name for
+    # communications.
     def test_set_get(self):
+        # [FUNCTION DOC] Asserts the profiling name is empty initially, equals the given name
+        # inside the record_comm block and is empty again after it.
         self.assertEqual(torch._C._distributed_c10d._get_comm_profiling_name(), "")
         with dist.record_comm("test_name"):
             self.assertEqual(
@@ -2990,6 +3677,8 @@ class RecordCommTest(TestCase):
         self.assertEqual(torch._C._distributed_c10d._get_comm_profiling_name(), "")
 
     def test_nesting(self):
+        # [FUNCTION DOC] Asserts nested record_comm blocks show the innermost name inside and
+        # restore the outer name and then the empty name on exit.
         with dist.record_comm("outer"):
             self.assertEqual(
                 torch._C._distributed_c10d._get_comm_profiling_name(), "outer"
@@ -3048,6 +3737,10 @@ _TLS_DECL_RE = re.compile(
 
 
 class ThreadLocalSafetyLintTest(TestCase):
+    # [CLASS DOC] Lint-style test that scans the c10d C++ sources for thread_local variables and
+    # fails on any whose type is not trivially destructible, because such destructors register
+    # with a libc mutex that can deadlock a forked child. Class attribute _KNOWN_VIOLATIONS lists
+    # allowed (relative path, variable name) pairs.
     """Lint: every thread_local in c10d must use a trivially-destructible type.
 
     Non-trivially-destructible thread_local variables (std::string,
@@ -3068,6 +3761,9 @@ class ThreadLocalSafetyLintTest(TestCase):
 
     @staticmethod
     def _c10d_src_dir() -> Path:
+        # [FUNCTION DOC] HELPER: Staticmethod returning the path of torch/csrc/distributed/c10d,
+        # computed as two directory levels above this file's directory (the repository root) plus
+        # that relative path.
         # test file:  caffe2/test/distributed/test_c10d_common.py
         # source dir: caffe2/torch/csrc/distributed/c10d/
         return (
@@ -3080,6 +3776,10 @@ class ThreadLocalSafetyLintTest(TestCase):
 
     @staticmethod
     def _is_safe_type(type_str: str) -> bool:
+        # [FUNCTION DOC] HELPER: Staticmethod. Strips const, volatile, mutable and inline
+        # qualifiers from a C++ type string; returns True if the result ends with a star
+        # (pointer) or fully matches the whitelist regex of scalar types (bool, sized ints, int,
+        # size_t, float, double, char, signed and unsigned variants, short, long), else False.
         """Return True if *type_str* is trivially destructible."""
         cleaned = type_str.strip()
         # Remove const / volatile / mutable qualifiers for matching
@@ -3091,6 +3791,13 @@ class ThreadLocalSafetyLintTest(TestCase):
         return bool(_SAFE_TLS_TYPE_RE.fullmatch(cleaned))
 
     def test_no_non_trivial_thread_locals(self):
+        # [FUNCTION DOC] Asserts the c10d source directory exists, then reads every cpp, hpp, h
+        # and cc file under it line by line. For lines mentioning thread_local (skipping comment-
+        # starting lines and static_assert lines) it matches a declaration regex, also trying the
+        # line joined with the next one for declarations split over two lines. Declarations with
+        # unsafe types, not in the known-violations allowlist (matched by relative path and
+        # variable name without class qualifiers), are collected as path:line messages, and the
+        # test fails if any are found. Reads files only.
         """Scan c10d sources for thread_local with non-trivial destructors."""
         c10d_dir = self._c10d_src_dir()
         self.assertTrue(
