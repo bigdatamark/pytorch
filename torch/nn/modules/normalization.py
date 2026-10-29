@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Normalization layers: LocalResponseNorm, CrossMapLRN2d, LayerNorm, GroupNorm,
+# RMSNorm.
+# Each is a thin Module that stores hyperparameters (and learnable scale/shift parameters where
+# applicable) and delegates computation to torch.nn.functional or the autograd Function in
+# _functions. No import-time side effects beyond defining the classes and __all__.
 import numbers
 
 import torch
@@ -14,6 +19,9 @@ __all__ = ["LocalResponseNorm", "CrossMapLRN2d", "LayerNorm", "GroupNorm", "RMSN
 
 
 class LocalResponseNorm(Module):
+    # [CLASS DOC] Local response normalization across channels (functional local_response_norm).
+    # State: size (neighborhood width), alpha, beta, k, all plain floats/ints kept as constants.
+    # No learnable parameters or buffers. forward returns a tensor of the input's shape.
     r"""Applies local response normalization over an input signal.
 
     The input signal is composed of several input planes, where channels occupy the second dimension.
@@ -52,6 +60,7 @@ class LocalResponseNorm(Module):
     def __init__(
         self, size: int, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0
     ) -> None:
+        # [FUNCTION DOC] Store size, alpha, beta and k on the module. No validation is performed.
         super().__init__()
         self.size = size
         self.alpha = alpha
@@ -59,12 +68,17 @@ class LocalResponseNorm(Module):
         self.k = k
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply local response normalization to the input tensor using the stored
+        # size, alpha,
+        # beta and k; returns a tensor with the same shape as the input.
         """
         Runs the forward pass.
         """
         return F.local_response_norm(input, self.size, self.alpha, self.beta, self.k)
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Return a string with size, alpha, beta and k for the module
+        # repr.
         """
         Return the extra representation of the module.
         """
@@ -72,6 +86,8 @@ class LocalResponseNorm(Module):
 
 
 class CrossMapLRN2d(Module):
+    # [CLASS DOC] Cross-map local response normalization for 4D inputs, implemented through the
+    # custom autograd Function in _functions. State: size, alpha, beta, k. No parameters/buffers.
     size: int
     alpha: float
     beta: float
@@ -80,6 +96,8 @@ class CrossMapLRN2d(Module):
     def __init__(
         self, size: int, alpha: float = 1e-4, beta: float = 0.75, k: float = 1
     ) -> None:
+        # [FUNCTION DOC] Store size, alpha, beta and k (k defaults to an integer 1). No
+        # validation is performed.
         super().__init__()
         self.size = size
         self.alpha = alpha
@@ -87,12 +105,17 @@ class CrossMapLRN2d(Module):
         self.k = k
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply the custom CrossMapLRN2d autograd Function to the input with the
+        # stored
+        # hyperparameters; returns the normalized tensor and supports backward.
         """
         Runs the forward pass.
         """
         return _cross_map_lrn2d.apply(input, self.size, self.alpha, self.beta, self.k)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with size, alpha, beta and k for the module
+        # repr.
         """
         Return the extra representation of the module.
         """
@@ -103,6 +126,13 @@ _shape_t = int | list[int] | Size
 
 
 class LayerNorm(Module):
+    # [CLASS DOC] Layer normalization over the trailing dimensions given by normalized_shape.
+    # State: normalized_shape (tuple of ints), eps, elementwise_affine, and optional learnable
+    # weight
+    # and bias parameters (each shaped like normalized_shape; either may be None). Invariant:
+    # when
+    # elementwise_affine is false both weight and bias are None. Key methods: reset_parameters,
+    # forward.
     r"""Applies Layer Normalization over a mini-batch of inputs.
 
     This layer implements the operation as described in
@@ -194,6 +224,13 @@ class LayerNorm(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Build the module. An integer normalized_shape is turned into a one
+        # element tuple and any
+        # sequence is converted to a tuple. If elementwise_affine, create weight (and bias unless
+        # bias
+        # is false) as uninitialized parameters on the given device/dtype; otherwise register
+        # both as
+        # None. Finishes by calling reset_parameters.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         if isinstance(normalized_shape, numbers.Integral):
@@ -219,17 +256,25 @@ class LayerNorm(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Initialize weight to ones and bias to zeros (each only if present);
+        # mutates in place.
         if self.elementwise_affine:
             init.ones_(self.weight)
             if self.bias is not None:
                 init.zeros_(self.bias)
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional layer_norm over the trailing normalized_shape
+        # dimensions using the
+        # stored weight, bias and eps; returns a tensor of the input's shape.
         return F.layer_norm(
             input, self.normalized_shape, self.weight, self.bias, self.eps
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with normalized_shape, eps, elementwise_affine
+        # and whether a bias
+        # exists.
         return (
             "{normalized_shape}, eps={eps}, elementwise_affine={elementwise_affine}, "
             "bias={use_bias}".format(**self.__dict__, use_bias=self.bias is not None)
@@ -237,6 +282,11 @@ class LayerNorm(Module):
 
 
 class GroupNorm(Module):
+    # [CLASS DOC] Group normalization: splits channels into num_groups groups and normalizes each
+    # group per sample. State: num_groups, num_channels, eps, affine, and optional learnable
+    # weight
+    # and bias parameters of length num_channels (None when affine is false, bias may be None).
+    # Invariant: num_channels is divisible by num_groups. Key methods: reset_parameters, forward.
     r"""Applies Group Normalization over a mini-batch of inputs.
 
     This layer implements the operation as described in
@@ -301,6 +351,12 @@ class GroupNorm(Module):
         *,
         bias: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Build the module. Raises ValueError if num_channels is not divisible by
+        # num_groups.
+        # Stores the hyperparameters; if affine, creates weight (and bias unless bias is false)
+        # of
+        # length num_channels, else registers them as None. Calls reset_parameters.
+        # KNOWN ISSUE: a num_groups of zero raises ZeroDivisionError rather than a clear error.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         if num_channels % num_groups != 0:
@@ -325,15 +381,22 @@ class GroupNorm(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Initialize weight to ones and bias to zeros (each only if present);
+        # mutates in place.
         if self.affine:
             init.ones_(self.weight)
             if self.bias is not None:
                 init.zeros_(self.bias)
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional group_norm with the stored num_groups, weight, bias and
+        # eps; returns
+        # a tensor of the input's shape.
         return F.group_norm(input, self.num_groups, self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with num_groups, num_channels, eps, affine and
+        # bias presence.
         return (
             "{num_groups}, {num_channels}, eps={eps}, affine={affine}, "
             "bias={use_bias}".format(**self.__dict__, use_bias=self.bias is not None)
@@ -341,6 +404,11 @@ class GroupNorm(Module):
 
 
 class RMSNorm(Module):
+    # [CLASS DOC] Root mean square normalization over the trailing normalized_shape dimensions.
+    # State: normalized_shape (tuple of ints), eps (None means the functional default based on
+    # the
+    # input dtype), elementwise_affine, and an optional learnable weight (None when not affine);
+    # there is no bias. Key methods: reset_parameters, forward.
     r"""Applies Root Mean Square Layer Normalization over a mini-batch of inputs.
 
     This layer implements the operation as described in
@@ -397,6 +465,12 @@ class RMSNorm(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Build the module. An integer normalized_shape becomes a one element
+        # tuple, other
+        # sequences are converted to a tuple. If elementwise_affine, create an uninitialized
+        # weight
+        # parameter on the given device/dtype, else register weight as None. Calls
+        # reset_parameters.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         if isinstance(normalized_shape, numbers.Integral):
@@ -414,6 +488,7 @@ class RMSNorm(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Initialize weight to ones when it exists; mutates in place.
         """
         Resets parameters based on their initialization used in __init__.
         """
@@ -421,12 +496,17 @@ class RMSNorm(Module):
             init.ones_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Apply functional rms_norm with normalized_shape, weight and eps; returns
+        # a tensor of the
+        # input's shape.
         """
         Runs the forward pass.
         """
         return F.rms_norm(x, self.normalized_shape, self.weight, self.eps)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with normalized_shape, eps and
+        # elementwise_affine.
         """
         Return the extra representation of the module.
         """

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Padding modules: Circular, Constant, Reflection, Replication and Zero padding for
+# 1D/2D/3D inputs. Each public class stores a normalized padding tuple and calls functional pad
+# with the matching mode. Private base classes (_CircularPadNd, _ConstantPadNd, _ReflectionPadNd,
+# _ReplicationPadNd) hold shared forward and repr logic. No import-time side effects.
 from collections.abc import Sequence
 
 import torch.nn.functional as F
@@ -31,21 +35,36 @@ __all__ = [
 
 
 class _CircularPadNd(Module):
+    # [CLASS DOC] HELPER: Base class for circular padding modules. Holds padding (sequence of
+    # ints) as a
+    # constant. Subclasses set padding and override _check_input_dim; forward validates then
+    # pads.
     __constants__ = ["padding"]
     padding: Sequence[int]
 
     def _check_input_dim(self, input):
+        # [FUNCTION DOC] HELPER: Abstract rank check; raises NotImplementedError in the base
+        # class.
         raise NotImplementedError
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Validate the input rank via _check_input_dim, then apply functional pad
+        # with circular
+        # mode (wrap-around) using the stored padding; returns the padded tensor.
         self._check_input_dim(input)
         return F.pad(input, self.padding, "circular")
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with the padding tuple for the module repr.
         return f"{self.padding}"
 
 
 class CircularPad1d(_CircularPadNd):
+    # [CLASS DOC] CircularPad1d pads the last 1 dimension(s) of the input using circular mode via
+    # functional pad.
+    # State: padding, a tuple of 2 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using circular padding of the input boundary.
 
     Tensor values at the beginning of the dimension are used to pad the end,
@@ -88,15 +107,24 @@ class CircularPad1d(_CircularPadNd):
     padding: tuple[int, int]
 
     def __init__(self, padding: _size_2_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 2 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _pair(padding)
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Validate input rank; raises ValueError unless the input has 2 or
+        # 3 dimensions.
         if input.dim() != 2 and input.dim() != 3:
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
 
 class CircularPad2d(_CircularPadNd):
+    # [CLASS DOC] CircularPad2d pads the last 2 dimension(s) of the input using circular mode via
+    # functional pad.
+    # State: padding, a tuple of 4 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using circular padding of the input boundary.
 
     Tensor values at the beginning of the dimension are used to pad the end,
@@ -149,15 +177,24 @@ class CircularPad2d(_CircularPadNd):
     padding: tuple[int, int, int, int]
 
     def __init__(self, padding: _size_4_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 4 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _quadruple(padding)
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Validate input rank; raises ValueError unless the input has 3 or
+        # 4 dimensions.
         if input.dim() != 3 and input.dim() != 4:
             raise ValueError(f"expected 3D or 4D input (got {input.dim()}D input)")
 
 
 class CircularPad3d(_CircularPadNd):
+    # [CLASS DOC] CircularPad3d pads the last 3 dimension(s) of the input using circular mode via
+    # functional pad.
+    # State: padding, a tuple of 6 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using circular padding of the input boundary.
 
     Tensor values at the beginning of the dimension are used to pad the end,
@@ -200,31 +237,48 @@ class CircularPad3d(_CircularPadNd):
     padding: tuple[int, int, int, int, int, int]
 
     def __init__(self, padding: _size_6_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 6 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _ntuple(6)(padding)
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Validate input rank; raises ValueError unless the input has 4 or
+        # 5 dimensions.
         if input.dim() != 4 and input.dim() != 5:
             raise ValueError(f"expected 4D or 5D input (got {input.dim()}D input)")
 
 
 class _ConstantPadNd(Module):
+    # [CLASS DOC] HELPER: Base class for constant padding modules. Holds value (fill number) and
+    # padding
+    # (set by subclasses). forward pads with the constant value via functional pad.
     __constants__ = ["padding", "value"]
     value: float
     padding: Sequence[int]
 
     def __init__(self, value: float) -> None:
+        # [FUNCTION DOC] HELPER: Store the fill value; subclasses set padding afterwards.
         super().__init__()
         self.value = value
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional pad in constant mode with the stored padding and fill
+        # value; returns
+        # the padded tensor.
         return F.pad(input, self.padding, "constant", self.value)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with padding and value for the module repr.
         return f"padding={self.padding}, value={self.value}"
 
 
 class ConstantPad1d(_ConstantPadNd):
+    # [CLASS DOC] ConstantPad1d pads the last 1 dimension(s) of the input using constant mode via
+    # functional pad.
+    # State: padding, a tuple of 2 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor boundaries with a constant value.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -272,11 +326,17 @@ class ConstantPad1d(_ConstantPadNd):
     padding: tuple[int, int]
 
     def __init__(self, padding: _size_2_t, value: float) -> None:
+        # [FUNCTION DOC] Store padding as a tuple of 2 ints and the constant fill value.
         super().__init__(value)
         self.padding = _pair(padding)
 
 
 class ConstantPad2d(_ConstantPadNd):
+    # [CLASS DOC] ConstantPad2d pads the last 2 dimension(s) of the input using constant mode via
+    # functional pad.
+    # State: padding, a tuple of 4 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor boundaries with a constant value.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -324,11 +384,17 @@ class ConstantPad2d(_ConstantPadNd):
     padding: tuple[int, int, int, int]
 
     def __init__(self, padding: _size_4_t, value: float) -> None:
+        # [FUNCTION DOC] Store padding as a tuple of 4 ints and the constant fill value.
         super().__init__(value)
         self.padding = _quadruple(padding)
 
 
 class ConstantPad3d(_ConstantPadNd):
+    # [CLASS DOC] ConstantPad3d pads the last 3 dimension(s) of the input using constant mode via
+    # functional pad.
+    # State: padding, a tuple of 6 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor boundaries with a constant value.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -365,22 +431,35 @@ class ConstantPad3d(_ConstantPadNd):
     padding: tuple[int, int, int, int, int, int]
 
     def __init__(self, padding: _size_6_t, value: float) -> None:
+        # [FUNCTION DOC] Store padding as a tuple of 6 ints and the constant fill value.
         super().__init__(value)
         self.padding = _ntuple(6)(padding)
 
 
 class _ReflectionPadNd(Module):
+    # [CLASS DOC] HELPER: Base class for reflection padding modules. Holds padding (sequence of
+    # ints), set
+    # by subclasses. forward pads in reflect mode via functional pad.
     __constants__ = ["padding"]
     padding: Sequence[int]
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional pad in reflect mode (mirror without repeating the edge)
+        # with the stored
+        # padding; returns the padded tensor. Rank and size errors come from functional pad.
         return F.pad(input, self.padding, "reflect")
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with the padding tuple for the module repr.
         return f"{self.padding}"
 
 
 class ReflectionPad1d(_ReflectionPadNd):
+    # [CLASS DOC] ReflectionPad1d pads the last 1 dimension(s) of the input using reflect mode
+    # via functional pad.
+    # State: padding, a tuple of 2 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using the reflection of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -419,11 +498,18 @@ class ReflectionPad1d(_ReflectionPadNd):
     padding: tuple[int, int]
 
     def __init__(self, padding: _size_2_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 2 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _pair(padding)
 
 
 class ReflectionPad2d(_ReflectionPadNd):
+    # [CLASS DOC] ReflectionPad2d pads the last 2 dimension(s) of the input using reflect mode
+    # via functional pad.
+    # State: padding, a tuple of 4 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using the reflection of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -473,11 +559,18 @@ class ReflectionPad2d(_ReflectionPadNd):
     padding: tuple[int, int, int, int]
 
     def __init__(self, padding: _size_4_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 4 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _quadruple(padding)
 
 
 class ReflectionPad3d(_ReflectionPadNd):
+    # [CLASS DOC] ReflectionPad3d pads the last 3 dimension(s) of the input using reflect mode
+    # via functional pad.
+    # State: padding, a tuple of 6 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using the reflection of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -529,22 +622,36 @@ class ReflectionPad3d(_ReflectionPadNd):
     padding: tuple[int, int, int, int, int, int]
 
     def __init__(self, padding: _size_6_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 6 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _ntuple(6)(padding)
 
 
 class _ReplicationPadNd(Module):
+    # [CLASS DOC] HELPER: Base class for replication padding modules. Holds padding (sequence of
+    # ints), set
+    # by subclasses. forward pads in replicate mode via functional pad.
     __constants__ = ["padding"]
     padding: Sequence[int]
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional pad in replicate mode (repeat the edge values) with the
+        # stored padding;
+        # returns the padded tensor. Rank and size errors come from functional pad.
         return F.pad(input, self.padding, "replicate")
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with the padding tuple for the module repr.
         return f"{self.padding}"
 
 
 class ReplicationPad1d(_ReplicationPadNd):
+    # [CLASS DOC] ReplicationPad1d pads the last 1 dimension(s) of the input using replicate mode
+    # via functional pad.
+    # State: padding, a tuple of 2 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using replication of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -583,11 +690,18 @@ class ReplicationPad1d(_ReplicationPadNd):
     padding: tuple[int, int]
 
     def __init__(self, padding: _size_2_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 2 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _pair(padding)
 
 
 class ReplicationPad2d(_ReplicationPadNd):
+    # [CLASS DOC] ReplicationPad2d pads the last 2 dimension(s) of the input using replicate mode
+    # via functional pad.
+    # State: padding, a tuple of 4 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using replication of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -637,11 +751,18 @@ class ReplicationPad2d(_ReplicationPadNd):
     padding: tuple[int, int, int, int]
 
     def __init__(self, padding: _size_4_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 4 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _quadruple(padding)
 
 
 class ReplicationPad3d(_ReplicationPadNd):
+    # [CLASS DOC] ReplicationPad3d pads the last 3 dimension(s) of the input using replicate mode
+    # via functional pad.
+    # State: padding, a tuple of 6 ints (before/after amounts per dimension, last dimension
+    # first); an int
+    # argument is expanded to every side. Output has the padded spatial sizes; no parameters.
     r"""Pads the input tensor using replication of the input boundary.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -680,11 +801,15 @@ class ReplicationPad3d(_ReplicationPadNd):
     padding: tuple[int, int, int, int, int, int]
 
     def __init__(self, padding: _size_6_t) -> None:
+        # [FUNCTION DOC] Store padding expanded to a tuple of 6 ints from an int or tuple
+        # argument.
         super().__init__()
         self.padding = _ntuple(6)(padding)
 
 
 class ZeroPad1d(ConstantPad1d):
+    # [CLASS DOC] ZeroPad1d is ConstantPad1d with the fill value fixed at 0.0; pads 1 trailing
+    # dimension(s). State: padding, a tuple of 2 ints. No parameters.
     r"""Pads the input tensor boundaries with zero.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -731,9 +856,12 @@ class ZeroPad1d(ConstantPad1d):
     padding: tuple[int, int]
 
     def __init__(self, padding: _size_2_t) -> None:
+        # [FUNCTION DOC] Delegate to the ConstantPad1d initializer with padding and a fill value
+        # of 0.0.
         super().__init__(padding, 0.0)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with only the padding tuple for the module repr.
         """
         Return the extra representation of the module.
         """
@@ -741,6 +869,8 @@ class ZeroPad1d(ConstantPad1d):
 
 
 class ZeroPad2d(ConstantPad2d):
+    # [CLASS DOC] ZeroPad2d is ConstantPad2d with the fill value fixed at 0.0; pads 2 trailing
+    # dimension(s). State: padding, a tuple of 4 ints. No parameters.
     r"""Pads the input tensor boundaries with zero.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -788,9 +918,12 @@ class ZeroPad2d(ConstantPad2d):
     padding: tuple[int, int, int, int]
 
     def __init__(self, padding: _size_4_t) -> None:
+        # [FUNCTION DOC] Delegate to the ConstantPad2d initializer with padding and a fill value
+        # of 0.0.
         super().__init__(padding, 0.0)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with only the padding tuple for the module repr.
         """
         Return the extra representation of the module.
         """
@@ -798,6 +931,8 @@ class ZeroPad2d(ConstantPad2d):
 
 
 class ZeroPad3d(ConstantPad3d):
+    # [CLASS DOC] ZeroPad3d is ConstantPad3d with the fill value fixed at 0.0; pads 3 trailing
+    # dimension(s). State: padding, a tuple of 6 ints. No parameters.
     r"""Pads the input tensor boundaries with zero.
 
     For `N`-dimensional padding, use :func:`torch.nn.functional.pad()`.
@@ -833,9 +968,12 @@ class ZeroPad3d(ConstantPad3d):
     padding: tuple[int, int, int, int, int, int]
 
     def __init__(self, padding: _size_6_t) -> None:
+        # [FUNCTION DOC] Delegate to the ConstantPad3d initializer with padding and a fill value
+        # of 0.0.
         super().__init__(padding, 0.0)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with only the padding tuple for the module repr.
         """
         Return the extra representation of the module.
         """

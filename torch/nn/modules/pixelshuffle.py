@@ -1,3 +1,5 @@
+# [MODULE DOC] Pixel rearrangement modules PixelShuffle and PixelUnshuffle, thin wrappers over
+# the functional pixel_shuffle / pixel_unshuffle. No import-time side effects.
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -8,6 +10,10 @@ __all__ = ["PixelShuffle", "PixelUnshuffle"]
 
 
 class PixelShuffle(Module):
+    # [CLASS DOC] Rearranges a tensor of shape (*, C*r^2, H, W) into (*, C, H*r, W*r) with r the
+    # upscale
+    # factor, trading channels for spatial resolution. State: upscale_factor (int constant). No
+    # parameters or buffers.
     r"""Rearrange elements in a tensor according to an upscaling factor.
 
     Rearranges elements in a tensor of shape :math:`(*, C \times r^2, H, W)`
@@ -52,16 +58,22 @@ class PixelShuffle(Module):
     upscale_factor: int
 
     def __init__(self, upscale_factor: int) -> None:
+        # [FUNCTION DOC] Store upscale_factor. No validation here; errors surface in the
+        # functional call.
         super().__init__()
         self.upscale_factor = upscale_factor
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional pixel_shuffle with the stored upscale_factor; returns
+        # the rearranged
+        # tensor. Errors for incompatible channel counts come from the functional op.
         """
         Runs the forward pass.
         """
         return F.pixel_shuffle(input, self.upscale_factor)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with upscale_factor for the module repr.
         """
         Return the extra representation of the module.
         """
@@ -69,6 +81,11 @@ class PixelShuffle(Module):
 
 
 class PixelUnshuffle(Module):
+    # [CLASS DOC] Inverse of PixelShuffle: rearranges (*, C, H*r, W*r) into (*, C*r^2, H, W) with
+    # r the
+    # downscale factor, moving spatial blocks into channels. State: downscale_factor (int
+    # constant).
+    # No parameters or buffers.
     r"""Reverse the PixelShuffle operation.
 
     Reverses the :class:`~torch.nn.PixelShuffle` operation by rearranging elements
@@ -111,16 +128,22 @@ class PixelUnshuffle(Module):
     downscale_factor: int
 
     def __init__(self, downscale_factor: int) -> None:
+        # [FUNCTION DOC] Store downscale_factor. No validation here; errors surface in the
+        # functional call.
         super().__init__()
         self.downscale_factor = downscale_factor
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional pixel_unshuffle with the stored downscale_factor;
+        # returns the
+        # rearranged tensor. Errors for non-divisible spatial sizes come from the functional op.
         """
         Runs the forward pass.
         """
         return F.pixel_unshuffle(input, self.downscale_factor)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with downscale_factor for the module repr.
         """
         Return the extra representation of the module.
         """

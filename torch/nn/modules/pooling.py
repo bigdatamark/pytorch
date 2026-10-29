@@ -1,3 +1,7 @@
+# [MODULE DOC] Pooling modules: max, max-unpool, average, fractional max, Lp, adaptive max and
+# adaptive average pooling in 1D/2D/3D. Each class stores hyperparameters and delegates to
+# torch.nn.functional. Private _*PoolNd base classes share init and repr logic. No import-time
+# side effects beyond defining the classes and __all__.
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.common_types import (
@@ -41,6 +45,10 @@ __all__ = [
 
 
 class _MaxPoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for max pooling modules. State: kernel_size, stride
+    # (defaults to
+    # kernel_size when None), padding, dilation, return_indices, ceil_mode. Subclasses define
+    # forward.
     __constants__ = [
         "kernel_size",
         "stride",
@@ -61,6 +69,9 @@ class _MaxPoolNd(Module):
         return_indices: bool = False,
         ceil_mode: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Store pooling hyperparameters as given (no per-dimension expansion or
+        # validation); stride
+        # falls back to kernel_size when None.
         super().__init__()
         self.kernel_size = kernel_size
         self.stride = stride if (stride is not None) else kernel_size
@@ -70,6 +81,9 @@ class _MaxPoolNd(Module):
         self.ceil_mode = ceil_mode
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with kernel_size, stride, padding, dilation and
+        # ceil_mode.
+        # KNOWN ISSUE: return_indices is not included in the representation.
         return (
             "kernel_size={kernel_size}, stride={stride}, padding={padding}"
             ", dilation={dilation}, ceil_mode={ceil_mode}".format(**self.__dict__)
@@ -77,6 +91,10 @@ class _MaxPoolNd(Module):
 
 
 class MaxPool1d(_MaxPoolNd):
+    # [CLASS DOC] Applies max pooling over 1 spatial dimension(s) of the input via functional
+    # max_pool1d.
+    # State is inherited from _MaxPoolNd; no learnable parameters. May also return argmax
+    # indices.
     r"""Applies a 1D max pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, L)`
@@ -140,6 +158,11 @@ class MaxPool1d(_MaxPoolNd):
     dilation: _size_1_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional max_pool1d with the stored kernel_size, stride,
+        # padding, dilation,
+        # ceil_mode and return_indices; returns the pooled tensor, or a (values, indices) pair
+        # when
+        # return_indices is true.
         """Runs the forward pass."""
         return F.max_pool1d(
             input,
@@ -153,6 +176,10 @@ class MaxPool1d(_MaxPoolNd):
 
 
 class MaxPool2d(_MaxPoolNd):
+    # [CLASS DOC] Applies max pooling over 2 spatial dimension(s) of the input via functional
+    # max_pool2d.
+    # State is inherited from _MaxPoolNd; no learnable parameters. May also return argmax
+    # indices.
     r"""Applies a 2D max pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, H, W)`,
@@ -220,6 +247,11 @@ class MaxPool2d(_MaxPoolNd):
     dilation: _size_2_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional max_pool2d with the stored kernel_size, stride,
+        # padding, dilation,
+        # ceil_mode and return_indices; returns the pooled tensor, or a (values, indices) pair
+        # when
+        # return_indices is true.
         """Runs the forward pass."""
         return F.max_pool2d(
             input,
@@ -233,6 +265,10 @@ class MaxPool2d(_MaxPoolNd):
 
 
 class MaxPool3d(_MaxPoolNd):
+    # [CLASS DOC] Applies max pooling over 3 spatial dimension(s) of the input via functional
+    # max_pool3d.
+    # State is inherited from _MaxPoolNd; no learnable parameters. May also return argmax
+    # indices.
     r"""Applies a 3D max pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, D, H, W)`,
@@ -304,6 +340,11 @@ class MaxPool3d(_MaxPoolNd):
     dilation: _size_3_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional max_pool3d with the stored kernel_size, stride,
+        # padding, dilation,
+        # ceil_mode and return_indices; returns the pooled tensor, or a (values, indices) pair
+        # when
+        # return_indices is true.
         """Runs the forward pass."""
         return F.max_pool3d(
             input,
@@ -317,11 +358,20 @@ class MaxPool3d(_MaxPoolNd):
 
 
 class _MaxUnpoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for max unpooling modules; supplies a shared repr over
+    # kernel_size,
+    # stride and padding. Subclasses set those attributes and implement forward.
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with kernel_size, stride and padding for the
+        # module repr.
         return f"kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}"
 
 
 class MaxUnpool1d(_MaxUnpoolNd):
+    # [CLASS DOC] Computes the partial inverse of MaxPool1d: scatters input values to the
+    # positions given by
+    # indices and leaves the rest zero. State: kernel_size, stride, padding as tuples. No
+    # parameters.
     r"""Computes a partial inverse of :class:`MaxPool1d`.
 
     :class:`MaxPool1d` is not fully invertible, since the non-maximal values are lost.
@@ -390,6 +440,9 @@ class MaxUnpool1d(_MaxUnpoolNd):
         stride: _size_1_t | None = None,
         padding: _size_1_t = 0,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size, stride (defaults to kernel_size when None) and
+        # padding, each expanded to
+        # a 1-element tuple.
         super().__init__()
         self.kernel_size = _single(kernel_size)
         self.stride = _single(stride if (stride is not None) else kernel_size)
@@ -398,6 +451,10 @@ class MaxUnpool1d(_MaxUnpoolNd):
     def forward(
         self, input: Tensor, indices: Tensor, output_size: list[int] | None = None
     ) -> Tensor:
+        # [FUNCTION DOC] Apply functional max_unpool1d to input using indices and the stored
+        # kernel_size, stride
+        # and padding; output_size optionally fixes the output shape. Returns the unpooled
+        # tensor.
         """Runs the forward pass."""
         return F.max_unpool1d(
             input, indices, self.kernel_size, self.stride, self.padding, output_size
@@ -405,6 +462,10 @@ class MaxUnpool1d(_MaxUnpoolNd):
 
 
 class MaxUnpool2d(_MaxUnpoolNd):
+    # [CLASS DOC] Computes the partial inverse of MaxPool2d: scatters input values to the
+    # positions given by
+    # indices and leaves the rest zero. State: kernel_size, stride, padding as tuples. No
+    # parameters.
     r"""Computes a partial inverse of :class:`MaxPool2d`.
 
     :class:`MaxPool2d` is not fully invertible, since the non-maximal values are lost.
@@ -486,6 +547,9 @@ class MaxUnpool2d(_MaxUnpoolNd):
         stride: _size_2_t | None = None,
         padding: _size_2_t = 0,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size, stride (defaults to kernel_size when None) and
+        # padding, each expanded to
+        # a 2-element tuple.
         super().__init__()
         self.kernel_size = _pair(kernel_size)
         self.stride = _pair(stride if (stride is not None) else kernel_size)
@@ -494,6 +558,10 @@ class MaxUnpool2d(_MaxUnpoolNd):
     def forward(
         self, input: Tensor, indices: Tensor, output_size: list[int] | None = None
     ) -> Tensor:
+        # [FUNCTION DOC] Apply functional max_unpool2d to input using indices and the stored
+        # kernel_size, stride
+        # and padding; output_size optionally fixes the output shape. Returns the unpooled
+        # tensor.
         """Runs the forward pass."""
         return F.max_unpool2d(
             input, indices, self.kernel_size, self.stride, self.padding, output_size
@@ -501,6 +569,10 @@ class MaxUnpool2d(_MaxUnpoolNd):
 
 
 class MaxUnpool3d(_MaxUnpoolNd):
+    # [CLASS DOC] Computes the partial inverse of MaxPool3d: scatters input values to the
+    # positions given by
+    # indices and leaves the rest zero. State: kernel_size, stride, padding as tuples. No
+    # parameters.
     r"""Computes a partial inverse of :class:`MaxPool3d`.
 
     :class:`MaxPool3d` is not fully invertible, since the non-maximal values are lost.
@@ -565,6 +637,9 @@ class MaxUnpool3d(_MaxUnpoolNd):
         stride: _size_3_t | None = None,
         padding: _size_3_t = 0,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size, stride (defaults to kernel_size when None) and
+        # padding, each expanded to
+        # a 3-element tuple.
         super().__init__()
         self.kernel_size = _triple(kernel_size)
         self.stride = _triple(stride if (stride is not None) else kernel_size)
@@ -573,6 +648,10 @@ class MaxUnpool3d(_MaxUnpoolNd):
     def forward(
         self, input: Tensor, indices: Tensor, output_size: list[int] | None = None
     ) -> Tensor:
+        # [FUNCTION DOC] Apply functional max_unpool3d to input using indices and the stored
+        # kernel_size, stride
+        # and padding; output_size optionally fixes the output shape. Returns the unpooled
+        # tensor.
         """Runs the forward pass."""
         return F.max_unpool3d(
             input, indices, self.kernel_size, self.stride, self.padding, output_size
@@ -580,6 +659,9 @@ class MaxUnpool3d(_MaxUnpoolNd):
 
 
 class _AvgPoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for average pooling modules; supplies a shared repr.
+    # Subclasses set
+    # kernel_size, stride, padding, ceil_mode, count_include_pad and implement forward.
     __constants__ = [
         "kernel_size",
         "stride",
@@ -589,10 +671,17 @@ class _AvgPoolNd(Module):
     ]
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with kernel_size, stride and padding for the
+        # module repr.
+        # KNOWN ISSUE: ceil_mode and count_include_pad are not included in the representation.
         return f"kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}"
 
 
 class AvgPool1d(_AvgPoolNd):
+    # [CLASS DOC] Applies average pooling over one spatial dimension via functional avg_pool1d.
+    # State:
+    # kernel_size, stride, padding (1-element tuples), ceil_mode, count_include_pad. No
+    # parameters.
     r"""Applies a 1D average pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, L)`,
@@ -658,6 +747,10 @@ class AvgPool1d(_AvgPoolNd):
         ceil_mode: bool = False,
         count_include_pad: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size, stride (defaults to kernel_size when None) and
+        # padding as 1-element
+        # tuples, plus ceil_mode and count_include_pad.
+        # KNOWN ISSUE: stride is annotated as a non-optional size although None is accepted.
         super().__init__()
         self.kernel_size = _single(kernel_size)
         self.stride = _single(stride if stride is not None else kernel_size)
@@ -666,6 +759,8 @@ class AvgPool1d(_AvgPoolNd):
         self.count_include_pad = count_include_pad
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional avg_pool1d with the stored settings; returns the pooled
+        # tensor.
         """Runs the forward pass."""
         return F.avg_pool1d(
             input,
@@ -678,6 +773,9 @@ class AvgPool1d(_AvgPoolNd):
 
 
 class AvgPool2d(_AvgPoolNd):
+    # [CLASS DOC] Applies average pooling over 2 spatial dimensions via functional avg_pool2d.
+    # State: kernel_size,
+    # stride, padding, ceil_mode, count_include_pad, divisor_override. No parameters.
     r"""Applies a 2D average pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, H, W)`,
@@ -766,6 +864,9 @@ class AvgPool2d(_AvgPoolNd):
         count_include_pad: bool = True,
         divisor_override: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store pooling hyperparameters as given (no tuple expansion); stride
+        # defaults to
+        # kernel_size when None. divisor_override, if set, replaces the averaging divisor.
         super().__init__()
         self.kernel_size = kernel_size
         self.stride = stride if (stride is not None) else kernel_size
@@ -775,6 +876,9 @@ class AvgPool2d(_AvgPoolNd):
         self.divisor_override = divisor_override
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional avg_pool2d with the stored settings including
+        # divisor_override;
+        # returns the pooled tensor.
         """Runs the forward pass."""
         return F.avg_pool2d(
             input,
@@ -788,6 +892,9 @@ class AvgPool2d(_AvgPoolNd):
 
 
 class AvgPool3d(_AvgPoolNd):
+    # [CLASS DOC] Applies average pooling over 3 spatial dimensions via functional avg_pool3d.
+    # State: kernel_size,
+    # stride, padding, ceil_mode, count_include_pad, divisor_override. No parameters.
     r"""Applies a 3D average pooling over an input signal composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, D, H, W)`,
@@ -883,6 +990,9 @@ class AvgPool3d(_AvgPoolNd):
         count_include_pad: bool = True,
         divisor_override: int | None = None,
     ) -> None:
+        # [FUNCTION DOC] Store pooling hyperparameters as given (no tuple expansion); stride
+        # defaults to
+        # kernel_size when None. divisor_override, if set, replaces the averaging divisor.
         super().__init__()
         self.kernel_size = kernel_size
         self.stride = stride if (stride is not None) else kernel_size
@@ -892,6 +1002,9 @@ class AvgPool3d(_AvgPoolNd):
         self.divisor_override = divisor_override
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional avg_pool3d with the stored settings including
+        # divisor_override;
+        # returns the pooled tensor.
         """Runs the forward pass."""
         return F.avg_pool3d(
             input,
@@ -904,6 +1017,10 @@ class AvgPool3d(_AvgPoolNd):
         )
 
     def __setstate__(self, d):
+        # [FUNCTION DOC] Restore state from a pickled dict via the base class, then default
+        # padding to 0,
+        # ceil_mode to false and count_include_pad to true for old pickles; mutates the instance.
+        # KNOWN ISSUE: divisor_override gets no default, so very old pickles lack that attribute.
         super().__setstate__(d)
         self.__dict__.setdefault("padding", 0)
         self.__dict__.setdefault("ceil_mode", False)
@@ -911,6 +1028,10 @@ class AvgPool3d(_AvgPoolNd):
 
 
 class FractionalMaxPool2d(Module):
+    # [CLASS DOC] Applies fractional max pooling over 2 spatial dimensions with pseudo-random
+    # region sizes.
+    # State: kernel_size, output_size or output_ratio (exactly one set), return_indices, and a
+    # _random_samples buffer (may be None).
     r"""Applies a 2D fractional max pooling over an input signal composed of several input planes.
 
     Fractional MaxPooling is described in detail in the paper `Fractional MaxPooling`_ by Ben Graham
@@ -967,6 +1088,12 @@ class FractionalMaxPool2d(Module):
         return_indices: bool = False,
         _random_samples=None,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size as a 2-element tuple, return_indices, and register
+        # _random_samples as a
+        # buffer. Raises ValueError if neither or both of output_size and output_ratio are given,
+        # or if
+        # output_ratio is outside the open interval 0 to 1.
+        # KNOWN ISSUE: unlike the 3D version, kernel_size positivity is not validated.
         super().__init__()
         self.kernel_size = _pair(kernel_size)
         self.return_indices = return_indices
@@ -989,6 +1116,9 @@ class FractionalMaxPool2d(Module):
                 )
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional fractional_max_pool2d with the stored settings and
+        # random samples;
+        # returns pooled output, or (values, indices) when return_indices is true.
         return F.fractional_max_pool2d(
             input,
             self.kernel_size,
@@ -1000,6 +1130,10 @@ class FractionalMaxPool2d(Module):
 
 
 class FractionalMaxPool3d(Module):
+    # [CLASS DOC] Applies fractional max pooling over 3 spatial dimensions with pseudo-random
+    # region sizes.
+    # State: kernel_size, output_size or output_ratio (exactly one set), return_indices, and a
+    # _random_samples buffer (may be None).
     r"""Applies a 3D fractional max pooling over an input signal composed of several input planes.
 
     Fractional MaxPooling is described in detail in the paper `Fractional MaxPooling`_ by Ben Graham
@@ -1053,6 +1187,12 @@ class FractionalMaxPool3d(Module):
         return_indices: bool = False,
         _random_samples=None,
     ) -> None:
+        # [FUNCTION DOC] Store kernel_size as a 3-element tuple, return_indices, and register
+        # _random_samples as a
+        # buffer. Raises ValueError if neither or both of output_size and output_ratio are given,
+        # or if
+        # output_ratio is outside the open interval 0 to 1. Also raises ValueError for non-
+        # positive kernel_size.
         super().__init__()
         if (isinstance(kernel_size, int) and kernel_size <= 0) or (
             isinstance(kernel_size, (tuple, list))
@@ -1086,6 +1226,9 @@ class FractionalMaxPool3d(Module):
                 )
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional fractional_max_pool3d with the stored settings and
+        # random samples;
+        # returns pooled output, or (values, indices) when return_indices is true.
         return F.fractional_max_pool3d(
             input,
             self.kernel_size,
@@ -1097,6 +1240,9 @@ class FractionalMaxPool3d(Module):
 
 
 class _LPPoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for power-average (Lp) pooling modules. State: norm_type,
+    # kernel_size,
+    # stride (None allowed), ceil_mode. Subclasses implement forward.
     __constants__ = ["norm_type", "kernel_size", "stride", "ceil_mode"]
 
     norm_type: float
@@ -1109,6 +1255,9 @@ class _LPPoolNd(Module):
         stride: _size_any_t | None = None,
         ceil_mode: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Store norm_type, kernel_size, stride and ceil_mode as given. Raises
+        # ValueError if norm_type
+        # equals zero.
         super().__init__()
         if norm_type == 0:
             raise ValueError(f"norm_type must be a non-zero value, but got {norm_type}")
@@ -1118,6 +1267,8 @@ class _LPPoolNd(Module):
         self.ceil_mode = ceil_mode
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with norm_type, kernel_size, stride and
+        # ceil_mode.
         return (
             "norm_type={norm_type}, kernel_size={kernel_size}, stride={stride}, "
             "ceil_mode={ceil_mode}".format(**self.__dict__)
@@ -1125,6 +1276,9 @@ class _LPPoolNd(Module):
 
 
 class LPPool1d(_LPPoolNd):
+    # [CLASS DOC] Applies power-average pooling over 1 spatial dimension(s) with exponent
+    # norm_type.
+    # State inherited from _LPPoolNd; no parameters.
     r"""Applies a 1D power-average pooling over an input signal composed of several input planes.
 
     On each window, the function computed is:
@@ -1165,6 +1319,9 @@ class LPPool1d(_LPPoolNd):
     stride: _size_1_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional lp_pool1d with norm_type converted to float,
+        # kernel_size, stride and
+        # ceil_mode; returns the pooled tensor.
         """Runs the forward pass."""
         return F.lp_pool1d(
             input, float(self.norm_type), self.kernel_size, self.stride, self.ceil_mode
@@ -1172,6 +1329,9 @@ class LPPool1d(_LPPoolNd):
 
 
 class LPPool2d(_LPPoolNd):
+    # [CLASS DOC] Applies power-average pooling over 2 spatial dimension(s) with exponent
+    # norm_type.
+    # State inherited from _LPPoolNd; no parameters.
     r"""Applies a 2D power-average pooling over an input signal composed of several input planes.
 
     On each window, the function computed is:
@@ -1225,6 +1385,9 @@ class LPPool2d(_LPPoolNd):
     stride: _size_2_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional lp_pool2d with norm_type converted to float,
+        # kernel_size, stride and
+        # ceil_mode; returns the pooled tensor.
         """Runs the forward pass."""
         return F.lp_pool2d(
             input, float(self.norm_type), self.kernel_size, self.stride, self.ceil_mode
@@ -1232,6 +1395,9 @@ class LPPool2d(_LPPoolNd):
 
 
 class LPPool3d(_LPPoolNd):
+    # [CLASS DOC] Applies power-average pooling over 3 spatial dimension(s) with exponent
+    # norm_type.
+    # State inherited from _LPPoolNd; no parameters.
     r"""Applies a 3D power-average pooling over an input signal composed of several input planes.
 
     On each window, the function computed is:
@@ -1289,6 +1455,9 @@ class LPPool3d(_LPPoolNd):
     stride: _size_3_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional lp_pool3d with norm_type converted to float,
+        # kernel_size, stride and
+        # ceil_mode; returns the pooled tensor.
         """Runs the forward pass."""
         return F.lp_pool3d(
             input, float(self.norm_type), self.kernel_size, self.stride, self.ceil_mode
@@ -1296,17 +1465,22 @@ class LPPool3d(_LPPoolNd):
 
 
 class _AdaptiveMaxPoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for adaptive max pooling modules. State: output_size,
+    # return_indices.
     __constants__ = ["output_size", "return_indices"]
     return_indices: bool
 
     def __init__(
         self, output_size: _size_any_opt_t, return_indices: bool = False
     ) -> None:
+        # [FUNCTION DOC] Store output_size (may contain None entries) and return_indices without
+        # validation.
         super().__init__()
         self.output_size = output_size
         self.return_indices = return_indices
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with output_size for the module repr.
         return f"output_size={self.output_size}"
 
 
@@ -1315,6 +1489,9 @@ class _AdaptiveMaxPoolNd(Module):
 
 
 class AdaptiveMaxPool1d(_AdaptiveMaxPoolNd):
+    # [CLASS DOC] Applies adaptive max pooling over 1 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 1D adaptive max pooling over an input signal composed of several input planes.
 
     The output size is :math:`L_{out}`, for any input size.
@@ -1341,11 +1518,17 @@ class AdaptiveMaxPool1d(_AdaptiveMaxPoolNd):
     output_size: _size_1_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional adaptive_max_pool1d with output_size and
+        # return_indices; returns the
+        # pooled tensor, or (values, indices) when return_indices is true.
         """Runs the forward pass."""
         return F.adaptive_max_pool1d(input, self.output_size, self.return_indices)
 
 
 class AdaptiveMaxPool2d(_AdaptiveMaxPoolNd):
+    # [CLASS DOC] Applies adaptive max pooling over 2 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 2D adaptive max pooling over an input signal composed of several input planes.
 
     The output is of size :math:`H_{out} \times W_{out}`, for any input size.
@@ -1384,11 +1567,17 @@ class AdaptiveMaxPool2d(_AdaptiveMaxPoolNd):
     output_size: _size_2_opt_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional adaptive_max_pool2d with output_size and
+        # return_indices; returns the
+        # pooled tensor, or (values, indices) when return_indices is true.
         """Runs the forward pass."""
         return F.adaptive_max_pool2d(input, self.output_size, self.return_indices)
 
 
 class AdaptiveMaxPool3d(_AdaptiveMaxPoolNd):
+    # [CLASS DOC] Applies adaptive max pooling over 3 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 3D adaptive max pooling over an input signal composed of several input planes.
 
     The output is of size :math:`D_{out} \times H_{out} \times W_{out}`, for any input size.
@@ -1428,22 +1617,31 @@ class AdaptiveMaxPool3d(_AdaptiveMaxPoolNd):
     output_size: _size_3_opt_t
 
     def forward(self, input: Tensor):
+        # [FUNCTION DOC] Apply functional adaptive_max_pool3d with output_size and
+        # return_indices; returns the
+        # pooled tensor, or (values, indices) when return_indices is true.
         """Runs the forward pass."""
         return F.adaptive_max_pool3d(input, self.output_size, self.return_indices)
 
 
 class _AdaptiveAvgPoolNd(Module):
+    # [CLASS DOC] HELPER: Base class for adaptive average pooling modules. State: output_size.
     __constants__ = ["output_size"]
 
     def __init__(self, output_size: _size_any_opt_t) -> None:
+        # [FUNCTION DOC] Store output_size (may contain None entries) without validation.
         super().__init__()
         self.output_size = output_size
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Return a string with output_size for the module repr.
         return f"output_size={self.output_size}"
 
 
 class AdaptiveAvgPool1d(_AdaptiveAvgPoolNd):
+    # [CLASS DOC] Applies adaptive average pooling over 1 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 1D adaptive average pooling over an input signal composed of several input planes.
 
     The output size is :math:`L_{out}`, for any input size.
@@ -1468,6 +1666,8 @@ class AdaptiveAvgPool1d(_AdaptiveAvgPoolNd):
     output_size: _size_1_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional adaptive_avg_pool1d with output_size; returns the
+        # pooled tensor.
         """
         Runs the forward pass.
         """
@@ -1475,6 +1675,9 @@ class AdaptiveAvgPool1d(_AdaptiveAvgPoolNd):
 
 
 class AdaptiveAvgPool2d(_AdaptiveAvgPoolNd):
+    # [CLASS DOC] Applies adaptive average pooling over 2 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 2D adaptive average pooling over an input signal composed of several input planes.
 
     The output is of size H x W, for any input size.
@@ -1510,11 +1713,16 @@ class AdaptiveAvgPool2d(_AdaptiveAvgPoolNd):
     output_size: _size_2_opt_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional adaptive_avg_pool2d with output_size; returns the
+        # pooled tensor.
         """Runs the forward pass."""
         return F.adaptive_avg_pool2d(input, self.output_size)
 
 
 class AdaptiveAvgPool3d(_AdaptiveAvgPoolNd):
+    # [CLASS DOC] Applies adaptive average pooling over 3 spatial dimension(s) to produce the
+    # requested
+    # output_size regardless of input size. State inherited; no parameters.
     r"""Applies a 3D adaptive average pooling over an input signal composed of several input planes.
 
     The output is of size D x H x W, for any input size.
@@ -1550,5 +1758,7 @@ class AdaptiveAvgPool3d(_AdaptiveAvgPoolNd):
     output_size: _size_3_opt_t
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply functional adaptive_avg_pool3d with output_size; returns the
+        # pooled tensor.
         """Runs the forward pass."""
         return F.adaptive_avg_pool3d(input, self.output_size)
